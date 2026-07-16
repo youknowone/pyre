@@ -5504,7 +5504,9 @@ impl<'a> Lowering<'a> {
                 // the destination to the receiver instead of emitting an
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
-                if args.len() == 1 && self.is_string_to_str_identity(&reg, &call.dest.ty) {
+                if args.len() == 1
+                    && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
+                {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -5531,7 +5533,7 @@ impl<'a> Lowering<'a> {
                 // let a char read byte-compare) without lowering a real
                 // byte-slice view here first, or those indexed uses would
                 // silently gain character semantics.
-                if args.len() == 1 && self.is_string_as_bytes_identity(&reg) {
+                if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref()) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -7389,20 +7391,27 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
-    /// `String::as_str(&self) -> &str`, and
+    /// `String::as_str(&self) -> &str`, `Wtf8::as_str(&self) -> &str`, and
     /// `<String as Borrow<str>>::borrow(&self) -> &str` — every one
     /// returns a `&str` view of the same string, an identity in the
-    /// lifted value model (Rust `String`/`&str`/`str` all lower to the
-    /// immutable rpy_string).  Without the intercept the call keeps a
-    /// `CallTarget::Method` `as_ref` getattr the rtyper cannot route on
-    /// the classdef-less string receiver (the `Cannot find attribute
-    /// "as_ref" on UnicodeString` wall).  Bind the destination to the
-    /// receiver instead, the same alias shape as the container deref
-    /// above.  Gated on the `str`-typed result so `String`'s sibling
-    /// `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>` impls — whose
-    /// `&[u8]`/etc. result is a *different* value-model family — keep
-    /// their ordinary lowering.
-    fn is_string_to_str_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+    /// lifted value model (Rust `String`/`&str`/`str`/`Wtf8`/`Wtf8Buf`
+    /// all lower to the immutable rpy_string).  Without the intercept the
+    /// call keeps a `CallTarget::Method` `as_ref` getattr the rtyper
+    /// cannot route on the classdef-less string receiver (the `Cannot
+    /// find attribute "as_ref" on UnicodeString` wall).  Bind the
+    /// destination to the receiver instead, the same alias shape as the
+    /// container deref above.  Gated on the receiver being a string value
+    /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
+    /// precise than the impl owner-leaf, plus the `str`-typed result so
+    /// `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>`
+    /// impls — whose `&[u8]`/etc. result is a *different* value-model
+    /// family — keep their ordinary lowering.
+    fn is_string_to_str_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -7416,7 +7425,7 @@ impl<'a> Lowering<'a> {
         if !matches!(leaf, "as_ref" | "as_str" | "borrow") {
             return false;
         }
-        if deref_impl_owner_leaf(self.llbc, fd).as_deref() != Some("String") {
+        if !first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc)) {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
@@ -7429,9 +7438,23 @@ impl<'a> Lowering<'a> {
     /// identity on the receiver — unlike the `&[u8]` family the `as_str`
     /// gate above excludes via `tyref_strips_to_str`, the byte view of a
     /// *string* receiver re-meets that same string value.  Gated on the
-    /// impl owner being a string-family type so a non-string `as_bytes`
-    /// (a real byte-buffer producer) keeps its ordinary lowering.
-    fn is_string_as_bytes_identity(&self, reg: &RegularCall) -> bool {
+    /// receiver being a string value (`tyref_is_string_value`:
+    /// `str`/`String`/`Wtf8`/`Wtf8Buf`), more precise than the impl
+    /// owner-leaf, so a non-string `as_bytes` (a real byte-buffer
+    /// producer) fails the gate and keeps its ordinary lowering.
+    ///
+    /// Sound only for len / equality / iteration consumers.  A scalar
+    /// index (`as_bytes()[i]`) lowers to `getitem` on `StringRepr`, which
+    /// yields a `Char`, not the `u8` the Rust source expects; there is no
+    /// `(CharRepr, IntegerRepr)` eq/arithmetic pairtype, so such a use
+    /// fails rtype and residualizes rather than miscompiling.  Do NOT add
+    /// a `(CharRepr, IntegerRepr)` eq arm without lowering a real
+    /// byte-slice view first.
+    fn is_string_as_bytes_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+    ) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -7441,10 +7464,7 @@ impl<'a> Lowering<'a> {
         if fd.item_meta.name_path().rsplit("::").next() != Some("as_bytes") {
             return false;
         }
-        matches!(
-            deref_impl_owner_leaf(self.llbc, fd).as_deref(),
-            Some("String" | "str" | "Wtf8" | "Wtf8Buf")
-        )
+        first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
     }
 
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`

@@ -115,9 +115,59 @@ green + `check.py` bit-exact 3-backend (list/dict subscript with huge int indice
 Err arm — MUST still raise IndexError/ValueError, not panic).
 
 ### Slice B — String / Wtf8 / IndexMap / slice / iter-adapter residuals (task #22, after A)
-The cluster tail: `String::new`, `Wtf8Buf::with_capacity`, `Enumerate::next`, `core::slice::get/join`,
-`IndexMap::insert/get`, `Map::collect`, `slice::iter::Iter::next`. Scope per-leaf after Slice A lands
-and re-census reveals which remain co-blocking the hot graphs.
+
+Scoped 7/17 on the post-Slice-A census (base `bb6ee8d179c`, 276 phaseA): **46 distinct unregistered
+residual paths**, saved to `/tmp/sliceB_residual_ranking.txt` (de-escape `\"`→`"` before counting).
+The three walls that gate the hot dispatcher heads (innermost per record):
+
+- `iter::adapters::map::Map::collect` (25 hits) → `setitem_slot`, `w_list_append`, `setitem_list`,
+  `w_list_setitem`.
+- `core::str::<Impl>::as_bytes` (7) → `getitem_slot`, `dict_entries_get_str`.
+- `sync::atomic::AtomicBool::store` (15) → `object_setattr` (via `w_type_set_abstract`).
+
+The 46 paths split into four orthodoxy buckets — **do NOT residualize a bucket-(N) core op** (that is
+the non-orthodox band-aid: a silent perf regression no correctness test catches):
+
+- **(F) foreign-opaque residual** — `Map::collect`, `Wtf8::*`, `IndexMap::{get,insert,get_index,
+  with_capacity,get_index_mut}`, `AtomicBool::store`, `BigInt::{sign,to_u32}`, `fmt::rt::Argument::
+  new_debug`. NOT auto-collected because the owners are EXTERNAL crates (`indexmap`/`wtf8`/`core`/`std`)
+  → `iter_local_fns` (charon-reader:208) never sees them, and `collect_foreign_opaque_method_externals`
+  (mir.rs:10681) only walks LOCAL opaque ADTs with a self-receiver and a modelable result
+  (`foreign_opaque_method_result_valuetype` mir.rs:10773 declines `Option`/enum/tuple/ref). `BigInt`
+  `sign`/`to_u32` owner IS opaque+local but the enum/`Option` result is declined. Fix = wrap the
+  **pyre-side caller** in `#[dont_look_inside]` + `push_alias_pair`. Template already shipped:
+  `w_dict_{store,lookup}_int_strategy` (jit_fnaddr.rs:557-580) residualize their internal
+  `IndexMap::{insert,get}` wholesale.
+- **(N) native-lowerable core op** — `core::slice::{get,first,index,as_ptr,chunks_exact}`,
+  `from_raw_parts`, `f64::abs` (rtyper has `rtype_abs` rfloat.rs:216 → `float_abs`, method callsite
+  unwired), `num::checked_div` (→ runtime-disc `Result`, template `try_lower_checked_neg` mir.rs:8610),
+  `convert::{from,num::try_from}` (int-to-int `try_from` = the Slice-A-deferred `int_pow`/`pow`/
+  `opcode_get_iter`), `RangeInclusive::new` (→ `rtype_builtin_range` rrange.rs:160), `Rev::next`,
+  `mut_ptr::add`, `Vec::{index,index_mut}`. Real rtype/recognizer, never a residual.
+- **(C) vec!/box/alloc cluster** — deferred to Slice C (capstone).
+- **(P) pyre-internal accessor** — `set_async`, `EVAL_NESTING`, `EXC_CLASS_REGISTRY`,
+  `subclass_range_read`, `GcType::type_id`, `Constants::{deref,index}`. `push_alias_pair` siblings of
+  the jit_fnaddr.rs:697-758 runtime-state accessors.
+
+**Sub-slice order (cheapest-per-leverage first; census depth LIES — head movement only when B1+B2
+co-land):**
+
+- **B1a (FIRST, done)** — the `str::as_bytes` / `Wtf8::as_str` identity-fold gap. Root cause:
+  `is_string_as_bytes_identity` (mir.rs:7434) and `is_string_to_str_identity` (mir.rs:7405) both gate on
+  `deref_impl_owner_leaf(fd)` matching an owner leaf, but `deref_impl_owner_leaf` (mir.rs:10530) resolves
+  the owner through `resolve_impl_owner_adt_def_id_free`, which needs an ADT def-id. The primitive `str`
+  is a `{Builtin:"Str"}` node with no def-id, so the literal `"str"` arm is dead; `Wtf8::as_str` fails a
+  different way (`is_string_to_str_identity` gates owner `== "String"` only). Fix: gate both folds on the
+  **receiver** being a string value via `tyref_is_string_value` (mir.rs:11539, which already handles
+  `Builtin("Str")` + `String` + `Wtf8`/`Wtf8Buf` uniformly) rather than the impl-owner leaf. Do NOT
+  touch `deref_impl_owner_leaf` (it also drives the `cast_pointer` thin-pointer rewrite).
+- **B1b** — the (P) register-only accessors + `fmt::Argument::new_debug` fold into the existing fmt
+  family (mir.rs:1757/7500).
+- **B2** — the (F) foreign residuals (`Map::collect`, `AtomicBool::store`, `IndexMap` family, `BigInt`
+  `sign`/`to_u32`). The str-dict path is STRUCTURALLY DIFFERENT from int/bytes: it uses the shared
+  `dict_entries_get_str` helper (dictmultiobject.rs:179, not `#[dont_look_inside]`), not a dedicated
+  strategy leaf — add a `w_dict_lookup_str_strategy`-style residual leaf or mark the shared helper.
+- **B3 (LAST in B, real rtyper work)** — the (N) native lowerings.
 
 ### Slice C — vec!/NewList recognizer + repr-generic rtype_newlist (task #20, LAST, capstone)
 - **Ca** Re-add the front/mir recognizer (verbatim from reverted `f41cb0496dc`): match
