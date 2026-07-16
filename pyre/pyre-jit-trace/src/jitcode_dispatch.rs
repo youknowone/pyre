@@ -11945,6 +11945,30 @@ fn walker_capture_snapshot_for_last_guard_impl(
             } else {
                 py_pc
             };
+            // `capture_resumedata(after_residual_call=True)` snapshots the
+            // trailing `-live-`, after the residual result has replaced the
+            // Python opcode's consumed operands (pyjitpl.py:177-198,
+            // opencoder.py:767-770).  The walk-level stack mirror normally
+            // applies that replacement only when `step_vstack_mirror` reaches
+            // the next Python opcode.  A guard emitted by the residual itself
+            // captures before that step, so advance the mirror here to the
+            // same post-call boundary before it supplies the vable snapshot.
+            // This is the same transition the following walk step would make;
+            // it merely makes the guard's resume image observe it at the
+            // required point.
+            if after_residual_call && ctx.vstack_valid {
+                let jc = unsafe { &*sym.jitcode };
+                let code_ptr = jc.payload.code_ptr;
+                if !code_ptr.is_null() {
+                    let resume_depth = crate::liveness::liveness_for(code_ptr)
+                        .depth_at_py_pc()
+                        .get(py_pc as usize)
+                        .copied()
+                        .unwrap_or(0) as usize;
+                    let code = unsafe { &*code_ptr };
+                    reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth);
+                }
+            }
             // Publish `last_instr = py_pc - 1` to the vable static shadow
             // before snapshotting.  The walker walks JitCode and never
             // crosses `set_orgpc`, so the `last_instr` scalar in
