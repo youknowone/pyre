@@ -6150,12 +6150,19 @@ pub(crate) fn super_check(
                 return Ok(obj_type);
             }
         }
-        if let Ok(apparent_type) = crate::baseobjspace::getattr_str(obj_or_type, "__class__") {
-            if pyre_object::is_type(apparent_type)
-                && crate::baseobjspace::issubtype_w(apparent_type, start_type)
-            {
-                return Ok(apparent_type);
+        match crate::baseobjspace::getattr_str(obj_or_type, "__class__") {
+            Ok(apparent_type) => {
+                if pyre_object::is_type(apparent_type)
+                    && crate::baseobjspace::issubtype_w(apparent_type, start_type)
+                {
+                    return Ok(apparent_type);
+                }
             }
+            // descriptor.py:139-143 — only AttributeError falls back to
+            // type(obj) (the normal case already rejected it above); any
+            // other exception from a `__class__` property propagates.
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
+            Err(e) => return Err(e),
         }
     }
     Err(crate::PyError::type_error(
