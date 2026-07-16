@@ -1,4 +1,7 @@
 /target
 **/*.rs.bk
 Cargo.lock
+# check.py local scratch: .out/.time snapshots and synthetic .jitstats.
+# The committed benchmark baselines live at pyre/bench/*.jitstats.
 /check.snap/
+/bench/synth/*.jitstats

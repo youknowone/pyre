@@ -380,6 +380,36 @@ jobs:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/check.py
+    - name: JIT structural stats vs committed baseline (Linux, informational)
+      # Diff each benchmark's [jit-stats] counters against the committed
+      # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided
+      # by the platform-independent tracer, so a diff here means a change moved
+      # what the JIT compiles. Informational: the baselines were recorded on
+      # macOS aarch64 and cross-runner/cross-platform determinism of the
+      # counters is not yet confirmed in CI, so this must not gate main until
+      # the summaries stay clean across real PRs. The .out/.time baselines are
+      # not committed, so their snapshot checks report "missing" and only the
+      # jit-stats diff is exercised. Runs on Linux only (one OS is enough for a
+      # platform-independent signal), where ripgrep is preinstalled.
+      if: runner.os == 'Linux'
+      continue-on-error: true
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+        PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
+      run: |
+        set -uo pipefail
+        {
+          echo '### JIT structural stats vs committed baseline'
+          for backend in dynasm cranelift; do
+            echo "#### $backend"
+            echo '```'
+            out=$(${{ steps.cpython.outputs.python-path }} pyre/check.py \
+              --backend "$backend" --no-synthetic --snapshot-diff 2>&1 || true)
+            echo "$out" | rg -i 'jit-stats diff|snapshot diff' \
+              || echo '(no jit-stats output)'
+            echo '```'
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
 
   pyre-check-macos:
     name: pyre/check.py (macos-latest)
