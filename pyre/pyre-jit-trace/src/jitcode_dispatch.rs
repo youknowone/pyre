@@ -8783,9 +8783,8 @@ thread_local! {
 #[derive(Clone, Debug)]
 pub(crate) enum InlineAbortCarrier {
     Entry {
-        call_py_pc: usize,
-        /// The outer CALL's native coordinate, carried alongside `call_py_pc`
-        /// during the pc_map-removal audit phase.
+        /// The outer CALL's native coordinate, resolved at the interpreter
+        /// flush boundary.
         outer_jitcode_index: u32,
         call_jitcode_pc: usize,
         call_stack: Vec<pyre_object::PyObjectRef>,
@@ -8802,16 +8801,13 @@ pub(crate) enum MidBodyAbortKind {
 #[derive(Clone, Debug)]
 pub(crate) struct MidBodyPayload {
     pub abort_kind: MidBodyAbortKind,
-    pub call_py_pc: usize,
-    pub post_call_py_pc: usize,
-    /// The outer CALL's native coordinate. Phase 1 keeps the legacy Python
-    /// words active and audits this pair at the interpreter-flush boundary.
+    /// The outer CALL's native coordinate, resolved at the interpreter flush
+    /// boundary.
     pub outer_jitcode_index: u32,
     pub call_jitcode_pc: usize,
     pub call_stack_len: usize,
-    pub callee_py_pc: usize,
-    /// The rebuilt callee's native abort coordinate, carried alongside the
-    /// Python word while the flush-boundary inversion is audited.
+    /// The rebuilt callee's native abort coordinate, resolved at the
+    /// interpreter flush boundary.
     pub callee_jitcode_index: u32,
     pub abort_jitcode_pc: usize,
     pub w_code: pyre_object::PyObjectRef,
@@ -9448,14 +9444,12 @@ pub(crate) fn fbw_bump_executed_effect() {
 
 /// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
 pub(crate) fn fbw_set_abort_call_resume(
-    call_py_pc: usize,
     outer_jitcode_index: u32,
     call_jitcode_pc: usize,
     stack: Vec<pyre_object::PyObjectRef>,
 ) {
     FBW_ABORT_CALL_RESUME.with(|c| {
         *c.borrow_mut() = Some(InlineAbortCarrier::Entry {
-            call_py_pc,
             outer_jitcode_index,
             call_jitcode_pc,
             call_stack: stack,
@@ -10699,9 +10693,9 @@ pub(crate) fn pcmap_callpc_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT").is_some())
 }
 
-/// `PYRE_PCMAP_MIDBODY_AUDIT` certifies the plain JitCode-PC metadata twins
-/// used by the inline-abort mid-body carrier and the carried native words
-/// which will replace its legacy Python-PC fields in a later phase.
+/// `PYRE_PCMAP_MIDBODY_AUDIT` certifies carried inline-abort identities at
+/// the interpreter-flush boundary and retains the deferred plain JitCode-PC
+/// producer-twin census.
 pub(crate) fn pcmap_midbody_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT").is_some())
@@ -15532,7 +15526,7 @@ fn try_walker_inline_user_call(
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
     let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !ctx.fbw_mode.inline_subwalk;
-    let abort_flush_call_coords: Option<(usize, u32, usize)> =
+    let abort_flush_call_jitcode_coord: Option<(u32, usize)> =
         if ctx.is_full_body_walk && is_top_inline {
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
@@ -15544,21 +15538,13 @@ fn try_walker_inline_user_call(
                 } else {
                     unsafe {
                         let jc = &*sym.jitcode;
-                        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-                        if !jc.payload.code_ptr.is_null() {
-                            let codeobj = &*jc.payload.code_ptr;
-                            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                        }
-                        Some((py as usize, jc.index as u32, op.pc))
+                        Some((jc.index as u32, op.pc))
                     }
                 }
             }
         } else {
             None
         };
-    let abort_flush_call_py_pc = abort_flush_call_coords.map(|(py_pc, _, _)| py_pc);
-    let abort_flush_call_jitcode_coord =
-        abort_flush_call_coords.map(|(_, jitcode_index, jitcode_pc)| (jitcode_index, jitcode_pc));
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
     // paused caller frame on the framestack so its in-callee guards
@@ -15578,21 +15564,11 @@ fn try_walker_inline_user_call(
                     && !unjournaled_before_subwalk
                     && fbw_executed_effect_count() == executed_effects_before
                 {
-                    if let (
-                        Some(call_py_pc),
-                        Some((outer_jitcode_index, call_jitcode_pc)),
-                        Some(stack),
-                    ) = (
-                        abort_flush_call_py_pc,
+                    if let (Some((outer_jitcode_index, call_jitcode_pc)), Some(stack)) = (
                         abort_flush_call_jitcode_coord,
                         reconstructed_all_ref_call_stack(code, op, ctx),
                     ) {
-                        fbw_set_abort_call_resume(
-                            call_py_pc,
-                            outer_jitcode_index,
-                            call_jitcode_pc,
-                            stack,
-                        );
+                        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
                     }
                 }
                 return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
@@ -15850,7 +15826,6 @@ fn try_walker_inline_user_call(
                 && fbw_executed_effect_count() != executed_effects_before
             {
                 let payload = (|| {
-                    let call_py_pc = abort_flush_call_py_pc?;
                     let (outer_jitcode_index, call_jitcode_pc) = abort_flush_call_jitcode_coord?;
                     let callee_pjc = crate::state::pyjitcode_for_code(w_code)?;
                     let metadata = &callee_pjc.metadata;
@@ -15949,30 +15924,15 @@ fn try_walker_inline_user_call(
                         }
                         *dst = Some(value);
                     }
-                    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-                    if sym_ptr.is_null() {
-                        return None;
-                    }
-                    let outer_jc = unsafe { &*(*sym_ptr).jitcode };
-                    if outer_jc.payload.code_ptr.is_null() {
-                        return None;
-                    }
-                    let post_call_py_pc = skip_python_trivia_forward(
-                        unsafe { &*outer_jc.payload.code_ptr },
-                        call_py_pc + 1,
-                    );
                     let Some(ConcreteValue::Ref(x_arg)) = callee_arg_concretes.first().copied()
                     else {
                         return None;
                     };
                     Some(MidBodyPayload {
                         abort_kind,
-                        call_py_pc,
-                        post_call_py_pc,
                         outer_jitcode_index,
                         call_jitcode_pc,
                         call_stack_len: arg_concretes.len(),
-                        callee_py_pc,
                         callee_jitcode_index: callee_pjc.jitcode.index() as u32,
                         abort_jitcode_pc: abort_pc,
                         w_code: w_code as pyre_object::PyObjectRef,
@@ -16020,16 +15980,10 @@ fn try_walker_inline_user_call(
                 && !unjournaled_before_subwalk
                 && fbw_executed_effect_count() == executed_effects_before
             {
-                if let (Some(call_py_pc), Some((outer_jitcode_index, call_jitcode_pc))) =
-                    (abort_flush_call_py_pc, abort_flush_call_jitcode_coord)
+                if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
                 {
                     if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
-                        fbw_set_abort_call_resume(
-                            call_py_pc,
-                            outer_jitcode_index,
-                            call_jitcode_pc,
-                            stack,
-                        );
+                        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
                     }
                 }
             }
