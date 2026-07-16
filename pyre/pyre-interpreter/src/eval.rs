@@ -1128,12 +1128,22 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
                 *err = trace_err;
             }
         }
+        // pyopcode.py:144-149 — after `except OperationError as e: operr = e`,
+        // record/trace the (possibly tracer-replaced) operr, not the exception
+        // captured before the trace hook ran.  Re-derive from `err`: an
+        // unreplaced err returns the cached object; a replaced err
+        // materialises the replacement.  Cache it so record and trace share
+        // one object.
+        let operr_obj = err.to_exc_object();
+        if err.exc_object.is_null() {
+            err.exc_object = operr_obj;
+        }
         // `pyopcode.py:147-148 pytraceback.record_application_traceback`
         // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
         unsafe {
             crate::pytraceback::record_application_traceback(
-                exc_obj,
+                operr_obj,
                 frame as *mut PyFrame,
                 frame.last_instr as i64,
             );
@@ -1147,9 +1157,10 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         // derives the class.  Passing the instance as `w_value` with a
         // null `w_type` makes `normalize_exception` take `w_inst = w_type`
         // (null) and raise "exceptions must derive from BaseException".
-        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_obj) };
+        let operr_obj = err.to_exc_object();
+        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(operr_obj) };
         if let Err(trace_err) = unsafe {
-            (*ec).exception_trace(frame as *mut PyFrame, exc_obj, pyre_object::PY_NULL, w_tb)
+            (*ec).exception_trace(frame as *mut PyFrame, operr_obj, pyre_object::PY_NULL, w_tb)
         } {
             // pyopcode.py:148 `ec.exception_trace(self, operr)` is
             // outside the except-block; a raise here propagates past
