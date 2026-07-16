@@ -870,6 +870,18 @@ fn select_recipe_entry(
         .flatten()
 }
 
+fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
+    crate::jitcode_runtime::decoded_ops(code)
+        .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
+        .and_then(|op| {
+            op.argcodes
+                .ends_with(">r")
+                .then(|| code.get(entry - 1).copied())
+                .flatten()
+        })
+        .map(usize::from)
+}
+
 /// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
 /// the full-body walker instead of aborting to a no-JIT re-interpret.
 ///
@@ -887,37 +899,50 @@ fn select_recipe_entry(
 /// are wired. This abort-to-blackhole drain is the safe default; the experimental
 /// `PYRE_P2_COMPILE` path remains opt-in.
 /// Thread a reconstructed callee's `SubReturn` value into the root portal's
-/// operand-stack result slot so the subsequent root walk (`run_perfn_walk`'s
-/// `bridge_stack_oprefs` seeding) reads it as the call result at `root_pc`.
+/// operand-stack result register so the subsequent root walk
+/// (`run_perfn_walk`'s bridge seeding) reads it as the call result at `root_pc`.
 ///
-/// The result lands at the codewriter-precomputed result color for the call's
-/// return pc (`result_color_at_pc_at`), mapped to its `bridge_stack_oprefs`
-/// stack slot (`color - nlocals`).  Returns `false` (caller declines the
-/// compile) when the color is unresolved or sits below the operand stack.
+/// `make_result_of_lastop` writes the result to the residual-call body's
+/// trailing `>r` destination byte, so use that register when the call ending at
+/// `root_pc` can be decoded.  Fall back to the precomputed result-color table
+/// for older shapes that lack the canonical residual-call encoding.  Returns
+/// `false` (caller declines the compile) when the register is unresolved or
+/// sits below the operand stack.
 fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
     if sym.jitcode.is_null() {
         return false;
     }
+    let payload = unsafe { &(*sym.jitcode).payload };
     let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
-    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
-    if crate::jitcode_dispatch::result_color_audit_enabled() {
-        let payload = unsafe { &(*sym.jitcode).payload };
-        let py_pc =
-            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
-        assert_eq!(
-            payload.result_color_for_jitcode_pc_pred(root_pc),
-            payload.metadata.result_color_at_pc.get(py_pc).copied(),
-            "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
-        );
-    }
-    let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_py_pc) else {
+    let result_reg = residual_ref_call_dst_before(payload.jitcode.code.as_slice(), root_pc)
+        .or_else(|| {
+            let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
+            if crate::jitcode_dispatch::result_color_audit_enabled() {
+                let py_pc =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc)
+                        as usize;
+                assert_eq!(
+                    payload.result_color_for_jitcode_pc_pred(root_pc),
+                    payload.metadata.result_color_at_pc.get(py_pc).copied(),
+                    "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
+                );
+            }
+            crate::state::result_color_at_pc_at(jitcode_index, root_py_pc)
+        });
+    let Some(result_reg) = result_reg else {
         return false;
     };
     let nlocals = sym.nlocals;
-    if result_color < nlocals {
+    if result_reg < nlocals {
         return false;
     }
-    let slot = result_color - nlocals;
+    if let Some(ref mut bridge_regs) = sym.bridge_registers_r {
+        if bridge_regs.len() <= result_reg {
+            bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
+        }
+        bridge_regs[result_reg] = result;
+    }
+    let slot = result_reg - nlocals;
     let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
     if bridge.len() <= slot {
         bridge.resize(slot + 1, majit_ir::OpRef::NONE);
