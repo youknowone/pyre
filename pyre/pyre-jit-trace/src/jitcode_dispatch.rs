@@ -8345,7 +8345,7 @@ pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
 /// compile.py:1101-1150) so a not-yet-compiled callee still enters via a real
 /// CALL_ASSEMBLER tmp-callback token instead of poisoning the trace with
 /// `LoopBearingCalleeInlineUnsupported`.  Mirrors the `build_jit_driver_pair`
-/// gate of the same name (eval.rs); default OFF while the migration lands.
+/// gate of the same name (eval.rs); default ON, `=0` opts out.
 pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
@@ -8353,7 +8353,7 @@ pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 

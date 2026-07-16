@@ -2706,21 +2706,6 @@ thread_local! {
     static JIT_DRIVER: UnsafeCell<Option<JitDriverPair>> = const { UnsafeCell::new(None) };
 }
 
-/// Gate for the full-portal recursive-call cutover — the RPython tmp-token
-/// CALL_ASSEMBLER path (`warmstate.py:714-723 get_assembler_token` +
-/// `compile.py:1101-1150 compile_tmp_callback`) for walker behavior that
-/// still differs from the default path during the staged cutover.
-pub(crate) fn rec_mutual_cutover_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => false,
-    })
-}
-
 fn build_jit_driver_pair() -> JitDriverPair {
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
