@@ -10154,6 +10154,18 @@ fn classify_vstack_opcode(
         // unmodeled it killed the mirror for the rest of the walk at the first
         // nested `def`, declining any later depth > 1 kept-stack branch guard.
         | Instruction::MakeFunction
+        // SET_FUNCTION_ATTRIBUTE follows MAKE_FUNCTION for defaults,
+        // annotations, and closures, and pushes the updated function back to
+        // TOS.  The remaining ops here also leave one result on the new TOS;
+        // their arg-dependent depths are already baked into
+        // `pyre/pyre-jit-trace/src/liveness.rs`'s depth table.
+        | Instruction::SetFunctionAttribute { .. }
+        | Instruction::CallKw { .. }
+        | Instruction::BuildSlice { .. }
+        | Instruction::CallFunctionEx
+        | Instruction::CallIntrinsic1 { .. }
+        | Instruction::LoadCommonConstant { .. }
+        | Instruction::LoadFromDictOrGlobals { .. }
         // #73: LOAD_FAST/STORE_FAST super-instructions.  Their net
         // result still lands on the new TOS as the LAST Ref written (the
         // second load, resp. the load following the store), so `ResultToTos`
@@ -10189,13 +10201,19 @@ fn classify_vstack_opcode(
         | Instruction::StoreSubscr
         | Instruction::DeleteSubscr
         | Instruction::StoreSlice
-        // LIST_APPEND / SET_ADD / MAP_ADD / LIST_EXTEND pop their value operand(s)
-        // and mutate the collection PEEK'd in place below them — a side-store,
-        // same shape as STORE_SUBSCR: the surviving TOS box stays put.
+        // LIST_APPEND / SET_ADD / MAP_ADD / LIST_EXTEND and the dict/set
+        // update opcodes pop their value operand(s) and mutate the collection
+        // PEEK'd in place below them — a side-store, same shape as
+        // STORE_SUBSCR: the surviving TOS box stays put. MAKE_CELL stores its
+        // result into the frame-local virtualizable slot, not operand TOS.
         | Instruction::ListAppend { .. }
         | Instruction::SetAdd { .. }
         | Instruction::MapAdd { .. }
         | Instruction::ListExtend { .. }
+        | Instruction::DictUpdate { .. }
+        | Instruction::DictMerge { .. }
+        | Instruction::SetUpdate { .. }
+        | Instruction::MakeCell { .. }
         | Instruction::DeleteFast { .. }
         | Instruction::DeleteName { .. }
         | Instruction::DeleteGlobal { .. }
