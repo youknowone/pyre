@@ -10491,6 +10491,38 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
     best_py
 }
 
+fn vstack_initial_py_pc(
+    metadata: &crate::PyJitCodeMetadata,
+    jit_pc: usize,
+    permuted_for_iter_entry: bool,
+) -> u32 {
+    if !permuted_for_iter_entry {
+        return vstack_containing_py_pc(metadata, jit_pc);
+    }
+    metadata_block_head_py_pc(metadata, jit_pc)
+        .unwrap_or_else(|| vstack_containing_py_pc(metadata, jit_pc))
+}
+
+fn metadata_block_head_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> Option<u32> {
+    metadata
+        .block_head_py_by_jit_pc
+        .binary_search_by_key(&jit_pc, |&(off, _)| off)
+        .ok()
+        .map(|i| metadata.block_head_py_by_jit_pc[i].1)
+}
+
+fn vstack_step_py_pc(
+    metadata: &crate::PyJitCodeMetadata,
+    jit_pc: usize,
+    current_py_pc: u32,
+) -> u32 {
+    if metadata_block_head_py_pc(metadata, jit_pc) == Some(current_py_pc) {
+        current_py_pc
+    } else {
+        vstack_containing_py_pc(metadata, jit_pc)
+    }
+}
+
 /// Reconstruct `pc_map[py]` — the `-live-` resume marker byte offset for
 /// Python PC `py` — from the two surviving tables plus the sparse carry-forward
 /// sidecar, WITHOUT the retired dense `pc_map` Vec.  Same resolution as
@@ -10588,7 +10620,7 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
             if jc.payload.code_ptr.is_null() {
                 return;
             }
-            let py_pc = vstack_containing_py_pc(&jc.payload.metadata, jit_pc);
+            let py_pc = vstack_step_py_pc(&jc.payload.metadata, jit_pc, ctx.vstack_cur_pypc);
             let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
                 .depth_at_py_pc()
                 .get(py_pc as usize)
@@ -10633,24 +10665,44 @@ fn seed_vstack_mirror(ctx: &mut WalkContext<'_, '_>, sym: &crate::state::PyreSym
     if sym.jitcode.is_null() || !sym.owns_virtualizable_shadow() {
         return;
     }
-    // Seed the mirror's current coordinate at the containment py_pc of the
-    // ACTUAL first-walked jitcode op (`start_pc`), NOT the resume/loop-header
-    // `entry_py_pc`.  A loop trace's `walk()` starts at `position = start_pc`,
-    // whose containing Python opcode may precede `entry_py_pc` (the
-    // loop-header resume coordinate the snapshot reader uses).  Seeding
-    // `cur_pypc = entry_py_pc` then made the FIRST `step_vstack_mirror`
-    // produce a spurious "backward" boundary (e.g. `5 -> 4`) that reconciled
-    // the not-yet-executed first opcode with `last_ref = None`, leaving a
-    // NONE hole that latched `vstack_valid = false` for the whole walk.
-    // Seeding at the first op's own py_pc makes the first step a no-op
-    // (`new_pypc == cur_pypc` early-out), so the mirror only reconciles
-    // boundaries AFTER the entry — where a previous opcode actually ran.
+    // Ordinarily seed at the opcode containing the first walked jitcode op,
+    // so the first step is a no-op and reconciliation starts only after an
+    // opcode actually runs. A SWAP/COPY immediately preceding a FOR_ITER
+    // block-head marker is different: the shadow already contains the
+    // post-permutation stack at trace entry. Seed that marker at FOR_ITER and
+    // let `vstack_step_py_pc` ignore the marker itself, preventing the
+    // predecessor permutation from being applied to the mirror a second time.
     let (first_pypc, depth, nlocals) = unsafe {
         let jc = &*sym.jitcode;
         if jc.payload.code_ptr.is_null() {
             return;
         }
-        let first_pypc = vstack_containing_py_pc(&jc.payload.metadata, start_pc);
+        let containing_pypc = vstack_containing_py_pc(&jc.payload.metadata, start_pc);
+        let predecessor_permuted_stack = pyre_interpreter::decode_instruction_at(
+            &*jc.payload.code_ptr,
+            containing_pypc as usize,
+        )
+        .is_some_and(|(instr, op_arg)| {
+            matches!(
+                classify_vstack_opcode(&instr, op_arg),
+                VstackOpClass::Swap(_) | VstackOpClass::Copy(_)
+            )
+        });
+        let target_is_for_iter = metadata_block_head_py_pc(&jc.payload.metadata, start_pc)
+            .and_then(|target| {
+                pyre_interpreter::decode_instruction_at(&*jc.payload.code_ptr, target as usize)
+            })
+            .is_some_and(|(instr, _)| {
+                matches!(
+                    instr,
+                    pyre_interpreter::bytecode::Instruction::ForIter { .. }
+                )
+            });
+        let first_pypc = vstack_initial_py_pc(
+            &jc.payload.metadata,
+            start_pc,
+            predecessor_permuted_stack && target_is_for_iter,
+        );
         let d = crate::liveness::liveness_for(jc.payload.code_ptr)
             .depth_at_py_pc()
             .get(first_pypc as usize)
@@ -25819,6 +25871,22 @@ mod tests {
         let index = unsafe { (*jitcode).index as u32 };
         INDEX.with(|slot| slot.set(Some(index)));
         index
+    }
+
+    #[test]
+    fn vstack_permuted_for_iter_entry_uses_block_head_target() {
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.first_jit_pc_by_py_pc = vec![usize::MAX; 19];
+        pyjit.metadata.first_jit_pc_by_py_pc[17] = 100;
+        pyjit.metadata.first_jit_pc_by_py_pc[18] = 120;
+        pyjit.metadata.block_head_py_by_jit_pc = vec![(110, 18)];
+
+        assert_eq!(vstack_containing_py_pc(&pyjit.metadata, 110), 17);
+        assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, true), 18);
+        assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, false), 17);
+        assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 18), 18);
+        assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 17), 17);
+        assert_eq!(vstack_step_py_pc(&pyjit.metadata, 120, 18), 18);
     }
 
     /// Build a fresh `TraceCtx`. Uses the public `for_test_types` +
