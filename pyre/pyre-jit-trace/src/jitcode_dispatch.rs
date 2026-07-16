@@ -10867,6 +10867,30 @@ pub(crate) fn pcmap_midbody_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_GUARDCAP_AUDIT` records the selected JitCode-PC depth twin at
+/// each full-body guard capture. Diagnostic only; the Python-PC table remains
+/// authoritative while the census establishes its coordinate coverage.
+fn pcmap_guardcap_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARDCAP_AUDIT").is_some())
+}
+
+/// Append one guard-capture depth census result. `check.py` discards
+/// diagnostic stderr, so the audit writes to an explicitly supplied probe.
+fn pcmap_guardcap_audit_probe(flavor: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_GUARDCAP_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "guardcap_depth\t{flavor}\t{verdict}");
+        }
+    }
+}
+
 /// Record one mid-body pc-map audit result. `check.py` discards diagnostic
 /// stderr, so the optional probe receives one row per attempted comparison.
 pub(crate) fn pcmap_midbody_audit_probe(site: &'static str, verdict: &'static str) {
@@ -12226,12 +12250,66 @@ fn walker_capture_snapshot_for_last_guard_impl(
             };
             // #67/#124: synthetic loop-close guard pc overshoots past the last
             // Python opcode → resume at the trace's entry py (loop header).
-            let py_pc = if py_pc as usize >= num_instrs {
+            let loop_close_overshoot = py_pc as usize >= num_instrs;
+            let py_pc = if loop_close_overshoot {
                 pcmap_entrypc_audit_ctx_read(ctx, "loop_close_overshoot");
                 ctx.entry_py_pc()
             } else {
                 py_pc
             };
+            // The three depth_at_py_pc[py_pc] reads below (vstack reconcile,
+            // valuestackdepth publication, and vable stack sync) intentionally
+            // share this one census verdict. Plain guards key their trivia twin
+            // at `op_pc`; after-residual guards key the same family at their
+            // post-call marker. A loop-close overshoot falls back to entry_py_pc
+            // and has no corresponding op_pc-derived twin.
+            if pcmap_guardcap_audit_enabled() {
+                let jc = unsafe { &*sym.jitcode };
+                let table_depth = if jc.payload.code_ptr.is_null() {
+                    None
+                } else {
+                    crate::liveness::liveness_for(jc.payload.code_ptr)
+                        .depth_at_py_pc()
+                        .get(py_pc as usize)
+                        .copied()
+                };
+                let (flavor, verdict) = if loop_close_overshoot {
+                    (
+                        if after_residual_call {
+                            "after_residual"
+                        } else {
+                            "plain"
+                        },
+                        "overshoot",
+                    )
+                } else if after_residual_call {
+                    match jc.payload.after_residual_marker_for_jitcode_pc(op_pc) {
+                        Some(marker) => {
+                            let twin_depth = jc.payload.depth_trivia_for_jitcode_pc(marker);
+                            (
+                                "after_residual",
+                                if twin_depth == table_depth {
+                                    "eq"
+                                } else {
+                                    "di"
+                                },
+                            )
+                        }
+                        None => ("after_residual", "no_marker"),
+                    }
+                } else {
+                    let twin_depth = jc.payload.depth_trivia_for_jitcode_pc(op_pc);
+                    (
+                        "plain",
+                        if twin_depth == table_depth {
+                            "eq"
+                        } else {
+                            "di"
+                        },
+                    )
+                };
+                pcmap_guardcap_audit_probe(flavor, verdict);
+            }
             // `capture_resumedata(after_residual_call=True)` snapshots the
             // trailing `-live-`, after the residual result has replaced the
             // Python opcode's consumed operands (pyjitpl.py:177-198,
@@ -12339,6 +12417,13 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 let jc = &*sym.jitcode;
                 python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc)
             });
+            if pcmap_guardcap_audit_enabled() {
+                assert_eq!(
+                    guard_py_pc.is_some(),
+                    scope.branch_guard_jitcode_pc.is_some(),
+                    "PCMAP_GUARDCAP F3 selector diverges",
+                );
+            }
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &*sym.jitcode;
