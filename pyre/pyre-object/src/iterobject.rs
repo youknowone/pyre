@@ -106,16 +106,25 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
 
 #[inline]
 pub unsafe fn is_list_iter(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
     !obj.is_null() && (*obj).ob_type == &LIST_ITER_TYPE as *const PyType
 }
 
 #[inline]
 pub unsafe fn is_list_reverse_iter(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
     !obj.is_null() && (*obj).ob_type == &LIST_REVERSE_ITER_TYPE as *const PyType
 }
 
 #[inline]
 pub unsafe fn is_tuple_iter(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
     !obj.is_null() && (*obj).ob_type == &TUPLE_ITER_TYPE as *const PyType
 }
 
