@@ -2061,74 +2061,79 @@ fn run_perfn_walk(
                              (unjournaled effect) — legacy replay kept"
                         );
                     }
-                } else if let Some((resume_py_pc, call_jitcode_coord)) =
+                } else if let Some((jitcode_index, call_jitcode_pc)) =
                     crate::jitcode_dispatch::fbw_abort_outer_resume_take()
                 {
+                    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32);
                     if crate::jitcode_dispatch::pcmap_callpc_audit_enabled() {
-                        if let Some((jitcode_index, call_jitcode_pc)) = call_jitcode_coord {
-                            let pjc =
-                                crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-                                    .expect("PCMAP_CALLPC carried jitcode index must resolve");
-                            let inverted = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
-                                &pjc.metadata,
-                                call_jitcode_pc,
-                            ) as usize;
-                            let verdict = if inverted == resume_py_pc { "eq" } else { "di" };
-                            if let Some(path) = std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT_PROBE") {
-                                use std::io::Write;
+                        if let Some(path) = std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT_PROBE") {
+                            use std::io::Write;
 
-                                if let Ok(mut probe) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(path)
-                                {
-                                    let _ = writeln!(probe, "fbw_abort_outer_resume\t{verdict}");
-                                }
+                            if let Ok(mut probe) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                            {
+                                let _ = writeln!(probe, "fbw_abort_outer_resume\tresolve");
                             }
-                            assert_eq!(
-                                inverted, resume_py_pc,
-                                "PCMAP_CALLPC mismatch jitcode_index={jitcode_index} call_jitcode_pc={call_jitcode_pc} inverted={inverted} resume_py_pc={resume_py_pc}",
-                            );
                         }
+                        assert!(
+                            pjc.is_some(),
+                            "PCMAP_CALLPC carried jitcode index must resolve: jitcode_index={jitcode_index} call_jitcode_pc={call_jitcode_pc}",
+                        );
                     }
-                    if entry_carrier_call_py_pc == Some(resume_py_pc) {
+                    if let Some(pjc) = pjc {
+                        let resume_py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                            &pjc.metadata,
+                            call_jitcode_pc,
+                        ) as usize;
+                        if entry_carrier_call_py_pc == Some(resume_py_pc) {
+                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
+                                     (entry carrier already handled same resume)"
+                                );
+                            }
+                        } else {
+                            // Flush while the overrides stay rooted in
+                            // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
+                            // locals — an allocation that can move the nursery-resident
+                            // override refs; the area walker forwards them in place),
+                            // then clear the cell.
+                            let committed =
+                                crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
+                                    |stack_overrides| {
+                                        crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
+                                            ctx,
+                                            cf_addr,
+                                            resume_py_pc,
+                                            stack_overrides,
+                                        )
+                                    },
+                                );
+                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                            if committed {
+                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                    eprintln!(
+                                        "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                         resume_py_pc={resume_py_pc} (nested inline decline)"
+                                    );
+                                }
+                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                );
+                            }
+                        }
+                    } else {
                         crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
-                                "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
-                                 (entry carrier already handled same resume)"
-                            );
-                        }
-                    } else {
-                        // Flush while the overrides stay rooted in
-                        // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
-                        // locals — an allocation that can move the nursery-resident
-                        // override refs; the area walker forwards them in place),
-                        // then clear the cell.
-                        let committed =
-                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
-                                |stack_overrides| {
-                                    crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
-                                        ctx,
-                                        cf_addr,
-                                        resume_py_pc,
-                                        stack_overrides,
-                                    )
-                                },
-                            );
-                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                        if committed {
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                     resume_py_pc={resume_py_pc} (nested inline decline)"
-                                );
-                            }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                 (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                                 (unresolved outer jitcode_index={jitcode_index}) — legacy replay kept"
                             );
                         }
                     }
@@ -2766,7 +2771,7 @@ fn full_body_walk_trace(
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
     crate::jitcode_dispatch::fbw_executed_body_residual_reset();
-    crate::jitcode_dispatch::fbw_abort_outer_resume_py_pc_reset();
+    crate::jitcode_dispatch::fbw_abort_outer_resume_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     // A continuation keeps them instead: see [`WalkJournals`].
