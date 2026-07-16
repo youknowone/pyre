@@ -723,7 +723,52 @@ pub fn register_pyframe_root_walker() {
     majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
 }
 
+thread_local! {
+    /// The exception currently being raised / propagated up the Rust call
+    /// stack. Between the raising frame's `record_application_traceback` and
+    /// the frame that finally catches it, the exception is held only in the
+    /// Rust `PyError` value in flight — not on any frame's value stack or in
+    /// `ec.sys_exc_value` yet. `W_BaseException` is std::alloc-backed (outside
+    /// the managed nursery/old-gen), so the collector never reaches it as a
+    /// root and never traces its slots; a dispatch-loop safepoint running the
+    /// non-moving old-gen major would sweep its old-gen traceback chain from
+    /// under it. Mirrors `tstate->current_exception`: keep the in-flight
+    /// exception's traceback chain a GC root until the exception is caught.
+    static IN_FLIGHT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(pyre_object::PY_NULL) };
+}
+
+/// Publish the exception now being raised / propagated so the GC root walker
+/// keeps it (and its traceback chain) alive across a collection. Called from
+/// `record_application_traceback`, the single chokepoint every raising frame
+/// passes through.
+pub fn set_in_flight_exception(exc: PyObjectRef) {
+    IN_FLIGHT_EXCEPTION.with(|c| c.set(exc));
+}
+
+fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    IN_FLIGHT_EXCEPTION.with(|c| {
+        let exc = c.get();
+        if exc.is_null() {
+            return;
+        }
+        // The exception object is off-GC (std::alloc-backed, outside the managed
+        // nursery/old-gen), so the collector cannot reach it as a root and cannot
+        // trace its slots. Forward its GC-managed traceback chain head directly
+        // instead, keeping the whole chain live. The traceback is old-gen
+        // non-moving, so the visitor never rewrites the slot — reading a copy is
+        // safe and avoids a mid-collection write-back that would re-enter the
+        // barrier.
+        let mut wtb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+        if !wtb.is_null() {
+            visitor(unsafe { &mut *(&mut wtb as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        }
+    });
+}
+
 fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    // The in-flight exception is a live stack root, not a prebuilt object;
+    // walk it on every collection, ahead of the prebuilt-dirty gate below.
+    walk_in_flight_exception(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor

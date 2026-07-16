@@ -311,6 +311,11 @@ pub unsafe fn record_application_traceback(
         if !pyre_object::is_exception(w_exc_object) {
             return;
         }
+        // Keep the exception now being propagated GC-reachable: until a frame
+        // catches it, it lives only in the in-flight Rust `PyError`, so a
+        // safepoint's non-moving major would otherwise sweep its old-gen
+        // traceback chain (`tstate->current_exception` parity).
+        crate::eval::set_in_flight_exception(w_exc_object);
         // `pytraceback.py:36 self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number
         // eagerly here (rather than lazily in `get_lineno`) because
