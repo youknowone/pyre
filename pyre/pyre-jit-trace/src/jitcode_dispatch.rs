@@ -2912,6 +2912,8 @@ fn compute_bridge_root_parent_frame(
         // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
         // the sentinel-based decode path.
         root_liveness_word,
+        OuterActiveBoxesEntryTwin::Trivia,
+        "bridge_root_parent",
         None,
         &[],
     );
@@ -3729,6 +3731,8 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
         entry_py_pc,
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
+        OuterActiveBoxesEntryTwin::PyPc,
+        "opcode_entry",
         None,
         &[],
     );
@@ -7375,6 +7379,96 @@ fn opref_is_null_const_ptr(op: OpRef) -> bool {
     op.as_const_ptr().is_some_and(|g| g.is_null())
 }
 
+/// The source selected for `collect_outer_active_boxes` entry metadata.  The
+/// audit compares the JitCode-PC variants to the legacy Python-PC tables;
+/// `PyPc` keeps a caller deferred after its census diverged or did not fire.
+#[derive(Clone, Copy)]
+enum OuterActiveBoxesEntryTwin {
+    PyPc,
+    Plain,
+    Trivia,
+}
+
+impl OuterActiveBoxesEntryTwin {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PyPc => "py_pc",
+            Self::Plain => "plain",
+            Self::Trivia => "trivia",
+        }
+    }
+}
+
+/// `PYRE_PCMAP_ENTRY_AUDIT` certifies an entry Python-PC read against the
+/// carried JitCode coordinate for one `collect_outer_active_boxes` caller.
+/// `PYRE_PCMAP_ENTRY_AUDIT_PROBE`, when set, receives one line per assertion
+/// attempt because check.py discards diagnostic stderr.
+fn audit_outer_active_boxes_entry_twin(
+    payload: &crate::pyjitcode::PyJitCode,
+    entry_py_pc: u32,
+    carried_jitcode_pc: i32,
+    twin: OuterActiveBoxesEntryTwin,
+    caller: &'static str,
+) {
+    if !pcmap_entry_audit_enabled()
+        || carried_jitcode_pc < 0
+        || matches!(twin, OuterActiveBoxesEntryTwin::PyPc)
+    {
+        return;
+    }
+    let cjc = carried_jitcode_pc as usize;
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_ENTRY_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "{caller}\t{}", twin.name());
+        }
+    }
+    let table_pcdep = payload
+        .metadata
+        .pcdep_color_slots
+        .get(entry_py_pc as usize)
+        .cloned()
+        .unwrap_or_default();
+    let (twin_pcdep, twin_depth) = match twin {
+        OuterActiveBoxesEntryTwin::PyPc => unreachable!("legacy source returns before audit"),
+        OuterActiveBoxesEntryTwin::Plain => (
+            payload.pcdep_for_jitcode_pc(cjc).unwrap_or_default(),
+            payload.depth_for_jitcode_pc_pred(cjc).unwrap_or(0),
+        ),
+        OuterActiveBoxesEntryTwin::Trivia => (
+            payload
+                .pcdep_trivia_for_jitcode_pc(cjc)
+                .map(ToOwned::to_owned)
+                .unwrap_or_default(),
+            payload.depth_trivia_for_jitcode_pc(cjc).unwrap_or(0),
+        ),
+    };
+    assert_eq!(
+        twin_pcdep,
+        table_pcdep,
+        "PCMAP_ENTRY pcdep mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc}",
+        twin.name(),
+    );
+    if !payload.code_ptr.is_null() {
+        let table_depth = crate::liveness::liveness_for(payload.code_ptr)
+            .depth_at_py_pc()
+            .get(entry_py_pc as usize)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            twin_depth,
+            table_depth,
+            "PCMAP_ENTRY depth mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc}",
+            twin.name(),
+        );
+    }
+}
+
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
     trace_ctx: &mut TraceCtx,
@@ -7385,6 +7479,8 @@ fn collect_outer_active_boxes(
     entry_py_pc: u32,
     guard_py_pc: Option<u32>,
     carried_jitcode_pc: i32,
+    entry_twin: OuterActiveBoxesEntryTwin,
+    entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
     kept_recovered: &[(u16, OpRef)],
 ) -> Vec<OpRef> {
@@ -7425,25 +7521,42 @@ fn collect_outer_active_boxes(
             unsafe {
                 let jc = &*sym.jitcode;
                 let payload = &jc.payload;
-                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
-                // liveness banks (`frame_liveness_reg_indices_by_bank_at`) are
-                // read at that py_pc, so the per-PC color→slot window
-                // (`pcdep_opt`'s stack clamp below) must be the depth at that
-                // py_pc too — NOT `sym.valuestackdepth` (the walker's *current*
-                // position).  For the per-opcode entry caller the two coincide,
-                // but a guard resuming at a not-taken branch target with a kept
-                // operand-stack temp (conditional expr / short-circuit / chained
-                // compare, #124/#281) resumes at a py_pc whose depth `> 0` while
-                // the walker stands at depth 0 — using the current depth there
-                // drops the kept temp's semantic slot, corrupting the frame.
+                audit_outer_active_boxes_entry_twin(
+                    payload,
+                    entry_py_pc,
+                    carried_jitcode_pc,
+                    entry_twin,
+                    entry_caller,
+                );
+                // Operand-stack depth at the snapshot coordinate. The liveness
+                // banks (`frame_liveness_reg_indices_by_bank_at`) are read at
+                // that coordinate too, so the per-PC color→slot window
+                // (`pcdep_opt`'s stack clamp below) must use its depth — NOT
+                // `sym.valuestackdepth` (the walker's *current* position). For
+                // the per-opcode entry caller the two coincide, but a guard
+                // resuming at a not-taken branch target with a kept operand-stack
+                // temp (conditional expr / short-circuit / chained compare,
+                // #124/#281) resumes at a depth `> 0` while the walker stands at
+                // depth 0 — using the current depth there drops the kept temp's
+                // semantic slot, corrupting the frame.
                 let stack_depth_at_pc = if payload.code_ptr.is_null() {
                     0usize
                 } else {
-                    crate::liveness::liveness_for(payload.code_ptr)
-                        .depth_at_py_pc()
-                        .get(entry_py_pc as usize)
-                        .copied()
-                        .unwrap_or(0) as usize
+                    match (entry_twin, carried_jitcode_pc >= 0) {
+                        (OuterActiveBoxesEntryTwin::Plain, true) => payload
+                            .depth_for_jitcode_pc_pred(carried_jitcode_pc as usize)
+                            .unwrap_or(0)
+                            as usize,
+                        (OuterActiveBoxesEntryTwin::Trivia, true) => payload
+                            .depth_trivia_for_jitcode_pc(carried_jitcode_pc as usize)
+                            .unwrap_or(0)
+                            as usize,
+                        _ => crate::liveness::liveness_for(payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(entry_py_pc as usize)
+                            .copied()
+                            .unwrap_or(0) as usize,
+                    }
                 };
                 (
                     sym.nlocals,
@@ -7454,7 +7567,7 @@ fn collect_outer_active_boxes(
                 )
             }
         };
-    // #348: per-PC color→slot entries at the snapshot PC — the color→slot source
+    // #348: per-snapshot-coordinate color→slot entries — the color→slot source
     // the inversions below consult for every drained (non-portal) jitcode, the
     // per-program-point color space the `-live-` markers carry. Branch-guard
     // resumes (`guard_py_pc.is_some()`) are fully covered here; a per-opcode-entry
@@ -7470,12 +7583,24 @@ fn collect_outer_active_boxes(
     } else {
         unsafe {
             let jc = &*sym.jitcode;
-            jc.payload
-                .metadata
-                .pcdep_color_slots
-                .get(entry_py_pc as usize)
-                .cloned()
-                .unwrap_or_default()
+            match (entry_twin, carried_jitcode_pc >= 0) {
+                (OuterActiveBoxesEntryTwin::Plain, true) => jc
+                    .payload
+                    .pcdep_for_jitcode_pc(carried_jitcode_pc as usize)
+                    .unwrap_or_default(),
+                (OuterActiveBoxesEntryTwin::Trivia, true) => jc
+                    .payload
+                    .pcdep_trivia_for_jitcode_pc(carried_jitcode_pc as usize)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default(),
+                _ => jc
+                    .payload
+                    .metadata
+                    .pcdep_color_slots
+                    .get(entry_py_pc as usize)
+                    .cloned()
+                    .unwrap_or_default(),
+            }
         }
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
@@ -10649,6 +10774,15 @@ pub(crate) fn pcmap_guard_kept_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARD_KEPT_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_ENTRY_AUDIT` enables assertions that each carried
+/// `collect_outer_active_boxes` entry coordinate's selected JitCode-PC twin
+/// reproduces the Python-PC depth and pcdep reads. Diagnostic only; off in
+/// production.
+fn pcmap_entry_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_ENTRY_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -12487,6 +12621,16 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 }
                 None => liveness_py_pc,
             };
+            let (entry_twin, entry_caller) = if guard_py_pc.is_some() {
+                (OuterActiveBoxesEntryTwin::Plain, "guard_snapshot_guard_pc")
+            } else {
+                (
+                    // Both plain and trivia twins diverged from this
+                    // fallthrough coordinate in the entry census.
+                    OuterActiveBoxesEntryTwin::PyPc,
+                    "guard_snapshot_fallthrough",
+                )
+            };
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -12497,6 +12641,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 liveness_py_pc,
                 guard_py_pc,
                 guard_jitcode_pc,
+                entry_twin,
+                entry_caller,
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
             );
@@ -12798,6 +12944,8 @@ fn compute_inline_caller_frame(
         fallthrough_py_pc,
         None,
         caller_liveness_word,
+        OuterActiveBoxesEntryTwin::Trivia,
+        "inline_caller",
         None,
         &[],
     );
@@ -15505,6 +15653,10 @@ fn try_walker_inline_user_call(
                     call_site_py_pc,
                     None,
                     call_site_word,
+                    // The trivia twin diverged at this capture coordinate in
+                    // the entry census.
+                    OuterActiveBoxesEntryTwin::PyPc,
+                    "call_site_capture",
                     None,
                     &[],
                 );
@@ -20265,6 +20417,9 @@ fn orthodox_list_append_commit(
         call_site_py_pc,
         None,
         call_site_word,
+        // This caller did not fire in the entry census.
+        OuterActiveBoxesEntryTwin::PyPc,
+        "w_list_append_call_site",
         None,
         &[],
     );
