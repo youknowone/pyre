@@ -108,6 +108,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     let mut full_input = String::new();
     let mut continuing_block = false;
     let mut continuing_line = false;
+    let mut pending_exit: Option<i32> = None;
 
     loop {
         let prompt = if continuing_block || continuing_line {
@@ -176,6 +177,12 @@ pub fn run_repl(quiet: bool, no_site: bool) {
                 continuing_line = false;
             }
             ShellExecResult::RuntimeErr(err) => {
+                if err.kind == pyre_interpreter::PyErrorKind::SystemExit {
+                    // exit()/quit() raise SystemExit; terminate the REPL with
+                    // its code instead of printing a traceback and continuing.
+                    pending_exit = Some(crate::system_exit_code(&err));
+                    break;
+                }
                 pyre_interpreter::eprint_exception(&err, true);
                 full_input.clear();
                 continuing_block = false;
@@ -186,6 +193,11 @@ pub fn run_repl(quiet: bool, no_site: bool) {
 
     if let Err(err) = repl.save_history(&history_path) {
         eprintln!("pyre: could not save REPL history: {err}");
+    }
+
+    if let Some(code) = pending_exit {
+        crate::maybe_print_jit_stats();
+        std::process::exit(code);
     }
 }
 
