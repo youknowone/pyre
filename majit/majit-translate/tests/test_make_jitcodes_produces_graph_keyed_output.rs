@@ -2,9 +2,9 @@
 //!
 //! Runs as
 //! `cargo test -p majit-translate test_make_jitcodes_produces_graph_keyed_output`.
-//! The full generated-registry check runs only under
-//! `cargo test --release`; debug-profile CI keeps this file to the cheap
-//! structural fixture.
+//! The compact canonical-pipeline fixture lives in the crate unit test
+//! `portal_driver_tests::make_jitcodes_compiles_a_registered_portal_graph`;
+//! this integration test retains the release-only full-LLBC acceptance check.
 //!
 //! ## RPython references
 //!
@@ -44,18 +44,9 @@ use std::sync::Arc;
 
 #[test]
 fn test_make_jitcodes_produces_graph_keyed_output() {
-    let reg = fixture_all_jitcodes();
-
-    // This is the cheap structural floor. The full interpreter LLBC
-    // translation is deliberately kept out of the default test path.
-    assert_registry_is_graph_keyed(&reg);
-    assert!(
-        reg.by_path.keys().all(|path| path
-            .segments
-            .first()
-            .is_none_or(|segment| segment != "__opcode_dispatch__")),
-        "synthetic opcode-dispatch roots are not part of make_jitcodes output",
-    );
+    // The default-CI canonical pipeline witness is the compact unit fixture
+    // named above. This integration-level floor only guards against restoring
+    // a parallel instruction-keyed output representation.
     assert_no_instruction_keyed_output_map();
 }
 
@@ -314,31 +305,6 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     });
 
     assert_no_instruction_keyed_output_map();
-}
-
-fn fixture_all_jitcodes() -> AllJitCodes {
-    let portal = Arc::new(JitCode::new("mainloop"));
-    let dispatch = Arc::new(JitCode::new("dispatch_step"));
-    let helper = Arc::new(JitCode::new("helper"));
-    AllJitCodes {
-        by_path: [
-            (
-                CallPath::from_segments(["engine", "mainloop"]),
-                Arc::clone(&portal),
-            ),
-            (
-                CallPath::from_segments(["engine", "dispatch_step"]),
-                Arc::clone(&dispatch),
-            ),
-            (
-                CallPath::from_segments(["engine", "helper"]),
-                Arc::clone(&helper),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        in_order: vec![portal, dispatch, helper],
-    }
 }
 
 fn assert_registry_is_graph_keyed(reg: &AllJitCodes) {

@@ -1538,43 +1538,7 @@ fn analyze_pipeline_from_module_paths(
     // RPython: setup_jitdriver(jitdriver_sd) — register every explicit
     // portal and its green/red layout. Portal binding and graph discovery
     // are independent of any interpreter dispatch representation.
-    assert!(
-        !config.pipeline.jit_drivers.is_empty(),
-        "full JitCode analysis requires at least one explicit JIT driver"
-    );
-    for (index, spec) in config.pipeline.jit_drivers.iter().enumerate() {
-        assert!(
-            !spec.portal.segments.is_empty(),
-            "JIT driver {index} has an empty portal CallPath"
-        );
-        assert!(
-            spec.red_types.is_empty() || spec.red_types.len() == spec.reds.len(),
-            "JIT driver `{}` has {} red types for {} reds",
-            spec.portal.canonical_key(),
-            spec.red_types.len(),
-            spec.reds.len(),
-        );
-        assert!(
-            !config.pipeline.jit_drivers[..index]
-                .iter()
-                .any(|previous| previous.portal == spec.portal),
-            "duplicate JIT driver portal `{}`",
-            spec.portal.canonical_key(),
-        );
-        assert!(
-            call_control.function_graphs().contains_key(&spec.portal),
-            "configured JIT driver portal `{}` does not resolve to an exact graph; \
-             configure its qualified CallPath rather than a leaf-name alias",
-            spec.portal.canonical_key(),
-        );
-        call_control.setup_jitdriver(
-            spec.portal.clone(),
-            spec.greens.clone(),
-            spec.reds.clone(),
-            spec.virtualizables.clone(),
-            spec.red_types.clone(),
-        );
-    }
+    register_configured_jitdrivers(&mut call_control, &config.pipeline.jit_drivers);
     // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
     // assigns each registered driver's virtualizable metadata only after the
     // complete driver set exists.
@@ -1645,6 +1609,56 @@ fn analyze_pipeline_from_module_paths(
     pipeline.descrs = descrs;
 
     pipeline
+}
+
+/// RPython `CodeWriter.setup_jitdriver` validation and registration.
+fn register_configured_jitdrivers(
+    call_control: &mut call::CallControl,
+    specs: &[pipeline::JitDriverSpec],
+) {
+    assert!(
+        !specs.is_empty(),
+        "full JitCode analysis requires at least one explicit JIT driver"
+    );
+    for (index, spec) in specs.iter().enumerate() {
+        assert!(
+            !spec.portal.segments.is_empty(),
+            "JIT driver {index} has an empty portal CallPath"
+        );
+        assert!(
+            spec.red_types.is_empty() || spec.red_types.len() == spec.reds.len(),
+            "JIT driver `{}` has {} red types for {} reds",
+            spec.portal.canonical_key(),
+            spec.red_types.len(),
+            spec.reds.len(),
+        );
+        let portal_graph = call_control.function_graphs().get(&spec.portal);
+        assert!(
+            portal_graph.is_some(),
+            "configured JIT driver portal `{}` does not resolve to an exact graph; \
+             configure its qualified CallPath rather than a leaf-name alias",
+            spec.portal.canonical_key(),
+        );
+        let portal_graph = portal_graph.unwrap();
+        assert!(
+            !specs[..index].iter().any(|previous| {
+                call_control
+                    .function_graphs()
+                    .get(&previous.portal)
+                    .is_some_and(|previous_graph| std::ptr::eq(previous_graph, portal_graph))
+            }),
+            "duplicate JIT driver portal graph for `{}`; aliases of one graph \
+             must share one JitDriverStaticData",
+            spec.portal.canonical_key(),
+        );
+        call_control.setup_jitdriver(
+            spec.portal.clone(),
+            spec.greens.clone(),
+            spec.reds.clone(),
+            spec.virtualizables.clone(),
+            spec.red_types.clone(),
+        );
+    }
 }
 
 /// Produce JitCodes for the graph closure reachable from configured portals.
@@ -1760,3 +1774,59 @@ pub use codegen::{JitCodeRecognition, RecognitionReport};
 /// Currently only the pieces required by the annotator port are
 /// present (rarithmetic subset for `compute_restype`).
 pub mod rlib;
+
+#[cfg(test)]
+mod portal_driver_tests {
+    use super::*;
+
+    fn driver(portal: CallPath) -> pipeline::JitDriverSpec {
+        pipeline::JitDriverSpec {
+            portal,
+            greens: Vec::new(),
+            reds: Vec::new(),
+            virtualizables: Vec::new(),
+            red_types: Vec::new(),
+        }
+    }
+
+    fn return_graph(name: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        graph.set_return(graph.startblock, None);
+        graph
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate JIT driver portal graph")]
+    fn rejects_two_aliases_of_one_portal_graph() {
+        let mut call_control = call::CallControl::new();
+        let first = CallPath::from_segments(["first_alias"]);
+        let second = CallPath::from_segments(["second_alias"]);
+        // GraphStore intentionally interns aliases of one source graph. The
+        // driver layer must preserve that identity instead of allocating two
+        // JitDriverStaticData records for it.
+        call_control.register_function_graph(first.clone(), return_graph("portal"));
+        call_control.register_function_graph(second.clone(), return_graph("portal"));
+
+        register_configured_jitdrivers(&mut call_control, &[driver(first), driver(second)]);
+    }
+
+    #[test]
+    fn make_jitcodes_compiles_a_registered_portal_graph() {
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "portal"]);
+        call_control.register_function_graph(portal.clone(), return_graph("portal"));
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![driver(portal.clone())],
+            register_trait_families: Vec::new(),
+        };
+        register_configured_jitdrivers(&mut call_control, &config.jit_drivers);
+        let mut policy = policy::DefaultJitPolicy::new();
+        call_control.find_all_graphs(&mut policy);
+
+        let (jitcodes, _, _) = make_jitcodes(&config, &mut call_control);
+        assert_eq!(jitcodes.len(), 1);
+        assert_eq!(jitcodes[0].index(), 0);
+        assert!(call_control.jitcodes().contains_key(&portal));
+    }
+}
