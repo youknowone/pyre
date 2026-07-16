@@ -570,7 +570,7 @@ pub fn trace_bytecode(
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
         && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
     {
-        let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
+        let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr, WalkJournals::Reset);
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
     }
@@ -996,7 +996,17 @@ fn drive_bridge_carrier_walk(
                 let root_py_pc =
                     crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
                         as usize;
-                return full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr);
+                // The sub-walk above already applied the callee's eager stores
+                // and journaled them; hand those journals to the root walk so
+                // its epilogue settles them exactly once.
+                return full_body_walk_trace(
+                    ctx,
+                    sym,
+                    w_code,
+                    root_py_pc,
+                    cf_addr,
+                    WalkJournals::Keep,
+                );
             }
             crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
         }
@@ -2701,12 +2711,30 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
 /// tracer.  Default-off → the trait `metainterp.interpret` path is
 /// untouched.  The remaining flip blocker is guard-snapshot/resume
 /// correctness, which this harness exists to validate.
+/// Whether [`full_body_walk_trace`] starts a fresh walk or continues one that
+/// has already applied eager stores.
+enum WalkJournals {
+    /// Fresh walk: drop the journals + unjournaled-effect flag a prior aborted
+    /// walk left behind, so this walk's commit cannot apply them.
+    Reset,
+    /// Continuation of a drain sub-walk that already concrete-executed a
+    /// reconstructed callee.  Keep its journals so THIS walk's epilogue settles
+    /// them — commit keeps the stores, non-commit rolls them back for the
+    /// blackhole replay.  Dropping them would leave every eager store standing
+    /// while the blackhole replays the callee from the guard, applying it a
+    /// second time.  The unjournaled-effect flag carries over for the same
+    /// reason: a sub-walk that only recorded a residual must still block the
+    /// root's commit.
+    Keep,
+}
+
 fn full_body_walk_trace(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
     w_code: *const (),
     start_pc: usize,
     cf_addr: usize,
+    journals: WalkJournals,
 ) -> TraceAction {
     // #125: decline up front when a loop body carries an `abort_permanent`
     // marker.  The authoritative walk would otherwise mis-seed the loop
@@ -2752,7 +2780,10 @@ fn full_body_walk_trace(
     crate::jitcode_dispatch::fbw_abort_outer_resume_py_pc_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
-    crate::jitcode_dispatch::fbw_store_journal_reset();
+    // A continuation keeps them instead: see [`WalkJournals`].
+    if matches!(journals, WalkJournals::Reset) {
+        crate::jitcode_dispatch::fbw_store_journal_reset();
+    }
     // A bridge resumes mid-loop from a guard failure; its input args are the
     // guard's resumedata, already seeded into the bridge sym by
     // `setup_bridge_sym`.  PyPy's `interpret()` (rebuild_state_after_failure →
