@@ -1229,9 +1229,6 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         if pyre_object::is_w_range(obj) {
             return getitem_range(obj, index);
         }
-        if is_range_iter(obj) {
-            return getitem_range_iter(obj, index);
-        }
         // descroperation.py:356-381 DescrOperation.getitem — any object
         // whose type defines `__getitem__` on its MRO is subscriptable
         // (the arms above are fast paths for builtin sequence/mapping
@@ -2461,35 +2458,6 @@ pub(crate) fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
         pyre_object::functional::w_zip_set_strict(args[0], strict);
     }
     Ok(w_none())
-}
-
-unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
-    let len = r.remaining;
-    if is_int(index) {
-        // range[i]
-        let i = w_int_get_value(index);
-        let idx = if i < 0 { len + i } else { i };
-        if idx < 0 || idx >= len {
-            return Err(PyError::new(
-                PyErrorKind::IndexError,
-                "range object index out of range",
-            ));
-        }
-        return Ok(w_int_new(r.current + idx * r.step));
-    }
-    if is_slice(index) {
-        // range[start:stop:step] → returns a list
-        let (start, stop, step) = normalize_slice(index, len)?;
-        let mut items = Vec::new();
-        let mut i = start;
-        while (step > 0 && i < stop) || (step < 0 && i > stop) {
-            items.push(w_int_new(r.current + i * r.step));
-            i += step;
-        }
-        return Ok(w_list_new(items));
-    }
-    Err(index_type_error("range", index))
 }
 
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
