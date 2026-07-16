@@ -1884,9 +1884,14 @@ fn run_perfn_walk(
                 },
                 _end_pc,
             )) => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
-                let marker_py =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
-                        as usize;
+                // A resume marker is always a block-head offset, so the
+                // exact tier is the whole resolution; an offset the table
+                // does not carry (skeleton / fixture) restarts at the
+                // header itself instead of a predecessor-scanned py.
+                let Some(marker_py) = pjc.block_head_py_for_jitcode_pc(marker) else {
+                    return *loop_header_pc;
+                };
+                let marker_py = marker_py as usize;
                 if marker_py == *loop_header_pc
                     && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
                 {

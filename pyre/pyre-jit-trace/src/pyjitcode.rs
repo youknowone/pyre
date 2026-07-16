@@ -715,6 +715,18 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// Block-entry Python pc for a `-live-` marker byte offset — the
+    /// EXACT-match tier of `python_pc_for_jitcode_pc`, without its
+    /// predecessor fallback. `None` when `jit_pc` is not a marker offset or
+    /// the table is empty (skeleton / fixture).
+    pub fn block_head_py_for_jitcode_pc(&self, jit_pc: usize) -> Option<u32> {
+        let table = &self.metadata.block_head_py_by_jit_pc;
+        table
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| table[i].1)
+    }
+
     /// task#73 S5 phase-2: codewrite-time after-residual fallthrough marker
     /// keyed by a JitCode byte offset, resolved with the SAME two tiers as
     /// `python_pc_for_jitcode_pc`: an EXACT marker match first (block-head
