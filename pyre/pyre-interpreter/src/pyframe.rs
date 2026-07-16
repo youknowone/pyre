@@ -3433,7 +3433,7 @@ pub(crate) fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantDa
 /// `&mut PyFrame` to dispatch through the trait, so this free function
 /// mirrors each `*_constant` body directly. Variant order matches
 /// `pyopcode.rs::load_const_value` so future additions stay in sync.
-fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
+pub(crate) fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
     use crate::bytecode::ConstantData;
     use num_traits::ToPrimitive;
     match constant {

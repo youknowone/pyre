@@ -9153,102 +9153,189 @@ fn init_method_type(ns: PyObjectRef) {
     };
 }
 
+fn code_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_new(args) }
+}
+
+fn code_descr_eq(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_eq(args[0], args[1]) }
+}
+
+fn code_descr_ne(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_ne(args[0], args[1]) }
+}
+
+fn code_descr_positions(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_positions(args[0]) }
+}
+
+fn code_descr_lines(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_lines(args[0]) }
+}
+
+fn code_descr_branches(args: &[PyObjectRef]) -> crate::PyResult {
+    unsafe { crate::pycode::code_branches(args[0]) }
+}
+
+fn code_field_getter(args: &[PyObjectRef]) -> crate::PyResult {
+    let descriptor = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let name = unsafe { pyre_object::typedef::w_getset_get_name(descriptor) };
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
+        return Err(crate::PyError::runtime_error(
+            "code field descriptor has no name",
+        ));
+    };
+    unsafe {
+        crate::pycode::code_get_field(args.get(1).copied().unwrap_or(pyre_object::PY_NULL), name)
+    }
+}
+
 fn init_code_type(ns: PyObjectRef) {
-    // code.replace(**kwargs) — pycode.py:543-550 W_PyCode.descr_replace →
-    // reconstruct the code object with the given co_* fields overridden.
+    // PyPy typedef.py:695-725 `PyCode.typedef`, with the Python 3.14-only
+    // slots (`__replace__`, `co_branches`, adaptive bytes and ordering
+    // wrappers) added from `PyCode_Type`. Every field descriptor reads the
+    // single compiler CodeObject stored by `PyCode`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "replace",
-            make_builtin_function("replace", |args| unsafe {
-                crate::pycode::code_replace(args)
-            }),
-        )
-    };
-    // `pypy/interpreter/typedef.py:720`
-    // `co_exceptiontable = interp_attrproperty('co_exceptiontable', cls=PyCode,
-    //                                          wrapfn="newbytes")`.
-    //
-    // Read-only attribute exposing the raw varint-packed table.  The
-    // matching getset descriptor wraps the field as a `bytes` object
-    // (PyPy `wrapfn="newbytes"`).  `args[0]` is the descriptor itself,
-    // `args[1]` is the PyCode instance (typedef.py:467-470 calling
-    // convention via `descr_property_get`).
+            "__doc__",
+            pyre_object::w_str_new("Create a code object.  Not for the faint of heart."),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_new_descr(code_descr_new),
+        );
+    }
+    for (name, function) in [
+        ("__eq__", code_descr_eq as crate::gateway::BuiltinCodeFn),
+        ("__ne__", code_descr_ne as crate::gateway::BuiltinCodeFn),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, 2),
+            );
+        }
+    }
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(
+                    name,
+                    |_args| Ok(pyre_object::special::w_not_implemented()),
+                    2,
+                ),
+            );
+        }
+    }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "co_exceptiontable",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "co_exceptiontable",
-                |args| {
-                    let w_self = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if w_self.is_null() {
-                        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
-                    }
-                    if !unsafe { crate::pycode::is_code(w_self) } {
-                        return Err(crate::PyError::type_error(
-                            "descriptor 'co_exceptiontable' requires a 'code' object",
-                        ));
-                    }
-                    let bytes = unsafe { crate::pycode::w_code_exceptiontable(w_self) };
-                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
-                },
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| unsafe { Ok(pyre_object::w_int_new(crate::pycode::code_hash(args[0])?)) },
+                1,
+            ),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| unsafe { crate::pycode::code_repr(args[0]) },
+                1,
+            ),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| unsafe { crate::pycode::code_sizeof(args[0]) },
+                1,
+            ),
+        );
+    }
+
+    for name in ["replace", "__replace__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, |args| unsafe { crate::pycode::code_replace(args) }),
+            );
+        }
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_varname_from_oparg",
+            make_builtin_function_with_arity(
+                "_varname_from_oparg",
+                |args| unsafe { crate::pycode::code_varname_from_oparg(args[0], args[1]) },
                 2,
-            )),
-        )
-    };
-    // code.co_positions() — PEP 657 per-instruction source positions
-    // (`pycode.py` exposes `co_positions` via `co_positions_iterator`).
-    // Yields one `(start_line, end_line, start_col, end_col)` tuple per
-    // instruction from the decoded `CodeObject.locations` table.
-    // `traceback._get_code_position` indexes the result at `tb_lasti // 2`,
-    // so the `tb_lasti` getter reports the byte-offset form
-    // (`2 * instruction_index`) to land on the same entry.
-    //
-    // The column fields are reported as `None`: pyre lacks the
-    // `compile(PyCF_ONLY_AST)` AST surface that `traceback`'s 3.14 caret
-    // anchoring (`_should_show_carets` / `_byte_offset_to_character_offset`)
-    // re-parses, and a `None` column makes `format_frame_summary`
-    // (`traceback.py:556-561`) take the column-free single-line branch —
-    // the same graceful degradation CPython uses when range info is absent
-    // (`-X no_debug_ranges`).  Line numbers stay exact.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+            ),
+        );
+    }
+    for (name, function) in [
+        (
             "co_positions",
-            make_builtin_function("co_positions", |args| {
-                let w_self = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                if w_self.is_null() || !unsafe { crate::pycode::is_code(w_self) } {
-                    return Err(crate::PyError::type_error(
-                        "descriptor 'co_positions' requires a 'code' object",
-                    ));
-                }
-                let code_ptr =
-                    unsafe { crate::pycode::w_code_get_ptr(w_self) } as *const crate::CodeObject;
-                let rows: Vec<pyre_object::PyObjectRef> = if code_ptr.is_null() {
-                    Vec::new()
-                } else {
-                    let code = unsafe { &*code_ptr };
-                    code.locations
-                        .iter()
-                        .map(|(start, end)| {
-                            pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new(start.line.get() as i64),
-                                pyre_object::w_int_new(end.line.get() as i64),
-                                pyre_object::w_none(),
-                                pyre_object::w_none(),
-                            ])
-                        })
-                        .collect()
-                };
-                let n = rows.len();
-                Ok(pyre_object::w_seq_iter_new(
-                    pyre_object::w_list_new(rows),
-                    n,
-                ))
-            }),
-        )
-    };
+            code_descr_positions as crate::gateway::BuiltinCodeFn,
+        ),
+        (
+            "co_lines",
+            code_descr_lines as crate::gateway::BuiltinCodeFn,
+        ),
+        (
+            "co_branches",
+            code_descr_branches as crate::gateway::BuiltinCodeFn,
+        ),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, 1),
+            );
+        }
+    }
+
+    for name in [
+        "_co_code_adaptive",
+        "co_argcount",
+        "co_posonlyargcount",
+        "co_kwonlyargcount",
+        "co_nlocals",
+        "co_stacksize",
+        "co_flags",
+        "co_code",
+        "co_consts",
+        "co_names",
+        "co_varnames",
+        "co_freevars",
+        "co_cellvars",
+        "co_filename",
+        "co_name",
+        "co_qualname",
+        "co_firstlineno",
+        "co_linetable",
+        "co_exceptiontable",
+        "co_lnotab",
+    ] {
+        let getter = make_builtin_function_with_arity(name, code_field_getter, 2);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(getter, name),
+            );
+        }
+    }
 }
 
 /// typedef.py:533-540 Member.typedef

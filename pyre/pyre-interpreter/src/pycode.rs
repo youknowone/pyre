@@ -5,6 +5,9 @@
 //! MakeFunction then extracts this pointer to build a function object.
 
 use pyre_object::pyobject::*;
+use pyre_object::{
+    w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new, w_tuple_new,
+};
 
 /// Compatibility marker for malformed bytecode.
 #[derive(Debug, Clone)]
@@ -148,6 +151,11 @@ pub struct PyCode {
     pub ob_header: PyObject,
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
+    /// `pycode.py:143 self.co_firstlineno = firstlineno`. RustPython's
+    /// `CodeObject.first_line_number: Option<OneIndexed>` cannot represent
+    /// the zero/negative values accepted by Python 3.14's CodeType
+    /// constructor, so preserve the exact Python integer on the PyCode itself.
+    pub co_firstlineno_raw: i32,
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
     /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
     /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
@@ -375,12 +383,20 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         crate::pyframe::npure_cellvars(code_ref) as u32
     };
+    let co_firstlineno_raw = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+        1
+    } else {
+        unsafe { &*(code_ptr as *const crate::CodeObject) }
+            .first_line_number
+            .map_or(1, |line| line.get() as i32)
+    };
     let obj = Box::new(PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
         code_ptr,
+        co_firstlineno_raw,
         w_globals: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
@@ -411,6 +427,14 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     w_code_new(code_ptr)
 }
 
+fn box_code_constant_with_firstlineno(code: &crate::CodeObject, firstlineno: i32) -> PyObjectRef {
+    let obj = box_code_constant(code);
+    unsafe {
+        (*(obj as *mut PyCode)).co_firstlineno_raw = firstlineno;
+    }
+    obj
+}
+
 /// The keyword-only fields `code.replace` accepts, in the order
 /// `pypy/interpreter/pycode.py:77-81` reconstructs the code object.
 const REPLACE_KWARGS: [&str; 18] = [
@@ -433,6 +457,468 @@ const REPLACE_KWARGS: [&str; 18] = [
     "co_linetable",
     "co_exceptiontable",
 ];
+
+#[inline]
+unsafe fn require_code(
+    obj: PyObjectRef,
+    descriptor: &str,
+) -> Result<&'static crate::CodeObject, crate::PyError> {
+    if obj.is_null() || !unsafe { is_code(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{descriptor}' requires a 'code' object"
+        )));
+    }
+    let ptr = unsafe { w_code_get_ptr(obj) } as *const crate::CodeObject;
+    if ptr.is_null() {
+        return Err(crate::PyError::type_error("code object has no code body"));
+    }
+    Ok(unsafe { &*ptr })
+}
+
+fn names_tuple(names: &[String]) -> PyObjectRef {
+    w_tuple_new(names.iter().map(|name| w_str_new(name)).collect())
+}
+
+fn constants_tuple(code: &crate::CodeObject) -> PyObjectRef {
+    w_tuple_new(
+        crate::pyframe::code_constants(code)
+            .iter()
+            .map(crate::pyframe::pyobject_from_constant)
+            .collect(),
+    )
+}
+
+fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
+    fn encode_pair(mut address: usize, mut line: i64, out: &mut Vec<u8>) {
+        while address > 255 {
+            out.extend_from_slice(&[255, 0]);
+            address -= 255;
+        }
+        while line < -128 {
+            out.extend_from_slice(&[address as u8, 128]);
+            line += 128;
+            address = 0;
+        }
+        while line > 127 {
+            out.extend_from_slice(&[address as u8, 127]);
+            line -= 127;
+            address = 0;
+        }
+        out.extend_from_slice(&[address as u8, line as i8 as u8]);
+    }
+
+    let mut out = Vec::new();
+    let mut line = firstlineno;
+    let mut start_offset = 0usize;
+    for (index, (start, _)) in code.locations.iter().enumerate() {
+        let next_line = start.line.get() as i64;
+        if next_line != line {
+            let offset = index * 2;
+            encode_pair(offset - start_offset, next_line - line, &mut out);
+            line = next_line;
+            start_offset = offset;
+        }
+    }
+    out
+}
+
+/// `PyCode.typedef` field getters. Each type-dict descriptor delegates here so
+/// the object carries one authoritative compiler `CodeObject`, matching
+/// `pycode.py`'s direct `co_*` attributes rather than a parallel side table.
+pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, name)? };
+    Ok(match name {
+        "co_argcount" => w_int_new(code.arg_count as i64),
+        "co_posonlyargcount" => w_int_new(code.posonlyarg_count as i64),
+        "co_kwonlyargcount" => w_int_new(code.kwonlyarg_count as i64),
+        "co_nlocals" => w_int_new(code.varnames.len() as i64),
+        "co_stacksize" => w_int_new(code.max_stackdepth as i64),
+        "co_flags" => w_int_new(code.flags.bits() as i64),
+        "co_code" | "_co_code_adaptive" => {
+            pyre_object::bytesobject::w_bytes_from_bytes(&code.instructions.original_bytes())
+        }
+        "co_consts" => constants_tuple(code),
+        "co_names" => names_tuple(&code.names),
+        "co_varnames" => names_tuple(&code.varnames),
+        "co_freevars" => names_tuple(&code.freevars),
+        "co_cellvars" => names_tuple(&code.cellvars),
+        "co_filename" => w_str_new(&code.source_path),
+        "co_name" => w_str_new(&code.obj_name),
+        "co_qualname" => w_str_new(&code.qualname),
+        "co_firstlineno" => w_int_new((*(obj as *const PyCode)).co_firstlineno_raw as i64),
+        "co_linetable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.linetable),
+        "co_exceptiontable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.exceptiontable),
+        // location.py:163-182 `linetable2lnotab`, reconstructed from the
+        // canonical decoded positions kept on CodeObject.
+        "co_lnotab" => pyre_object::bytesobject::w_bytes_from_bytes(&legacy_lnotab(
+            code,
+            (*(obj as *const PyCode)).co_firstlineno_raw as i64,
+        )),
+        _ => {
+            return Err(crate::PyError::attribute_error(format!(
+                "'code' object has no attribute '{name}'"
+            )));
+        }
+    })
+}
+
+/// CPython 3.14 `code.__new__` positional-only constructor, with the PyPy
+/// `descr_code__new__` validations and field order adjusted to 3.14 (the
+/// exception table precedes freevars/cellvars).
+pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if !(17..=19).contains(&args.len()) {
+        return Err(crate::PyError::type_error(format!(
+            "code expected at least 16 arguments, got {}",
+            args.len().saturating_sub(1),
+        )));
+    }
+    let argcount = unsafe { read_code_u32(args[1], "argcount")? };
+    let posonly = unsafe { read_code_u32(args[2], "posonlyargcount")? };
+    let kwonly = unsafe { read_code_u32(args[3], "kwonlyargcount")? };
+    let nlocals = unsafe { read_code_u32(args[4], "nlocals")? };
+    let stacksize_value = unsafe { crate::builtins::space_index_w(args[5])? };
+    let flags_value = unsafe { crate::builtins::space_index_w(args[6])? };
+    if stacksize_value < 0 || flags_value < 0 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "Objects/codeobject.c: bad argument to internal function",
+        ));
+    }
+    let stacksize = stacksize_value as u32;
+    let flags_bits = flags_value as u32;
+    let instructions = unsafe { read_code_units(args[7])? };
+    let constants = unsafe { read_code_consts(args[8])? };
+    let names = unsafe { read_code_names(args[9], "names")? };
+    let varnames = unsafe { read_code_names(args[10], "varnames")? };
+    if varnames.len() != nlocals as usize {
+        return Err(crate::PyError::value_error(format!(
+            "code: co_nlocals != len(co_varnames)"
+        )));
+    }
+    let source_path = unsafe { read_code_str(args[11], "filename")? };
+    let obj_name = unsafe { read_code_str(args[12], "name")? };
+    let qualname = unsafe { read_code_str(args[13], "qualname")? };
+    let first_line = unsafe { crate::builtins::space_index_w(args[14])? };
+    let first_line_number = if first_line <= 0 {
+        None
+    } else {
+        rustpython_compiler_core::OneIndexed::new(first_line as usize)
+    };
+    let linetable = unsafe { read_code_bytes(args[15], "linetable")? };
+    let exceptiontable = unsafe { read_code_bytes(args[16], "exceptiontable")? };
+    let freevars = if args.len() >= 18 {
+        unsafe { read_code_names(args[17], "freevars")? }
+    } else {
+        Vec::<String>::new().into_boxed_slice()
+    };
+    let cellvars = if args.len() >= 19 {
+        unsafe { read_code_names(args[18], "cellvars")? }
+    } else {
+        Vec::<String>::new().into_boxed_slice()
+    };
+    if argcount + kwonly > nlocals || posonly > argcount {
+        return Err(crate::PyError::value_error("code: invalid argument count"));
+    }
+
+    // CPython's localsplus table stores cell aliases on the local slot and
+    // appends only pure cells, followed by free variables.
+    let mut localspluskinds = vec![crate::bytecode::CO_FAST_LOCAL; varnames.len()];
+    for cell in cellvars.iter() {
+        if let Some(index) = varnames.iter().position(|name| name == cell) {
+            localspluskinds[index] |= crate::bytecode::CO_FAST_CELL;
+        } else {
+            localspluskinds.push(crate::bytecode::CO_FAST_CELL);
+        }
+    }
+    localspluskinds.extend(std::iter::repeat_n(
+        crate::bytecode::CO_FAST_FREE,
+        freevars.len(),
+    ));
+
+    let locations = rustpython_compiler_core::marshal::linetable_to_locations(
+        &linetable,
+        first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        instructions.len(),
+    );
+    let code = crate::CodeObject {
+        instructions,
+        locations,
+        flags: crate::bytecode::CodeFlags::from_bits_retain(flags_bits),
+        posonlyarg_count: posonly,
+        arg_count: argcount,
+        kwonlyarg_count: kwonly,
+        source_path,
+        first_line_number,
+        max_stackdepth: stacksize,
+        obj_name,
+        qualname,
+        constants,
+        names,
+        varnames,
+        cellvars,
+        freevars,
+        localspluskinds: localspluskinds.into_boxed_slice(),
+        linetable,
+        exceptiontable,
+    };
+    Ok(box_code_constant_with_firstlineno(
+        &code,
+        first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+    ))
+}
+
+fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
+    a.obj_name == b.obj_name
+        && a.qualname == b.qualname
+        && a.arg_count == b.arg_count
+        && a.posonlyarg_count == b.posonlyarg_count
+        && a.kwonlyarg_count == b.kwonlyarg_count
+        && a.varnames.len() == b.varnames.len()
+        && a.flags == b.flags
+        && a.first_line_number == b.first_line_number
+        && a.instructions.original_bytes() == b.instructions.original_bytes()
+        && a.names.len() == b.names.len()
+        && a.constants.len() == b.constants.len()
+        && a.varnames == b.varnames
+        && a.freevars == b.freevars
+        && a.cellvars == b.cellvars
+        && a.names == b.names
+        && crate::pyframe::code_constants(a)
+            .iter()
+            .zip(crate::pyframe::code_constants(b).iter())
+            .all(|(left, right)| constant_strong_equal(left, right))
+}
+
+fn constant_strong_equal(
+    left: &crate::bytecode::ConstantData,
+    right: &crate::bytecode::ConstantData,
+) -> bool {
+    use crate::bytecode::ConstantData;
+    match (left, right) {
+        (ConstantData::Code { code: a }, ConstantData::Code { code: b }) => code_data_equal(a, b),
+        (ConstantData::Tuple { elements: a }, ConstantData::Tuple { elements: b }) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| constant_strong_equal(x, y))
+        }
+        (ConstantData::Slice { elements: a }, ConstantData::Slice { elements: b }) => a
+            .iter()
+            .zip(b.iter())
+            .all(|(x, y)| constant_strong_equal(x, y)),
+        (ConstantData::Frozenset { elements: a }, ConstantData::Frozenset { elements: b }) => {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut matched = vec![false; b.len()];
+            a.iter().all(|item| {
+                b.iter()
+                    .enumerate()
+                    .find(|(index, candidate)| {
+                        !matched[*index] && constant_strong_equal(item, candidate)
+                    })
+                    .map(|(index, _)| {
+                        matched[index] = true;
+                    })
+                    .is_some()
+            })
+        }
+        _ => left == right,
+    }
+}
+
+pub unsafe fn code_eq(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { is_code(other) } {
+        return Ok(pyre_object::special::w_not_implemented());
+    }
+    let a = unsafe { require_code(this, "__eq__")? };
+    let b = unsafe { require_code(other, "__eq__")? };
+    if (*(this as *const PyCode)).co_firstlineno_raw
+        != (*(other as *const PyCode)).co_firstlineno_raw
+    {
+        return Ok(w_bool_from(false));
+    }
+    Ok(w_bool_from(code_data_equal(a, b)))
+}
+
+pub unsafe fn code_ne(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let equal = unsafe { code_eq(this, other)? };
+    if unsafe { pyre_object::is_not_implemented(equal) } {
+        Ok(equal)
+    } else {
+        Ok(w_bool_from(!unsafe { w_bool_get_value(equal) }))
+    }
+}
+
+pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let code = unsafe { require_code(obj, "__hash__")? };
+    #[inline]
+    fn scramble(result: i64, value: i64) -> i64 {
+        ((result as u64 ^ value as u64).wrapping_mul(1_000_003)) as i64
+    }
+    #[inline]
+    fn add_obj(result: &mut i64, value: PyObjectRef) -> Result<(), crate::PyError> {
+        *result = scramble(*result, crate::baseobjspace::hash_w_strict(value)?);
+        Ok(())
+    }
+    let mut result = 20_250_211i64;
+    add_obj(&mut result, w_str_new(&code.obj_name))?;
+    add_obj(&mut result, w_str_new(&code.qualname))?;
+    for value in [
+        code.arg_count as i64,
+        code.posonlyarg_count as i64,
+        code.kwonlyarg_count as i64,
+        code.varnames.len() as i64,
+        code.flags.bits() as i64,
+        (*(obj as *const PyCode)).co_firstlineno_raw as i64,
+    ] {
+        result = scramble(result, value);
+    }
+    add_obj(
+        &mut result,
+        pyre_object::bytesobject::w_bytes_from_bytes(&code.instructions.original_bytes()),
+    )?;
+    for names in [&code.varnames, &code.freevars, &code.cellvars, &code.names] {
+        for name in names.iter() {
+            add_obj(&mut result, w_str_new(name))?;
+        }
+    }
+    for constant in crate::pyframe::code_constants(code) {
+        add_obj(
+            &mut result,
+            crate::pyframe::pyobject_from_constant(constant),
+        )?;
+    }
+    Ok(if result == -1 { -2 } else { result })
+}
+
+pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, "__repr__")? };
+    let line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
+    Ok(w_str_new(&format!(
+        "<code object {} at {obj:p}, file \"{}\", line {line}>",
+        code.obj_name, code.source_path,
+    )))
+}
+
+pub unsafe fn code_sizeof(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, "__sizeof__")? };
+    let size = std::mem::size_of::<PyCode>()
+        + std::mem::size_of::<crate::CodeObject>()
+        + code.instructions.len() * 2
+        + code.locations.len()
+            * std::mem::size_of::<(
+                rustpython_compiler_core::SourceLocation,
+                rustpython_compiler_core::SourceLocation,
+            )>()
+        + code.linetable.len()
+        + code.exceptiontable.len();
+    Ok(w_int_new(size as i64))
+}
+
+pub unsafe fn code_varname_from_oparg(
+    obj: PyObjectRef,
+    index: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, "_varname_from_oparg")? };
+    let mut index = unsafe { crate::builtins::space_index_w(index)? };
+    if index >= 0 {
+        if let Some(name) = code.varnames.get(index as usize) {
+            return Ok(w_str_new(name));
+        }
+        index -= code.varnames.len() as i64;
+        if let Some(name) = code.cellvars.get(index as usize) {
+            return Ok(w_str_new(name));
+        }
+        index -= code.cellvars.len() as i64;
+        if let Some(name) = code.freevars.get(index as usize) {
+            return Ok(w_str_new(name));
+        }
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::IndexError,
+        "tuple index out of range",
+    ))
+}
+
+pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, "co_positions")? };
+    let rows = code
+        .locations
+        .iter()
+        .map(|(start, end)| {
+            w_tuple_new(vec![
+                w_int_new(start.line.get() as i64),
+                w_int_new(end.line.get() as i64),
+                w_int_new(start.character_offset.get().saturating_sub(1) as i64),
+                w_int_new(end.character_offset.get().saturating_sub(1) as i64),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let n = rows.len();
+    Ok(w_seq_iter_new(w_list_new(rows), n))
+}
+
+pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, "co_lines")? };
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    while start < code.locations.len() {
+        let line = code.locations[start].0.line.get();
+        let mut end = start + 1;
+        while end < code.locations.len() && code.locations[end].0.line.get() == line {
+            end += 1;
+        }
+        rows.push(w_tuple_new(vec![
+            w_int_new((start * 2) as i64),
+            w_int_new((end * 2) as i64),
+            w_int_new(line as i64),
+        ]));
+        start = end;
+    }
+    let n = rows.len();
+    Ok(w_seq_iter_new(w_list_new(rows), n))
+}
+
+pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { require_code(obj, "co_branches")? };
+    let mut rows = Vec::new();
+    let mut index = 0usize;
+    while index < code.instructions.len() {
+        let op = code.instructions.read_op(index).deoptimize();
+        let next = index + 1 + op.cache_entries();
+        if op.has_jump() && !op.is_unconditional_jump() {
+            let delta = u8::from(code.instructions.read_arg(index)) as usize;
+            let target = next.saturating_add(delta);
+            // Python 3.14 inserts NOT_TAKEN at the fallthrough edge so branch
+            // instrumentation can distinguish the untaken path. `co_branches`
+            // reports the first real instruction after that marker.
+            let fallthrough = if next < code.instructions.len()
+                && matches!(
+                    code.instructions.read_op(next).deoptimize(),
+                    crate::bytecode::Instruction::NotTaken
+                ) {
+                next + 1
+            } else {
+                next
+            };
+            rows.push(w_tuple_new(vec![
+                w_int_new((index * 2) as i64),
+                w_int_new((fallthrough * 2) as i64),
+                w_int_new((target * 2) as i64),
+            ]));
+        }
+        index = next.max(index + 1);
+    }
+    let n = rows.len();
+    Ok(w_seq_iter_new(w_list_new(rows), n))
+}
 
 /// `code.replace(**kwds)` — `pypy/interpreter/pycode.py:74-91` applevel
 /// `replace`, which gathers every `co_*` attribute (taking the keyword
@@ -466,7 +952,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             }
             if !REPLACE_KWARGS.contains(&key.as_str()) {
                 return Err(crate::PyError::type_error(format!(
-                    "'{key}' is an invalid keyword argument for replace()"
+                    "replace() got an unexpected keyword argument '{key}'"
                 )));
             }
         }
@@ -479,6 +965,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
     }
     let mut code = unsafe { (*code_ptr).clone() };
+    let mut firstlineno_raw = unsafe { (*(w_self as *const PyCode)).co_firstlineno_raw };
     let get = |name: &str| crate::builtins::kwarg_get(kwargs, name);
 
     if let Some(v) = get("co_argcount") {
@@ -499,11 +986,23 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.max_stackdepth = unsafe { read_code_u32(v, "co_stacksize")? };
     }
     if let Some(v) = get("co_flags") {
-        let bits = unsafe { crate::builtins::space_index_w(v)? } as u32;
+        let value = unsafe { crate::builtins::space_index_w(v)? };
+        if value < 0 {
+            return Err(crate::PyError::value_error(
+                "co_flags must be a positive integer",
+            ));
+        }
+        let bits = value as u32;
         code.flags = crate::bytecode::CodeFlags::from_bits_retain(bits);
     }
     if let Some(v) = get("co_firstlineno") {
         let n = unsafe { crate::builtins::space_index_w(v)? };
+        if n < 0 {
+            return Err(crate::PyError::value_error(
+                "co_firstlineno must be a positive integer",
+            ));
+        }
+        firstlineno_raw = n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         code.first_line_number = if n <= 0 {
             None
         } else {
@@ -544,16 +1043,19 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.instructions = unsafe { read_code_units(v)? };
     }
 
-    Ok(box_code_constant(&code))
+    Ok(box_code_constant_with_firstlineno(&code, firstlineno_raw))
 }
 
 /// A non-negative `co_*` count argument as `u32`.
 unsafe fn read_code_u32(v: PyObjectRef, field: &str) -> Result<u32, crate::PyError> {
     let n = unsafe { crate::builtins::space_index_w(v)? };
     if n < 0 {
-        return Err(crate::PyError::value_error(format!(
-            "{field} must be a non-negative integer"
-        )));
+        let message = if field.starts_with("co_") {
+            format!("{field} must be a positive integer")
+        } else {
+            format!("code: {field} must not be negative")
+        };
+        return Err(crate::PyError::value_error(message));
     }
     Ok(n as u32)
 }
