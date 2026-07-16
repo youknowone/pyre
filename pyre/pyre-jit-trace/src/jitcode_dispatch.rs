@@ -2139,6 +2139,30 @@ fn write_ref_reg(
     Ok(())
 }
 
+/// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
+///
+/// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
+/// `valuestackdepth(2)`, `debugdata(3)`, `lastblock(4)`, and `w_globals(5)`
+/// (`virtualizable_gen.rs:33-60`, `NUM_VABLE_SCALARS = 6`).  They are frame
+/// bookkeeping; the Python operand stack lives in the separate
+/// `locals_cells_stack_w` array (`virtualizable_gen.rs:66-72`,
+/// `pyre-interpreter/src/pyframe.rs:735-739`).  PyPy's `interp_jit.py:24-30`
+/// grounds the same scalar-vs-array split, and `pyjitpl.py:177-234
+/// get_list_of_active_boxes` sources liveness-indexed register boxes, not
+/// scalar virtualizable fields.
+fn write_vable_field_ref_reg(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let saved = ctx.vstack_last_ref;
+    write_ref_reg(ctx, pc, dst, value, concrete)?;
+    ctx.vstack_last_ref = saved;
+    Ok(())
+}
+
 /// Int-bank twin of [`read_ref_reg_concrete`] (Int-bank concrete shadow).
 /// Reads the Int-bank slot at the operand index from
 /// `ctx.concrete_registers_i`.  Returns `ConcreteValue::Null` for
@@ -4304,7 +4328,7 @@ fn getfield_gc_via_heapcache(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `interp_jit.py:25-31` PyFrame static-field order
+/// `virtualizable_gen.rs:33-60` pyre PyFrame static-field order
 /// `[last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals]`.
 const VABLE_CODE_FIELD_IDX: usize = 1;
 const VABLE_NAMESPACE_FIELD_IDX: usize = 5;
@@ -4378,7 +4402,7 @@ fn try_resolve_inline_callee_static_field(
     };
     let result = ctx.trace_ctx.const_ref(const_ptr as i64);
     let dst = code[op.pc + 4] as usize;
-    write_ref_reg(
+    write_vable_field_ref_reg(
         ctx,
         op.pc,
         dst,
@@ -4512,13 +4536,7 @@ fn getfield_vable_via_metainterp(
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Scalar vable fields are frame bookkeeping, never Python
-            // operand-stack values, so they must not become the mirror's TOS
-            // candidate. `get_list_of_active_boxes` (pyjitpl.py:177-234)
-            // never names scalar fields as per-PC stack slots.
-            let vstack_last_ref = ctx.vstack_last_ref;
-            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
-            ctx.vstack_last_ref = vstack_last_ref;
+            write_vable_field_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
