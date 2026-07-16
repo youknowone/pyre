@@ -866,11 +866,21 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.count", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.count",
+                init_count_type,
+                object_type,
+                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.repeat", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.repeat",
+                init_repeat_type,
+                object_type,
+                &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType as usize,
@@ -17843,6 +17853,228 @@ fn init_tuple_iterator_type(ns: PyObjectRef) {
                 "__setstate__",
                 crate::baseobjspace::tuple_iter_setstate_method,
                 2,
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.count / itertools.repeat TypeDefs ─────────────────────
+// PyPy: pypy/module/itertools/interp_itertools.py W_Count.typedef and
+// W_Repeat.typedef.  Python 3.14 deliberately omits the old PyPy
+// `__reduce__` entries, so these two concrete types are not picklable.
+
+fn itertools_constructor_scope(
+    args: &[PyObjectRef],
+    fn_name: &str,
+    names: Vec<&'static str>,
+    defaults: &[PyObjectRef],
+) -> Result<(PyObjectRef, Vec<PyObjectRef>), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let positional = positional.get(1..).unwrap_or(&[]);
+    let mut keyword_names_w = Vec::new();
+    let mut keywords_w = Vec::new();
+    if let Some(dict) = kwargs {
+        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
+            if key.as_str() == Ok("__pyre_kw__") {
+                continue;
+            }
+            let w_name = pyre_object::w_str_from_wtf8(key);
+            pyre_object::gc_roots::pin_root(w_name);
+            keyword_names_w.push(w_name);
+            keywords_w.push(value);
+        }
+    }
+    let signature = crate::gateway::Signature::new(names, None, None, 0, 0);
+    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let mut scope_w = vec![PY_NULL; signature.scope_length()];
+    arguments.parse_into_scope(
+        PY_NULL,
+        &mut scope_w,
+        fn_name,
+        &signature,
+        Some(defaults),
+        PY_NULL,
+    )?;
+    Ok((cls, scope_w))
+}
+
+fn itertools_alloc_for_class(
+    cls: PyObjectRef,
+    exact_type: PyObjectRef,
+    obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // typedef.py:511 `allocate_instance` first checks that the requested
+    // subtype shares the builtin's layout, then installs that class on the
+    // freshly allocated interpreter object.
+    check_user_subclass(exact_type, cls)?;
+    if !std::ptr::eq(cls, exact_type) {
+        unsafe { (*obj).w_class = cls };
+    }
+    Ok(obj)
+}
+
+fn count_check_number(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    // interp_itertools.py `check_number`, with CPython 3.14's public error
+    // wording (`a number is required`) in place of PyPy 3.11's older text.
+    let has_int = unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some();
+    let has_float = unsafe { crate::baseobjspace::lookup(obj, "__float__") }.is_some();
+    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).unwrap_or(PY_NULL);
+    if !has_int
+        && !has_float
+        && (complex_type.is_null()
+            || !unsafe { crate::baseobjspace::isinstance_w(obj, complex_type) })
+    {
+        return Err(crate::PyError::type_error("a number is required"));
+    }
+    Ok(())
+}
+
+fn count_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_Count___new__(space, w_subtype, w_start=0, w_step=1).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_zero = w_int_new(0);
+    pyre_object::gc_roots::pin_root(w_zero);
+    let w_one = w_int_new(1);
+    pyre_object::gc_roots::pin_root(w_one);
+    let (cls, scope) =
+        itertools_constructor_scope(args, "count", vec!["start", "step"], &[w_zero, w_one])?;
+    let w_start = scope[0];
+    let w_step = scope[1];
+    count_check_number(w_start)?;
+    count_check_number(w_step)?;
+    let exact = gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).unwrap_or(PY_NULL);
+    let obj = pyre_object::interp_itertools::w_count_new(w_start, w_step);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn count_single_argument(w_step: PyObjectRef) -> Result<bool, crate::PyError> {
+    // W_Count.single_argument: isinstance(step, int) and step == 1.
+    let int_type = gettypefor(&pyre_object::INT_TYPE).unwrap_or(PY_NULL);
+    Ok(!int_type.is_null()
+        && unsafe { crate::baseobjspace::isinstance_w(w_step, int_type) }
+        && crate::baseobjspace::eq_w(w_step, w_int_new(1))?)
+}
+
+fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let cls = r#type(obj).unwrap_or(PY_NULL);
+    let full_name = unsafe { pyre_object::w_type_get_name(cls) };
+    let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
+    let w_c = unsafe { pyre_object::interp_itertools::w_count_get_c(obj) };
+    let w_step = unsafe { pyre_object::interp_itertools::w_count_get_step(obj) };
+    let c = unsafe { crate::display::py_repr(w_c)? };
+    let text = if count_single_argument(w_step)? {
+        format!("{cls_name}({c})")
+    } else {
+        let step = unsafe { crate::display::py_repr(w_step)? };
+        format!("{cls_name}({c}, {step})")
+    };
+    Ok(w_str_new(&text))
+}
+
+fn init_count_type(ns: PyObjectRef) {
+    // Source order follows W_Count.typedef.  `__reduce__` is the one explicit
+    // Python-3.14 semantic delta (the concrete type no longer exposes it).
+    let entries = [
+        ("__new__", make_new_descr(count_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", count_descr_repr, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return a count object whose .__next__() method returns consecutive values.\n\nEquivalent to:\n    def count(firstval=0, step=1):\n        x = firstval\n        while 1:\n            yield x\n            x += step",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn repeat_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_Repeat___new__(space, w_subtype, w_object, w_times=None).  A null
+    // default represents a missing `times`; an explicit Python None still
+    // passes through `space.index_w` and raises TypeError, as in 3.14.
+    let (cls, scope) =
+        itertools_constructor_scope(args, "repeat", vec!["object", "times"], &[PY_NULL])?;
+    let w_obj = scope[0];
+    let w_times = scope[1];
+    let times = if w_times.is_null() {
+        None
+    } else {
+        Some(crate::builtins::space_index_w(w_times)?)
+    };
+    let exact = gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).unwrap_or(PY_NULL);
+    let obj = pyre_object::interp_itertools::w_repeat_new(w_obj, times);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn repeat_descr_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    if unsafe { pyre_object::interp_itertools::w_repeat_get_counting(obj) } {
+        Ok(w_int_new(unsafe {
+            pyre_object::interp_itertools::w_repeat_get_count(obj)
+        }))
+    } else {
+        // PyPy 3.11 returned NotImplemented; Python 3.14 raises directly.
+        Err(crate::PyError::type_error("len() of unsized object"))
+    }
+}
+
+fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let cls = r#type(obj).unwrap_or(PY_NULL);
+    let full_name = unsafe { pyre_object::w_type_get_name(cls) };
+    let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
+    let w_obj = unsafe { pyre_object::interp_itertools::w_repeat_get_obj(obj) };
+    let objrepr = unsafe { crate::display::py_repr(w_obj)? };
+    let text = if unsafe { pyre_object::interp_itertools::w_repeat_get_counting(obj) } {
+        let count = unsafe { pyre_object::interp_itertools::w_repeat_get_count(obj) };
+        format!("{cls_name}({objrepr}, {count})")
+    } else {
+        format!("{cls_name}({objrepr})")
+    };
+    Ok(w_str_new(&text))
+}
+
+fn init_repeat_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(repeat_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity("__length_hint__", repeat_descr_length_hint, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", repeat_descr_repr, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "repeat(object [,times]) -> create an iterator which returns the object\nfor the specified number of times.  If not specified, returns the object\nendlessly.",
             ),
         ),
     ];

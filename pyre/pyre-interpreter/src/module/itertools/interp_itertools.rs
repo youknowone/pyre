@@ -50,46 +50,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             2,
         ),
     );
-    // count(start=0, step=1) — PyPy: W_Count___new__
-    //
-    //     def W_Count___new__(space, w_subtype, w_start=0, w_step=1):
-    //         return W_Count(space, w_start, w_step)
+    // PyPy exposes W_Count.typedef / W_Repeat.typedef themselves from the
+    // module, not function-shaped constructor shims.  Their `__new__` slots
+    // perform allocation and argument parsing.
     crate::module_ns_store(
         ns,
         "count",
-        crate::make_builtin_function("count", |args| {
-            let w_start = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
-            let w_step = args.get(1).copied().unwrap_or(pyre_object::w_int_new(1));
-            Ok(pyre_object::interp_itertools::w_count_new(w_start, w_step))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COUNT_TYPE)
+            .expect("itertools.count TypeDef initialized"),
     );
-    // repeat(obj, times=None) — PyPy: W_Repeat___new__
-    //
-    //     def W_Repeat___new__(space, w_subtype, w_obj, w_times=None):
-    //         return W_Repeat(space, w_obj, w_times)
     crate::module_ns_store(
         ns,
         "repeat",
-        crate::make_builtin_function("repeat", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "repeat() missing 'object' argument",
-                ));
-            }
-            let w_obj = args[0];
-            let w_times = if args.len() >= 2 {
-                unsafe {
-                    if pyre_object::is_int(args[1]) {
-                        Some(pyre_object::w_int_get_value(args[1]))
-                    } else {
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            Ok(pyre_object::interp_itertools::w_repeat_new(w_obj, w_times))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE)
+            .expect("itertools.repeat TypeDef initialized"),
     );
     // islice(iterable, stop) | islice(iterable, start, stop[, step]) —
     // PyPy: W_ISlice.__init__.  Pulled lazily from the source iterator so
