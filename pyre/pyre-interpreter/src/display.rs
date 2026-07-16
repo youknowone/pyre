@@ -412,38 +412,45 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
 /// handled natively in `py_str` / `py_repr`, but a Python subclass
 /// (`class E(Exception): def __str__(self): ...`) installs its own
 /// method that must win, the same way `str(e)` dispatches it in PyPy.
-/// Returns `None` when `__str__`/`__repr__` resolves to the builtin
-/// `BaseException` / `object` registration (no override) or when the
-/// override raises or returns a non-`str`, so the caller falls back to
-/// the native formatting.
-unsafe fn exc_user_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
-    unsafe { exc_user_dunder_obj(obj, name).map(|r| pyre_object::w_str_get_value(r).to_string()) }
+/// Returns `None` only when `__str__`/`__repr__` resolves to the builtin
+/// `BaseException` / `object` registration (no override). A raising override
+/// propagates, and a non-string result raises `TypeError`.
+unsafe fn exc_user_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate::PyError> {
+    unsafe {
+        Ok(exc_user_dunder_obj(obj, name)?.map(|r| pyre_object::w_str_get_value(r).to_string()))
+    }
 }
 
 /// `exc_user_dunder` variant returning the raw `str` result object so a
 /// WTF-8-preserving caller (`exception_descr_str_wtf8`) can read the
-/// lone-surrogate-carrying bytes directly.  Returns `None` under the
-/// same no-override / non-`str` / raising conditions.
-unsafe fn exc_user_dunder_obj(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// lone-surrogate-carrying bytes directly. A raising override propagates and
+/// a non-string result raises `TypeError`, matching descroperation.py's
+/// `space.str` / `space.repr` result check.
+pub(crate) unsafe fn exc_user_dunder_obj(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
         let w_class = (*obj).w_class;
         if w_class.is_null() || !pyre_object::is_type(w_class) {
-            return None;
+            return Ok(None);
         }
-        let (src, method) = crate::baseobjspace::lookup_where_pair(w_class, name)?;
+        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
+            return Ok(None);
+        };
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
-            return None;
+            return Ok(None);
         }
         if let Some(base) = crate::builtins::lookup_exc_class("BaseException") {
             if std::ptr::eq(src, base) {
-                return None;
+                return Ok(None);
             }
         }
-        let r = crate::call_function(method, &[obj]);
-        if !r.is_null() && pyre_object::is_str(r) {
-            return Some(r);
+        let r = crate::builtins::call_and_check(method, &[obj])?;
+        if pyre_object::is_str(r) {
+            return Ok(Some(r));
         }
-        None
+        Err(dunder_returned_non_string(name, r))
     }
 }
 
@@ -611,7 +618,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // A user subclass that overrides `__repr__` shadows the builtin
             // `W_BaseException.descr_repr`; dispatch it before the native
             // formatting below.
-            if let Some(s) = exc_user_dunder(obj, "__repr__") {
+            if let Some(s) = exc_user_dunder(obj, "__repr__")? {
                 return Ok(s);
             }
             // `pypy/module/exceptions/interp_exceptions.py:135-147
@@ -961,7 +968,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // the Unicode / OSError / KeyError `__str__` overrides, so a
             // non-overridden exception here resolves `__str__` to the
             // BaseException builtin and falls through unchanged.
-            if let Some(s) = exc_user_dunder(obj, "__str__") {
+            if let Some(s) = exc_user_dunder(obj, "__str__")? {
                 return Ok(s);
             }
             let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
@@ -1029,7 +1036,7 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
                 return Ok(pyre_object::w_str_get_wtf8(obj).to_wtf8_buf());
             }
             if pyre_object::is_exception(obj) {
-                if let Some(w) = exception_descr_str_wtf8(obj) {
+                if let Some(w) = exception_descr_str_wtf8(obj)? {
                     return Ok(w);
                 }
             }
@@ -1083,13 +1090,13 @@ pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
-unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
+unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, crate::PyError> {
     unsafe {
         // A user subclass that overrides `__str__` shadows the builtin
         // `W_BaseException.descr_str`; dispatch it (preserving WTF-8)
         // before the single-`str`-arg fast path below, matching `py_str`.
-        if let Some(r) = exc_user_dunder_obj(obj, "__str__") {
-            return Some(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+        if let Some(r) = exc_user_dunder_obj(obj, "__str__")? {
+            return Ok(Some(pyre_object::w_str_get_wtf8(r).to_wtf8_buf()));
         }
         let kind = pyre_object::w_exception_get_kind(obj);
         if matches!(
@@ -1099,21 +1106,21 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
                 | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 | pyre_object::interp_exceptions::ExcKind::KeyError
         ) {
-            return None;
+            return Ok(None);
         }
         let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
         if args.is_null() || !pyre_object::is_tuple(args) {
-            return None;
+            return Ok(None);
         }
         if pyre_object::w_tuple_len(args) != 1 {
-            return None;
+            return Ok(None);
         }
         let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
         let first = crate::baseobjspace::unwrap_cell(first);
         if first.is_null() || !std::ptr::eq((*first).ob_type, &STR_TYPE as *const PyType) {
-            return None;
+            return Ok(None);
         }
-        Some(pyre_object::w_str_get_wtf8(first).to_wtf8_buf())
+        Ok(Some(pyre_object::w_str_get_wtf8(first).to_wtf8_buf()))
     }
 }
 

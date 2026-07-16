@@ -9694,6 +9694,12 @@ thread_local! {
     /// pyre's nested-residual decline below is a local protection for
     /// FOREIGN unjournaled residuals.
     static SELFREC_CA_FOLD_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The bounded `str(exc)` / `repr(exc)` descriptor inline may retain an
+    /// interior residual such as `repr(self.args)`. The caller's original
+    /// iteration already supplied the concrete result, while the compiled
+    /// trace executes that residual once on later iterations, so the generic
+    /// nested-replay decline does not apply to this resolved descriptor path.
+    static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Scoped setter for [`SELFREC_CA_FOLD_ACTIVE`]. Restores the prior value so
@@ -9719,6 +9725,27 @@ impl Drop for SelfRecCaFoldGuard {
     }
 }
 
+struct ExceptionStringInlineGuard {
+    prior: bool,
+}
+
+impl ExceptionStringInlineGuard {
+    fn enter() -> Self {
+        let prior = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| {
+            let prior = c.get();
+            c.set(true);
+            prior
+        });
+        Self { prior }
+    }
+}
+
+impl Drop for ExceptionStringInlineGuard {
+    fn drop(&mut self) {
+        EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.set(self.prior));
+    }
+}
+
 fn fbw_abort_nested_unjournaled_residual(
     ctx: &WalkContext<'_, '_>,
     pc: usize,
@@ -9735,7 +9762,12 @@ fn fbw_abort_nested_unjournaled_residual(
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
     let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
-    if enabled && !in_selfrec_fold && !ctx.session.borrow().framestack.is_empty() {
+    let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
+    if enabled
+        && !in_selfrec_fold
+        && !in_exception_string_inline
+        && !ctx.session.borrow().framestack.is_empty()
+    {
         let (outer_resume_py_pc, stack_overrides) = {
             let session = ctx.session.borrow();
             match session.framestack.first().and_then(|f| f.parent.as_ref()) {
@@ -14338,6 +14370,58 @@ fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[Desc
     true
 }
 
+/// Whether sampling an exception string override before recording can have no
+/// app-visible effect. Portal-frame vable traffic and constant/int boxing are
+/// local; branches, other calls, and live-heap writes decline the sample.
+fn exception_string_override_sample_safe(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            return false;
+        }
+        if d.opname.starts_with("residual_call") {
+            let kind = residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs);
+            if !matches!(
+                kind,
+                Some(majit_ir::PyreHelperKind::LoadConst | majit_ir::PyreHelperKind::BoxInt)
+            ) {
+                return false;
+            }
+        } else if d.opname.starts_with("setfield_gc")
+            || d.opname.starts_with("setarrayitem_gc")
+            || d.opname.starts_with("setinteriorfield_gc")
+            || d.opname.starts_with("raw_store")
+            || d.opname.starts_with("cond_call")
+            || d.opname.starts_with("call_assembler")
+            || d.opname.starts_with("inline_call")
+        {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
+/// The bounded builtin-dispatch route only admits a straight-line app-level
+/// override. A control-flow-bearing method stays on the original residual
+/// dispatch path, where the interpreter owns its frame and branch semantics.
+fn exception_string_override_straight_line(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
 /// (#68).  The fast-path inline predicate guarantees the callee does not own a
 /// virtualizable (any vable op declines the inline), so the owns_vable /
@@ -15148,6 +15232,66 @@ fn try_walker_inline_user_call(
     else {
         return Ok(None);
     };
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        callable,
+        r_args[0],
+        callable,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        method_form,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        false,
+        false,
+    )
+}
+
+type ExceptionInlineReceiverGuard = (
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    u64,
+);
+
+/// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
+/// resolve their callee from the CALL operand; builtin-dispatch specializers
+/// resolve an app-level descriptor first and enter here with that function as
+/// the callee while independently pinning the original builtin callable.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_resolved_user_call(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    callable: pyre_object::PyObjectRef,
+    callable_guard_op: OpRef,
+    callable_guard_value: pyre_object::PyObjectRef,
+    arg_concretes: Vec<ConcreteValue>,
+    callee_args: Vec<OpRef>,
+    callee_arg_concretes: Vec<ConcreteValue>,
+    method_form: bool,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
+    allow_method_load_attr: bool,
+    require_str_result: bool,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Only exact-positional, closure-free calls: every callee local [0..nparams]
     // is bound from a passed arg, none from defaults/varargs/cells.
     if has_closure || callee_args.len() != nparams {
@@ -15203,7 +15347,10 @@ fn try_walker_inline_user_call(
     {
         return Ok(None);
     }
-    if method_form && !method_form_callee_body_supported(body.code, callee_descr_refs) {
+    if method_form
+        && !allow_method_load_attr
+        && !method_form_callee_body_supported(body.code, callee_descr_refs)
+    {
         return Ok(None);
     }
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
@@ -15364,11 +15511,26 @@ fn try_walker_inline_user_call(
     // CALL boundary (single outer Python frame — re-execute the whole
     // call on deopt), captured via `fbw_mode.inline_subwalk` for
     // the sub-walk guards below.
-    let callable_opref = r_args[0];
-    let callable_expected = ctx.trace_ctx.const_ref(callable as usize as i64);
-    if !callable_opref.is_constant() {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_opref, callable_expected], 0);
+    if let Some((receiver, concrete_receiver, w_class, version_tag)) = exception_receiver_guard {
+        walker_guard_exception_attr_slot(
+            ctx,
+            op.pc,
+            receiver,
+            concrete_receiver,
+            w_class,
+            version_tag,
+        )?;
+    }
+
+    let callable_expected = ctx
+        .trace_ctx
+        .const_ref(callable_guard_value as usize as i64);
+    if !callable_guard_op.is_constant() {
+        ctx.trace_ctx.record_guard(
+            OpCode::GuardValue,
+            &[callable_guard_op, callable_expected],
+            0,
+        );
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
@@ -16062,6 +16224,29 @@ fn try_walker_inline_user_call(
             result: Some(value),
         } => {
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+            if require_str_result
+                && !matches!(
+                    concrete_for_shadow,
+                    ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
+                )
+            {
+                // descroperation.py checks the app-level result before
+                // returning from `space.str` / `space.repr`. Re-run the
+                // original builtin call at the caller boundary so the
+                // interpreter raises its faithful TypeError; the inlined
+                // body has no committed concrete effect at this point.
+                if is_top_inline
+                    && !unjournaled_before_subwalk
+                    && fbw_executed_effect_count() == executed_effects_before
+                {
+                    if let Some(call_pc) = abort_flush_call_py_pc {
+                        if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
+                            fbw_set_abort_call_resume(call_pc, stack);
+                        }
+                    }
+                }
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            }
             match dst_bank {
                 'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
                 'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
@@ -16121,6 +16306,154 @@ fn try_walker_inline_user_call(
         }
         other => Ok(Some((other, op.next_pc))),
     }
+}
+
+/// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+/// Pyre's exact `str` type call follows `str_descr_new` → `builtin_str` →
+/// `exc_user_dunder_obj`; the builtin `repr` follows `builtin_repr` →
+/// `py_repr_obj`. Both paths look up the receiver dunder before builtin
+/// exception formatting. This is the walker counterpart of
+/// `descroperation.py`'s `space.lookup` + `get_and_call_function`: pin the
+/// promoted exception class, then enter the ordinary resolved-callee inline
+/// plumbing with the receiver as `self`.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_exception_string_override(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let Some(concrete_callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if walker_concrete_ref_object(ctx, r_args[1]).is_some() {
+        return Ok(None);
+    }
+    let Some(concrete_receiver) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exception(concrete_receiver) } {
+        return Ok(None);
+    }
+
+    let dunder = if std::ptr::eq(
+        concrete_callable,
+        pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::STR_TYPE),
+    ) {
+        "__str__"
+    } else if pyre_interpreter::builtins::is_builtin_repr_function(concrete_callable) {
+        "__repr__"
+    } else {
+        return Ok(None);
+    };
+
+    let w_class = unsafe { (*concrete_receiver).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    else {
+        return Ok(None);
+    };
+    let Some(base_exception) = pyre_interpreter::builtins::lookup_exc_class("BaseException") else {
+        return Ok(None);
+    };
+    let Some(default_method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base_exception, dunder) })
+    else {
+        return Ok(None);
+    };
+    if std::ptr::eq(method, default_method) {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !exception_string_override_straight_line(body.code) {
+        return Ok(None);
+    }
+
+    // A straight-line, effect-free override can be sampled before any IR is
+    // emitted. If its observed result is not a string, decline to the original
+    // builtin residual so the interpreter's result check raises TypeError and
+    // the exception-handler loop remains traceable. More complex bodies are
+    // not executed speculatively; their inlined result is guarded below.
+    if let (Some(body), Some((callee_descr_refs, _, _))) = (
+        crate::state::sub_jitcode_body_for_code(w_code),
+        crate::state::sub_jitcode_descr_pool_for_code(w_code),
+    ) {
+        if exception_string_override_sample_safe(body.code, callee_descr_refs) {
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(method, &[concrete_receiver])
+            };
+            let sampled_is_acceptable = matches!(sampled, Ok(result)
+                if !result.is_null() && unsafe { pyre_object::is_str(result) });
+            if !sampled_is_acceptable {
+                return Ok(None);
+            }
+        }
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_receiver),
+    ];
+    let _exception_string_inline = ExceptionStringInlineGuard::enter();
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        r_args[0],
+        concrete_callable,
+        arg_concretes,
+        vec![r_args[2]],
+        vec![ConcreteValue::Ref(concrete_receiver)],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((r_args[2], concrete_receiver, w_class, version_tag)),
+        true,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        let str_type = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+        let str_type_const = ctx.trace_ctx.const_int(str_type);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[result, str_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(result, str_type);
+    }
+    Ok(Some(inlined))
 }
 
 fn dispatch_residual_call_iRd_kind(
@@ -16197,6 +16530,18 @@ fn dispatch_residual_call_iRd_kind(
         dst,
     )? {
         return Ok(inlined);
+    }
+
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+    {
+        if let Some(inlined) = try_walker_inline_exception_string_override(
+            ctx, op, code, funcptr, &r_args, call_descr, dst,
+        )? {
+            return Ok(inlined);
+        }
     }
 
     // #62: a self-recursive call the inline path declined (e.g. the

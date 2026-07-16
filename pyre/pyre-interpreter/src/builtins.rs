@@ -2644,6 +2644,25 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the canonical builtin `repr` function object.
+/// The JIT walker uses the builtin-code identity to distinguish it from an
+/// arbitrary replacement stored under the same global name.
+pub fn is_builtin_repr_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        std::ptr::fn_addr_eq(
+            crate::gateway::builtin_code_get(code),
+            builtin_repr as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5083,6 +5102,16 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if let Some(r) = crate::display::try_call_dunder_obj(obj, "__repr__")? {
                 return Ok(r);
             }
+        }
+        // `space.str` returns an app-level `__str__` result object directly;
+        // a str subclass is valid and retains its Python class. The WTF-8
+        // conversion below is for builtin formatting, where a fresh base str
+        // is the appropriate result object.
+        if !obj.is_null()
+            && pyre_object::is_exception(obj)
+            && let Some(r) = crate::display::exc_user_dunder_obj(obj, "__str__")?
+        {
+            return Ok(r);
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
