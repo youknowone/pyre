@@ -481,6 +481,13 @@ pub struct FbwWalkMode {
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
     pub carrier_resume: bool,
+    /// Bridge-entry view of `ExecutionContext.sys_exc_value` reconstructed
+    /// from the failing guard's pending setfield.  The walk is temporally
+    /// displaced from the guard failure, so live TLS is not a valid source
+    /// until a walked SETFIELD replaces this seed.
+    pub current_exception_seed: Option<OpRef>,
+    /// Concrete shadow paired with [`FbwWalkMode::current_exception_seed`].
+    pub current_exception_seed_concrete: pyre_object::PyObjectRef,
 }
 
 impl Default for FbwWalkMode {
@@ -489,6 +496,8 @@ impl Default for FbwWalkMode {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
             carrier_resume: false,
+            current_exception_seed: None,
+            current_exception_seed_concrete: pyre_object::PY_NULL,
         }
     }
 }
@@ -2719,6 +2728,13 @@ pub fn dispatch_via_miframe(
             inline_callee_consts: None,
             fbw_mode: FbwWalkMode {
                 snapshot_sym: sym_ptr,
+                current_exception_seed: (trace_ctx.is_bridge_trace && !sym.last_exc_box.is_none())
+                    .then_some(sym.last_exc_box),
+                current_exception_seed_concrete: if trace_ctx.is_bridge_trace {
+                    sym.last_exc_value
+                } else {
+                    pyre_object::PY_NULL
+                },
                 ..Default::default()
             },
             session,
@@ -3233,6 +3249,9 @@ fn drive_bridge_frame_subwalk(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
+                current_exception_seed: (!root_sym.last_exc_box.is_none())
+                    .then_some(root_sym.last_exc_box),
+                current_exception_seed_concrete: root_sym.last_exc_value,
             },
             session,
             registers_r: &mut regs_r,
@@ -3576,6 +3595,9 @@ pub(crate) fn drive_outer_frame_continuation(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
+                current_exception_seed: (!root_sym.last_exc_box.is_none())
+                    .then_some(root_sym.last_exc_box),
+                current_exception_seed_concrete: root_sym.last_exc_value,
             },
             session,
             registers_r: &mut regs_r,
@@ -16564,6 +16586,30 @@ fn dispatch_residual_call_iRd_kind(
         && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
+        && r_args.is_empty()
+        && ctx.fbw_mode.current_exception_seed.is_some()
+    {
+        let seed = ctx.fbw_mode.current_exception_seed.unwrap();
+        let concrete = ctx.fbw_mode.current_exception_seed_concrete;
+        if !concrete.is_null() && unsafe { pyre_object::is_exception(concrete) } {
+            // `RAISE_VARARGS 0` may use the normalizing nullary helper rather
+            // than the raw current-exception helper.  A bridge seed is already
+            // a live BaseException, so the helper's successful result is the
+            // pending fieldbox itself; retaining that OpRef keeps the value
+            // loop-variant in the bridge namespace.
+            ctx.trace_ctx.set_opref_concrete(
+                seed,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+            );
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', seed)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && fbw_raise_enabled()
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
         && try_walker_trace_raise_builtin(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -21181,17 +21227,25 @@ fn try_walker_lower_exc_info_residual(
         if !r_args.is_empty() || dst_bank != 'r' {
             return Ok(None);
         }
-        let Some(ec) = walker_ensure_execution_context(ctx) else {
-            return Ok(None);
+        let (prev, prev_obj) = if let Some(seed) = ctx.fbw_mode.current_exception_seed {
+            // resume.py:993-1007 applies pending fields before resumed
+            // execution.  Bridge tracing does not mutate the live EC, so use
+            // the decoded fieldbox directly; a runtime GETFIELD here would
+            // read the pre-guard TLS value before the bridge applies anything.
+            (seed, ctx.fbw_mode.current_exception_seed_concrete)
+        } else {
+            let Some(ec) = walker_ensure_execution_context(ctx) else {
+                return Ok(None);
+            };
+            let prev = ctx.trace_ctx.record_op_with_descr(
+                OpCode::GetfieldGcR,
+                &[ec],
+                crate::descr::ec_sys_exc_value_descr(),
+            );
+            (prev, pyre_interpreter::eval::get_current_exception())
         };
-        let prev = ctx.trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[ec],
-            crate::descr::ec_sys_exc_value_descr(),
-        );
-        // Stamp the live `prev` concrete (the residual executor would return
-        // it), so a downstream concrete read of the dst sees the right value.
-        let prev_obj = pyre_interpreter::eval::get_current_exception();
+        // Stamp the concrete `prev` so a downstream read sees the value the
+        // residual executor would have returned at this resume point.
         ctx.trace_ctx.set_opref_concrete(
             prev,
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
@@ -21288,6 +21342,8 @@ fn try_walker_lower_exc_info_residual(
     // exception into the next frame's `sys_exc_value`.
     fbw_sys_exc_journal_push(pyre_interpreter::eval::get_current_exception());
     pyre_interpreter::eval::set_current_exception(store_concrete);
+    ctx.fbw_mode.current_exception_seed = Some(store_op);
+    ctx.fbw_mode.current_exception_seed_concrete = store_concrete;
     Ok(Some(()))
 }
 

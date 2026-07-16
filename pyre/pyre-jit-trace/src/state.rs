@@ -6255,6 +6255,83 @@ fn bridge_decode_box(
     }
 }
 
+/// Seed the bridge walk's current-exception channel from the guard-owned
+/// pending field stream.  `resume.py:_prepare_pendingfields` decodes these
+/// tagged values only after virtual preparation; bridge tracing must decode
+/// the same fieldbox without applying the write to the live execution
+/// context, because the walk may still be abandoned.
+#[allow(clippy::too_many_arguments)]
+fn seed_bridge_pending_current_exception(
+    sym: &mut PyreSym,
+    ctx: &mut majit_metainterp::TraceCtx,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache,
+) {
+    let Some(storage) = resume_data.storage.as_ref() else {
+        return;
+    };
+    let target_descr = crate::descr::ec_sys_exc_value_descr();
+    for pending in &storage.rd_pendingfields {
+        let Some(descr) = pending.descr.as_ref() else {
+            continue;
+        };
+        if pending.item_index >= 0 || !std::sync::Arc::ptr_eq(descr, &target_descr) {
+            continue;
+        }
+
+        // resume.py:1002-1005: both operands use the same tagged decoder as
+        // frame boxes.  Decode the target as well as the fieldbox so virtual
+        // preparation and malformed-tag checks stay aligned with deopt.
+        let rd_consts = storage.rd_consts();
+        let target = majit_ir::resumedata::decode_tagged_value(
+            pending.target_tagged,
+            resume_data.num_failargs,
+            rd_consts,
+            &resume_data.fail_arg_types,
+            storage.rd_virtuals.len(),
+        );
+        let value = majit_ir::resumedata::decode_tagged_value(
+            pending.value_tagged,
+            resume_data.num_failargs,
+            rd_consts,
+            &resume_data.fail_arg_types,
+            storage.rd_virtuals.len(),
+        );
+        let _ = bridge_decode_box(
+            ctx,
+            &target,
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        let (value_box, value_concrete) = bridge_decode_box(
+            ctx,
+            &value,
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        let majit_ir::Value::Ref(value_ref) = value_concrete else {
+            continue;
+        };
+        sym.last_exc_box = value_box;
+        sym.last_exc_value = value_ref.as_usize() as pyre_object::PyObjectRef;
+        sym.class_of_last_exc_is_const = false;
+    }
+}
+
 /// resume.py:1245-1264 decode_box concrete parity for tagged fieldnums.
 /// Converts a tagged i16 (from `rd_virtuals[*].fieldnums`) into raw i64
 /// bits suitable for backend concrete setters/calls.
@@ -9085,6 +9162,17 @@ impl JitState for PyreJitState {
                 recipes,
             });
         }
+
+        seed_bridge_pending_current_exception(
+            sym,
+            ctx,
+            resume_data,
+            rd_virtuals,
+            fail_values,
+            fail_types,
+            backend,
+            &mut virtuals_cache,
+        );
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.

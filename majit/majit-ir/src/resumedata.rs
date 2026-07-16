@@ -399,7 +399,13 @@ pub struct RebuiltFrame {
     pub values: Vec<RebuiltValue>,
 }
 
-fn decode_tagged(
+/// Decode one tagged resume value outside the numbered frame stream.
+///
+/// Pending fields carry their target and value through the same
+/// TAGBOX/TAGCONST/TAGVIRTUAL encoding as frame slots
+/// (`resume.py:_add_pending_fields`).  Bridge setup uses this entry point so
+/// its consume-side view is identical to `rebuild_from_numbering`.
+pub fn decode_tagged_value(
     tagged: i16,
     num_failargs: i32,
     rd_consts: &[Const],
@@ -499,7 +505,7 @@ pub fn rebuild_from_numbering(
             break;
         }
         let tagged = reader.next_item() as i16;
-        vable_values.push(decode_tagged(
+        vable_values.push(decode_tagged_value(
             tagged,
             num_failargs,
             rd_consts,
@@ -516,7 +522,7 @@ pub fn rebuild_from_numbering(
             break;
         }
         let tagged = reader.next_item() as i16;
-        vref_values.push(decode_tagged(
+        vref_values.push(decode_tagged_value(
             tagged,
             num_failargs,
             rd_consts,
@@ -548,7 +554,7 @@ pub fn rebuild_from_numbering(
                 break;
             }
             let tagged = reader.next_item() as i16;
-            values.push(decode_tagged(
+            values.push(decode_tagged_value(
                 tagged,
                 num_failargs,
                 rd_consts,
