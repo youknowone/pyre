@@ -881,6 +881,15 @@ pub struct Assembler386<'a> {
     /// references no reference constants. Set before `assemble_loop` /
     /// `assemble_bridge` via [`set_gc_table_base`](Self::set_gc_table_base).
     gc_table_base: usize,
+    /// Address of the owning `JitCellToken.invalidated` `AtomicBool`.
+    /// `GUARD_NOT_INVALIDATED` bakes it as a 64-bit immediate and loads
+    /// the byte at runtime, branching to its recovery stub when set.
+    /// PyPy instead emits no runtime code and patches the guard site
+    /// (`invalidate_positions`) when the quasi-immutable field mutates;
+    /// pyre reads the flag live so re-entry through any path (warm entry,
+    /// CALL_ASSEMBLER, resume) observes the invalidation. 0 leaves the
+    /// guard as a no-op (bridges / tests with no owning token).
+    invalidated_flag_addr: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -1028,6 +1037,7 @@ impl<'a> Assembler386<'a> {
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
             gc_table_base: 0,
+            invalidated_flag_addr: 0,
         }
     }
 
@@ -2579,6 +2589,12 @@ impl<'a> Assembler386<'a> {
     /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
     pub fn set_call_assembler_targets(&mut self, targets: IndexMap<u64, usize>) {
         self.call_assembler_targets = targets;
+    }
+
+    /// Bake the owning token's `invalidated` flag address so
+    /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
+    pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
+        self.invalidated_flag_addr = addr;
     }
 
     /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
@@ -4600,7 +4616,24 @@ impl<'a> Assembler386<'a> {
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNotInvalidated => {
-                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+                // Load the owning token's `invalidated` byte and fail the
+                // guard when set.  This sits at the head of the peeled loop
+                // body, so every iteration — reached by any entry path (warm
+                // entry, CALL_ASSEMBLER, blackhole resume) — observes a
+                // quasi-immutable mutation that flipped the flag and bails to
+                // the bridge / interpreter instead of running the stale,
+                // const-folded body.  R11 is the dedicated scratch (as in
+                // `_cmp_guard_class`); a 0 address leaves the guard a no-op.
+                if self.invalidated_flag_addr != 0 {
+                    dynasm!(self.mc ; .arch x64
+                        ; mov r11, QWORD self.invalidated_flag_addr as i64
+                        ; cmp BYTE [r11], 0
+                    );
+                    self.guard_success_cc = Some(CC_E);
+                    self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                } else {
+                    self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+                }
             }
             OpCode::GuardAlwaysFails => {
                 self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);

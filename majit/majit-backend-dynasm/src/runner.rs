@@ -2078,6 +2078,7 @@ impl Backend for DynasmBackend {
             asm.set_gc_table_base(table.base_addr());
         }
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
+        asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&token.invalidated) as usize);
         let compiled = asm.assemble_loop()?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -2325,6 +2326,7 @@ impl Backend for DynasmBackend {
             asm.set_gc_table_base(table.base_addr());
         }
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
+        asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&original_token.invalidated) as usize);
 
         let _orig_compiled = Self::get_compiled(original_token);
 

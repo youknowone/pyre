@@ -336,6 +336,15 @@ pub struct AssemblerARM64<'a> {
     /// references no reference constants. Set before `assemble_loop` /
     /// `assemble_bridge` via [`set_gc_table_base`](Self::set_gc_table_base).
     gc_table_base: usize,
+    /// Address of the owning `JitCellToken.invalidated` `AtomicBool`.
+    /// `GUARD_NOT_INVALIDATED` bakes it as a 64-bit immediate and loads
+    /// the byte at runtime, branching to its recovery stub when set.
+    /// PyPy instead emits no runtime code and patches the guard site
+    /// (`invalidate_positions`) when the quasi-immutable field mutates;
+    /// pyre reads the flag live so re-entry through any path (warm entry,
+    /// CALL_ASSEMBLER, resume) observes the invalidation. 0 leaves the
+    /// guard as a no-op (bridges / tests with no owning token).
+    invalidated_flag_addr: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -473,6 +482,7 @@ impl<'a> AssemblerARM64<'a> {
             attached_descrs,
             cpu_handle,
             gc_table_base: 0,
+            invalidated_flag_addr: 0,
         }
     }
 
@@ -1805,6 +1815,12 @@ impl<'a> AssemblerARM64<'a> {
     /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
     pub fn set_call_assembler_targets(&mut self, targets: IndexMap<u64, usize>) {
         self.call_assembler_targets = targets;
+    }
+
+    /// Bake the owning token's `invalidated` flag address so
+    /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
+    pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
+        self.invalidated_flag_addr = addr;
     }
 
     /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
@@ -3449,7 +3465,9 @@ impl<'a> AssemblerARM64<'a> {
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNotInvalidated => {
-                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_not_invalidated_with_faillocs(
+                    op, op_index, fail_index, faillocs,
+                );
             }
             OpCode::GuardAlwaysFails => {
                 self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);
@@ -3769,6 +3787,30 @@ impl<'a> AssemblerARM64<'a> {
     ) {
         let fail_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
+        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
+    }
+
+    /// `GUARD_NOT_INVALIDATED`: load the owning token's `invalidated` byte
+    /// and branch to the recovery stub when it is set.  This sits at the
+    /// head of the peeled loop body, so every iteration — reached by any
+    /// entry path (warm entry, CALL_ASSEMBLER, blackhole resume) — observes
+    /// a quasi-immutable mutation that flipped the flag and bails out to the
+    /// bridge / interpreter instead of running the stale, const-folded body.
+    fn implement_guard_not_invalidated_with_faillocs(
+        &mut self,
+        op: &Op,
+        op_index: usize,
+        fail_index: u32,
+        faillocs: &[Option<Loc>],
+    ) {
+        let fail_label = self.mc.new_dynamic_label();
+        if self.invalidated_flag_addr != 0 {
+            self.emit_mov_imm64(16, self.invalidated_flag_addr as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; ldrb w17, [x16]
+                ; cbnz w17, =>fail_label
+            );
+        }
         self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
     }
 
