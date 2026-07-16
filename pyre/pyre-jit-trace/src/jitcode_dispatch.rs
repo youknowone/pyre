@@ -12162,11 +12162,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
         // (fresh `top_regs`), not in `sym.registers_*`.
         let sym = unsafe { &*full_body_sym };
         if !sym.jitcode.is_null() {
-            // Set to `Some(call_py_pc)` when an after-residual-call guard's
-            // residual call sits inside a try-block (its per-CodeObject jitcode
-            // emitted a post-call catch); the snapshot resume pc is then the
-            // bit-14-marked CALL pc so the blackhole resumes at that catch.
-            let mut marker_call_py_pc: Option<u32> = None;
+            // Set when an after-residual-call guard's residual call sits inside
+            // a try-block (its per-CodeObject jitcode emitted a post-call
+            // catch); the JitCode resume coordinate then selects that catch.
             let mut marker_call_jit_pc: Option<usize> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
@@ -12202,9 +12200,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // FOR_ITER-next residual guard is being captured
                     // (`GuardCaptureScope::foriter_next_catch_resume`) and the
                     // call's CALL pc has a post-call catch, fold the bit-14
-                    // marker onto the CALL pc
-                    // (handled at `resume_py_pc` below) so the blackhole resumes
-                    // at the call's OWN catch and routes the raise to the
+                    // marker onto the CALL pc so the blackhole resumes at the
+                    // call's OWN catch and routes the raise to the
                     // enclosing handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
@@ -12217,7 +12214,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                 .after_residual_call_resume_for_jitcode_pc(op_pc)
                                 .is_some()
                         {
-                            marker_call_py_pc = Some(call_py_pc);
                             marker_call_jit_pc = Some(op_pc);
                         }
                     }
@@ -12763,21 +12759,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `collect_outer_active_boxes`.  A non-branch guard carries no guard
             // pc, so it keeps the merge `py_pc` and its exact resume-translation.
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
-            // The snapshot resume pc folds in the bit-14 marker for a try-block
-            // residual call so the decode routes through
-            // the post-call catch marker (the call's OWN post-call
-            // `-live-`/catch), mirroring the trait leg's `marker_aware_resume_pc`.
-            // Liveness / depth / `last_instr` (above) and `collect_outer_active_boxes`
-            // (below) keep the plain (fallthrough) `liveness_py_pc` — the same
-            // split the trait leg keeps between `snapshot_live_pc` (marked) and
-            // `saved_orgpc` (plain) — so the active-box layout stays consistent
-            // with what the decoder reads.
-            let resume_py_pc = match marker_call_py_pc {
-                Some(call_py_pc) => {
-                    majit_ir::resumedata::encode_after_residual_call_pc(call_py_pc as i32) as u32
-                }
-                None => liveness_py_pc,
-            };
             let (entry_jitcode_pc, entry_twin, entry_caller) = if guard_py_pc.is_some() {
                 (
                     guard_jitcode_pc,
