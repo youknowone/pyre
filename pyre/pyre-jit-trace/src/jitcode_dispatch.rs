@@ -8867,6 +8867,17 @@ thread_local! {
     static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for Empty-list first-append promotion during pyre's
+    /// speculative full-body walk.  Entries ride the same commit/rollback
+    /// lifecycle as [`FBW_APPEND_JOURNAL`]: a committed walk keeps the typed
+    /// strategy, while a replayed walk restores the list to Empty so replay
+    /// can execute the append from the original shape.  This exists only for
+    /// pyre's speculative-replay walk and can be removed when
+    /// single-executor tracing lands (gh#73/#34).  Entries are GC roots via
+    /// [`fbw_store_journal_root_walker`].
+    static FBW_APPEND_PROMOTE_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     /// Undo log for the walked region's eagerly executed module-global
     /// `IntMutableCell` stores: `(cell, intvalue_before)` pairs pushed by the
     /// StoreName/StoreGlobal cell fold before it writes `cell.intvalue` in
@@ -9054,6 +9065,7 @@ pub(crate) struct MidBodyPayload {
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
+    append_promote: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
@@ -9066,6 +9078,7 @@ thread_local! {
     static FBW_STORE_JOURNAL_ROOT_AREA: FbwStoreJournalRootArea = FbwStoreJournalRootArea {
         stores: FBW_STORE_JOURNAL.with(|value| value as *const _),
         appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
+        append_promote: FBW_APPEND_PROMOTE_JOURNAL.with(|value| value as *const _),
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
@@ -9097,6 +9110,7 @@ fn fbw_built_exc_take(op: OpRef) -> bool {
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
@@ -9153,6 +9167,13 @@ pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_bef
     fbw_bump_executed_effect();
 }
 
+/// Record an Empty-list first append whose eager execution promoted the list
+/// to a typed strategy, for strategy restore when the walk does not commit.
+#[allow(dead_code)]
+pub(crate) fn fbw_append_promote_journal_push(list: pyre_object::PyObjectRef) {
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().push(list));
+}
+
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
 /// for the in-place restore when the walk does not commit its end state.
 // Consumed by the StoreName/StoreGlobal cell fold
@@ -9182,6 +9203,7 @@ fn fbw_sys_exc_journal_push(displaced: pyre_object::PyObjectRef) {
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     // A committed walk keeps its eager `sys_exc_value` store (the compiled
     // trace or the adopted end state carries the same exception state), so
@@ -9548,6 +9570,18 @@ pub(crate) fn fbw_store_journal_rollback() {
                     // fold path records it); nothing to rewind.
                     pyre_object::listobject::ListStrategy::Empty => {}
                 }
+            }
+        }
+    });
+    // The length rewind above already shrank the list back to length 0.
+    // `w_list_clear` additionally restores the Empty strategy and drops the
+    // typed backing block, completing the undo of the Empty-to-typed switch
+    // that the length journal alone cannot undo.
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some(list) = entries.pop() {
+            unsafe {
+                pyre_object::listobject::w_list_clear(list);
             }
         }
     });
@@ -9952,6 +9986,13 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     }
     let appends = unsafe { &mut *(*area.appends).as_ptr() };
     for (list, _len) in appends.iter_mut() {
+        visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // SAFETY: promoted-list refs can be nursery-resident across the rest of
+    // the walk; a minor collection may move them before rollback restores
+    // Empty, so each journal slot is a root.
+    let append_promote = unsafe { &mut *(*area.append_promote).as_ptr() };
+    for list in append_promote.iter_mut() {
         visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
     }
     // Nested-inline abort outer-frame stash: PyObjectRef slots kept across the
