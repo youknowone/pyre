@@ -1667,8 +1667,18 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_str_subclass_from_wtf8(contents, cls))
 }
 
-/// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
-/// with a backing dict for storage. PyPy: dictmultiobject.py descr__new__
+/// `dictmultiobject.py:115-117 descr_new` — allocate the instance and return
+/// it; `__args__` is ignored.
+///
+/// `__new__` must NOT populate from the constructor arguments:
+/// `object.__new__`/`dict.__new__` ignore them, and filling is the job of
+/// `__init__` (`:137-138 descr_init` → `:1430 init_or_update`, the inherited
+/// `dict.__init__` for a plain subclass, or the subclass override).
+/// Pre-filling here consumes the argument a second time: a re-iterable one is
+/// walked twice (`dict(mapping)` calling `keys`/`__getitem__` twice), a
+/// one-shot one raises on the second walk, and a subclass whose `__init__`
+/// accumulates (e.g. `Counter`, whose `update` adds rather than sets)
+/// double-applies it.
 fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = if args.is_empty() {
         pyre_object::PY_NULL
@@ -1677,18 +1687,12 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     let dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
 
-    // If cls IS dict (not a subclass), use normal dict constructor
     if cls.is_null() || std::ptr::eq(cls, dict_type) {
-        return crate::builtins::builtin_dict_ctor(&args[1..]);
+        return Ok(pyre_object::w_dict_new());
     }
 
-    // cls is a dict subclass — create the instance with an empty backing
-    // dict. `__new__` must NOT populate from the constructor arguments:
-    // `object.__new__`/`dict.__new__` ignore them, and filling is the job of
-    // `__init__` (the inherited `dict.__init__` for a plain subclass, or the
-    // subclass override). Pre-filling here double-applies the argument for a
-    // subclass whose `__init__` accumulates (e.g. `Counter`, whose `update`
-    // adds rather than sets).
+    // A dict subclass keeps its items in an instance attribute, so the
+    // allocation carries an empty backing dict for `__init__` to fill.
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
     let _ = crate::baseobjspace::setattr_str(instance, "__dict_data__", backing);
