@@ -367,6 +367,15 @@ pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
     })
 }
 
+/// `rbigint.toint()` payload for the runtime-fallible narrowing lowering:
+/// the value is read only on the fits (Ok) path, so out-of-range returns 0
+/// instead of panicking — the walker's discriminant switch discards it on
+/// the Err path. Companion of [`jit_bigint_to_i64_fits`].
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_i64_value_or_zero(num: &BigInt) -> i64 {
+    i64::try_from(num).unwrap_or(0)
+}
+
 /// `BigInt::to_u64().is_some()` on a borrowed BigInt payload. Scalar half of
 /// the `BigInt::to_u64()` split so the two-phase rtyper never has to model an
 /// `Option<u64>` ABI. Companion of [`jit_bigint_to_u64_value`].

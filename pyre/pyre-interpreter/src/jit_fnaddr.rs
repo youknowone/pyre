@@ -920,6 +920,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::longobject::jit_bigint_to_i64_value_or_zero",
+        "pyre_object::jit_bigint_to_i64_value_or_zero",
+        pyre_object::jit_bigint_to_i64_value_or_zero as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::longobject::jit_bigint_to_u64_fits",
         "pyre_object::jit_bigint_to_u64_fits",
         pyre_object::jit_bigint_to_u64_fits as *const (),

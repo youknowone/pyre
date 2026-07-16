@@ -6077,6 +6077,17 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_bigint_i64_try_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `<BigInt as {One,Zero}>::{one,zero}()` — a 0-arg associated
                 // fn returning a fresh `BigInt` constant.  Emit `BigInt::from(1)`
                 // / `BigInt::from(0)` (a `ConstInt` operand feeding the
@@ -8700,6 +8711,159 @@ impl<'a> Lowering<'a> {
         // Success (`arg != MIN`) is the `Some` variant (discriminant 1).
         let payload_owner =
             Self::tagged_pair_payload_owner(td, &owner, 1).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            payload,
+            dest_local,
+            target,
+        )?;
+        Ok(true)
+    }
+
+    /// Lower the runtime-fallible `i64::try_from(&BigInt)`
+    /// (`malachite_bigint::bigint::<Impl>::try_from`, Opaque in the LLBC)
+    /// into its decomposed runtime-discriminant `Result` shape: a
+    /// `__discriminant` tag driven by `rbigint.fits_int()` and a
+    /// `__pos_0` payload holding the narrowed value.  Callers narrow a
+    /// list/str/bytes index or a byte value; overflow raises a Python
+    /// `IndexError`/`ValueError`, so the fallibility must survive the
+    /// lowering — a panic-residual swap would be a bit-exact regression.
+    ///
+    /// The arg type — not the module path — is the robust discriminator
+    /// (same philosophy as the BigInt binary-operator retarget), so this
+    /// guards on the opaque `BigInt` ADT rather than hard-matching
+    /// `malachite_bigint`.
+    ///
+    /// # Eager-payload panic hazard
+    /// [`Self::emit_tagged_pair_aggregate`] writes `__pos_0 = payload`
+    /// UNCONDITIONALLY in the call's block, before the consumer's
+    /// discriminant switch runs in a successor block.  A
+    /// [`jit_bigint_to_i64_value`] payload PANICS on overflow, so on a
+    /// non-fitting index (`lst[2**100]`) it would panic in the
+    /// walker/blackhole graph BEFORE the switch routes to the `Err` arm —
+    /// panic instead of `IndexError`.  `__pos_0` is read only on the
+    /// fits (`Ok`) path, so its value is dead on the `Err` path; the
+    /// payload op only needs to be TOTAL, not correct-on-overflow.  Hence
+    /// the non-trapping [`jit_bigint_to_i64_value_or_zero`] variant, which
+    /// returns 0 out of range.
+    ///
+    /// `Ok=0`/`Err=1`: `disc = (fits == 0)` is 0 when it fits (`Ok` tag)
+    /// and 1 otherwise (`Err` tag).
+    fn try_lower_bigint_i64_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [.., impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if impl_seg.as_str() != "<Impl>" || leaf.as_str() != "try_from" {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        // Guard on the ARG type (the opaque BigInt ADT), not the module
+        // path — the robust discriminator, so a same-named `try_from`
+        // impl on any other type is never redirected.  The narrowed
+        // operand is the receiver — `try_from(&BigInt)` — so read
+        // `inputs[0]`.
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !tyref_is_opaque_bigint(src, self.llbc) {
+            return Ok(false);
+        }
+        // Resolve the destination `Result` decl so the FieldWrite owner
+        // matches what `resolve_aggregate_adt` would record for a real
+        // `Ok(..)` construction site of the same type.
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        // Route the runtime-discriminant tagged-pair ctor to the SAME
+        // per-instantiation enum root a static `Ok(..)`/`Err(..)` mints,
+        // by suffixing the bare template name with the `<X>` the
+        // destination `Result<X, E>` local carries.
+        // Fail-closed: no splitting generic yields "" → bare owner.
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let arg = arg.clone();
+        let bb_id = self.block_id[mir_bb];
+
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        // Non-trapping payload: read only on the fits (`Ok`) path, dead on
+        // the `Err` path, but eagerly evaluated in this block — must not
+        // panic on overflow (see the eager-payload hazard above).
+        let payload = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".to_string(),
+                        "longobject".to_string(),
+                        "jit_bigint_to_i64_value_or_zero".to_string(),
+                    ],
+                },
+                args: vec![arg.clone()],
+                result_ty: ValueType::Int,
+            },
+        );
+        let fits = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".to_string(),
+                        "longobject".to_string(),
+                        "jit_bigint_to_i64_fits".to_string(),
+                    ],
+                },
+                args: vec![arg],
+                result_ty: ValueType::Int,
+            },
+        );
+        let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
+        // `disc = (fits == 0)`: 0 when it fits (`Ok` tag), 1 otherwise
+        // (`Err` tag) — matching the `Ok=0`/`Err=1` convention.
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: fits,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        );
+        // Success is the `Ok` variant (discriminant 0).
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
         self.emit_tagged_pair_aggregate(
             mir_bb,
             &owner,
