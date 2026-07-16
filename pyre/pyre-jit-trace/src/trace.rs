@@ -2968,6 +2968,7 @@ fn full_body_walk_trace(
                 // `finish_args` (matching `StepResult::Return` in
                 // trace_opcode.rs). Ungated → no payload → `Abort`
                 // exactly as before the slice.
+                let finish_is_exception = crate::jitcode_dispatch::fbw_finish_is_exception();
                 match crate::jitcode_dispatch::fbw_finish_payload_take() {
                     // A top-level `void_return/` stashes a `Type::Void`-marked
                     // payload: the portal exits with no value, so build a
@@ -2978,6 +2979,18 @@ fn full_body_walk_trace(
                         finish_args: vec![],
                         finish_arg_types: vec![],
                         exit_with_exception: false,
+                    },
+                    // A top-level uncaught raise stashes the exception box as an
+                    // `is_exception` payload (`fbw_terminate_with_raise`): build
+                    // the portal-exit FINISH against
+                    // `exit_frame_with_exception_descr` (mirror of the trait
+                    // tracer's `compile_exit_frame_with_exception`,
+                    // pyjitpl.py:3238-3242) so the frame exits carrying the
+                    // exception to the caller instead of aborting the bridge.
+                    Some((exc, _)) if finish_is_exception => TraceAction::Finish {
+                        finish_args: vec![exc],
+                        finish_arg_types: vec![majit_ir::Type::Ref],
+                        exit_with_exception: true,
                     },
                     Some((finish_value, finish_type)) => TraceAction::Finish {
                         finish_args: vec![finish_value],

@@ -1699,16 +1699,16 @@ pub fn walk(
                     continue;
                 }
                 if ctx.is_top_level {
-                    // RPython parity: framestack exhausted with no
-                    // handler match → `compile_exit_frame_with_exception(
-                    // last_exc_box)` records the outermost FINISH.
-                    ctx.trace_ctx
-                        .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
-                    if let ConcreteValue::Ref(p) = exc_concrete {
-                        if !p.is_null() {
-                            fbw_finish_raise_set(exc_concrete);
-                        }
-                    }
+                    // RPython parity: framestack exhausted with no handler
+                    // match → `compile_exit_frame_with_exception(last_exc_box)`.
+                    // Stash the exception the same way the value-return arms
+                    // stash their result (payload + no inline FINISH); the
+                    // Terminate arm builds `TraceAction::Finish {
+                    // exit_with_exception: true }` so the compile consumer
+                    // records the FINISH once against
+                    // `exit_frame_with_exception_descr`.  Recording it here too
+                    // would double it.
+                    fbw_terminate_with_raise(exc, exc_concrete);
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
@@ -7910,17 +7910,22 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// alongside the already-explicit `after_residual_call`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GuardCaptureScope<'a> {
-    /// True for a FOR_ITER-next residual's `GUARD_NO_EXCEPTION`. Tells the
-    /// snapshot helper to fold the bit-14 after-residual-call marker onto the
-    /// FOR_ITER CALL pc so a deopt resumes at the call's OWN post-call
-    /// `catch_exception` (emitted by the codewriter when the FOR_ITER sits in a
-    /// try-block) — the blackhole's `handle_exception_in_frame` then routes the
-    /// raise to the enclosing handler instead of escaping the frame. A
-    /// FOR_ITER-next's fallthrough is the continue-arm body (reached only on a
-    /// non-null item), which carries no catch for the call's own raise, so the
-    /// generic fallthrough resume the other residual calls use cannot find one.
-    /// False for every other residual.
-    pub foriter_next_catch_resume: bool,
+    /// Request that a residual call's `GUARD_NO_EXCEPTION` route its resume
+    /// through the call's OWN post-call `catch_exception` instead of the
+    /// generic post-call fallthrough. The snapshot helper only acts on this
+    /// when the call's CALL pc is directly covered by an enclosing
+    /// exception-table handler: it then folds the bit-14 after-residual-call
+    /// marker onto the CALL pc so a deopt resumes at the call's own catch —
+    /// the blackhole's `handle_exception_in_frame` routes the raise to the
+    /// enclosing handler instead of escaping the frame. Without this, a
+    /// residual resumes at the NEXT opcode, whose own catch receives only a
+    /// raise from that opcode, not from the call itself; a residual whose CALL
+    /// pc sits directly under a try (its fallthrough may leave the covered
+    /// region — e.g. a FOR_ITER-next fallthrough is the continue-arm body,
+    /// reached only on a non-null item, which carries no catch for the call's
+    /// own raise) needs its own catch to receive the raise. Uncovered
+    /// residuals fall back to the fallthrough resume even when this is set.
+    pub residual_call_catch_resume: bool,
 
     /// The branch guard's own jitcode `op.pc` for a kept-stack branch guard
     /// (#124). The snapshot helper is invoked with the *resume* coordinate
@@ -8430,6 +8435,18 @@ thread_local! {
     static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
         const { std::cell::Cell::new(None) };
 
+    /// Discriminates the `FBW_FINISH_PAYLOAD` disposition: `true` when the
+    /// payload is a top-level uncaught raise (`fbw_terminate_with_raise`),
+    /// so [`crate::trace::full_body_walk_trace`] builds a
+    /// `TraceAction::Finish { exit_with_exception: true }`
+    /// (`compile_exit_frame_with_exception`) rather than a value-return
+    /// FINISH.  A dedicated flag rather than the `FBW_FINISH_CONCRETE::Raise`
+    /// marker because the latter is null-guarded for GC-rooting and so is
+    /// absent when the raised exception has no concrete Ref.  Reset with the
+    /// payload at the start of every walk.
+    static FBW_FINISH_IS_EXCEPTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// The terminal disposition a top-level walk produced, set for a
     /// loop-free portal exit (`DispatchOutcome::Terminate`).  Unlike
     /// `FBW_FINISH_PAYLOAD` (the symbolic re-boxed `OpRef` the compile
@@ -8578,6 +8595,7 @@ pub fn fbw_debug_abort_enabled() -> bool {
 /// stale value from a prior aborted walk cannot leak into this one.
 pub(crate) fn fbw_finish_payload_reset() {
     FBW_FINISH_PAYLOAD.with(|c| c.set(None));
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.set(false));
     FBW_FINISH_CONCRETE.with(|c| c.set(None));
 }
 
@@ -9995,6 +10013,32 @@ fn fbw_terminate_void_with_finish(
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
     Ok(())
+}
+
+/// Exception variant of [`fbw_terminate_with_finish`] for the top-level
+/// uncaught raise (`compile_exit_frame_with_exception`, pyjitpl.py:3238-3242).
+/// Stashes the exception box (`exc`, already a `Type::Ref`) as an
+/// `is_exception` payload and, when the raised exception has a concrete Ref,
+/// the concrete disposition for the GC root walker / no-replay portal.  Like
+/// the value path it does NOT record the `FINISH` op — [`crate::trace::
+/// full_body_walk_trace`]'s Terminate arm builds
+/// `TraceAction::Finish { exit_with_exception: true }` and the compile
+/// consumer records it once against `exit_frame_with_exception_descr`.
+fn fbw_terminate_with_raise(exc: OpRef, exc_concrete: ConcreteValue) {
+    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((exc, Type::Ref))));
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.set(true));
+    if let ConcreteValue::Ref(p) = exc_concrete {
+        if !p.is_null() {
+            fbw_finish_raise_set(exc_concrete);
+        }
+    }
+}
+
+/// Whether the stashed `FBW_FINISH_PAYLOAD` is a top-level uncaught raise
+/// (see [`fbw_terminate_with_raise`]).  Read by the Terminate arm before
+/// taking the payload; reset with the payload at the start of every walk.
+pub(crate) fn fbw_finish_is_exception() -> bool {
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.get())
 }
 
 /// #73: classification of a Python opcode's effect on the walk-level
@@ -12294,22 +12338,31 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // fallthrough resume routes a raise through the next opcode's
                     // own `catch_exception` (still inside the same try-block) and
                     // the bridge-decline path, which handles every sequential
-                    // residual call.
+                    // residual call whose NEXT opcode shares the try.
                     //
-                    // FOR_ITER-next is the exception: its fallthrough is the
-                    // continue-arm body (reached only on a NON-null item), which
-                    // carries no catch for the call's OWN raise.  When the
-                    // FOR_ITER-next residual guard is being captured
-                    // (`GuardCaptureScope::foriter_next_catch_resume`) and the
-                    // call's CALL pc has a post-call catch, fold the bit-14
-                    // marker onto the CALL pc so the blackhole resumes at the
-                    // call's OWN catch and routes the raise to the
+                    // A residual whose CALL pc is itself directly covered by an
+                    // enclosing exception-table handler needs its OWN catch to
+                    // receive the raise: its fallthrough may leave the covered
+                    // region (e.g. FOR_ITER-next's fallthrough is the continue-arm
+                    // body, reached only on a NON-null item, which carries no
+                    // catch for the call's OWN raise).  When the guard capture
+                    // requested catch-resume
+                    // (`GuardCaptureScope::residual_call_catch_resume`) and the
+                    // call's CALL pc is covered by the code's exception table,
+                    // fold the bit-14 marker onto the CALL pc so the blackhole
+                    // resumes at the call's OWN catch and routes the raise to the
                     // enclosing handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
                         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
-                        if scope.foriter_next_catch_resume
+                        let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
+                            &code.exceptiontable,
+                            call_py_pc * 2,
+                        )
+                        .is_some();
+                        if scope.residual_call_catch_resume
+                            && call_pc_has_catch
                             && call_py_pc < flag
                             && jc
                                 .payload
@@ -17165,7 +17218,8 @@ fn dispatch_residual_call_iRd_kind(
         // a virtualizable BUILD_LIST source temp is consumed without forcing.
         // Gated on `PYRE_NEWLIST_VIRT`; declines to the opaque residual
         // otherwise (SAFE — always byte-correct).
-        if newlist_virt_enabled() && try_walker_specialize_setslice(ctx, op.pc, &r_args)?.is_some() {
+        if newlist_virt_enabled() && try_walker_specialize_setslice(ctx, op.pc, &r_args)?.is_some()
+        {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
@@ -17591,18 +17645,19 @@ fn dispatch_residual_call_iRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                // FOR_ITER-next routes its no-exception-guard resume through
-                // the call's OWN post-call catch
-                // (`GuardCaptureScope::foriter_next_catch_resume`);
-                // every other residual keeps the fallthrough resume.  See the
-                // scope field's doc and the marker handling in
-                // `walker_capture_snapshot_for_last_guard_impl`.
-                let is_for_iter_next = ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+                // Request that this residual call's no-exception-guard resume
+                // route through the call's OWN post-call catch
+                // (`GuardCaptureScope::residual_call_catch_resume`).  The
+                // snapshot helper folds the marker only when the call's CALL pc
+                // is actually covered by the code's exception table (checked in
+                // `walker_capture_snapshot_for_last_guard_impl`); an uncovered
+                // residual keeps the generic fallthrough resume.  See the scope
+                // field's doc.
                 walker_capture_snapshot_for_last_guard_scoped(
                     ctx,
                     op.pc,
                     GuardCaptureScope {
-                        foriter_next_catch_resume: is_for_iter_next,
+                        residual_call_catch_resume: true,
                         ..GuardCaptureScope::default()
                     },
                 )?;
@@ -23268,7 +23323,8 @@ fn try_walker_specialize_setslice(
     // residual) + guard strategy == Integer.  Folds away when the operand is the
     // just-built virtual list.
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    let list_instantiate = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_instantiate =
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
     let sid_const_val = pyre_object::listobject::ListStrategy::Integer as i64;
     for &lst_op in &[list_op, value_op] {
         if !lst_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(lst_op) {
@@ -23348,7 +23404,8 @@ fn try_walker_specialize_setslice(
     );
     for j in 0..slice_len {
         let src_idx = ctx.trace_ctx.const_int(j);
-        let src_raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, src_block, src_idx);
+        let src_raw =
+            crate::state::trace_int_block_getitem_value(ctx.trace_ctx, src_block, src_idx);
         let tgt_idx = ctx.trace_ctx.const_int(start + j);
         crate::state::trace_int_block_setitem_value(ctx.trace_ctx, tgt_block, tgt_idx, src_raw);
     }
@@ -30524,33 +30581,32 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 2);
         drop(wc);
+        // The exception is stashed as an `is_exception` finish payload, NOT
+        // recorded inline: `full_body_walk_trace`'s Terminate arm builds
+        // `TraceAction::Finish { exit_with_exception: true }` and the compile
+        // consumer records the single FINISH against
+        // `exit_frame_with_exception_descr` (mirror of the value-return
+        // `fbw_terminate_with_finish` path).  So no op is recorded in `walk()`.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "raise/r must record exactly one FINISH op (outermost branch)",
+            ops_before,
+            "raise/r must NOT record an inline FINISH — the payload is deferred",
         );
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![expected_exc],
-            "FINISH args must carry the exception OpRef from registers_r[src]",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
-            "FINISH descr must be the caller-supplied \
-             `exit_frame_with_exception_descr_ref`, not \
-             `done_with_this_frame_descr_ref`",
+            fbw_finish_is_exception(),
+            "top-level raise/r must mark the finish payload as an exception exit",
+        );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        assert_eq!(
+            finish_value, expected_exc,
+            "the stashed payload must carry the exception OpRef from registers_r[src]",
         );
     }
 
@@ -30723,31 +30779,29 @@ mod tests {
         // With `PYRE_FBW_RAISE` on (default), `reraise/` surfaces
         // `SubRaise` and `walk()`'s top-level SubRaise arm records the
         // outermost FINISH + converts to Terminate.
+        fbw_finish_payload_reset();
         let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 1, "reraise/ has no operand");
         drop(wc);
+        // As with `raise/r`, the standing exception is stashed as an
+        // `is_exception` payload and the outermost FINISH is recorded
+        // downstream by the compile consumer, not inline in `walk()`.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "reraise/ at top-level must record exactly one outermost FINISH",
+            ops_before,
+            "reraise/ must NOT record an inline FINISH — the payload is deferred",
         );
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![active_exc],
-            "FINISH args must carry the standing last_exc_value OpRef",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
-            "reraise/ at top-level must use exit_frame_with_exception_descr_ref",
+            fbw_finish_is_exception(),
+            "top-level reraise/ must mark the finish payload as an exception exit",
+        );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        assert_eq!(
+            finish_value, active_exc,
+            "the stashed payload must carry the standing last_exc_value OpRef",
         );
     }
 
