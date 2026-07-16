@@ -6596,7 +6596,10 @@ fn try_execute_residual_call_via_executor(
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::PyreHelperKind::ForIterNext {
         let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-            .unwrap_or(ctx.entry_py_pc as usize + 1);
+            .unwrap_or_else(|| {
+                pcmap_entrypc_audit_ctx_read(ctx, "foriter_attempt_fallback");
+                ctx.entry_py_pc as usize + 1
+            });
         fbw_foriter_inflight_mark_attempt(body_pc);
     }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
@@ -6780,7 +6783,10 @@ fn try_execute_residual_call_via_executor(
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
                 let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-                    .unwrap_or(ctx.entry_py_pc as usize + 1);
+                    .unwrap_or_else(|| {
+                        pcmap_entrypc_audit_ctx_read(ctx, "foriter_capture_fallback");
+                        ctx.entry_py_pc as usize + 1
+                    });
                 fbw_foriter_inflight_capture(
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body_pc,
@@ -6800,6 +6806,7 @@ fn try_execute_residual_call_via_executor(
                 // valid).
                 ctx.vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
+                    pcmap_entrypc_audit_ctx_read(ctx, "foriter_debug");
                     let item = result_i64 as usize as pyre_object::PyObjectRef;
                     let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
                         Some(unsafe { pyre_object::w_int_get_value(item) })
@@ -7279,6 +7286,7 @@ fn collect_outer_active_boxes(
     // (`setup_bridge_sym` / `rebuild_inline_callee`), which read the same
     // carried word.  With the flag off `carried_jitcode_pc` is ignored and
     // this is the plain py_pc→jitcode-translation query.
+    pcmap_entrypc_audit_liveness_fallback(outer_jitcode_index, entry_py_pc, carried_jitcode_pc);
     let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         outer_jitcode_index as i32,
         entry_py_pc as i32,
@@ -10648,6 +10656,84 @@ pub(crate) fn pcmap_callpc_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_ENTRYPC_AUDIT` records every remaining consumer of
+/// `WalkContext::entry_py_pc` against its marker twin. Diagnostic only; off
+/// in production.
+pub(crate) fn pcmap_entrypc_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_ENTRYPC_AUDIT").is_some())
+}
+
+/// Append one report-only `entry_py_pc` consumer census row. `check.py`
+/// discards diagnostic stderr, so the audit writes to an explicitly supplied
+/// probe file instead.
+fn pcmap_entrypc_audit_probe(site: &'static str, relation: &str, extra: &str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_ENTRYPC_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "entrypc\t{site}\t{relation}\t{extra}");
+        }
+    }
+}
+
+/// Audit a genuine `WalkContext::entry_py_pc` read. The marker comparison is
+/// deliberately diagnostic-only: consumers retain their existing Python-PC
+/// behavior in this phase.
+fn pcmap_entrypc_audit_ctx_read(ctx: &WalkContext<'_, '_>, site: &'static str) {
+    if !pcmap_entrypc_audit_enabled() {
+        return;
+    }
+    let Some(marker) = ctx.outer_resume_marker_jit_pc else {
+        pcmap_entrypc_audit_probe(site, "nomarker", "-");
+        return;
+    };
+    let marker_py_pc =
+        crate::state::backxlat_py_pc(ctx.outer_jitcode_index as i32, marker as i32) as u32;
+    if marker_py_pc == ctx.entry_py_pc {
+        pcmap_entrypc_audit_probe(site, "eq", "-");
+    } else {
+        pcmap_entrypc_audit_probe(
+            site,
+            "di",
+            &format!(
+                "entry_py_pc={} marker_py_pc={marker_py_pc}",
+                ctx.entry_py_pc
+            ),
+        );
+    }
+}
+
+/// `collect_outer_active_boxes` has no `WalkContext`, so its fallback-key
+/// audit intentionally records `noctx`. Probe only when its carried JitCode
+/// coordinate cannot resolve, the only path where its Python key could matter.
+fn pcmap_entrypc_audit_liveness_fallback(
+    outer_jitcode_index: u32,
+    entry_py_pc: u32,
+    carried_jitcode_pc: i32,
+) {
+    if !pcmap_entrypc_audit_enabled() {
+        return;
+    }
+    let carried_resolves = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
+        .is_some_and(|payload| {
+            payload
+                .resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, crate::state::op_live())
+                .is_some()
+        });
+    if !carried_resolves {
+        pcmap_entrypc_audit_probe(
+            "liveness_fallback",
+            "noctx",
+            &format!("entry_py_pc={entry_py_pc} carried_jitcode_pc={carried_jitcode_pc}"),
+        );
+    }
+}
+
 /// `PYRE_PCMAP_ENTRY_AUDIT` enables assertions that each carried
 /// `collect_outer_active_boxes` entry coordinate's selected JitCode-PC twin
 /// reproduces the Python-PC depth and pcdep reads. Diagnostic only; off in
@@ -11881,6 +11967,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // #67/#124: synthetic loop-close guard pc overshoots past the last
             // Python opcode → resume at the trace's entry py (loop header).
             let py_pc = if py_pc as usize >= num_instrs {
+                pcmap_entrypc_audit_ctx_read(ctx, "loop_close_overshoot");
                 ctx.entry_py_pc
             } else {
                 py_pc
@@ -21357,8 +21444,11 @@ fn try_walker_specialize_for_iter_next(
 
     // A new consume attempt completes the prior in-flight iteration before
     // this irreversible concrete advance, matching the residual executor.
-    let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-        .unwrap_or(ctx.entry_py_pc as usize + 1);
+    let body_pc =
+        fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc).unwrap_or_else(|| {
+            pcmap_entrypc_audit_ctx_read(ctx, "range_foriter_attempt_fallback");
+            ctx.entry_py_pc as usize + 1
+        });
     fbw_foriter_inflight_mark_attempt(body_pc);
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
