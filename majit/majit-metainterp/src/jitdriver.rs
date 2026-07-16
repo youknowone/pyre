@@ -4232,6 +4232,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_on_guard_failure(f);
     }
 
+    /// Set a callback for trace abort events. `f` receives `(green_key, permanent)`
+    /// where `permanent` is true when the abort disables the key permanently.
+    pub fn set_on_trace_abort(&mut self, f: impl Fn(u64, bool) + Send + 'static) {
+        self.meta.set_on_trace_abort(f);
+    }
+
     /// Set a JIT parameter by name at runtime.
     ///
     /// Supported parameters:
