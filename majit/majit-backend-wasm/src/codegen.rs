@@ -2665,7 +2665,8 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // offset
                     sink.i32_wrap_i64();
                     sink.i32_add();
-                    sink.i64_load(mem64(0));
+                    let (item_size, signed) = array_item_size_sign_from_descr(op);
+                    emit_sized_int_load(&mut sink, 0, item_size, signed);
                     sink.local_set(1 + vi);
                 }
             }
@@ -2676,7 +2677,8 @@ fn build_function(
                 sink.i32_wrap_i64();
                 sink.i32_add();
                 emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                sink.i64_store(mem64(0));
+                let (item_size, _signed) = array_item_size_sign_from_descr(op);
+                emit_sized_int_store(&mut sink, 0, item_size);
             }
 
             // ── Exception handling ──
