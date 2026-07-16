@@ -5263,7 +5263,7 @@ impl PyreJitState {
             return;
         }
         if meta.has_virtualizable {
-            self.restore_virtualizable_i64(values);
+            self.restore_virtualizable_i64(&meta.slot_types, values);
         } else {
             let nlocals = self.local_count();
             let stack_only = self.valuestackdepth().saturating_sub(nlocals);
@@ -5512,10 +5512,12 @@ impl PyreJitState {
     /// over the array calling reader.load_next_value_of_type(GCREF),
     /// i.e. reader.next_ref() — every slot is a GCREF pointer.
     ///
-    /// The raw i64 values here are already PyObjectRef pointers from
-    /// the backend's Ref register bank. Write them directly without
-    /// per-slot type dispatch.
-    fn restore_virtualizable_i64(&mut self, values: &[i64]) {
+    /// The raw i64 values here come from the backend register banks. Each
+    /// frame slot is written through `boxed_slot_i64_for_type` using the
+    /// merge point's per-slot types: a Ref slot writes the raw pointer, an
+    /// Int slot re-boxes the raw i64 into a W_Int so the interpreter sees a
+    /// valid boxed value on guard failure.
+    fn restore_virtualizable_i64(&mut self, slot_types: &[Type], values: &[i64]) {
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
         // virtualizable.py:134-137:
@@ -5523,11 +5525,13 @@ impl PyreJitState {
         //       lst = getattr(virtualizable, fieldname)
         //       for j in range(len(lst)):
         //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
-        // ARRAYITEMTYPE is always GCREF for locals_cells_stack_w.
+        // Each slot re-boxes per its merge-point type; Ref slots write the
+        // raw pointer, Int slots allocate a W_Int.
         let nlocals = self.local_count();
         for i in 0..nlocals {
             if idx < values.len() {
-                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+                let slot_type = slot_types.get(i).copied().unwrap_or(Type::Ref);
+                let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
             }
             idx += 1;
         }
@@ -5535,7 +5539,8 @@ impl PyreJitState {
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
-                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+                let slot_type = slot_types.get(nlocals + i).copied().unwrap_or(Type::Ref);
+                let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
             }
             idx += 1;
         }
@@ -9355,9 +9360,15 @@ impl JitState for PyreJitState {
         // extra_reds + vable scalars), so do NOT add `trace_extra_reds`.
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let _ = provisional.trace_extra_reds; // staging copy only
-        // RPython parity: Python locals/stack are always Ref.
+        // Slot types come from the merge-point boxes: each GreenBox.ty is the
+        // real per-slot type (skip the leading scalar inputargs). Today's
+        // Python locals/stack are all Ref, so this matches the prior hardcode;
+        // it becomes load-bearing once a merge point declares an Int slot.
         let slot_types = if original_box_count >= NUM_SCALAR_INPUTARGS {
-            vec![Type::Ref; original_box_count.saturating_sub(NUM_SCALAR_INPUTARGS)]
+            original_boxes[NUM_SCALAR_INPUTARGS..]
+                .iter()
+                .map(|gb| gb.ty)
+                .collect()
         } else {
             Vec::new()
         };
