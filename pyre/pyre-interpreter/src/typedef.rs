@@ -6718,7 +6718,7 @@ fn make_getset_property(
 
 /// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
 /// `make_getset_descriptor_named` for the typedef.py:58 motivation.
-fn make_getset_property_named(
+pub(crate) fn make_getset_property_named(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
