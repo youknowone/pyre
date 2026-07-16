@@ -7605,7 +7605,8 @@ fn init_type_type(ns: PyObjectRef) {
             }),
         )
     };
-    // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__
+    // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__ /
+    // __base__
     // are exposed as getset descriptors so
     // `type.__dict__['<name>'].__get__(cls)` invokes the underlying getter
     // and returns the real value (matching CPython's getset_descriptor).
@@ -7912,6 +7913,29 @@ fn init_type_type(ns: PyObjectRef) {
                 pyre_object::PY_NULL,
                 "__bases__",
             ),
+        )
+    };
+
+    // PyPy typeobject.py:1164-1166 descr__base.  `object` has no best base,
+    // which is surfaced as None; for multiple inheritance this follows the
+    // most-derived instance layout rather than blindly choosing bases[0].
+    let base_getter = make_builtin_function_with_arity(
+        "__base__",
+        |args| unsafe {
+            let base = pyre_object::typeobject::w_type_get_best_base(args[1]);
+            if base.is_null() {
+                Ok(pyre_object::w_none())
+            } else {
+                Ok(base)
+            }
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__base__",
+            make_getset_descriptor(base_getter),
         )
     };
 }
@@ -13128,6 +13152,10 @@ pub(crate) fn buffer_as_bytes_like(
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
             pyre_object::interp_array::w_array_bytes(obj)
         })));
+    }
+    #[cfg(all(unix, feature = "host_env"))]
+    if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes(obj) {
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
         return Ok(Some(obj));

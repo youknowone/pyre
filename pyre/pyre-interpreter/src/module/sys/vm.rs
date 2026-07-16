@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: `pypy/module/sys/vm.py`.
 
-use crate::{module_ns_store, make_builtin_function_with_arity};
+use crate::{make_builtin_function_with_arity, module_ns_store};
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -20,11 +20,13 @@ fn sys_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__init__",
-                crate::make_builtin_function("__init__", sys_namespace_init),
-            ) };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", sys_namespace_init),
+                )
+            };
         });
         // The stubs want a per-instance mapdict store; a `__dict__`
         // rawdict key would instead claim the typedef manages the dict
@@ -69,7 +71,6 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
-
 
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile`.
@@ -338,8 +339,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     break;
                 }
                 remaining -= 1;
-                current =
-                    crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
+                current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
             }
             // `pyframe.py:767 f_back = GetSetProperty(PyFrame.fget_f_back)`.
             // Return the live `PyFrame` itself as the user-visible `frame`
@@ -383,55 +383,147 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // structseq port is tracked separately.
     {
         let flags_type = crate::typedef::make_builtin_type("sys.flags", |fns| {
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "debug", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "inspect", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "interactive", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "optimize", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "dont_write_bytecode", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "no_user_site",
-                w_int_new(i64::from(crate::importing::no_user_site_flag())),
-            ) };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "debug",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "inspect",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "interactive",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "optimize",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "dont_write_bytecode",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "no_user_site",
+                    w_int_new(i64::from(crate::importing::no_user_site_flag())),
+                )
+            };
             // `-S` (skip `import site`) is recorded by the launcher.
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "no_site",
-                w_int_new(i64::from(crate::importing::no_site_flag())),
-            ) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "ignore_environment",
-                w_int_new(i64::from(crate::importing::ignore_environment_flag())),
-            ) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "verbose", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "bytes_warning", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "quiet", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "hash_randomization", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "isolated",
-                w_int_new(i64::from(crate::importing::isolated_flag())),
-            ) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "dev_mode",
-                w_bool_from(crate::importing::dev_mode_flag()),
-            ) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "utf8_mode",
-                w_int_new(crate::importing::utf8_mode_flag()),
-            ) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "warn_default_encoding", w_int_new(0)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                fns,
-                "safe_path",
-                w_bool_from(crate::importing::safe_path_flag()),
-            ) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "int_max_str_digits", w_int_new(4300)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "context_aware_warnings", w_bool_from(false)) };
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "thread_inherit_context", w_int_new(0)) };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "no_site",
+                    w_int_new(i64::from(crate::importing::no_site_flag())),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "ignore_environment",
+                    w_int_new(i64::from(crate::importing::ignore_environment_flag())),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "verbose",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "bytes_warning",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "quiet",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "hash_randomization",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "isolated",
+                    w_int_new(i64::from(crate::importing::isolated_flag())),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "dev_mode",
+                    w_bool_from(crate::importing::dev_mode_flag()),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "utf8_mode",
+                    w_int_new(crate::importing::utf8_mode_flag()),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "warn_default_encoding",
+                    w_int_new(0),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "safe_path",
+                    w_bool_from(crate::importing::safe_path_flag()),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "int_max_str_digits",
+                    w_int_new(4300),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "context_aware_warnings",
+                    w_bool_from(false),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    fns,
+                    "thread_inherit_context",
+                    w_int_new(0),
+                )
+            };
         });
         let flags = w_instance_new(flags_type);
         module_ns_store(ns, "flags", flags);
@@ -754,21 +846,71 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // advertised set matches what is actually importable.
     #[allow(unused_mut)]
     let mut builtin_names = vec![
-        "__pypy__", "_abc", "_bisect", "_blake2", "_codecs", "_collections",
-        "_collections_abc", "_contextvars", "_csv", "_datetime", "_decimal",
-        "_functools", "_hashlib", "_heapq", "_imp", "_io", "_json", "_locale",
-        "_md5", "_opcode", "_operator", "_pickle", "_random", "_sha1", "_sha2",
-        "_sha3", "_signal", "_socket", "_sre", "_stat", "_string", "_struct",
-        "_thread", "_tokenize", "_tracemalloc", "_typing", "_warnings", "_weakref",
-        "atexit", "binascii", "builtins", "errno", "fcntl", "grp", "itertools",
-        "marshal", "math", "cmath", "operator", "posix", "pwd", "select", "sys",
+        "__pypy__",
+        "_abc",
+        "_bisect",
+        "_blake2",
+        "_codecs",
+        "_collections",
+        "_collections_abc",
+        "_contextvars",
+        "_csv",
+        "_datetime",
+        "_decimal",
+        "_functools",
+        "_hashlib",
+        "_heapq",
+        "_imp",
+        "_io",
+        "_json",
+        "_locale",
+        "_md5",
+        "_opcode",
+        "_operator",
+        "_pickle",
+        "_random",
+        "_sha1",
+        "_sha2",
+        "_sha3",
+        "_signal",
+        "_socket",
+        "_sre",
+        "_stat",
+        "_string",
+        "_struct",
+        "_thread",
+        "_tokenize",
+        "_tracemalloc",
+        "_typing",
+        "_warnings",
+        "_weakref",
+        "atexit",
+        "binascii",
+        "builtins",
+        "errno",
+        "fcntl",
+        "grp",
+        "itertools",
+        "marshal",
+        "math",
+        "cmath",
+        "operator",
+        "posix",
+        "pwd",
+        "select",
+        "sys",
         "time",
     ];
     // Host-access modules registered only in non-sandbox builds (importing.rs);
     // under `sandbox` they are omitted, so drop them from the advertised set
     // in place — the surrounding order is left untouched.
     #[cfg(feature = "sandbox")]
-    builtin_names.retain(|n| !matches!(*n, "_signal" | "_socket" | "fcntl" | "grp" | "pwd" | "select"));
+    builtin_names.retain(|n| {
+        !matches!(
+            *n,
+            "_signal" | "_socket" | "fcntl" | "grp" | "pwd" | "select"
+        )
+    });
     module_ns_store(
         ns,
         "builtin_module_names",
@@ -866,6 +1008,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "getsizeof(object, default) -> int: object size is not tracked; supply a default",
                     )),
                 }
+            },
+            1,
+        ),
+    );
+    // PyPy normally omits CPython's raw refcount API.  The shared ctypes
+    // tests only require the strong-reference delta created by a c_char_p
+    // `_objects` keepalive; bytes records that real ownership transition in
+    // its object payload, while other tracing-GC objects report the stable
+    // call/argument baseline.
+    module_ns_store(
+        ns,
+        "getrefcount",
+        make_builtin_function_with_arity(
+            "getrefcount",
+            |args| {
+                let owned = if unsafe { pyre_object::is_bytes(args[0]) } {
+                    unsafe { pyre_object::bytesobject::w_bytes_ctypes_keepalive_refs(args[0]) }
+                } else {
+                    0
+                };
+                Ok(pyre_object::w_int_new((2 + owned) as i64))
             },
             1,
         ),
@@ -990,13 +1153,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     crate::baseobjspace::setdictvalue(
         stream,
         "errors",
-        w_str_new(if to_stderr { "backslashreplace" } else { "strict" }),
+        w_str_new(if to_stderr {
+            "backslashreplace"
+        } else {
+            "strict"
+        }),
     );
-    crate::baseobjspace::setdictvalue(
-        stream,
-        "mode",
-        w_str_new(if writable { "w" } else { "r" }),
-    );
+    crate::baseobjspace::setdictvalue(stream, "mode", w_str_new(if writable { "w" } else { "r" }));
     crate::baseobjspace::setdictvalue(stream, "closed", w_bool_from(false));
     crate::baseobjspace::setdictvalue(stream, "buffer", w_none());
     // Instance-stored builtin methods do not get `self` prepended (see

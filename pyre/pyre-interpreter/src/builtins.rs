@@ -214,6 +214,8 @@ unsafe fn w_memoryview_new_plain(
         // size-changing mutation is refused while this view is live.
         if backing_is_bytearray(r_obj) {
             pyre_object::bytearrayobject::w_bytearray_exports_incref(r_obj);
+        } else if is_array {
+            pyre_object::interp_array::w_array_exports_incref(r_obj);
         }
         let backing = memoryview_backing_buffer(r_obj);
         let view = if is_array {
@@ -315,6 +317,52 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
+        }
+        #[cfg(all(unix, feature = "host_env"))]
+        if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
+            crate::module::_ctypes::cdata::cdata_buffer_view(w_obj)
+        {
+            use pyre_object::buffer::Buffer;
+            use pyre_object::bufferview::BufferView;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(w_obj);
+            pyre_object::gc_roots::pin_root(backing_obj);
+            pyre_object::gc_roots::pin_root(w_str_new(&fmt));
+            let shape_i64 = shape.iter().map(|&dim| dim as i64).collect::<Vec<_>>();
+            let mut strides = vec![0i64; shape.len()];
+            let mut stride = itemsize as i64;
+            for (i, &dim) in shape_i64.iter().enumerate().rev() {
+                strides[i] = stride;
+                stride = stride.saturating_mul(dim);
+            }
+            pyre_object::gc_roots::pin_root(memoryview_wrap_dims(&shape_i64));
+            pyre_object::gc_roots::pin_root(memoryview_wrap_dims(&strides));
+            let mv = w_memoryview_alloc_header(false, true);
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+            let r_backing = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+            let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+            let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+            let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 4);
+            pyre_object::bytearrayobject::w_bytearray_exports_incref(r_backing);
+            let backing = Buffer::sub(Buffer::Byte { w_obj: r_backing }, offset, byte_len as i64);
+            let raw = BufferView::Raw {
+                backing,
+                w_obj: r_obj,
+                w_fmt: r_fmt,
+                itemsize: itemsize as i64,
+                length: byte_len as i64,
+            };
+            let view = BufferView::ViewND {
+                parent: Box::new(raw),
+                w_obj: r_obj,
+                ndim: shape.len() as i64,
+                w_shape: r_shape,
+                w_strides: r_strides,
+            };
+            let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+            pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+            return Ok(mv);
         }
         let (fmt, itemsize, _readonly, byte_len) = match memoryview_buffer_params(w_obj) {
             Some(p) => p,
@@ -1005,7 +1053,7 @@ fn memoryview_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         memoryview_check_released(mv)?;
         let dim = pyre_object::memoryview::w_memoryview_ndim(mv);
         if dim == 0 {
-            return Ok(w_int_new(1));
+            return Err(crate::PyError::type_error("0-dim memory has no length"));
         }
         match pyre_object::memoryview::w_memoryview_native_shape(mv).first() {
             Some(&s) => Ok(w_int_new(s)),

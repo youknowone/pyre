@@ -733,6 +733,8 @@ impl PyError {
         };
         let mut first_line = if where_desc.is_empty() {
             String::new()
+        } else if where_desc.starts_with("Exception ignored ") {
+            where_desc.to_string()
         } else {
             format!("Exception ignored in: {where_desc}")
         };

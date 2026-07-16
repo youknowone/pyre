@@ -694,7 +694,8 @@ fn trace_buffer_exporter(
     match buf {
         pyre_object::buffer::Buffer::String { w_obj }
         | pyre_object::buffer::Buffer::Byte { w_obj }
-        | pyre_object::buffer::Buffer::Array { w_obj } => {
+        | pyre_object::buffer::Buffer::Array { w_obj }
+        | pyre_object::buffer::Buffer::External { w_obj, .. } => {
             f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         }
         pyre_object::buffer::Buffer::Sub { parent, .. } => {
@@ -784,6 +785,9 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
     let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if !view_ptr.is_null() {
+        if unsafe { (*mv).owns_export } {
+            unsafe { (&*view_ptr).backing().release_export() };
+        }
         drop(unsafe { Box::from_raw(view_ptr) });
     }
 }

@@ -4824,6 +4824,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
                 return Ok(bases);
             }
+            if name == "__base__" {
+                // typeobject.py:1164-1166 descr__base — choose the base whose
+                // instance layout is extended, not merely bases[0].
+                let base = pyre_object::typeobject::w_type_get_best_base(obj);
+                if base.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                return Ok(base);
+            }
             // PEP 649 lazy annotations: when `cls.__annotations__` is
             // requested and only `__annotate_func__` (or `__annotate__`)
             // is set, call the annotate function with format=1 to

@@ -19,6 +19,12 @@ pub struct W_BytesObject {
     pub ob_header: PyObject,
     pub data: *const Vec<u8>,
     pub len: usize,
+    /// Strong references owned by ctypes `_objects` dictionaries.  Pyre is a
+    /// tracing-GC runtime, so it has no CPython `ob_refcnt`; this trailing
+    /// counter preserves the observable ctypes-owned delta used by
+    /// `sys.getrefcount` compatibility without changing object identity or
+    /// storing a parallel object side table.
+    pub ctypes_keepalive_refs: usize,
 }
 
 /// GC type id assigned to `W_BytesObject` at JitDriver init time.
@@ -66,6 +72,7 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
         },
         data,
         len,
+        ctypes_keepalive_refs: 0,
     }) as PyObjectRef
 }
 
@@ -82,6 +89,20 @@ pub unsafe fn is_bytes(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_bytes_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_BytesObject)).len }
+}
+
+pub unsafe fn w_bytes_ctypes_keepalive_refs(obj: PyObjectRef) -> usize {
+    unsafe { (*(obj as *const W_BytesObject)).ctypes_keepalive_refs }
+}
+
+pub unsafe fn w_bytes_inc_ctypes_keepalive_refs(obj: PyObjectRef) {
+    let bytes = unsafe { &mut *(obj as *mut W_BytesObject) };
+    bytes.ctypes_keepalive_refs = bytes.ctypes_keepalive_refs.saturating_add(1);
+}
+
+pub unsafe fn w_bytes_dec_ctypes_keepalive_refs(obj: PyObjectRef) {
+    let bytes = unsafe { &mut *(obj as *mut W_BytesObject) };
+    bytes.ctypes_keepalive_refs = bytes.ctypes_keepalive_refs.saturating_sub(1);
 }
 
 #[inline]

@@ -25,6 +25,13 @@ pub enum Buffer {
     Byte { w_obj: PyObjectRef },
     /// `array.array` — its raw element bytes.
     Array { w_obj: PyObjectRef },
+    /// Raw foreign memory used by `ctypes.memoryview_at`.
+    External {
+        w_obj: PyObjectRef,
+        address: usize,
+        size: usize,
+        readonly: bool,
+    },
     /// A `[offset, offset+size)` window over another `Buffer` (`SubBuffer`,
     /// `rpython/rlib/buffer.py:389`).  Sub-buffers never nest — see [`sub`].
     ///
@@ -40,6 +47,22 @@ pub enum Buffer {
 }
 
 impl Buffer {
+    /// Release the single exporter lock owned by a root memoryview.
+    /// Derived/sub views do not call this; their root view owns the count.
+    pub unsafe fn release_export(&self) {
+        unsafe {
+            match self {
+                Buffer::Byte { w_obj } => {
+                    crate::bytearrayobject::w_bytearray_exports_decref(*w_obj)
+                }
+                Buffer::Array { w_obj } => crate::interp_array::w_array_exports_decref(*w_obj),
+                Buffer::String { .. } => {}
+                Buffer::External { .. } => {}
+                Buffer::Sub { parent, .. } => parent.release_export(),
+            }
+        }
+    }
+
     /// `SubBuffer(parent, offset, size)` (`rpython/rlib/buffer.py:389`).  A
     /// `Sub` over a `Sub` is collapsed to a single window over the inner
     /// buffer (`buffer.py:397` — "don't nest them"): the offsets sum and the
@@ -87,6 +110,7 @@ impl Buffer {
         match self {
             Buffer::String { .. } => true,
             Buffer::Byte { .. } | Buffer::Array { .. } => false,
+            Buffer::External { readonly, .. } => *readonly,
             Buffer::Sub { parent, .. } => parent.readonly(),
         }
     }
@@ -97,7 +121,10 @@ impl Buffer {
     #[inline]
     pub fn w_obj(&self) -> PyObjectRef {
         match self {
-            Buffer::String { w_obj } | Buffer::Byte { w_obj } | Buffer::Array { w_obj } => *w_obj,
+            Buffer::String { w_obj }
+            | Buffer::Byte { w_obj }
+            | Buffer::Array { w_obj }
+            | Buffer::External { w_obj, .. } => *w_obj,
             Buffer::Sub { parent, .. } => parent.w_obj(),
         }
     }
@@ -115,6 +142,9 @@ impl Buffer {
                 Buffer::String { w_obj } => crate::bytesobject::w_bytes_data(*w_obj),
                 Buffer::Byte { w_obj } => crate::bytearrayobject::w_bytearray_data(*w_obj),
                 Buffer::Array { w_obj } => crate::interp_array::w_array_bytes(*w_obj),
+                Buffer::External { address, size, .. } => {
+                    core::slice::from_raw_parts(*address as *const u8, *size)
+                }
                 Buffer::Sub {
                     parent,
                     offset,
@@ -155,6 +185,18 @@ impl Buffer {
                 }
                 Buffer::Array { w_obj } => {
                     Some(crate::interp_array::w_array_vec_mut(*w_obj).as_mut_slice())
+                }
+                Buffer::External {
+                    address,
+                    size,
+                    readonly,
+                    ..
+                } => {
+                    if *readonly {
+                        None
+                    } else {
+                        Some(core::slice::from_raw_parts_mut(*address as *mut u8, *size))
+                    }
                 }
                 Buffer::Sub {
                     parent,

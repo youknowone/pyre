@@ -6,6 +6,14 @@
 //! call `is_done()` during shutdown.
 
 use pyre_object::*;
+use std::cell::Cell;
+
+thread_local! {
+    // The runtime is single-OS-threaded, but a synchronous emulation of a
+    // joinable Python thread still needs a distinct logical ident so
+    // threading._active never replaces the main-thread entry.
+    static LOGICAL_THREAD_IDENT: Cell<i64> = const { Cell::new(0) };
+}
 
 fn lock_count(obj: PyObjectRef) -> i64 {
     let d = crate::baseobjspace::getdict(obj);
@@ -73,6 +81,17 @@ mod lock_class {
             }
             fn _at_fork_reinit(self_obj: PyObjectRef) {
                 lock_set_count(self_obj, 0);
+            }
+            fn _release_save(self_obj: PyObjectRef) -> i64 {
+                let count = lock_count(self_obj);
+                lock_set_count(self_obj, 0);
+                count
+            }
+            fn _acquire_restore(self_obj: PyObjectRef, count: i64) {
+                lock_set_count(self_obj, count.max(1));
+            }
+            fn _recursion_count(self_obj: PyObjectRef) -> i64 {
+                lock_count(self_obj)
             }
         }
     }
@@ -142,11 +161,60 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_int_new(1))
 }
 
+fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let function = pos
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("missing function argument"))?;
+    let thread_obj = if unsafe { pyre_object::is_method(function) } {
+        unsafe { pyre_object::w_method_get_self(function) }
+    } else {
+        pyre_object::PY_NULL
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(function);
+    if !thread_obj.is_null() {
+        pyre_object::gc_roots::pin_root(thread_obj);
+    }
+    let thread_slot =
+        (!thread_obj.is_null()).then(|| pyre_object::gc_roots::shadow_stack_len() - 1);
+    // A real OS thread starts with a distinct ctypes TLS errno slot.  The
+    // synchronous thread emulator must therefore bracket the call rather than
+    // letting the worker overwrite its caller's slot.
+    let caller_errno = rustpython_host_env::ctypes::get_errno();
+    rustpython_host_env::ctypes::set_errno(0);
+    LOGICAL_THREAD_IDENT.with(|ident| {
+        let previous = ident.replace(2);
+        let _ = crate::call::call_function_impl_result(function, &[]);
+        ident.set(previous);
+    });
+    rustpython_host_env::ctypes::set_errno(caller_errno);
+    // The emulated thread has already completed before this function returns.
+    // Remove its debugging-only weak entry now, matching the state a real
+    // thread reaches once its Thread object becomes unreachable.  This also
+    // avoids leaving a dead weak target for the next nursery collection.
+    if let (Some(slot), Some(threading)) =
+        (thread_slot, crate::importing::get_sys_module("threading"))
+    {
+        let thread_obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        if let Ok(dangling) = crate::baseobjspace::getattr_str(threading, "_dangling") {
+            if let Ok(discard) = crate::baseobjspace::getattr_str(dangling, "discard") {
+                let _ = crate::call::call_function_impl_result(discard, &[thread_obj]);
+            }
+        }
+    }
+    Ok(w_int_new(1))
+}
+
 // PyPy `_thread.get_ident` returns the pthread handle; pyre routes
 // through `rustpython_host_env::thread::current_thread_id`.  Without
 // host_env we always return 1 (single-threaded sentinel).
-#[crate::pyre_function]
-fn get_ident() -> i64 {
+fn current_ident() -> i64 {
+    let logical = LOGICAL_THREAD_IDENT.with(Cell::get);
+    if logical != 0 {
+        return logical;
+    }
     // The sandboxed child is a single logical thread; do not leak the real
     // thread id (host state), return the single-threaded sentinel instead.
     #[cfg(all(
@@ -161,6 +229,11 @@ fn get_ident() -> i64 {
     {
         1
     }
+}
+
+#[crate::pyre_function]
+fn get_ident() -> i64 {
+    current_ident()
 }
 
 // `_thread.get_native_id()` — kernel-level TID, NOT the pthread
@@ -227,8 +300,8 @@ crate::py_module! {
         "stack_size"             / 1 = |_| Ok(w_int_new(0)),
         "set_name"               / 1 = |_| Ok(w_none()),
         "_excepthook"            / 1 = |_| Ok(w_none()),
-        "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(1)),
-        "start_joinable_thread"  / * = |_| Ok(w_int_new(0)),
+        "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(current_ident())),
+        "start_joinable_thread"  / * = start_joinable_thread,
         "start_new_thread"       / * = start_new_thread,
         "start_new"              / * = start_new_thread,
     },

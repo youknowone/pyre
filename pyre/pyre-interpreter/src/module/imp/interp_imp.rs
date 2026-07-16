@@ -50,6 +50,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    crate::module_ns_store(
+        ns,
+        "_frozen_module_names",
+        crate::make_builtin_function("_frozen_module_names", |_| {
+            Ok(pyre_object::w_list_new(Vec::new()))
+        }),
+    );
     // `_imp.find_frozen(name)` — `FrozenImporter.find_spec` calls this and
     // treats None as "not a frozen module". Pyre has no frozen modules, so
     // every name resolves to None and the import falls through to the next

@@ -824,6 +824,13 @@ unsafe fn find_best_base(w_type: PyObjectRef) -> PyObjectRef {
     w_bestbase
 }
 
+/// PyPy `typeobject.py:1164-1166 descr__base` — return the base whose
+/// instance layout this type extends.  This is not necessarily the first
+/// entry in `__bases__` for multiple inheritance.
+pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
+    find_best_base(w_type)
+}
+
 /// Set the cached MRO.
 ///
 /// Construction installs the MRO here (rather than in `__init__`
@@ -877,6 +884,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     }
     const HEAPTYPE: i64 = 1 << 9;
     const CPYTYPE: i64 = 1;
+    const IMMUTABLETYPE: i64 = 1 << 8;
     const DISALLOW_INSTANTIATION: i64 = 1 << 7;
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
@@ -887,7 +895,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if t.flag_heaptype {
         flags |= HEAPTYPE;
     } else {
-        flags |= CPYTYPE;
+        flags |= CPYTYPE | IMMUTABLETYPE;
     }
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
         flags |= IS_ABSTRACT;

@@ -18,12 +18,13 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     unsafe {
         if is_str(obj) {
             Ok(w_str_get_value(obj).as_bytes().to_vec())
-        } else if bytesobject::is_bytes_like(obj) {
-            Ok(bytesobject::bytes_like_data(obj).to_vec())
         } else {
-            Err(crate::PyError::type_error(
-                "argument should be bytes, buffer or ASCII string",
-            ))
+            match crate::typedef::buffer_as_bytes_like(obj)? {
+                Some(src) => Ok(bytesobject::bytes_like_data(src).to_vec()),
+                None => Err(crate::PyError::type_error(
+                    "argument should be bytes, buffer or ASCII string",
+                )),
+            }
         }
     }
 }

@@ -131,6 +131,7 @@ fn unicode_char_w(w: PyObjectRef) -> Result<u32, PyError> {
 
 /// Append one packed value (`append` / single-element `extend`).
 fn array_append(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
+    array_check_resize(obj)?;
     let tc = unsafe { arr::w_array_typecode(obj) };
     let mut buf: Bytes = [0u8; 8];
     let n = pack_into(tc, w_value, &mut buf)?;
@@ -139,8 +140,20 @@ fn array_append(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
     Ok(())
 }
 
+fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
+    if unsafe { arr::w_array_exports(obj) } != 0 {
+        Err(PyError::new(
+            PyErrorKind::BufferError,
+            "cannot resize an array that is exporting buffers",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Extend from any iterable, packing each element (`descr_extend`).
 fn array_extend_iterable(obj: PyObjectRef, w_iterable: PyObjectRef) -> Result<(), PyError> {
+    array_check_resize(obj)?;
     // A fast path for same-typecode arrays: raw byte concat.
     if unsafe { arr::is_array(w_iterable) } {
         let dst_tc = unsafe { arr::w_array_typecode(obj) };
@@ -168,6 +181,7 @@ fn array_extend_iterable(obj: PyObjectRef, w_iterable: PyObjectRef) -> Result<()
 
 /// Append raw bytes (`frombytes`); length must be a multiple of itemsize.
 fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
+    array_check_resize(obj)?;
     let isz = unsafe { arr::w_array_itemsize(obj) };
     if bytes.len() % isz != 0 {
         return Err(PyError::value_error(
@@ -245,6 +259,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
 
 /// `fromunicode` — append code points of a str to a `'u'` array.
 fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError> {
+    array_check_resize(obj)?;
     if unsafe { arr::w_array_typecode(obj) } != b'u' {
         return Err(PyError::value_error(
             "fromunicode() may only be called on unicode type arrays",
@@ -476,6 +491,7 @@ fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
 fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 3, "array.insert")?;
     let obj = args[0];
+    array_check_resize(obj)?;
     let len = unsafe { arr::w_array_len(obj) };
     let isz = unsafe { arr::w_array_itemsize(obj) };
     let tc = unsafe { arr::w_array_typecode(obj) };
@@ -500,6 +516,7 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
+    array_check_resize(obj)?;
     let len = unsafe { arr::w_array_len(obj) };
     if len == 0 {
         return Err(PyError::new(
@@ -531,6 +548,7 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
 fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.remove")?;
     let obj = args[0];
+    array_check_resize(obj)?;
     let idx = array_find(obj, args[1])?;
     match idx {
         Some(i) => {
@@ -599,7 +617,13 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
     // descr_clear — empty the buffer, preserving typecode/itemsize.
+    array_check_resize(args[0])?;
     unsafe { arr::w_array_vec_mut(args[0]) }.clear();
+    Ok(pyre_object::w_none())
+}
+
+fn array_release_buffer(args: &[PyObjectRef]) -> PyResult {
+    unsafe { arr::w_array_exports_decref(args[0]) };
     Ok(pyre_object::w_none())
 }
 
@@ -851,6 +875,7 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
 fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__iadd__")?;
     let a = args[0];
+    array_check_resize(a)?;
     let b = args[1];
     if !unsafe { arr::is_array(b) }
         || unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) }
@@ -891,6 +916,7 @@ fn array_mul_method(args: &[PyObjectRef]) -> PyResult {
 fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__imul__")?;
     let obj = args[0];
+    array_check_resize(obj)?;
     let count = crate::builtins::getindex_w(args[1])?.max(0) as usize;
     let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
     if count == 0 {
@@ -1030,6 +1056,7 @@ pub fn init_array_type(ns: PyObjectRef) {
     };
     m(ns, "count", array_count_method, 2);
     m(ns, "clear", array_clear_method, 1);
+    m(ns, "__release_buffer__", array_release_buffer, 2);
     m(ns, "reverse", array_reverse_method, 1);
     m(ns, "tolist", array_tolist_method, 1);
     m(ns, "fromlist", array_fromlist_method, 2);

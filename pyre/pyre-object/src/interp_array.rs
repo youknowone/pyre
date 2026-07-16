@@ -24,6 +24,9 @@ pub struct W_Array {
     pub typecode: u8,
     pub itemsize: u8,
     pub data: *mut Vec<u8>,
+    /// Number of active buffer exports.  Size-changing operations are
+    /// forbidden while this is non-zero (`interp_array.py::_check_resize`).
+    pub exports: i64,
 }
 
 /// The supported typecodes, in `array.typecodes` order
@@ -59,6 +62,7 @@ pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
         typecode,
         itemsize,
         data,
+        exports: 0,
     })
 }
 
@@ -74,6 +78,7 @@ pub fn w_array_from_bytes(typecode: u8, itemsize: u8, bytes: Vec<u8>) -> PyObjec
         typecode,
         itemsize,
         data,
+        exports: 0,
     })
 }
 
@@ -135,6 +140,23 @@ pub unsafe fn w_array_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
         let a = &*(obj as *const W_Array);
         &mut *a.data
+    }
+}
+
+pub unsafe fn w_array_exports(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_Array)).exports }
+}
+
+pub unsafe fn w_array_exports_incref(obj: PyObjectRef) {
+    unsafe { (*(obj as *mut W_Array)).exports += 1 };
+}
+
+pub unsafe fn w_array_exports_decref(obj: PyObjectRef) {
+    unsafe {
+        let array = &mut *(obj as *mut W_Array);
+        if array.exports > 0 {
+            array.exports -= 1;
+        }
     }
 }
 
