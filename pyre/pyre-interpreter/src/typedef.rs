@@ -2361,14 +2361,53 @@ fn range_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     )?))
 }
 
-/// `functional.py W_Range.descr_eq`.
-fn range_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// CPython 3.14 `range_richcompare`, layered on PyPy
+/// `functional.py W_Range.descr_eq`.  PyPy only publishes `descr_eq`; 3.14
+/// takes precedence and exposes the whole rich-comparison slot surface.
+fn range_descr_richcompare(
+    args: &[PyObjectRef],
+    op: crate::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::is_w_range(args[1]) } {
         return Ok(w_not_implemented());
     }
-    Ok(w_bool_from(unsafe {
-        pyre_object::w_range_eq(args[0], args[1])
-    }))
+    match op {
+        crate::baseobjspace::CompareOp::Eq | crate::baseobjspace::CompareOp::Ne => {
+            let mut result = unsafe { pyre_object::w_range_eq(args[0], args[1]) };
+            if matches!(op, crate::baseobjspace::CompareOp::Ne) {
+                result = !result;
+            }
+            Ok(w_bool_from(result))
+        }
+        crate::baseobjspace::CompareOp::Le
+        | crate::baseobjspace::CompareOp::Ge
+        | crate::baseobjspace::CompareOp::Lt
+        | crate::baseobjspace::CompareOp::Gt => Ok(w_not_implemented()),
+    }
+}
+
+fn range_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Eq)
+}
+
+fn range_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Ne)
+}
+
+fn range_descr_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Lt)
+}
+
+fn range_descr_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Le)
+}
+
+fn range_descr_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Gt)
+}
+
+fn range_descr_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    range_descr_richcompare(args, crate::baseobjspace::CompareOp::Ge)
 }
 
 /// `functional.py W_Range.descr_bool`.
@@ -2459,6 +2498,26 @@ fn init_range_type(ns: PyObjectRef) {
         (
             "__eq__",
             make_builtin_function_with_arity("__eq__", range_descr_eq, 2),
+        ),
+        (
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", range_descr_ne, 2),
+        ),
+        (
+            "__lt__",
+            make_builtin_function_with_arity("__lt__", range_descr_lt, 2),
+        ),
+        (
+            "__le__",
+            make_builtin_function_with_arity("__le__", range_descr_le, 2),
+        ),
+        (
+            "__gt__",
+            make_builtin_function_with_arity("__gt__", range_descr_gt, 2),
+        ),
+        (
+            "__ge__",
+            make_builtin_function_with_arity("__ge__", range_descr_ge, 2),
         ),
         (
             "__hash__",

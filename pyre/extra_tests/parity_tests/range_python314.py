@@ -3,7 +3,7 @@
 import operator
 
 
-required = {
+expected_surface = {
     "__doc__",
     "__new__",
     "__repr__",
@@ -14,6 +14,11 @@ required = {
     "__reduce__",
     "__contains__",
     "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
     "__hash__",
     "__bool__",
     "count",
@@ -22,7 +27,7 @@ required = {
     "stop",
     "step",
 }
-assert required <= set(range.__dict__)
+assert set(range.__dict__) == expected_surface
 
 r = range(2, 13, 3)
 assert repr(r) == "range(2, 13, 3)"
@@ -39,8 +44,27 @@ assert r.index(8) == 2 and r.index(8.0) == 2
 assert range(0, 3, 2) == range(0, 4, 2)
 assert hash(range(0, 3, 2)) == hash(range(0, 4, 2))
 assert range.__eq__(r, object()) is NotImplemented
+assert range.__ne__(r, range(2, 13, 3)) is False
+assert range.__ne__(r, range(2, 15, 3)) is True
+assert range.__ne__(r, object()) is NotImplemented
+for name in ("__lt__", "__le__", "__gt__", "__ge__"):
+    assert getattr(range, name)(r, range(2, 15, 3)) is NotImplemented
+    assert getattr(range, name)(r, object()) is NotImplemented
 assert r.__reduce__() == (range, (2, 13, 3))
 assert not range(0)
+
+for compare in (
+    lambda: r < range(2, 15, 3),
+    lambda: r <= range(2, 15, 3),
+    lambda: r > range(2, 15, 3),
+    lambda: r >= range(2, 15, 3),
+):
+    try:
+        compare()
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("range ordering must remain unsupported")
 
 try:
     r.start = 9
