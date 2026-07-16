@@ -57,12 +57,11 @@ enum ResolvedArg {
 #[derive(Clone, Copy)]
 struct CallAssemblerTargetAddr {
     immediate: Option<usize>,
-    addr_slot: Option<usize>,
 }
 
 impl CallAssemblerTargetAddr {
     fn is_available(self) -> bool {
-        self.immediate.is_some() || self.addr_slot.is_some()
+        self.immediate.is_some()
     }
 }
 
@@ -301,10 +300,6 @@ pub struct AssemblerARM64<'a> {
     /// Leaked pointer holding the resolved entry address for self-recursive
     /// CALL_ASSEMBLER via the execute trampoline. Written after finalization.
     self_entry_addr_ptr: *mut usize,
-    /// assembler.py:320 descr._ll_function_addr parity:
-    /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
-    /// Populated by the runner before compilation, from registered loop targets.
-    call_assembler_targets: IndexMap<u64, usize>,
     /// opassembler.py:1177 _finish_gcmap.
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
@@ -482,7 +477,6 @@ impl<'a> AssemblerARM64<'a> {
             classptr_to_subclass_range,
             self_entry_label: None,
             self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
-            call_assembler_targets: IndexMap::new(),
             finish_gcmap: None,
             gcmap_for_finish: {
                 let gcmap = allocate_gcmap(1, JITFRAME_FIXED_SIZE);
@@ -1823,12 +1817,6 @@ impl<'a> AssemblerARM64<'a> {
         })
     }
 
-    /// assembler.py:320 descr._ll_function_addr parity: store
-    /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
-    pub fn set_call_assembler_targets(&mut self, targets: IndexMap<u64, usize>) {
-        self.call_assembler_targets = targets;
-    }
-
     /// Bake the owning token's `invalidated` flag address so
     /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
     pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
@@ -1848,35 +1836,13 @@ impl<'a> AssemblerARM64<'a> {
             if descr_addr != 0 {
                 return CallAssemblerTargetAddr {
                     immediate: Some(descr_addr),
-                    addr_slot: None,
                 };
             }
-            if let Some(registry_addr) = self
-                .call_assembler_targets
-                .get(&token.number)
-                .copied()
-                .filter(|&addr| addr != 0)
-            {
-                return CallAssemblerTargetAddr {
-                    immediate: Some(registry_addr),
-                    addr_slot: None,
-                };
-            }
-            return CallAssemblerTargetAddr {
-                immediate: None,
-                addr_slot: None,
-            };
+            return CallAssemblerTargetAddr { immediate: None };
         }
 
-        let immediate = descr
-            .and_then(|d| d.as_call_descr())
-            .and_then(|cd| cd.call_target_token())
-            .and_then(|token| self.call_assembler_targets.get(&token).copied())
-            .filter(|&addr| addr != 0);
-        CallAssemblerTargetAddr {
-            immediate,
-            addr_slot: None,
-        }
+        let _ = descr;
+        CallAssemblerTargetAddr { immediate: None }
     }
 
     /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
@@ -5777,12 +5743,6 @@ impl<'a> AssemblerARM64<'a> {
                 let addr = addr as i64;
                 self.emit_mov_imm64(1, addr);
                 dynasm!(self.mc ; .arch aarch64 ; blr x1);
-            } else if let Some(addr_slot) = target_addr.addr_slot {
-                self.emit_mov_imm64(1, addr_slot as i64);
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x1, [x1]
-                    ; blr x1
-                );
             } else if let Some(entry_label) = self.self_entry_label {
                 dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }

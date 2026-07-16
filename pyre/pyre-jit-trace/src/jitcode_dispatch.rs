@@ -14803,12 +14803,11 @@ fn try_walker_call_assembler_self_recursive(
     } {
         return Ok(None);
     }
-    // Resolve the callee's own loop / pending assembler token
+    // Resolve the callee's own loop or trace-in-progress marker
     // (`trace_opcode.rs:5954` + `6138`: `make_green_key(w_callee_code, 0)`,
-    // `pc = 0` = function entry).  `get_loop_token_arc` first, else the
-    // pending token `fib` hits before its loop finishes compiling
-    // (`trace_opcode.rs:6035-6036`).  A key miss returns `None` here =
-    // safe bail to residual.
+    // `pc = 0` = function entry). A pending token only proves the callee is
+    // being traced; emission below resolves compiled-or-tmp so the descr never
+    // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
     let callee_key = crate::driver::make_green_key(w_code, 0);
     let has_existing = driver.get_loop_token_arc(callee_key).is_some()
@@ -14820,26 +14819,24 @@ fn try_walker_call_assembler_self_recursive(
         return Ok(None);
     }
     // warmstate.py:714-723 / compile.py:1101-1150: resolve an installed
-    // procedure token, the real pending token, or synthesize a tmp callback
-    // token for full-portal cutover.
+    // procedure token, or synthesize a tmp callback token while the real loop
+    // is still tracing.
     let greenboxes = [
         majit_ir::Value::Int(0),
         majit_ir::Value::Int(0),
         majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
     ];
     let red_types = [Type::Ref, Type::Ref];
-    let token = match driver
-        .meta_interp_mut()
-        .get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types)
-    {
-        Some(token) => token,
-        None => {
-            if std::env::var_os("PYRE_P2_DIAG").is_some() {
-                eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
+    let token =
+        match driver.get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types) {
+            Some(token) => token,
+            None => {
+                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                    eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-    };
+        };
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
@@ -26679,10 +26676,17 @@ fn handle(
                     let callee_key =
                         crate::driver::make_green_key(callee_code as *const (), next_instr);
                     let (driver, _) = crate::driver::driver_pair();
-                    if let Some(token) = driver
-                        .get_loop_token_arc(callee_key)
-                        .or_else(|| driver.get_pending_token_arc(callee_key))
-                    {
+                    let greenboxes = [
+                        Value::Int(next_instr as i64),
+                        Value::Int(0),
+                        Value::Ref(majit_ir::GcRef(callee_code)),
+                    ];
+                    let red_types = [Type::Ref, Type::Ref];
+                    if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
+                        callee_key,
+                        &greenboxes,
+                        &red_types,
+                    ) {
                         return Ok((
                             DispatchOutcome::SubLoopCalleeCallAssembler {
                                 token,
@@ -26717,10 +26721,17 @@ fn handle(
                             let callee_key =
                                 crate::driver::make_green_key(callee_code as *const (), next_instr);
                             let (driver, _) = crate::driver::driver_pair();
-                            if let Some(token) = driver
-                                .get_loop_token_arc(callee_key)
-                                .or_else(|| driver.get_pending_token_arc(callee_key))
-                            {
+                            let greenboxes = [
+                                Value::Int(next_instr as i64),
+                                Value::Int(0),
+                                Value::Ref(majit_ir::GcRef(callee_code)),
+                            ];
+                            let red_types = [Type::Ref, Type::Ref];
+                            if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
+                                callee_key,
+                                &greenboxes,
+                                &red_types,
+                            ) {
                                 return Ok((
                                     DispatchOutcome::SubLoopCalleeCallAssembler {
                                         token,

@@ -4495,6 +4495,20 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_pending_token_arc(green_key).cloned()
     }
 
+    /// Resolve a portal CALL_ASSEMBLER target through an installed loop token
+    /// or an RPython tmp callback (`warmstate.py:714-723`,
+    /// `compile.py:1101-1150`). The pending token remains only a
+    /// trace-in-progress marker for inline decisions.
+    pub fn get_or_make_portal_assembler_token_arc(
+        &mut self,
+        green_key: u64,
+        greenboxes: &[Value],
+        red_arg_types: &[Type],
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta
+            .get_or_make_portal_assembler_token_arc(green_key, greenboxes, red_arg_types)
+    }
+
     /// Decide how to handle a function call during tracing.
     ///
     /// Returns `Inline` if the callee should be traced through,

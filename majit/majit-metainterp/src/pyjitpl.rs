@@ -3672,24 +3672,6 @@ impl<M: Clone> MetaInterp<M> {
                 // see `setup_tracing` for the contract on raw-pointer
                 // lifetime pinning by MetaInterp ownership.
                 ctx.set_cpu(Some(&self.backend));
-                // compile_tmp_callback parity: pending CALL_ASSEMBLER targets
-                // must expose the same red-args-only entry contract that
-                // `patch_new_loop_to_load_virtualizable_fields()` later hands
-                // to `backend.compile_loop(...)`. Mirror the `setup_tracing`
-                // path so both trace-start entry points register the same
-                // pending-token shape.
-                let input_types = Self::pending_target_input_types(
-                    ctx.inputarg_types(),
-                    driver_descriptor.as_ref(),
-                );
-                let num_inputs = input_types.len();
-                // warmspot.py:527-538 — jd.index_of_virtualizable is -1 when
-                // no virtualizables, else jitdriver.reds.index(vname).
-                let index_of_virtualizable: i32 = ctx
-                    .driver_descriptor()
-                    .and_then(|jd| jd.virtualizable_arg_index())
-                    .map(|i| i as i32)
-                    .unwrap_or(-1);
                 self.tracing = Some(ctx);
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
                 // `setup_tracing` for rationale.  Bridge-trace
@@ -3710,19 +3692,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let pending_token =
                     self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
-                let pending_num = pending_token.number;
                 self.pending_token = Some((green_key, pending_token));
-                // RPython compile_tmp_callback parity: register a placeholder
-                // target so call_assembler can resolve the pending token at
-                // runtime. call_assembler_fast_path detects null code_ptr and
-                // falls back to force_fn.
-                self.backend.register_pending_target(
-                    pending_num,
-                    input_types,
-                    num_inputs,
-                    self.num_scalar_inputargs,
-                    index_of_virtualizable,
-                );
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -3857,34 +3827,6 @@ impl<M: Clone> MetaInterp<M> {
         }))
     }
 
-    #[allow(dead_code)]
-    fn pending_target_input_types(
-        input_types: Vec<Type>,
-        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
-    ) -> Vec<Type> {
-        let Some(driver) = driver_descriptor else {
-            return input_types;
-        };
-        let Some(_) = driver.virtualizable_arg_index() else {
-            return input_types;
-        };
-        // `patch_new_loop_to_load_virtualizable_fields()` (compile.py:425-461)
-        // collapses the loop's inputargs to the JitDriver reds. Pyre's
-        // `extract_live_values()` still emits the expanded
-        // `[frame, last_instr, pycode, valuestackdepth, debugdata, lastblock,
-        //  w_globals, locals..., stack...]` shape, so the trace's inputarg
-        // types do NOT carry the reds in the leading `num_reds` slots —
-        // truncating to `num_reds` here would register a bogus
-        // `[Ref(frame), Int(last_instr)]` ABI when reds is `[frame, ec]`.
-        // Synthesise the reds-only shape directly from the JitDriver var
-        // table (`JitDriverVar.tp` matches RPython's `Box.type` parity).
-        let red_types: Vec<Type> = driver.reds().iter().map(|red| red.tp).collect();
-        if input_types.len() <= red_types.len() {
-            return input_types;
-        }
-        red_types
-    }
-
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -3954,18 +3896,6 @@ impl<M: Clone> MetaInterp<M> {
         // this trace because `self` (MetaInterp) owns both `tracing`
         // and `backend`, and tracing is torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
-        // compile_tmp_callback parity: pending CALL_ASSEMBLER targets must
-        // expose the same red-args-only entry contract that
-        // `patch_new_loop_to_load_virtualizable_fields()` later hands to
-        // `backend.compile_loop(...)`.
-        let input_types =
-            Self::pending_target_input_types(ctx.inputarg_types(), driver_descriptor.as_ref());
-        let num_inputs = input_types.len();
-        let index_of_virtualizable: i32 = ctx
-            .driver_descriptor()
-            .and_then(|jd| jd.virtualizable_arg_index())
-            .map(|i| i as i32)
-            .unwrap_or(-1);
         self.tracing = Some(ctx);
         // pyjitpl.py:1547-1556 `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
@@ -3988,15 +3918,7 @@ impl<M: Clone> MetaInterp<M> {
             }));
         }
         let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
-        let pending_num = pending_token.number;
         self.pending_token = Some((green_key, pending_token));
-        self.backend.register_pending_target(
-            pending_num,
-            input_types,
-            num_inputs,
-            self.num_scalar_inputargs,
-            index_of_virtualizable,
-        );
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
@@ -11577,13 +11499,12 @@ impl<M: Clone> MetaInterp<M> {
         ctx_info: Option<(usize, usize)>,
     ) -> InlineDecision {
         // pyre adaptation: `pending_token` covers the window between
-        // beginning a self-recursive CALL_ASSEMBLER convergence and
-        // installing the compiled trace in `compiled_loops`. RPython
-        // closes the same gap through `get_assembler_token`, which
-        // synthesises a `compile_tmp_callback` token on demand
-        // (warmstate.py:714). Pyre has no `compile_tmp_callback`, so
-        // the pending-token entry stands in for an already-installed
-        // token for inlining-decision purposes only.
+        // beginning a recursive trace and installing the compiled trace in
+        // `compiled_loops`. RPython closes the same gap through
+        // `get_assembler_token`, which synthesises a `compile_tmp_callback`
+        // token on demand (warmstate.py:714). Pyre uses the pending-token
+        // entry for inlining-decision purposes only; emitted CALL_ASSEMBLER
+        // descrs resolve to either a compiled token or a tmp-callback token.
         let callee_compiled = self.compiled_loops.contains_key(&callee_key)
             || self
                 .pending_token
@@ -13551,8 +13472,7 @@ impl<M: Clone> MetaInterp<M> {
     /// via `compile_tmp_callback` — the CALL_ASSEMBLER token object for a
     /// recursive callee whose own loop has not finished compiling.  Returns the
     /// token Arc to carry in the descr, or `None` when the real
-    /// portal driver is unregistered (cutover off) or `compile_tmp_callback`
-    /// fails.
+    /// portal driver metadata is unavailable or `compile_tmp_callback` fails.
     ///
     /// `greenboxes` carries the portal greens in `build_portal_calldescr`
     /// declaration order (`[next_instr, is_being_profiled, pycode]`);
@@ -13564,16 +13484,9 @@ impl<M: Clone> MetaInterp<M> {
         red_arg_types: &[Type],
     ) -> Option<Arc<JitCellToken>> {
         // `compile.py:187` parity: an already-compiled loop token wins.
-        // Resolved before the portal-driver lookup — neither an installed
-        // nor a pending token needs the portal staticdata, and the real
-        // portal driver is only registered under the mutual cutover.
+        // Resolved before the portal-driver lookup — an installed token does
+        // not need the portal staticdata.
         if let Some(arc) = self.get_loop_token_arc(green_key) {
-            return Some(Arc::clone(arc));
-        }
-        // The real loop's pending token object wins over a tmp callback for
-        // self-recursion. This is the token whose `_ll_function_addr` will be
-        // filled by the later real-loop install.
-        if let Some(arc) = self.get_pending_token_arc(green_key) {
             return Some(Arc::clone(arc));
         }
         // The real portal driver has greens; the empty
@@ -21492,58 +21405,5 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
-    }
-
-    #[test]
-    fn test_pending_target_input_types_passes_through_when_no_descriptor() {
-        // No descriptor → expanded form survives untouched.
-        let expanded = vec![Type::Ref, Type::Int, Type::Ref, Type::Int, Type::Ref];
-        let result = MetaInterp::<()>::pending_target_input_types(expanded.clone(), None);
-        assert_eq!(result, expanded);
-    }
-
-    #[test]
-    fn test_pending_target_input_types_passes_through_when_no_virtualizable() {
-        let descriptor = JitDriverStaticData::new(
-            vec![("pc", Type::Int)],
-            vec![("a", Type::Int), ("b", Type::Int)],
-        );
-        let expanded = vec![Type::Int, Type::Int];
-        let result =
-            MetaInterp::<()>::pending_target_input_types(expanded.clone(), Some(&descriptor));
-        assert_eq!(result, expanded);
-    }
-
-    #[test]
-    fn test_pending_target_input_types_uses_driver_red_types_not_expanded_prefix() {
-        // PyPy `interp_jit.py:67`: reds=[frame, ec], virtualizable=frame.
-        // The trace's expanded inputarg shape is
-        // `[Ref(frame), Int(last_instr), Ref(pycode), Int(valuestackdepth),
-        //   Ref(debugdata), Ref(lastblock), Ref(w_globals), ...locals/stack]`.
-        // Truncating the leading two slots would yield `[Ref, Int]` — wrong.
-        // The descriptor's `reds` is the source of truth, so the result
-        // must be `[Ref, Ref]`.
-        let descriptor = JitDriverStaticData::with_virtualizable(
-            vec![
-                ("next_instr", Type::Int),
-                ("is_being_profiled", Type::Int),
-                ("pycode", Type::Ref),
-            ],
-            vec![("frame", Type::Ref), ("ec", Type::Ref)],
-            Some("frame"),
-        );
-        let expanded = vec![
-            Type::Ref,
-            Type::Int,
-            Type::Ref,
-            Type::Int,
-            Type::Ref,
-            Type::Ref,
-            Type::Ref,
-            Type::Ref,
-            Type::Ref,
-        ];
-        let result = MetaInterp::<()>::pending_target_input_types(expanded, Some(&descriptor));
-        assert_eq!(result, vec![Type::Ref, Type::Ref]);
     }
 }

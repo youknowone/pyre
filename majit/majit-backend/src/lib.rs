@@ -35,8 +35,7 @@ pub struct CpuTotalTracker {
     /// parity).  The bump used to live in [`CompiledLoopToken::new`]
     /// but moved because pyre eagerly creates the CLT in
     /// `JitCellToken::new`, which would over-count tokens that are
-    /// allocated but never assembled (the `register_pending_target`
-    /// path is one such caller).
+    /// allocated but never assembled.
     pub total_compiled_loops: AtomicUsize,
     /// `model.py:10` `total_compiled_bridges` — bumped by
     /// [`CompiledLoopToken::compiling_a_bridge`] before bridge assembly.
@@ -947,8 +946,7 @@ pub struct CompiledLoopToken {
 /// runs eagerly from [`JitCellToken::new`] (line 1265 documents the
 /// eager-vs-lazy adaptation), so doing the bump there would
 /// over-count loops whose JitCellToken is allocated but never reaches
-/// `backend.compile_loop` (the `register_pending_target` path in
-/// `dynasm/runner.rs` is one such caller).
+/// `backend.compile_loop`.
 ///
 /// Each backend's `compile_loop` calls this helper as its first act.
 /// The helper records at most once per [`CompiledLoopToken`], matching
@@ -1691,21 +1689,6 @@ pub trait Backend: Send {
     /// backend's propagate-exception slow path
     /// (`x86/assembler.py:870`, `aarch64/assembler.py:566-572`).
     fn set_propagate_exception_descr(&mut self, _descr: Arc<dyn Descr>) {}
-
-    /// Register a placeholder for a pending token (RPython compile_tmp_callback).
-    /// The placeholder has null code_ptr; call_assembler_fast_path detects this
-    /// and falls back to force_fn. Replaced by the real target on compile_loop.
-    /// Register a placeholder for a pending token (RPython compile_tmp_callback).
-    /// `num_scalar_inputargs` = virtualizable.py:86 NUM_SCALAR_INPUTARGS.
-    fn register_pending_target(
-        &mut self,
-        _token_number: u64,
-        _input_types: Vec<Type>,
-        _num_inputs: usize,
-        _num_scalar_inputargs: usize,
-        _index_of_virtualizable: i32,
-    ) {
-    }
 
     /// `compile.py:484 do_compile_bridge(metainterp_sd, faildescr, inputargs,
     /// operations, original_loop_token, log, memo)` — RPython's upstream

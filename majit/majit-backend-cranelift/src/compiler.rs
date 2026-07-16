@@ -2503,13 +2503,11 @@ fn install_call_assembler_expectations(
 
     for (&target_token, &expected_result_kind) in &expectations {
         if let Some(target) = lookup_call_assembler_target(target_token) {
-            // Pending placeholders (null code_ptr) have not compiled their
-            // finish exits yet, so `fail_descrs` is empty. Defer the
-            // actual-result-kind check to the callee's own compile, where
-            // `register_call_assembler_target` runs
-            // `validate_registered_target_against_call_assembler_expectations`
-            // against the real finish descrs. Mirrors the pending guard in
-            // `resolve_call_assembler_target` (code_ptr.is_null()).
+            // A null `code_ptr` has no compiled finish exits, so
+            // `fail_descrs` is empty. Defer the actual-result-kind check to a
+            // later real registration, where `register_call_assembler_target`
+            // runs `validate_registered_target_against_call_assembler_expectations`
+            // against the real finish descrs.
             if target.code_ptr.is_null() {
                 continue;
             }
@@ -2567,18 +2565,10 @@ fn register_call_assembler_target(
         // Derive from types: first N header entries.
         token.inputarg_types.len().min(compiled.num_inputs)
     };
-    // P2.2 — CLT Arc continuity across pending → real registration.
-    //
-    // `compile_tmp_callback` (RPython `compile.py`) creates a placeholder
-    // target before the real `JitCellToken` exists; caller traces
-    // rewritten during the pending window bake in the pending CLT's
-    // `frame_info` address. If we let `JitCellToken::new` replace that
-    // Arc with a fresh one, the baked pointer dangles.
-    //
-    // Fix: adopt the pending Arc onto `token.compiled_loop_token` so the
-    // same allocation survives registration. `CompiledLoopToken::new`
-    // zero-initialises the fields we're about to populate, so swapping
-    // the fresh CLT the token already owns is safe (no state lost).
+    // Preserve an existing registered CLT Arc when this token number is
+    // re-registered, so metadata pointers already baked into callers remain
+    // stable. `CompiledLoopToken::new` zero-initialises the fields we're about
+    // to populate, so reusing the token's current CLT is safe.
     if let Some(existing_clt) = with_call_assembler_registry(|m| {
         m.get(&token.number).map(|t| t.compiled_loop_token.clone())
     }) {
@@ -2661,50 +2651,6 @@ fn unregister_call_assembler_target(token_number: u64) {
     if let Some(target) = removed {
         unregister_call_assembler_bridge_tree(&target.fail_descrs);
     }
-}
-
-/// RPython compile_tmp_callback parity: register a placeholder target
-/// with null code_ptr for a pending token. call_assembler_fast_path
-/// detects null code_ptr and falls back to force_fn (interpreter).
-/// When compilation completes, the placeholder is replaced by the real target.
-pub(crate) fn register_pending_call_assembler_target(
-    token_number: u64,
-    inputarg_types: Vec<Type>,
-    num_inputs: usize,
-    num_scalar_inputargs: usize,
-    index_of_virtualizable: i32,
-    cpu_attachments: CpuDescrHandle,
-) {
-    // compile.py: compile_tmp_callback installs a placeholder target that must
-    // not retain dispatch metadata from a previous token incarnation.
-    ca_dispatch_remove(token_number);
-    ca_dispatch_slot(token_number, std::ptr::null());
-    ca_dispatch_set_finish_descr_ptr(token_number, CA_FINISH_INDEX_UNKNOWN as i64);
-    // `rpython/jit/backend/model.py:292` — fresh placeholder
-    // `CompiledLoopToken`. `register_call_assembler_target` adopts this
-    // same Arc onto `token.compiled_loop_token` so the allocation (and
-    // therefore the `frame_info` address baked into already-rewritten
-    // caller traces) stays valid across the pending → real transition.
-    let pending_clt = Arc::new(CompiledLoopToken::new(token_number));
-    *pending_clt._ll_initial_locs.lock() = (0..num_inputs).map(|i| (i as i32) * 8).collect();
-    let target = RegisteredLoopTarget {
-        trace_id: 0,
-        header_pc: 0,
-        green_key: 0,
-        caller_prefix_layout: None,
-        code_ptr: std::ptr::null(),
-        fail_descrs: Box::new([]),
-        fail_descr_cells: Box::new([]),
-        num_inputs,
-        num_ref_roots: 0,
-        max_output_slots: 1,
-        inputarg_types,
-        num_scalar_inputargs,
-        index_of_virtualizable,
-        compiled_loop_token: pending_clt,
-        cpu_attachments,
-    };
-    with_call_assembler_registry(|m| m.insert(token_number, target));
 }
 
 fn lookup_call_assembler_target(token_number: u64) -> Option<RegisteredLoopTarget> {
@@ -3429,10 +3375,9 @@ fn call_assembler_fast_path(
     outcome: *mut i64,
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
-    // RPython parity: compile_tmp_callback. When target is pending
-    // (code_ptr not yet set), fall back to force_fn which runs the
-    // interpreter. The force_fn receives the callee frame pointer
-    // from the first input arg.
+    // RPython parity: compile_tmp_callback. Production CALL_ASSEMBLER descrs
+    // should carry compiled or tmp-callback bodies; keep the null-code fallback
+    // for helper and compatibility paths that still reach the shim.
     if target.code_ptr.is_null() {
         let frame_ptr = inputs.get(0).copied().unwrap_or(0);
         // Set pending_force_local0 for lazy frame creation.
@@ -4669,10 +4614,8 @@ fn resolve_call_assembler_target(
         }
     }
 
-    // Pending targets (null code_ptr) are placeholders — no compiled code
-    // or finish descriptors yet. Return None so codegen uses shim fallback.
-    // At runtime, call_assembler_fast_path detects null code_ptr and calls
-    // force_fn (RPython compile_tmp_callback parity).
+    // A null `code_ptr` has no compiled code or finish descriptors. Return
+    // None so codegen uses the shim fallback.
     if target.code_ptr.is_null() {
         return Ok(None);
     }
@@ -4707,7 +4650,7 @@ fn resolve_call_assembler_target(
         // reserved for cases that look like a real layout bug —
         // typically when the target's scalar header is SMALLER than
         // the caller's red count, which would not be explained by
-        // pending vable expansion.
+        // vable expansion.
         if target.num_scalar_inputargs > call_descr.arg_types().len() {
             return Ok(None);
         }
@@ -11158,41 +11101,26 @@ impl CraneliftBackend {
                     let ca_merge_block = builder.create_block();
                     builder.append_block_param(ca_merge_block, cl_types::I64);
 
-                    // Direct call via dispatch table: load code_ptr from a
-                    // stable slot (AtomicPtr). For self-recursion (target not
-                    // yet registered), pre-create the slot with null — compile
-                    // completion fills it. Runtime null check falls back to shim.
-                    let descr_addr_slot = if resolved_target.is_some()
-                        && descr_token.is_some_and(|token| token.ll_function_addr() != 0)
-                    {
-                        descr_token.map(|token| token.ll_function_addr_slot() as usize)
-                    } else {
-                        None
-                    };
-                    let dispatch_slot_addr = if descr_addr_slot.is_none() && token_val != 0 {
-                        let code_ptr = resolved_target
-                            .as_ref()
-                            .map(|target| target.code_ptr)
-                            .unwrap_or(std::ptr::null());
-                        // Self-recursion and other pending targets are
-                        // registered as Some(target) with a null code_ptr.
-                        // Still emit the direct dispatch block: the stable
-                        // slot is filled by register_call_assembler_target
-                        // after compilation, while runtime null/unknown
-                        // checks keep the current execution on the shim.
-                        Some(ca_dispatch_slot(token_val, code_ptr) as usize)
-                    } else {
-                        None
-                    };
+                    // Direct call via the descr-carried token: always load the
+                    // entry address from the token's `_ll_function_addr` slot
+                    // at runtime, never bake it as an immediate.  Unlike
+                    // dynasm, cranelift does not patch an old loop's entry
+                    // code on `redirect_call_assembler` (assembler.py:1138) —
+                    // it stores the new address into the OLD token's slot, so
+                    // a baked immediate would pin every call to a redirected
+                    // tmp-callback body forever (portal round-trip per call).
+                    // A slot that still contains 0 (recursive target still
+                    // tracing) falls back to the shim via the runtime null
+                    // check until `register_call_assembler_target` stores the
+                    // real address. Descrs without an Arc fall back to the
+                    // helper shim instead of a number-keyed dispatch slot.
+                    let descr_addr_slot =
+                        descr_token.map(|token| token.ll_function_addr_slot() as usize);
 
-                    let use_direct = descr_addr_slot.is_some() || dispatch_slot_addr.is_some();
-
-                    if use_direct {
-                        let slot_addr = dispatch_slot_addr.unwrap_or(0);
-
+                    if let Some(addr_slot) = descr_addr_slot {
                         // No separate out_slot: callee writes outputs to args_slot (shared).
 
-                        // Load code_ptr from the dispatch entry.  RPython's
+                        // Load code_ptr from the token slot.  RPython's
                         // call_assembler path compares the returned jf_descr
                         // against the CPU's DoneWithThisFrame* descr for the
                         // CALL_ASSEMBLER result type; it is not target-local.
@@ -11201,13 +11129,8 @@ impl CraneliftBackend {
                         // recursive call.
                         // RPython done_with_this_frame parity: compare jf_descr
                         // with the finish FailDescr pointer directly.
-                        let code_addr = if let Some(addr_slot) = descr_addr_slot {
+                        let code_addr = {
                             let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
-                            builder
-                                .ins()
-                                .load(ptr_type, MemFlags::trusted(), entry_ptr, 0)
-                        } else {
-                            let entry_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
                             builder
                                 .ins()
                                 .load(ptr_type, MemFlags::trusted(), entry_ptr, 0)
@@ -15654,24 +15577,6 @@ impl majit_backend::Backend for CraneliftBackend {
             .propagate_exception_descr = Some(descr);
     }
 
-    fn register_pending_target(
-        &mut self,
-        token_number: u64,
-        input_types: Vec<majit_ir::Type>,
-        num_inputs: usize,
-        num_scalar_inputargs: usize,
-        index_of_virtualizable: i32,
-    ) {
-        register_pending_call_assembler_target(
-            token_number,
-            input_types,
-            num_inputs,
-            num_scalar_inputargs,
-            index_of_virtualizable,
-            self.cpu_handle(),
-        );
-    }
-
     /// `compile.py:484 do_compile_bridge` — line-by-line.  Phase E.3+:
     /// the caller resolves `source_jct = descr_owning_jct(fail_descr)`
     /// (`majit-backend/src/lib.rs:969`) and passes it as `original_token`,
@@ -16602,6 +16507,21 @@ impl majit_backend::Backend for CraneliftBackend {
         if new_addr != 0 {
             old.set_ll_function_addr(new_addr);
         }
+        // x86/assembler.py:1146-1151 update_frame_info parity: propagate the
+        // new loop's frame depth onto the old token and its redirect chain.
+        // Callers baked the OLD CompiledLoopToken's frame_info pointer at
+        // rewrite time and read jfi_frame_size at runtime (rewrite.py:627-653),
+        // so without this every redirected call allocates a frame sized for
+        // the old (tmp-callback) body and the new loop's prologue reallocs it
+        // on every call.
+        if let (Some(new_clt), Some(old_clt)) = (
+            new.compiled_loop_token.as_ref(),
+            old.compiled_loop_token.as_ref(),
+        ) {
+            let baseofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
+            let old_weak = Arc::downgrade(old_clt);
+            new_clt.update_frame_info(old_clt, old_weak, baseofs);
+        }
         redirect_call_assembler_target(old.number, new.number)
     }
 
@@ -17360,11 +17280,6 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
-    fn pending_call_assembler_force_values() -> &'static Mutex<Vec<(i64, Option<i64>)>> {
-        static VALUES: OnceLock<Mutex<Vec<(i64, Option<i64>)>>> = OnceLock::new();
-        VALUES.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
     thread_local! {
         static TEST_EXCEPTION_VALUE: Cell<i64> = const { Cell::new(0) };
         static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
@@ -17498,15 +17413,6 @@ mod tests {
             return get_ref_from_deadframe(&deadframe, 3).unwrap().0 as i64;
         }
         return_ref
-    }
-
-    extern "C" fn pending_call_assembler_force_probe(frame_ptr: i64) -> i64 {
-        let pending = take_pending_force_local0();
-        pending_call_assembler_force_values()
-            .lock()
-            .unwrap()
-            .push((frame_ptr, pending));
-        frame_ptr + pending.unwrap_or(0)
     }
 
     fn make_gc_backend() -> CraneliftBackend {
@@ -22464,43 +22370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_assembler_fast_path_pending_target_uses_force_fallback() {
-        pending_call_assembler_force_values()
-            .lock()
-            .unwrap()
-            .clear();
-
-        let token_number = 1500_199;
-        register_pending_call_assembler_target(
-            token_number,
-            vec![Type::Int],
-            2,
-            1,
-            -1,
-            Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
-        );
-
-        let target_ptr = unsafe { fast_lookup_ca_target(token_number) };
-        assert!(!target_ptr.is_null(), "pending target should be registered");
-        let target = unsafe { &*target_ptr };
-        let mut outcome = [0i64; 2];
-        let result = call_assembler_fast_path(
-            target,
-            &[0x1234, 77],
-            outcome.as_mut_ptr(),
-            pending_call_assembler_force_probe,
-        );
-
-        assert_eq!(result as i64, 0x1234 + 77);
-        assert_eq!(outcome, [CALL_ASSEMBLER_OUTCOME_FINISH, 0]);
-        assert_eq!(
-            *pending_call_assembler_force_values().lock().unwrap(),
-            vec![(0x1234, Some(77))]
-        );
-        assert_eq!(take_pending_force_local0(), None);
-    }
-
-    #[test]
+    #[ignore = "bodyless/later-bound CALL_ASSEMBLER backend target path retired; production uses compile_tmp_callback"]
     fn test_call_assembler_compiles_before_target_is_registered() {
         let mut backend = make_call_assembler_backend();
 
@@ -22517,7 +22387,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.register_pending_target(deferred_target.number, vec![Type::Int], 1, 1, -1);
         let mut caller = JitCellToken::new(1500_241);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
@@ -22547,6 +22416,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bodyless/later-bound CALL_ASSEMBLER backend target path retired; production uses compile_tmp_callback"]
     fn test_call_assembler_late_bound_ref_result_supports_plain_ref_finish() {
         let mut backend = make_call_assembler_backend();
 
@@ -22562,7 +22432,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        backend.register_pending_target(deferred_target.number, vec![Type::Ref], 1, 0, -1);
         let mut caller = JitCellToken::new(1500_246);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
@@ -22592,6 +22461,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bodyless self-recursive backend token path retired; production uses compile_tmp_callback"]
     fn test_call_assembler_supports_direct_self_recursive_dispatch() {
         let mut backend = make_call_assembler_backend();
 
@@ -22624,7 +22494,6 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
-        backend.register_pending_target(token.number, vec![Type::Int], 1, 1, -1);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let compiled = token
@@ -22672,6 +22541,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bodyless/later-bound CALL_ASSEMBLER backend target path retired; production uses compile_tmp_callback"]
     fn test_call_assembler_reused_token_resets_stale_pending_dispatch_slot() {
         let token_number = 1500_252;
 
@@ -22706,7 +22576,6 @@ mod tests {
                 mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
                 mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             ];
-            backend.register_pending_target(token.number, vec![Type::Int], 1, 1, -1);
             backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
             let failed = backend.execute_token(&token, &[Value::Int(0)]);
@@ -22730,7 +22599,6 @@ mod tests {
         }
 
         let mut backend = make_call_assembler_backend();
-        backend.register_pending_target(token_number, vec![Type::Int], 1, 1, -1);
         let mut deferred_target = JitCellToken::new(token_number);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![

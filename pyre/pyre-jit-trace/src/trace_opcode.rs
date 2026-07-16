@@ -6164,73 +6164,90 @@ impl MIFrame {
                         is_self_recursive
                     );
                 }
-                if let Some(token) = driver.get_pending_token_arc(callee_key) {
+                if driver.get_pending_token_arc(callee_key).is_some() {
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
                     {
-                        let call_pc = self.fallthrough_pc.saturating_sub(1);
-                        return self.with_ctx(|this, ctx| {
-                            if !is_self_recursive {
-                                this.implement_guard_value(ctx, callable, concrete_callable as i64);
-                            }
-                            let self_recursive_raw_arg = if is_self_recursive
-                                && nargs == 1
-                                && matches!(concrete_arg0, Some(arg) if is_int(arg))
-                            {
-                                Some(this.trace_guarded_int_payload(ctx, args[0]))
-                            } else {
-                                None
-                            };
-                            let (callee_frame, drop_callee_frame) =
-                                emit_call_assembler_callee_frame(
-                                    this,
-                                    ctx,
-                                    callable,
-                                    args,
-                                    concrete_callable,
-                                    w_callee_code,
-                                    callee_code,
-                                    is_self_recursive,
-                                    self_recursive_raw_arg,
-                                )?;
-                            // pyjitpl.py:2017: do_residual_call step 1
-                            this.vable_and_vrefs_before_residual_call(ctx);
-                            let ec = this.ensure_execution_context(ctx);
-                            let ca_result = ctx.call_assembler_red_only_ref_arc(
-                                token,
-                                &[callee_frame, ec],
-                                &[Type::Ref, Type::Ref],
-                            );
-                            // pyjitpl.py:2080-2081 direct_assembler_call:
-                            // record KEEPALIVE on callee virtualizable so
-                            // it survives until the result is consumed.
-                            ctx.record_op(OpCode::Keepalive, &[callee_frame]);
-                            if drop_callee_frame {
-                                // Only the opaque arena-helper path needs the
-                                // explicit drop. Trace-visible PyFrames are
-                                // GC-owned and must not go through arena.put.
-                                ctx.call_void(
-                                    crate::callbacks::get().jit_drop_callee_frame,
-                                    &[callee_frame],
+                        let greenboxes = [
+                            Value::Int(0),
+                            Value::Int(0),
+                            Value::Ref(GcRef(w_callee_code as usize)),
+                        ];
+                        let red_types = [Type::Ref, Type::Ref];
+                        let token = driver.get_or_make_portal_assembler_token_arc(
+                            callee_key,
+                            &greenboxes,
+                            &red_types,
+                        );
+                        if let Some(token) = token {
+                            let call_pc = self.fallthrough_pc.saturating_sub(1);
+                            return self.with_ctx(|this, ctx| {
+                                if !is_self_recursive {
+                                    this.implement_guard_value(
+                                        ctx,
+                                        callable,
+                                        concrete_callable as i64,
+                                    );
+                                }
+                                let self_recursive_raw_arg = if is_self_recursive
+                                    && nargs == 1
+                                    && matches!(concrete_arg0, Some(arg) if is_int(arg))
+                                {
+                                    Some(this.trace_guarded_int_payload(ctx, args[0]))
+                                } else {
+                                    None
+                                };
+                                let (callee_frame, drop_callee_frame) =
+                                    emit_call_assembler_callee_frame(
+                                        this,
+                                        ctx,
+                                        callable,
+                                        args,
+                                        concrete_callable,
+                                        w_callee_code,
+                                        callee_code,
+                                        is_self_recursive,
+                                        self_recursive_raw_arg,
+                                    )?;
+                                // pyjitpl.py:2017: do_residual_call step 1
+                                this.vable_and_vrefs_before_residual_call(ctx);
+                                let ec = this.ensure_execution_context(ctx);
+                                let ca_result = ctx.call_assembler_red_only_ref_arc(
+                                    token,
+                                    &[callee_frame, ec],
+                                    &[Type::Ref, Type::Ref],
                                 );
-                            }
-                            // pyjitpl.py:2049
-                            this.vrefs_after_residual_call(ctx);
-                            // pyjitpl.py:2078
-                            this.vable_after_residual_call()?;
-                            // pyjitpl.py:2079
-                            this.push_call_replay_stack(ctx, callable, args, call_pc);
-                            this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
-                            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
-                            ctx.heap_cache_mut().invalidate_caches_for_escaped();
-                            this.pop_call_replay_stack(ctx, args.len())?;
-                            let result = if inline_framestack_active {
-                                ca_result // already Ref — no unbox+rebox needed
-                            } else {
-                                // Caller unboxes: guard_class + getfield_gc_i
-                                this.trace_guarded_int_payload(ctx, ca_result)
-                            };
-                            Ok(result)
-                        });
+                                // pyjitpl.py:2080-2081 direct_assembler_call:
+                                // record KEEPALIVE on callee virtualizable so
+                                // it survives until the result is consumed.
+                                ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+                                if drop_callee_frame {
+                                    // Only the opaque arena-helper path needs the
+                                    // explicit drop. Trace-visible PyFrames are
+                                    // GC-owned and must not go through arena.put.
+                                    ctx.call_void(
+                                        crate::callbacks::get().jit_drop_callee_frame,
+                                        &[callee_frame],
+                                    );
+                                }
+                                // pyjitpl.py:2049
+                                this.vrefs_after_residual_call(ctx);
+                                // pyjitpl.py:2078
+                                this.vable_after_residual_call()?;
+                                // pyjitpl.py:2079
+                                this.push_call_replay_stack(ctx, callable, args, call_pc);
+                                this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+                                ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                                this.pop_call_replay_stack(ctx, args.len())?;
+                                let result = if inline_framestack_active {
+                                    ca_result // already Ref — no unbox+rebox needed
+                                } else {
+                                    // Caller unboxes: guard_class + getfield_gc_i
+                                    this.trace_guarded_int_payload(ctx, ca_result)
+                                };
+                                Ok(result)
+                            });
+                        }
                     }
                 }
 
@@ -6876,6 +6893,18 @@ impl MIFrame {
         assembler_call: bool,
     ) -> Result<OpRef, PyError> {
         let (driver, _) = crate::driver::driver_pair();
+        let ca_token = if assembler_call {
+            let w_callee_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
+            let greenboxes = [
+                Value::Int(callee_raw.1 as i64),
+                Value::Int(0),
+                Value::Ref(GcRef(w_callee_code as usize)),
+            ];
+            let red_types = [Type::Ref, Type::Ref];
+            driver.get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types)
+        } else {
+            None
+        };
         let concrete_arg0 = if args.len() == 1 {
             passed_concrete_args.first().copied()
         } else {
@@ -6921,16 +6950,6 @@ impl MIFrame {
                         crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     } else {
                         crate::callbacks::get().jit_force_recursive_call_argraw_boxed_1
-                    };
-                    // pyjitpl.py:2053-2055: direct_assembler_call only when
-                    // assembler_call=True (computed in _opimpl_recursive_call).
-                    // Token lookup happens AFTER the decision, not before.
-                    let ca_token = if assembler_call {
-                        driver
-                            .get_loop_token_arc(callee_key)
-                            .or_else(|| driver.get_pending_token_arc(callee_key))
-                    } else {
-                        None
                     };
                     let raw_result = if let Some(token) = ca_token.as_ref() {
                         let w_callee_code = unsafe { pyre_interpreter::getcode(concrete_callable) };

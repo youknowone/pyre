@@ -2695,11 +2695,11 @@ impl GcRewriterImpl {
 
         // rewrite.py:673 — index_list = loop_token.compiled_loop_token._ll_initial_locs
         // RPython: compiled_loop_token is pre-allocated with the token;
-        // frame_info pointer is stable. Self-recursive calls go through
-        // register_pending_call_assembler_target() BEFORE tracing emits
-        // any CALL_ASSEMBLER op referencing this token.
+        // frame_info pointer is stable. Recursive calls emit against either a
+        // compiled token or a `compile_tmp_callback` token, so metadata must
+        // already exist before the rewriter sees CALL_ASSEMBLER.
         let callee_locs = lookup(token)
-            .expect("pending CALL_ASSEMBLER target must be registered before rewriter runs");
+            .expect("CALL_ASSEMBLER target metadata must be registered before rewriter runs");
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[gc-rewrite][call-assembler] token={} frame_info_ptr=0x{:x} ll_initial_locs={:?} frame_depth={} index_of_virtualizable={}",
