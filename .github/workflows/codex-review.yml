@@ -1,10 +1,20 @@
 name: codex-review
 
-# Static-analysis parity review of a PR's diff against the local RPython/PyPy
-# sources, run by the Codex CLI and posted back as a sticky PR comment. The
-# review prompt is the single source of truth in `.github/codex-review-prompt.md`,
-# shared with the `/codex-review` local skill. This job only *reports*; acting
-# on the findings is the skill's job.
+# Trigger half of the Codex parity review.
+#
+# `pull_request` runs in the PR's own context: for a PR from a fork that means
+# no secrets and a read-only token, so this workflow can neither run Codex nor
+# post to the PR. It only records which PR this is. `codex-review-run.yml`
+# picks that up through `workflow_run`, where the base repository's secrets are
+# available, and does the actual review.
+#
+# Nothing produced here is trusted. `pull_request` runs the workflow file from
+# the PR's merge commit, so a fork controls this file and everything it
+# uploads; the artifact below is a *claim* the runner re-verifies against the
+# base repository's own view of the PR before acting on it.
+#
+# The runner matches this workflow by name (`workflows: ["codex-review"]`).
+# Renaming it silently disables the review.
 
 on:
   pull_request:
@@ -15,144 +25,25 @@ concurrency:
   group: codex-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
-  codex-review:
-    name: Codex parity review
+  queue:
+    name: Queue Codex parity review
     # Skip draft PRs; the review fires once the PR is marked ready for review.
+    # With no artifact the runner finds nothing to review and stops.
     if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
-        with:
-          # Full history so `git diff upstream/main` has a merge base.
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Set up upstream/main as the review base
+      - name: Record the PR number
         env:
-          BASE_REPO: ${{ github.event.pull_request.base.repo.clone_url }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # `upstream` is the PR's base repository; `upstream/main` is the base
-          # the diff is measured against (matches the local skills' base).
-          # Pin it to the base SHA the PR event was computed against (the merge
-          # ref's first parent), NOT the branch tip: the tip can move between
-          # the event and this fetch, and a diff against a moved tip reports
-          # base-only commits as reversals introduced by the patch.
-          git remote add upstream "$BASE_REPO" 2>/dev/null || git remote set-url upstream "$BASE_REPO"
-          git fetch --no-tags upstream "$BASE_SHA" || git fetch --no-tags upstream "$BASE_REF:refs/remotes/upstream/main"
-          if git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-            git update-ref refs/remotes/upstream/main "$BASE_SHA"
-          fi
-          git log -1 --oneline refs/remotes/upstream/main
+          mkdir -p meta
+          printf '%s' "${PR_NUMBER}" > meta/pr-number
 
-      - name: Compute the patch file list
-        id: diff
-        run: |
-          git diff --name-only upstream/main > changed-files.txt
-          if [ -s changed-files.txt ]; then
-            echo "empty=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "empty=true" >> "$GITHUB_OUTPUT"
-            echo "The diff against the review base is empty; nothing to review." > report.md
-          fi
-
-      - name: Check Codex auth secret
-        id: auth
-        env:
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-        run: |
-          if [ -z "${CODEX_AUTH_JSON}" ]; then
-            echo "::notice::CODEX_AUTH_JSON secret is not set (e.g. a fork PR); skipping Codex review."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          node-version: 22
-
-      - name: Install Codex CLI
-        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
-        run: npm install -g @openai/codex
-
-      - name: Configure Codex auth (ChatGPT token)
-        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
-        env:
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-        run: |
-          mkdir -p "$HOME/.codex"
-          printf '%s' "${CODEX_AUTH_JSON}" > "$HOME/.codex/auth.json"
-          chmod 600 "$HOME/.codex/auth.json"
-
-      - name: Run Codex review
-        if: steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
-        run: |
-          set +e
-          PROMPT="$(cat .github/codex-review-prompt.md)
-
-          Authoritative changed-file list for this patch (git diff upstream/main --name-only):
-          $(cat changed-files.txt)"
-          codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.6-terra \
-            --output-last-message report.md \
-            "$PROMPT" </dev/null > codex.log 2>&1
-          status=$?
-          if [ ! -s report.md ]; then
-            {
-              echo "Codex did not produce a report (exit ${status}). Last log lines:"
-              echo
-              echo '```'
-              tail -n 60 codex.log
-              echo '```'
-            } > report.md
-          fi
-          # Never fail the job on a review error — the comment carries the detail.
-          exit 0
-
-      - name: Post sticky review comment
-        if: steps.auth.outputs.present == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- codex-parity-review -->';
-            let report = fs.readFileSync('report.md', 'utf8');
-            const LIMIT = 60000;
-            if (report.length > LIMIT) {
-              report = report.slice(0, LIMIT) +
-                '\n\n…report truncated; see the workflow logs for the full output.';
-            }
-            let files = '';
-            try { files = fs.readFileSync('changed-files.txt', 'utf8').trim(); } catch {}
-            const filesBlock = files
-              ? ['<details><summary>Files in the reviewed diff</summary>', '', '```', files, '```', '</details>', ''].join('\n')
-              : '';
-            const body = [
-              marker,
-              '## 🤖 Codex parity review',
-              `Static analysis of this diff vs the local RPython/PyPy sources (commit ${context.sha.slice(0, 7)}).`,
-              `Updated: ${new Date().toISOString()}`,
-              '',
-              filesBlock,
-              report,
-            ].join('\n');
-
-            const { owner, repo } = context.repo;
-            const issue_number = context.issue.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number, per_page: 100,
-            });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
+          name: codex-review-meta
+          path: meta/
+          retention-days: 1

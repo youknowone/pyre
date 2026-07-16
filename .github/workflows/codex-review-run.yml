@@ -1,0 +1,401 @@
+name: codex-review-run
+
+# Runner half of the Codex parity review: static analysis of a PR's diff
+# against the local RPython/PyPy sources, posted back as a sticky PR comment.
+# The review prompt is the single source of truth in
+# `.github/codex-review-prompt.md`, shared with the `/codex-review` local
+# skill. This job only *reports*; acting on the findings is the skill's job.
+#
+# `workflow_run` is what makes this work for PRs from forks. A `pull_request`
+# run of a fork PR gets no secrets, so the review used to skip itself silently
+# and still report green. This workflow instead runs in the base repository's
+# context, where `CODEX_AUTH_JSON` and a writable token are available.
+#
+# That context is privileged, so everything reaching it from the PR is treated
+# as untrusted input:
+#   - the PR number arrives via artifact from a workflow file the fork controls,
+#     so it is re-verified against this repository's own view of the PR;
+#   - the code is fetched from this repository's `refs/pull/*`, never from the
+#     fork remote or the artifact;
+#   - the prompt is read from the base commit, so a PR cannot rewrite the
+#     instructions Codex is given;
+#   - Codex runs sandboxed (no network for its shell commands) rather than with
+#     `--dangerously-bypass-approvals-and-sandbox`;
+#   - the report is scrubbed of the credential before it is posted;
+#   - fork PRs wait for a maintainer to approve the `codex-review` environment.
+#
+# This workflow only fires once it is on the default branch — `workflow_run`
+# never triggers from a PR branch.
+
+on:
+  workflow_run:
+    workflows: ["codex-review"]
+    types: [ completed ]
+
+concurrency:
+  # The PR number isn't known until the artifact is downloaded, but concurrency
+  # is evaluated before any step runs — key on the head instead. Branch names
+  # collide across forks, so the head repository has to be part of the key.
+  group: >-
+    codex-review-run-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  approve:
+    name: Approve fork review
+    # A fork PR is code nobody has read yet. Gate it on a maintainer approving
+    # the `codex-review` environment before the review job is handed the
+    # credential. Same-repo PRs skip this job and review immediately.
+    #
+    # A draft PR skips the trigger job, which leaves the run `skipped` rather
+    # than `success` — without that guard a draft fork PR would raise an
+    # approval request for a review that has nothing to do.
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_repository.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    environment: codex-review
+    steps:
+      - name: Record what was approved
+        env:
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: echo "Approved Codex review of ${HEAD_REPO}@${HEAD_SHA}"
+
+  review:
+    name: Codex parity review
+    needs: [approve]
+    # `approve` is skipped for same-repo PRs and must have succeeded for forks.
+    if: >-
+      ${{ always() && github.event.workflow_run.conclusion == 'success'
+      && (needs.approve.result == 'success' || needs.approve.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download the trigger's PR metadata
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-review-meta
+          path: meta
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve and verify which PR this run belongs to
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ ! -s meta/pr-number ]; then
+            echo "::notice::No PR metadata artifact (draft PR, or the trigger was skipped); nothing to review."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PR_NUMBER="$(tr -cd '0-9' < meta/pr-number)"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::PR metadata artifact does not contain a number."
+            exit 1
+          fi
+
+          # The artifact was produced in the PR's own context, where a fork
+          # controls the workflow file — so the number is a claim, not a fact.
+          # Bind it to this run: the PR it names must have exactly the head this
+          # run was triggered for. Without this check a fork could point the
+          # review at an unrelated PR and post a report on it.
+          pr_json="$(gh api "/repos/${REPO}/pulls/${PR_NUMBER}")"
+          claim_sha="$(jq -r '.head.sha' <<<"$pr_json")"
+          claim_repo="$(jq -r '.head.repo.full_name' <<<"$pr_json")"
+          if [ "$claim_sha" != "$HEAD_SHA" ] || [ "$claim_repo" != "$HEAD_REPO" ]; then
+            echo "::error::PR #${PR_NUMBER} is ${claim_repo}@${claim_sha}, but this run is for ${HEAD_REPO}@${HEAD_SHA}; refusing to review."
+            exit 1
+          fi
+
+          {
+            echo "skip=false"
+            echo "number=${PR_NUMBER}"
+            echo "base_sha=$(jq -r '.base.sha' <<<"$pr_json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mark the review as pending on the PR
+        if: steps.pr.outputs.skip == 'false'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'pending',
+              context: 'Codex parity review',
+              target_url: process.env.RUN_URL,
+              description: 'Reviewing the diff against RPython/PyPy…',
+            });
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        if: steps.pr.outputs.skip == 'false'
+        with:
+          # Full history so `git diff upstream/main` has a merge base.
+          fetch-depth: 0
+          # Leave no token in the working tree: Codex reads this checkout.
+          persist-credentials: false
+
+      - name: Check out the PR's code from this repository's refs
+        if: steps.pr.outputs.skip == 'false'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          API_BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # `refs/pull/*` on the base repository — never the fork remote, so the
+          # fork cannot serve different content than the PR shows.
+          if git fetch --no-tags origin "refs/pull/${PR_NUMBER}/merge"; then
+            git checkout --detach FETCH_HEAD
+            # The merge ref's parents are (base, head). Its first parent is the
+            # exact base the PR event was computed against — pinning to that,
+            # rather than the branch tip, keeps a diff from reporting base-only
+            # commits as reversals when main moves underneath us.
+            BASE_SHA="$(git rev-parse HEAD^1)"
+            MERGE_HEAD="$(git rev-parse HEAD^2)"
+            if [ "$MERGE_HEAD" != "$HEAD_SHA" ]; then
+              echo "::error::Merge ref for PR #${PR_NUMBER} carries head ${MERGE_HEAD}, expected ${HEAD_SHA}."
+              exit 1
+            fi
+          else
+            # A conflicted PR has no merge ref; review the head against the base
+            # the API reports.
+            echo "::notice::PR #${PR_NUMBER} has no merge ref (conflicts?); reviewing the head ref."
+            git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+            git checkout --detach FETCH_HEAD
+            FETCHED="$(git rev-parse HEAD)"
+            if [ "$FETCHED" != "$HEAD_SHA" ]; then
+              echo "::error::Head ref for PR #${PR_NUMBER} is ${FETCHED}, expected ${HEAD_SHA}."
+              exit 1
+            fi
+            BASE_SHA="$API_BASE_SHA"
+            git fetch --no-tags origin "$BASE_SHA"
+          fi
+          # `upstream/main` is the base the diff is measured against, matching
+          # the local skills' base.
+          git update-ref refs/remotes/upstream/main "$BASE_SHA"
+          git log -1 --oneline refs/remotes/upstream/main
+
+      - name: Read the review prompt from the base commit
+        if: steps.pr.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          # From `upstream/main`, not the checked-out tree: the tree contains the
+          # PR's changes, and a PR that edits the prompt would otherwise be
+          # dictating its own review instructions.
+          git show upstream/main:.github/codex-review-prompt.md > review-prompt.md
+
+      - name: Check Codex auth secret
+        id: auth
+        if: steps.pr.outputs.skip == 'false'
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -z "${CODEX_AUTH_JSON}" ]; then
+            echo "::warning::CODEX_AUTH_JSON is not set; reporting the skip rather than reviewing."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "The \`CODEX_AUTH_JSON\` secret is not set, so no review ran." > report.md
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute the patch file list
+        id: diff
+        if: steps.pr.outputs.skip == 'false'
+        run: |
+          git diff --name-only upstream/main > changed-files.txt
+          if [ -s changed-files.txt ]; then
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "The diff against the review base is empty; nothing to review." > report.md
+          fi
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: steps.pr.outputs.skip == 'false' && steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
+        with:
+          node-version: 22
+
+      - name: Install Codex CLI
+        if: steps.pr.outputs.skip == 'false' && steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
+        run: npm install -g @openai/codex
+
+      - name: Configure Codex auth (ChatGPT token)
+        if: steps.pr.outputs.skip == 'false' && steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          mkdir -p "$HOME/.codex"
+          printf '%s' "${CODEX_AUTH_JSON}" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Run Codex review
+        if: steps.pr.outputs.skip == 'false' && steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false'
+        run: |
+          set +e
+          PROMPT="$(cat review-prompt.md)
+
+          Authoritative changed-file list for this patch (git diff upstream/main --name-only):
+          $(cat changed-files.txt)"
+          # `-s workspace-write`, not `--dangerously-bypass-approvals-and-sandbox`:
+          # the diff under review is untrusted and a review only needs to read.
+          # The sandbox denies the model's shell commands network access, which
+          # is what stops an injected prompt from exfiltrating the credential.
+          codex exec -s workspace-write -m gpt-5.6-terra \
+            --output-last-message report.md \
+            "$PROMPT" </dev/null > codex.log 2>&1
+          status=$?
+          if [ ! -s report.md ]; then
+            {
+              echo "Codex did not produce a report (exit ${status}). Last log lines:"
+              echo
+              echo '```'
+              tail -n 60 codex.log
+              echo '```'
+            } > report.md
+          fi
+          # Never fail the job on a review error — the comment carries the detail.
+          exit 0
+
+      - name: Scrub the credential from the report
+        if: ${{ always() && steps.pr.outputs.skip == 'false' }}
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          # Actions masks secrets in logs, but not in a comment body posted
+          # through the API. The sandbox denies the model network access, so the
+          # report is the one channel an injected prompt could push the
+          # credential through — close it here.
+          python3 - <<'PY'
+          import json, os
+
+          raw = os.environ.get("CODEX_AUTH_JSON", "")
+          try:
+              with open("report.md", encoding="utf-8") as fh:
+                  report = fh.read()
+          except FileNotFoundError:
+              raise SystemExit(0)
+
+          values = set()
+
+          def walk(node):
+              if isinstance(node, dict):
+                  for item in node.values():
+                      walk(item)
+              elif isinstance(node, list):
+                  for item in node:
+                      walk(item)
+              # Short strings are structural ("openai", "gpt-5"); only long ones
+              # are credential-shaped, and replacing short ones would corrupt
+              # legitimate report text.
+              elif isinstance(node, str) and len(node) >= 16:
+                  values.add(node)
+
+          if raw:
+              values.add(raw.strip())
+              try:
+                  walk(json.loads(raw))
+              except ValueError:
+                  pass
+
+          hits = 0
+          for value in sorted(values, key=len, reverse=True):
+              hits += report.count(value)
+              report = report.replace(value, "***")
+
+          with open("report.md", "w", encoding="utf-8") as fh:
+              fh.write(report)
+          if hits:
+              print(f"::warning::Scrubbed {hits} credential occurrence(s) from the report.")
+          PY
+
+      - name: Post sticky review comment
+        if: ${{ always() && steps.pr.outputs.skip == 'false' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- codex-parity-review -->';
+            let report;
+            try {
+              report = fs.readFileSync('report.md', 'utf8');
+            } catch {
+              report = 'The review job failed before producing a report; see the workflow logs.';
+            }
+            const LIMIT = 60000;
+            if (report.length > LIMIT) {
+              report = report.slice(0, LIMIT) +
+                '\n\n…report truncated; see the workflow logs for the full output.';
+            }
+            let files = '';
+            try { files = fs.readFileSync('changed-files.txt', 'utf8').trim(); } catch {}
+            const filesBlock = files
+              ? ['<details><summary>Files in the reviewed diff</summary>', '', '```', files, '```', '</details>', ''].join('\n')
+              : '';
+            const sha = process.env.HEAD_SHA;
+            const body = [
+              marker,
+              '## 🤖 Codex parity review',
+              `Static analysis of this diff vs the local RPython/PyPy sources (commit ${sha.slice(0, 7)}).`,
+              `Updated: ${new Date().toISOString()}`,
+              '',
+              filesBlock,
+              report,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR_NUMBER);
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Report the outcome as a commit status
+        if: ${{ always() && steps.pr.outputs.skip == 'false' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+          REVIEWED: ${{ steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false' }}
+        with:
+          script: |
+            // `workflow_run` runs are not attached to the PR's check suite, so
+            // without this the review is invisible on the PR — which is how a
+            // skipped review previously passed for green.
+            const ok = process.env.JOB_STATUS === 'success';
+            const reviewed = process.env.REVIEWED === 'true';
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.HEAD_SHA,
+              state: ok ? 'success' : 'failure',
+              context: 'Codex parity review',
+              target_url: process.env.RUN_URL,
+              description: ok
+                ? (reviewed ? 'Review posted as a PR comment' : 'Nothing to review — see the PR comment')
+                : 'The review job failed; see the logs',
+            });
