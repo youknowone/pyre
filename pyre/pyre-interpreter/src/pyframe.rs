@@ -2130,6 +2130,18 @@ impl PyFrame {
         self.locals_w()[self.valuestackdepth - 1 - depth]
     }
 
+    /// Null the locals_cells_stack slots at and above `depth`, the
+    /// fresh-frame parity clear (`write_from_resume_data_partial` does not
+    /// trim).  Used after a resume-time `valuestackdepth` correction so a GC
+    /// scan before the next push does not observe a stale operand pointer
+    /// above the live depth.
+    pub fn clear_stack_above(&mut self, depth: usize) {
+        let arr = self.locals_w_mut().as_mut_slice();
+        for slot in arr.iter_mut().skip(depth) {
+            *slot = PY_NULL;
+        }
+    }
+
     /// PyPy-compatible stack operation aliases.
     #[inline]
     pub fn pushvalue(&mut self, value: PyObjectRef) {

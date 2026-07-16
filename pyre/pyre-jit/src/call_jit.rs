@@ -2240,6 +2240,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                 frame.execution_context = ec;
             }
             frame.set_last_instr_from_next_instr(next_instr);
+            // The blackhole wrote the failing guard's recorded operand depth
+            // into the frame; resuming at the merge-point `next_instr` (a
+            // different pc) would carry that over-count and overflow the frame
+            // at its peak stack use.  Re-derive the depth from the resume pc —
+            // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
+            crate::eval::correct_resume_vsd(frame, next_instr);
             match crate::eval::portal_runner_result(frame) {
                 Ok(result) => Some(result as i64),
                 Err(err) => {

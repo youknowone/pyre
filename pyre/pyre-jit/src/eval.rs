@@ -5281,6 +5281,43 @@ enum HandleFailOutcome {
     BridgeRaised(PyError),
 }
 
+/// Re-derive `frame.valuestackdepth` from the resume pc `resume_pc` and null
+/// the operand slots above it.  A blackhole guard-failure resume writes the
+/// failing guard's own recorded operand depth into the frame; when the handoff
+/// resumes at a different pc (a merge point) that depth over-counts, so the loop
+/// header's pushes overflow the frame at its peak stack use.  Re-derive the
+/// operand depth from the actual resume pc, mirroring the bridge path's
+/// `depth_based_vsd_for_wcode` correction.  Shared by every blackhole resume leg
+/// (the eval.rs CRN arms via [`apply_blackhole_crn_handoff`] and the
+/// CALL_ASSEMBLER arm in `handle_blackhole_result`) so the resume coordinate and
+/// its operand depth stay consistent.  A `None` depth (missing liveness) leaves
+/// the frame untouched, matching the bridge path's skip-on-None.
+#[majit_macros::dont_look_inside]
+pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
+    if let Some(corrected) =
+        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, resume_pc)
+    {
+        frame.valuestackdepth = corrected;
+        frame.clear_stack_above(corrected);
+    }
+}
+
+/// Blackhole `ContinueRunningNormally` handoff: resume `frame` at the
+/// merge-point next_instr carried in `green_int[0]` and re-derive its
+/// `valuestackdepth` from that resume pc via [`correct_resume_vsd`].
+///
+/// warmspot.py:961 `handle_jitexception` parity — the CRN carries the
+/// merge-point args, so the frame restarts at the merge point, not the
+/// guard-failure pc.
+#[majit_macros::dont_look_inside]
+fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
+    let Some(&ni) = green_int.first() else {
+        return;
+    };
+    frame.set_last_instr_from_next_instr(ni as usize);
+    correct_resume_vsd(frame, ni as usize);
+}
+
 /// compile.py:701-717 handle_fail.
 ///
 /// Single function containing the complete guard failure handling:
@@ -5701,15 +5738,7 @@ fn execute_assembler(
                             green_int,
                             ..
                         } => {
-                            // warmspot.py:961 handle_jitexception parity:
-                            // CRN carries merge-point args. Write next_instr
-                            // back to the frame so eval_loop_jit restarts at
-                            // the merge point, not the guard-failure PC.
-                            if let Some(&ni) = green_int.first() {
-                                frame_root
-                                    .frame()
-                                    .set_last_instr_from_next_instr(ni as usize);
-                            }
+                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             Some(LoopResult::ContinueRunningNormally)
                         }
                         crate::call_jit::BlackholeResult::DoneWithThisFrameRef(v) => {
@@ -6019,12 +6048,7 @@ fn bound_reached(
                             green_int,
                             ..
                         } => {
-                            // warmspot.py:961 parity: write merge-point PC
-                            if let Some(&ni) = green_int.first() {
-                                frame_root
-                                    .frame()
-                                    .set_last_instr_from_next_instr(ni as usize);
-                            }
+                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             return Some(LoopResult::ContinueRunningNormally);
                         }
                         crate::call_jit::BlackholeResult::Failed => {}
@@ -6217,20 +6241,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             green_int,
                             ..
                         } => {
-                            // warmspot.py:961 handle_jitexception parity: CRN
-                            // carries merge-point args. Write next_instr back
-                            // to the frame so the fall-through eval_loop_jit
-                            // restarts at the merge point, not the
-                            // guard-failure PC. Without this the frame keeps
-                            // the guard's PC (whose operand depth the
-                            // merge-point resume does not restore) and the
-                            // interpreter underflows on the next pop. Mirrors
-                            // the execute_assembler CRN arm.
-                            if let Some(&ni) = green_int.first() {
-                                frame_root
-                                    .frame()
-                                    .set_last_instr_from_next_instr(ni as usize);
-                            }
+                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             // Fall through to eval_loop_jit
                         }
                         crate::call_jit::BlackholeResult::Failed => {
