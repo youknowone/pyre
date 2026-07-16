@@ -12,6 +12,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -89,6 +90,15 @@ BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
 BENCH_COMPARE_BUFFER_S = 0.005
+# Empty-program user-CPU startup is MEASURED per interpreter/backend (median of
+# STARTUP_SAMPLES runs) and subtracted from every timed run before ratios and
+# perf gates are computed, so a large fixed startup — notably wasmtime
+# recompiling the ~14MB module on every process spawn (~0.12s user-CPU) — does
+# not inflate the ratio/gate of a short bench. Never hardcode the startup.
+# Floored so a bench at/below its own startup (or noise) cannot drive a time
+# to <= 0 and blow up a ratio.
+STARTUP_SAMPLES = 3
+EXEC_TIME_FLOOR_S = 0.005
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S below).
@@ -536,6 +546,9 @@ class Check:
         self.pass_count = {}
         self.fail_count = {}
         self.pyre = {}
+        # interpreter/backend key -> measured empty-program user-CPU startup (s).
+        # Populated by measure_startups(); missing key => 0.0 (no subtraction).
+        self.startup = {}
         self.snapshot_diffs = []
         self.snapshot_missing = []
         self.jitstats_diffs = []
@@ -560,6 +573,69 @@ class Check:
             # Default wasm headroom composes with --timeout-scale.
             return WASM_TIMEOUT_SCALE * self.args.timeout_scale
         return self.args.timeout_scale
+
+    def measure_startups(self):
+        """Measure each timed interpreter/backend's empty-program user-CPU cost.
+
+        Runs an empty script STARTUP_SAMPLES times per interpreter and records
+        the median user-CPU in self.startup. This is the fixed per-process cost
+        (interpreter init; for wasm, wasmtime recompiling the module) added to
+        every bench regardless of workload; subtracting it yields an
+        execution-only comparison. No-op under --no-startup-subtract.
+        """
+        if self.args.no_startup_subtract:
+            return
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False
+        ) as handle:
+            empty_path = handle.name  # zero-length program
+        try:
+            targets = [
+                ("cpython", [PYTHON3, empty_path], None),
+                ("pypy", [PYPY3, empty_path], None),
+            ]
+            for backend in ALL_BACKENDS:
+                if self.enabled(backend):
+                    targets.append(
+                        (backend, [self._pyre(backend), empty_path], pyre_env())
+                    )
+            parts = []
+            for key, cmd, env in targets:
+                samples = []
+                for _ in range(STARTUP_SAMPLES):
+                    _out, elapsed, code, _err = run_timed(
+                        cmd, timeout_s=60, env=env,
+                    )
+                    if code != 0:
+                        samples = []
+                        break
+                    samples.append(elapsed)
+                startup = statistics.median(samples) if samples else 0.0
+                self.startup[key] = startup
+                parts.append(f"{key}={startup:.3f}s")
+            print(dim(
+                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}; "
+                f"ratios/gates are execution-only): " + " ".join(parts)
+            ))
+        finally:
+            try:
+                os.unlink(empty_path)
+            except OSError:
+                pass
+
+    def _exec_time(self, key, t):
+        """Startup-subtracted user-CPU for interpreter *key*, floored.
+
+        Returns *t* unchanged when subtraction is disabled or *t* is
+        unavailable ("-"/None). Never returns <= 0 (floored to
+        EXEC_TIME_FLOOR_S) so downstream ratios cannot divide by ~0.
+        """
+        if t is None or t == "-":
+            return t
+        value = float(t)
+        if self.args.no_startup_subtract:
+            return value
+        return max(value - self.startup.get(key, 0.0), EXEC_TIME_FLOOR_S)
 
     def _set_pyre(self, backend, path):
         self.pyre[backend] = path
@@ -910,10 +986,18 @@ class Check:
 
     def _performance_gate_passed(
         self, backend, script, timeout, elapsed, limit, baseline_time,
-        baseline_cmd, expected_output,
+        baseline_cmd, expected_output, baseline_key,
     ):
-        """Check one performance ratio, retrying a failure by median."""
-        if elapsed <= baseline_time * limit + BENCH_COMPARE_BUFFER_S:
+        """Check one performance ratio, retrying a failure by median.
+
+        The pass/fail decision compares execution-only (startup-subtracted)
+        times; the returned elapsed/baseline stay raw for reporting.
+        """
+        if (
+            self._exec_time(backend, elapsed)
+            <= self._exec_time(baseline_key, baseline_time) * limit
+            + BENCH_COMPARE_BUFFER_S
+        ):
             return True, elapsed, baseline_time, ""
 
         retry = self._retry_performance_gate(
@@ -921,7 +1005,11 @@ class Check:
         )
         if retry is not None:
             median_elapsed, median_baseline = retry
-            if median_elapsed <= median_baseline * limit + BENCH_COMPARE_BUFFER_S:
+            if (
+                self._exec_time(backend, median_elapsed)
+                <= self._exec_time(baseline_key, median_baseline) * limit
+                + BENCH_COMPARE_BUFFER_S
+            ):
                 return True, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
             return False, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
 
@@ -977,15 +1065,20 @@ class Check:
             self._append_comparison(backend, name, t_cpython, t_pypy, "WRONG")
             return
 
-        ratio = "-"
-        if t_pypy not in (None, "-") and float(t_pypy) > 0 and elapsed > 0:
-            ratio = f"{elapsed / float(t_pypy):.1f}x"
+        def _ratio(elapsed_val, pypy_val):
+            num = self._exec_time(backend, elapsed_val)
+            den = self._exec_time("pypy", pypy_val)
+            if den in (None, "-") or float(den) <= 0 or num in (None, "-"):
+                return "-"
+            return f"{float(num) / float(den):.1f}x"
+
+        ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
 
         retry_note = ""
         if vs_cpython and t_cpython not in (None, "-"):
             passed, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_cpython, float(t_cpython),
-                [PYTHON3, script], pypy_output,
+                [PYTHON3, script], pypy_output, "cpython",
             )
             if not passed:
                 self._record(
@@ -1001,12 +1094,12 @@ class Check:
                 return
             if retry_note:
                 elapsed = checked_elapsed
-                ratio = f"{elapsed / float(t_pypy):.1f}x" if float(t_pypy) > 0 else "-"
+                ratio = _ratio(elapsed, t_pypy)
 
         if vs_pypy and t_pypy not in (None, "-"):
             passed, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
-                [PYPY3, script], pypy_output,
+                [PYPY3, script], pypy_output, "pypy",
             )
             if not passed:
                 self._record(
@@ -1023,7 +1116,7 @@ class Check:
             if retry_note:
                 elapsed = checked_elapsed
                 t_pypy = f"{checked_baseline:.2f}"
-                ratio = f"{elapsed / checked_baseline:.1f}x" if checked_baseline > 0 else "-"
+                ratio = _ratio(elapsed, t_pypy)
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, script, output, stderr, elapsed,
@@ -1411,6 +1504,12 @@ def parse_args():
         "but recompiles the module each start) or wasmi (interpreter, near-zero "
         "startup, slower loops)",
     )
+    parser.add_argument(
+        "--no-startup-subtract",
+        action="store_true",
+        help="do not measure/subtract each interpreter's empty-program user-CPU "
+        "startup from ratios and perf gates (report raw times incl. startup)",
+    )
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--dynasm-timeout-scale", type=float, default=None)
     parser.add_argument("--cranelift-timeout-scale", type=float, default=None)
@@ -1503,6 +1602,7 @@ def main():
     print(bold("pyre pre-merge check"))
     chk.print_backend_config()
     print()
+    chk.measure_startups()
     if not args.synthetic_only:
         chk.warmup(f"{BENCH_DIR}/int_loop.py")
         print()
