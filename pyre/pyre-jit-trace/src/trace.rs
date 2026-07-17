@@ -913,15 +913,21 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// reconstructed-frame walk plumbing before result-threading + the root walk
 /// are wired. The compile leg is unconditional.
 /// Thread a reconstructed callee's `SubReturn` value into the root portal's
-/// operand-stack result register so the subsequent root walk
-/// (`run_perfn_walk`'s bridge seeding) reads it as the call result at `root_pc`.
+/// residual-call result register so the subsequent root walk reads it as the
+/// call result at `root_pc`.
 ///
 /// `make_result_of_lastop` writes the result to the residual-call body's
 /// trailing `>r` destination byte, so use that register when the call ending at
 /// `root_pc` can be decoded.  Fall back to the codewriter-baked result-color
 /// trivia twin keyed by the call's JitCode pc for older shapes that lack the
-/// canonical residual-call encoding.  Returns `false` (caller declines the
-/// compile) when the register is unresolved.
+/// canonical residual-call encoding.
+///
+/// The result is always mirrored into `bridge_registers_r` for interior-entry
+/// bridge walks, whose Ref-bank seed is color-indexed.  Opcode-entry bridge
+/// walks rebuild slot-indexed locals and operand-stack values from
+/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so mirror the destination
+/// there too.  Returns `false` (caller declines the compile) when the register
+/// is unresolved.
 fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
     if sym.jitcode.is_null() {
         return false;
@@ -944,7 +950,14 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
         }
         bridge_regs[result_reg] = result;
     }
-    if result_reg >= nlocals {
+    if result_reg < nlocals {
+        if let Some(ref mut locals) = sym.bridge_local_oprefs {
+            if locals.len() <= result_reg {
+                locals.resize(result_reg + 1, majit_ir::OpRef::NONE);
+            }
+            locals[result_reg] = result;
+        }
+    } else {
         let slot = result_reg - nlocals;
         let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
         if bridge.len() <= slot {
