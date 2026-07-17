@@ -5138,21 +5138,22 @@ fn exception_group_copy_attrs(
     Ok(())
 }
 
-fn exception_group_derive_from(
-    w_self: PyObjectRef,
-    exceptions: Vec<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
-    let (message, _) = exception_group_fields(w_self)?;
-    let cls = crate::typedef::r#type(w_self).unwrap();
-    let list = pyre_object::w_list_new(exceptions);
-    crate::call::call_function_impl_result(cls, &[message, list])
-}
-
 fn exception_group_derive_and_copy(
     w_self: PyObjectRef,
     exceptions: Vec<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let group = exception_group_derive_from(w_self, exceptions)?;
+    // _derive_and_copy_attrs: construct the sub-result through the overridable
+    // `derive` method so a subclass can control reconstruction (e.g. thread
+    // extra constructor args), then copy the metadata attrs onto it.
+    let derive = crate::baseobjspace::getattr_str(w_self, "derive")?;
+    let list = pyre_object::w_list_new(exceptions);
+    let group = crate::call::call_function_impl_result(derive, &[list])?;
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if !crate::baseobjspace::isinstance(group, base_group)? {
+        return Err(crate::PyError::type_error(
+            "derive must return an instance of BaseExceptionGroup",
+        ));
+    }
     exception_group_copy_attrs(w_self, group)?;
     Ok(group)
 }
@@ -5409,9 +5410,13 @@ fn exception_group_derive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "derive() takes exactly one argument",
         ));
     }
+    // The default derive constructs a BaseExceptionGroup (promoted to
+    // ExceptionGroup when every leaf is an Exception), NOT `type(self)`: a
+    // subclass that adds constructor args must override `derive` to preserve
+    // its type, otherwise split/subgroup fall back to the base class.
     let (message, _) = exception_group_fields(args[0])?;
-    let cls = crate::typedef::r#type(args[0]).unwrap();
-    crate::call::call_function_impl_result(cls, &[message, args[1]])
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    crate::call::call_function_impl_result(base_group, &[message, args[1]])
 }
 
 fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5485,7 +5490,15 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                     ns,
                     "__new__",
                     make_builtin_function("__new__", exception_group_new),
-                )
+                );
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__class_getitem__",
+                    pyre_object::function::w_classmethod_new(make_builtin_function(
+                        "__class_getitem__",
+                        crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    )),
+                );
             };
         },
         bases,
