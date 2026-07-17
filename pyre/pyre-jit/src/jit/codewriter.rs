@@ -12646,6 +12646,8 @@ impl CodeWriter {
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
+        let n_py_instrs = u32::try_from(first_jit_pc_by_py_pc.len())
+            .expect("Python instruction count must fit metadata");
         let first_insn_base = pc_map.len() + after_call_some.len();
         for (k, (py_pc, _)) in first_insn_some.iter().enumerate() {
             first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
@@ -13015,6 +13017,7 @@ impl CodeWriter {
             after_residual_call_resume_marker_by_jit_pc,
             after_residual_call_resume_pred_by_jit_pc,
             first_jit_pc_by_py_pc,
+            n_py_instrs,
             block_head_py_by_jit_pc,
             py_floor_by_jit_pc,
             carryfwd_resume_pc,
@@ -13052,6 +13055,11 @@ impl CodeWriter {
         };
 
         if pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+            assert_eq!(
+                metadata.n_py_instrs as usize,
+                metadata.first_jit_pc_by_py_pc.len(),
+                "PCMAP_PIVOT Python instruction count diverges from first-jit map",
+            );
             for jit_pc in 0..jitcode.body().code.len() {
                 assert_eq!(
                     metadata

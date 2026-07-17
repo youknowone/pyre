@@ -12435,7 +12435,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 (
                     py,
                     jc.index as u32,
-                    jc.payload.metadata.first_jit_pc_by_py_pc.len(),
+                    if jc.payload.metadata.n_py_instrs == 0 {
+                        jc.payload.metadata.first_jit_pc_by_py_pc.len()
+                    } else {
+                        jc.payload.metadata.n_py_instrs as usize
+                    },
                 )
             };
             // #67/#124: synthetic loop-close guard pc overshoots past the last

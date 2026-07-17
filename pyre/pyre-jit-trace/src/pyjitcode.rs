@@ -72,6 +72,11 @@ pub struct PyJitCodeMetadata {
     /// the exact inverse (jitcode pc → containing Python opcode) for
     /// guard resume coordinates, which this table provides.  Same length
     pub first_jit_pc_by_py_pc: Vec<usize>,
+    /// Number of Python instructions in the source CodeObject. Drained
+    /// installs source this from the same allocation length as
+    /// `first_jit_pc_by_py_pc`; zero retains the table-length fallback for
+    /// skeleton and fixture metadata.
+    pub n_py_instrs: u32,
     /// Inverse of the derived marker resolution's block-head case: each distinct
     /// `-live-` marker byte offset that some PC resolves to → the first Python PC
     /// that resolves to it. Portal JitCodes emit live frame/global reads at
@@ -850,6 +855,7 @@ impl PyJitCode {
                 after_residual_call_resume_marker_by_jit_pc: Vec::new(),
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
+                n_py_instrs: 0,
                 block_head_py_by_jit_pc: Vec::new(),
                 py_floor_by_jit_pc: Vec::new(),
                 carryfwd_resume_pc: Vec::new(),
