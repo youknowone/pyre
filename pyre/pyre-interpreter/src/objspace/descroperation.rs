@@ -2491,6 +2491,12 @@ pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
         if lhs_num && rhs_num {
+            // intobject.py:356-360 `_divmod` — a zero integer divisor reports
+            // divmod's own "integer divmod by zero"; a float operand instead
+            // falls through to floordiv/mod (which report "float modulo").
+            if is_int_or_long(a) && is_int_or_long(b) && !is_true(b)? {
+                return Err(PyError::zero_division("integer divmod by zero"));
+            }
             let q = floordiv(a, b)?;
             let r = mod_(a, b)?;
             return Ok(w_tuple_new(vec![q, r]));
@@ -2857,6 +2863,12 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
         if lhs_num && rhs_num {
+            // intobject.py:356-360 `_divmod` — a zero integer divisor reports
+            // divmod's own "integer divmod by zero"; a float operand instead
+            // falls through to floordiv/mod (which report "float modulo").
+            if is_int_or_long(a) && is_int_or_long(b) && !is_true(b)? {
+                return Err(PyError::zero_division("integer divmod by zero"));
+            }
             let q = floordiv(a, b)?;
             let r = mod_(a, b)?;
             return Ok(w_tuple_new(vec![q, r]));
