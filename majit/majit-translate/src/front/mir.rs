@@ -6100,36 +6100,32 @@ impl<'a> Lowering<'a> {
                 // `box_assume_init_into_vec_unsafe(box [e0, …, eN])`, whose
                 // `box_assume_init` primitive is unregistered, so the legacy
                 // CodeWriter residualizes it as a plain call (the same
-                // treatment `w_int_new` / `w_float_new` get).  An earlier
-                // recognizer rewrote this shape to `OpKind::NewList` (feeding
-                // the now-repr-generic `rtype_newlist`, which decomposes it to
-                // `ll_fixed_newlist` + `ll_fixed_setitem_fast` for a
-                // never-mutated vec! `FixedSizeListRepr`), but the front-end
-                // rewrite is UNCONDITIONAL: it plants `NewList` into a graph
-                // regardless of whether that graph two-phase lifts or drops to
-                // the legacy walker.  The legacy walker never runs
-                // `rtype_newlist`, so a dropped graph's raw `NewList` reaches
-                // the assembler's default arm and emits `newlist/r>r` — an
-                // opname with no blackhole handler — breaking the build via
-                // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
+                // treatment `w_int_new` / `w_float_new` get).  A recognizer
+                // that rewrites this shape to `OpKind::NewList` (feeding the
+                // repr-generic `rtype_newlist`) is UNCONDITIONAL: it plants
+                // `NewList` into a graph regardless of whether that graph
+                // two-phase lifts or drops to the legacy walker, and the legacy
+                // walker never runs `rtype_newlist`, so a dropped graph's raw
+                // `NewList` reaches the assembler default arm and emits
+                // `newlist/r>r` — an opname with no blackhole handler —
+                // breaking `default_bh_builder_unwired_set_matches_task_85_snapshot`.
                 //
-                // Slice-C measurement (7/18, base 0bdfdb85781, AFTER wall-1 +
-                // wall-2 both closed): re-adding the recognizer STILL trips the
-                // snapshot with `newlist/r>r`.  Wall-1 (cross-block Link box
-                // sweep, `prune_dead_boxing_remnants`) and wall-2 (set/frozenset
-                // constant-`ob_type` monomorphization → `fuse_boxing_alloc`)
-                // are landed and census-verified (head 274→267, `w_set_new`
-                // fully lifts, set `malloc_typed` fuses), but at least one
-                // vec!-bearing graph beyond `make_generic_alias` /
-                // `set_method_difference` still drops to the legacy walker
-                // carrying a raw `NewList`.  The census only surfaces a graph's
-                // FIRST wall, so the blocking graph is one whose earlier wall
-                // hides its vec!; it must be identified (census scan for every
-                // `box_assume_init_into_vec_unsafe` producer graph, then trace
-                // why it fails phaseA) and its wall closed before the recognizer
-                // is safe.  Until then the residual call is the correct
-                // lowering; `rtype_newlist`'s Fixed arm stays implemented and
-                // dormant.
+                // Slice-C 7/18 measurement (base 4d3d6e290f6, assembler
+                // `[ASM newlist DIAG]`): EXACTLY TWO graphs carry a vec! and
+                // still drop to the legacy walker, each behind an INDEPENDENT
+                // non-vec! wall the recognizer does not touch —
+                //   • `_pypy_generic_alias::make_generic_alias`: `collect_parameters`
+                //     → `push_unique` → `slice::iter::Iter::next` (unregistered),
+                //     plus a `collect_parameters` `UnionError: r_uint ∪ int`.
+                //   • `typedef::set_method_difference`: `&args[1..]` →
+                //     `core::slice::index::<Impl>::index` (unregistered), and the
+                //     `set_copy_real` → `w_set_copy_storage_from` storage-copy
+                //     chain.
+                // Until BOTH graphs fully lift (slice-iterator + slice-index +
+                // the collect_parameters UnionError — all annotator-completeness
+                // axis walls, not vec! walls), the unconditional recognizer is
+                // unsafe.  `rtype_newlist`'s Fixed arm stays implemented and
+                // dormant; the residual call is the correct lowering meanwhile.
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
