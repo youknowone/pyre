@@ -7284,7 +7284,7 @@ pub(crate) unsafe fn get(
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
             let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(raiseattrerror(obj, slot_name));
+            return Err(raiseattrerror(obj, slot_name, None));
         }
         return Ok(found);
     }
@@ -7584,31 +7584,35 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
     // whether `obj` is a Python-level instance, so the lookup must run for
     // every object whose type pyre can resolve — not just W_ObjectObject.
-    unsafe {
+    // A found-but-non-settable descriptor (no reachable `__set__`/`__delete__`)
+    // is carried to the terminal so a dict-less miss reports read-only rather
+    // than absent (descr__setattr__:129 passes `w_descr` to raiseattrerror).
+    let w_descr = unsafe {
         let w_type = if is_instance(obj) {
             w_instance_get_type(obj)
-        } else if is_type(obj) {
+        } else {
             // For type objects pyre stores attributes in the type's own
             // dict below; the descriptor walk uses the metaclass MRO so
             // metatype-installed setters (e.g. on `type`) still fire.
             crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
-        } else {
-            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
         };
-        if !w_type.is_null() {
-            if let Some(descr) = lookup_in_type_where(w_type, name) {
-                if set(descr, obj, value)? {
-                    return Ok(w_none());
-                }
-                // descroperation.py:124-126 — `__delete__` but no `__set__`
-                // is a read-only data descriptor; reject rather than shadow
-                // it with an instance/type dict store.
-                if descr_has_delete(descr) {
-                    return Err(descr_not_settable_error(descr));
-                }
+        if w_type.is_null() {
+            None
+        } else if let Some(descr) = lookup_in_type_where(w_type, name) {
+            if set(descr, obj, value)? {
+                return Ok(w_none());
             }
+            // descroperation.py:124-126 — `__delete__` but no `__set__`
+            // is a read-only data descriptor; reject rather than shadow
+            // it with an instance/type dict store.
+            if descr_has_delete(descr) {
+                return Err(descr_not_settable_error(descr));
+            }
+            Some(descr)
+        } else {
+            None
         }
-    }
+    };
     // Type objects: store in the type's own namespace (class dict).
     // PyPy: typeobject.py type.__setattr__ → w_type.dict_w[name] = w_value
     unsafe {
@@ -7976,7 +7980,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     if setdictvalue(obj, name, value) {
         return Ok(w_none());
     }
-    Err(raiseattrerror(obj, name))
+    Err(raiseattrerror(obj, name, w_descr))
 }
 
 /// A direct `W_BaseException` reference slot whose hard-coded getattr/setattr
@@ -8168,10 +8172,25 @@ pub(crate) fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> 
 /// ```
 // dont_look_inside: attribute-miss / read-only AttributeError construction; slow path.
 #[majit_macros::dont_look_inside]
-fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
-    // descroperation.py:58-64 — a type receiver reports its own name through
-    // the `type object '%N'` form; every other object reports its type's name
-    // through the `'%T' object` form.
+fn raiseattrerror(obj: PyObjectRef, name: &str, w_descr: Option<PyObjectRef>) -> PyError {
+    // descroperation.py:58-67 — with a descriptor in hand, the attribute
+    // exists on the type but has no reachable `__set__`/`__delete__` and the
+    // receiver has no dict to store into: it is read-only.  Otherwise this is
+    // a genuine miss: a type receiver reports through the `type object '%N'`
+    // form, every other object through the `'%T' object` form.
+    if w_descr.is_some() {
+        let tp_name = unsafe {
+            match crate::typedef::r#type(obj) {
+                Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                None => (*(*obj).ob_type).name.to_string(),
+            }
+        };
+        return PyError::attribute_error_with_context(
+            format!("'{tp_name}' object attribute '{name}' is read-only"),
+            obj,
+            name,
+        );
+    }
     let subject = unsafe {
         if is_type(obj) {
             format!("type object '{}'", pyre_object::w_type_get_name(obj))
@@ -8216,24 +8235,27 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type
     // pyre can resolve — not just W_ObjectObject — and before the
-    // module/type/instance dict removal below.
-    unsafe {
+    // module/type/instance dict removal below.  A found-but-non-data
+    // descriptor is carried to the terminal so a dict-less miss reports
+    // read-only rather than absent (descr__delattr__:140 passes `w_descr`).
+    let w_descr = unsafe {
         let w_type = if is_instance(obj) {
             w_instance_get_type(obj)
-        } else if is_type(obj) {
-            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
         } else {
             crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
         };
-        if !w_type.is_null() {
-            if let Some(descr) = lookup_in_type_where(w_type, name) {
-                if is_data_descr(descr) {
-                    delete(descr, obj)?;
-                    return Ok(w_none());
-                }
+        if w_type.is_null() {
+            None
+        } else if let Some(descr) = lookup_in_type_where(w_type, name) {
+            if is_data_descr(descr) {
+                delete(descr, obj)?;
+                return Ok(w_none());
             }
+            Some(descr)
+        } else {
+            None
         }
-    }
+    };
     // Module objects: PyPy `module.py:Module` does not override
     // `descr__delattr__`, so the call falls through to W_Root's
     // `deldictvalue` (`baseobjspace.py:58-67`):
@@ -8269,7 +8291,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     Err(err) if err.kind == crate::PyErrorKind::KeyError => {
                         // descroperation.py descr__delattr__: deldictvalue
                         // returning False raises AttributeError immediately.
-                        return Err(raiseattrerror(obj, name));
+                        return Err(raiseattrerror(obj, name, None));
                     }
                     Err(err) => return Err(err),
                 }
@@ -8302,7 +8324,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     mutated(obj, Some(name));
                     return Ok(w_none());
                 }
-                return Err(raiseattrerror(obj, name));
+                return Err(raiseattrerror(obj, name, None));
             }
         }
     }
@@ -8326,7 +8348,8 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // through the shared terminal — the same as object_setattr and the
     // module/type misses above — so the receiver's own type is named and the
     // obj/name context is attached, rather than the bare `object` base.
-    Err(raiseattrerror(obj, name))
+    // `w_descr` carries a found-but-non-data descriptor so the miss is read-only.
+    Err(raiseattrerror(obj, name, w_descr))
 }
 
 /// PyPy: baseobjspace.py `call`.
