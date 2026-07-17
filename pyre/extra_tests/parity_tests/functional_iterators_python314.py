@@ -187,6 +187,31 @@ assert iter(m) is m and next(m) == 2
 assert m.__reduce__()[0] is map
 assert list(m) == [3]
 
+
+class MapSubclass(map):
+    pass
+
+
+m = MapSubclass(str, [1])
+assert m.__reduce__()[0] is MapSubclass
+m.__setstate__([1])
+assert m.__reduce__()[2] is True
+m.__setstate__([])
+assert len(m.__reduce__()) == 2
+
+for name, call_args in [
+    ("__iter__", (42,)),
+    ("__next__", (42,)),
+    ("__reduce__", (42,)),
+    ("__setstate__", (42, True)),
+]:
+    try:
+        getattr(map, name)(*call_args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"map.{name} must validate its receiver")
+
 f = filter(None, [0, 1, "", "x"])
 assert iter(f) is f and f.__reduce__()[0] is filter
 assert list(f) == [1, "x"]

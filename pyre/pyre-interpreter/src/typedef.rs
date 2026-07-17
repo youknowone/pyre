@@ -2481,7 +2481,14 @@ fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// W_Map.descr___new__`.
 fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let value = crate::builtins::builtin_map(args.get(1..).unwrap_or(&[]))?;
+    pyre_object::gc_roots::pin_root(value);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE)? {
         unsafe {
             (*value).w_class = sub;
@@ -3037,10 +3044,10 @@ fn init_map_type(ns: PyObjectRef) {
     for (name, function, arity) in [
         (
             "__iter__",
-            crate::baseobjspace::iter_self_method as DunderFn,
+            crate::baseobjspace::map_iter_method as DunderFn,
             1,
         ),
-        ("__next__", crate::baseobjspace::iter_next_method, 1),
+        ("__next__", crate::baseobjspace::map_next_method, 1),
         ("__reduce__", crate::baseobjspace::map_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::map_setstate_method, 2),
     ] {

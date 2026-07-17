@@ -8382,25 +8382,51 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "map")?;
-    let strict = kwarg_get(kwargs, "strict")
-        .map(|v| crate::baseobjspace::is_true(v))
-        .transpose()?
-        .unwrap_or(false);
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
             "map() must have at least two arguments.",
         ));
     }
-    let func = args[0];
-    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
-    let mut iters = Vec::with_capacity(args.len() - 1);
-    for &arg in &args[1..] {
-        iters.push(crate::baseobjspace::iter(arg)?);
+
+    // PyPy's `args_w` and `build_iterators_from_args` keep every argument live
+    // while `space.iter` and the Python 3.14 `strict` truth conversion execute.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
     }
-    let w_iterators = pyre_object::w_list_new(iters);
+    let w_strict = kwarg_get(kwargs, "strict");
+    let strict_slot = w_strict.map(|value| {
+        pyre_object::gc_roots::pin_root(value);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let strict = strict_slot
+        .map(|slot| {
+            crate::baseobjspace::is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    let mut iter_slots = Vec::with_capacity(args.len() - 1);
+    for index in 1..args.len() {
+        let w_iter = crate::baseobjspace::iter(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(args_base + index)
+        })?;
+        pyre_object::gc_roots::pin_root(w_iter);
+        iter_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+    }
+    let w_iterators = pyre_object::w_list_new(
+        iter_slots
+            .into_iter()
+            .map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+            .collect(),
+    );
+    pyre_object::gc_roots::pin_root(w_iterators);
+    let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::functional::w_map_new(
-        func,
-        w_iterators,
+        unsafe { pyre_object::gc_roots::shadow_stack_get(args_base) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
         strict,
     ))
 }
