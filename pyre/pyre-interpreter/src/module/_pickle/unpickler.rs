@@ -44,7 +44,12 @@ pub struct W_Unpickler {
 #[crate::pyre_methods(doc = "Unpickler(file) -> unpickler reading from file.")]
 impl W_Unpickler {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
+    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+        // Construction arguments are consumed/validated by `__init__`; accept
+        // (and ignore) any positional or keyword args here via the whole-slice
+        // catch-all so the ctor keyword parameters (fix_imports/encoding/errors/
+        // buffers) do not trip an unknown-argument error in `__new__`.
+        let _ = _args;
         W_Unpickler::allocate(W_Unpickler {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),

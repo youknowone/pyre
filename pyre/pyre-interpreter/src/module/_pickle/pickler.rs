@@ -247,7 +247,12 @@ impl Framer {
 #[crate::pyre_methods(doc = "Pickler(file, protocol=None) -> pickler writing to file.")]
 impl W_Pickler {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
+    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+        // Construction arguments are consumed/validated by `__init__`; accept
+        // (and ignore) any positional or keyword args here via the whole-slice
+        // catch-all so the ctor keyword parameters (protocol/fix_imports/
+        // buffer_callback) do not trip an unknown-argument error in `__new__`.
+        let _ = _args;
         W_Pickler::allocate(W_Pickler {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
