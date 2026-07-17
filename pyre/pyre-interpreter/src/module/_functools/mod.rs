@@ -27,9 +27,32 @@ def cmp_to_key(mycmp):
             return mycmp(self.obj, other.obj) >= 0
         __hash__ = None
     return K
-"# => ["cmp_to_key"],
-    },
-    functions: {
-        "reduce" / * = |_| Err(crate::PyError::type_error("reduce not implemented")),
+
+
+def reduce(*args):
+    # _functoolsmodule.c functools_reduce — reduce(function, iterable[, initial]).
+    if len(args) < 2:
+        raise TypeError(
+            "reduce() takes at least 2 positional arguments (%d given)" % len(args))
+    if len(args) > 3:
+        raise TypeError(
+            "reduce() takes at most 3 arguments (%d given)" % len(args))
+    function = args[0]
+    try:
+        it = iter(args[1])
+    except TypeError:
+        raise TypeError("reduce() arg 2 must support iteration") from None
+    if len(args) == 3:
+        accum = args[2]
+    else:
+        try:
+            accum = next(it)
+        except StopIteration:
+            raise TypeError(
+                "reduce() of empty iterable with no initial value") from None
+    for element in it:
+        accum = function(accum, element)
+    return accum
+"# => ["cmp_to_key", "reduce"],
     },
 }
