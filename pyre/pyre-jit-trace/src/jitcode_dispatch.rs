@@ -11512,12 +11512,21 @@ fn decode_side_other_target(
 /// never reaches that leg.
 pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
     match majit_ir::resumedata::decode_branch_orgpc(carried) {
-        None => carried,
+        None => {
+            pcmap_pivot_audit_record_fire("expand_branch_carried", "passthrough");
+            carried
+        }
         Some((orgpc, flavor)) => {
             let code = payload.jitcode.code.as_slice();
             match decode_side_other_target(code, orgpc, flavor) {
-                Err(_) => majit_ir::resumedata::NO_JITCODE_PC,
-                Ok(derived) => derived as i32,
+                Err(_) => {
+                    pcmap_pivot_audit_record_fire("expand_branch_carried", "expanded_fail");
+                    majit_ir::resumedata::NO_JITCODE_PC
+                }
+                Ok(derived) => {
+                    pcmap_pivot_audit_record_fire("expand_branch_carried", "expanded_ok");
+                    derived as i32
+                }
             }
         }
     }
@@ -12110,7 +12119,12 @@ fn walker_capture_inline_nonstandard_vable_guard(
     let Some(nsvable_pc_word) =
         crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
             .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(nsvable_word, crate::state::op_live())
+                let resolved = payload
+                    .resolve_resume_pc_with_jitcode_pc(nsvable_word, crate::state::op_live());
+                if resolved.is_none() {
+                    pcmap_pivot_audit_record_fire("resolve_none_caller", "nsvable_word");
+                }
+                resolved
             })
             .map(|offset| offset as u32)
     else {
@@ -13012,10 +13026,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 scope.branch_guard_kept_recovered,
             );
             let payload = unsafe { &(&*sym.jitcode).payload };
-            let Some(pc_word) = payload
-                .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live())
-                .map(|offset| offset as u32)
-            else {
+            let resolved = payload
+                .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live());
+            if resolved.is_none() {
+                pcmap_pivot_audit_record_fire("resolve_none_caller", "guard_snapshot");
+            }
+            let Some(pc_word) = resolved.map(|offset| offset as u32) else {
                 return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
             };
             ctx.trace_ctx
@@ -13044,7 +13060,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
     let Some(arm_pc_word) =
         crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
             .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(arm_word, crate::state::op_live())
+                let resolved =
+                    payload.resolve_resume_pc_with_jitcode_pc(arm_word, crate::state::op_live());
+                if resolved.is_none() {
+                    pcmap_pivot_audit_record_fire("resolve_none_caller", "arm_word");
+                }
+                resolved
             })
             .map(|offset| offset as u32)
     else {
@@ -13706,7 +13727,12 @@ fn walker_capture_multi_frame_inline_snapshot(
         };
         let Some(pf_pc_word) = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
             .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(pf_word, crate::state::op_live())
+                let resolved =
+                    payload.resolve_resume_pc_with_jitcode_pc(pf_word, crate::state::op_live());
+                if resolved.is_none() {
+                    pcmap_pivot_audit_record_fire("resolve_none_caller", "pf_word");
+                }
+                resolved
             })
             .map(|offset| offset as u32)
         else {

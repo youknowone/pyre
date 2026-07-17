@@ -4071,8 +4071,17 @@ impl MIFrame {
             let parent_pc_word =
                 crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
                     .and_then(|payload| {
-                        payload
-                            .resolve_resume_pc_with_jitcode_pc(parent_word, crate::state::op_live())
+                        let resolved = payload.resolve_resume_pc_with_jitcode_pc(
+                            parent_word,
+                            crate::state::op_live(),
+                        );
+                        if resolved.is_none() {
+                            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                                "resolve_none_caller",
+                                "parent_word",
+                            );
+                        }
+                        resolved
                     })
                     .map(|offset| offset as u32)
                     .unwrap_or_else(|| {
@@ -4128,15 +4137,19 @@ impl MIFrame {
             majit_ir::resumedata::NO_JITCODE_PC
         };
         let payload = unsafe { &(&*self.sym().jitcode).payload };
-        let top_pc_word = payload
-            .resolve_resume_pc_with_jitcode_pc(top_word, crate::state::op_live())
-            .map(|offset| offset as u32)
-            .unwrap_or_else(|| {
-                // A missing carried marker declines this trace before the
-                // provisional snapshot can be installed.
-                crate::state::request_trace_abort();
-                top_pc as u32
-            });
+        let resolved = payload.resolve_resume_pc_with_jitcode_pc(top_word, crate::state::op_live());
+        if resolved.is_none() {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_none_caller",
+                "top_word",
+            );
+        }
+        let top_pc_word = resolved.map(|offset| offset as u32).unwrap_or_else(|| {
+            // A missing carried marker declines this trace before the
+            // provisional snapshot can be installed.
+            crate::state::request_trace_abort();
+            top_pc as u32
+        });
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,

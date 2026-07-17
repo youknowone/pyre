@@ -792,8 +792,24 @@ impl PyJitCode {
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);
         if used_carried {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_resume_pc",
+                "carried_used",
+            );
             Some(carried as usize)
         } else {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_resume_pc",
+                "carried_none",
+            );
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_resume_pc",
+                if carried == majit_ir::resumedata::NO_JITCODE_PC || carried < 0 {
+                    "none_sentinel"
+                } else {
+                    "none_not_live_anchored"
+                },
+            );
             None
         }
     }
@@ -809,10 +825,30 @@ impl PyJitCode {
     /// does not name a decodable startpoint (the caller keeps the pc_map entry).
     pub fn resolve_bridge_walk_entry_pc(&self, carried: i32, op_live: u8) -> Option<usize> {
         let carried = crate::jitcode_dispatch::expand_branch_carried(self, carried);
-        (carried != majit_ir::resumedata::NO_JITCODE_PC
+        let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC
             && carried >= 0
-            && self.jitcode.can_decode_live_vars(carried as usize, op_live))
-        .then_some(carried as usize)
+            && self.jitcode.can_decode_live_vars(carried as usize, op_live);
+        if used_carried {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_bridge_walk_entry",
+                "carried_used",
+            );
+            Some(carried as usize)
+        } else {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_bridge_walk_entry",
+                "carried_none",
+            );
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_bridge_walk_entry",
+                if carried == majit_ir::resumedata::NO_JITCODE_PC || carried < 0 {
+                    "none_sentinel"
+                } else {
+                    "none_not_live_anchored"
+                },
+            );
+            None
+        }
     }
 
     /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`

@@ -794,10 +794,25 @@ pub fn skip_python_trivia_forward_public(
 /// never index with the word, so no wrap results).
 pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
     let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
-    python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
+    match python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)
-        .unwrap_or(fallback)
+    {
+        Some(py_pc) => {
+            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "backxlat_py_pc",
+                "pivot_hit",
+            );
+            py_pc
+        }
+        None => {
+            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "backxlat_py_pc",
+                "py_word_fallback",
+            );
+            fallback
+        }
+    }
 }
 
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
@@ -1065,8 +1080,16 @@ pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32)
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let jc = sd.jitcodes.get(jitcode_index as usize)?;
-        jc.payload
-            .resolve_bridge_walk_entry_pc(carried_jitcode_pc, sd.op_live)
+        let resolved = jc
+            .payload
+            .resolve_bridge_walk_entry_pc(carried_jitcode_pc, sd.op_live);
+        if resolved.is_none() {
+            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_none_caller",
+                "bridge_walk_entry",
+            );
+        }
+        resolved
     })
 }
 
@@ -1210,6 +1233,10 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let resolved_jit_pc: Option<usize> =
             payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, sd.op_live);
         let Some(jit_pc) = resolved_jit_pc else {
+            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                "resolve_none_caller",
+                "frame_liveness",
+            );
             return FrameLivenessRegIndices::default();
         };
         let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
