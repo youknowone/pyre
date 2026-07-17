@@ -824,6 +824,7 @@ impl LowererConfig {
         ref_fields: &[crate::jit_interp::RefFieldEntry],
         native_int_binops: &[(syn::Path, syn::Ident)],
         native_tag_small: &[syn::Path],
+        headerless_structs: &[syn::Path],
     ) -> Self {
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
             .iter()
@@ -866,7 +867,10 @@ impl LowererConfig {
             pool_arrays: Vec::new(),
             ref_fields: ref_fields_map,
             call_returns: HashMap::new(),
-            headerless_structs: std::collections::HashSet::new(),
+            headerless_structs: headerless_structs
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
             native_int_binops: native_int_binops
                 .iter()
                 .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
@@ -2451,6 +2455,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2474,6 +2479,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2493,6 +2499,7 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
             &[],
             &[],
             &[],

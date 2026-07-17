@@ -755,7 +755,7 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
 /// a single `Path` and then split: the last segment is the field name, the
 /// remaining prefix is the struct type.
 /// Parse `call_returns = { func_path => StructType, ... }`.
-fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> {
+pub(crate) fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -795,7 +795,7 @@ pub(crate) fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec
     Ok(entries)
 }
 
-fn parse_path_set(input: ParseStream) -> syn::Result<Vec<Path>> {
+pub(crate) fn parse_path_set(input: ParseStream) -> syn::Result<Vec<Path>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();

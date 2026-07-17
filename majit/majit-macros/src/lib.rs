@@ -34,6 +34,8 @@ struct JitInlineArgs {
     ref_fields: Vec<jit_interp::RefFieldEntry>,
     native_int_binops: Vec<(Path, Ident)>,
     native_tag_small: Vec<Path>,
+    struct_allocs: Vec<(Path, Path)>,
+    headerless_structs: Vec<Path>,
 }
 
 impl Parse for JitInlineArgs {
@@ -43,6 +45,8 @@ impl Parse for JitInlineArgs {
         let mut ref_fields: Vec<jit_interp::RefFieldEntry> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
+        let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
+        let mut headerless_structs: Vec<Path> = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -101,6 +105,12 @@ impl Parse for JitInlineArgs {
                 "native_tag_small" => {
                     native_tag_small = jit_interp::parse_native_tag_small_list(input)?;
                 }
+                "struct_allocs" => {
+                    struct_allocs = jit_interp::parse_call_returns_map(input)?;
+                }
+                "headerless_structs" => {
+                    headerless_structs = jit_interp::parse_path_set(input)?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -116,6 +126,8 @@ impl Parse for JitInlineArgs {
             ref_fields,
             native_int_binops,
             native_tag_small,
+            struct_allocs,
+            headerless_structs,
         })
     }
 }
@@ -124,6 +136,7 @@ fn rewrite_jit_inline_ref_param_fields(
     block: &syn::Block,
     ref_params: &[(Ident, Path)],
     ref_fields: &[jit_interp::RefFieldEntry],
+    struct_allocs: &[(Path, Path)],
 ) -> syn::Block {
     use std::collections::HashMap;
     use syn::visit_mut::VisitMut;
@@ -131,6 +144,7 @@ fn rewrite_jit_inline_ref_param_fields(
     struct InlineRefFieldRewriter {
         local_ref_types: HashMap<String, syn::Path>,
         field_pointees: HashMap<String, syn::Path>,
+        struct_allocs: HashMap<Vec<String>, syn::Path>,
     }
 
     impl InlineRefFieldRewriter {
@@ -173,6 +187,31 @@ fn rewrite_jit_inline_ref_param_fields(
 
     impl VisitMut for InlineRefFieldRewriter {
         fn visit_stmt_mut(&mut self, stmt: &mut syn::Stmt) {
+            // Rewrite struct literal inits on the concrete path:
+            // `let x = StructType { f0: v0, f1: v1 }` where StructType is
+            // in `struct_allocs` → `let x = allocator_func(v0, v1)`. This
+            // must run before `record_ref_field_local`/the default visitor
+            // descend, so `x` stays a plain (non-ref) local bound to the
+            // allocator call's usize result rather than a ref-field local.
+            if let syn::Stmt::Local(local) = stmt {
+                if let Some(init) = &mut local.init {
+                    if let syn::Expr::Struct(s) = &*init.expr {
+                        let segs: Vec<String> = s
+                            .path
+                            .segments
+                            .iter()
+                            .map(|seg| seg.ident.to_string())
+                            .collect();
+                        if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
+                            let field_args: Vec<syn::Expr> =
+                                s.fields.iter().map(|f| f.expr.clone()).collect();
+                            init.expr = Box::new(syn::parse_quote! {
+                                #alloc_func(#(#field_args),*)
+                            });
+                        }
+                    }
+                }
+            }
             if let syn::Stmt::Local(local) = stmt {
                 self.record_ref_field_local(local);
             }
@@ -255,12 +294,24 @@ fn rewrite_jit_inline_ref_param_fields(
             )
         })
         .collect();
+    let struct_allocs_map: HashMap<Vec<String>, syn::Path> = struct_allocs
+        .iter()
+        .map(|(struct_path, alloc_func)| {
+            let segs: Vec<String> = struct_path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            (segs, alloc_func.clone())
+        })
+        .collect();
     let mut rewriter = InlineRefFieldRewriter {
         local_ref_types: ref_params
             .iter()
             .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
             .collect(),
         field_pointees,
+        struct_allocs: struct_allocs_map,
     };
     let mut block = block.clone();
     if !rewriter.local_ref_types.is_empty() {
@@ -1987,6 +2038,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.ref_fields,
         &args.native_int_binops,
         &args.native_tag_small,
+        &args.headerless_structs,
     ) {
         Ok(Some(lowered)) => lowered,
         Ok(None) => {
@@ -2003,8 +2055,12 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &func.sig;
-    let block =
-        rewrite_jit_inline_ref_param_fields(&func.block, &args.ref_params, &args.ref_fields);
+    let block = rewrite_jit_inline_ref_param_fields(
+        &func.block,
+        &args.ref_params,
+        &args.ref_fields,
+        &args.struct_allocs,
+    );
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
     let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
