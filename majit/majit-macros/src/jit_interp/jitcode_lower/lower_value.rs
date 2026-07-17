@@ -1069,6 +1069,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
+                            use majit_metainterp::jitcode::JitCodeRuntimeExt as _;
                             let __sub_jitcode = #builder_path(__asm);
                             let (__sub_return_kind, _) = __sub_jitcode
                                 .trailing_return_info()
