@@ -83,13 +83,12 @@ pub struct PyJitCodeMetadata {
     /// resuming there). Empty for skeleton / fixture metadata,
     /// where the legacy scan remains the fallback.
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
-    /// JitCode byte-offset → containing Python PC boundary table.  Each entry
-    /// starts a piecewise-constant segment; the first entry is always `(0, 0)`
-    /// for a drained install.  It composes the predecessor op-start tier with
-    /// the one-byte block-head marker override at codewrite time, leaving the
-    /// py-indexed source tables in place for legacy fallback and later work.
-    /// Empty for skeleton / fixture metadata.
-    pub py_by_jit_pc: Vec<(u32, u32)>,
+    /// JitCode byte-offset → containing Python PC floor boundary table. Each
+    /// entry starts a piecewise-constant opcode-emission segment; the first
+    /// entry is always `(0, 0)` for a drained install. This is only the
+    /// predecessor op-start tier: exact block-head marker precedence remains in
+    /// `block_head_py_by_jit_pc`. Empty for skeleton / fixture metadata.
+    pub py_floor_by_jit_pc: Vec<(u32, u32)>,
     /// task#50 sparse carry-forward sidecar: the `-live-` marker byte offset
     /// for each py_pc whose dense marker the on-demand [`derive_resume_marker`]
     /// derivation cannot reproduce from `first_jit_pc_by_py_pc` +
@@ -436,12 +435,20 @@ pub fn derive_resume_marker(
     Some(block_head_py_by_jit_pc[idx].0)
 }
 
-/// Return the Python-PC segment containing `jit_pc` in a codewriter-built
-/// JitCode-PC pivot.  An empty table is deliberately distinguishable from the
-/// `(0, 0)` fallback segment carried by every drained install.
-pub fn py_for_jitcode_pc_pivot(py_by_jit_pc: &[(u32, u32)], jit_pc: usize) -> Option<u32> {
-    let end = py_by_jit_pc.partition_point(|&(off, _)| (off as usize) <= jit_pc);
-    end.checked_sub(1).map(|idx| py_by_jit_pc[idx].1)
+/// Return the floor segment containing `jit_pc` in a codewriter-built JitCode
+/// PC pivot. An empty table is deliberately distinguishable from the `(0, 0)`
+/// fallback segment carried by every drained install.
+pub fn floor_segment_for_jitcode_pc(
+    py_floor_by_jit_pc: &[(u32, u32)],
+    jit_pc: usize,
+) -> Option<(usize, u32)> {
+    let end = py_floor_by_jit_pc.partition_point(|&(off, _)| (off as usize) <= jit_pc);
+    end.checked_sub(1).map(|idx| {
+        (
+            py_floor_by_jit_pc[idx].0 as usize,
+            py_floor_by_jit_pc[idx].1,
+        )
+    })
 }
 
 impl PyJitCode {
@@ -844,7 +851,7 @@ impl PyJitCode {
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
-                py_by_jit_pc: Vec::new(),
+                py_floor_by_jit_pc: Vec::new(),
                 carryfwd_resume_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: Vec::new(),

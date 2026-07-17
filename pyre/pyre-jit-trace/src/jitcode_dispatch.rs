@@ -10382,12 +10382,32 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
 /// opcode (where the walk physically is), not the resume block-head a
 /// `-live-` marker names — the marker case returns an EARLIER py_pc and
 /// makes the mirror's boundary detection oscillate.  Uses only the
-/// `first_jit_pc_by_py_pc` containment table (largest `py` with
-/// `first_jit[py] <= jit_pc`); falls back to the nearest-`-live-`-marker
+/// JitCode-PC floor pivot (largest floor boundary at-or-before `jit_pc`);
+/// falls back to the nearest-`-live-`-marker
 /// heuristic (reconstructed via [`pc_map_marker_for`])
 /// when that table is empty (skeleton / fixture installs).
 fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     let first_jit = &metadata.first_jit_pc_by_py_pc;
+    if !metadata.py_floor_by_jit_pc.is_empty() {
+        let pivot =
+            crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+                .expect("drained JitCode PC floor pivot must begin at byte offset zero")
+                .1;
+        if pcmap_pivot_audit_enabled() {
+            let mut best: Option<(usize, u32)> = None;
+            for (py, &pos) in first_jit.iter().enumerate() {
+                if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
+                    best = Some((pos, py as u32));
+                }
+            }
+            assert_eq!(
+                pivot,
+                best.map_or(0, |(_, py)| py),
+                "PCMAP_PIVOT vstack floor lookup diverges at jit_pc={jit_pc}",
+            );
+        }
+        return pivot;
+    }
     if !first_jit.is_empty() {
         let mut best: Option<(usize, u32)> = None;
         for (py, &pos) in first_jit.iter().enumerate() {
@@ -11248,9 +11268,17 @@ pub fn pcmap_pivot_audit_record_sweep(jitcode_byte_len: usize) {
 }
 
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
-    if !metadata.py_by_jit_pc.is_empty() {
-        let pivot = crate::pyjitcode::py_for_jitcode_pc_pivot(&metadata.py_by_jit_pc, jit_pc)
-            .expect("drained JitCode PC pivot must begin at byte offset zero");
+    if !metadata.py_floor_by_jit_pc.is_empty() {
+        let pivot = metadata
+            .block_head_py_by_jit_pc
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| metadata.block_head_py_by_jit_pc[i].1)
+            .or_else(|| {
+                crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+                    .map(|(_, py)| py)
+            })
+            .expect("drained JitCode PC floor pivot must begin at byte offset zero");
         if pcmap_pivot_audit_enabled() {
             assert_eq!(
                 pivot,
