@@ -9475,13 +9475,12 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // A guard whose bridge a terminal-declining backend
-        // (`bridge_decline_is_terminal()`) already refused as structurally
-        // `Unsupported` must not re-fire — re-tracing rebuilds the same
-        // unsupported bridge forever (a compile storm). Native backends never
-        // populate this set (their declines are transient), so this only ever
-        // short-circuits wasm guards. Fall back to the blackhole resume the
-        // dormant path always used for this guard.
+        // A guard whose bridge was refused by a terminal-declining backend
+        // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
+        // full-body-walk decline must not re-fire: re-tracing rebuilds the same
+        // unsupported bridge forever. Transient backend and walker aborts do
+        // not populate this set. Fall back to the blackhole resume the dormant
+        // path always used for this guard.
         if self
             .declined_bridge_guards
             .contains(&(trace_id, fail_index))

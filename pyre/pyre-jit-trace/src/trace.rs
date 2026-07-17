@@ -129,8 +129,7 @@ fn fbw_bridge_decline(ctx: &TraceCtx) {
     }
 }
 
-fn p2_drain_abort(ctx: &TraceCtx) -> TraceAction {
-    fbw_bridge_decline(ctx);
+fn p2_drain_abort() -> TraceAction {
     TraceAction::Abort
 }
 
@@ -995,7 +994,12 @@ fn drive_bridge_carrier_walk(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        return p2_drain_abort(ctx);
+        // Churn guard (Task 8): making this class transient retried the same
+        // guard 500 times in depth2_inline_chain_typeflip.py and
+        // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
+        // this measured P2 class permanently declined.
+        fbw_bridge_decline(ctx);
+        return p2_drain_abort();
     };
 
     let pre_pos = ctx.get_trace_position();
@@ -1009,12 +1013,12 @@ fn drive_bridge_carrier_walk(
     else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
-        return p2_drain_abort(ctx);
+        return p2_drain_abort();
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
-        return p2_drain_abort(ctx);
+        return p2_drain_abort();
     };
     let entry = select_recipe_entry(
         recipe.jitcode_index,
@@ -1024,7 +1028,7 @@ fn drive_bridge_carrier_walk(
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
-        return p2_drain_abort(ctx);
+        return p2_drain_abort();
     };
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
@@ -1117,7 +1121,7 @@ fn drive_bridge_carrier_walk(
     // pre-walk heap rather than dropping the journals (which would leave every
     // eager store standing to be applied a second time).
     crate::jitcode_dispatch::fbw_store_journal_rollback();
-    p2_drain_abort(ctx)
+    p2_drain_abort()
 }
 
 /// Shape A orthodox multi-frame bridge resume: the escape-hatch driver for a
@@ -1552,7 +1556,7 @@ fn run_perfn_walk(
         sidecar_entry
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without
-        // one the existing `None` path below declines the walk.
+        // one the site-specific decline below rejects the walk.
         None
     };
     let Some(pc_map_entry) = pc_map_entry else {
@@ -3285,7 +3289,6 @@ fn full_body_walk_trace(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
-            fbw_bridge_decline(ctx);
             TraceAction::Abort
         }
     }
