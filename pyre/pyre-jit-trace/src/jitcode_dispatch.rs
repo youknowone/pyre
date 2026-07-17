@@ -23414,23 +23414,28 @@ fn try_walker_specialize_setslice(
     // assignment to the concrete lists now as `slice_len` in-bounds setitems,
     // journaling each displaced element first so a non-committing walk's legacy
     // replay re-executes against the pre-walk heap (FBW_STORE_JOURNAL).  Each
-    // `w_list_getitem` / `w_int_new` boxes (a minor collection there can move the
-    // operands), so pin fresh boxes and re-read the forwarded operand refs from
-    // the shadow after every allocation.
+    // `w_list_getitem` / `w_int_new` boxes, and a minor collection there can
+    // move any live GC object.  Following the push_roots/pop_roots reload
+    // discipline, every live ref is reloaded after each boxing allocation,
+    // before its next use: walker operands (`list_obj`/`value_obj`) from the
+    // forwarded shadow via `walker_concrete_ref_object`, and the pinned fresh
+    // boxes (`src_item`/`displaced`) from their shadow-stack slot via
+    // `shadow_stack_get` (the slot index captured just before the pin).
     {
         let _roots = pyre_object::gc_roots::push_roots();
         for j in 0..slice_len {
             let tgt_index = start + j;
-            let (Some(list_obj), Some(value_obj)) = (
-                walker_concrete_ref_object(ctx, list_op),
-                walker_concrete_ref_object(ctx, value_op),
-            ) else {
+            let Some(value_obj) = walker_concrete_ref_object(ctx, value_op) else {
                 unreachable!("setslice specialization: operand concrete vanished from the shadow");
             };
             let Some(src_item) = (unsafe { pyre_object::w_list_getitem(value_obj, j) }) else {
                 unreachable!("setslice specialization: source index {j} has no element");
             };
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(src_item);
+            let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
+                unreachable!("setslice specialization: operand concrete vanished from the shadow");
+            };
             let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, tgt_index) })
             else {
                 unreachable!(
@@ -23438,12 +23443,15 @@ fn try_walker_specialize_setslice(
                      (bounds gate admitted it)"
                 );
             };
+            let disp_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(displaced);
             let key_box = pyre_object::w_int_new(tgt_index);
             pyre_object::gc_roots::pin_root(key_box);
             let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
                 unreachable!("setslice specialization: list concrete vanished mid-apply");
             };
+            let src_item = pyre_object::gc_roots::shadow_stack_get(src_slot);
+            let displaced = pyre_object::gc_roots::shadow_stack_get(disp_slot);
             fbw_store_journal_push(list_obj, key_box, displaced);
             let stored = unsafe { pyre_object::w_list_setitem(list_obj, tgt_index, src_item) };
             debug_assert!(stored, "setslice specialization: in-bounds store failed");
