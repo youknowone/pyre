@@ -992,11 +992,23 @@ pub fn init_typeobjects() {
         reg
     });
 
-    patch_object_class_descriptor();
-    patch_builtin_function_descriptors();
-    patch_frame_traceback_descriptors();
-    patch_getset_descriptor_metadata();
-    patch_typeobject_descriptor_names();
+    // The `patch_*` passes install descriptors into the shared global type
+    // dicts (e.g. `object.__class__`).  `get_or_init` above serializes only
+    // the type construction: once it returns, every concurrent
+    // `ExecutionContext::new` caller it was blocking falls through to here at
+    // once, so an unguarded first-time `type_dict_store` would race a sibling
+    // thread's `type_dict_contains` read on the same `IndexMap` and tear its
+    // internal index table.  A dedicated `Once` collapses the patch pass to a
+    // single writer; it runs after `TYPEOBJECT_CACHE` is populated so
+    // `patch_typeobject_descriptor_names` still observes the registry.
+    static PATCH_TYPEOBJECTS: std::sync::Once = std::sync::Once::new();
+    PATCH_TYPEOBJECTS.call_once(|| {
+        patch_object_class_descriptor();
+        patch_builtin_function_descriptors();
+        patch_frame_traceback_descriptors();
+        patch_getset_descriptor_metadata();
+        patch_typeobject_descriptor_names();
+    });
 }
 
 /// Install `object.__class__` after the root object type exists.
