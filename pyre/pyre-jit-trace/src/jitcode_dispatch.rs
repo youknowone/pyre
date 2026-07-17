@@ -3178,7 +3178,37 @@ fn recipe_parent_frame_from_recipe(
         recipe.jitcode_pc,
     );
     let stack_only = recipe.valuestackdepth.saturating_sub(recipe.nlocals);
-    let maps = crate::state::bridge_semantic_maps_at(recipe.jitcode_index, recipe.jitcode_pc);
+    let maps = if pcmap_pivot_audit_enabled() {
+        pcmap_pivot_audit_record_fire("bridge_maps_recipe", "fire");
+        let legacy = crate::state::bridge_semantic_maps_at(recipe.jitcode_index, recipe.jitcode_pc);
+        let twin =
+            crate::state::bridge_semantic_maps_from_pc(recipe.jitcode_index, recipe.jitcode_pc);
+        if legacy.has_color_map == twin.has_color_map
+            && legacy.stack_depth_at_pc == twin.stack_depth_at_pc
+            && legacy.pcdep_entries == twin.pcdep_entries
+        {
+            pcmap_pivot_audit_record_fire("bridge_maps_recipe", "eq");
+        } else {
+            pcmap_pivot_audit_record_fire("bridge_maps_recipe", "di");
+            pcmap_pivot_audit_record_data(
+                "bridge_maps_recipe",
+                &format!(
+                    "idx={} pc={} legacy=({},{},{:?}) twin=({},{},{:?})",
+                    recipe.jitcode_index,
+                    recipe.jitcode_pc,
+                    legacy.has_color_map,
+                    legacy.stack_depth_at_pc,
+                    legacy.pcdep_entries,
+                    twin.has_color_map,
+                    twin.stack_depth_at_pc,
+                    twin.pcdep_entries,
+                ),
+            );
+        }
+        legacy
+    } else {
+        crate::state::bridge_semantic_maps_at(recipe.jitcode_index, recipe.jitcode_pc)
+    };
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
     for &color in &banks.int {
@@ -7538,65 +7568,117 @@ fn collect_outer_active_boxes(
     // `semantic_ref_slot_for_reg_color`, read the vable shadow for
     // portal-owner frames, and route the two portal red regs through
     // `sym.frame` / `sym.execution_context` directly.
-    let (nlocals, valid_stack_only, owns_vable, portal_frame_reg, portal_ec_reg) =
-        if sym.jitcode.is_null() {
-            (0usize, 0usize, false, u16::MAX, u16::MAX)
-        } else {
-            unsafe {
-                let jc = &*sym.jitcode;
-                let payload = &jc.payload;
-                audit_outer_active_boxes_entry_twin(
-                    payload,
-                    entry_py_pc,
-                    entry_jitcode_pc,
-                    entry_twin,
-                    entry_caller,
-                );
-                // Operand-stack depth at the snapshot coordinate. The liveness
-                // banks (`frame_liveness_reg_indices_by_bank_at`) are read at
-                // that coordinate too, so the per-PC color→slot window
-                // (`pcdep_opt`'s stack clamp below) must use its depth — NOT
-                // `sym.valuestackdepth` (the walker's *current* position). For
-                // the per-opcode entry caller the two coincide, but a guard
-                // resuming at a not-taken branch target with a kept operand-stack
-                // temp (conditional expr / short-circuit / chained compare,
-                // #124/#281) resumes at a depth `> 0` while the walker stands at
-                // depth 0 — using the current depth there drops the kept temp's
-                // semantic slot, corrupting the frame.
-                let stack_depth_at_pc = if payload.code_ptr.is_null() {
-                    0usize
-                } else {
-                    match (entry_twin, entry_jitcode_pc >= 0) {
-                        (OuterActiveBoxesEntryTwin::Plain, true) => payload
-                            .depth_for_jitcode_pc_pred(entry_jitcode_pc as usize)
-                            .unwrap_or(0)
-                            as usize,
-                        (OuterActiveBoxesEntryTwin::Trivia, true) => payload
-                            .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-                            .unwrap_or(0)
-                            as usize,
-                        _ => {
-                            pcmap_pivot_audit_record_fire(
-                                "collect_outer_active_boxes_depth",
-                                "py_pc_entry",
+    let (nlocals, valid_stack_only, owns_vable, portal_frame_reg, portal_ec_reg) = if sym
+        .jitcode
+        .is_null()
+    {
+        (0usize, 0usize, false, u16::MAX, u16::MAX)
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode;
+            let payload = &jc.payload;
+            audit_outer_active_boxes_entry_twin(
+                payload,
+                entry_py_pc,
+                entry_jitcode_pc,
+                entry_twin,
+                entry_caller,
+            );
+            // Operand-stack depth at the snapshot coordinate. The liveness
+            // banks (`frame_liveness_reg_indices_by_bank_at`) are read at
+            // that coordinate too, so the per-PC color→slot window
+            // (`pcdep_opt`'s stack clamp below) must use its depth — NOT
+            // `sym.valuestackdepth` (the walker's *current* position). For
+            // the per-opcode entry caller the two coincide, but a guard
+            // resuming at a not-taken branch target with a kept operand-stack
+            // temp (conditional expr / short-circuit / chained compare,
+            // #124/#281) resumes at a depth `> 0` while the walker stands at
+            // depth 0 — using the current depth there drops the kept temp's
+            // semantic slot, corrupting the frame.
+            let stack_depth_at_pc = if payload.code_ptr.is_null() {
+                0usize
+            } else {
+                match (entry_twin, entry_jitcode_pc >= 0) {
+                    (OuterActiveBoxesEntryTwin::Plain, true) => payload
+                        .depth_for_jitcode_pc_pred(entry_jitcode_pc as usize)
+                        .unwrap_or(0)
+                        as usize,
+                    (OuterActiveBoxesEntryTwin::Trivia, true) => payload
+                        .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
+                        .unwrap_or(0)
+                        as usize,
+                    _ => {
+                        pcmap_pivot_audit_record_fire(
+                            "collect_outer_active_boxes_depth",
+                            "py_pc_entry",
+                        );
+                        let legacy = crate::liveness::liveness_for(payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(entry_py_pc as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        if pcmap_pivot_audit_enabled() {
+                            pcmap_pivot_audit_record_fire("coab_pypc_entry_depth", "fire");
+                            let resolved = jc.payload.resolve_resume_pc_with_jitcode_pc(
+                                carried_jitcode_pc,
+                                crate::state::op_live(),
                             );
-                            crate::liveness::liveness_for(payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(entry_py_pc as usize)
-                                .copied()
-                                .unwrap_or(0) as usize
+                            match resolved {
+                                Some(resolved_off) => {
+                                    let twin = jc
+                                        .payload
+                                        .depth_trivia_for_jitcode_pc(resolved_off)
+                                        .unwrap_or(0);
+                                    let arm = if legacy == twin { "eq" } else { "di" };
+                                    pcmap_pivot_audit_record_fire("coab_pypc_entry_depth", arm);
+                                    if arm == "di" {
+                                        pcmap_pivot_audit_record_data(
+                                            "coab_pypc_entry_depth",
+                                            &format!(
+                                                "jcidx={} py={} carried={} resolved={:?} legacy={:?} twin={:?}",
+                                                jc.index,
+                                                entry_py_pc,
+                                                carried_jitcode_pc,
+                                                resolved,
+                                                legacy,
+                                                twin
+                                            ),
+                                        );
+                                    }
+                                }
+                                None => {
+                                    pcmap_pivot_audit_record_fire(
+                                        "coab_pypc_entry_depth",
+                                        "cand_miss",
+                                    );
+                                    pcmap_pivot_audit_record_data(
+                                        "coab_pypc_entry_depth",
+                                        &format!(
+                                            "jcidx={} py={} carried={} resolved={:?} legacy={:?} twin={:?}",
+                                            jc.index,
+                                            entry_py_pc,
+                                            carried_jitcode_pc,
+                                            resolved,
+                                            legacy,
+                                            Option::<u16>::None
+                                        ),
+                                    );
+                                }
+                            }
                         }
+                        legacy as usize
                     }
-                };
-                (
-                    sym.nlocals,
-                    stack_depth_at_pc,
-                    sym.owns_virtualizable_shadow(),
-                    payload.metadata.portal_frame_reg,
-                    payload.metadata.portal_ec_reg,
-                )
-            }
-        };
+                }
+            };
+            (
+                sym.nlocals,
+                stack_depth_at_pc,
+                sym.owns_virtualizable_shadow(),
+                payload.metadata.portal_frame_reg,
+                payload.metadata.portal_ec_reg,
+            )
+        }
+    };
     // #348: per-snapshot-coordinate color→slot entries — the color→slot source
     // the inversions below consult for every drained (non-portal) jitcode, the
     // per-program-point color space the `-live-` markers carry. Branch-guard
@@ -7628,12 +7710,64 @@ fn collect_outer_active_boxes(
                         "collect_outer_active_boxes_pcdep",
                         "py_pc_entry",
                     );
-                    jc.payload
+                    let legacy = jc
+                        .payload
                         .metadata
                         .pcdep_color_slots
                         .get(entry_py_pc as usize)
                         .cloned()
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    if pcmap_pivot_audit_enabled() {
+                        pcmap_pivot_audit_record_fire("coab_pypc_entry", "fire");
+                        let resolved = jc.payload.resolve_resume_pc_with_jitcode_pc(
+                            carried_jitcode_pc,
+                            crate::state::op_live(),
+                        );
+                        match resolved {
+                            Some(resolved_off) => {
+                                let twin = jc
+                                    .payload
+                                    .pcdep_trivia_for_jitcode_pc(resolved_off)
+                                    .unwrap_or_default();
+                                let arm = if legacy.as_slice() == twin {
+                                    "eq"
+                                } else {
+                                    "di"
+                                };
+                                pcmap_pivot_audit_record_fire("coab_pypc_entry", arm);
+                                if arm == "di" {
+                                    pcmap_pivot_audit_record_data(
+                                        "coab_pypc_entry",
+                                        &format!(
+                                            "jcidx={} py={} carried={} resolved={:?} legacy={:?} twin={:?}",
+                                            jc.index,
+                                            entry_py_pc,
+                                            carried_jitcode_pc,
+                                            resolved,
+                                            legacy,
+                                            twin
+                                        ),
+                                    );
+                                }
+                            }
+                            None => {
+                                pcmap_pivot_audit_record_fire("coab_pypc_entry", "cand_miss");
+                                pcmap_pivot_audit_record_data(
+                                    "coab_pypc_entry",
+                                    &format!(
+                                        "jcidx={} py={} carried={} resolved={:?} legacy={:?} twin={:?}",
+                                        jc.index,
+                                        entry_py_pc,
+                                        carried_jitcode_pc,
+                                        resolved,
+                                        legacy,
+                                        Option::<Vec<(u8, u16, u16)>>::None
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    legacy
                 }
             }
         }
@@ -7686,6 +7820,7 @@ fn collect_outer_active_boxes(
                             .pcdep_for_jitcode_pc(cjc as usize)
                             .unwrap_or_default()
                     } else {
+                        pcmap_pivot_audit_record_fire("coab_guard_cjc_neg", "fire");
                         jc.payload
                             .metadata
                             .pcdep_color_slots
@@ -11404,6 +11539,25 @@ pub fn pcmap_pivot_audit_record_fire(site: &'static str, arm: &'static str) {
     }
 }
 
+/// Append report-only PC-map census data for a divergent or missing candidate.
+pub fn pcmap_pivot_audit_record_data(site: &'static str, data: &str) {
+    if !pcmap_pivot_audit_enabled() {
+        return;
+    }
+    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
+        return;
+    };
+    use std::io::Write;
+
+    if let Ok(mut probe) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(probe, "pcmap_data\t{site}\t{data}");
+    }
+}
+
 fn floor_boundary_at_or_after(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,
@@ -13400,6 +13554,7 @@ fn compute_inline_caller_frame(
         // existing Python-keyed path rather than declining a formerly valid
         // caller frame.
         None => unsafe {
+            pcmap_pivot_audit_record_fire("inline_caller_marker_miss", "depth");
             crate::liveness::liveness_for(code_ptr)
                 .depth_at_py_pc()
                 .get(fallthrough_py_pc as usize)
@@ -13505,6 +13660,7 @@ fn compute_nested_inline_caller_frame(
     let depth = match resume_marker_jit_pc {
         Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
         None => {
+            pcmap_pivot_audit_record_fire("nested_inline_caller_marker_miss", "depth");
             let fallthrough_py_pc = legacy_fallthrough_py_pc();
             unsafe {
                 crate::liveness::liveness_for(pjc.code_ptr)

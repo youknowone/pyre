@@ -929,7 +929,21 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    pjc.metadata.pcdep_color_slots.first().cloned()
+    let legacy = pjc.metadata.pcdep_color_slots.first().cloned();
+    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "fire");
+        let twin = pjc.pcdep_for_jitcode_pc(0);
+        if legacy == twin {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "eq");
+        } else {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "di");
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
+                "entry_param_colors",
+                &format!("legacy={legacy:?} twin={twin:?}"),
+            );
+        }
+    }
+    legacy
 }
 
 pub(crate) type SubDescrPool = (
@@ -1620,12 +1634,26 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                         payload.pcdep_for_jitcode_pc(jp),
                     ) {
                         (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                        _ => via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                        _ => {
+                            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                                "bridge_maps_via_py_pc",
+                                "twin_miss",
+                            );
+                            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
+                        }
                     }
                 } else {
+                    crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                        "bridge_maps_via_py_pc",
+                        "non_decodable",
+                    );
                     via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
                 }
             } else {
+                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                    "bridge_maps_via_py_pc",
+                    "no_word",
+                );
                 via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
             };
         BridgeSemanticMaps {
@@ -6043,7 +6071,36 @@ fn reconstruct_inline_recipe(
     // resume pc there is no per-pc map to faithfully rebuild the frame, so
     // decline to the single-frame bridge (whose vable payload IS semantic-
     // ordered) rather than rebuild the frame with mis-slotted boxes.
-    let maps = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
+    let maps = if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("bridge_maps_frame", "fire");
+        let legacy = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
+        let twin = bridge_semantic_maps_from_pc(frame.jitcode_index, frame.pc);
+        if legacy.has_color_map == twin.has_color_map
+            && legacy.stack_depth_at_pc == twin.stack_depth_at_pc
+            && legacy.pcdep_entries == twin.pcdep_entries
+        {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("bridge_maps_frame", "eq");
+        } else {
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("bridge_maps_frame", "di");
+            crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
+                "bridge_maps_frame",
+                &format!(
+                    "idx={} pc={} legacy=({},{},{:?}) twin=({},{},{:?})",
+                    frame.jitcode_index,
+                    frame.pc,
+                    legacy.has_color_map,
+                    legacy.stack_depth_at_pc,
+                    legacy.pcdep_entries,
+                    twin.has_color_map,
+                    twin.stack_depth_at_pc,
+                    twin.pcdep_entries,
+                ),
+            );
+        }
+        legacy
+    } else {
+        bridge_semantic_maps_at(frame.jitcode_index, frame.pc)
+    };
     if maps.pcdep_entries.is_empty() {
         return None;
     }
@@ -8938,6 +8995,40 @@ impl JitState for PyreJitState {
                 frame0.pc as usize,
                 portal_ec_reg,
             );
+            if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("ec_color_gate", "fire");
+                let resolved = frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc);
+                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                    "ec_color_gate",
+                    if resolved { "resolved" } else { "unresolved" },
+                );
+                let twin =
+                    pyjitcode_for_jitcode_index(frame0.jitcode_index).is_some_and(|payload| {
+                        payload
+                            .pcdep_trivia_for_jitcode_pc(frame0.pc as usize)
+                            .is_some_and(|entries| {
+                                entries
+                                    .iter()
+                                    .any(|&(bank, color, _)| bank == 1 && color == portal_ec_reg)
+                            })
+                    });
+                if ec_color_names_frame_slot == twin {
+                    crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("ec_color_gate", "eq");
+                } else {
+                    crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("ec_color_gate", "di");
+                    crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
+                        "ec_color_gate",
+                        &format!(
+                            "idx={} pc={} resolved={} legacy={} twin={}",
+                            frame0.jitcode_index,
+                            frame0.pc,
+                            resolved,
+                            ec_color_names_frame_slot,
+                            twin,
+                        ),
+                    );
+                }
+            }
             if !ec_color_names_frame_slot {
                 let slot = portal_ec_reg as usize;
                 assert!(
