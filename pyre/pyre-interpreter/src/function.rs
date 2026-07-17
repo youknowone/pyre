@@ -2655,6 +2655,7 @@ mod tests {
 
     #[test]
     fn test_function_create() {
+        crate::test_hooks::install_hash_hook();
         // Function.code now stores a Code-level wrapper (PyCode).
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);

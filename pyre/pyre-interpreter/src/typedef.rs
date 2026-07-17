@@ -1054,6 +1054,7 @@ fn patch_object_class_descriptor() {
             class_getter,
             class_setter,
             pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
             object_type,
             Some("__class__"),
         ),
@@ -4931,21 +4932,28 @@ fn init_dict_view_common_slots(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "mapping",
-            make_getset_descriptor(make_builtin_function_with_arity(
+            make_getset_property_named_doc(
+                make_builtin_function_with_arity(
+                    "mapping",
+                    |args| {
+                        let view = args[1];
+                        if view.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let dict =
+                            unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
+                        if dict.is_null() {
+                            return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
+                        }
+                        Ok(pyre_object::w_dict_proxy_new(dict))
+                    },
+                    2,
+                ),
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "dictionary that this view refers to",
                 "mapping",
-                |args| {
-                    let view = args[1];
-                    if view.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
-                    if dict.is_null() {
-                        return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
-                    }
-                    Ok(pyre_object::w_dict_proxy_new(dict))
-                },
-                2,
-            )),
+            ),
         )
     };
 }
@@ -7388,6 +7396,39 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 `PyGetSetDescr_Type.tp_repr` renders
+    // `<attribute 'name' of 'Owner' objects>`. PyPy's GetSetProperty typedef
+    // has no explicit repr; this is the selected 3.14 surface.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    if descr.is_null()
+                        || !unsafe { pyre_object::typedef::is_getset_property(descr) }
+                    {
+                        let received = if descr.is_null() {
+                            "NoneType".to_string()
+                        } else {
+                            crate::typedef::r#type(descr)
+                                .map(|tp| unsafe { pyre_object::w_type_get_name(tp) }.to_string())
+                                .unwrap_or_else(|| "object".to_string())
+                        };
+                        return Err(crate::PyError::type_error(format!(
+                            "descriptor '__repr__' requires a 'getset_descriptor' object but received a '{received}'"
+                        )));
+                    }
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        getset_descriptor_repr(descr)
+                    }))
+                },
+                1,
+            ),
+        )
+    };
     // The four metadata getsets (typedef.py:470-473
     // __name__/__qualname__/__objclass__/__doc__) cannot be
     // installed inside this function — each one allocates a fresh
@@ -7426,21 +7467,27 @@ fn patch_getset_descriptor_metadata() {
     crate::type_dict_store(
         tp,
         "__name__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__name__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
-                if name.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                Ok(name)
-            },
-            2,
-        )),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__name__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
+                        if name.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        Ok(name)
+                    },
+                    2,
+                ),
+                "__name__",
+            ),
+            tp,
+        ),
     );
     // typedef.py:471 __qualname__ = GetSetProperty(descr_get_qualname)
     //
@@ -7463,61 +7510,64 @@ fn patch_getset_descriptor_metadata() {
     crate::type_dict_store(
         tp,
         "__qualname__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__qualname__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                unsafe {
-                    let cached = pyre_object::typedef::w_getset_get_qualname(descr);
-                    if !cached.is_null() {
-                        return Ok(cached);
-                    }
-                    // typedef.py:425-432 _calculate_qualname:
-                    //   if self.reqcls is None: type_qualname = '?'
-                    //   else:
-                    //       w_type = space.gettypeobject(self.reqcls.typedef)
-                    //       type_qualname = space.text_w(
-                    //           space.getattr(w_type, space.newtext('__qualname__')))
-                    //
-                    // PyPy reads the bound class's `__qualname__`
-                    // (which respects nested-class scoping and any
-                    // explicit `__qualname__` assignment in the class
-                    // body), NOT the bare `__name__`.  Pyre's
-                    // `getattr(w_type, '__qualname__')` resolves
-                    // through the type-side __qualname__ getset that
-                    // already mirrors PyPy's lookup-then-fallback
-                    // chain (`baseobjspace.rs:4004-4009`).
-                    let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
-                    let type_qualname = if reqcls.is_null() {
-                        "?".to_string()
-                    } else {
-                        match crate::baseobjspace::getattr_str(reqcls, "__qualname__") {
-                            Ok(qn) if pyre_object::is_str(qn) => {
-                                pyre_object::w_str_get_value(qn).to_string()
-                            }
-                            // PyPy raises through here on AttributeError;
-                            // pyre falls back to the bare type name to
-                            // avoid surfacing an unrelated AttributeError
-                            // when introspecting `descr.__qualname__`.
-                            _ => pyre_object::w_type_get_name(reqcls).to_string(),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__qualname__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Ok(pyre_object::w_none());
                         }
-                    };
-                    let name_obj = pyre_object::typedef::w_getset_get_name(descr);
-                    let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
-                        pyre_object::w_str_get_value(name_obj).to_string()
-                    } else {
-                        "<generic property>".to_string()
-                    };
-                    let combined = pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
-                    pyre_object::typedef::w_getset_set_qualname(descr, combined);
-                    Ok(combined)
-                }
-            },
-            2,
-        )),
+                        unsafe {
+                            let cached = pyre_object::typedef::w_getset_get_qualname(descr);
+                            if !cached.is_null() {
+                                return Ok(cached);
+                            }
+                            // typedef.py:425-432 _calculate_qualname:
+                            //   if self.reqcls is None: type_qualname = '?'
+                            //   else:
+                            //       w_type = space.gettypeobject(self.reqcls.typedef)
+                            //       type_qualname = space.text_w(
+                            //           space.getattr(w_type, space.newtext('__qualname__')))
+                            //
+                            // PyPy reads the bound class's `__qualname__`
+                            // (which respects nested-class scoping and any
+                            // explicit `__qualname__` assignment in the class
+                            // body), NOT the bare `__name__`.  Pyre's
+                            // `getattr(w_type, '__qualname__')` resolves
+                            // through the type-side __qualname__ getset that
+                            // already mirrors PyPy's lookup-then-fallback
+                            // chain (`baseobjspace.rs:4004-4009`).
+                            // PyPy's original only consults `reqcls`. During type
+                            // materialisation `copy_for_type` deliberately leaves
+                            // reqcls null and records the concrete owner in
+                            // `w_objclass`; CPython 3.14 uses that owner for both
+                            // __objclass__ and __qualname__, so prefer it here.
+                            let owner = getset_descriptor_owner(descr);
+                            let type_qualname = if owner.is_null() {
+                                "?".to_string()
+                            } else {
+                                descriptor_owner_qualname(owner)
+                            };
+                            let name_obj = pyre_object::typedef::w_getset_get_name(descr);
+                            let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
+                                pyre_object::w_str_get_value(name_obj).to_string()
+                            } else {
+                                "<generic property>".to_string()
+                            };
+                            let combined =
+                                pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
+                            pyre_object::typedef::w_getset_set_qualname(descr, combined);
+                            Ok(combined)
+                        }
+                    },
+                    2,
+                ),
+                "__qualname__",
+            ),
+            tp,
+        ),
     );
     // typedef.py:472 __objclass__ = GetSetProperty(descr_get_objclass)
     //
@@ -7533,52 +7583,107 @@ fn patch_getset_descriptor_metadata() {
     crate::type_dict_store(
         tp,
         "__objclass__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__objclass__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Err(crate::PyError::attribute_error(
-                        "generic self has no __objclass__",
-                    ));
-                }
-                unsafe {
-                    let w_objclass = pyre_object::typedef::w_getset_get_objclass(descr);
-                    if !w_objclass.is_null() {
-                        return Ok(w_objclass);
-                    }
-                    let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
-                    if !reqcls.is_null() {
-                        return Ok(reqcls);
-                    }
-                    Err(crate::PyError::attribute_error(
-                        "generic self has no __objclass__",
-                    ))
-                }
-            },
-            2,
-        )),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__objclass__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Err(crate::PyError::attribute_error(
+                                "generic self has no __objclass__",
+                            ));
+                        }
+                        unsafe {
+                            let w_objclass = pyre_object::typedef::w_getset_get_objclass(descr);
+                            if !w_objclass.is_null() {
+                                return Ok(w_objclass);
+                            }
+                            let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
+                            if !reqcls.is_null() {
+                                return Ok(reqcls);
+                            }
+                            Err(crate::PyError::attribute_error(
+                                "generic self has no __objclass__",
+                            ))
+                        }
+                    },
+                    2,
+                ),
+                "__objclass__",
+            ),
+            tp,
+        ),
     );
     // typedef.py:473 __doc__ = interp_attrproperty('doc', ...)
     crate::type_dict_store(
         tp,
         "__doc__",
-        make_getset_descriptor(make_builtin_function_with_arity(
-            "__doc__",
-            |args| {
-                let descr = args[1];
-                if descr.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
-                if doc.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                Ok(doc)
-            },
-            2,
-        )),
+        copy_for_type(
+            make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__doc__",
+                    |args| {
+                        let descr = args[1];
+                        if descr.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
+                        if doc.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        Ok(doc)
+                    },
+                    2,
+                ),
+                "__doc__",
+            ),
+            tp,
+        ),
     );
+}
+
+#[inline]
+unsafe fn getset_descriptor_owner(descr: PyObjectRef) -> PyObjectRef {
+    let objclass = unsafe { pyre_object::typedef::w_getset_get_objclass(descr) };
+    if !objclass.is_null() {
+        objclass
+    } else {
+        unsafe { pyre_object::typedef::w_getset_get_reqcls(descr) }
+    }
+}
+
+/// The owner component used by CPython 3.14 descriptor `__qualname__`.
+/// Heap classes carry their compiler-stamped qualified name in their own
+/// namespace; static types fall back to the bare final component of tp_name.
+unsafe fn descriptor_owner_qualname(owner: PyObjectRef) -> String {
+    match crate::type_dict_lookup(owner, "__qualname__") {
+        Some(value) if unsafe { pyre_object::is_str(value) } => {
+            unsafe { pyre_object::w_str_get_value(value) }.to_string()
+        }
+        _ => {
+            let full = unsafe { pyre_object::w_type_get_name(owner) };
+            full.rsplit('.').next().unwrap_or(full).to_string()
+        }
+    }
+}
+
+/// CPython 3.14 getset descriptor repr, shared with `display::py_repr` because
+/// native GetSetProperty instances do not carry a heap-instance `w_class`.
+pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
+    let name_obj = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
+    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+        unsafe { pyre_object::w_str_get_value(name_obj) }
+    } else {
+        "<generic property>"
+    };
+    let owner = unsafe { getset_descriptor_owner(descr) };
+    let owner_name = if owner.is_null() {
+        "?"
+    } else {
+        unsafe { pyre_object::w_type_get_name(owner) }
+    };
+    format!("<attribute '{name}' of '{owner_name}' objects>")
 }
 
 /// `GetSetProperty(fget)` — read-only getset descriptor with no required class.
@@ -7587,6 +7692,7 @@ fn patch_getset_descriptor_metadata() {
 fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     make_getset_property_full(
         getter,
+        pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -7608,6 +7714,7 @@ pub(crate) fn make_getset_descriptor_named(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
         Some(name),
     )
 }
@@ -7620,7 +7727,14 @@ fn make_getset_property(
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL, None)
+    make_getset_property_full(
+        fget,
+        fset,
+        fdel,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        None,
+    )
 }
 
 /// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
@@ -7631,7 +7745,33 @@ pub(crate) fn make_getset_property_named(
     fdel: pyre_object::PyObjectRef,
     name: &str,
 ) -> pyre_object::PyObjectRef {
-    make_getset_property_full(fget, fset, fdel, pyre_object::PY_NULL, Some(name))
+    make_getset_property_full(
+        fget,
+        fset,
+        fdel,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        Some(name),
+    )
+}
+
+/// `GetSetProperty(..., doc=..., name=...)` — the full descriptor payload
+/// used by doc-bearing getsets such as `mapping`, `__dict__`, and `__weakref__`.
+fn make_getset_property_named_doc(
+    fget: pyre_object::PyObjectRef,
+    fset: pyre_object::PyObjectRef,
+    fdel: pyre_object::PyObjectRef,
+    doc: &str,
+    name: &str,
+) -> pyre_object::PyObjectRef {
+    make_getset_property_full(
+        fget,
+        fset,
+        fdel,
+        pyre_object::w_str_new(doc),
+        pyre_object::PY_NULL,
+        Some(name),
+    )
 }
 
 /// `GetSetProperty(fget, fset, fdel, cls=cls)` — full getset descriptor
@@ -7644,6 +7784,7 @@ fn make_getset_property_full(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
+    doc: pyre_object::PyObjectRef,
     cls: pyre_object::PyObjectRef,
     name: Option<&str>,
 ) -> pyre_object::PyObjectRef {
@@ -7665,7 +7806,7 @@ fn make_getset_property_full(
         fget,
         fset,
         fdel,
-        pyre_object::PY_NULL, // doc
+        doc,
         cls,
         false, // use_closure
         resolved_name,
@@ -18998,7 +19139,7 @@ fn init_generator_type(ns: PyObjectRef) {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
             )
         };
     }
@@ -19640,7 +19781,13 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
         // `"__dict__"` instead of the `"<generic property>"` sentinel.
         // The earlier setattr fix-up was masked by the new read-only
         // `__name__` getset and silently failed.
-        make_getset_property_named(fget, fset, fdel, "__dict__") as usize
+        make_getset_property_named_doc(
+            fget,
+            fset,
+            fdel,
+            "dictionary for instance variables",
+            "__dict__",
+        ) as usize
     });
     addr as pyre_object::PyObjectRef
 }
@@ -19659,7 +19806,13 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
         let fget = make_builtin_function_with_arity("descr_get_weakref", descr_get_weakref, 2);
         // typedef.py:591 `weakref_descr.name = '__weakref__'` —
         // see `dict_descr` for the parity rationale.
-        make_getset_descriptor_named(fget, "__weakref__") as usize
+        make_getset_property_named_doc(
+            fget,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            "list of weak references to the object",
+            "__weakref__",
+        ) as usize
     });
     addr as pyre_object::PyObjectRef
 }

@@ -708,6 +708,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`.
             let inner = pyre_object::w_dict_proxy_get_mapping(obj);
             format!("mappingproxy({})", py_repr(inner)?)
+        } else if pyre_object::typedef::is_getset_property(obj) {
+            // CPython 3.14 `PyGetSetDescr_Type.tp_repr`.
+            crate::typedef::getset_descriptor_repr(obj)
         } else if pyre_object::is_member(obj) {
             // CPython 3.14 `PyMemberDescr_Type.tp_repr = member_repr`.
             // Member descriptors are native-layout objects with no `w_class`,
