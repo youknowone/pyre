@@ -16989,6 +16989,128 @@ fn try_walker_inline_exception_string_override(
     Ok(Some(inlined))
 }
 
+/// Inline a plain Python `__add__` after the numeric BINARY_OP
+/// specializations decline. The receiver class and its version tag pin the
+/// descriptor lookup, matching `try_dispatch_binary_special`'s forward arm.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_user_binop(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    op_tag: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // This speculative path is inert unless the development flag is set to a
+    // non-zero value.
+    let binop_inline_enabled =
+        std::env::var("PYRE_FBW_INLINE_BINOP").is_ok_and(|value| value != "0");
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || !binop_inline_enabled
+        || dst_bank != 'r'
+        || r_args.len() != 2
+    {
+        return Ok(None);
+    }
+
+    let Some(pyre_interpreter::bytecode::BinaryOperator::Add) =
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
+    else {
+        return Ok(None);
+    };
+    let dunder = "__add__";
+
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
+        return Ok(None);
+    };
+    let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
+        return Ok(None);
+    };
+
+    let w_class = unsafe { (*concrete_lhs).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+
+    let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(w_class, w_typ_r)
+        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r, w_class) }
+    {
+        return Ok(None);
+    }
+
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+    if nparams != 2 {
+        return Ok(None);
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_lhs),
+        ConcreteValue::Ref(concrete_rhs),
+    ];
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![lhs, rhs],
+        vec![
+            ConcreteValue::Ref(concrete_lhs),
+            ConcreteValue::Ref(concrete_rhs),
+        ],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((lhs, concrete_lhs, w_class, version_tag)),
+        false,
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        if matches!(
+            concrete_from_recorded_opref(ctx, result),
+            ConcreteValue::Ref(obj)
+                if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
+        ) {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+    }
+    Ok(Some(inlined))
+}
+
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
     op: &DecodedOp,
@@ -24754,6 +24876,13 @@ fn dispatch_residual_call_iIRd_kind(
                 };
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                if ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp {
+                    if let Some(inlined) = try_walker_inline_user_binop(
+                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                    )? {
+                        return Ok(inlined);
+                    }
                 }
             }
         }
