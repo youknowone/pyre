@@ -134,14 +134,8 @@ fn fbw_bridge_decline(ctx: &TraceCtx) {
     }
 }
 
-fn p2_compile_enabled() -> bool {
-    std::env::var_os("PYRE_P2_COMPILE").as_deref() != Some(std::ffi::OsStr::new("0"))
-}
-
 fn p2_drain_abort(ctx: &TraceCtx) -> TraceAction {
-    if p2_compile_enabled() {
-        fbw_bridge_decline(ctx);
-    }
+    fbw_bridge_decline(ctx);
     TraceAction::Abort
 }
 
@@ -592,8 +586,8 @@ pub fn trace_bytecode(
         // The framestack-walk cross-frame bridge is correctness-buggy for a
         // branchy inlined-callee continuation. Keep it behind
         // `PYRE_P2_DRAIN=0` pending the orthodox multi-frame reconstruction fix
-        // (#343). The drain sub-walk is the safe default: the compile leg runs
-        // unless `PYRE_P2_COMPILE=0` restores drain-and-discard diagnostics.
+        // (#343). The drain sub-walk is the safe default, with the compile leg
+        // enabled unconditionally.
         if crate::state::p2_drain_enabled() {
             let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
             finish_trace_namespace_dependency(meta);
@@ -922,8 +916,7 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// (`recipes` is outermost-first, so the last entry is the guard-failing
 /// frame), log the outcome, discard the trace, and abort — validates the
 /// reconstructed-frame walk plumbing before result-threading + the root walk
-/// are wired. The compile leg is now the default; `PYRE_P2_COMPILE=0` restores
-/// the abort-to-blackhole drain-and-discard diagnostic path.
+/// are wired. The compile leg is unconditional.
 /// Thread a reconstructed callee's `SubReturn` value into the root portal's
 /// operand-stack result register so the subsequent root walk
 /// (`run_perfn_walk`'s bridge seeding) reads it as the call result at `root_pc`.
@@ -1060,8 +1053,7 @@ fn drive_bridge_carrier_walk(
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
     // compile the bridge (the recorded callee continuation + the root
-    // continuation form one bridge body).  Enabled by default; set
-    // `PYRE_P2_COMPILE=0` to restore the drain-and-discard diagnostic path.
+    // continuation form one bridge body).
     // Other shapes / outcomes log + abort (trace discarded).
     let subwalk_result = match &walk {
         Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
@@ -1070,7 +1062,7 @@ fn drive_bridge_carrier_walk(
         _ => None,
     };
     if let Some(result) = subwalk_result {
-        if carrier.recipes.len() == 1 && p2_compile_enabled() {
+        if carrier.recipes.len() == 1 {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
                 let root_py_pc =
