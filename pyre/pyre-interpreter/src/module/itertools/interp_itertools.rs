@@ -3,7 +3,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 
-/// itertools stub
+/// groupby(iterable, key=None) — itertools-docs pure-Python equivalent.
 const GROUPBY_SRC: &str = r#"
 class groupby:
     __module__ = 'itertools'
@@ -30,6 +30,38 @@ class groupby:
             except StopIteration:
                 return
             self.currkey = self.keyfunc(self.currvalue)
+"#;
+
+/// tee(iterable, n=2) — itertools-docs pure-Python equivalent.  Each `_tee`
+/// keeps its own deque; when a deque runs dry the shared source iterator is
+/// advanced once and the new value is fanned out to every deque, so the copies
+/// stay independent and an unbounded source is drawn lazily.
+const TEE_SRC: &str = r#"
+import collections
+import operator
+
+class _tee:
+    __module__ = 'itertools'
+    def __init__(self, it, deques, mydeque):
+        self._it = it
+        self._deques = deques
+        self._mydeque = mydeque
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if not self._mydeque:
+            newval = next(self._it)
+            for d in self._deques:
+                d.append(newval)
+        return self._mydeque.popleft()
+
+def tee(iterable, n=2):
+    n = operator.index(n)
+    if n < 0:
+        raise ValueError("n must be >= 0")
+    it = iter(iterable)
+    deques = [collections.deque() for _ in range(n)]
+    return tuple(_tee(it, deques, d) for d in deques)
 "#;
 
 pub fn register_module(ns: pyre_object::PyObjectRef) {
@@ -181,6 +213,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // advances; expressing that shared state directly in Python avoids a
     // second native iterator type.
     crate::importing::appleveldef_install(ns, GROUPBY_SRC, "<inline>", &["groupby"]);
+    // tee(iterable, n=2) — the itertools-docs pure-Python equivalent.  A native
+    // dataobject type would only save buffer copies; the deque-per-copy recipe
+    // keeps the copies lazy and independent, which is what callers observe.
+    crate::importing::appleveldef_install(ns, TEE_SRC, "<inline>", &["tee"]);
     // permutations(iterable, r=None) — PyPy: pypy/module/itertools/interp_itertools.py
     crate::module_ns_store(
         ns,
@@ -271,6 +307,60 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     out
                 }
                 let all = combs(&pool, r, 0);
+                let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
+                let n = tuples.len();
+                let list = pyre_object::w_list_new(tuples);
+                Ok(pyre_object::w_seq_iter_new(list, n))
+            },
+            2,
+        ),
+    );
+    // combinations_with_replacement(iterable, r) — like combinations, but an
+    // element may repeat, so the recursion re-enters at `i` rather than `i + 1`
+    // and `r` may exceed the pool length.  `r` is taken through `__index__`
+    // before the iterable is drawn, matching the argument-clinic evaluation
+    // order, and a negative `r` is a ValueError.
+    crate::module_ns_store(
+        ns,
+        "combinations_with_replacement",
+        crate::make_builtin_function_with_arity(
+            "combinations_with_replacement",
+            |args| {
+                let missing = match args.len() {
+                    0 => Some("iterable"),
+                    1 => Some("r"),
+                    _ => None,
+                };
+                if let Some(name) = missing {
+                    return Err(crate::PyError::type_error(format!(
+                        "combinations_with_replacement() missing required argument '{name}'"
+                    )));
+                }
+                let r = crate::builtins::space_index_w(args[1])?;
+                if r < 0 {
+                    return Err(crate::PyError::value_error("r must be non-negative"));
+                }
+                let r = r as usize;
+                let pool = crate::builtins::collect_iterable(args[0])?;
+                fn cwr(
+                    pool: &[pyre_object::PyObjectRef],
+                    r: usize,
+                    start: usize,
+                ) -> Vec<Vec<pyre_object::PyObjectRef>> {
+                    if r == 0 {
+                        return vec![vec![]];
+                    }
+                    let mut out = Vec::new();
+                    for i in start..pool.len() {
+                        for mut tail in cwr(pool, r - 1, i) {
+                            let mut v = vec![pool[i]];
+                            v.append(&mut tail);
+                            out.push(v);
+                        }
+                    }
+                    out
+                }
+                let all = cwr(&pool, r, 0);
                 let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
                 let n = tuples.len();
                 let list = pyre_object::w_list_new(tuples);
