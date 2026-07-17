@@ -66,6 +66,65 @@ pub struct W_TupleObject {
 pub const W_TUPLE_GC_TYPE_ID: u32 = 8;
 pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 
+/// Raw `(ptr, len)` view of a tuple's inline `PyObjectRef` items for GC root
+/// walking.  `wrappeditems` is exact-size (`capacity == len`, every slot
+/// written by `alloc_tuple_items_block`), so the block capacity is the live
+/// length.  Returns `None` for a null block.  Alloc-free — mirrors
+/// `listobject::w_list_object_items_ptr_len` and the stationary branch of
+/// `tuple_object_custom_trace`, reading `items_block_items_base` /
+/// `items_block_capacity` over the block.  The returned pointer aliases the
+/// live backing store; the caller must not mutate the tuple while reading
+/// through it.
+///
+/// # Safety
+/// `obj` must point to a valid `W_TupleObject`.
+pub unsafe fn w_tuple_object_items_ptr_len(
+    obj: PyObjectRef,
+) -> Option<(*const PyObjectRef, usize)> {
+    let tuple = &*(obj as *const W_TupleObject);
+    let block = tuple.wrappeditems;
+    if block.is_null() {
+        return None;
+    }
+    let base = items_block_items_base(block);
+    let cap = items_block_capacity(block);
+    Some((base as *const PyObjectRef, cap))
+}
+
+/// Walk, in place, every element `PyObjectRef` slot of any tuple — general
+/// `W_TupleObject` or a specialised arity-2 variant — for GC root forwarding.
+/// `is_tuple` reports all four layouts as `tuple`, but only the general variant
+/// carries a `wrappeditems` block; the specialised `_oo` variant stores its two
+/// objects inline (`value0` / `value1`) and `_ii` / `_ff` hold unboxed scalars
+/// with no GC children.  Dispatch on the concrete layout exactly as the marker
+/// does (`tuple_object_custom_trace` and the `spec_tuple_*` gc_ptr_offsets), so
+/// a specialised tuple is never mis-read as a general one.  Alloc-free.
+///
+/// # Safety
+/// `obj` must point to a valid tuple (`is_tuple(obj)` true).
+pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
+    use crate::specialisedtupleobject::{
+        W_SpecialisedTupleObject_oo, is_specialised_tuple_ff, is_specialised_tuple_ii,
+        is_specialised_tuple_oo,
+    };
+    if is_specialised_tuple_oo(obj) {
+        let t = obj as *mut W_SpecialisedTupleObject_oo;
+        visitor(std::ptr::addr_of_mut!((*t).value0));
+        visitor(std::ptr::addr_of_mut!((*t).value1));
+        return;
+    }
+    // `_ii` / `_ff` are GC-leaf (unboxed scalars) — nothing to forward.
+    if is_specialised_tuple_ii(obj) || is_specialised_tuple_ff(obj) {
+        return;
+    }
+    // General `W_TupleObject`: forward each slot of the exact-size items block.
+    if let Some((ptr, n)) = w_tuple_object_items_ptr_len(obj) {
+        for i in 0..n {
+            visitor(ptr.add(i) as *mut PyObjectRef);
+        }
+    }
+}
+
 /// Allocate a new tuple from a Vec of items.
 ///
 /// Arity-2 tuples are routed through `makespecialisedtuple2`

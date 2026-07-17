@@ -24,6 +24,49 @@
 
 use crate::PyObjectRef;
 
+/// Per-`#[pyre_class]`-type registry of inline `PyObjectRef` field offsets
+/// (the descriptor's `gc_ptr_offsets`), keyed by the type's static `PyType`
+/// pointer cast to `usize`.
+///
+/// Populated once at single-threaded JIT-driver init (`register_pyre_class`
+/// in `pyre-jit/src/eval.rs`).  Read during GC marking by the interpreter's
+/// generic immortal-root walker to force-forward the managed children of a
+/// `malloc_typed`-immortal object the marker skips.  The stored slice is the
+/// descriptor's `&'static [usize]`, so a lookup copies a fat pointer with no
+/// allocation.
+static PYRE_CLASS_GC_OFFSETS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<usize, &'static [usize]>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Register a type's inline `gc_ptr_offsets` under its `PyType` pointer.
+/// Called only at single-threaded init; a poisoned lock silently drops the
+/// insert (init is the sole writer, so this cannot happen in practice).
+pub fn register_pyre_class_offsets(pytype_ptr: usize, offsets: &'static [usize]) {
+    if let Ok(mut map) = PYRE_CLASS_GC_OFFSETS.write() {
+        map.insert(pytype_ptr, offsets);
+    }
+}
+
+/// Look up the registered inline `PyObjectRef` field offsets for `ob_type`.
+/// Returns `None` for a null `ob_type` or an unregistered type.  Takes a
+/// process-global read lock — cheap and alloc-free, safe while the collector
+/// is marking; a poisoned lock reads as `None`.
+///
+/// # Safety
+/// `ob_type` must be null or point to a valid, `'static` `PyType`.
+pub unsafe fn offsets_for_pytype(
+    ob_type: *const crate::pyobject::PyType,
+) -> Option<&'static [usize]> {
+    if ob_type.is_null() {
+        return None;
+    }
+    PYRE_CLASS_GC_OFFSETS
+        .read()
+        .ok()?
+        .get(&(ob_type as usize))
+        .copied()
+}
+
 /// Signature of the host-side GC allocation callback.
 ///
 /// `type_id` is the backend-registered GC type id (same id used by

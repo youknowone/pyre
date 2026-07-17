@@ -260,25 +260,108 @@ unsafe fn walk_raw_exception_roots(
     }
 }
 
-/// Mark the GC-reachable children of a Box-immortal `W_SeqIterObject`.
-///
-/// The seq iterator is `malloc_typed`-immortal (its `allocate` uses
-/// `malloc_typed`), so `seed_major_root` ignores it.  Its `seq` field
-/// points to the iterable — often a user-defined instance allocated in
-/// old-gen via `try_gc_alloc_stable`.  Without this walk, that instance
-/// is invisible to the marker and freed while the iterator still holds
-/// a live reference.
-unsafe fn walk_raw_seq_iter_roots(
+/// Maximum recursion depth for `walk_raw_immortal_roots`.  Immortal objects
+/// chain a few levels at most (`map(f, filter(p, iter(seq)))`, a view's dict,
+/// a tuple of iterators); this bounds the walk against a malformed cycle — the
+/// only cycle protection.
+const IMMORTAL_WALK_MAX_DEPTH: u32 = 8;
+
+/// Force-forward the managed children of any `malloc_typed`-immortal REGISTERED
+/// pyre object reachable from a value-stack slot.  Such objects are outside the
+/// GC arenas, so the marker skips them and their registered `gc_ptr_offsets`
+/// trace never fires; a managed child held solely through one is freed by a
+/// collection (a bare `for x in <expr>:` whose iterator sits on the value
+/// stack, a `d.keys()` view, an immortal iterator's source list).  Drive off
+/// the per-type offset registry so every present and future immortal type is
+/// covered.  Runs on both minor and major collections via the
+/// collection-kind-agnostic `visitor`.
+unsafe fn walk_raw_immortal_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
+    unsafe { walk_immortal_rec(value, visitor, 0) };
+}
+
+unsafe fn walk_immortal_rec(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    depth: u32,
+) {
     unsafe {
-        if value.is_null() {
+        if value.is_null() || depth >= IMMORTAL_WALK_MAX_DEPTH {
             return;
         }
-        if pyre_object::iterobject::is_seq_iter(value) {
-            let iter = &mut *(value as *mut pyre_object::W_SeqIterObject);
-            visitor(&mut *(&mut iter.seq as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // A tagged immediate is an int with no managed children; short-circuit
+        // before any predicate below dereferences its `ob_type`. Gated on
+        // `CAN_BE_TAGGED` (default false).
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(value) {
+            return;
+        }
+
+        // (A) A `malloc_typed`-immortal REGISTERED pyre object: the marker
+        // ignores it, so follow its registered `gc_ptr_offsets` in place and
+        // recurse.  Managed registered objects (`try_gc_owns_object`) are
+        // traced by the marker already, so leave their offsets to `None` and
+        // fall through — re-walking a managed graph here is redundant.
+        // Positive predicate (no `!` over a cross-crate bool): compute the
+        // offsets only for a non-owned object.
+        let immortal_offsets = if pyre_object::gc_hook::try_gc_owns_object(value as *mut u8) {
+            None
+        } else {
+            pyre_object::gc_hook::offsets_for_pytype((*value).ob_type)
+        };
+        if let Some(offsets) = immortal_offsets {
+            for &off in offsets {
+                let slot = (value as usize + off) as *mut PyObjectRef;
+                visitor(&mut *(slot as *mut majit_ir::GcRef));
+                // Re-read the slot AFTER the visitor so a relocated child is
+                // the one recursed into.
+                walk_immortal_rec(*slot, visitor, depth + 1);
+            }
+            return;
+        }
+
+        // (B) A managed container reached AS A CHILD of an immortal (depth>=1):
+        // its immortal elements would otherwise stay untraced-through (the
+        // marker forwards element slots but does not recurse into an immortal
+        // element's own children).  Enumerate element slots in place and
+        // recurse.  Top-level (depth 0) managed containers are left to the
+        // marker — matches prior scope.
+        if depth >= 1 {
+            if pyre_object::is_list(value) {
+                if let Some((ptr, n)) = pyre_object::listobject::w_list_object_items_ptr_len(value)
+                {
+                    for i in 0..n {
+                        let s = ptr.add(i) as *mut PyObjectRef;
+                        visitor(&mut *(s as *mut majit_ir::GcRef));
+                        walk_immortal_rec(*s, visitor, depth + 1);
+                    }
+                }
+            } else if pyre_object::is_tuple(value) {
+                // Dispatch on the concrete tuple layout (general vs specialised
+                // arity-2): a specialised `_oo` stores objects inline, so a
+                // general-tuple block read would mis-cast its inline slots.
+                pyre_object::tupleobject::w_tuple_walk_gc_refs(
+                    value,
+                    &mut |s: *mut PyObjectRef| {
+                        visitor(&mut *(s as *mut majit_ir::GcRef));
+                        walk_immortal_rec(*s, visitor, depth + 1);
+                    },
+                );
+            } else if pyre_object::is_dict(value) {
+                let strat = pyre_object::dictmultiobject::w_dict_get_strategy(value);
+                strat.walk_gc_refs(value, &mut |s: *mut PyObjectRef| {
+                    visitor(&mut *(s as *mut majit_ir::GcRef));
+                    walk_immortal_rec(*s, visitor, depth + 1);
+                });
+            } else if pyre_object::setobject::is_set_or_frozenset(value) {
+                // `set` and `frozenset` share the `W_SetObject` layout and the
+                // marker's `set_object_custom_trace`, so one walker covers both.
+                pyre_object::setobject::w_set_walk_gc_refs(value, &mut |s: *mut PyObjectRef| {
+                    visitor(&mut *(s as *mut majit_ir::GcRef));
+                    walk_immortal_rec(*s, visitor, depth + 1);
+                });
+            }
         }
     }
 }
@@ -668,7 +751,7 @@ pub unsafe fn walk_pyframe_roots_area(
                     unsafe {
                         let value = (*slot_ptr).0 as PyObjectRef;
                         walk_raw_exception_roots(value, visitor);
-                        walk_raw_seq_iter_roots(value, visitor);
+                        walk_raw_immortal_roots(value, visitor);
                     }
                 }
             }

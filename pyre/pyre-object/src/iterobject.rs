@@ -96,7 +96,7 @@ pub fn w_tuple_iter_new(seq: PyObjectRef) -> PyObjectRef {
 
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     // A tagged immediate is an `int`, never a seq-iter; short-circuit before
-    // the `ob_type` deref so the GC value-stack walker (`walk_raw_seq_iter_roots`)
+    // the `ob_type` deref so the GC value-stack walker (`walk_raw_immortal_roots`)
     // never dereferences one. Gated on `CAN_BE_TAGGED` (default false).
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;

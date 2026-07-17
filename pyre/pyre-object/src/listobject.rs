@@ -1052,6 +1052,26 @@ pub unsafe fn w_list_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
     temporarily_as_objects(list)
 }
 
+/// Raw `(ptr, len)` view of an Object-strategy list's `PyObjectRef` items for
+/// GC root walking.  Returns `None` for Empty / Integer / Float strategies:
+/// those store unboxed scalars with no GC children, and materialising them
+/// would allocate — forbidden while the collector is marking.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.  The returned pointer aliases
+/// the list's live backing store; the caller must not mutate the list while
+/// reading through it.
+pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const PyObjectRef, usize)> {
+    let list = &*(obj as *const W_ListObject);
+    match list.strategy {
+        ListStrategy::Object => {
+            let items = list.object_items_slice();
+            Some((items.as_ptr(), items.len()))
+        }
+        _ => None,
+    }
+}
+
 /// listobject.py:363-371 _temporarily_as_objects()
 ///
 /// Returns wrapped object items without mutating the source list's strategy.

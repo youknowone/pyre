@@ -1229,6 +1229,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         let pytype_ptr = descr.pytype_ptr as usize;
         majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
         pytype_to_tid.insert(pytype_ptr, tid);
+        // Register this type's inline `gc_ptr_offsets` for the interpreter's
+        // generic immortal-root walker (`walk_raw_immortal_roots`).  Covers
+        // every `#[pyre_class]` type — immortal AND managed; the walker's
+        // immortality gate skips managed ones at walk time.
+        pyre_object::gc_hook::register_pyre_class_offsets(pytype_ptr, descr.ptr_offsets);
         tid
     };
     majit_gc::GcAllocator::register_vtable_for_type(
@@ -1792,6 +1797,27 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             w_dict_view_tid,
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_tid);
+        // `W_DictViewObject` is `malloc_typed`-immortal and not a
+        // `#[pyre_class]`, so register its `w_dict` back-pointer offset for the
+        // interpreter's generic immortal-root walker.
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,
+        );
+    }
+    // The three dict-view iterator PyTypes (`W_BaseDictMultiIterObject`) are
+    // likewise `malloc_typed`-immortal and not `#[pyre_class]`, and (unlike the
+    // views) have no GC vtable registration site; register their `w_dict`
+    // back-pointer offset for the generic immortal-root walker directly.
+    for tp in [
+        &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE,
+    ] {
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            &pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS,
+        );
     }
     // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
     // — fget/fset/fdel/doc/reqcls/name are W_Root references.

@@ -631,6 +631,28 @@ pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
     (*s.items).keys().map(|key| key.obj).collect()
 }
 
+/// Walk, in place, every element `PyObjectRef` slot of a set for GC root
+/// forwarding.  Forwards each `ObjectKey.obj` slot: `ObjectKey.hash` is
+/// identity-stable across a GC move, so writing the relocated pointer through
+/// the key's `obj` slot keeps the bucket index valid.  Alloc-free — unlike
+/// [`w_set_items`], which materialises a `Vec`.  The port of
+/// `set_object_custom_trace`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
+    let set = &mut *(obj as *mut W_SetObject);
+    if set.items.is_null() {
+        return;
+    }
+    let entries = &mut *set.items;
+    for (key, _) in entries.iter_mut() {
+        let key_ptr = key as *const crate::dictmultiobject::ObjectKey
+            as *mut crate::dictmultiobject::ObjectKey;
+        visitor(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut PyObjectRef);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
