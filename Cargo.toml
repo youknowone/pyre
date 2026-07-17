@@ -7,6 +7,7 @@ homepage = "https://github.com/youknowone/pyre"
 
 [workspace]
 resolver = "2"
+exclude = ["wasmi"]
 default-members = ["pyre/pyrex"]
 members = [
     # majit
