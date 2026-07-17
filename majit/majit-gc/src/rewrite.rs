@@ -1093,25 +1093,25 @@ impl GcRewriterImpl {
                 // emit a NULL typeptr.
                 if vtable != 0 {
                     self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
-                    // Upstream rewrite.py:479-484 rewrites NEW_WITH_VTABLE
-                    // into allocation plus full header initialization. Pyre's
-                    // object layout carries a separate `w_class` Python-class pointer
-                    // alongside the vtable; interpreter, blackhole, and deopt-materialize
-                    // paths all write it, so compiled allocations must too or trace-time
-                    // GuardValue(w_class) folds fail deterministically on trace-made objects.
-                    if let Some(w_class) = descr.w_class_obj() {
-                        if w_class != 0 {
-                            if let Some(w_class_fd) =
-                                descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class())
-                            {
-                                self.gen_initialize_w_class(
-                                    obj_ref.clone(),
-                                    w_class,
-                                    w_class_fd.as_ref(),
-                                    st,
-                                );
-                            }
-                        }
+                }
+            }
+            // Upstream rewrite.py:479-484 rewrites NEW_WITH_VTABLE into allocation
+            // plus full header initialization. Pyre's object layout carries a
+            // separate `w_class` Python-class pointer alongside the vtable;
+            // interpreter, blackhole, and deopt-materialize paths all write it,
+            // so compiled allocations must too or trace-time GuardValue(w_class)
+            // folds fail deterministically on trace-made objects.
+            if let Some(w_class) = descr.w_class_obj() {
+                if w_class != 0 {
+                    if let Some(w_class_fd) =
+                        descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class())
+                    {
+                        self.gen_initialize_w_class(
+                            obj_ref.clone(),
+                            w_class,
+                            w_class_fd.as_ref(),
+                            st,
+                        );
                     }
                 }
             }
@@ -1140,7 +1140,7 @@ impl GcRewriterImpl {
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(&result);
         for fd in descr.gc_fielddescrs() {
-            if fd.is_w_class() {
+            if fd.is_w_class() && descr.w_class_obj().is_some_and(|w| w != 0) {
                 continue;
             }
             entries.insert(fd.offset() as i64);
@@ -3194,6 +3194,7 @@ mod tests {
         size: usize,
         type_id: u32,
         vtable: usize,
+        w_class: Option<i64>,
         headerless: bool,
         gc_fields: Vec<Arc<dyn FieldDescr>>,
     }
@@ -3219,6 +3220,9 @@ mod tests {
         }
         fn vtable(&self) -> usize {
             self.vtable
+        }
+        fn w_class_obj(&self) -> Option<i64> {
+            self.w_class
         }
         fn headerless(&self) -> bool {
             self.headerless
@@ -3250,6 +3254,32 @@ mod tests {
         }
         fn field_type(&self) -> Type {
             self.field_type
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWClassFieldDescr {
+        offset: usize,
+    }
+
+    impl Descr for TestWClassFieldDescr {
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestWClassFieldDescr {
+        fn offset(&self) -> usize {
+            self.offset
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> Type {
+            Type::Ref
+        }
+        fn field_name(&self) -> &str {
+            "w_class"
         }
     }
 
@@ -3367,6 +3397,7 @@ mod tests {
             size,
             type_id,
             vtable: 0,
+            w_class: None,
             headerless: false,
             gc_fields: Vec::new(),
         })
@@ -3377,6 +3408,7 @@ mod tests {
             size,
             type_id,
             vtable: 0,
+            w_class: None,
             headerless: true,
             gc_fields: Vec::new(),
         })
@@ -3391,6 +3423,24 @@ mod tests {
             size,
             type_id,
             vtable: 0,
+            w_class: None,
+            headerless: false,
+            gc_fields,
+        })
+    }
+
+    fn size_descr_with_w_class(
+        size: usize,
+        type_id: u32,
+        vtable: usize,
+        w_class: Option<i64>,
+        gc_fields: Vec<Arc<dyn FieldDescr>>,
+    ) -> DescrRef {
+        Arc::new(TestSizeDescr {
+            size,
+            type_id,
+            vtable,
+            w_class,
             headerless: false,
             gc_fields,
         })
@@ -3401,6 +3451,7 @@ mod tests {
             size,
             type_id,
             vtable,
+            w_class: None,
             headerless: false,
             gc_fields: Vec::new(),
         })
@@ -3758,6 +3809,10 @@ mod tests {
         })
     }
 
+    fn w_class_field_descr_at(offset: usize) -> Arc<dyn FieldDescr> {
+        Arc::new(TestWClassFieldDescr { offset })
+    }
+
     /// rewrite.py:499-500 + rewrite.py:761-766 — malloc_zero_filled=true
     /// short-circuits `clear_gc_fields`, so NEW emits no pending NULL
     /// stores at the next flush point.  Mirrors pyre's production
@@ -4100,6 +4155,73 @@ mod tests {
                 .inline_const_bits()
                 .expect("inline ConstInt"),
             0xDEAD_i64
+        );
+    }
+
+    #[test]
+    fn test_new_with_vtable_initializes_w_class_without_vtable_store() {
+        let mut rw = make_rewriter();
+        rw.fielddescr_vtable = None;
+        rw.malloc_zero_filled = false;
+        let w_class = 0xCAFE;
+        let ops = vec![
+            Op::with_descr(
+                OpCode::NewWithVtable,
+                &[],
+                size_descr_with_w_class(48, 3, 0, Some(w_class), vec![w_class_field_descr_at(16)]),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, _constants, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert_eq!(gcrefs, vec![GcRef(w_class as usize)]);
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::LoadFromGcTable),
+            "non-null w_class constant must be routed through the GC table"
+        );
+        let w_class_stores: Vec<_> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .filter(|o| o.arg(1).to_opref().inline_const_bits() == Some(16))
+            .collect();
+        assert_eq!(
+            w_class_stores.len(),
+            1,
+            "w_class must be initialized once and not followed by a delayed zero store: {result:?}"
+        );
+        assert_ne!(
+            w_class_stores[0].arg(2).to_opref().inline_const_bits(),
+            Some(0),
+            "w_class initialization must not be a NULL delayed-zero store"
+        );
+    }
+
+    #[test]
+    fn test_clear_gc_fields_zeros_w_class_without_init_value() {
+        let mut rw = make_rewriter();
+        rw.fielddescr_vtable = None;
+        rw.malloc_zero_filled = false;
+        let ops = vec![
+            Op::with_descr(
+                OpCode::NewWithVtable,
+                &[],
+                size_descr_with_w_class(48, 3, 0, None, vec![w_class_field_descr_at(16)]),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, _constants, _gcrefs) =
+            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert!(
+            result.iter().any(|o| {
+                o.opcode == OpCode::GcStore
+                    && o.arg(1).to_opref().inline_const_bits() == Some(16)
+                    && o.arg(2).to_opref().inline_const_bits() == Some(0)
+                    && o.arg(3).to_opref().inline_const_bits() == Some(8)
+            }),
+            "w_class field without an init value must be included in delayed-zero stores: {result:?}"
         );
     }
 
