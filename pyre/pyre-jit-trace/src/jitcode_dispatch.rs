@@ -488,6 +488,11 @@ pub struct FbwWalkMode {
     pub current_exception_seed: Option<OpRef>,
     /// Concrete shadow paired with [`FbwWalkMode::current_exception_seed`].
     pub current_exception_seed_concrete: pyre_object::PyObjectRef,
+    /// Walker-carried mirror of
+    /// `MetaInterp.class_of_last_exc_is_const` (`pyjitpl.py:3382-3393`).
+    /// This is shared logically across recursive MIFrame walks; catch routing
+    /// writes the proven-class state back into the caller's copy.
+    pub class_of_last_exc_is_const: bool,
 }
 
 /// The outer snapshot's Python-PC coordinate. Non-root producers preserve the
@@ -517,6 +522,7 @@ impl Default for FbwWalkMode {
             carrier_resume: false,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
+            class_of_last_exc_is_const: false,
         }
     }
 }
@@ -1737,6 +1743,7 @@ pub fn walk(
                 if let Some(target) = try_catch_exception_at(code, pc) {
                     ctx.last_exc_value = Some(exc);
                     ctx.last_exc_value_concrete = exc_concrete;
+                    ctx.fbw_mode.class_of_last_exc_is_const = true;
                     // The exception is now caught by this frame's handler, so
                     // drain the standing residual-call exception flag the
                     // raising helper published (`try_execute_residual_call_via_
@@ -2906,6 +2913,7 @@ pub fn dispatch_via_miframe(
                 } else {
                     pyre_object::PY_NULL
                 },
+                class_of_last_exc_is_const: sym.class_of_last_exc_is_const,
                 ..Default::default()
             },
             session,
@@ -2969,6 +2977,7 @@ pub fn dispatch_via_miframe(
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
         let final_last_exc = wc.last_exc_value;
+        let final_class_of_last_exc_is_const = wc.fbw_mode.class_of_last_exc_is_const;
         drop(wc);
         // Full `sym.last_exc_*` state writeback parity.
         //
@@ -3003,7 +3012,7 @@ pub fn dispatch_via_miframe(
         //     concrete state is fed by another path).
         if let Some(exc) = final_last_exc {
             sym.last_exc_box = exc;
-            sym.class_of_last_exc_is_const = true;
+            sym.class_of_last_exc_is_const = final_class_of_last_exc_is_const;
         }
         outcome
     };
@@ -3411,6 +3420,7 @@ fn drive_bridge_frame_subwalk(
                 current_exception_seed: (!root_sym.last_exc_box.is_none())
                     .then_some(root_sym.last_exc_box),
                 current_exception_seed_concrete: root_sym.last_exc_value,
+                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const,
             },
             session,
             registers_r: &mut regs_r,
@@ -3755,6 +3765,7 @@ pub(crate) fn drive_outer_frame_continuation(
                 current_exception_seed: (!root_sym.last_exc_box.is_none())
                     .then_some(root_sym.last_exc_box),
                 current_exception_seed_concrete: root_sym.last_exc_value,
+                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const,
             },
             session,
             registers_r: &mut regs_r,
@@ -7073,6 +7084,9 @@ fn try_execute_residual_call_via_executor(
             ctx.last_exc_value = Some(ctx.trace_ctx.const_ref(bh_exc));
             ctx.last_exc_value_concrete =
                 ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
+            // `pyjitpl.py:2768-2777 execute_raised(..., constant=False)`:
+            // a residual exception has not had its class proven by a guard yet.
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh_exc));
             // `execute_raised` records the raise into `last_exc_value`
             // (above) only.  The shared `bh_*` residual helper also
@@ -13879,8 +13893,10 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
             return;
         }
     };
-    // `pyjitpl.py:3382-3384`: ALWAYS emit `GuardException` with a const
-    // class pin (`class_of_last_exc_is_const = True` after the emit).
+    let class_of_last_exc_is_const = ctx.fbw_mode.class_of_last_exc_is_const;
+    // `pyjitpl.py:3382-3393` / `pyjitpl.rs:12221-12258`: always emit
+    // `GuardException` with a const class pin, but keep its live result box
+    // unless the exception class was already proven constant.
     // Pyre's `W_BaseException.ob_header.ob_type` is the per-`ExcKind`
     // `PyType` static (`interp_exceptions.rs::exc_kind_to_pytype`), matching
     // upstream `OBJECT.typeptr = specific class` (`rclass.py:167-174`).
@@ -13890,9 +13906,22 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
             .ob_type as i64
     };
     let exc_type_const = ctx.trace_ctx.const_int(exc_type_ptr);
-    ctx.trace_ctx
+    let guard_op = ctx
+        .trace_ctx
         .record_guard(OpCode::GuardException, &[exc_type_const], 0);
     let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
+    // `op.setref_base(val)` supplies the recording-time shadow without
+    // changing the guard result's live replay identity.
+    ctx.trace_ctx.set_opref_concrete(
+        guard_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(exc_obj as usize)),
+    );
+    ctx.last_exc_value = Some(if class_of_last_exc_is_const {
+        ctx.trace_ctx.const_ref(exc_obj as usize as i64)
+    } else {
+        guard_op
+    });
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
 }
 
 fn clear_walk_exception(ctx: &mut WalkContext<'_, '_>) {
@@ -14325,7 +14354,11 @@ fn try_walker_store_subscr_specialization(
             let exc_concrete = ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
             ctx.last_exc_value = Some(exc);
             ctx.last_exc_value_concrete = exc_concrete;
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
             walker_record_guard_exception(ctx, op.pc);
+            let exc = ctx
+                .last_exc_value
+                .expect("GuardException must bind the raised exception box");
             return Some(DispatchOutcome::SubRaise { exc, exc_concrete });
         }
         // Defensive: helper returned 0 but did not stash an exception.
@@ -16768,6 +16801,7 @@ fn try_walker_inline_resolved_user_call(
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
                 ctx.last_exc_value_concrete = exc_concrete;
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
                 Ok(Some((
@@ -25345,6 +25379,7 @@ fn dispatch_inline_call_dr_kind(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -25487,6 +25522,7 @@ fn dispatch_inline_call_dir_kind(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -25641,6 +25677,7 @@ fn dispatch_inline_call_dirf_kind(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -27158,6 +27195,7 @@ fn handle(
             }
             ctx.last_exc_value = Some(exc);
             ctx.last_exc_value_concrete = concrete_exc;
+            ctx.fbw_mode.class_of_last_exc_is_const = true;
             // Gated `PYRE_FBW_RAISE`: route the top-level raise through
             // `SubRaise` so walk()'s SubRaise arm runs the in-frame
             // `catch_exception/L` lookahead (`finishframe_lookahead_at`) and
