@@ -427,6 +427,30 @@ impl W_Deque {
         }
         Ok(())
     }
+    fn insert(&mut self, i: PyObjectRef, x: PyObjectRef) -> Result<(), crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
+        // `W_Deque.insert(i, x)` — the index goes through `__index__` (converted
+        // before the deque is inspected), then a bounded deque that is already
+        // full raises before the element is placed.
+        let index = crate::builtins::getindex_w(i)?;
+        let mut items = snapshot(self_obj);
+        if maxlen_bound(self_obj).is_some_and(|m| items.len() >= m) {
+            return Err(crate::PyError::index_error(
+                "deque already at its maximum size",
+            ));
+        }
+        let len = items.len() as i64;
+        // list.insert clamping: a negative index counts from the end and an
+        // out-of-range index clamps to the near edge.
+        let pos = if index < 0 {
+            (index + len).max(0)
+        } else {
+            index.min(len)
+        } as usize;
+        items.insert(pos, x);
+        store(self_obj, items);
+        Ok(())
+    }
     fn index(
         &self,
         x: PyObjectRef,
