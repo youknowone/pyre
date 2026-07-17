@@ -700,9 +700,8 @@ fn stack_effects(
                 (d - 2, d - 2)
             }
         }
-        // CheckExcMatch: codewriter pops match_type, peeks the caught
-        // exception, then pushes the bool result. Net 0.
-        Instruction::CheckExcMatch => (d, d),
+        // Both exception checks have no net stack effect.
+        Instruction::CheckExcMatch | Instruction::CheckEgMatch => (d, d),
         // Pop 2 push 1 (net -1)
         Instruction::BinaryOp { .. }
         | Instruction::CompareOp { .. }

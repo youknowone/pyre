@@ -1158,6 +1158,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn check_exc_match(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("check_exc_match not implemented").into())
     }
+    fn check_eg_match(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("check_eg_match not implemented").into())
+    }
     /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
     ///
     /// `oparg` is the depth (0..) at which the original raise-site lasti
@@ -1369,6 +1372,14 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Ok(())
     }
 
+    fn prep_reraise_star(
+        &mut self,
+        _orig: Self::Value,
+        _exceptions: Self::Value,
+    ) -> Result<Self::Value, PyError> {
+        Err(crate::PyError::type_error("prep_reraise_star not implemented").into())
+    }
+
     /// BUILD_TEMPLATE: pop the interpolations and strings tuples and build a
     /// `string.templatelib.Template`.  Overridden by the interpreter; the trace
     /// path declines (t-strings run at import time, never inside a JIT-traced
@@ -1449,6 +1460,13 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// CALL_INTRINSIC_2: two-argument intrinsic operations.
     fn call_intrinsic_2(&mut self, func: IntrinsicFunction2) -> Result<(), PyError> {
         match func {
+            IntrinsicFunction2::PrepReraiseStar => {
+                let exceptions = self.pop_value()?;
+                let orig = self.pop_value()?;
+                let result = self.prep_reraise_star(orig, exceptions)?;
+                self.push_value(result)?;
+                Ok(())
+            }
             IntrinsicFunction2::SetFunctionTypeParams => {
                 // arg2 = type_params, arg1 = function
                 // Set __type_params__ attribute on the function; push function back
@@ -1886,6 +1904,13 @@ pub fn execute_check_exc_match<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.check_exc_match()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_check_eg_match<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.check_eg_match()?;
     Ok(StepResult::Continue)
 }
 
@@ -3362,6 +3387,7 @@ where
         Instruction::PushExcInfo => execute_push_exc_info(executor),
         Instruction::PopExcept => execute_pop_except(executor),
         Instruction::CheckExcMatch => execute_check_exc_match(executor),
+        Instruction::CheckEgMatch => execute_check_eg_match(executor),
         Instruction::RaiseVarargs { .. } => execute_raise_varargs(executor, instruction, op_arg),
         Instruction::Reraise { .. } => execute_reraise(executor, instruction, op_arg),
 

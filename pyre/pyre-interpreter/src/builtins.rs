@@ -5083,6 +5083,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
+    Identity(Vec<usize>),
 }
 
 impl ExceptionGroupCondition {
@@ -5093,6 +5094,7 @@ impl ExceptionGroupCondition {
                 let result = crate::call::call_function_impl_result(callable, &[exc])?;
                 crate::baseobjspace::is_true(result)
             }
+            Self::Identity(ref addresses) => Ok(addresses.contains(&(exc as usize))),
         }
     }
 }
@@ -5227,6 +5229,141 @@ fn exception_group_split_inner(
         exception_group_derive_and_copy(w_self, nonmatching)?
     };
     Ok((yes, no))
+}
+
+pub(crate) fn exception_group_match(
+    w_exc: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if crate::baseobjspace::isinstance(w_exc, w_type)? {
+        if crate::baseobjspace::isinstance(w_exc, base_group)? {
+            return Ok((w_exc, pyre_object::w_none()));
+        }
+        let message = unsafe { pyre_object::w_str_new("") };
+        let exceptions = pyre_object::w_tuple_new(vec![w_exc]);
+        let group = exception_group_new(&[base_group, message, exceptions])?;
+        return Ok((group, pyre_object::w_none()));
+    }
+    if crate::baseobjspace::isinstance(w_exc, base_group)? {
+        return exception_group_split_inner(w_exc, &ExceptionGroupCondition::Class(w_type));
+    }
+    Ok((pyre_object::w_none(), w_exc))
+}
+
+fn exception_group_notes(w_exc: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match crate::baseobjspace::getattr_str(w_exc, "__notes__") {
+        Ok(notes) => Ok(Some(notes)),
+        Err(err) if err.kind == crate::PyErrorKind::AttributeError => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn exception_group_same_metadata(
+    w_left: PyObjectRef,
+    w_right: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    let left_notes = exception_group_notes(w_left)?;
+    let right_notes = exception_group_notes(w_right)?;
+    if !match (left_notes, right_notes) {
+        (Some(left), Some(right)) => std::ptr::eq(left, right),
+        (None, None) => true,
+        _ => false,
+    } {
+        return Ok(false);
+    }
+    Ok(unsafe {
+        std::ptr::eq(
+            pyre_object::interp_exceptions::w_exception_get_traceback(w_left),
+            pyre_object::interp_exceptions::w_exception_get_traceback(w_right),
+        ) && std::ptr::eq(
+            pyre_object::interp_exceptions::w_exception_get_cause(w_left),
+            pyre_object::interp_exceptions::w_exception_get_cause(w_right),
+        ) && std::ptr::eq(
+            pyre_object::interp_exceptions::w_exception_get_context(w_left),
+            pyre_object::interp_exceptions::w_exception_get_context(w_right),
+        )
+    })
+}
+
+fn exception_group_collect_leaf_addresses(
+    w_exc: PyObjectRef,
+    addresses: &mut Vec<usize>,
+) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_none(w_exc) } {
+        return Ok(());
+    }
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if crate::baseobjspace::isinstance(w_exc, base_group)? {
+        let (_, exceptions) = exception_group_fields(w_exc)?;
+        for child in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+            exception_group_collect_leaf_addresses(child, addresses)?;
+        }
+    } else if unsafe { pyre_object::is_exception(w_exc) } {
+        let address = w_exc as usize;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    } else {
+        let name = crate::baseobjspace::object_functionstr_type_name(w_exc);
+        return Err(crate::PyError::type_error(format!(
+            "expected BaseException, got {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn exception_group_projection(
+    w_group: PyObjectRef,
+    keep: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut addresses = Vec::new();
+    for w_exc in keep.iter().copied() {
+        exception_group_collect_leaf_addresses(w_exc, &mut addresses)?;
+    }
+    let (matching, _) =
+        exception_group_split_inner(w_group, &ExceptionGroupCondition::Identity(addresses))?;
+    Ok(matching)
+}
+
+pub(crate) fn exception_group_prep_reraise_star(
+    w_orig: PyObjectRef,
+    w_exc_list: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let exceptions = crate::baseobjspace::fixedview(w_exc_list, -1)?;
+    if exceptions.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    if !crate::baseobjspace::isinstance(w_orig, base_group)? {
+        return Ok(exceptions[0]);
+    }
+
+    let mut raised = Vec::new();
+    let mut reraised = Vec::new();
+    for w_exc in exceptions {
+        if !unsafe { pyre_object::is_none(w_exc) } {
+            if exception_group_same_metadata(w_exc, w_orig)? {
+                reraised.push(w_exc);
+            } else {
+                raised.push(w_exc);
+            }
+        }
+    }
+    let reraised_group = exception_group_projection(w_orig, &reraised)?;
+    if raised.is_empty() {
+        return Ok(reraised_group);
+    }
+    if !unsafe { pyre_object::is_none(reraised_group) } {
+        raised.push(reraised_group);
+    }
+    if raised.len() == 1 {
+        return Ok(raised[0]);
+    }
+    let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
+    let message = unsafe { pyre_object::w_str_new("") };
+    let list = pyre_object::w_list_new(raised);
+    exception_group_new(&[exception_group, message, list])
 }
 
 fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

@@ -1129,6 +1129,30 @@ pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyErr
     Ok(())
 }
 
+fn validate_check_eg_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
+    validate_check_exc_match_class(exc_type)?;
+    let base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup").unwrap();
+    unsafe {
+        if pyre_object::is_tuple(exc_type) {
+            let n = pyre_object::w_tuple_len(exc_type) as i64;
+            for i in 0..n {
+                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
+                    if crate::baseobjspace::issubclass(w_type, base_group)? {
+                        return Err(PyError::type_error(
+                            "catching ExceptionGroup with except* is not allowed. Use except instead.",
+                        ));
+                    }
+                }
+            }
+        } else if crate::baseobjspace::issubclass(exc_type, base_group)? {
+            return Err(PyError::type_error(
+                "catching ExceptionGroup with except* is not allowed. Use except instead.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) -> bool {
     // pyopcode.py:1040 `return space.exception_match(space.type(w_1), w_2)`.
     // `crate::typedef::r#type` is the `space.type` equivalent — it
@@ -3167,6 +3191,31 @@ impl OpcodeStepExecutor for PyFrame {
         let matched = check_exc_match_against(exc_value, exc_type);
         self.push(pyre_object::w_bool_from(matched));
         Ok(())
+    }
+
+    fn check_eg_match(&mut self) -> Result<(), PyError> {
+        let exc_type = self.pop();
+        validate_check_eg_match_class(exc_type)?;
+        let exc_value = self.pop();
+        let (matching, rest) = if unsafe { pyre_object::is_none(exc_value) } {
+            (pyre_object::w_none(), pyre_object::w_none())
+        } else {
+            crate::builtins::exception_group_match(exc_value, exc_type)?
+        };
+        self.push(rest);
+        self.push(matching);
+        if !unsafe { pyre_object::is_none(matching) } {
+            set_current_exception(matching);
+        }
+        Ok(())
+    }
+
+    fn prep_reraise_star(
+        &mut self,
+        orig: Self::Value,
+        exceptions: Self::Value,
+    ) -> Result<Self::Value, PyError> {
+        crate::builtins::exception_group_prep_reraise_star(orig, exceptions)
     }
 
     // ── PopExcept ──

@@ -4417,8 +4417,19 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
-        if let pyre_interpreter::Instruction::ForIter { .. } = arg_state.get(unit).0 {
-            has_for_iter = true;
+        let (instruction, op_arg) = arg_state.get(unit);
+        match instruction {
+            pyre_interpreter::Instruction::ForIter { .. } => has_for_iter = true,
+            pyre_interpreter::Instruction::CheckEgMatch => {
+                return UnsupportedJitShape::CurrentFrameOnly;
+            }
+            pyre_interpreter::Instruction::CallIntrinsic2 { func }
+                if func.get(op_arg)
+                    == pyre_interpreter::bytecode::IntrinsicFunction2::PrepReraiseStar =>
+            {
+                return UnsupportedJitShape::CurrentFrameOnly;
+            }
+            _ => {}
         }
     }
     if has_for_iter {
@@ -4466,12 +4477,10 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     match unsupported_jit_shape(code) {
         UnsupportedJitShape::None => {}
         UnsupportedJitShape::CurrentFrameOnly => {
-            // A FOR_ITER frame the #57 gate cannot trace (a non-journalable
-            // mutator body, or a `finally`-duplicated loop): run it in the plain
-            // interpreter.  The tracer never sees it, so record the frame-shape
-            // decline in the census (deduped per code object) — otherwise a hot
-            // loop declined here reads as a silent no-token gap, indistinguishable
-            // from a loop the JIT never noticed.
+            // Run frames with unsupported current-frame bytecode shapes in the
+            // plain interpreter. The tracer never sees them, so record the
+            // frame-shape decline in the census rather than leaving a silent
+            // no-token gap.
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
                 "FrameShape::CurrentFrameOnly",

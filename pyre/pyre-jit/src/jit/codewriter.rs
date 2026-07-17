@@ -9188,6 +9188,22 @@ impl CodeWriter {
                             emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }
 
+                        // CHECK_EG_MATCH replaces the exception and match type
+                        // with the unmatched and matched portions. Exception-group
+                        // handling remains an interpreter boundary, but the graph
+                        // walk still needs the post-opcode stack shape for later
+                        // blocks reached through exception-table control flow.
+                        Instruction::CheckEgMatch => {
+                            for _ in 0..2 {
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            }
+                            for _ in 0..2 {
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                            }
+                            emit_abort_permanent!(py_pc);
+                        }
+
                         Instruction::PopExcept => {
                             // eval.rs:1243-1249 / pyopcode.py:778 parity:
                             //   prev = pop()
