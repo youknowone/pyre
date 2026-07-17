@@ -1842,6 +1842,32 @@ pub trait Backend: Send {
         true
     }
 
+    /// Register a resolvable-but-not-enterable placeholder CALL_ASSEMBLER
+    /// target for a pending token, before the loop body is compiled.
+    ///
+    /// Backends that resolve pending tokens rather than tmp-callback bodies
+    /// (`supports_tmp_callback_call_assembler` false) need the pending
+    /// target's frame geometry and dispatch slot published now so an
+    /// already-emitted caller can enter it and be redirected once the real
+    /// loop compiles. Backends that enter tmp-callback bodies never emit a
+    /// pending target, so the default is a no-op.
+    fn register_pending_target(
+        &mut self,
+        token_number: u64,
+        input_types: Vec<Type>,
+        num_inputs: usize,
+        num_scalar_inputargs: usize,
+        index_of_virtualizable: i32,
+    ) {
+        let _ = (
+            token_number,
+            input_types,
+            num_inputs,
+            num_scalar_inputargs,
+            index_of_virtualizable,
+        );
+    }
+
     /// Execute compiled code with integer-only arguments.
     ///
     /// Avoids the `Value::Int` wrapping/unwrapping overhead when all

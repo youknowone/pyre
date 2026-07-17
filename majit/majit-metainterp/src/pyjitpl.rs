@@ -3672,6 +3672,24 @@ impl<M: Clone> MetaInterp<M> {
                 // see `setup_tracing` for the contract on raw-pointer
                 // lifetime pinning by MetaInterp ownership.
                 ctx.set_cpu(Some(&self.backend));
+                // compile_tmp_callback parity: mirror `setup_tracing` so both
+                // trace-start entry points register the same pending-token
+                // shape for backends that resolve CALL_ASSEMBLER to the
+                // pending token instead of a tmp-callback body.
+                let pending_target =
+                    (!self.backend.supports_tmp_callback_call_assembler()).then(|| {
+                        let input_types = Self::pending_target_input_types(
+                            ctx.inputarg_types(),
+                            driver_descriptor.as_ref(),
+                        );
+                        let num_inputs = input_types.len();
+                        let index_of_virtualizable: i32 = ctx
+                            .driver_descriptor()
+                            .and_then(|jd| jd.virtualizable_arg_index())
+                            .map(|i| i as i32)
+                            .unwrap_or(-1);
+                        (input_types, num_inputs, index_of_virtualizable)
+                    });
                 self.tracing = Some(ctx);
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
                 // `setup_tracing` for rationale.  Bridge-trace
@@ -3692,7 +3710,17 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let pending_token =
                     self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
+                let pending_num = pending_token.number;
                 self.pending_token = Some((green_key, pending_token));
+                if let Some((input_types, num_inputs, index_of_virtualizable)) = pending_target {
+                    self.backend.register_pending_target(
+                        pending_num,
+                        input_types,
+                        num_inputs,
+                        self.num_scalar_inputargs,
+                        index_of_virtualizable,
+                    );
+                }
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -3827,6 +3855,34 @@ impl<M: Clone> MetaInterp<M> {
         }))
     }
 
+    /// Reds-only inputarg shape for a pending CALL_ASSEMBLER target, matching
+    /// the entry contract `patch_new_loop_to_load_virtualizable_fields()`
+    /// later hands to `backend.compile_loop(...)` (compile.py:425-461).
+    fn pending_target_input_types(
+        input_types: Vec<Type>,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) -> Vec<Type> {
+        let Some(driver) = driver_descriptor else {
+            return input_types;
+        };
+        let Some(_) = driver.virtualizable_arg_index() else {
+            return input_types;
+        };
+        // `extract_live_values()` still emits the expanded
+        // `[frame, last_instr, pycode, valuestackdepth, debugdata, lastblock,
+        //  w_globals, locals..., stack...]` shape, so the trace's inputarg
+        // types do NOT carry the reds in the leading `num_reds` slots —
+        // truncating to `num_reds` here would register a bogus
+        // `[Ref(frame), Int(last_instr)]` ABI when reds is `[frame, ec]`.
+        // Synthesise the reds-only shape directly from the JitDriver var
+        // table (`JitDriverVar.tp` matches `Box.type`).
+        let red_types: Vec<Type> = driver.reds().iter().map(|red| red.tp).collect();
+        if input_types.len() <= red_types.len() {
+            return input_types;
+        }
+        red_types
+    }
+
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -3896,6 +3952,22 @@ impl<M: Clone> MetaInterp<M> {
         // this trace because `self` (MetaInterp) owns both `tracing`
         // and `backend`, and tracing is torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
+        // compile_tmp_callback parity: a backend that resolves CALL_ASSEMBLER
+        // to the pending token (rather than a tmp-callback body) needs its
+        // pending target registered with the same red-args-only entry
+        // contract `patch_new_loop_to_load_virtualizable_fields()` later hands
+        // to `backend.compile_loop(...)`.
+        let pending_target = (!self.backend.supports_tmp_callback_call_assembler()).then(|| {
+            let input_types =
+                Self::pending_target_input_types(ctx.inputarg_types(), driver_descriptor.as_ref());
+            let num_inputs = input_types.len();
+            let index_of_virtualizable: i32 = ctx
+                .driver_descriptor()
+                .and_then(|jd| jd.virtualizable_arg_index())
+                .map(|i| i as i32)
+                .unwrap_or(-1);
+            (input_types, num_inputs, index_of_virtualizable)
+        });
         self.tracing = Some(ctx);
         // pyjitpl.py:1547-1556 `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
@@ -3918,7 +3990,17 @@ impl<M: Clone> MetaInterp<M> {
             }));
         }
         let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
+        let pending_num = pending_token.number;
         self.pending_token = Some((green_key, pending_token));
+        if let Some((input_types, num_inputs, index_of_virtualizable)) = pending_target {
+            self.backend.register_pending_target(
+                pending_num,
+                input_types,
+                num_inputs,
+                self.num_scalar_inputargs,
+                index_of_virtualizable,
+            );
+        }
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
