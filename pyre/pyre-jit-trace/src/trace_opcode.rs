@@ -10095,10 +10095,7 @@ mod tests {
         // local 0 -> color 0 (slot 0), local 1 -> color 1 (slot 1), and the
         // live operand-stack slot (depth 0 = abs slot nlocals+0 = 2) -> color
         // 0, reusing dead local 0's color. Sorted by (color, slot).
-        pyjit
-            .metadata
-            .pcdep_color_slots
-            .push(vec![(1, 0, 0), (1, 0, 2), (1, 1, 1)]);
+        pyjit.metadata.has_color_map = true;
         // JitCode-native twins the migrated `get_list_of_active_boxes` reads
         // (`pcdep_for_jitcode_pc` / `depth_for_jitcode_pc_pred`): mirror the
         // py_pc-keyed tables above at the single `-live-` JitCode offset 0.

@@ -9244,14 +9244,24 @@ mod tests {
     }
 
     /// Post-regalloc Ref-bank color of semantic slot `slot` at `py_pc`,
-    /// read from the per-PC `pcdep_color_slots` entries (local `i` is
+    /// read from the JitCode-PC twins (local `i` is
     /// slot `i`, operand-stack depth `d` is slot `nlocals + d`). Colors
     /// are per-program-point (chordal coloring may coalesce
     /// disjointly-live slots and re-color across PCs), so there is no
     /// flat slot → color lookup; `None` when the slot carries no live
     /// restorable entry at that PC.
     fn pcdep_color_for_slot(jitcode_index: i32, py_pc: usize, slot: usize) -> Option<u32> {
-        pyre_jit_trace::state::pcdep_color_slots_at(jitcode_index, py_pc as i32)
+        let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+        let jit_pc = payload
+            .metadata
+            .py_floor_by_jit_pc
+            .iter()
+            .find(|&&(_, py)| py as usize == py_pc)
+            .map(|&(pc, _)| pc as usize)?;
+        payload
+            .pcdep_trivia_for_jitcode_pc(jit_pc)
+            .map(ToOwned::to_owned)
+            .or_else(|| payload.pcdep_for_jitcode_pc(jit_pc))?
             .iter()
             .find(|&&(b, _, s)| b == 1 && s as usize == slot)
             .map(|&(_, c, _)| u32::from(c))

@@ -13411,8 +13411,8 @@ impl CodeWriter {
             after_residual_marker_pred_by_jit_pc,
             result_color_after_residual_marker_by_jit_pc,
             result_color_after_residual_pred_by_jit_pc,
-            result_color_at_pc,
             result_color_by_jit_pc,
+            has_color_map: !pcdep_color_slots.is_empty(),
             portal_frame_reg,
             portal_ec_reg,
             // Records the INPUT SHAPE (Portal `[frame, ec]` + frame-vable
@@ -13422,7 +13422,6 @@ impl CodeWriter {
             built_as_portal: true,
             stack_base: frame_stack_base,
             max_stackdepth: code.max_stackdepth as usize,
-            pcdep_color_slots,
             const_ref_slots_at_pc,
             const_ref_slots_by_jit_pc,
             is_drained: true,

@@ -1391,33 +1391,6 @@ pub fn seed_compiled_trace_jitcode_test_state(
     }
 }
 
-/// Per-PC `(color, semantic_slot)` resume entries for the registered
-/// jitcode at `jitcode_index` (`metadata.pcdep_color_slots[py_pc]`).
-/// Empty when the index or PC is out of range, or the jitcode was never
-/// colored (portal/skeleton installs).
-///
-/// Used by tests + tooling that need to translate a physical frame slot
-/// (local `i` for `i < code.varnames.len()`, `metadata.stack_base + d` for
-/// operand-stack depth `d`) into the post-rename register color the dispatcher would touch
-/// at a given PC — colors are per-program-point, so a flat
-/// slot-arithmetic lookup does not exist.
-pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u8, u16, u16)> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        sd.jitcodes
-            .get(jitcode_index as usize)
-            .and_then(|jc| {
-                jc.payload
-                    .metadata
-                    .pcdep_color_slots
-                    .get(usize::try_from(py_pc).ok()?)
-                    .cloned()
-            })
-            .unwrap_or_default()
-    })
-}
-
 /// Trivia-aware per-PC `(color, semantic_slot)` resume entries keyed directly
 /// by a JitCode byte offset. `None` when the index, offset, or trivia twin is
 /// unavailable; callers that preserve the legacy empty-result behavior may use
@@ -1431,22 +1404,6 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
             .payload
             .pcdep_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
             .map(ToOwned::to_owned)
-    })
-}
-
-/// The post-regalloc Ref-bank color of the call-result operand-stack slot,
-/// keyed directly by a JitCode byte offset through the trivia-aware twin.
-/// Returns `None` for an empty stack, unavailable twin, or invalid coordinate.
-pub fn result_color_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<usize> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        sd.jitcodes
-            .get(jitcode_index as usize)?
-            .payload
-            .result_color_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
-            .map(|color| color as usize)
-            .filter(|&color| color != u16::MAX as usize)
     })
 }
 
@@ -1587,13 +1544,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 .get(rp)
                 .copied()
                 .unwrap_or(0) as usize;
-            let pcdep = payload
-                .metadata
-                .pcdep_color_slots
-                .get(rp)
-                .cloned()
-                .unwrap_or_default();
-            (depth, pcdep)
+            depth
         };
         let (stack_depth_at_pc, pcdep_entries) =
             if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
@@ -1618,33 +1569,28 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                         payload.pcdep_for_jitcode_pc(jp),
                     ) {
                         (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                        _ => {
-                            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                                "bridge_maps_via_py_pc",
-                                "twin_miss",
-                            );
-                            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-                        }
+                        _ => (
+                            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                            Vec::new(),
+                        ),
                     }
                 } else {
-                    crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                        "bridge_maps_via_py_pc",
-                        "non_decodable",
-                    );
-                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
+                    (
+                        via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                        Vec::new(),
+                    )
                 }
             } else {
-                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                    "bridge_maps_via_py_pc",
-                    "no_word",
-                );
-                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
+                (
+                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                    Vec::new(),
+                )
             };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
             // is non-empty — the field-free replacement for the retired flat
             // `local_color_map.is_empty() && stack_color_map.is_empty()` test.
-            has_color_map: !payload.metadata.pcdep_color_slots.is_empty(),
+            has_color_map: payload.metadata.has_color_map,
             stack_depth_at_pc,
             pcdep_entries,
         }
@@ -12575,14 +12521,13 @@ mod tests {
                 result_color_after_residual_marker_by_jit_pc: Vec::new(),
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: vec![2],
-                result_color_at_pc: Vec::new(),
                 result_color_by_jit_pc: Vec::new(),
+                has_color_map: false,
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 built_as_portal: true,
                 stack_base: 1,
                 max_stackdepth: 0,
-                pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
                 const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: true,
@@ -13261,15 +13206,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
-    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-        let py_pc = backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc);
-        assert_eq!(
-            pcdep,
-            pcdep_color_slots_at(recipe.jitcode_index, py_pc),
-            "pcdep trivia twin vs backxlat consumer diverges at jit_pc={}",
-            recipe.jitcode_pc
-        );
-    }
     for k in nlocals..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
