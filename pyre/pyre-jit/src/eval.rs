@@ -2618,17 +2618,26 @@ fn install_pyre_object_hooks() {
 /// `gc_sync::is_initialized()` + `gc_sync::store_singleton()` ensures
 /// exactly one GC is created even under cargo test's parallel threads.
 fn build_gc_global() {
-    if majit_gc::gc_sync::is_initialized() {
-        return;
-    }
-    let gc = build_gc();
-    // Publish the eval-breaker word address before store_singleton flips the
-    // GC-initialized flag (Release). A concurrent initializer that observes the
-    // flag set (Acquire) early-returns above; ordering the publish first makes
-    // that observer also sees a non-zero address when recording the
-    // back-edge eval-breaker poll.
-    majit_ir::eval_breaker_word::publish_addr();
-    majit_gc::gc_sync::store_singleton(gc);
+    // `is_initialized()` is a plain check-then-act, so on a fresh process
+    // every thread that reaches here before the first `store_singleton`
+    // observes the flag unset and would each run `build_gc()`.  `build_gc`
+    // calls `freeze_types()` and the subclass-range writeback, which mutate
+    // the shared global `PyType` GC-tid table and `subclassrange_{min,max}`
+    // atomics; concurrent writebacks race a sibling thread reading those
+    // ranges.  A `Once` collapses the build to a single initializer.
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        if majit_gc::gc_sync::is_initialized() {
+            return;
+        }
+        let gc = build_gc();
+        // Publish the eval-breaker word address before store_singleton flips
+        // the GC-initialized flag (Release), so an observer that sees the flag
+        // set also reads a non-zero address when recording the back-edge
+        // eval-breaker poll.
+        majit_ir::eval_breaker_word::publish_addr();
+        majit_gc::gc_sync::store_singleton(gc);
+    });
 }
 
 /// Test-support: give the calling `gc_stress` worker a pristine GC heap by
