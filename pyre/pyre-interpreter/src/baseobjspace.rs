@@ -5248,6 +5248,22 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // the slot was never stamped.
                 return Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) });
             }
+            "message" | "exceptions" => {
+                if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
+                    && isinstance(obj, base_group)?
+                {
+                    let w_dict =
+                        unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
+                    let key = if name == "message" {
+                        "__pyre_exception_group_message"
+                    } else {
+                        "__pyre_exception_group_exceptions"
+                    };
+                    if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
+                        return Ok(value);
+                    }
+                }
+            }
             "value" => {
                 // `pypy/module/exceptions/interp_exceptions.py
                 // W_StopIteration.descr_init` stores `value = w_args[0]`,
@@ -7697,6 +7713,12 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // Non-special names land in the lazily allocated instance dict on
     // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225).
     if unsafe { pyre_object::is_exception(obj) } {
+        if matches!(name, "message" | "exceptions")
+            && crate::builtins::lookup_exc_class("BaseExceptionGroup")
+                .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
+        {
+            return Err(PyError::attribute_error("readonly attribute"));
+        }
         // `pypy/module/exceptions/interp_exceptions.py:156-157
         // W_BaseException.descr_setargs` →
         //   self.args_w = space.fixedview(w_newargs)

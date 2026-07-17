@@ -2258,16 +2258,11 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "TimeoutError",
         make_exc_type("TimeoutError", exc_os_error_new, os_error),
     );
-    crate::module_ns_store(
-        ns,
-        "BaseExceptionGroup",
-        make_exc_type("BaseExceptionGroup", exc_base_exception_new, base_exc),
-    );
-    crate::module_ns_store(
-        ns,
-        "ExceptionGroup",
-        make_exc_type("ExceptionGroup", exc_exception_new, exception),
-    );
+    let base_exception_group = make_exception_group_type("BaseExceptionGroup", &[base_exc]);
+    crate::module_ns_store(ns, "BaseExceptionGroup", base_exception_group);
+    let exception_group =
+        make_exception_group_type("ExceptionGroup", &[base_exception_group, exception]);
+    crate::module_ns_store(ns, "ExceptionGroup", exception_group);
     crate::module_ns_store(
         ns,
         "PythonFinalizationError",
@@ -4967,6 +4962,361 @@ pub(crate) fn make_exc_type_multi(
                     ns,
                     "__new__",
                     make_builtin_function("__new__", new_fn),
+                )
+            };
+        },
+        bases,
+    );
+    register_exc_class(name, cls);
+    cls
+}
+
+const EG_MESSAGE_KEY: &str = "__pyre_exception_group_message";
+const EG_EXCEPTIONS_KEY: &str = "__pyre_exception_group_exceptions";
+
+fn exception_group_fields(
+    w_self: PyObjectRef,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+    let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
+    let message = unsafe { pyre_object::w_dict_getitem_str(w_dict, EG_MESSAGE_KEY) }
+        .ok_or_else(|| crate::PyError::attribute_error("exception group has no message"))?;
+    let exceptions = unsafe { pyre_object::w_dict_getitem_str(w_dict, EG_EXCEPTIONS_KEY) }
+        .ok_or_else(|| crate::PyError::attribute_error("exception group has no exceptions"))?;
+    Ok((message, exceptions))
+}
+
+fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "BaseExceptionGroup.__new__() takes exactly 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let mut cls = args[0];
+    let message = args[1];
+    let w_exceptions = args[2];
+    if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
+        let type_name = crate::baseobjspace::object_functionstr_type_name(message);
+        return Err(crate::PyError::type_error(format!(
+            "argument 1 must be str, not {type_name}"
+        )));
+    }
+    let is_list_or_tuple = unsafe {
+        crate::baseobjspace::isinstance_list_w(w_exceptions) || pyre_object::is_tuple(w_exceptions)
+    };
+    if !is_list_or_tuple {
+        let has_len = crate::baseobjspace::getattr_str(w_exceptions, "__len__").is_ok();
+        let has_getitem = crate::baseobjspace::getattr_str(w_exceptions, "__getitem__").is_ok();
+        if !has_len || !has_getitem {
+            return Err(crate::PyError::type_error(
+                "second argument (exceptions) must be a sequence",
+            ));
+        }
+    }
+    let exceptions = crate::baseobjspace::fixedview(w_exceptions, -1)?;
+    if exceptions.is_empty() {
+        return Err(crate::PyError::value_error(
+            "second argument (exceptions) must be a non-empty sequence",
+        ));
+    }
+    for (index, exc) in exceptions.iter().copied().enumerate() {
+        if !unsafe { pyre_object::is_exception(exc) } {
+            return Err(crate::PyError::value_error(format!(
+                "Item {index} of second argument (exceptions) is not an exception"
+            )));
+        }
+    }
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
+    let exception = lookup_exc_class("Exception").unwrap();
+    let all_exceptions = exceptions
+        .iter()
+        .all(|exc| crate::baseobjspace::isinstance(*exc, exception).unwrap_or(false));
+    if std::ptr::eq(cls, base_group) && all_exceptions {
+        cls = exception_group;
+    }
+    if crate::baseobjspace::issubclass(cls, exception)? && !all_exceptions {
+        let name = unsafe { pyre_object::w_type_get_name(cls) };
+        let msg = if std::ptr::eq(cls, exception_group) {
+            "Cannot nest BaseExceptions in an ExceptionGroup".to_string()
+        } else {
+            format!("Cannot nest BaseExceptions in '{name}'")
+        };
+        return Err(crate::PyError::type_error(msg));
+    }
+
+    let kind = if crate::baseobjspace::issubclass(cls, exception)? {
+        pyre_object::interp_exceptions::ExcKind::Exception
+    } else {
+        pyre_object::interp_exceptions::ExcKind::BaseException
+    };
+    let exc = pyre_object::interp_exceptions::w_exception_new_empty(kind);
+    unsafe {
+        (*exc).w_class = cls;
+        let tuple = pyre_object::w_tuple_new(exceptions);
+        let w_dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
+        pyre_object::w_dict_setitem_str(w_dict, EG_MESSAGE_KEY, message);
+        pyre_object::w_dict_setitem_str(w_dict, EG_EXCEPTIONS_KEY, tuple);
+        pyre_object::interp_exceptions::w_exception_set_args(
+            exc,
+            pyre_object::w_list_new(vec![message, w_exceptions]),
+        );
+    }
+    Ok(exc)
+}
+
+enum ExceptionGroupCondition {
+    Class(PyObjectRef),
+    Callable(PyObjectRef),
+}
+
+impl ExceptionGroupCondition {
+    fn matches(&self, exc: PyObjectRef) -> Result<bool, crate::PyError> {
+        match *self {
+            Self::Class(classinfo) => crate::baseobjspace::isinstance(exc, classinfo),
+            Self::Callable(callable) => {
+                let result = crate::call::call_function_impl_result(callable, &[exc])?;
+                crate::baseobjspace::is_true(result)
+            }
+        }
+    }
+}
+
+fn exception_group_condition(
+    w_condition: PyObjectRef,
+) -> Result<ExceptionGroupCondition, crate::PyError> {
+    let base_exc = lookup_exc_class("BaseException").unwrap();
+    let valid_type = unsafe { pyre_object::is_type(w_condition) }
+        && crate::baseobjspace::issubclass(w_condition, base_exc).unwrap_or(false);
+    let valid_tuple = unsafe { pyre_object::is_tuple(w_condition) }
+        && (0..unsafe { pyre_object::w_tuple_len(w_condition) }).all(|i| {
+            let item = unsafe { pyre_object::w_tuple_getitem(w_condition, i as i64) }.unwrap();
+            (unsafe { pyre_object::is_type(item) })
+                && crate::baseobjspace::issubclass(item, base_exc).unwrap_or(false)
+        });
+    if valid_type || valid_tuple {
+        return Ok(ExceptionGroupCondition::Class(w_condition));
+    }
+    if crate::baseobjspace::callable_w(w_condition) {
+        return Ok(ExceptionGroupCondition::Callable(w_condition));
+    }
+    Err(crate::PyError::type_error(
+        "expected a function, exception type or tuple of exception types",
+    ))
+}
+
+fn exception_group_copy_attrs(
+    source: PyObjectRef,
+    target: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if let Ok(notes) = crate::baseobjspace::getattr_str(source, "__notes__") {
+        if let Ok(items) = crate::baseobjspace::fixedview(notes, -1) {
+            crate::baseobjspace::setattr_str(target, "__notes__", pyre_object::w_list_new(items))?;
+        }
+    }
+    for name in ["__cause__", "__context__", "__traceback__"] {
+        let value = crate::baseobjspace::getattr_str(source, name)?;
+        crate::baseobjspace::setattr_str(target, name, value)?;
+    }
+    Ok(())
+}
+
+fn exception_group_derive_from(
+    w_self: PyObjectRef,
+    exceptions: Vec<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (message, _) = exception_group_fields(w_self)?;
+    let cls = crate::typedef::r#type(w_self).unwrap();
+    let list = pyre_object::w_list_new(exceptions);
+    crate::call::call_function_impl_result(cls, &[message, list])
+}
+
+fn exception_group_derive_and_copy(
+    w_self: PyObjectRef,
+    exceptions: Vec<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let group = exception_group_derive_from(w_self, exceptions)?;
+    exception_group_copy_attrs(w_self, group)?;
+    Ok(group)
+}
+
+fn exception_group_subgroup_inner(
+    w_self: PyObjectRef,
+    condition: &ExceptionGroupCondition,
+) -> Result<PyObjectRef, crate::PyError> {
+    if condition.matches(w_self)? {
+        return Ok(w_self);
+    }
+    let (_, exceptions) = exception_group_fields(w_self)?;
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let mut selected = Vec::new();
+    let mut modified = false;
+    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+        if crate::baseobjspace::isinstance(exc, base_group)? {
+            let subgroup = exception_group_subgroup_inner(exc, condition)?;
+            if !unsafe { pyre_object::is_none(subgroup) } {
+                selected.push(subgroup);
+            }
+            if !std::ptr::eq(subgroup, exc) {
+                modified = true;
+            }
+        } else if condition.matches(exc)? {
+            selected.push(exc);
+        } else {
+            modified = true;
+        }
+    }
+    if !modified {
+        Ok(w_self)
+    } else if selected.is_empty() {
+        Ok(pyre_object::w_none())
+    } else {
+        exception_group_derive_and_copy(w_self, selected)
+    }
+}
+
+fn exception_group_split_inner(
+    w_self: PyObjectRef,
+    condition: &ExceptionGroupCondition,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+    if condition.matches(w_self)? {
+        return Ok((w_self, pyre_object::w_none()));
+    }
+    let (_, exceptions) = exception_group_fields(w_self)?;
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let mut matching = Vec::new();
+    let mut nonmatching = Vec::new();
+    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+        if crate::baseobjspace::isinstance(exc, base_group)? {
+            let (yes, no) = exception_group_split_inner(exc, condition)?;
+            if !unsafe { pyre_object::is_none(yes) } {
+                matching.push(yes);
+            }
+            if !unsafe { pyre_object::is_none(no) } {
+                nonmatching.push(no);
+            }
+        } else if condition.matches(exc)? {
+            matching.push(exc);
+        } else {
+            nonmatching.push(exc);
+        }
+    }
+    let yes = if matching.is_empty() {
+        pyre_object::w_none()
+    } else {
+        exception_group_derive_and_copy(w_self, matching)?
+    };
+    let no = if nonmatching.is_empty() {
+        pyre_object::w_none()
+    } else {
+        exception_group_derive_and_copy(w_self, nonmatching)?
+    };
+    Ok((yes, no))
+}
+
+fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(
+            "subgroup() takes exactly one argument",
+        ));
+    }
+    let condition = exception_group_condition(args[1])?;
+    exception_group_subgroup_inner(args[0], &condition)
+}
+
+fn exception_group_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(
+            "split() takes exactly one argument",
+        ));
+    }
+    let condition = exception_group_condition(args[1])?;
+    let (yes, no) = exception_group_split_inner(args[0], &condition)?;
+    Ok(pyre_object::w_tuple_new(vec![yes, no]))
+}
+
+fn exception_group_derive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(
+            "derive() takes exactly one argument",
+        ));
+    }
+    let (message, _) = exception_group_fields(args[0])?;
+    let cls = crate::typedef::r#type(args[0]).unwrap();
+    crate::call::call_function_impl_result(cls, &[message, args[1]])
+}
+
+fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (message, exceptions) = exception_group_fields(args[0])?;
+    let message = unsafe { pyre_object::w_str_get_wtf8(message) };
+    let count = unsafe { pyre_object::w_tuple_len(exceptions) };
+    let suffix = if count == 1 { "" } else { "s" };
+    Ok(pyre_object::w_str_new(&format!(
+        "{} ({count} sub-exception{suffix})",
+        message.to_string_lossy()
+    )))
+}
+
+fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = args[0];
+    let (message, exceptions) = exception_group_fields(w_self)?;
+    let cls = crate::typedef::r#type(w_self).unwrap();
+    let name = unsafe { pyre_object::w_type_get_name(cls) };
+    let message_repr = unsafe { crate::display::py_repr(message)? };
+    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
+    let list_repr = unsafe { crate::display::py_repr(pyre_object::w_list_new(items))? };
+    Ok(pyre_object::w_str_new(&format!(
+        "{name}({message_repr}, {list_repr})"
+    )))
+}
+
+fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObjectRef {
+    let cls = crate::typedef::make_builtin_type_with_bases(
+        name,
+        move |ns| {
+            if name != "BaseExceptionGroup" {
+                return;
+            }
+            for (method_name, function, arity) in [
+                (
+                    "subgroup",
+                    exception_group_subgroup as crate::gateway::BuiltinCodeFn,
+                    2,
+                ),
+                (
+                    "split",
+                    exception_group_split as crate::gateway::BuiltinCodeFn,
+                    2,
+                ),
+                (
+                    "derive",
+                    exception_group_derive as crate::gateway::BuiltinCodeFn,
+                    2,
+                ),
+                (
+                    "__str__",
+                    exception_group_str as crate::gateway::BuiltinCodeFn,
+                    1,
+                ),
+                (
+                    "__repr__",
+                    exception_group_repr as crate::gateway::BuiltinCodeFn,
+                    1,
+                ),
+            ] {
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        method_name,
+                        make_builtin_function_with_arity(method_name, function, arity),
+                    )
+                };
+            }
+            unsafe {
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__new__",
+                    make_builtin_function("__new__", exception_group_new),
                 )
             };
         },
