@@ -905,29 +905,58 @@ pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
     let code = unsafe { require_code(obj, "co_branches")? };
     let mut rows = Vec::new();
     let mut index = 0usize;
+    let mut op_arg = 0usize;
     while index < code.instructions.len() {
         let op = code.instructions.read_op(index).deoptimize();
         let next = index + 1 + op.cache_entries();
-        if op.has_jump() && !op.is_unconditional_jump() {
-            let delta = u8::from(code.instructions.read_arg(index)) as usize;
-            let target = next.saturating_add(delta);
-            // Python 3.14 inserts NOT_TAKEN at the fallthrough edge so branch
-            // instrumentation can distinguish the untaken path. `co_branches`
-            // reports the first real instruction after that marker.
-            let fallthrough = if next < code.instructions.len()
-                && matches!(
-                    code.instructions.read_op(next).deoptimize(),
+        let arg = u8::from(code.instructions.read_arg(index)) as usize;
+        match op {
+            crate::bytecode::Instruction::ExtendedArg => {
+                op_arg = (op_arg << 8) | arg;
+            }
+            crate::bytecode::Instruction::ForIter { .. } => {
+                op_arg = (op_arg << 8) | arg;
+                rows.push(w_tuple_new(vec![
+                    w_int_new((index * 2) as i64),
+                    w_int_new((next * 2) as i64),
+                    w_int_new(((next + op_arg + 2) * 2) as i64),
+                ]));
+                op_arg = 0;
+            }
+            crate::bytecode::Instruction::PopJumpIfFalse { .. }
+            | crate::bytecode::Instruction::PopJumpIfTrue { .. }
+            | crate::bytecode::Instruction::PopJumpIfNone { .. }
+            | crate::bytecode::Instruction::PopJumpIfNotNone { .. } => {
+                op_arg = (op_arg << 8) | arg;
+                // Python 3.14 inserts NOT_TAKEN at the fallthrough edge so
+                // branch instrumentation can distinguish the untaken path.
+                let not_taken = next + 1;
+                rows.push(w_tuple_new(vec![
+                    w_int_new((index * 2) as i64),
+                    w_int_new((not_taken * 2) as i64),
+                    w_int_new(((next + op_arg) * 2) as i64),
+                ]));
+                op_arg = 0;
+            }
+            crate::bytecode::Instruction::EndAsyncFor => {
+                op_arg = (op_arg << 8) | arg;
+                let source = next - op_arg;
+                debug_assert!(matches!(
+                    code.instructions.read_op(source).deoptimize(),
+                    crate::bytecode::Instruction::EndSend
+                ));
+                debug_assert!(matches!(
+                    code.instructions.read_op(source + 1).deoptimize(),
                     crate::bytecode::Instruction::NotTaken
-                ) {
-                next + 1
-            } else {
-                next
-            };
-            rows.push(w_tuple_new(vec![
-                w_int_new((index * 2) as i64),
-                w_int_new((fallthrough * 2) as i64),
-                w_int_new((target * 2) as i64),
-            ]));
+                ));
+                rows.push(w_tuple_new(vec![
+                    w_int_new((source * 2) as i64),
+                    w_int_new(((source + 2) * 2) as i64),
+                    w_int_new((next * 2) as i64),
+                ]));
+                op_arg = 0;
+            }
+            _ => op_arg = 0,
         }
         index = next.max(index + 1);
     }

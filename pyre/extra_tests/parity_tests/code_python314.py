@@ -86,6 +86,27 @@ assert len(positions) == len(code.co_code) // 2
 assert lines and all(len(row) == 3 for row in lines)
 assert branches == [(12, 18, 48)]
 
+
+def loop(values):
+    for value in values:
+        pass
+
+
+assert list(loop.__code__.co_branches()) == [(6, 10, 20)]
+
+large_namespace = {}
+large_body = "\n".join(f"        value = {number}" for number in range(300))
+exec(
+    "def large_branch(flag):\n"
+    "    if flag:\n"
+    f"{large_body}\n"
+    "    return value\n",
+    large_namespace,
+)
+large_branches = list(large_namespace["large_branch"].__code__.co_branches())
+assert large_branches
+assert max(max(row) for row in large_branches) > 512
+
 same = code.replace()
 same_dunder = code.__replace__()
 assert same is not code
