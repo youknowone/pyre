@@ -1450,22 +1450,6 @@ pub fn result_color_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<usize> 
     })
 }
 
-/// Whether `pcdep_color_slots[pc]` maps register color `color` to a semantic
-/// frame slot — i.e. the register allocator assigned this color to a real
-/// local/stack value at `pc`, so the color does NOT carry its force-alived
-/// portal-red meaning there (`collect_outer_active_boxes` scratch gate /
-/// `setup_bridge_sym` ec-seed gate).
-pub fn pcdep_color_names_frame_slot_at(jitcode_index: i32, pc: usize, color: u16) -> bool {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        sd.jitcodes
-            .get(jitcode_index as usize)
-            .and_then(|jc| jc.payload.metadata.pcdep_color_slots.get(pc))
-            .is_some_and(|entries| entries.iter().any(|&(b, c, _)| b == 1 && c == color))
-    })
-}
-
 /// Depth-based `valuestackdepth` for `w_code` at `py_pc`:
 /// `nlocals + ncells + depth_at_py_pc[py_pc]`.  Mirrors the encoder's
 /// published vsd (the `jitcode_dispatch` valuestackdepth publish).  The
@@ -6071,36 +6055,7 @@ fn reconstruct_inline_recipe(
     // resume pc there is no per-pc map to faithfully rebuild the frame, so
     // decline to the single-frame bridge (whose vable payload IS semantic-
     // ordered) rather than rebuild the frame with mis-slotted boxes.
-    let maps = if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("bridge_maps_frame", "fire");
-        let legacy = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
-        let twin = bridge_semantic_maps_from_pc(frame.jitcode_index, frame.pc);
-        if legacy.has_color_map == twin.has_color_map
-            && legacy.stack_depth_at_pc == twin.stack_depth_at_pc
-            && legacy.pcdep_entries == twin.pcdep_entries
-        {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("bridge_maps_frame", "eq");
-        } else {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("bridge_maps_frame", "di");
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
-                "bridge_maps_frame",
-                &format!(
-                    "idx={} pc={} legacy=({},{},{:?}) twin=({},{},{:?})",
-                    frame.jitcode_index,
-                    frame.pc,
-                    legacy.has_color_map,
-                    legacy.stack_depth_at_pc,
-                    legacy.pcdep_entries,
-                    twin.has_color_map,
-                    twin.stack_depth_at_pc,
-                    twin.pcdep_entries,
-                ),
-            );
-        }
-        legacy
-    } else {
-        bridge_semantic_maps_at(frame.jitcode_index, frame.pc)
-    };
+    let maps = bridge_semantic_maps_from_pc(frame.jitcode_index, frame.pc);
     if maps.pcdep_entries.is_empty() {
         return None;
     }
@@ -8990,45 +8945,16 @@ impl JitState for PyreJitState {
         // `ensure_execution_context` frame-field recovery instead.
         let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
         if portal_ec_reg != u16::MAX {
-            let ec_color_names_frame_slot = crate::state::pcdep_color_names_frame_slot_at(
-                frame0.jitcode_index,
-                frame0.pc as usize,
-                portal_ec_reg,
-            );
-            if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("ec_color_gate", "fire");
-                let resolved = frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc);
-                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                    "ec_color_gate",
-                    if resolved { "resolved" } else { "unresolved" },
-                );
-                let twin =
-                    pyjitcode_for_jitcode_index(frame0.jitcode_index).is_some_and(|payload| {
-                        payload
-                            .pcdep_trivia_for_jitcode_pc(frame0.pc as usize)
-                            .is_some_and(|entries| {
-                                entries
-                                    .iter()
-                                    .any(|&(bank, color, _)| bank == 1 && color == portal_ec_reg)
-                            })
-                    });
-                if ec_color_names_frame_slot == twin {
-                    crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("ec_color_gate", "eq");
-                } else {
-                    crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("ec_color_gate", "di");
-                    crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
-                        "ec_color_gate",
-                        &format!(
-                            "idx={} pc={} resolved={} legacy={} twin={}",
-                            frame0.jitcode_index,
-                            frame0.pc,
-                            resolved,
-                            ec_color_names_frame_slot,
-                            twin,
-                        ),
-                    );
-                }
-            }
+            let ec_color_names_frame_slot = pyjitcode_for_jitcode_index(frame0.jitcode_index)
+                .is_some_and(|payload| {
+                    payload
+                        .pcdep_trivia_for_jitcode_pc(frame0.pc as usize)
+                        .is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|&(bank, color, _)| bank == 1 && color == portal_ec_reg)
+                        })
+                });
             if !ec_color_names_frame_slot {
                 let slot = portal_ec_reg as usize;
                 assert!(
