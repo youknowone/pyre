@@ -39,10 +39,10 @@ mod reexports {
         expr_has_loop_control, extract_block_tail_int, extract_bool_branch_values,
         extract_branch_int, extract_pat_literals, extract_pat_switch_case_tokens,
         extract_pat_value_tokens, extract_stmts, inline_builder_path, inline_call_tokens,
-        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, stmt_has_loop_control,
-        typed_call_arg_tokens,
+        inline_call_tokens_void, inline_float_arg_tokens, inline_int_arg_tokens,
+        inline_prebuild_path, inline_ref_arg_tokens, int_arg_regs, is_supported_float_type,
+        is_supported_int_cast, is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop,
+        stmt_has_loop_control, typed_call_arg_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -294,6 +294,7 @@ pub(crate) enum InlineReturnKind {
     Int,
     Ref,
     Float,
+    Void,
 }
 
 #[derive(Clone)]
@@ -482,6 +483,7 @@ pub(super) fn call_policy_effect_slot(
         | K::InlineInt
         | K::InlineRef
         | K::InlineFloat
+        | K::InlineVoid
         | K::InlinePipelineInt
         | K::InlinePipelineRef
         | K::InlinePipelineFloat
@@ -498,7 +500,9 @@ pub(super) fn call_policy_effect_slot(
 /// can-raise classification decides.  MayForce / ReleaseGil have no
 /// conditional-call slot but force / may raise, so they keep the marker.
 pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
-    if binding_kind_for_inline_policy(kind).is_some() {
+    if binding_kind_for_inline_policy(kind).is_some()
+        || matches!(kind, crate::jit_interp::CallPolicyKind::InlineVoid)
+    {
         return false;
     }
     if matches!(kind, crate::jit_interp::CallPolicyKind::ConcreteOnlyVoid) {
@@ -524,6 +528,7 @@ pub(super) fn call_policy_result_kind(
         | K::ReleaseGilVoidWrapped
         | K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
+        | K::InlineVoid
         | K::ConcreteOnlyVoid => Some(CallResultKind::Void),
 
         K::ResidualInt

@@ -1957,10 +1957,11 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// This is the proc-macro side of RPython's `codewriter.py` helper serialization:
 /// the original function stays callable by the interpreter, and the macro also
 /// emits a hidden `__majit_inline_jitcode_*()` function that `#[jit_interp]`
-/// can use when a call policy maps the helper to `inline_int`/`inline_ref`/`inline_float`.
+/// can use when a call policy maps the helper to
+/// `inline_int`/`inline_ref`/`inline_float`/`inline_void`.
 ///
-/// Supports Int (i64/isize), Ref (usize/pointer), and Float (f64) return types
-/// and parameter types.
+/// Supports Int (i64/isize), Ref (usize/pointer), Float (f64), and void return
+/// types. Parameters must be Int, Ref, or Float.
 #[proc_macro_attribute]
 pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     use jit_interp::jitcode_lower::InlineReturnKind;
@@ -2000,6 +2001,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         InlineReturnKind::Int => quote! { __builder.int_return(#return_reg); },
         InlineReturnKind::Ref => quote! { __builder.ref_return(#return_reg); },
         InlineReturnKind::Float => quote! { __builder.float_return(#return_reg); },
+        InlineReturnKind::Void => quote! { __builder.void_return(); },
     };
 
     // RPython jtransform.py: rewrite_call() bakes the result kind into the
@@ -2008,13 +2010,15 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // through explicit `inline_ref` / `inline_float` policies.
     let inferred_policy_code: u8 = match helper.return_kind {
         InlineReturnKind::Int => jit_interp::call_policy_byte::INT_INLINE,
-        InlineReturnKind::Ref | InlineReturnKind::Float => {
+        InlineReturnKind::Ref | InlineReturnKind::Float | InlineReturnKind::Void => {
             jit_interp::call_policy_byte::UNSUPPORTED
         }
     };
     let inferred_inline_builder = match helper.return_kind {
         InlineReturnKind::Int => quote! { #helper_with_asm_name as *const () },
-        InlineReturnKind::Ref | InlineReturnKind::Float => quote! { std::ptr::null() },
+        InlineReturnKind::Ref | InlineReturnKind::Float | InlineReturnKind::Void => {
+            quote! { std::ptr::null() }
+        }
     };
 
     // Ensure the right register file for each parameter
@@ -2054,7 +2058,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         // (`call.py:174-189`), so liveness offsets are always relative
         // to one shared table.
         #[doc(hidden)]
-        pub(crate) fn #helper_with_asm_name(
+        #vis fn #helper_with_asm_name(
             __asm: &mut majit_metainterp::Assembler,
         ) -> majit_metainterp::JitCode {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
@@ -2076,7 +2080,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `jitcode_lower::inline_prebuild_path`).
         #[allow(non_snake_case, unused_variables, unused_mut)]
         #[doc(hidden)]
-        pub(crate) fn #helper_prebuild_name(
+        #vis fn #helper_prebuild_name(
             __asm: &mut majit_metainterp::Assembler,
         ) {
             #helper_liveness_prebuild
@@ -2084,7 +2088,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
-        pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
+        #vis fn #policy_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
             (
                 #inferred_policy_code,
                 #inferred_inline_builder,

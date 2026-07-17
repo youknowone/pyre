@@ -1,4 +1,4 @@
-use super::lower_value::struct_type_id;
+use super::lower_value::struct_type_id_tokens;
 use super::*;
 
 impl<'c> Lowerer<'c> {
@@ -24,7 +24,7 @@ impl<'c> Lowerer<'c> {
         // Raw host-owned struct (the ref-scalar's pointee, no GC header) →
         // `is_gc_managed = false`, the same id the getfield/setfield lowering
         // uses so this write-EI rebuilds the SAME parent SizeDescr identity.
-        let tid = struct_type_id(struct_path, false);
+        let tid = struct_type_id_tokens(struct_path, false);
         Some(quote! {
             // The residual mutates a host-owned native struct field (no
             // GC header) → `is_gc_managed = false`, matching the
@@ -1063,6 +1063,25 @@ impl<'c> Lowerer<'c> {
                             },
                         );
                     }
+                }
+                crate::jit_interp::CallPolicyKind::InlineVoid => {
+                    let builder_path = inline_builder_path(&call.func)?;
+                    let prebuild_path = inline_prebuild_path(&call.func)?;
+                    let (inline_call, post_live) = inline_call_tokens_void(&arg_bindings);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.inline_liveness_prebuild.push(quote! {
+                        #prebuild_path(__asm);
+                    });
+                    self.emit_op(
+                        OpMeta::linear(OpKind::InlineCall, __arg_regs, vec![]),
+                        quote! {
+                            let __sub_jitcode = #builder_path(__asm);
+                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
                 }
                 crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {

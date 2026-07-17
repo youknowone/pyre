@@ -345,18 +345,15 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         ));
     }
 
-    let ReturnType::Type(_, return_ty) = &func.sig.output else {
-        return Err(syn::Error::new_spanned(
-            &func.sig.output,
-            "#[jit_inline] requires a return type",
-        ));
+    let return_kind = match &func.sig.output {
+        ReturnType::Default => InlineReturnKind::Void,
+        ReturnType::Type(_, return_ty) => classify_param_type(return_ty).ok_or_else(|| {
+            syn::Error::new_spanned(
+                return_ty,
+                "#[jit_inline] supports i64/isize (Int), usize/pointer (Ref), f64 (Float), or void return types",
+            )
+        })?,
     };
-    let return_kind = classify_param_type(return_ty).ok_or_else(|| {
-        syn::Error::new_spanned(
-            return_ty,
-            "#[jit_inline] supports i64/isize (Int), usize/pointer (Ref), or f64 (Float) return types",
-        )
-    })?;
 
     let call_policies = calls
         .iter()
@@ -402,6 +399,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             InlineReturnKind::Int => BindingKind::Int,
             InlineReturnKind::Ref => BindingKind::Ref,
             InlineReturnKind::Float => BindingKind::Float,
+            InlineReturnKind::Void => unreachable!("helper parameters cannot be void"),
         };
         let param_name = pat_ident.ident.to_string();
         let declared_struct_type = ref_param_structs.get(&param_name).cloned();
@@ -435,8 +433,18 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     }
     lowerer.next_reg = max_reg;
 
-    let Some(binding) = lowerer.lower_block_value(&func.block) else {
-        return Ok(None);
+    let return_reg = if matches!(return_kind, InlineReturnKind::Void) {
+        for stmt in &func.block.stmts {
+            if lowerer.lower_stmt(stmt).is_none() {
+                return Ok(None);
+            }
+        }
+        0
+    } else {
+        let Some(binding) = lowerer.lower_block_value(&func.block) else {
+            return Ok(None);
+        };
+        binding.reg
     };
 
     let helper_name = func.sig.ident.to_string();
@@ -451,7 +459,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         body: quote! {
             #(#statements)*
         },
-        return_reg: binding.reg,
+        return_reg,
         return_kind,
         liveness_prebuild,
     }))
@@ -493,6 +501,7 @@ pub(crate) fn inline_helper_param_layout(
                 next_f = next_f.saturating_add(1);
                 reg
             }
+            InlineReturnKind::Void => unreachable!("helper parameters cannot be void"),
         };
         layout.push((param_kind, reg));
     }
@@ -509,6 +518,7 @@ pub(crate) fn inline_helper_param_counts(func: &ItemFn) -> syn::Result<(u16, u16
             InlineReturnKind::Int => count_i = count_i.saturating_add(1),
             InlineReturnKind::Ref => count_r = count_r.saturating_add(1),
             InlineReturnKind::Float => count_f = count_f.saturating_add(1),
+            InlineReturnKind::Void => {}
         }
     }
     Ok((count_i, count_r, count_f))

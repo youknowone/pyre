@@ -1,7 +1,13 @@
 use super::*;
 
-/// Deterministic per-struct type id for a size descr.  Hashes the struct path
-/// tokens; the same id keys the builder's `struct_size_specs` cache so each
+/// Legacy macro-time per-struct type id. Hashes the struct path tokens; retain
+/// it for a caller which genuinely needs a compile-time value, but do not use
+/// it for descriptor/layout identities: spelling one Rust type through two
+/// paths gives two different token streams.
+///
+/// Descriptor/layout identities instead use [`struct_type_id_tokens`], which
+/// emits the runtime `TypeId`-based identity helper. The same id keys the
+/// builder's `struct_size_specs` cache so each
 /// `setfield_gc_*` resolves its field's parent SizeDescr + `index_in_parent`
 /// (`descr.py:238`).  Distinct struct paths collide only at `DefaultHasher`'s
 /// 64-bit range, matching the runtime `LLType::Struct(type_id)` cache-key
@@ -24,6 +30,31 @@ pub(super) fn struct_type_id(path: &syn::Path, is_gc_managed: bool) -> u64 {
         "raw".hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Emit the runtime lltype-identity surrogate for `path`.
+///
+/// RPython's `descr.py:get_size_descr()` is keyed by the lltype `STRUCT`
+/// object, not by a textual spelling in an individual graph. `TypeId` gives
+/// the corresponding process-local Rust type identity, so an inline helper
+/// using `super::linkedlist::Stack` and a caller using its fully qualified
+/// spelling share the same field descr cache key.
+///
+/// `TypeId::of` requires a `'static` type. A path with generic arguments can
+/// name a non-static type parameter and cannot be proven static by this proc
+/// macro, so preserve the legacy path hash for that conservative fallback.
+/// Concrete JIT structs use the runtime identity path.
+pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> TokenStream {
+    let has_generic_args = path
+        .segments
+        .iter()
+        .any(|segment| !segment.arguments.is_none());
+    if has_generic_args {
+        let legacy = struct_type_id(path, is_gc_managed);
+        quote! { #legacy }
+    } else {
+        quote! { majit_metainterp::__pyre_struct_type_id::<#path>(#is_gc_managed) }
+    }
 }
 
 impl<'c> Lowerer<'c> {
@@ -281,8 +312,9 @@ impl<'c> Lowerer<'c> {
             depends_on_stack |= value.depends_on_stack;
             fields.push((field.member.clone(), value));
         }
-        // GC-allocated struct (`new_struct`): keep the bare-hash id.
-        let type_id = struct_type_id(struct_path, true);
+        // GC-allocated struct (`new_struct`): TypeId plus the GC-layout
+        // discriminator, shared by every spelling of this concrete type.
+        let type_id = struct_type_id_tokens(struct_path, true);
         let result_reg = self.alloc_reg();
         // descr.py:122-126 init_size_descr: the SizeDescr carries the
         // struct's full `(offset, is_ref, name)` layout so the optimizer can

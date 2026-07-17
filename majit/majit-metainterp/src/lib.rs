@@ -41,6 +41,26 @@ extern crate self as majit_metainterp;
 
 use majit_ir::{OpRef, Type};
 
+/// Runtime surrogate for RPython's lltype `STRUCT` identity.
+///
+/// Descriptor caches are process-global, so this only needs to be stable for
+/// the lifetime of this process. Rust's `TypeId` is exactly that identity and
+/// is independent of whether callers spell the type with an absolute or a
+/// relative module path. Keep GC-managed and raw layouts distinct, matching
+/// RPython's distinct `GcStruct(T)` / `Struct(T)` lltypes.
+#[doc(hidden)]
+pub fn __pyre_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
+    use std::any::TypeId;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    TypeId::of::<T>().hash(&mut hasher);
+    if !is_gc_managed {
+        "raw".hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub mod blackhole;
 pub mod box_trace;
 pub(crate) mod call_descr;

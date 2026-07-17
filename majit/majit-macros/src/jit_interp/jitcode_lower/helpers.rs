@@ -313,6 +313,49 @@ pub(super) fn inline_call_tokens(
     (call_match, post_live)
 }
 
+pub(super) fn inline_call_tokens_void(bindings: &[Binding]) -> (TokenStream, TokenStream) {
+    let args_i = inline_int_arg_tokens(bindings);
+    let args_r = inline_ref_arg_tokens(bindings);
+    let args_f = inline_float_arg_tokens(bindings);
+    let has_int_args = bindings
+        .iter()
+        .any(|binding| matches!(binding.kind, BindingKind::Int));
+    let has_float_args = bindings
+        .iter()
+        .any(|binding| matches!(binding.kind, BindingKind::Float));
+
+    let call = if has_float_args {
+        quote! {
+            __builder.inline_call_irf_v(
+                __sub_idx,
+                #args_i,
+                #args_r,
+                #args_f,
+                None,
+            );
+        }
+    } else if has_int_args {
+        quote! {
+            __builder.inline_call_ir_v(
+                __sub_idx,
+                #args_i,
+                #args_r,
+                None,
+            );
+        }
+    } else {
+        quote! {
+            __builder.inline_call_r_v(
+                __sub_idx,
+                #args_r,
+                None,
+            );
+        }
+    };
+    let post_live = quote! { let _ = __builder.live_placeholder(); };
+    (call, post_live)
+}
+
 pub(super) fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
     let args = bindings.iter().map(|binding| {
         let reg = binding.reg;

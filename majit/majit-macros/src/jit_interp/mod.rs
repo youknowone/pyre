@@ -458,6 +458,7 @@ pub(crate) enum CallPolicyKind {
     InlineInt,
     InlineRef,
     InlineFloat,
+    InlineVoid,
     /// `BC_INLINE_CALL` ('j' argcode) into a pipeline-built sub-jitcode
     /// resolved by name through the host's `__majit_pipeline_jitcode`, rather
     /// than a macro-generated `__majit_inline_jitcode_<name>` helper. Int /
@@ -529,6 +530,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "inline_int" => CallPolicyKind::InlineInt,
         "inline_ref" => CallPolicyKind::InlineRef,
         "inline_float" => CallPolicyKind::InlineFloat,
+        "inline_void" => CallPolicyKind::InlineVoid,
         "inline_pipeline_int" => CallPolicyKind::InlinePipelineInt,
         "inline_pipeline_ref" => CallPolicyKind::InlinePipelineRef,
         "inline_pipeline_float" => CallPolicyKind::InlinePipelineFloat,

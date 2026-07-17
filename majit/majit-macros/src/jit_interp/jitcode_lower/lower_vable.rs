@@ -1,4 +1,4 @@
-use super::lower_value::struct_type_id;
+use super::lower_value::struct_type_id_tokens;
 use super::*;
 
 impl<'c> Lowerer<'c> {
@@ -710,7 +710,7 @@ impl<'c> Lowerer<'c> {
         let is_ref_field = ref_field_entry.is_some();
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
         // distinct descriptor id from any GC `new_struct` of the same type.
-        let tid = struct_type_id(&struct_path, false);
+        let tid = struct_type_id_tokens(&struct_path, false);
         // Lower the `state.<ref_scalar>` base to a ref binding (its
         // load_state_field_ref already declares the ref identity slot live for
         // resume), then read the field off that concrete ref.
@@ -821,7 +821,7 @@ impl<'c> Lowerer<'c> {
         let ref_field_key = format!("{}::{}", struct_last, member_name);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
-        let tid = struct_type_id(&struct_path, false);
+        let tid = struct_type_id_tokens(&struct_path, false);
         let base_reg = binding.reg;
         let result_reg = self.alloc_reg();
         if is_ref_field {
@@ -1007,7 +1007,7 @@ impl<'c> Lowerer<'c> {
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, the
         // same id the matching getfield uses so this setfield invalidates it.
-        let tid = struct_type_id(&struct_path, false);
+        let tid = struct_type_id_tokens(&struct_path, false);
         let base = self.lower_state_field_read(&field.base)?;
         if !matches!(base.kind, BindingKind::Ref) {
             return None;
@@ -1112,7 +1112,7 @@ impl<'c> Lowerer<'c> {
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
-        let tid = struct_type_id(&struct_path, false);
+        let tid = struct_type_id_tokens(&struct_path, false);
         let base_reg = binding.reg;
         let rhs = self.lower_value_expr(&assign.right)?;
         if is_ref_field {
