@@ -5386,6 +5386,7 @@ fn init_dict_type(ns: PyObjectRef) {
                 // classmethod: args[0] is the bound cls; the user arguments are
                 // fromkeys(iterable, value=None).
                 let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
                 let (iterable, value) = if args.len() >= 3 {
                     (args[1], args[2])
                 } else if args.len() == 2 {
@@ -20040,23 +20041,22 @@ fn init_set_type(ns: PyObjectRef) {
                 "add",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "add", true)?;
-                    if args.len() >= 2 {
-                        // `try_hash_value` may run a user `__hash__` that
-                        // allocates and triggers a moving minor collection;
-                        // root `self` and the element across it, then reload.
-                        // Its digest keys the store, so the element is hashed
-                        // once.
-                        unsafe {
-                            let _roots = pyre_object::gc_roots::push_roots();
-                            let sp = pyre_object::gc_roots::shadow_stack_len();
-                            pyre_object::gc_roots::pin_root(args[0]);
-                            pyre_object::gc_roots::pin_root(args[1]);
-                            let hash = crate::builtins::try_hash_value(args[1])?;
-                            let set = pyre_object::gc_roots::shadow_stack_get(sp);
-                            let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_set_add_hashed_checked(set, item, hash)
-                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
-                        }
+                    crate::type_methods::arity_exact(args, "set.add", 1)?;
+                    // `try_hash_value` may run a user `__hash__` that
+                    // allocates and triggers a moving minor collection;
+                    // root `self` and the element across it, then reload.
+                    // Its digest keys the store, so the element is hashed
+                    // once.
+                    unsafe {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let sp = pyre_object::gc_roots::shadow_stack_len();
+                        pyre_object::gc_roots::pin_root(args[0]);
+                        pyre_object::gc_roots::pin_root(args[1]);
+                        let hash = crate::builtins::try_hash_value(args[1])?;
+                        let set = pyre_object::gc_roots::shadow_stack_get(sp);
+                        let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                        pyre_object::w_set_add_hashed_checked(set, item, hash)
+                            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -20072,9 +20072,8 @@ fn init_set_type(ns: PyObjectRef) {
                 "discard",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "discard", true)?;
-                    if args.len() >= 2 {
-                        set_discard_from_set(args[0], args[1])?;
-                    }
+                    crate::type_methods::arity_exact(args, "set.discard", 1)?;
+                    set_discard_from_set(args[0], args[1])?;
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -20089,9 +20088,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "remove",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "remove", true)?;
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error("remove() requires an argument"));
-                    }
+                    crate::type_methods::arity_exact(args, "set.remove", 1)?;
                     if !set_discard_from_set(args[0], args[1])? {
                         return Err(crate::PyError::key_error_with_key(args[1]));
                     }
@@ -20109,6 +20106,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "pop",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "pop", true)?;
+                    crate::type_methods::arity_no_args(args, "set.pop")?;
                     if let Some(item) = unsafe { pyre_object::w_set_popitem(args[0]) } {
                         return Ok(item);
                     }
@@ -20129,6 +20127,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "clear",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "clear", true)?;
+                    crate::type_methods::arity_no_args(args, "set.clear")?;
                     unsafe { pyre_object::w_set_clear(args[0]) };
                     Ok(pyre_object::w_none())
                 },
