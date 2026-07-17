@@ -762,7 +762,12 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
-        let graph = match lower_fun_decl_with_static_addrs(llbc, fd, static_addrs) {
+        let graph = match lower_fun_decl_with_static_addrs_and_attrs(
+            llbc,
+            fd,
+            static_addrs,
+            &struct_field_attrs,
+        ) {
             Ok(g) => g,
             Err(e) => {
                 skipped.push((name.clone(), e.to_string()));
@@ -1522,6 +1527,21 @@ pub fn lower_fun_decl_with_static_addrs(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
+    // Derive the struct field-layout map the boxing-alloc fusion reads
+    // (`fuse_boxing_alloc`).  The whole-program build lowers each function
+    // through the `_with_attrs` variant with a single precomputed map; this
+    // stand-alone entry (used by the reader / tests) derives it per call from
+    // the same source of truth so the fusion fires identically.
+    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+    lower_fun_decl_with_static_addrs_and_attrs(llbc, fd, static_addrs, &struct_field_attrs)
+}
+
+fn lower_fun_decl_with_static_addrs_and_attrs(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
@@ -1559,7 +1579,7 @@ pub fn lower_fun_decl_with_static_addrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(&mut lo.graph);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.result_exc_call_results.is_empty() {
@@ -1778,7 +1798,7 @@ pub fn lower_fun_decl_with_static_addrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(&mut lo.graph);
+        simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         // `format!`-chain expansion (#131): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -1814,7 +1834,7 @@ pub fn lower_fun_decl_with_static_addrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(&mut lo.graph);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         Ok(())
     };
@@ -1909,7 +1929,10 @@ pub fn lower_fun_decl_with_static_addrs(
 ///   the later backendopt sweep (`backendopt/all.py`); the model
 ///   layer has no later sweep, so it runs here, gated on an actual
 ///   removal to keep untouched graphs byte-identical.
-fn simplify_lowered_graph(graph: &mut FunctionGraph) {
+fn simplify_lowered_graph(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) {
     crate::model::eliminate_empty_blocks(graph);
     // `eliminate_empty_blocks` (simplify.py:33-78) rewires each incoming
     // link past an operation-less block and leaves the bypassed block
@@ -1932,7 +1955,19 @@ fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     // to a native `NewWithVtable` + payload store before the dead-aggregate
     // sweep, which then reclaims the orphaned construct-on-stack ctor and
     // header field writes.
-    let mut dirty = crate::model::fuse_boxing_alloc(graph) > 0;
+    let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
+    // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
+    // liveness (`transform_dead_op_vars`, simplify.py:425-479) with the
+    // malloc-removal exemption (`remove_simple_mallocs`, malloc.py).  Unlike
+    // `remove_dead_aggregates` below, it treats a `Link.arg` as a dependency
+    // of the target inputarg, not an unconditional read, so it reaches a box
+    // threaded across a block boundary.  Runs unconditionally: a `vec!`-only
+    // graph has `fused == 0`, and the pass is conservative (fresh-alloc
+    // producers + scoped store exemption) so it is a no-op on graphs with no
+    // such remnants.  A removal leaves dangling threaded inputargs / link args
+    // the `prune_dead_phis` below reclaims, so fold its count into `dirty`.
+    dirty |= crate::model::prune_dead_boxing_remnants(graph) > 0;
     // Drop dead aggregate constructions (malloc + field stores whose
     // result is never read) before the dead-op sweep — `prune_dead_phis`
     // keeps them because a `FieldWrite` is side-effecting, so its `base`
@@ -5570,7 +5605,8 @@ impl<'a> Lowering<'a> {
                 // let a char read byte-compare) without lowering a real
                 // byte-slice view here first, or those indexed uses would
                 // silently gain character semantics.
-                if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref()) {
+                if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
+                {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -6065,15 +6101,35 @@ impl<'a> Lowering<'a> {
                 // `box_assume_init` primitive is unregistered, so the legacy
                 // CodeWriter residualizes it as a plain call (the same
                 // treatment `w_int_new` / `w_float_new` get).  An earlier
-                // recognizer rewrote this shape to `OpKind::NewList`, but those
-                // graphs fail the two-phase prepass on the dead cross-block
-                // `Box::new_uninit` and drop to the legacy CodeWriter, which
-                // cannot run `rtype_newlist` (the legacy annotator types the
-                // result `Ref`, not `ListRepr`).  The un-lowered `newlist`
-                // opname then reached the build-time `Assembler.insns` table
-                // with no blackhole handler.  Until the vec! graphs two-phase
-                // lift (`rtype_newlist` is implemented but dormant), the
-                // residual call is the correct lowering.
+                // recognizer rewrote this shape to `OpKind::NewList` (feeding
+                // the now-repr-generic `rtype_newlist`, which decomposes it to
+                // `ll_fixed_newlist` + `ll_fixed_setitem_fast` for a
+                // never-mutated vec! `FixedSizeListRepr`), but the front-end
+                // rewrite is UNCONDITIONAL: it plants `NewList` into a graph
+                // regardless of whether that graph two-phase lifts or drops to
+                // the legacy walker.  The legacy walker never runs
+                // `rtype_newlist`, so a dropped graph's raw `NewList` reaches
+                // the assembler's default arm and emits `newlist/r>r` — an
+                // opname with no blackhole handler — breaking the build via
+                // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
+                //
+                // Slice-C measurement (7/18, base 0bdfdb85781, AFTER wall-1 +
+                // wall-2 both closed): re-adding the recognizer STILL trips the
+                // snapshot with `newlist/r>r`.  Wall-1 (cross-block Link box
+                // sweep, `prune_dead_boxing_remnants`) and wall-2 (set/frozenset
+                // constant-`ob_type` monomorphization → `fuse_boxing_alloc`)
+                // are landed and census-verified (head 274→267, `w_set_new`
+                // fully lifts, set `malloc_typed` fuses), but at least one
+                // vec!-bearing graph beyond `make_generic_alias` /
+                // `set_method_difference` still drops to the legacy walker
+                // carrying a raw `NewList`.  The census only surfaces a graph's
+                // FIRST wall, so the blocking graph is one whose earlier wall
+                // hides its vec!; it must be identified (census scan for every
+                // `box_assume_init_into_vec_unsafe` producer graph, then trace
+                // why it fails phaseA) and its wall closed before the recognizer
+                // is safe.  Until then the residual call is the correct
+                // lowering; `rtype_newlist`'s Fixed arm stays implemented and
+                // dormant.
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
@@ -6720,12 +6776,13 @@ impl<'a> Lowering<'a> {
             && fmt_path_ends_with(segments, &["range", "RangeInclusive", "new"])
             && tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
         {
-            self.range_inclusive_new_sites
-                .push(crate::front::range_contains::RangeInclusiveNewSite {
+            self.range_inclusive_new_sites.push(
+                crate::front::range_contains::RangeInclusiveNewSite {
                     result_var: result_var.clone(),
                     lo: args[0].clone(),
                     hi: args[1].clone(),
-                });
+                },
+            );
         }
         // Capture `RangeInclusive::contains(&self, &x)` sites for the same
         // fold.  Its `&RangeInclusive` receiver is an opaque foreign ADT
@@ -7545,11 +7602,7 @@ impl<'a> Lowering<'a> {
     /// fails rtype and residualizes rather than miscompiling.  Do NOT add
     /// a `(CharRepr, IntegerRepr)` eq arm without lowering a real
     /// byte-slice view first.
-    fn is_string_as_bytes_identity(
-        &self,
-        reg: &RegularCall,
-        first_arg_ty: Option<&TyRef>,
-    ) -> bool {
+    fn is_string_as_bytes_identity(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -16828,11 +16881,28 @@ mod tests {
                     .count()
             };
 
-            assert_eq!(range_call("new"), 0, "{fname}: residual RangeInclusive::new removed");
-            assert_eq!(range_call("contains"), 0, "{fname}: residual contains removed");
-            assert!(binops("le") >= 1, "{fname}: at least one `le` compare emitted");
-            assert!(binops("ge") >= 1, "{fname}: at least one `ge` compare emitted");
-            assert!(binops("bitand") >= 1, "{fname}: at least one `bitand` emitted");
+            assert_eq!(
+                range_call("new"),
+                0,
+                "{fname}: residual RangeInclusive::new removed"
+            );
+            assert_eq!(
+                range_call("contains"),
+                0,
+                "{fname}: residual contains removed"
+            );
+            assert!(
+                binops("le") >= 1,
+                "{fname}: at least one `le` compare emitted"
+            );
+            assert!(
+                binops("ge") >= 1,
+                "{fname}: at least one `ge` compare emitted"
+            );
+            assert!(
+                binops("bitand") >= 1,
+                "{fname}: at least one `bitand` emitted"
+            );
         }
     }
 

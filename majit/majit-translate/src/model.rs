@@ -2625,24 +2625,43 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// The orphaned aggregate ctor + header `FieldWrite`s become dead and are swept
 /// by the `remove_dead_aggregates` + `prune_dead_phis` passes that follow in
 /// `simplify_lowered_graph`.
-pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
+pub fn fuse_boxing_alloc(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> usize {
     use crate::flowspace::model::Variable;
-    // Recognised boxing structs and their scalar payload fields, in struct
-    // order.  The header (`ob_header`: ob_type + w_class) is NOT listed as a
-    // payload — its type pointer is captured separately into
+    // Derive a boxing struct's scalar payload fields from its registered field
+    // layout, in struct-declaration order, skipping the `ob_header` (PyObject
+    // base): the header's type pointer is captured separately into
     // `NewWithVtable.vtable` (see `resolve_vtable_addr`) and the runtime stamps
-    // `ob_type` / `w_class` from it, so only the scalar payload setfield(s) are
+    // `ob_type` / `w_class` from it, so only the non-header setfield(s) are
     // re-emitted (oracle: `box_trace.rs trace_box_float` / `trace_box_int`).
-    fn payload_fields(owner: &str) -> Option<&'static [(&'static str, ValueType)]> {
-        match owner {
-            "W_FloatObject" => Some(&[("floatval", ValueType::Float)]),
-            "W_IntObject" => Some(&[("intval", ValueType::Int)]),
-            "W_ComplexObject" => Some(&[("real", ValueType::Float), ("imag", ValueType::Float)]),
-            // `value: *mut BigInt` — a raw pointer payload, stored as a ref-kind
-            // setfield (`Ref(None)`, opaque pointee).
-            "W_LongObject" => Some(&[("value", ValueType::Ref(None))]),
-            _ => None,
-        }
+    // This mirrors the type-generic malloc lowering in the front end
+    // (`rbuiltin.py` `rtype_malloc` / `rclass.py` reads the lltype's field
+    // layout); `struct_field_attrs` is the already-computed layout map the
+    // front end owns, so this pass performs no front-end (Llbc) reads.
+    //
+    // The ctor carries the bare struct leaf (`W_FloatObject`) while the map is
+    // keyed by the crate-stripped qualified path (`floatobject::W_FloatObject`),
+    // so fall back to a leaf match when the exact key misses.  An unknown struct
+    // yields `None` and is left unfused — the same fail-safe the old hardcoded
+    // set applied to any struct outside the numeric four.
+    fn payload_fields(
+        owner: &str,
+        struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> Option<Vec<(String, ValueType)>> {
+        let rows = struct_field_attrs.get(owner).or_else(|| {
+            struct_field_attrs
+                .iter()
+                .find(|(k, _)| k.rsplit("::").next() == Some(owner))
+                .map(|(_, v)| v)
+        })?;
+        Some(
+            rows.iter()
+                .filter(|(name, _)| name != "ob_header")
+                .cloned()
+                .collect(),
+        )
     }
 
     let is_malloc_typed = |target: &CallTarget| -> bool {
@@ -2748,7 +2767,7 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
                     _ => None,
                 });
             let Some(owner) = owner else { continue };
-            let Some(fields) = payload_fields(&owner) else {
+            let Some(fields) = payload_fields(&owner, struct_field_attrs) else {
                 continue;
             };
             // Resolve every payload field's store: `FieldWrite { base: %agg,
@@ -2757,7 +2776,7 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
             // than emitting a half-initialised allocation.
             let mut payloads = Vec::with_capacity(fields.len());
             let mut complete = true;
-            for &(field_name, ref payload_ty) in fields {
+            for (field_name, payload_ty) in &fields {
                 let found = graph
                     .blocks
                     .iter()
@@ -2765,7 +2784,7 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
                     .find_map(|o| match &o.kind {
                         OpKind::FieldWrite {
                             base, field, value, ..
-                        } if base == agg && field.name.as_str() == field_name => {
+                        } if base == agg && field.name.as_str() == field_name.as_str() => {
                             Some((field.clone(), value.clone()))
                         }
                         _ => None,
@@ -2841,9 +2860,6 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
                 },
             );
         }
-    }
-    if fused > 0 {
-        prune_dead_boxing_remnants(graph);
     }
     fused
 }
@@ -2981,7 +2997,7 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 /// cluster at once; the inputargs / link args the removed producers leave
 /// dangling (and the now-dead address constants) are reclaimed by the
 /// [`prune_dead_phis`] pass the lowering runs next.
-pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
+pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
     use std::collections::HashMap;
 
@@ -3012,7 +3028,21 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
                     .iter()
                     .map(String::as_str)
                     .eq(get_instantiate.iter().copied());
-            is_cast || is_get_instantiate
+            // `boxed::Box::new_uninit()` — the no-arg heap-box allocation the
+            // `vec![…]` lowering (`box_assume_init_into_vec_unsafe(box [..])`)
+            // opens.  Once a consumer rewrite turns the `vec!` into a
+            // `newlist`, the box result flows only into the `FieldWrite` that
+            // stored the now-unused `Array` aggregate, so the box is a fresh
+            // alloc nothing reads.  Pin the arity so an unrelated multi-arg
+            // path sharing the leaf is never swept.
+            let new_uninit = ["boxed", "Box", "new_uninit"];
+            let is_box_new_uninit = args.is_empty()
+                && segments.len() >= new_uninit.len()
+                && segments[segments.len() - new_uninit.len()..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(new_uninit.iter().copied());
+            is_cast || is_get_instantiate || is_box_new_uninit
         }
         _ => false,
     };
@@ -3024,24 +3054,38 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
         .map(|(i, b)| (b.id, i))
         .collect();
 
-    // Fresh stack aggregates (`SyntheticTransparentCtor`) are the only bases
-    // whose field stores may be dropped: a store into an aggregate nothing
-    // reads is itself dead (`malloc.py remove_simple_mallocs`).  A store
-    // *through* an aliasing or loaded base (`__pyre_cast_instance` /
-    // `get_instantiate` / a parameter / …) is a real heap side effect, so the
-    // exemption is scoped to ctor results — every other store roots its base.
-    let synthetic_ctor_results: HashSet<Variable> = graph
+    // Fresh heap allocations are the only bases whose field stores may be
+    // dropped: a store into an allocation nothing reads is itself dead
+    // (`malloc.py remove_simple_mallocs`).  Two producer shapes qualify — a
+    // `SyntheticTransparentCtor` stack construct and a no-arg
+    // `boxed::Box::new_uninit()` heap box (the `vec![…]` lowering's fresh
+    // allocation, which nothing aliases legitimately).  A store *through* an
+    // aliasing or loaded base (`__pyre_cast_instance` / `get_instantiate` / a
+    // parameter / …) is a real heap side effect, so the exemption is scoped to
+    // these fresh-allocation results — every other store roots its base.
+    let fresh_alloc_results: HashSet<Variable> = graph
         .blocks
         .iter()
         .flat_map(|b| &b.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor { .. },
-                    ..
-                }
-            )
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            } => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } => {
+                let new_uninit = ["boxed", "Box", "new_uninit"];
+                args.is_empty()
+                    && segments.len() >= new_uninit.len()
+                    && segments[segments.len() - new_uninit.len()..]
+                        .iter()
+                        .map(String::as_str)
+                        .eq(new_uninit.iter().copied())
+            }
+            _ => false,
         })
         .filter_map(|op| op.result.clone())
         .collect();
@@ -3053,10 +3097,10 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
-                // A store into a fresh aggregate is live iff the aggregate is
-                // live; the `base` is deliberately not rooted, so an unread
-                // aggregate's stores die with it (malloc-removal exemption).
-                OpKind::FieldWrite { base, value, .. } if synthetic_ctor_results.contains(base) => {
+                // A store into a fresh allocation is live iff the allocation
+                // is live; the `base` is deliberately not rooted, so an unread
+                // allocation's stores die with it (malloc-removal exemption).
+                OpKind::FieldWrite { base, value, .. } if fresh_alloc_results.contains(base) => {
                     if let Some(var) = value.as_variable() {
                         dependencies
                             .entry(base.clone())
@@ -3158,25 +3202,22 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
         })
         .collect();
     if dead.is_empty() {
-        return;
+        return 0;
     }
 
     // Drop the dead producers and every field store targeting one.
+    let mut removed = 0usize;
     for block in &mut graph.blocks {
         block.operations.retain(|op| {
-            if let Some(r) = &op.result {
-                if dead.contains(r) {
-                    return false;
-                }
+            let drop = op.result.as_ref().is_some_and(|r| dead.contains(r))
+                || matches!(&op.kind, OpKind::FieldWrite { base, .. } if dead.contains(base));
+            if drop {
+                removed += 1;
             }
-            if let OpKind::FieldWrite { base, .. } = &op.kind {
-                if dead.contains(base) {
-                    return false;
-                }
-            }
-            true
+            !drop
         });
     }
+    removed
 }
 
 /// Remove dead operations and dead inputargs from `graph` per
@@ -5993,6 +6034,46 @@ mod tests {
         );
     }
 
+    /// The four numeric boxing structs' field layouts, keyed by the
+    /// crate-stripped qualified path (`floatobject::W_FloatObject`) the front
+    /// end registers — exercising `fuse_boxing_alloc`'s leaf-fallback lookup
+    /// (the ctor carries only the bare `W_FloatObject` leaf).  Each row is the
+    /// full field layout including `ob_header`, matching what
+    /// `derive_program_metadata` builds.
+    fn numeric_boxing_attrs() -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
+        std::collections::HashMap::from([
+            (
+                "floatobject::W_FloatObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("floatval".to_string(), ValueType::Float),
+                ],
+            ),
+            (
+                "intobject::W_IntObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("intval".to_string(), ValueType::Int),
+                ],
+            ),
+            (
+                "complexobject::W_ComplexObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("real".to_string(), ValueType::Float),
+                    ("imag".to_string(), ValueType::Float),
+                ],
+            ),
+            (
+                "longobject::W_LongObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("value".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+        ])
+    }
+
     #[test]
     fn fuse_boxing_alloc_lowers_float_box_cluster() {
         // entry: %v       = const (the boxed payload);
@@ -6103,7 +6184,7 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(ret.clone()));
 
-        let fused = fuse_boxing_alloc(&mut graph);
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
         assert_eq!(fused, 1, "exactly one boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -6249,7 +6330,7 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(ret.clone()));
 
-        let fused = fuse_boxing_alloc(&mut graph);
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
         assert_eq!(fused, 1, "the complex boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -6316,7 +6397,7 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(ret));
 
-        let fused = fuse_boxing_alloc(&mut graph);
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
         assert_eq!(fused, 0, "unknown boxing owner must not fuse");
         assert!(
             !graph
@@ -6442,8 +6523,12 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(ret.clone()));
 
-        let fused = fuse_boxing_alloc(&mut graph);
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
         assert_eq!(fused, 1, "the nested-header boxing cluster must fuse");
+        // Fusion orphans the header sub-tree but no longer sweeps it itself;
+        // the remnant sweep is a separate pass (run right after fusion in
+        // `simplify_lowered_graph`).
+        prune_dead_boxing_remnants(&mut graph);
 
         let ops = &graph.block(entry).operations;
         // The dead header sub-tree is gone: no SyntheticTransparentCtor and no
@@ -6490,6 +6575,178 @@ mod tests {
             "the live return cast must survive"
         );
         let _ = ret;
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_lowers_non_numeric_struct_generically() {
+        // A non-numeric boxing struct (`W_SetObject`: ob_header + items + len +
+        // hash) fuses through the generic field-layout derivation, not the old
+        // hardcoded numeric set.  The three non-header fields become payload
+        // setfields in struct order, each re-typed from the registered layout;
+        // `ob_header` is dropped (rides the `NewWithVtable` type pointer).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let len = graph.push_op_var(entry, OpKind::ConstInt(3), true).unwrap();
+        let hash = graph
+            .push_op_var(entry, OpKind::ConstInt(-1), true)
+            .unwrap();
+        // Resolvable `ob_header.ob_type` type-pointer so the fusion fires.
+        let ty_addr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor {
+                    name: "ob_type".into(),
+                    owner_root: Some("PyObject".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(ty_addr),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_SetObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("W_SetObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_SetObject".into()),
+                    owner_id: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "len", LinkArg::Value(len), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "hash", LinkArg::Value(hash), ValueType::Ref(None)),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                    },
+                    args: vec![agg.clone()],
+                    result_ty: ValueType::Ref(Some("W_SetObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        // Layout keyed by the crate-stripped qualified path; the ctor carries
+        // only the bare `W_SetObject` leaf, exercising the leaf-fallback lookup.
+        let attrs = std::collections::HashMap::from([(
+            "setobject::W_SetObject".to_string(),
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("items".to_string(), ValueType::Ref(None)),
+                ("len".to_string(), ValueType::Int),
+                ("hash".to_string(), ValueType::Int),
+            ],
+        )]);
+        let fused = fuse_boxing_alloc(&mut graph, &attrs);
+        assert_eq!(fused, 1, "the non-numeric boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_SetObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        assert_eq!(
+            ops[nwv_pos].result.as_ref(),
+            Some(&ret),
+            "NewWithVtable must reuse the malloc result register"
+        );
+        // Three payload stores follow in struct order (ob_header dropped),
+        // each re-typed from the registered layout.
+        let mut got: Vec<(String, ValueType)> = Vec::new();
+        for off in 1..=3 {
+            match &ops[nwv_pos + off].kind {
+                OpKind::FieldWrite {
+                    base, field, ty, ..
+                } => {
+                    assert_eq!(base, &ret, "payload store must target the alloc result");
+                    got.push((field.name.clone(), ty.clone()));
+                }
+                other => panic!("expected payload FieldWrite, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("items".to_string(), ValueType::Ref(None)),
+                ("len".to_string(), ValueType::Int),
+                ("hash".to_string(), ValueType::Int),
+            ],
+            "payloads must be the non-header fields in struct order, re-typed \
+             from the registered layout"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed")
+            )),
+            "no malloc_typed call may survive the fusion"
+        );
     }
 
     #[test]
@@ -6760,6 +7017,116 @@ mod tests {
             "the dangling threaded inputargs must be reclaimed by prune_dead_phis"
         );
         let _ = (ret, header, cast2, ty_addr1, ty_addr2);
+    }
+
+    #[test]
+    fn prune_dead_boxing_remnants_sweeps_cross_block_threaded_vec_box() {
+        // The `vec![e0]` lowering after a consumer rewrite to `newlist`: the
+        // `box_assume_init_into_vec_unsafe(box [e0])` idiom leaves a no-arg
+        // `boxed::Box::new_uninit()` allocation storing a fresh `Array`
+        // aggregate.  `front::mir`'s framestate threading splits the box
+        // allocation from the block that consumed it, reusing the SAME
+        // `Variable` as both the entry op result and the successor block's
+        // inputarg, and threads the box pointer through the `Link`.  The
+        // successor no longer reads the box (its consumer became a `newlist`
+        // reading the elements directly), so the whole box → Array → element
+        // store cluster is dead.  `remove_dead_aggregates` cannot prove it —
+        // it counts the threaded `Link.arg` as an unconditional read — but the
+        // dependency-flow sweep reaches it: the box's target inputarg is unread
+        // and the box is a fresh alloc exempt from store-base rooting.
+        type Var = crate::flowspace::model::Variable;
+        let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: None,
+                owner_id: None,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let box_new_uninit = || OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["boxed".into(), "Box".into(), "new_uninit".into()],
+            },
+            args: vec![],
+            result_ty: ValueType::Ref(Some("Box".into())),
+        };
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        // A live `vec!` element (a genuine parameter).
+        let elem = graph.alloc_value_var();
+        graph.push_inputarg_var(entry, elem.clone());
+        // DEAD: the `Box::new_uninit()` heap box the `vec!` lowering opens.
+        let boxed = graph.push_op_var(entry, box_new_uninit(), true).unwrap();
+        // DEAD: the fresh `Array` aggregate the box stores, plus its `__pos_0`
+        // element write.
+        let array = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Array"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Array".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&array, "__pos_0", &elem), false);
+        // DEAD: the store threading the `Array` into the box.
+        graph.push_op_var(entry, field(&boxed, "ptr", &array), false);
+
+        // Successor block reached after the boundary the framestate threading
+        // opens; its inputarg reuses the SAME `boxed` Variable (id-reuse), and
+        // nothing in it reads the box.
+        let blk = graph.create_block();
+        graph.push_inputarg_var(blk, boxed.clone());
+        graph.set_goto(entry, blk, vec![boxed.clone()]);
+        graph.set_return(blk, None);
+
+        let removed = prune_dead_boxing_remnants(&mut graph);
+        assert!(
+            removed >= 3,
+            "the box, the Array ctor, and both field stores must be swept, got {removed}"
+        );
+
+        let kinds: Vec<&OpKind> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .map(|o| &o.kind)
+            .collect();
+        assert!(
+            !kinds.iter().any(|k| matches!(
+                k,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+                    if args.is_empty()
+                        && segments.last().map(String::as_str) == Some("new_uninit")
+            )),
+            "the dead cross-block `Box::new_uninit` box must be swept: {kinds:#?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| matches!(
+                k,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )),
+            "the dead `Array` aggregate ctor must be swept"
+        );
+        assert!(
+            !kinds.iter().any(|k| matches!(k, OpKind::FieldWrite { .. })),
+            "both dead field stores (the `Array` element write and the box store) must be swept"
+        );
+
+        // `prune_dead_phis` reclaims the now-dangling threaded inputarg / link
+        // arg the sweep leaves behind.
+        prune_dead_phis(&mut graph);
+        assert!(
+            !graph.block(blk).inputargs.contains(&boxed),
+            "the dangling threaded box inputarg must be reclaimed by prune_dead_phis"
+        );
     }
 
     #[test]

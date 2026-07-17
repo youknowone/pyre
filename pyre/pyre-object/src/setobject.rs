@@ -140,14 +140,15 @@ fn set_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {
+/// Allocate an empty `set`.
+pub fn w_set_new() -> PyObjectRef {
     let items = crate::lltype::malloc_raw(indexmap::IndexMap::<
         crate::dictmultiobject::ObjectKey,
         (),
     >::new());
     let header = PyObject {
-        ob_type: tp as *const PyType,
-        w_class: get_instantiate(tp),
+        ob_type: &SET_TYPE as *const PyType,
+        w_class: get_instantiate(&SET_TYPE),
     };
     // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
     // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
@@ -181,14 +182,41 @@ fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {
     }
 }
 
-/// Allocate an empty `set`.
-pub fn w_set_new() -> PyObjectRef {
-    alloc_set_with_type(&SET_TYPE)
-}
-
 /// Allocate an empty `frozenset`.
+///
+/// Same body as [`w_set_new`] with the constant `&FROZENSET_TYPE` baked
+/// into `ob_type`; see that constructor for the GC old-gen rationale.
 pub fn w_frozenset_new() -> PyObjectRef {
-    alloc_set_with_type(&FROZENSET_TYPE)
+    let items = crate::lltype::malloc_raw(indexmap::IndexMap::<
+        crate::dictmultiobject::ObjectKey,
+        (),
+    >::new());
+    let header = PyObject {
+        ob_type: &FROZENSET_TYPE as *const PyType,
+        w_class: get_instantiate(&FROZENSET_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    if !raw.is_null() {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_SetObject,
+                W_SetObject {
+                    ob_header: header,
+                    items,
+                    len: 0,
+                    hash: -1,
+                },
+            );
+        }
+        raw as PyObjectRef
+    } else {
+        crate::lltype::malloc_typed(W_SetObject {
+            ob_header: header,
+            items,
+            len: 0,
+            hash: -1,
+        }) as PyObjectRef
+    }
 }
 
 /// Allocate a populated set from a slice of elements (deduped).
