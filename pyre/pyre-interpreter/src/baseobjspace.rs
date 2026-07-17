@@ -8851,14 +8851,11 @@ fn _unpackiterable_unknown_length(
     w_iterable: PyObjectRef,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     // baseobjspace.py:1005-1008 — `try: items = newlist_hint(length_hint(...))
-    // except MemoryError: items = []`.  Mirror with try_reserve_exact so a
-    // hostile / huge `__length_hint__` does not turn into a Rust panic
-    // (Vec::with_capacity aborts on capacity overflow).
-    let hint = length_hint(w_iterable, 0)?;
-    let mut items: Vec<PyObjectRef> = Vec::new();
-    if hint > 0 {
-        let _ = items.try_reserve_exact(hint as usize);
-    }
+    // except MemoryError: items = []`.
+    let _ = length_hint(w_iterable, 0)?;
+    let items = pyre_object::listobject::w_list_new_object(Vec::new());
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(items);
     // baseobjspace.py:1010 `greenkey = self.iterator_greenkey(w_iterator)`.
     let greenkey = iterator_greenkey(w_iterator);
     loop {
@@ -8866,12 +8863,17 @@ fn _unpackiterable_unknown_length(
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
         unpackiterable_driver.jit_merge_point(greenkey);
         match next(w_iterator) {
-            Ok(w_item) => items.push(w_item),
+            Ok(w_item) => unsafe { pyre_object::listobject::w_list_append(items, w_item) },
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
-    Ok(items)
+    let n = unsafe { pyre_object::listobject::w_list_len(items) };
+    let mut out: Vec<PyObjectRef> = Vec::with_capacity(n);
+    for i in 0..n as i64 {
+        out.push(unsafe { pyre_object::listobject::w_list_getitem(items, i).unwrap() });
+    }
+    Ok(out)
 }
 
 /// pypy/interpreter/baseobjspace.py:1080-1108 `length_hint`.
