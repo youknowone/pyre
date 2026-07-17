@@ -91,15 +91,10 @@ fn finish_trace_namespace_dependency(meta: &mut MetaInterp<PyreMeta>) {
 }
 
 thread_local! {
-    /// Green keys whose full-body walk failed on a structural walker
-    /// limitation (the recurring `DispatchError` classes listed in
-    /// `full_body_walk_trace`).  A retrace of such a key skips the walk and
-    /// re-interprets without JIT instead of re-walking and re-failing every
-    /// hot encounter; the location stays trace-eligible (not
-    /// `DONT_TRACE_HERE`), so upstream's invariant that an abort never marks a
-    /// location untraceable (pyjitpl.py:2392 aborted_tracing) holds.  A walker
-    /// improvement that closes one of those `DispatchError` classes shrinks
-    /// this set.
+    /// Green keys whose full-body walk deterministically re-reaches a
+    /// structural walk decline that must skip future walks of the same entry.
+    /// This set is intentionally narrow: transient walker capability gaps
+    /// return a plain abort and rely on the normal hotness/abort machinery.
     static FBW_DECLINED_KEYS: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
     /// FOR_ITER green keys whose range-only specialization observed a class
@@ -3220,19 +3215,11 @@ fn full_body_walk_trace(
             }
         },
         Some((_entry, _code_len, Err(e))) => {
-            // Structural walker limitations recur identically on every
-            // retrace of this location (the same jitcode walked from the same
-            // entry produces the same error), so record the key in
-            // `FBW_DECLINED_KEYS` instead of thrashing futile deep re-walks —
-            // each of which executes the body's residual calls concretely
-            // before failing at the unsupported resume / exception / closure
-            // shape.  `FBW_DECLINED_KEYS` is a permanent per-process decline:
-            // the key re-interprets without tracing.  These are the
-            // multi-session-blocked shapes (resume snapshot #124,
-            // exception-handler resume #51c, closure NULL-self #60, unported
-            // raise marker, a residual arg register the walk never binds);
-            // other errors retain the plain `Abort` without declining so a
-            // capability that lands mid-run can still pick the location up.
+            // Record the key in `FBW_DECLINED_KEYS` only for errors that
+            // deterministically re-reach a structural decline of the same
+            // entry.  Transient walker capability gaps retain the plain
+            // `Abort` without declining so a capability that lands mid-run can
+            // still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3250,17 +3237,14 @@ fn full_body_walk_trace(
                 // location can never trace soundly — interpret it permanently
                 // (the loop runs correctly under the interpreter).
                 DE::InplaceContainerMutationUnsupported { .. } => TraceAction::AbortPermanent,
-                DE::AbortPermanentMarkerReached { .. }
-                | DE::GuardSnapshotVableUntyped { .. }
+                DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
+                DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::NonStandardVableFinishPortalUnsupported { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
-                | DE::ResidualCallArgUnbound { .. } => {
-                    fbw_decline(crate::driver::make_green_key(w_code, start_pc));
-                    TraceAction::Abort
-                }
+                | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
                 // #68 multiframe (`PYRE_FBW_INLINE_MULTIFRAME`): a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same
