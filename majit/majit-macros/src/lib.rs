@@ -32,6 +32,8 @@ struct JitInlineArgs {
     calls: Vec<jit_interp::CallEntry>,
     ref_params: Vec<(Ident, Path)>,
     ref_fields: Vec<jit_interp::RefFieldEntry>,
+    native_int_binops: Vec<(Path, Ident)>,
+    native_tag_small: Vec<Path>,
 }
 
 impl Parse for JitInlineArgs {
@@ -39,6 +41,8 @@ impl Parse for JitInlineArgs {
         let mut calls: Vec<jit_interp::CallEntry> = Vec::new();
         let mut ref_params: Vec<(Ident, Path)> = Vec::new();
         let mut ref_fields: Vec<jit_interp::RefFieldEntry> = Vec::new();
+        let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
+        let mut native_tag_small: Vec<Path> = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -91,6 +95,12 @@ impl Parse for JitInlineArgs {
                         policy: None,
                     }));
                 }
+                "native_int_binops" => {
+                    native_int_binops = jit_interp::parse_native_int_binops_map(input)?;
+                }
+                "native_tag_small" => {
+                    native_tag_small = jit_interp::parse_native_tag_small_list(input)?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -104,6 +114,8 @@ impl Parse for JitInlineArgs {
             calls,
             ref_params,
             ref_fields,
+            native_int_binops,
+            native_tag_small,
         })
     }
 }
@@ -1973,6 +1985,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.calls,
         &args.ref_params,
         &args.ref_fields,
+        &args.native_int_binops,
+        &args.native_tag_small,
     ) {
         Ok(Some(lowered)) => lowered,
         Ok(None) => {

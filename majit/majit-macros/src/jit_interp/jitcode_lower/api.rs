@@ -337,6 +337,8 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     calls: &[crate::jit_interp::CallEntry],
     ref_params: &[(Ident, syn::Path)],
     ref_fields: &[crate::jit_interp::RefFieldEntry],
+    native_int_binops: &[(Path, Ident)],
+    native_tag_small: &[Path],
 ) -> syn::Result<Option<InlineHelperJitCode>> {
     if !func.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -369,10 +371,18 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         .iter()
         .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
         .collect();
-    let inline_config = if ref_param_structs.is_empty() && ref_fields.is_empty() {
+    let inline_config = if ref_param_structs.is_empty()
+        && ref_fields.is_empty()
+        && native_int_binops.is_empty()
+        && native_tag_small.is_empty()
+    {
         None
     } else {
-        Some(LowererConfig::inline_helper(ref_fields))
+        Some(LowererConfig::inline_helper(
+            ref_fields,
+            native_int_binops,
+            native_tag_small,
+        ))
     };
     let mut lowerer = Lowerer::new_with_call_policies(
         inline_config.as_ref(),

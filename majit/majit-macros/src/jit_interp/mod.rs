@@ -769,7 +769,7 @@ fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> 
     Ok(entries)
 }
 
-fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
+pub(crate) fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -783,7 +783,7 @@ fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ide
     Ok(entries)
 }
 
-fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
+pub(crate) fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();

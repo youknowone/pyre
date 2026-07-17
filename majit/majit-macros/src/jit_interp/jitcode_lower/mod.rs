@@ -820,7 +820,11 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
 }
 
 impl LowererConfig {
-    pub fn inline_helper(ref_fields: &[crate::jit_interp::RefFieldEntry]) -> Self {
+    pub fn inline_helper(
+        ref_fields: &[crate::jit_interp::RefFieldEntry],
+        native_int_binops: &[(syn::Path, syn::Ident)],
+        native_tag_small: &[syn::Path],
+    ) -> Self {
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
             .iter()
             .map(|entry| {
@@ -863,8 +867,14 @@ impl LowererConfig {
             ref_fields: ref_fields_map,
             call_returns: HashMap::new(),
             headerless_structs: std::collections::HashSet::new(),
-            native_int_binops: Vec::new(),
-            native_tag_small: Vec::new(),
+            native_int_binops: native_int_binops
+                .iter()
+                .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
+                .collect(),
+            native_tag_small: native_tag_small
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
             split_dispatch: false,
             switch_dispatch: false,
         }
@@ -2439,6 +2449,8 @@ mod tests {
             &[inline_policy("callee")],
             &[],
             &[],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2460,6 +2472,8 @@ mod tests {
             &[inline_policy("callee")],
             &[],
             &[],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2479,6 +2493,8 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
             &[],
             &[],
         )
