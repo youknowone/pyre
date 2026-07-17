@@ -1045,6 +1045,12 @@ impl ExecutionContext {
         // through `w_module_new_aliasing_dict` without a raw storage
         // pointer (the strategy storage IS the canonical store).
         let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
+        // function.py:797-815 BuiltinFunction.w_moduleobj. The defining
+        // module object does not exist while `new_builtin_module_dict` fills
+        // the namespace, so bind each builtin's `__self__` now.
+        for (_, value) in unsafe { pyre_object::w_dict_str_entries(self.builtins_module) } {
+            unsafe { crate::function::builtin_function_set_module_obj(value, module) };
+        }
         self.builtin_dict_cache.set(module);
         // `pypy/interpreter/baseobjspace.py:647` —
         // `self.setitem(self.builtin.w_dict, 'builtins',  w_builtin)`.

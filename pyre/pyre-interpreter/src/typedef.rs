@@ -495,13 +495,21 @@ pub fn init_typeobjects() {
             function_type as usize,
         );
 
-        // builtin_function — PyPy: typedef.py BuiltinFunction.typedef
-        // Mirrors Function.typedef except `__get__` is intentionally absent.
-        let builtin_function_type =
-            new_typeobject_with_base("builtin_function", init_builtin_function_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false) };
+        // builtin_function — PyPy: typedef.py BuiltinFunction.typedef. The
+        // externally visible name follows CPython 3.14.
+        let builtin_function_type = new_typeobject_with_base(
+            "builtin_function_or_method",
+            init_builtin_function_type,
+            object_type,
+        );
         unsafe {
-            pyre_object::w_type_set_hasdict(builtin_function_type, true);
+            pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false);
+            pyre_object::w_type_set_disallow_instantiation(builtin_function_type);
+        }
+        unsafe {
+            // CPython 3.14 PyCFunction objects are weakrefable but have no
+            // instance dict. PyPy's copied Function rawdict differs here.
+            pyre_object::w_type_set_hasdict(builtin_function_type, false);
             pyre_object::w_type_set_weakrefable(builtin_function_type, true);
         }
         reg.insert(
@@ -8989,6 +8997,15 @@ fn init_function_type_common(ns: PyObjectRef) {
             )),
         )
     };
+    // typedef.py:793-794 `Function.typedef.__call__`; copied verbatim into
+    // `BuiltinFunction.typedef` by `**Function.typedef.rawdict`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", function_descr_call),
+        )
+    };
 }
 
 /// PyPy `Function.descr_function_call(self, __args__)`: forward the complete
@@ -9061,7 +9078,11 @@ pub(crate) unsafe fn direct_member_set(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_FUNCTION_MODULE => {
-            unsafe { crate::function::fset___module__(obj, value)? };
+            if unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) } {
+                unsafe { crate::function::builtin_function_set_module_attr(obj, value) };
+            } else {
+                unsafe { crate::function::fset___module__(obj, value)? };
+            }
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
@@ -9078,7 +9099,13 @@ pub(crate) unsafe fn direct_member_delete(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_FUNCTION_MODULE => {
-            unsafe { crate::function::fdel___module__(obj)? };
+            if unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) } {
+                unsafe {
+                    crate::function::builtin_function_set_module_attr(obj, pyre_object::w_none())
+                };
+            } else {
+                unsafe { crate::function::fdel___module__(obj)? };
+            }
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
@@ -9106,15 +9133,6 @@ fn init_function_type(ns: PyObjectRef) {
             );
         }
     }
-    // CPython 3.14 `PyFunction_Type.tp_call = _PyObject_MakeTpCall` and
-    // PyPy `Function.typedef.__call__ = descr_function_call`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__call__",
-            make_builtin_function("__call__", function_descr_call),
-        )
-    };
     // CPython 3.14 func_repr: `<function {qualname} at {address}>`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -9273,47 +9291,72 @@ fn init_function_type(ns: PyObjectRef) {
 /// pyre starts modeling them.
 fn init_builtin_function_type(ns: PyObjectRef) {
     init_function_type_common(ns);
+
+    // CPython 3.14 `PyCFunction_Type` does not expose the user-function
+    // storage copied by PyPy's `**Function.typedef.rawdict`. Keep the PyPy
+    // construction above, then apply the version-selected surface delta.
+    for name in [
+        "__annotations__",
+        "__builtins__",
+        "__closure__",
+        "__code__",
+        "__defaults__",
+        "__defaults_count__",
+        "__globals__",
+        "__kwdefaults__",
+        "__new__",
+        "__objclass__",
+    ] {
+        unsafe { pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, name) };
+    }
+
+    // methodobject.c `meth_members`: `__module__` is the one direct member;
+    // it accepts arbitrary assignments and deletion stores None.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__new__",
-            make_new_descr(|_args| {
-                Err(crate::PyError::type_error(
-                    "cannot create 'builtin_function' instances",
-                ))
-            }),
+            "__module__",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_FUNCTION_MODULE,
+                "__module__".to_owned(),
+                pyre_object::PY_NULL,
+            ),
         )
     };
 
-    // typedef.py:816 GetSetProperty(always_none, cls=BuiltinFunction). The
-    // `cls=` argument routes through descr_self_interp_w so wrong-class
-    // instances raise DescrMismatch instead of silently returning None.
-    // `init_builtin_function_type` runs while the BuiltinFunction
-    // W_TypeObject is still under construction, so `cls` cannot be
-    // resolved here; `patch_builtin_function_descriptors` runs after the
-    // type cache is populated and writes the missing reqcls.
-    // A builtin `__new__` carrier reports its defining type as `__self__`
-    // (`typeobject.c add_tp_new_wrapper`), stamped via
-    // `stamp_new_descr_self`; every other builtin function keeps the
-    // `always_none` behaviour.
-    let self_getter = make_builtin_function_with_arity(
-        "__self__",
-        |args| {
-            let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if func.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(unsafe { crate::function::function_get_self_or_none(func) })
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__self__",
-            make_getset_descriptor(self_getter),
-        )
-    };
+    // methodobject.c `meth_getsets`. All five are read-only in 3.14. PyPy's
+    // `BuiltinFunction.w_moduleobj` supplies `__self__`; type `__new__`
+    // carriers fall back to their separately stamped defining type.
+    for (name, getter) in [
+        (
+            "__doc__",
+            (|args: &[PyObjectRef]| Ok(unsafe { crate::function::fget_func_doc(args[1]) }))
+                as fn(&[PyObjectRef]) -> crate::PyResult,
+        ),
+        ("__name__", |args: &[PyObjectRef]| {
+            Ok(unsafe { crate::function::fget_func_name(args[1]) })
+        }),
+        ("__qualname__", |args: &[PyObjectRef]| {
+            Ok(pyre_object::w_str_new(&unsafe {
+                crate::function::function_get_qualname(args[1])
+            }))
+        }),
+        ("__self__", |args: &[PyObjectRef]| {
+            Ok(unsafe { crate::function::function_get_self_or_none(args[1]) })
+        }),
+        ("__text_signature__", |args: &[PyObjectRef]| unsafe {
+            crate::function::fget_func_text_signature(args[1])
+        }),
+    ] {
+        let get = make_builtin_function_with_arity(name, getter, 2);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor(get),
+            )
+        };
+    }
 
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -9337,21 +9380,69 @@ fn init_builtin_function_type(ns: PyObjectRef) {
         )
     };
 
-    // `pypy/interpreter/typedef.py:899-906`
-    // `BuiltinFunction.typedef.rawdict.update({...})` re-asserts
-    // `__doc__` from the inherited `Function.typedef.rawdict` slot
-    // (also `getset_func_doc`).  Pyre installs `__doc__` once in
-    // `init_function_type_common` so both function types share the
-    // same getter/setter/deleter; the `_check_code_mutable` gate
-    // inside the setter/deleter raises `TypeError` for builtin
-    // instances because `can_change_code = False`.
+    // function.py:807-808 `BuiltinFunction.descr__reduce__`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| {
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        crate::function::function_get_qualname(args[0])
+                    }))
+                },
+                1,
+            ),
+        )
+    };
+
+    // CPython 3.14's method-wrapper slots are materialised directly on
+    // `PyCFunction_Type`. Their semantics are the object identity defaults.
+    for (name, method) in [
+        (
+            "__eq__",
+            (|args: &[PyObjectRef]| Ok(pyre_object::w_bool_from(std::ptr::eq(args[0], args[1]))))
+                as fn(&[PyObjectRef]) -> crate::PyResult,
+        ),
+        ("__ne__", |args: &[PyObjectRef]| {
+            Ok(pyre_object::w_bool_from(!std::ptr::eq(args[0], args[1])))
+        }),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, method, 2),
+            )
+        };
+    }
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_not_implemented()), 2),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| Ok(pyre_object::w_int_new(args[0] as i64)),
+                1,
+            ),
+        )
+    };
 }
 
-/// typedef.py:816,818 wires `cls=BuiltinFunction` on the `__self__` and
-/// `__doc__` GetSetProperty entries; the inner `init_builtin_function_type`
-/// runs while the W_TypeObject is still under construction, so the reqcls
-/// patch happens here, after `init_typeobjects` has filled the cache and
-/// the BuiltinFunction typeobject is reachable.
+/// Stamp CPython 3.14's builtin-function getset/member descriptors after the
+/// W_TypeObject is reachable. PyPy supplies `cls=BuiltinFunction` for the
+/// inherited descriptors; CPython's `PyGetSetDef` / `PyMemberDef` entries all
+/// carry `PyCFunction_Type` as their owner.
 fn patch_builtin_function_descriptors() {
     let bf_type =
         gettypefor(&crate::BUILTIN_FUNCTION_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
@@ -9361,17 +9452,22 @@ fn patch_builtin_function_descriptors() {
     if !crate::type_dict_has_storage(bf_type) {
         return;
     }
-    for name in ["__self__", "__doc__"] {
+    for name in [
+        "__doc__",
+        "__name__",
+        "__qualname__",
+        "__self__",
+        "__text_signature__",
+    ] {
         if let Some(descr) = crate::type_dict_lookup(bf_type, name) {
             if unsafe { pyre_object::typedef::is_getset_property(descr) } {
-                // typedef.py:818 `cls=BuiltinFunction` — patch the
-                // `reqcls` slot in place now that the BuiltinFunction
-                // typeobject exists.  GetSetProperty's reqcls is a
-                // single PyObjectRef field, so this is a one-line
-                // store rather than the previous side-table read /
-                // mutate / write back dance.
                 unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
             }
+        }
+    }
+    if let Some(descr) = crate::type_dict_lookup(bf_type, "__module__") {
+        if unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) } {
+            unsafe { pyre_object::w_member_set_cls(descr, bf_type) };
         }
     }
 }

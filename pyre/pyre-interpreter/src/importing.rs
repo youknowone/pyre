@@ -861,6 +861,15 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
         }
     }
     let module = pyre_object::w_module_new_aliasing_dict(name, w_dict);
+    // function.py:797-815 BuiltinFunction.w_moduleobj — MixedModule binds
+    // every interp-level function to the live defining module object.
+    for key in &keys {
+        if let Some(value) =
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, key) }
+        {
+            unsafe { crate::function::builtin_function_set_module_obj(value, module) };
+        }
+    }
     // `pypy/interpreter/baseobjspace.py:647` installs the self
     // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
     // so user code can reach the builtins module through

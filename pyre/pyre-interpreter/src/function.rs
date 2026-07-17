@@ -11,7 +11,8 @@ use pyre_object::pyobject::*;
 /// Type descriptor for user-defined functions.
 pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function");
 /// Type descriptor for module-level builtins.
-pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("builtin_function");
+pub static BUILTIN_FUNCTION_TYPE: PyType =
+    pyre_object::pyobject::new_pytype("builtin_function_or_method");
 
 /// User-defined function object.
 ///
@@ -130,6 +131,11 @@ pub struct Function {
     /// has no `__self__`); only stamped on the per-type builtin
     /// `__new__` carriers at type-finalisation time.
     pub w_new_self: PyObjectRef,
+    /// function.py:797-815 `BuiltinFunction.w_moduleobj` — the module object
+    /// bound as `__self__` for an interp-level module function. PyPy stores
+    /// this on each BuiltinFunction; CPython 3.14 likewise exposes the
+    /// defining module object from `PyCFunction_GET_SELF`.
+    pub w_moduleobj: PyObjectRef,
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -217,6 +223,8 @@ pub const FUNCTION_W_TEXT_SIGNATURE_OFFSET: usize =
 /// Field offset of `w_new_self` within `Function` — the builtin
 /// `__new__` descriptor's `__self__` (defining type).
 pub const FUNCTION_W_NEW_SELF_OFFSET: usize = std::mem::offset_of!(Function, w_new_self);
+/// Field offset of PyPy `BuiltinFunction.w_moduleobj`.
+pub const FUNCTION_W_MODULEOBJ_OFFSET: usize = std::mem::offset_of!(Function, w_moduleobj);
 
 /// GC type id assigned to `Function` at JitDriver init time. Held as
 /// a constant alongside the struct (rather than runtime-queried) so
@@ -252,7 +260,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 15] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 16] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
@@ -289,6 +297,8 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 15] = [
     // `w_new_self` is intentionally absent: it holds the defining type
     // of a builtin `__new__` carrier, a static-region W_TypeObject that
     // is never nursery-relocated (same reasoning as `ob.w_class`).
+    // PyPy `BuiltinFunction.w_moduleobj` is an ordinary GC module reference.
+    FUNCTION_W_MODULEOBJ_OFFSET,
 ];
 
 impl pyre_object::lltype::GcType for Function {
@@ -420,6 +430,7 @@ pub(crate) fn function_new_impl(
         w_objclass: PY_NULL,
         w_text_signature: PY_NULL,
         w_new_self: PY_NULL,
+        w_moduleobj: PY_NULL,
     };
 
     // A `BuiltinCode`-backed function is a permanent type / module slot (the
@@ -554,6 +565,16 @@ pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRe
     }
 }
 
+/// CPython 3.14 `PyCFunctionObject.m_module` member assignment. Unlike
+/// PyPy's shared Function getset, builtin `__module__` is a writable direct
+/// member and accepts any object; deletion stores `None`.
+pub unsafe fn builtin_function_set_module_attr(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_module = value;
+    }
+}
+
 /// Stamp the `__self__` of a builtin `__new__` carrier — the defining
 /// type whose `tp_new` it wraps (`typeobject.c add_tp_new_wrapper`).
 /// Only touches functions whose `w_new_self` is still unset, so an
@@ -579,11 +600,33 @@ pub unsafe fn function_set_new_self(obj: PyObjectRef, w_type: PyObjectRef) {
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `Function`.
 pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
-    let w_self = unsafe { (*(obj as *const Function)).w_new_self };
+    let func = unsafe { &*(obj as *const Function) };
+    let w_self = if !func.w_moduleobj.is_null() {
+        func.w_moduleobj
+    } else {
+        func.w_new_self
+    };
     if w_self.is_null() {
         pyre_object::w_none()
     } else {
         w_self
+    }
+}
+
+/// Stamp PyPy `BuiltinFunction.w_moduleobj` after the defining module object
+/// has been created. The module name is installed first through
+/// `builtin_function_set_module`; this second field preserves the distinct
+/// `__module__` (string) / `__self__` (module object) identities.
+///
+/// # Safety
+/// `obj` must be a valid PyObjectRef. Non-builtin functions are ignored.
+pub unsafe fn builtin_function_set_module_obj(obj: PyObjectRef, w_module: PyObjectRef) {
+    unsafe {
+        if py_type_check(obj, &BUILTIN_FUNCTION_TYPE) {
+            let func = obj as *mut Function;
+            function_write_barrier(obj);
+            (*func).w_moduleobj = w_module;
+        }
     }
 }
 
@@ -2722,6 +2765,7 @@ mod tests {
                 std::mem::offset_of!(Function, w_qualname),
                 std::mem::offset_of!(Function, w_objclass),
                 std::mem::offset_of!(Function, w_text_signature),
+                std::mem::offset_of!(Function, w_moduleobj),
             ]
         );
     }
