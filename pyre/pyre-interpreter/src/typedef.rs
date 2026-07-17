@@ -13153,7 +13153,7 @@ pub(crate) fn buffer_as_bytes_like(
             pyre_object::interp_array::w_array_bytes(obj)
         })));
     }
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes(obj) {
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }

@@ -318,7 +318,7 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
         }
-        #[cfg(all(unix, feature = "host_env"))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
             crate::module::_ctypes::cdata::cdata_buffer_view(w_obj)
         {
