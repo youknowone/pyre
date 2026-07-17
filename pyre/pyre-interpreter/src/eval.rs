@@ -1125,6 +1125,12 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     }
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+            // The materialized exception is old-gen managed but lives only in the
+            // `PyError` local; publish it as the in-flight root before the trace hook
+            // runs arbitrary Python that can allocate and drive a major collection to
+            // sweep an unrooted (white) exception. `record_application_traceback`
+            // re-publishes the possibly-replaced operr below.
+            set_in_flight_exception(err.exc_object);
             let saved_trace = frame.get_w_f_trace();
             if !saved_trace.is_null() {
                 frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
