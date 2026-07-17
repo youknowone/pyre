@@ -1014,6 +1014,7 @@ pub fn init_typeobjects() {
     PATCH_TYPEOBJECTS.call_once(|| {
         patch_object_class_descriptor();
         patch_builtin_function_descriptors();
+        patch_function_member_descriptors();
         patch_frame_traceback_descriptors();
         patch_cell_descriptor();
         patch_getset_descriptor_metadata();
@@ -8381,25 +8382,17 @@ fn init_function_type_common(ns: PyObjectRef) {
             make_getset_descriptor(globals_getter),
         )
     };
-    // `func.__builtins__` — `_PyEval_BuiltinsFromGlobals(globals)`: look up
-    // `__builtins__` in the function's globals; a Module yields its dict,
-    // any other value is returned directly, and an absent key falls back to
-    // the default builtin Module.  `pick_builtin_obj` already performs that
-    // resolution (honoring a custom `__builtins__`); convert the Module it
-    // returns to its dict so callers see a mapping (annotationlib's
-    // `{**annotate.__builtins__, **annotate.__globals__}`).
+    // CPython 3.14 `func.__builtins__` is the construction-time
+    // `func_builtins` field, not a fresh lookup in `func_globals`.  The
+    // allocator resolves a Module to its dict and roots that exact object.
     let func_builtins_getter = make_builtin_function("__builtins__", |args| {
         let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
         if func.is_null() {
             return Ok(pyre_object::w_none());
         }
-        let w_globals = unsafe { crate::function::function_get_globals_obj(func) };
-        let exec_ctx = crate::call::take_last_exec_ctx();
-        let w_builtin = crate::baseobjspace::pick_builtin_obj(w_globals, exec_ctx);
+        let w_builtin = unsafe { crate::function::function_get_builtins(func) };
         if w_builtin.is_null() {
             Ok(pyre_object::w_none())
-        } else if unsafe { pyre_object::is_module(w_builtin) } {
-            Ok(unsafe { pyre_object::w_module_get_w_dict(w_builtin) })
         } else {
             Ok(w_builtin)
         }
@@ -8537,8 +8530,101 @@ fn function_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     })
 }
 
+/// Python 3.14 `PyFunction_Type` direct `PyMemberDef` accessors. PyPy's
+/// `Function.typedef` spells these values as GetSetProperty entries, but 3.14
+/// exposes them as member_descriptor objects. The tagged Member index keeps
+/// the descriptor shape distinct while these helpers preserve the existing
+/// Function field semantics.
+pub(crate) unsafe fn function_direct_member_get(
+    member: PyObjectRef,
+    function: PyObjectRef,
+) -> crate::PyResult {
+    match unsafe { pyre_object::w_member_get_direct_kind(member) } {
+        pyre_object::MEMBER_FUNCTION_CLOSURE => {
+            Ok(unsafe { crate::function::fget_func_closure(function) })
+        }
+        pyre_object::MEMBER_FUNCTION_DOC => Ok(unsafe { crate::function::fget_func_doc(function) }),
+        pyre_object::MEMBER_FUNCTION_GLOBALS => {
+            let value = unsafe { crate::function::function_get_globals_obj(function) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_FUNCTION_MODULE => {
+            Ok(unsafe { crate::function::fget___module__(function) })
+        }
+        pyre_object::MEMBER_FUNCTION_BUILTINS => {
+            let builtins = unsafe { crate::function::function_get_builtins(function) };
+            Ok(if builtins.is_null() {
+                pyre_object::w_none()
+            } else {
+                builtins
+            })
+        }
+        _ => Err(crate::PyError::attribute_error(unsafe {
+            pyre_object::w_member_get_name(member)
+        })),
+    }
+}
+
+pub(crate) unsafe fn function_direct_member_set(
+    member: PyObjectRef,
+    function: PyObjectRef,
+    value: PyObjectRef,
+) -> crate::PyResult {
+    match unsafe { pyre_object::w_member_get_direct_kind(member) } {
+        pyre_object::MEMBER_FUNCTION_DOC => {
+            unsafe { crate::function::fset_func_doc(function, value)? };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_FUNCTION_MODULE => {
+            unsafe { crate::function::fset___module__(function, value)? };
+            Ok(pyre_object::w_none())
+        }
+        _ => Err(crate::PyError::attribute_error("readonly attribute")),
+    }
+}
+
+pub(crate) unsafe fn function_direct_member_delete(
+    member: PyObjectRef,
+    function: PyObjectRef,
+) -> crate::PyResult {
+    match unsafe { pyre_object::w_member_get_direct_kind(member) } {
+        pyre_object::MEMBER_FUNCTION_DOC => {
+            unsafe { crate::function::fdel_func_doc(function)? };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_FUNCTION_MODULE => {
+            unsafe { crate::function::fdel___module__(function)? };
+            Ok(pyre_object::w_none())
+        }
+        _ => Err(crate::PyError::attribute_error("readonly attribute")),
+    }
+}
+
 fn init_function_type(ns: PyObjectRef) {
     init_function_type_common(ns);
+    // CPython 3.14 `func_memberlist`: these five entries are direct
+    // member_descriptor objects. PyPy's equivalent values live in
+    // Function.typedef as GetSetProperty; the observable descriptor kind is
+    // the 3.14 difference selected by this project.
+    for (name, kind) in [
+        ("__closure__", pyre_object::MEMBER_FUNCTION_CLOSURE),
+        ("__doc__", pyre_object::MEMBER_FUNCTION_DOC),
+        ("__globals__", pyre_object::MEMBER_FUNCTION_GLOBALS),
+        ("__module__", pyre_object::MEMBER_FUNCTION_MODULE),
+        ("__builtins__", pyre_object::MEMBER_FUNCTION_BUILTINS),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL),
+            );
+        }
+    }
     // CPython 3.14 `PyFunction_Type.tp_call = _PyObject_MakeTpCall` and
     // PyPy `Function.typedef.__call__ = descr_function_call`.
     unsafe {
@@ -8804,6 +8890,30 @@ fn patch_builtin_function_descriptors() {
                 // store rather than the previous side-table read /
                 // mutate / write back dance.
                 unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
+            }
+        }
+    }
+}
+
+/// Stamp the owner of Python 3.14's direct function member descriptors after
+/// the Function W_TypeObject is available. This is the Member counterpart of
+/// the GetSetProperty reqcls patch immediately above.
+fn patch_function_member_descriptors() {
+    let function_type =
+        gettypefor(&crate::FUNCTION_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
+    if function_type.is_null() || !crate::type_dict_has_storage(function_type) {
+        return;
+    }
+    for name in [
+        "__closure__",
+        "__doc__",
+        "__globals__",
+        "__module__",
+        "__builtins__",
+    ] {
+        if let Some(descr) = crate::type_dict_lookup(function_type, name) {
+            if unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) } {
+                unsafe { pyre_object::w_member_set_cls(descr, function_type) };
             }
         }
     }
@@ -9408,6 +9518,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         )));
                     }
                 }
+                if unsafe { pyre_object::w_member_is_direct(descr) } {
+                    return unsafe { function_direct_member_get(descr, obj) };
+                }
                 // typedef.py:511-516: w_result = w_obj.getslotvalue(self.index);
                 // None → AttributeError("'%T' object has no attribute '%s'").
                 let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
@@ -9459,6 +9572,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         )));
                     }
                 }
+                if unsafe { pyre_object::w_member_is_direct(descr) } {
+                    return unsafe { function_direct_member_set(descr, obj, value) };
+                }
                 // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
                 let index = unsafe { pyre_object::w_member_get_index(descr) };
                 if unsafe { pyre_object::is_instance(obj) } {
@@ -9506,6 +9622,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             (*(*obj).ob_type).name,
                         )));
                     }
+                }
+                if unsafe { pyre_object::w_member_is_direct(descr) } {
+                    return unsafe { function_direct_member_delete(descr, obj) };
                 }
                 // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
                 let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
@@ -9577,6 +9696,109 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
             make_getset_descriptor(objclass_getter),
         )
     };
+    // CPython 3.14 `PyMemberDescr_Type` metadata.  PyPy's Member typedef
+    // stops at __name__/__objclass__; these four entries are the selected
+    // 3.14 surface.
+    let doc_getter =
+        make_builtin_function_with_arity("__doc__", |_args| Ok(pyre_object::w_none()), 2);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            make_getset_descriptor_named(doc_getter, "__doc__"),
+        )
+    };
+
+    let qualname_getter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| {
+            let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if member.is_null() || !unsafe { pyre_object::typedef::is_member(member) } {
+                return Ok(pyre_object::w_none());
+            }
+            let name = unsafe { pyre_object::w_member_get_name(member) };
+            let owner = unsafe { pyre_object::w_member_get_cls(member) };
+            let owner_qualname = if owner.is_null() {
+                "?".to_string()
+            } else {
+                // `type.__getattribute__` also sees the metatype's
+                // `__qualname__` getset.  Read the class namespace itself,
+                // matching `type.getqualname`: heap classes carry the
+                // compiler-stamped string there; static types fall back to
+                // their bare `tp_name` component.
+                match crate::type_dict_lookup(owner, "__qualname__") {
+                    Some(value) if unsafe { pyre_object::is_str(value) } => {
+                        unsafe { pyre_object::w_str_get_value(value) }.to_string()
+                    }
+                    _ => {
+                        let full = unsafe { pyre_object::w_type_get_name(owner) };
+                        full.rsplit('.').next().unwrap_or(full).to_string()
+                    }
+                }
+            };
+            Ok(pyre_object::w_str_new(&format!("{owner_qualname}.{name}")))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__qualname__",
+            make_getset_descriptor_named(qualname_getter, "__qualname__"),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        member_descriptor_repr(member)
+                    }))
+                },
+                1,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| {
+                    let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let owner = unsafe { pyre_object::w_member_get_cls(member) };
+                    let name =
+                        pyre_object::w_str_new(unsafe { pyre_object::w_member_get_name(member) });
+                    Ok(pyre_object::w_tuple_new(vec![
+                        crate::baseobjspace::builtin_callable("getattr"),
+                        pyre_object::w_tuple_new(vec![owner, name]),
+                    ]))
+                },
+                1,
+            ),
+        )
+    };
+}
+
+/// CPython 3.14 `member_get_qualname` / `member_repr` surface shared by the
+/// registered `__repr__` method and `display::py_repr`'s native descriptor
+/// dispatch.
+pub(crate) unsafe fn member_descriptor_repr(member: PyObjectRef) -> String {
+    let name = unsafe { pyre_object::w_member_get_name(member) };
+    let owner = unsafe { pyre_object::w_member_get_cls(member) };
+    let owner_name = if owner.is_null() {
+        "?"
+    } else {
+        unsafe { pyre_object::w_type_get_name(owner) }
+    };
+    format!("<member '{name}' of '{owner_name}' objects>")
 }
 
 /// CPython 3.14 `cell_new`, matching PyPy `descr_new_cell` except that the

@@ -1019,6 +1019,7 @@ unsafe fn classify_attr(
             // only a `__slots__` Member that belongs to this type is cacheable.
             if unsafe { crate::baseobjspace::is_data_descr(d) } {
                 if unsafe { pyre_object::is_member(d) }
+                    && !unsafe { pyre_object::w_member_is_direct(d) }
                     && unsafe {
                         crate::baseobjspace::issubtype_w(w_type, pyre_object::w_member_get_cls(d))
                     }

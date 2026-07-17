@@ -708,6 +708,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`.
             let inner = pyre_object::w_dict_proxy_get_mapping(obj);
             format!("mappingproxy({})", py_repr(inner)?)
+        } else if pyre_object::is_member(obj) {
+            // CPython 3.14 `PyMemberDescr_Type.tp_repr = member_repr`.
+            // Member descriptors are native-layout objects with no `w_class`,
+            // so the generic builtin-dunder fallback below cannot discover
+            // their registered __repr__ method.
+            crate::typedef::member_descriptor_repr(obj)
         } else if std::ptr::eq(
             tp,
             &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType,

@@ -243,6 +243,18 @@ pub struct W_MemberDescr {
     pub w_cls: PyObjectRef,
 }
 
+/// Python 3.14's function type exposes five direct `PyMemberDef` entries.
+/// PyPy represents the same values with GetSetProperty, while ordinary PyPy
+/// `Member` objects use `index` for `__slots__`.  Reserve the high bit so the
+/// existing slot-index shape stays intact and the interpreter can distinguish
+/// the 3.14 direct members without a side table.
+pub const MEMBER_DIRECT_FLAG: u32 = 1 << 31;
+pub const MEMBER_FUNCTION_CLOSURE: u32 = MEMBER_DIRECT_FLAG;
+pub const MEMBER_FUNCTION_DOC: u32 = MEMBER_DIRECT_FLAG | 1;
+pub const MEMBER_FUNCTION_GLOBALS: u32 = MEMBER_DIRECT_FLAG | 2;
+pub const MEMBER_FUNCTION_MODULE: u32 = MEMBER_DIRECT_FLAG | 3;
+pub const MEMBER_FUNCTION_BUILTINS: u32 = MEMBER_DIRECT_FLAG | 4;
+
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
@@ -258,6 +270,12 @@ pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef
         name,
         w_cls,
     })
+}
+
+/// Create one of Python 3.14's direct function member descriptors.
+pub fn w_member_new_direct(kind: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
+    debug_assert_ne!(kind & MEMBER_DIRECT_FLAG, 0);
+    w_member_new(kind, name, w_cls)
 }
 
 /// Check if an object is a Member descriptor.
@@ -276,11 +294,29 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_MemberDescr)).w_cls }
 }
 
+/// Fill a descriptor owner after the built-in type registry is published.
+pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+    unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls }
+}
+
 /// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),
 /// used by the LOAD_ATTR/STORE_ATTR cache to form the `SLOTS_STARTING_FROM +
 /// index` attrkind (mapdict.py:1520).
 pub unsafe fn w_member_get_index(obj: PyObjectRef) -> u32 {
     unsafe { (*(obj as *const W_MemberDescr)).index }
+}
+
+#[inline]
+pub unsafe fn w_member_is_direct(obj: PyObjectRef) -> bool {
+    unsafe { w_member_get_index(obj) & MEMBER_DIRECT_FLAG != 0 }
+}
+
+#[inline]
+pub unsafe fn w_member_get_direct_kind(obj: PyObjectRef) -> u32 {
+    let kind = unsafe { w_member_get_index(obj) };
+    debug_assert_ne!(kind & MEMBER_DIRECT_FLAG, 0);
+    kind
 }
 
 #[cfg(test)]

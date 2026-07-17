@@ -53,6 +53,12 @@ pub struct Function {
     /// `__dict__` and frames built from this function share globals.
     /// `PY_NULL` for globals-less carriers (gateway builtins).
     pub w_func_globals_obj: PyObjectRef,
+    /// CPython 3.14 `PyFunctionObject.func_builtins` — resolved once from
+    /// globals at function construction and then exposed by the direct
+    /// read-only `__builtins__` member.  This is intentionally distinct from
+    /// frame builtin selection: replacing `globals['__builtins__']` later
+    /// does not change `function.__builtins__`.
+    pub w_builtins: PyObjectRef,
     /// `function.py:50 w_ann=None` constructor default plus
     /// `function.py:548-551 fget_func_annotations` lazy-init shape:
     /// PyPy stores the annotations dict directly on the function and
@@ -183,6 +189,8 @@ pub const FUNCTION_W_MODULE_OFFSET: usize = std::mem::offset_of!(Function, w_mod
 /// lazy-cached canonical W_DictObject for `w_func_globals`.
 pub const FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET: usize =
     std::mem::offset_of!(Function, w_func_globals_obj);
+/// Field offset of CPython 3.14 `func_builtins`.
+pub const FUNCTION_W_BUILTINS_OFFSET: usize = std::mem::offset_of!(Function, w_builtins);
 /// Field offset of `w_ann` within `Function` — the
 /// `function.py:50 w_ann` annotations dict slot.
 pub const FUNCTION_W_ANN_OFFSET: usize = std::mem::offset_of!(Function, w_ann);
@@ -244,7 +252,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 14] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 15] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
@@ -254,6 +262,8 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 14] = [
     // the function's sole globals carrier; traced for the lifetime of the
     // function so its `__globals__` identity survives minor collection.
     FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+    // CPython 3.14 `func_builtins` — frozen at Function construction.
+    FUNCTION_W_BUILTINS_OFFSET,
     // `function.py:50 w_ann` — annotations dict, allocated lazily on
     // first read by the getter or stamped at MAKE_FUNCTION time.
     FUNCTION_W_ANN_OFFSET,
@@ -368,6 +378,24 @@ pub(crate) fn function_new_impl(
     // object directly as the function's sole globals carrier.
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
+    // CPython 3.14 `_PyEval_BuiltinsFromGlobals` at function construction:
+    // retain the selected mapping identity even if the globals entry changes
+    // later.  Builtin/gateway carriers have no globals and keep a null slot.
+    let w_builtins = if w_func_globals_obj.is_null() {
+        PY_NULL
+    } else {
+        let selected = crate::baseobjspace::pick_builtin_obj(
+            w_func_globals_obj,
+            crate::call::take_last_exec_ctx(),
+        );
+        if !selected.is_null() && unsafe { pyre_object::is_module(selected) } {
+            unsafe { pyre_object::w_module_get_w_dict(selected) }
+        } else {
+            selected
+        }
+    };
+    pyre_object::gc_roots::pin_root(w_builtins);
+
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
     let function = Function {
         ob: PyObject {
@@ -382,6 +410,7 @@ pub(crate) fn function_new_impl(
         w_kw_defs: PY_NULL,
         w_module: PY_NULL,
         w_func_globals_obj,
+        w_builtins,
         w_ann: PY_NULL,
         w_annotate: PY_NULL,
         w_func_dict: PY_NULL,
@@ -746,6 +775,13 @@ pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn function_get_globals_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Function)).w_func_globals_obj }
+}
+
+/// CPython 3.14 `PyFunctionObject.func_builtins`, resolved once during
+/// construction. Returns `PY_NULL` for globals-less builtin carriers.
+#[inline]
+pub unsafe fn function_get_builtins(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const Function)).w_builtins }
 }
 
 /// Get the closure tuple from a function object.
@@ -2676,6 +2712,7 @@ mod tests {
                 std::mem::offset_of!(Function, w_kw_defs),
                 std::mem::offset_of!(Function, w_module),
                 std::mem::offset_of!(Function, w_func_globals_obj),
+                std::mem::offset_of!(Function, w_builtins),
                 std::mem::offset_of!(Function, w_ann),
                 std::mem::offset_of!(Function, w_annotate),
                 std::mem::offset_of!(Function, w_func_dict),

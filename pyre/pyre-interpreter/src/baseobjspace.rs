@@ -7272,6 +7272,15 @@ pub(crate) unsafe fn get(
                 (*(*obj).ob_type).name,
             )));
         }
+        // CPython 3.14 `PyFunction_Type` exposes five `PyMemberDef`
+        // descriptors whose values live in the native Function fields rather
+        // than mapdict's numbered `__slots__` storage.  Their tagged index is
+        // only a member-kind discriminator; never pass it to getslotvalue.
+        if pyre_object::w_member_is_direct(descr) {
+            return Ok(Some(crate::typedef::function_direct_member_get(
+                descr, obj,
+            )?));
+        }
         // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
         let found = if is_instance(obj) {
@@ -7355,6 +7364,10 @@ unsafe fn set(
                 (*(*obj).ob_type).name,
             )));
         }
+        if pyre_object::w_member_is_direct(descr) {
+            crate::typedef::function_direct_member_set(descr, obj, value)?;
+            return Ok(true);
+        }
         // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
         let index = pyre_object::w_member_get_index(descr);
         if is_instance(obj) {
@@ -7423,6 +7436,10 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
                 pyre_object::w_type_get_name(w_cls),
                 (*(*obj).ob_type).name,
             )));
+        }
+        if pyre_object::w_member_is_direct(descr) {
+            crate::typedef::function_direct_member_delete(descr, obj)?;
+            return Ok(());
         }
         // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
