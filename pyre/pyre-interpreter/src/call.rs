@@ -3307,10 +3307,11 @@ fn build_class_inner(
     }
 
     // type_new_classcell (typeobject.c) — capture the `__classcell__` cell
-    // so its content can be set to the new class below.  `__class__` /
-    // `__classdict__` are cellvar names that `fast2locals` mirrors into
-    // the namespace; CPython never exposes them as namespace keys, so drop
-    // them now before a metaclass or the class dict ever sees them.
+    // so its content can be set to the new class below.  The `__class__` /
+    // `__classdict__` cells themselves never reach the namespace (the body
+    // writes through `setdictscope`, and their cells stay empty during the
+    // body), so a `__class__` key here is an explicit class-body assignment
+    // (e.g. a `__class__` property) that must survive into the class dict.
     // `__classcell__` / `__classdictcell__` ARE real namespace entries the
     // class body stores explicitly: a custom metaclass observes them
     // (type.__new__ receives the full namespace) and `type.__new__`
@@ -3318,12 +3319,7 @@ fn build_class_inner(
     // construction path below rather than up front.
     let classcell = {
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        let cell = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classcell__") };
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__class__") };
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classdict__") };
-        cell
+        unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classcell__") }
     };
 
     // typeobject.c type_new: every class carries `__doc__` (None when the
@@ -3430,24 +3426,6 @@ fn build_class_inner(
                     unsafe {
                         pyre_object::w_dict_setitem_wtf8_no_proxy(w_prepared_dict, &key, value)
                     };
-                }
-            } else {
-                // The body wrote directly into the mapping, so the prepared
-                // dict already holds every store — but `fast2locals` may have
-                // synced the `__class__` / `__classdict__` cellvars into it.
-                // Drop that scaffolding before the metaclass observes it.
-                for scaffold in ["__class__", "__classdict__"] {
-                    // The cellvar sync may not have written these keys, so an
-                    // absent-key KeyError is expected and ignored; any other
-                    // __delitem__ error from a custom mapping propagates.
-                    match crate::baseobjspace::delitem(
-                        w_prepared_dict,
-                        pyre_object::w_str_new(scaffold),
-                    ) {
-                        Ok(()) => {}
-                        Err(e) if e.kind == crate::PyErrorKind::KeyError => {}
-                        Err(e) => return Err(e),
-                    }
                 }
             }
             pyre_object::gc_roots::shadow_stack_get(w_namespace_root)

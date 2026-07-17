@@ -18542,7 +18542,8 @@ mod tests {
             .map(|_| std::thread::spawn(crate::typedef::init_typeobjects))
             .collect();
         for t in threads {
-            t.join().expect("concurrent init_typeobjects must not panic");
+            t.join()
+                .expect("concurrent init_typeobjects must not panic");
         }
         // Also init on this thread: installs the thread-local hash hook the
         // dict probe below needs, and exercises the already-initialized path.
