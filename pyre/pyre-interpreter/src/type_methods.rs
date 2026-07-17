@@ -5442,7 +5442,7 @@ mod dict_method_tests {
 
 // ── Tuple methods ────────────────────────────────────────────────────
 
-/// PyPy: tupleobject.py descr_index — tuple.index(value)
+/// tupleobject.py descr_index — tuple.index(value[, start[, stop]]).
 pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_tuple_receiver(args, "index", true)?;
     if args.len() < 2 {
@@ -5459,15 +5459,40 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let tup = args[0];
     let value = args[1];
-    let length = unsafe { w_tuple_len(tup) } as i64;
-    let w_start = args.get(2).copied().unwrap_or_else(|| w_int_new(0));
-    let w_stop = args.get(3).copied().unwrap_or_else(|| w_int_new(i64::MAX));
-    let (start, stop) = crate::sliceobject::unwrap_start_stop(length, w_start, w_stop)?;
-    for i in start..stop.min(length) {
-        if let Some(item) = unsafe { w_tuple_getitem(tup, i) } {
-            if crate::baseobjspace::eq_w(item, value)? {
-                return Ok(w_int_new(i));
+    // descr_index defaults: w_start=0, w_stop=maxint; unwrap_start_stop does
+    // negative normalization and __index__ coercion.
+    let size = unsafe { w_tuple_len(tup) } as i64;
+    let w_start = if args.len() >= 3 {
+        args[2]
+    } else {
+        w_int_new(0)
+    };
+    let w_stop = if args.len() >= 4 {
+        args[3]
+    } else {
+        w_int_new(i64::MAX)
+    };
+    // A user __eq__ (or an __index__ on start/stop) may allocate and move the
+    // tuple / search value across a minor collection; root both and reload.
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(tup);
+        pyre_object::gc_roots::pin_root(value);
+        let (start, stop) = crate::sliceobject::unwrap_start_stop(size, w_start, w_stop)?;
+        let mut i = start.max(0);
+        while i < stop {
+            let tup = pyre_object::gc_roots::shadow_stack_get(sp);
+            if i >= w_tuple_len(tup) as i64 {
+                break;
             }
+            if let Some(item) = w_tuple_getitem(tup, i) {
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                if crate::baseobjspace::eq_w(item, value)? {
+                    return Ok(w_int_new(i));
+                }
+            }
+            i += 1;
         }
     }
     Err(crate::PyError::value_error(
@@ -5487,14 +5512,26 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let tup = args[0];
     let value = args[1];
     let mut count: i64 = 0;
+    // A user __eq__ may allocate and move the tuple / value across a minor
+    // collection; root both and reload after each comparison.
     unsafe {
-        let n = w_tuple_len(tup);
-        for i in 0..n {
-            if let Some(item) = w_tuple_getitem(tup, i as i64) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(tup);
+        pyre_object::gc_roots::pin_root(value);
+        let mut i = 0i64;
+        loop {
+            let tup = pyre_object::gc_roots::shadow_stack_get(sp);
+            if i >= w_tuple_len(tup) as i64 {
+                break;
+            }
+            if let Some(item) = w_tuple_getitem(tup, i) {
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                 if crate::baseobjspace::eq_w(item, value)? {
                     count += 1;
                 }
             }
+            i += 1;
         }
     }
     Ok(w_int_new(count))
