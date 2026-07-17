@@ -70,7 +70,9 @@
 //! census Skip) — no regression.
 
 use crate::flowspace::model::Variable;
-use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+use crate::model::{
+    BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+};
 
 /// A recognized `RangeInclusive::new(lo, hi)` call site captured during
 /// body lowering (`front::mir`).  Carries the result var (the range) and
@@ -216,14 +218,8 @@ fn rewire_one_range_contains_site(
     //    place and reusing its result Variable for the final `bitand`.
     let lo_le = graph.alloc_value_var();
     let hi_ge = graph.alloc_value_var();
-    let inserts = build_range_contains_compares(
-        &site.result_var,
-        lo_in_c,
-        hi_in_c,
-        x,
-        lo_le,
-        hi_ge,
-    );
+    let inserts =
+        build_range_contains_compares(&site.result_var, lo_in_c, hi_in_c, x, lo_le, hi_ge);
     let ops = &mut graph.blocks[c_idx].operations;
     ops.remove(call_idx);
     for (offset, op) in inserts.into_iter().enumerate() {
@@ -307,11 +303,7 @@ fn range_matches_new_site(
 /// single-predecessor edges only — the precondition under which
 /// [`FunctionGraph::ensure_variable_at_block`] threads cleanly.  Mirrors
 /// the private helper of the same name in `model::thread_undefined_op_operands`.
-fn defined_via_single_pred_chain(
-    graph: &FunctionGraph,
-    block: BlockId,
-    var: &Variable,
-) -> bool {
+fn defined_via_single_pred_chain(graph: &FunctionGraph, block: BlockId, var: &Variable) -> bool {
     let mut cur = block;
     let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
     loop {
@@ -335,8 +327,7 @@ fn defined_via_single_pred_chain(
 /// `ensure_variable_at_block` succeeds on; checked first so a
 /// multi-predecessor / orphan case declines instead of panicking.
 fn can_thread_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable) -> bool {
-    graph.variable_defined_in_block(block, var)
-        || defined_via_single_pred_chain(graph, block, var)
+    graph.variable_defined_in_block(block, var) || defined_via_single_pred_chain(graph, block, var)
 }
 
 /// `true` when the range value is CONSUMED by exactly the one
