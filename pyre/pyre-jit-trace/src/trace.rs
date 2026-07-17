@@ -631,6 +631,36 @@ pub(crate) fn bridge_resume_merge_point_regs(
     Some((gr, rr))
 }
 
+/// Decode the first source `jit_merge_point` at or after a static sidecar
+/// entry and return its Ref-green register colors.
+///
+/// RPython starts `_compile_and_run_once` with the concrete green arguments
+/// that selected the warm-state cell. A source-translated marker entry must
+/// make the Ref green available to the root MIFrame even when register
+/// allocation leaves the pre-marker `pycode` load symbolic. Int greens live
+/// in the JitCode constant region and are populated by `copy_constants`; they
+/// are deliberately not positional call arguments. The sidecar enters before
+/// the marker, so forward selection (unlike bridge resume's backward
+/// selection) identifies the marker owned by this green entry.
+fn static_entry_merge_point_green_ref_regs(code: &[u8], entry: usize) -> Option<Vec<u8>> {
+    let mp_pc = crate::jitcode_runtime::decoded_ops(code)
+        .filter(|op| op.opname == "jit_merge_point" && op.pc >= entry)
+        .map(|op| op.pc)
+        .min()?;
+    let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
+    let mut lists: [Vec<u8>; 6] = Default::default();
+    for slot in lists.iter_mut() {
+        let count = *code.get(cursor)? as usize;
+        cursor += 1;
+        for _ in 0..count {
+            slot.push(*code.get(cursor)?);
+            cursor += 1;
+        }
+    }
+    let [_gi, gr, _gf, _ri, _rr, _rf] = lists;
+    Some(gr)
+}
+
 type PerfnWalkResult = Result<
     (crate::jitcode_dispatch::DispatchOutcome, usize),
     crate::jitcode_dispatch::DispatchError,
@@ -1537,6 +1567,11 @@ fn run_perfn_walk(
     // pointers.  `argboxes_r[i] -> top_regs_r[i]` is the seed channel.
     let ec_box = mi.ctx().const_ref(sym.concrete_execution_context as i64);
     let pycode_box = mi.ctx().const_ref(w_code as i64);
+    let static_entry_green_ref_regs = if is_bridge_trace {
+        None
+    } else {
+        static_entry_merge_point_green_ref_regs(pjc.jitcode.code.as_slice(), entry)
+    };
     let portal_frame_reg = pjc.metadata.portal_frame_reg;
     let portal_ec_reg = pjc.metadata.portal_ec_reg;
     let argboxes_r: Vec<majit_ir::OpRef> = {
@@ -1555,10 +1590,9 @@ fn run_perfn_walk(
         if !is_bridge_trace {
             // C1 marker entry starts at the static sidecar coordinate BEFORE
             // the source marker.  Seed only the root JitCode's formal red
-            // inputs at their per-JitCode metadata colors; the pre-marker
-            // instructions and BC_JIT_MERGE_POINT payload establish pycode and
-            // the live green/red marker colors themselves.  In particular,
-            // do not reconstruct the first marker at/after entry here.
+            // inputs at their per-JitCode metadata colors. The marker's Int
+            // greens remain in the constant region; its Ref green is seeded
+            // below from this frame's concrete PyJitCode identity.
             let frame_color = if portal_frame_reg != u16::MAX {
                 portal_frame_reg as u8
             } else {
@@ -1571,6 +1605,19 @@ fn run_perfn_walk(
             };
             seed(frame_color, frame_box);
             seed(ec_color, ec_box);
+            // `_compile_and_run_once` selected this trace with concrete
+            // `[next_instr, is_being_profiled, pycode]` greens.  Thread the
+            // Ref green into the marker's allocated color just as RPython's
+            // root MIFrame receives its green arguments.  This is per-frame:
+            // `pycode_box` belongs to this PyJitCode/frame, never a shared
+            // portal anchor.  The pre-marker instructions may overwrite it
+            // with the same value; seeding is required when their vable load
+            // remains symbolic (the wasm regression caught that shape).
+            if let Some(gr) = static_entry_green_ref_regs.as_ref() {
+                if let Some(&pycode_color) = gr.first() {
+                    seed(pycode_color, pycode_box);
+                }
+            }
             reserved_red_colors.push(frame_color);
             reserved_red_colors.push(ec_color);
         } else {
@@ -3017,6 +3064,32 @@ mod tests {
     use pyre_interpreter::bytecode::Instruction;
     use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;
+
+    #[test]
+    fn static_marker_entry_recovers_ref_green_register_color() {
+        let marker = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("jit_merge_point/cIRFIRF")
+            .expect("jit_merge_point must be registered");
+        let code = [
+            marker, 0, // jdindex
+            2, 7, 8, // gi: next_instr, is_being_profiled
+            1, 9, // gr: pycode
+            0, // gf
+            0, // ri
+            2, 10, 11, // rr: frame, ec
+            0,  // rf
+        ];
+
+        assert_eq!(
+            super::static_entry_merge_point_green_ref_regs(&code, 0),
+            Some(vec![9])
+        );
+        assert_eq!(
+            super::static_entry_merge_point_green_ref_regs(&code, code.len()),
+            None,
+            "a sidecar after the marker must not bind an earlier sibling marker"
+        );
+    }
 
     #[test]
     fn test_semantic_fallthrough_pc_skips_branch_trivia() {
