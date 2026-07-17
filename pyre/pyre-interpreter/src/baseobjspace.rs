@@ -8322,11 +8322,11 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             return Ok(w_none());
         }
     }
-    let tp_name = unsafe { (*(*obj).ob_type).name };
-    Err(PyError::new(
-        PyErrorKind::AttributeError,
-        format!("'{tp_name}' object has no attribute '{name}'"),
-    ))
+    // deldictvalue returning False (no dict, or the key was absent) raises
+    // through the shared terminal — the same as object_setattr and the
+    // module/type misses above — so the receiver's own type is named and the
+    // obj/name context is attached, rather than the bare `object` base.
+    Err(raiseattrerror(obj, name))
 }
 
 /// PyPy: baseobjspace.py `call`.
