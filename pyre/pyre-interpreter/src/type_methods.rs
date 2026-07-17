@@ -3453,7 +3453,7 @@ fn is_identifier(s: &str) -> bool {
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.zfill", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let len = s.code_points().count();
     if len >= width {
         return Ok(str_result_unchanged(args[0]));
@@ -4218,7 +4218,7 @@ pub(crate) fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "center", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "center")?;
     let s_len = s.code_points().count();
     if s_len >= width {
@@ -4239,7 +4239,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "ljust", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "ljust")?;
     let s_len = s.code_points().count();
     if s_len >= width {
@@ -4255,7 +4255,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rjust", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
+    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "rjust")?;
     let s_len = s.code_points().count();
     if s_len >= width {

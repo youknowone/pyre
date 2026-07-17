@@ -3061,29 +3061,41 @@ pub(crate) fn kwarg_reject_duplicate(
 /// object's type, mirroring PyPy's `lookup_in_type` pass before
 /// raising `TypeError`.
 pub(crate) fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    unsafe {
-        if pyre_object::is_int(obj) {
-            return Ok(pyre_object::w_int_get_value(obj));
+    // Read the machine-word value of a bool / int / long object, raising
+    // OverflowError when a bigint does not fit. Returns `None` for anything
+    // else so the caller can fall through to the `__index__` lookup / error.
+    unsafe fn as_index_value(o: PyObjectRef) -> Option<Result<i64, crate::PyError>> {
+        unsafe {
+            if pyre_object::is_bool(o) {
+                return Some(Ok(pyre_object::w_bool_get_value(o) as i64));
+            }
+            if pyre_object::is_int(o) {
+                return Some(Ok(pyre_object::w_int_get_value(o)));
+            }
+            if pyre_object::is_long(o) {
+                let big = pyre_object::longobject::w_long_get_value(o);
+                return Some(
+                    if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                        Ok(pyre_object::longobject::jit_bigint_to_i64_value(big))
+                    } else {
+                        Err(crate::PyError::overflow_error(
+                            "int too large to convert to int",
+                        ))
+                    },
+                );
+            }
         }
-        if pyre_object::is_bool(obj) {
-            return Ok(if pyre_object::w_bool_get_value(obj) {
-                1
-            } else {
-                0
-            });
+        None
+    }
+    unsafe {
+        if let Some(v) = as_index_value(obj) {
+            return v;
         }
         if let Some(w_type) = crate::typedef::r#type(obj) {
             if let Some(index_fn) = crate::baseobjspace::lookup_in_type(w_type, "__index__") {
                 let result = crate::call::call_function_impl_result(index_fn, &[obj])?;
-                if pyre_object::is_int(result) {
-                    return Ok(pyre_object::w_int_get_value(result));
-                }
-                if pyre_object::is_bool(result) {
-                    return Ok(if pyre_object::w_bool_get_value(result) {
-                        1
-                    } else {
-                        0
-                    });
+                if let Some(v) = as_index_value(result) {
+                    return v;
                 }
             }
         }
