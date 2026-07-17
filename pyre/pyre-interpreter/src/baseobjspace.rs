@@ -4566,8 +4566,11 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             }
             // typeobject.py:820-823: the type's own MRO value, bound through
             // `space.get(w_value, space.w_None, self)` = `__get__(None, type)`.
+            // Internally a null receiver distinguishes this class access from
+            // attribute access on the actual `None` singleton; `get` converts
+            // it back to `w_None` only for a Python-visible `__get__` call.
             if let Some(w_value) = lookup_in_type_wtf8(obj, name) {
-                if let Some(result) = get(w_value, w_none(), obj)? {
+                if let Some(result) = get(w_value, PY_NULL, obj)? {
                     return Ok(result);
                 }
                 return Ok(w_value);
@@ -5192,11 +5195,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // typeobject.py:820-823 — the type's own MRO value, bound via
             // `space.get(w_value, space.w_None, self)` = `__get__(None, type)`
             // (functions stay unbound, classmethod binds the class, a custom
-            // descriptor sees `obj is None`).  The receiver must be the `None`
-            // singleton, not a null pointer, or a Python
-            // `__get__(self, obj, objtype=None)` loses its `obj` argument.
+            // descriptor sees `obj is None`).  A null internal receiver keeps
+            // this distinct from looking up a descriptor on the actual None
+            // singleton; `get` materialises `w_None` for custom `__get__`.
             if let Some(value) = lookup_in_type_where(obj, name) {
-                match get(value, w_none(), obj) {
+                match get(value, PY_NULL, obj) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => return Ok(value),
                     Err(e) => {
@@ -7542,7 +7545,7 @@ pub(crate) unsafe fn get(
         if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
             && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
         {
-            if obj.is_null() || is_none(obj) {
+            if obj.is_null() {
                 return Ok(Some(descr));
             }
             return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
@@ -7551,10 +7554,10 @@ pub(crate) unsafe fn get(
 
     // property: PyPy W_Property.get → call fget(obj)
     if is_property(descr) {
-        // W_Property.get: `if space.is_w(w_obj, space.w_None): return self`
-        // — a `None` receiver (class-level access via `__get__(None, type)`)
-        // returns the property itself, the same as a null receiver.
-        if obj.is_null() || is_none(obj) {
+        // W_Property.get receives `space.w_None` for class access.  Internally
+        // that state is a null pointer so the actual None singleton can still
+        // be a property-bearing instance.
+        if obj.is_null() {
             return Ok(Some(descr));
         }
         let fget = w_property_get_fget(descr);
@@ -7574,7 +7577,7 @@ pub(crate) unsafe fn get(
     //   return w_result
     if pyre_object::is_member(descr) {
         // typedef.py:507-508
-        if obj.is_null() || is_none(obj) {
+        if obj.is_null() {
             return Ok(Some(descr));
         }
         // typedef.py:510: self.typecheck(space, w_obj) → TypeError
@@ -7625,7 +7628,9 @@ pub(crate) unsafe fn get(
     if let Some(descr_type) = crate::typedef::r#type(descr) {
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
-                let result = crate::call::call_function_impl_result(get_fn, &[descr, obj, w_type])?;
+                let visible_obj = if obj.is_null() { w_none() } else { obj };
+                let result =
+                    crate::call::call_function_impl_result(get_fn, &[descr, visible_obj, w_type])?;
                 return Ok(Some(result));
             }
         }

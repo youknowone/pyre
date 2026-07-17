@@ -7,6 +7,32 @@ except TypeError as exc:
 else:
     raise AssertionError("Python 3.14 makes bool(NotImplemented) an error")
 
+for singleton, constructor_error in (
+    (Ellipsis, "EllipsisType takes no arguments"),
+    (NotImplemented, "NotImplementedType takes no arguments"),
+    (None, "NoneType takes no arguments"),
+):
+    singleton_type = type(singleton)
+    assert singleton_type() is singleton
+    try:
+        singleton_type(1)
+    except TypeError as exc:
+        assert str(exc) == constructor_error
+    else:
+        raise AssertionError(f"{singleton_type.__name__} accepted an argument")
+
+    for name in singleton_type.__dict__:
+        if name in {"__doc__", "__new__"}:
+            continue
+        method = getattr(singleton_type, name)
+        call_args = (42, 0) if name in {"__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"} else (42,)
+        try:
+            method(*call_args)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f"{singleton_type.__name__}.{name} accepted a foreign receiver")
+
 none_type = type(None)
 assert none_type() is None
 try:

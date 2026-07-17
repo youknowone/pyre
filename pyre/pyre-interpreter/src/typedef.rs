@@ -2008,8 +2008,30 @@ fn init_module_type(ns: PyObjectRef) {
     };
 }
 
+fn singleton_receiver(
+    args: &[PyObjectRef],
+    owner: &str,
+    name: &str,
+    predicate: unsafe fn(PyObjectRef) -> bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { predicate(self_) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a '{owner}' object but received a '{}'",
+            type_name_of(self_),
+        )));
+    }
+    Ok(self_)
+}
+
 fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "EllipsisType takes no arguments",
+        ));
+    }
+    let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_ellipsis) = gettypefor(&pyre_object::ELLIPSIS_TYPE) {
         check_user_subclass(w_ellipsis, cls)?;
     }
@@ -2035,21 +2057,41 @@ fn init_ellipsis_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity("__repr__", |_args| Ok(w_str_new("Ellipsis")), 1),
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    singleton_receiver(args, "ellipsis", "__repr__", pyre_object::is_ellipsis)?;
+                    Ok(w_str_new("Ellipsis"))
+                },
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity("__reduce__", |_args| Ok(w_str_new("Ellipsis")), 1),
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| {
+                    singleton_receiver(args, "ellipsis", "__reduce__", pyre_object::is_ellipsis)?;
+                    Ok(w_str_new("Ellipsis"))
+                },
+                1,
+            ),
         )
     };
 }
 
 /// special.py:20: NotImplemented.descr_new_notimplemented
 fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "NotImplementedType takes no arguments",
+        ));
+    }
+    let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_notimplemented) = gettypefor(&pyre_object::pyobject::NOTIMPLEMENTED_TYPE) {
         check_user_subclass(w_notimplemented, cls)?;
     }
@@ -2078,7 +2120,15 @@ fn init_notimplemented_type(ns: PyObjectRef) {
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
-                |_args| Ok(w_str_new("NotImplemented")),
+                |args| {
+                    singleton_receiver(
+                        args,
+                        "NotImplementedType",
+                        "__repr__",
+                        pyre_object::is_not_implemented,
+                    )?;
+                    Ok(w_str_new("NotImplemented"))
+                },
                 1,
             ),
         )
@@ -2089,7 +2139,15 @@ fn init_notimplemented_type(ns: PyObjectRef) {
             "__reduce__",
             make_builtin_function_with_arity(
                 "__reduce__",
-                |_args| Ok(w_str_new("NotImplemented")),
+                |args| {
+                    singleton_receiver(
+                        args,
+                        "NotImplementedType",
+                        "__reduce__",
+                        pyre_object::is_not_implemented,
+                    )?;
+                    Ok(w_str_new("NotImplemented"))
+                },
                 1,
             ),
         )
@@ -2102,7 +2160,13 @@ fn init_notimplemented_type(ns: PyObjectRef) {
             "__bool__",
             make_builtin_function_with_arity(
                 "__bool__",
-                |_args| {
+                |args| {
+                    singleton_receiver(
+                        args,
+                        "NotImplementedType",
+                        "__bool__",
+                        pyre_object::is_not_implemented,
+                    )?;
                     Err(crate::PyError::type_error(
                         "NotImplemented should not be used in a boolean context",
                     ))
@@ -2129,6 +2193,27 @@ fn none_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
+fn none_ordering(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    singleton_receiver(args, "NoneType", name, pyre_object::is_none)?;
+    Ok(pyre_object::w_not_implemented())
+}
+
+fn none_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    none_ordering(args, "__lt__")
+}
+
+fn none_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    none_ordering(args, "__le__")
+}
+
+fn none_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    none_ordering(args, "__gt__")
+}
+
+fn none_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    none_ordering(args, "__ge__")
+}
+
 fn init_none_type(ns: PyObjectRef) {
     let entries = [
         (
@@ -2140,19 +2225,33 @@ fn init_none_type(ns: PyObjectRef) {
             "__bool__",
             make_builtin_function_with_arity(
                 "__bool__",
-                |_args| Ok(pyre_object::w_bool_from(false)),
+                |args| {
+                    singleton_receiver(args, "NoneType", "__bool__", pyre_object::is_none)?;
+                    Ok(pyre_object::w_bool_from(false))
+                },
                 1,
             ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", |_args| Ok(w_str_new("None")), 1),
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    singleton_receiver(args, "NoneType", "__repr__", pyre_object::is_none)?;
+                    Ok(w_str_new("None"))
+                },
+                1,
+            ),
         ),
         (
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
-                |args| Ok(pyre_object::w_int_new(crate::builtins::hash_value(args[0]))),
+                |args| {
+                    let self_ =
+                        singleton_receiver(args, "NoneType", "__hash__", pyre_object::is_none)?;
+                    Ok(pyre_object::w_int_new(crate::builtins::hash_value(self_)))
+                },
                 1,
             ),
         ),
@@ -2161,6 +2260,7 @@ fn init_none_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__eq__",
                 |args| {
+                    singleton_receiver(args, "NoneType", "__eq__", pyre_object::is_none)?;
                     if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
                         Ok(pyre_object::w_bool_from(true))
                     } else {
@@ -2175,6 +2275,7 @@ fn init_none_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__ne__",
                 |args| {
+                    singleton_receiver(args, "NoneType", "__ne__", pyre_object::is_none)?;
                     if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
                         Ok(pyre_object::w_bool_from(false))
                     } else {
@@ -2188,16 +2289,17 @@ fn init_none_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
     }
-    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+    for (name, function) in [
+        ("__lt__", none_lt as DunderFn),
+        ("__le__", none_le as DunderFn),
+        ("__gt__", none_gt as DunderFn),
+        ("__ge__", none_ge as DunderFn),
+    ] {
         unsafe {
             pyre_object::w_dict_setitem_str(
                 ns,
                 name,
-                make_builtin_function_with_arity(
-                    name,
-                    |_args| Ok(pyre_object::w_not_implemented()),
-                    2,
-                ),
+                make_builtin_function_with_arity(name, function, 2),
             )
         };
     }
