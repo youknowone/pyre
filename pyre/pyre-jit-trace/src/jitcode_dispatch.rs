@@ -4433,6 +4433,64 @@ fn top_level_live_code(ctx: &WalkContext<'_, '_>) -> Option<*const ()> {
     }
 }
 
+fn guard_current_frame_globals_identity(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    expected_globals: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    if expected_globals.is_null() || majit_gc::can_move(majit_ir::GcRef(expected_globals as usize))
+    {
+        return Ok(false);
+    }
+    let Some(w_globals_op) = ctx
+        .trace_ctx
+        .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
+    else {
+        return Ok(false);
+    };
+    let expected = ctx.trace_ctx.const_ref(expected_globals as i64);
+    if w_globals_op.is_constant() {
+        return Ok(ctx.trace_ctx.const_value(w_globals_op) == Some(expected_globals as i64));
+    }
+    // pypy/objspace/std/celldict.py `elidable_promote('0,1,2')` promotes
+    // `w_dict`; mirror that by pinning the runtime frame's w_globals identity.
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[w_globals_op, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx.replace_box(w_globals_op, expected);
+    for slot in ctx.registers_r.iter_mut() {
+        if *slot == w_globals_op {
+            *slot = expected;
+        }
+    }
+    Ok(true)
+}
+
+fn replace_movable_load_global_namespace_with_frame_globals(
+    ctx: &mut WalkContext<'_, '_>,
+    ei: &majit_ir::EffectInfo,
+    allboxes: &mut [OpRef],
+) {
+    if ei.pyre_helper != majit_ir::PyreHelperKind::LoadGlobal {
+        return;
+    }
+    let Some(ns_box) = allboxes.get_mut(1) else {
+        return;
+    };
+    let Some(Value::Ref(majit_ir::GcRef(ns_ptr))) = ctx.trace_ctx.box_value(*ns_box) else {
+        return;
+    };
+    if !majit_gc::can_move(majit_ir::GcRef(ns_ptr)) {
+        return;
+    }
+    if let Some(w_globals_op) = ctx
+        .trace_ctx
+        .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
+    {
+        *ns_box = w_globals_op;
+    }
+}
+
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
 /// callee's OWN (unseeded) portal frame to the callee's compile-time
 /// constant.  This is the walk-time mirror of the codewriter's non-portal
@@ -17064,7 +17122,8 @@ fn dispatch_residual_call_iRd_kind(
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+    let mut allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+    replace_movable_load_global_namespace_with_frame_globals(ctx, ei, &mut allboxes);
     if let Err(e) = ensure_residual_call_args_bound(&allboxes, op.pc) {
         if fbw_debug_abort_enabled() {
             let len_pc = op.pc + 1 + 1;
@@ -23439,6 +23498,9 @@ fn try_walker_load_global_cell_fold(
     // ignores the slot); use `usize::MAX` as a past-the-end sentinel so the
     // `quasi_immut_cache` key cannot collide with a real cell fold's slot for
     // a DIFFERENT present name on the same module dict.
+    if !guard_current_frame_globals_identity(ctx, op_pc, w_globals)? {
+        return Ok(false);
+    }
     let abs_ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
     let abs_slot_const = ctx.trace_ctx.const_int(usize::MAX as i64);
     crate::state::record_namespace_quasiimmut_field(
@@ -23452,7 +23514,21 @@ fn try_walker_load_global_cell_fold(
     // `emit_namespace_cell_fold` below records a `QUASIIMMUT_FIELD` on the
     // builtins dict + the elidable cell lookup, so a rebind/del of the
     // builtin bumps the builtins-dict `version` and fails the loop.
-    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_builtin_dict, b_slot, b_stored)?;
+    if majit_gc::can_move(majit_ir::GcRef(w_builtin_dict as usize)) {
+        return Ok(false);
+    }
+    if !emit_namespace_cell_fold(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        w_builtin_dict,
+        b_slot,
+        b_stored,
+        false,
+    )? {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -23546,8 +23622,9 @@ fn emit_module_dict_cell_fold(
                 // (never nursery), so `can_move` is false and a hot int/object
                 // global folds; a raw movable value does not.
                 if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
-                    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, slot, stored)?;
-                    return Ok(true);
+                    return emit_namespace_cell_fold(
+                        ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true,
+                    );
                 }
             }
         }
@@ -23577,11 +23654,15 @@ fn emit_namespace_cell_fold(
     ns: pyre_object::PyObjectRef,
     slot: usize,
     stored: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
+    guard_frame_globals: bool,
+) -> Result<bool, DispatchError> {
     let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
     let is_int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(stored) };
     let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
 
+    if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     let ns_const = ctx.trace_ctx.const_ref(ns as i64);
     let slot_const = ctx.trace_ctx.const_int(slot as i64);
     crate::state::record_namespace_quasiimmut_field(
@@ -23649,7 +23730,7 @@ fn emit_namespace_cell_fold(
     // `last_exc_value` set and the walk aborts `CatchExceptionWithActiveException`.
     ctx.last_exc_value = None;
     ctx.last_exc_value_concrete = ConcreteValue::Null;
-    Ok(())
+    Ok(true)
 }
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
@@ -24304,6 +24385,8 @@ fn dispatch_residual_call_iIRd_kind(
             }
         }
     }
+
+    replace_movable_load_global_namespace_with_frame_globals(ctx, ei, &mut allboxes);
 
     // Defer the arg-bound check past the short-circuiting LoadConst /
     // LoadGlobal folds above: each resolves the call to a constant from
