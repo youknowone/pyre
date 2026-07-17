@@ -2063,21 +2063,17 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         if pyre_object::is_range_iter(args[0]) {
             // CPython 3.14 `rangeiter_setstate`: `PyLong_AsLong`, so an
-            // overflowing Python int raises instead of being clipped.
-            if !(is_int(args[1]) || is_long(args[1]) || is_bool(args[1])) {
-                return Err(PyError::type_error("state must be an int"));
-            }
-            let mut state = BigInt::from(int_w(args[1])?);
-            if state < BigInt::zero() {
-                state = BigInt::zero();
-            }
+            // overflowing Python int raises instead of being clipped. Unlike
+            // the long variant, PyLong_AsLong also accepts `__index__`.
+            let state = int_w(space_index(args[1])?).map_err(|err| {
+                if err.kind == PyErrorKind::OverflowError {
+                    PyError::overflow_error("Python int too large to convert to C long")
+                } else {
+                    err
+                }
+            })?;
             let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-            let remaining_b = BigInt::from(remaining);
-            if state > remaining_b {
-                state = remaining_b;
-            }
-            let state_obj = pyre_object::range_bigint_to_obj(state);
-            let skipped = pyre_object::range_obj_as_i64(state_obj).unwrap_or(remaining);
+            let skipped = state.clamp(0, remaining);
             let next = (current as i128 + skipped as i128 * step as i128) as i64;
             pyre_object::w_range_iter_set_cursor(args[0], next, remaining - skipped);
         } else {

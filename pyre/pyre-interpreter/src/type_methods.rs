@@ -346,6 +346,50 @@ pub(crate) fn require_set_iterator_receiver(
     Ok(receiver)
 }
 
+/// Receiver validation supplied by `W_AbstractRangeIterator.typedef`'s
+/// gateways. Python 3.14 gives the machine-word and arbitrary-precision
+/// implementations distinct public owner names even though PyPy shares the
+/// abstract typedef implementation.
+pub(crate) fn require_range_iterator_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+    long: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let owner = if long {
+        "longrange_iterator"
+    } else {
+        "range_iterator"
+    };
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method {owner}.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of '{owner}' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    let matches = unsafe {
+        if long {
+            pyre_object::is_long_range_iter(receiver)
+        } else {
+            pyre_object::is_range_iter(receiver)
+        }
+    };
+    if !matches {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for '{owner}' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a '{owner}' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.

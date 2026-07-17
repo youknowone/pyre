@@ -1040,7 +1040,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
 // advances by one each step (`self.w_index`), so the cursor keeps arbitrary
 // precision and never overflows for a range longer than a machine word.
 
-#[pyre_class("range_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
+#[pyre_class("longrange_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
 pub struct W_LongRangeIterator {
     pub start: PyObjectRef,
     pub step: PyObjectRef,

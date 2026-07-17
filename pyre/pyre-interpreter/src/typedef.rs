@@ -819,17 +819,17 @@ pub fn init_typeobjects() {
             }
             reg.insert(pytype as usize, iterator_type as usize);
         }
-        let long_range_iterator_type =
-            new_typeobject_with_base("range_iterator", init_range_iterator_type, object_type);
+        let long_range_iterator_type = new_typeobject_with_base(
+            "longrange_iterator",
+            init_long_range_iterator_type,
+            object_type,
+        );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(long_range_iterator_type);
             pyre_object::w_type_set_acceptable_as_base_class(long_range_iterator_type, false);
         }
         reg.insert(
             &pyre_object::functional::LONG_RANGE_ITER_TYPE as *const PyType as usize,
-            // `W_AbstractRangeIterator.typedef` names every range-iterator
-            // class `range_iterator` (`functional.py`); the word-fit and bignum
-            // iterators share that public name though they are distinct types.
             long_range_iterator_type as usize,
         );
         reg.insert(
@@ -20563,20 +20563,52 @@ fn init_dict_iterator_type(ns: PyObjectRef) {
     }
 }
 
+fn range_iterator_self(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__iter__", false, false)
+}
+
+fn range_iterator_next(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__next__", false, false)?;
+    crate::baseobjspace::next(args[0])
+}
+
 fn range_iterator_length_hint(args: &[PyObjectRef]) -> crate::PyResult {
-    if unsafe { pyre_object::is_range_iter(args[0]) } {
-        crate::baseobjspace::range_iter_length_hint_method(args)
-    } else {
-        crate::baseobjspace::long_range_iter_length_hint_method(args)
-    }
+    crate::type_methods::require_range_iterator_receiver(args, "__length_hint__", true, false)?;
+    crate::baseobjspace::range_iter_length_hint_method(args)
 }
 
 fn range_iterator_reduce(args: &[PyObjectRef]) -> crate::PyResult {
-    if unsafe { pyre_object::is_range_iter(args[0]) } {
-        crate::baseobjspace::range_iter_reduce_method(args)
-    } else {
-        crate::baseobjspace::long_range_iter_reduce_method(args)
-    }
+    crate::type_methods::require_range_iterator_receiver(args, "__reduce__", true, false)?;
+    crate::baseobjspace::range_iter_reduce_method(args)
+}
+
+fn range_iterator_setstate(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__setstate__", true, false)?;
+    crate::baseobjspace::range_iter_setstate_method(args)
+}
+
+fn long_range_iterator_self(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__iter__", false, true)
+}
+
+fn long_range_iterator_next(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__next__", false, true)?;
+    crate::baseobjspace::next(args[0])
+}
+
+fn long_range_iterator_length_hint(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__length_hint__", true, true)?;
+    crate::baseobjspace::long_range_iter_length_hint_method(args)
+}
+
+fn long_range_iterator_reduce(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__reduce__", true, true)?;
+    crate::baseobjspace::long_range_iter_reduce_method(args)
+}
+
+fn long_range_iterator_setstate(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::require_range_iterator_receiver(args, "__setstate__", true, true)?;
+    crate::baseobjspace::range_iter_setstate_method(args)
 }
 
 /// PyPy `functional.py W_AbstractRangeIterator.typedef`.
@@ -20585,7 +20617,7 @@ fn init_range_iterator_type(ns: PyObjectRef) {
     let entries = [
         (
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+            make_builtin_function_with_arity("__iter__", range_iterator_self, 1),
         ),
         (
             "__length_hint__",
@@ -20593,7 +20625,7 @@ fn init_range_iterator_type(ns: PyObjectRef) {
         ),
         (
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+            make_builtin_function_with_arity("__next__", range_iterator_next, 1),
         ),
         (
             "__reduce__",
@@ -20601,11 +20633,38 @@ fn init_range_iterator_type(ns: PyObjectRef) {
         ),
         (
             "__setstate__",
-            make_builtin_function_with_arity(
-                "__setstate__",
-                crate::baseobjspace::range_iter_setstate_method,
-                2,
-            ),
+            make_builtin_function_with_arity("__setstate__", range_iterator_setstate, 2),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+/// Python 3.14 exposes the arbitrary-precision implementation as the distinct
+/// `longrange_iterator` type, while retaining the same five protocol entries.
+fn init_long_range_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", long_range_iterator_self, 1),
+        ),
+        (
+            "__length_hint__",
+            make_builtin_function_with_arity("__length_hint__", long_range_iterator_length_hint, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", long_range_iterator_next, 1),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity("__reduce__", long_range_iterator_reduce, 1),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity("__setstate__", long_range_iterator_setstate, 2),
         ),
     ];
     for (name, value) in entries {

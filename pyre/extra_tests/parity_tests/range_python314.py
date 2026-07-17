@@ -81,6 +81,23 @@ except OverflowError:
 else:
     raise AssertionError("range.__len__ must overflow Py_ssize_t")
 
+small_type = type(iter(range(1)))
+long_type = type(iter(range(10**30, 10**30 + 1)))
+assert small_type.__name__ == "range_iterator"
+assert long_type.__name__ == "longrange_iterator"
+assert small_type is not long_type
+
+iterator_surface = {
+    "__iter__",
+    "__length_hint__",
+    "__next__",
+    "__reduce__",
+    "__setstate__",
+    "__doc__",
+}
+assert set(small_type.__dict__) == iterator_surface
+assert set(long_type.__dict__) == iterator_surface
+
 for source in (range(5), range(10**30, 10**30 + 4)):
     iterator = iter(source)
     iterator_type = type(iterator)
@@ -111,6 +128,43 @@ for source in (range(5), range(10**30, 10**30 + 4)):
     iterator.__setstate__(99)
     assert list(iterator) == []
 
+for iterator_type, foreign in (
+    (small_type, iter(range(10**30, 10**30 + 1))),
+    (long_type, iter(range(1))),
+):
+    for name in ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"):
+        descriptor = iterator_type.__dict__[name]
+        args = (foreign, 0) if name == "__setstate__" else (foreign,)
+        try:
+            descriptor(*args)
+        except TypeError as exc:
+            owner = iterator_type.__name__
+            received = type(foreign).__name__
+            if name in ("__iter__", "__next__"):
+                expected = (
+                    f"descriptor '{name}' requires a '{owner}' object "
+                    f"but received a '{received}'"
+                )
+            else:
+                expected = (
+                    f"descriptor '{name}' for '{owner}' objects "
+                    f"doesn't apply to a '{received}' object"
+                )
+            assert str(exc) == expected
+        else:
+            raise AssertionError("range iterator descriptors must validate their receiver")
+
+        try:
+            descriptor()
+        except TypeError as exc:
+            if name in ("__iter__", "__next__"):
+                expected = f"descriptor '{name}' of '{owner}' object needs an argument"
+            else:
+                expected = f"unbound method {owner}.{name}() needs an argument"
+            assert str(exc) == expected
+        else:
+            raise AssertionError("range iterator descriptors must require a receiver")
+
 iterator = iter(range(5))
 try:
     iterator.__setstate__(10**40)
@@ -118,5 +172,22 @@ except OverflowError:
     pass
 else:
     raise AssertionError("machine range iterator state must fit a C long")
+
+class IndexState:
+    def __index__(self):
+        return 2
+
+iterator = iter(range(5))
+iterator.__setstate__(IndexState())
+assert next(iterator) == 2
+
+for state in (True, IndexState()):
+    iterator = iter(range(10**30))
+    try:
+        iterator.__setstate__(state)
+    except TypeError as exc:
+        assert str(exc) == "state must be an int, not " + type(state).__name__
+    else:
+        raise AssertionError("longrange_iterator state must be an exact int")
 
 print("OK")
