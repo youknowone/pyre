@@ -1961,6 +1961,20 @@ fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
     }
 }
 
+fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
+    let mut pc = position;
+    while let Some(op) = decode_op_at(code, pc) {
+        if op.key == "catch_exception/L" {
+            return false;
+        }
+        if matches!(op.key, "last_exception/>i" | "last_exc_value/>r") {
+            return true;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
 /// Read a 2-byte little-endian descr index operand and resolve to
 /// the descr from [`WalkContext::descr_refs`]. RPython equivalent:
 /// `BlackholeInterpreter.descrs[code[pc] | (code[pc+1] << 8)]`
@@ -2646,6 +2660,66 @@ fn dispatch_switch_id(
 /// **Production wiring**: the full-body-walk walker
 /// (`full_body_walk_trace`) is the caller, dispatching each JitCode
 /// opcode through this entry as it walks the body.
+fn seed_standing_exception_for_walk(
+    sym: &mut crate::state::PyreSym,
+    trace_ctx: &mut TraceCtx,
+    concrete_frame_addr: usize,
+) {
+    if !sym.last_exc_box.is_none() {
+        return;
+    }
+
+    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+    if bh_exc != 0 {
+        let exc = bh_exc as pyre_object::PyObjectRef;
+        if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
+            let exc_box = trace_ctx.const_ref(exc as i64);
+            sym.current_exc_value = exc;
+            sym.current_exc_box = exc_box;
+            sym.last_exc_value = exc;
+            sym.last_exc_box = exc_box;
+            sym.class_of_last_exc_is_const = true;
+            return;
+        }
+    }
+
+    let current = pyre_interpreter::eval::get_current_exception();
+    if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
+        let exc_box = trace_ctx.const_ref(current as i64);
+        sym.current_exc_value = current;
+        sym.current_exc_box = exc_box;
+        sym.last_exc_value = current;
+        sym.last_exc_box = exc_box;
+        sym.class_of_last_exc_is_const = true;
+        return;
+    }
+
+    if concrete_frame_addr == 0 {
+        return;
+    }
+    let frame = unsafe { &*(concrete_frame_addr as *const pyre_interpreter::pyframe::PyFrame) };
+    if frame.locals_cells_stack_w.is_null() {
+        return;
+    }
+    let nlocals = crate::state::concrete_nlocals(concrete_frame_addr).unwrap_or(0);
+    let stack_top = frame.valuestackdepth.min(frame.locals_w().len());
+    let Some(exc) = frame.locals_w().as_slice()[nlocals.min(stack_top)..stack_top]
+        .iter()
+        .rev()
+        .copied()
+        .find(|obj| !obj.is_null() && unsafe { pyre_object::is_exception(*obj) })
+    else {
+        return;
+    };
+
+    let exc_box = trace_ctx.const_ref(exc as i64);
+    sym.current_exc_value = exc;
+    sym.current_exc_box = exc_box;
+    sym.last_exc_value = exc;
+    sym.last_exc_box = exc_box;
+    sym.class_of_last_exc_is_const = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_via_miframe(
     miframe: &mut MIFrame,
@@ -2695,6 +2769,7 @@ pub fn dispatch_via_miframe(
     // means dereferencing both simultaneously is sound.
     let ctx_ptr = miframe.ctx;
     let sym_ptr = miframe.sym;
+    let concrete_frame_addr = miframe.concrete_frame_addr;
     let entry_py_pc = EntryPyPc::Py(miframe.orgpc as u32);
     // SAFETY: both pointers were initialized at MIFrame
     // construction time and outlive this call (TraceCtx and
@@ -2730,6 +2805,7 @@ pub fn dispatch_via_miframe(
     // references it (use-before-def).  Seed here — the trait's pre-guard
     // cache-once analog — so every guard snapshot reads a real EC OpRef.
     seed_execution_context_for_walk(sym, trace_ctx);
+    seed_standing_exception_for_walk(sym, trace_ctx, concrete_frame_addr);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
@@ -23790,8 +23866,13 @@ fn dispatch_residual_call_iIRd_kind(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
     // residual-call entry; see dispatch_residual_call_iRd_kind.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    let saved_last_exc_value = ctx.last_exc_value;
+    let saved_last_exc_value_concrete = ctx.last_exc_value_concrete;
+    let preserve_last_exc_for_handler =
+        saved_last_exc_value.is_some() && reads_last_exc_before_next_catch(code, op.next_pc);
+    if !preserve_last_exc_for_handler {
+        clear_walk_exception(ctx);
+    }
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
@@ -23886,7 +23967,6 @@ fn dispatch_residual_call_iIRd_kind(
         })?;
 
     let ei = call_descr.get_extra_info();
-    clear_walk_exception(ctx);
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
@@ -24327,7 +24407,15 @@ fn dispatch_residual_call_iIRd_kind(
                     // decline for Ref operands → generic residual) when an
                     // operand has no concrete shadow or the match target is
                     // not a valid exception class.
-                    try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?
+                    let keep_last_exc_for_handler =
+                        reads_last_exc_before_next_catch(code, op.next_pc);
+                    let folded =
+                        try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?;
+                    if folded.is_some() && keep_last_exc_for_handler {
+                        ctx.last_exc_value = saved_last_exc_value;
+                        ctx.last_exc_value_concrete = saved_last_exc_value_concrete;
+                    }
+                    folded
                 } else {
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.
@@ -26747,7 +26835,16 @@ fn handle(
             // so a downstream
             // `last_exc_value/>r` can propagate it into its dst slot.
             let exc = read_ref_reg(code, op, 0, ctx)?;
-            let concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
+            let mut concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
+            if matches!(concrete_exc, ConcreteValue::Ref(p) if p.is_null())
+                && let Some(Value::Ref(gc_ref)) = ctx.trace_ctx.box_value(exc)
+                && gc_ref != majit_ir::GcRef::NO_CONCRETE
+            {
+                let ptr = gc_ref.as_usize() as pyre_object::PyObjectRef;
+                if !ptr.is_null() && unsafe { pyre_object::is_exception(ptr) } {
+                    concrete_exc = ConcreteValue::Ref(ptr);
+                }
+            }
             // `pyjitpl.py:1688-1693 opimpl_raise` calls
             // `generate_guard(GUARD_CLASS, exc_value_box, clsbox,
             // resumepc=orgpc)`; the first line of `generate_guard`
@@ -26871,19 +26968,25 @@ fn handle(
             //
             // Operand layout `>i`: 1B dst register only; the dst byte sits
             // at `op.pc + 1`.
-            let _exc = ctx
+            let exc = ctx
                 .last_exc_value
                 .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
-            let exc_ptr = match ctx.last_exc_value_concrete {
-                ConcreteValue::Ref(p) if !p.is_null() => p,
-                _ => {
-                    return Err(DispatchError::LastExceptionWithoutActiveException { pc: op.pc });
+            let typeptr = if let Some(cls) = ctx.trace_ctx.heap_cache().get_known_class(exc) {
+                cls
+            } else {
+                let exc_ptr = match ctx.last_exc_value_concrete {
+                    ConcreteValue::Ref(p) if !p.is_null() => p,
+                    _ => {
+                        return Err(DispatchError::LastExceptionWithoutActiveException {
+                            pc: op.pc,
+                        });
+                    }
+                };
+                unsafe {
+                    (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
+                        .ob_header
+                        .ob_type as i64
                 }
-            };
-            let typeptr = unsafe {
-                (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
-                    .ob_header
-                    .ob_type as i64
             };
             let dst = code[op.pc + 1] as usize;
             let cls_const = ctx.trace_ctx.const_int(typeptr);
