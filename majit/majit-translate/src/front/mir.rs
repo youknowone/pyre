@@ -1739,6 +1739,32 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.bigint_div_mod_floor_sites,
             );
         }
+        // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
+        // the residual `contains` method call in place with native
+        // `bitand(le(a, x), ge(b, x))` compares and removes the paired
+        // residual `RangeInclusive::new` call in its predecessor block.  It
+        // threads the `new` bounds into the `contains` block via
+        // `ensure_variable_at_block` (touching predecessor link args /
+        // inputargs only — no fresh blocks, no detached edges).  Removing the
+        // cross-block `new` producer leaves its threaded range value dangling
+        // on the predecessor link arg, so a rewrite MUST be followed by
+        // `prune_dead_phis` to reclaim the dead threaded range inputarg /
+        // link args (the compares never read them) — run it unconditionally
+        // on any rewrite rather than relying on the gated sweep in
+        // `simplify_lowered_graph`.  Fail-safe: a structural mismatch leaves
+        // BOTH residual calls (rtyper Skip) and touches nothing.
+        let range_contains_rewritten = if lo.range_contains_sites.is_empty() {
+            0
+        } else {
+            crate::front::range_contains::rewire_range_contains_call_sites(
+                &mut lo.graph,
+                &lo.range_inclusive_new_sites,
+                &lo.range_contains_sites,
+            )
+        };
+        if range_contains_rewritten > 0 {
+            crate::model::prune_dead_phis(&mut lo.graph);
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -2115,6 +2141,15 @@ struct Lowering<'a> {
     /// `front::bigint_div_mod_floor` post-pass synthesizes (see
     /// [`crate::front::bigint_div_mod_floor::BigIntDivModFloorSite`]).
     bigint_div_mod_floor_sites: Vec<crate::front::bigint_div_mod_floor::BigIntDivModFloorSite>,
+    /// `RangeInclusive::new(lo, hi)` call sites recorded for the
+    /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
+    /// `front::range_contains` post-pass synthesizes (see
+    /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
+    range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
+    /// `RangeInclusive::contains(&self, &x)` call sites paired with the
+    /// `new` sites above by the `front::range_contains` post-pass (see
+    /// [`crate::front::range_contains::RangeContainsSite`]).
+    range_contains_sites: Vec<crate::front::range_contains::RangeContainsSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
@@ -2298,6 +2333,8 @@ impl<'a> Lowering<'a> {
             bool_then_sites: Vec::new(),
             bigint_div_rem_sites: Vec::new(),
             bigint_div_mod_floor_sites: Vec::new(),
+            range_inclusive_new_sites: Vec::new(),
+            range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -6658,6 +6695,64 @@ impl<'a> Lowering<'a> {
                     result_var: result_var.clone(),
                 },
             );
+        }
+        // Capture `RangeInclusive::new(lo, hi)` sites for the
+        // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
+        // `new` is an inherent-impl associated function whose owner
+        // resolves to the opaque `RangeInclusive` ADT, so `lower_call`
+        // emits it as a 2-arg FunctionPath whose segments end
+        // `["range", "RangeInclusive", "new"]` (the owner-qualified
+        // spelling, like `bigint::BigInt::div_rem`).  The int element gate
+        // reads the destination `RangeInclusive`'s type argument
+        // (`call.dest.ty`), which is present even when the bounds are
+        // literal constants — the common `(0..=255)` shape passes
+        // `Operand::Const` bounds, so gating the operand types instead
+        // would miss them.  A float / narrower-width range never records a
+        // site and declines cleanly (both calls stay residual, census
+        // Skip).  The op is still emitted normally; the post-pass removes
+        // it once the paired `contains` folds.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "new"])
+            && tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
+        {
+            self.range_inclusive_new_sites
+                .push(crate::front::range_contains::RangeInclusiveNewSite {
+                    result_var: result_var.clone(),
+                    lo: args[0].clone(),
+                    hi: args[1].clone(),
+                });
+        }
+        // Capture `RangeInclusive::contains(&self, &x)` sites for the same
+        // fold.  Its `&RangeInclusive` receiver is an opaque foreign ADT
+        // whose impl-owner resolution routes it as a 2-arg FunctionPath
+        // (receiver `args[0]`, value `args[1]`) ending
+        // `["range", "RangeInclusive", "contains"]`, NOT a
+        // `CallTarget::Method`.  Gate on the receiver operand type
+        // (`first_arg_ty`) resolving to the opaque `RangeInclusive` ADT
+        // over an int element so a same-named `contains` on any other type
+        // — or a float range — is never recorded; the post-pass pairs each
+        // recorded site with its producing `new` and declines on any
+        // structural mismatch.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "contains"])
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
+        {
+            self.range_contains_sites
+                .push(crate::front::range_contains::RangeContainsSite {
+                    result_var: result_var.clone(),
+                });
         }
         // Capture `Option::unwrap_or(opt, default)` /
         // `Result::unwrap_or(res, default)` sites for the discriminant
@@ -11416,6 +11511,53 @@ fn tyref_is_opaque_bigint(ty: &TyRef, llbc: &Llbc) -> bool {
             matches!(td.kind, TypeDeclKind::Opaque)
                 && td.item_meta.name_path().ends_with("bigint::BigInt")
         })
+}
+
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
+/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
+/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
+/// both the `new` and the `contains` recording of the
+/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
+/// type — and a float / narrower-width range — is never folded to
+/// integer compares.  The element type is read from the ADT reference's
+/// `generics.types[0]`, so it is available even when the `new` bounds are
+/// literal constants (whose operand types the front does not carry);
+/// float ranges decline cleanly (both calls stay residual, census Skip).
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(adt) = node
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+    let is_range = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            matches!(td.kind, TypeDeclKind::Opaque)
+                && td.item_meta.name_path() == "core::ops::range::RangeInclusive"
+        });
+    if !is_range {
+        return false;
+    }
+    let elem = adt
+        .get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc));
+    matches!(
+        elem.and_then(|e| e.as_object())
+            .and_then(|m| m.get("Literal"))
+            .and_then(|l| l.as_object())
+            .and_then(|l| l.get("Int"))
+            .and_then(serde_json::Value::as_str),
+        Some("I64" | "Isize")
+    )
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -16630,6 +16772,107 @@ mod tests {
         assert!(
             !residual,
             "FUNCTION_OBJECT_SIZE must not residualize as a FunctionPath call"
+        );
+    }
+
+    /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
+    /// its int census callers — `setitem_bytearray` / `byte_w`
+    /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
+    /// i64..=i32::MAX as i64)`, NON-constant bounds).  For each, both
+    /// residual range calls (`RangeInclusive::new` / `contains`) must be
+    /// gone and native `le` / `ge` / `bitand` compares present.  Ignored
+    /// by default (loads the real LLBC); run with `cargo test -p
+    /// majit-translate --lib range_contains_fold_real -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_int_census_sites() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+
+        for fname in ["setitem_bytearray", "byte_w", "c_int_w"] {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+
+            // Calls whose FunctionPath ends `["range", "RangeInclusive",
+            // "new"|"contains"]` (the owner-resolved spelling `lower_call`
+            // emits) and the native compare binops the fold produces.
+            let range_call = |leaf: &str| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                                if super::fmt_path_ends_with(
+                                    segments,
+                                    &["range", "RangeInclusive", leaf],
+                                )
+                        )
+                    })
+                    .count()
+            };
+            let binops = |name: &str| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == name))
+                    .count()
+            };
+
+            assert_eq!(range_call("new"), 0, "{fname}: residual RangeInclusive::new removed");
+            assert_eq!(range_call("contains"), 0, "{fname}: residual contains removed");
+            assert!(binops("le") >= 1, "{fname}: at least one `le` compare emitted");
+            assert!(binops("ge") >= 1, "{fname}: at least one `ge` compare emitted");
+            assert!(binops("bitand") >= 1, "{fname}: at least one `bitand` emitted");
+        }
+    }
+
+    /// The float range in `complex_pow` (`descroperation.rs:1459`,
+    /// `(-100.0..=100.0)`) is out of the int-only fold's scope: the
+    /// element gate rejects the `F64` type, so BOTH residual range calls
+    /// survive (the graph census-Skips as before — no regression, no
+    /// float→int miscompile).  Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_declines_float_range() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "complex_pow").expect("lower complex_pow");
+
+        let range_call = |leaf: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(
+                                segments,
+                                &["range", "RangeInclusive", leaf],
+                            )
+                    )
+                })
+                .count()
+        };
+        assert!(
+            range_call("contains") >= 1,
+            "float range contains stays residual (fold out of scope)"
         );
     }
 
