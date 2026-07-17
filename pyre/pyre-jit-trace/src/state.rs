@@ -8596,9 +8596,23 @@ impl JitState for PyreJitState {
                         // array) so the seeded bridge walk can fold a branch
                         // derived from it without risking a moved-pointer
                         // stamp (gap-10 bridge sub-class; see seed note above).
+                        // Skip a NULL (`GcRef(0)`) source, matching the
+                        // deferred-overlay seed below: a loop-carried local
+                        // held in a register at an interior guard reads NULL
+                        // from `locals_cells_stack_w` because it was never
+                        // written back.  Stamping that hole poisons the real
+                        // vable box with concrete NULL, folding a later
+                        // residual's Ref arg to NULL →
+                        // `MayForceNullRefArgUnsupported`.  Leaving the box
+                        // unstamped keeps it symbolic so the residual reads
+                        // the runtime value.
                         if seed_bridge_locals {
                             if let Some(&cv) = live_local_values.get(s) {
-                                if !matches!(cv, majit_ir::Value::Void) {
+                                if !matches!(
+                                    cv,
+                                    majit_ir::Value::Void
+                                        | majit_ir::Value::Ref(majit_ir::GcRef(0))
+                                ) {
                                     ctx.try_set_opref_concrete(v, cv);
                                 }
                             }
