@@ -127,9 +127,15 @@ crate::py_module! {
     "operator",
     // `countOf` + the `itemgetter`/`attrgetter`/`methodcaller` callable
     // classes are app-level (`pypy/module/operator/app_operator.py`,
-    // `moduledef.py` `app_names`), not interp-level.
+    // `moduledef.py` `app_names`), not interp-level.  `concat`/`indexOf`/
+    // `inv`/`is_none`/`is_not_none`/`call` follow the `operator.py` pure-
+    // Python definitions verbatim (`call`'s `**kwargs` forwarding and
+    // `concat`'s `__getitem__` guard are awkward to express interp-level).
     appleveldefs: {
-        "app_operator.py" => ["countOf", "itemgetter", "attrgetter", "methodcaller"],
+        "app_operator.py" => [
+            "countOf", "itemgetter", "attrgetter", "methodcaller",
+            "concat", "indexOf", "inv", "is_none", "is_not_none", "call",
+        ],
     },
     functions: {
         "index"    / 1 = op_index,
