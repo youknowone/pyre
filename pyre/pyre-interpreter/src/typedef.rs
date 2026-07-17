@@ -10049,7 +10049,10 @@ fn init_method_type(ns: PyObjectRef) {
     let doc_getter = make_builtin_function_with_arity(
         "__doc__",
         |args| {
-            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let method = crate::function::require_method(
+                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                "__doc__",
+            )?;
             let function = unsafe { pyre_object::w_method_get_func(method) };
             crate::baseobjspace::getattr_str(function, "__doc__")
         },
@@ -10108,10 +10111,10 @@ fn init_method_type(ns: PyObjectRef) {
     let func_getter = make_builtin_function_with_arity(
         "__func__",
         |args| {
-            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if !unsafe { pyre_object::function::is_method(method) } {
-                return Ok(pyre_object::w_none());
-            }
+            let method = crate::function::require_method(
+                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                "__func__",
+            )?;
             let w_value = unsafe { pyre_object::w_method_get_func(method) };
             if w_value.is_null() {
                 Ok(pyre_object::w_none())
@@ -10131,10 +10134,10 @@ fn init_method_type(ns: PyObjectRef) {
     let self_getter = make_builtin_function_with_arity(
         "__self__",
         |args| {
-            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if !unsafe { pyre_object::function::is_method(method) } {
-                return Ok(pyre_object::w_none());
-            }
+            let method = crate::function::require_method(
+                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                "__self__",
+            )?;
             let w_value = unsafe { pyre_object::w_method_get_self(method) };
             if w_value.is_null() {
                 Ok(pyre_object::w_none())
@@ -10184,16 +10187,37 @@ fn init_method_type(ns: PyObjectRef) {
             ),
         )
     };
-    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+    type MethodOrderFn = fn(&[PyObjectRef]) -> crate::PyResult;
+    fn order(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+        crate::function::require_method(
+            args.first().copied().unwrap_or(pyre_object::PY_NULL),
+            name,
+        )?;
+        Ok(pyre_object::special::w_not_implemented())
+    }
+    fn lt(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__lt__")
+    }
+    fn le(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__le__")
+    }
+    fn gt(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__gt__")
+    }
+    fn ge(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__ge__")
+    }
+    for (name, function) in [
+        ("__lt__", lt as MethodOrderFn),
+        ("__le__", le),
+        ("__gt__", gt),
+        ("__ge__", ge),
+    ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(
-                    name,
-                    |_args| Ok(pyre_object::special::w_not_implemented()),
-                    2,
-                ),
+                make_builtin_function_with_arity(name, function, 2),
             )
         };
     }
