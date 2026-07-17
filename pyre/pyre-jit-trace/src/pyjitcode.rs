@@ -160,6 +160,16 @@ pub struct PyJitCodeMetadata {
     /// fixture.
     pub after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
+    /// Result color (`result_color_at_pc`) of the call-result operand slot at
+    /// the after-residual fallthrough PC, keyed by JitCode byte offset with the
+    /// same exact-marker / predecessor-op-start split as
+    /// `after_residual_marker_*`. Value =
+    /// `result_color_at_pc[semantic_fallthrough_pc(skip_python_trivia_forward(py))]`
+    /// (`None` past the table end). Retires the runtime py-keyed result-color
+    /// read in the inline-caller marker-miss fallback. Empty for skeleton /
+    /// fixture.
+    pub result_color_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
+    pub result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
     /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
     /// `u16::MAX` where the stack is empty. The inline multiframe capture
@@ -733,6 +743,27 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// Result color of the call-result operand slot at the after-residual
+    /// fallthrough PC, keyed by a JitCode byte offset with the SAME exact-marker
+    /// / predecessor-op-start tiers as `after_residual_marker_for_jitcode_pc`.
+    /// Equals the legacy
+    /// `result_color_at_pc[semantic_fallthrough_pc(python_pc_for_jitcode_pc(jit_pc))]`
+    /// for a call-op coordinate; `u16::MAX` where the return stack is empty;
+    /// `None` when the twin is empty (skeleton / fixture) or the fallthrough is
+    /// past the table end.
+    pub fn result_color_after_residual_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let marker = &self.metadata.result_color_after_residual_marker_by_jit_pc;
+        let pred = &self.metadata.result_color_after_residual_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return marker[i].1;
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
     /// Post-`residual_call` catch resume marker keyed by a JitCode byte
     /// offset, resolved with the SAME exact-marker / predecessor-op-start
     /// tiers as `python_pc_for_jitcode_pc`.
@@ -896,6 +927,8 @@ impl PyJitCode {
                 resume_marker_pred_by_jit_pc: Vec::new(),
                 after_residual_marker_marker_by_jit_pc: Vec::new(),
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
+                result_color_after_residual_marker_by_jit_pc: Vec::new(),
+                result_color_after_residual_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 result_color_by_jit_pc: Vec::new(),

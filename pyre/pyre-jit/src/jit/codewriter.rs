@@ -13177,6 +13177,9 @@ impl CodeWriter {
         let mut resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut result_color_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)> =
+            Vec::new();
+        let mut result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)> =
             Vec::new();
         let mut after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
@@ -13298,8 +13301,15 @@ impl CodeWriter {
                     .get(ft)
                     .and_then(|_| resolve_marker(ft));
                 after_residual_marker_marker_by_jit_pc.push((off, value));
+                // The retired runtime read took the fallthrough of the RAW
+                // block-head py (no trivia skip); match it exactly so the twin
+                // reproduces `result_color_at_pc[fallthrough(python_pc_for_jitcode_pc(off))]`.
+                let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py as usize);
+                result_color_after_residual_marker_by_jit_pc
+                    .push((off, result_color_at_pc.get(ft_rc).copied()));
             }
             after_residual_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            result_color_after_residual_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
@@ -13309,9 +13319,13 @@ impl CodeWriter {
                         .get(ft)
                         .and_then(|_| resolve_marker(ft));
                     after_residual_marker_pred_by_jit_pc.push((pos, value));
+                    let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
+                    result_color_after_residual_pred_by_jit_pc
+                        .push((pos, result_color_at_pc.get(ft_rc).copied()));
                 }
             }
             after_residual_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            result_color_after_residual_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Post-residual-call catch marker twin: source values from the
             // same sparse construction inputs, while resolving its key
             // with the exact block-head / predecessor-op-start split of the
@@ -13379,6 +13393,8 @@ impl CodeWriter {
             resume_marker_pred_by_jit_pc,
             after_residual_marker_marker_by_jit_pc,
             after_residual_marker_pred_by_jit_pc,
+            result_color_after_residual_marker_by_jit_pc,
+            result_color_after_residual_pred_by_jit_pc,
             result_color_at_pc,
             result_color_by_jit_pc,
             portal_frame_reg,

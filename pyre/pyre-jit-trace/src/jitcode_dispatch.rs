@@ -13420,10 +13420,12 @@ fn compute_inline_caller_frame(
             .result_color_for_jitcode_pc_pred(marker)
             .filter(|&color| color != u16::MAX)
             .map(|color| color as usize),
-        // Keep the legacy table only for the unkeyed marker-miss fallback.
-        None => {
-            crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
-        }
+        // Marker-miss: the after-residual result-color twin keys the same
+        // fallthrough coordinate by JitCode byte offset, retiring the py read.
+        None => unsafe { &(*caller_sym.jitcode).payload }
+            .result_color_after_residual_for_jitcode_pc(call_jit_pc)
+            .filter(|&color| color != u16::MAX)
+            .map(|color| color as usize),
     }
     .ok_or(InlineCallerFrameDecline::Unavailable)?;
     // Null the not-yet-produced result slot, build the box list, then restore
@@ -13539,10 +13541,10 @@ fn compute_nested_inline_caller_frame(
             .result_color_for_jitcode_pc_pred(marker)
             .filter(|&color| color != u16::MAX)
             .map(|color| color as usize),
-        None => crate::state::result_color_at_pc_at(
-            jitcode_index as i32,
-            legacy_fallthrough_py_pc() as usize,
-        ),
+        None => pjc
+            .result_color_after_residual_for_jitcode_pc(call_jit_pc)
+            .filter(|&color| color != u16::MAX)
+            .map(|color| color as usize),
     }
     .ok_or(InlineCallerFrameDecline::Unavailable)?;
     if pcmap_pfresume_audit_enabled() {
