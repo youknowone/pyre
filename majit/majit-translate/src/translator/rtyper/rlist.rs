@@ -381,14 +381,18 @@ fn rlist_runtime_deferred(name: &str) -> TyperError {
 ///     return v_result
 /// ```
 ///
-/// Constructs a fresh resized list (`Ptr(GcStruct("list", length, items))`)
-/// via the shared [`build_ll_newlist_helper_graph`] (`ListLayout::Resized`),
-/// then fills it positionally with `ll_setitem_fast` calls
-/// ([`build_ll_setitem_fast_helper_graph`]); the `dum_nocheck` index is
-/// statically `0..n`, so the negative-index / bound-check wrappers are
-/// skipped exactly as upstream's `ll_setitem_nonneg`-fast-path does. Each
+/// Constructs a fresh list via the shared [`build_ll_newlist_helper_graph`],
+/// then fills it positionally with `ll_setitem_fast` calls; the `dum_nocheck`
+/// index is statically `0..n`, so the negative-index / bound-check wrappers
+/// are skipped exactly as upstream's `ll_setitem_nonneg`-fast-path does. Each
 /// element is coerced to `r_list.item_repr` (the internal gcref-wrapped
 /// element repr) before being stored.
+///
+/// `LIST.ll_newlist` is a repr-generic typemethod upstream: the resized
+/// `ListRepr` binds `ll_newlist` (`Ptr(GcStruct("list", length, items))`) and
+/// the never-resized `FixedSizeListRepr` binds `ll_fixed_newlist`
+/// (`Ptr(GcArray)`). This dispatches on the concrete `hop.r_result` repr and
+/// forwards to [`rtype_newlist_layout`] with the matching [`ListLayout`].
 pub fn rtype_newlist(hop: &HighLevelOp) -> RTypeResult {
     let r_result = hop
         .r_result
@@ -396,34 +400,76 @@ pub fn rtype_newlist(hop: &HighLevelOp) -> RTypeResult {
         .clone()
         .ok_or_else(|| TyperError::message("rtype_newlist: r_result missing"))?;
     let any_r: &dyn std::any::Any = r_result.as_ref();
-    let r_list = any_r
-        .downcast_ref::<ListRepr>()
-        .ok_or_else(|| TyperError::message("rtype_newlist: hop.r_result is not a ListRepr"))?;
-    let ptr_lltype = r_list.lltype.clone();
-    let item_lltype = r_list.item_repr.lowleveltype().clone();
+    // `hop.r_result` is a `list` display's repr: the resized `ListRepr`
+    // (`Ptr(GcStruct("list", length, items))`) for a mutated `list(...)`, or
+    // the `FixedSizeListRepr` (`Ptr(GcArray)`) for a never-resized `vec![...]`.
+    // The `LIST.ll_newlist` typemethod is repr-generic upstream
+    // (`ll_newlist` vs `ll_fixed_newlist`); dispatch on the concrete repr and
+    // parameterise the shared body on [`ListLayout`].
+    if let Some(r_list) = any_r.downcast_ref::<ListRepr>() {
+        return rtype_newlist_layout(
+            hop,
+            r_list.lltype.clone(),
+            r_list.item_repr.lowleveltype().clone(),
+            r_list.item_repr.as_ref(),
+            ListLayout::Resized,
+        );
+    }
+    if let Some(r_list) = any_r.downcast_ref::<FixedSizeListRepr>() {
+        return rtype_newlist_layout(
+            hop,
+            r_list.lltype.clone(),
+            r_list.item_repr.lowleveltype().clone(),
+            r_list.item_repr.as_ref(),
+            ListLayout::Fixed,
+        );
+    }
+    Err(TyperError::message(
+        "rtype_newlist: hop.r_result is not a ListRepr or FixedSizeListRepr",
+    ))
+}
+
+/// Repr-generic body of [`rtype_newlist`], shared by the resized `ListRepr`
+/// and the fixed-size `FixedSizeListRepr`. The `LIST.ll_newlist(n)` +
+/// positional `ll_setitem_fast` shape is identical; only the receiver layout
+/// (and hence the concrete helper graphs) differ.
+///
+/// The two layouts build DIFFERENT helper graphs (the resized newlist mallocs
+/// a `GcStruct` header + items array and stores both fields; the fixed newlist
+/// is the bare `malloc_varsize`), so they MUST use distinct helper-fn names —
+/// `lowlevel_helper_function_with_builder` memoises on `(name, args, result)`
+/// and would otherwise be at risk of serving a cached resized graph for a
+/// fixed request. Distinct names (`ll_newlist` / `ll_fixed_newlist`,
+/// `ll_setitem_fast` / `ll_fixed_setitem_fast`) also match the upstream
+/// `ADTIList` / `ADTIFixedList` adtmeth entries.
+fn rtype_newlist_layout(
+    hop: &HighLevelOp,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    item_repr: &dyn Repr,
+    layout: ListLayout,
+) -> RTypeResult {
     let n = hop.nb_args();
 
     // upstream `items_v = [hop.inputarg(r_list.item_repr, i) for i in range(n)]`.
-    let converted: Vec<ConvertedTo<'_>> = (0..n)
-        .map(|_| ConvertedTo::Repr(r_list.item_repr.as_ref()))
-        .collect();
+    let converted: Vec<ConvertedTo<'_>> = (0..n).map(|_| ConvertedTo::Repr(item_repr)).collect();
     let items_v = hop.inputargs(converted)?;
+
+    let (newlist_name, setitem_name) = match layout {
+        ListLayout::Fixed => ("ll_fixed_newlist", "ll_fixed_setitem_fast"),
+        ListLayout::Resized => ("ll_newlist", "ll_setitem_fast"),
+    };
 
     // upstream `v_result = llops.gendirectcall(LIST.ll_newlist, cno)`.
     let newlist_fn = {
         let ptr = ptr_lltype.clone();
         let item = item_lltype.clone();
         hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_newlist".to_string(),
+            newlist_name.to_string(),
             vec![LowLevelType::Signed],
             ptr_lltype.clone(),
             move |_rtyper, _args, _result| {
-                build_ll_newlist_helper_graph(
-                    "ll_newlist",
-                    ListLayout::Resized,
-                    ptr.clone(),
-                    item.clone(),
-                )
+                build_ll_newlist_helper_graph(newlist_name, layout, ptr.clone(), item.clone())
             },
         )?
     };
@@ -438,11 +484,18 @@ pub fn rtype_newlist(hop: &HighLevelOp) -> RTypeResult {
         let ptr = ptr_lltype.clone();
         let item = item_lltype.clone();
         hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_setitem_fast".to_string(),
+            setitem_name.to_string(),
             vec![ptr_lltype, LowLevelType::Signed, item_lltype],
             LowLevelType::Void,
-            move |_rtyper, _args, _result| {
-                build_ll_setitem_fast_helper_graph("ll_setitem_fast", ptr.clone(), item.clone())
+            move |_rtyper, _args, _result| match layout {
+                ListLayout::Fixed => build_ll_fixed_setitem_fast_helper_graph(
+                    setitem_name,
+                    ptr.clone(),
+                    item.clone(),
+                ),
+                ListLayout::Resized => {
+                    build_ll_setitem_fast_helper_graph(setitem_name, ptr.clone(), item.clone())
+                }
             },
         )?
     };
@@ -5321,6 +5374,87 @@ mod tests {
             3,
             "expected ll_newlist + 2×ll_setitem_fast direct_calls, got {:?}",
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+    }
+
+    /// The `vec![e0, …, eN]` never-resized display annotates as a
+    /// `FixedSizeListRepr` (bare `Ptr(GcArray)`). `rtype_newlist` must take
+    /// the Fixed arm — `ll_fixed_newlist(N)` + N `ll_fixed_setitem_fast` — and
+    /// mint helper graphs under DISTINCT names from the resized variant, so
+    /// the `(name, args, result)` helper cache never serves a resized-shaped
+    /// graph for the fixed request.
+    #[test]
+    fn translate_operation_newlist_fixed_repr_emits_ll_fixed_helpers() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> = Arc::new(
+            FixedSizeListRepr::new(&rtyper, r_int.clone()).expect("FixedSizeListRepr::new"),
+        );
+
+        let v_a = Variable::new();
+        v_a.set_concretetype(Some(LowLevelType::Signed));
+        let v_b = Variable::new();
+        v_b.set_concretetype(Some(LowLevelType::Signed));
+        let v_a_h = Hlvalue::Variable(v_a);
+        let v_b_h = Hlvalue::Variable(v_b);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "newlist".to_string(),
+            vec![v_a_h.clone(), v_b_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_a_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_b_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation newlist must dispatch to rtype_newlist")
+            .expect("newlist returns the fresh list Variable");
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        // `ll_fixed_newlist(len)` + one `ll_fixed_setitem_fast` per element.
+        assert_eq!(
+            direct_calls,
+            3,
+            "expected ll_fixed_newlist + 2×ll_fixed_setitem_fast direct_calls, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+
+        // The Fixed arm must have minted its own `ll_fixed_*` helper graphs
+        // (distinct cache keys), not reused the resized `ll_newlist` graph.
+        let translator = ann.translator.clone();
+        let names: Vec<String> = translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_fixed_newlist"),
+            "Fixed arm must mint an ll_fixed_newlist helper graph, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ll_fixed_setitem_fast"),
+            "Fixed arm must mint an ll_fixed_setitem_fast helper graph, got {names:?}"
         );
     }
 
