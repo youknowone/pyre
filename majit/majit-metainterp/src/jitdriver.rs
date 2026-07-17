@@ -4951,6 +4951,7 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
+        ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
         ctx.bridge_target_header_pc = parent_header_pc;
         ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
             let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };

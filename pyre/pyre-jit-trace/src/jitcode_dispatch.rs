@@ -2660,12 +2660,16 @@ fn dispatch_switch_id(
 /// **Production wiring**: the full-body-walk walker
 /// (`full_body_walk_trace`) is the caller, dispatching each JitCode
 /// opcode through this entry as it walks the body.
-fn seed_standing_exception_for_walk(
-    sym: &mut crate::state::PyreSym,
-    trace_ctx: &mut TraceCtx,
-    concrete_frame_addr: usize,
-) {
+///
+/// Bridge exception seeding follows `pyjitpl.py:3125-3173`: only a
+/// `ResumeGuardExcDescr`/`ResumeGuardCopiedExcDescr` source guard carries
+/// exception state into bridge tracing. Operand-stack values are never scanned
+/// to infer a standing exception.
+fn seed_standing_exception_for_walk(sym: &mut crate::state::PyreSym, trace_ctx: &mut TraceCtx) {
     if !sym.last_exc_box.is_none() {
+        return;
+    }
+    if trace_ctx.is_bridge_trace && !trace_ctx.bridge_source_is_exception_guard() {
         return;
     }
 
@@ -2691,33 +2695,7 @@ fn seed_standing_exception_for_walk(
         sym.last_exc_value = current;
         sym.last_exc_box = exc_box;
         sym.class_of_last_exc_is_const = true;
-        return;
     }
-
-    if concrete_frame_addr == 0 {
-        return;
-    }
-    let frame = unsafe { &*(concrete_frame_addr as *const pyre_interpreter::pyframe::PyFrame) };
-    if frame.locals_cells_stack_w.is_null() {
-        return;
-    }
-    let nlocals = crate::state::concrete_nlocals(concrete_frame_addr).unwrap_or(0);
-    let stack_top = frame.valuestackdepth.min(frame.locals_w().len());
-    let Some(exc) = frame.locals_w().as_slice()[nlocals.min(stack_top)..stack_top]
-        .iter()
-        .rev()
-        .copied()
-        .find(|obj| !obj.is_null() && unsafe { pyre_object::is_exception(*obj) })
-    else {
-        return;
-    };
-
-    let exc_box = trace_ctx.const_ref(exc as i64);
-    sym.current_exc_value = exc;
-    sym.current_exc_box = exc_box;
-    sym.last_exc_value = exc;
-    sym.last_exc_box = exc_box;
-    sym.class_of_last_exc_is_const = true;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2805,7 +2783,7 @@ pub fn dispatch_via_miframe(
     // references it (use-before-def).  Seed here — the trait's pre-guard
     // cache-once analog — so every guard snapshot reads a real EC OpRef.
     seed_execution_context_for_walk(sym, trace_ctx);
-    seed_standing_exception_for_walk(sym, trace_ctx, concrete_frame_addr);
+    seed_standing_exception_for_walk(sym, trace_ctx);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`

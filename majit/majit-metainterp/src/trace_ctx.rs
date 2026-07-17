@@ -519,6 +519,11 @@ pub struct TraceCtx {
     /// (a static trait method with no metainterp access) can map each
     /// decoded frame value to its sym slot via `reg_idx - identity_base`.
     pub(crate) bridge_reg_indices: Option<crate::resume::FrameLivenessRegIndices>,
+    /// Whether the source guard descr for this bridge is a
+    /// ResumeGuardExcDescr analog. Set by `start_bridge_tracing` from
+    /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
+    /// that only receive `TraceCtx`.
+    pub(crate) bridge_source_is_exception_guard: bool,
 }
 
 /// A decoded-but-not-yet-built description of one inlined
@@ -1218,6 +1223,7 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
+            bridge_source_is_exception_guard: false,
         }
     }
 
@@ -1293,6 +1299,7 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
+            bridge_source_is_exception_guard: false,
         }
     }
 
@@ -1322,6 +1329,17 @@ impl TraceCtx {
     /// value (laid out int-bank then ref-bank then float) to its sym slot.
     pub fn bridge_reg_indices(&self) -> Option<&crate::resume::FrameLivenessRegIndices> {
         self.bridge_reg_indices.as_ref()
+    }
+
+    /// Mark whether this bridge's source guard is an exception guard
+    /// (`ResumeGuardExcDescr` / `ResumeGuardCopiedExcDescr` analog).
+    pub fn set_bridge_source_is_exception_guard(&mut self, is_exception_guard: bool) {
+        self.bridge_source_is_exception_guard = is_exception_guard;
+    }
+
+    /// True only for bridge traces sourced from an exception guard descr.
+    pub fn bridge_source_is_exception_guard(&self) -> bool {
+        self.bridge_source_is_exception_guard
     }
 
     /// Get or create a constant OpRef for a given i64 value.

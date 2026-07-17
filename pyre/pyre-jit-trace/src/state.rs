@@ -7933,56 +7933,38 @@ fn materialize_bridge_virtual(
     }
 }
 
-/// ResumeGuardExcDescr analog for bridge walks that start inside an
-/// already-entered exception handler.
+/// ResumeGuardExcDescr analog for bridge walks.
 ///
 /// `setup_bridge_sym` runs after guard-failure resume has rebuilt the live
-/// frame and restored the execution-context exception slot. If the raise that
-/// reached the handler was delivered by blackhole replay, it was not recorded
-/// in the bridge trace, so `sym.last_exc_box` is still empty even though the
-/// handler's first jitcode ops (`last_exception`, `last_exc_value`, `reraise`)
-/// require RPython's standing `metainterp.last_exc_value`. Seed the standing
-/// slot from the restored current exception only when it is a real exception
-/// object and the walk has not already seeded an in-trace raise.
+/// frame. Per `pyjitpl.py:3125-3173`, only a
+/// ResumeGuardExcDescr/ResumeGuardCopiedExcDescr source guard carries the
+/// pending exception into bridge tracing. Non-exception guards do not seed
+/// standing exception state, and operand-stack values are never scanned to
+/// infer one.
 fn seed_bridge_standing_exception_from_current(
     sym: &mut PyreSym,
     ctx: &mut majit_metainterp::TraceCtx,
-    semantic_mirror: &[OpRef],
-    live_slot_values: &[Value],
-    nlocals: usize,
 ) {
+    if !ctx.bridge_source_is_exception_guard() {
+        return;
+    }
     if !sym.last_exc_box.is_none() {
         return;
     }
 
     let mut exc = sym.current_exc_value;
-    let mut exc_box = sym.current_exc_box;
+    let exc_box = sym.current_exc_box;
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         let current = pyre_interpreter::eval::get_current_exception();
         if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
             exc = current;
         } else {
-            let stack_exc = semantic_mirror
-                .iter()
-                .enumerate()
-                .skip(nlocals)
-                .rev()
-                .find_map(|(slot, &opref)| {
-                    let value = live_slot_values.get(slot)?;
-                    let Value::Ref(majit_ir::GcRef(ptr)) = value else {
-                        return None;
-                    };
-                    let obj = *ptr as pyre_object::PyObjectRef;
-                    if obj.is_null() || !unsafe { pyre_object::is_exception(obj) } {
-                        return None;
-                    }
-                    Some((obj, opref))
-                });
-            let Some((stack_exc, stack_opref)) = stack_exc else {
-                return;
-            };
-            exc = stack_exc;
-            exc_box = stack_opref;
+            sym.current_exc_value = std::ptr::null_mut();
+            sym.current_exc_box = OpRef::NONE;
+            sym.last_exc_value = std::ptr::null_mut();
+            sym.last_exc_box = OpRef::NONE;
+            sym.class_of_last_exc_is_const = false;
+            return;
         }
     }
 
@@ -8891,13 +8873,7 @@ impl JitState for PyreJitState {
                 }
             }
         }
-        seed_bridge_standing_exception_from_current(
-            sym,
-            ctx,
-            &semantic_mirror,
-            &live_local_values,
-            nlocals,
-        );
+        seed_bridge_standing_exception_from_current(sym, ctx);
         sym.registers_r = semantic_mirror;
         sym.symbolic_local_types = {
             let mut types = bridge_local_types.clone();
