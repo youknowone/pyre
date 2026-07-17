@@ -46,6 +46,41 @@ fn inline_mixed_int_identity(_ptr: usize, value: i64, _scale: f64) -> i64 {
     value
 }
 
+#[repr(C)]
+struct InlineTypedStack {
+    head: *mut InlineTypedNode,
+    size: usize,
+}
+
+#[repr(C)]
+struct InlineTypedNode {
+    value: i64,
+    next: *mut InlineTypedNode,
+}
+
+#[jit_inline(
+    ref_params = {
+        stack: ref(InlineTypedStack),
+    },
+    ref_fields = {
+        InlineTypedStack::head => InlineTypedNode,
+        InlineTypedNode::next => InlineTypedNode,
+    },
+)]
+fn inline_typed_stack_pop(stack: usize) -> i64 {
+    let head = stack.head;
+    let value = head.value;
+    let next = head.next;
+    stack.head = next;
+    stack.size = stack.size - 1usize;
+    value
+}
+
+#[jit_inline(calls = { inline_typed_stack_pop => inline_int })]
+fn inline_typed_stack_pop_caller(stack: usize) -> i64 {
+    inline_typed_stack_pop(stack)
+}
+
 #[dont_look_inside]
 fn wrapped_ref_identity(ptr: *const i64) -> *const i64 {
     ptr
@@ -157,6 +192,114 @@ fn jit_inline_mixed_identity_generates_dense_per_kind_jitcode() {
         majit_metainterp::JitArgKind::Int,
         0,
     );
+}
+
+#[test]
+fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
+    let insns = majit_metainterp::jitcode::wellknown_bh_insns();
+    let getfield_i = *insns.get("getfield_gc_i/rd>i").unwrap();
+    let getfield_r = *insns.get("getfield_gc_r/rd>r").unwrap();
+    let setfield_i = *insns.get("setfield_gc_i/rid").unwrap();
+    let setfield_r = *insns.get("setfield_gc_r/rrd").unwrap();
+    let inline_call = majit_metainterp::jitcode::insns::BC_INLINE_CALL;
+    let residual_call_r_i = majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_R_I;
+    let residual_call_ir_i = majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IR_I;
+    let residual_call_irf_i = majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IRF_I;
+
+    let mut asm = majit_metainterp::Assembler::new();
+    let helper = __majit_inline_jitcode_inline_typed_stack_pop_with_asm(&mut asm);
+    assert!(
+        helper.code.contains(&getfield_r),
+        "typed ref-param helper must read ref fields with getfield_gc_r; code={:?}",
+        helper.code
+    );
+    assert!(
+        helper.code.contains(&getfield_i),
+        "typed ref-param helper must read int fields with getfield_gc_i; code={:?}",
+        helper.code
+    );
+    assert!(
+        helper.code.contains(&setfield_r),
+        "typed ref-param helper must write ref fields with setfield_gc_r; code={:?}",
+        helper.code
+    );
+    assert!(
+        helper.code.contains(&setfield_i),
+        "typed ref-param helper must write int fields with setfield_gc_i; code={:?}",
+        helper.code
+    );
+    assert!(
+        !helper.code.contains(&residual_call_r_i)
+            && !helper.code.contains(&residual_call_ir_i)
+            && !helper.code.contains(&residual_call_irf_i),
+        "typed field helper must not fall back to residual int calls; code={:?}",
+        helper.code
+    );
+
+    let caller = __majit_inline_jitcode_inline_typed_stack_pop_caller_with_asm(&mut asm);
+    assert!(
+        caller.code.contains(&inline_call),
+        "caller helper should splice the typed helper through inline_call; code={:?}",
+        caller.code
+    );
+    assert!(
+        !caller.code.contains(&residual_call_r_i)
+            && !caller.code.contains(&residual_call_ir_i)
+            && !caller.code.contains(&residual_call_irf_i),
+        "caller helper must not use a residual call for inline_typed_stack_pop; code={:?}",
+        caller.code
+    );
+
+    let mut second = InlineTypedNode {
+        value: 22,
+        next: std::ptr::null_mut(),
+    };
+    let mut first = InlineTypedNode {
+        value: 11,
+        next: &mut second,
+    };
+    let mut stack = InlineTypedStack {
+        head: &mut first,
+        size: 2,
+    };
+
+    let mut top = majit_metainterp::JitCodeBuilder::new();
+    let sub_idx = top.add_sub_jitcode(caller);
+    top.inline_call_r_i(sub_idx, &[(0, 0)], Some(0));
+    let top = top.finish();
+
+    let mut bh_insns: indexmap::IndexMap<String, u8> =
+        majit_metainterp::jitcode::wellknown_bh_insns()
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), *value))
+            .collect();
+    bh_insns.extend(
+        majit_metainterp::jitcode::pyre_extension_insns()
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), *value)),
+    );
+    let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
+    bh_builder.setup_insns(&bh_insns);
+    bh_builder.setup_cached_control_opcodes(
+        majit_metainterp::jitcode::insns::BC_LIVE as i32,
+        majit_metainterp::jitcode::insns::BC_CATCH_EXCEPTION as i32,
+        majit_metainterp::jitcode::insns::BC_RVMPROF_CODE as i32,
+    );
+    majit_metainterp::blackhole::wire_bhimpl_handlers(&mut bh_builder);
+    let mut bh = bh_builder.acquire_interp();
+    bh.setposition(std::sync::Arc::new(top), 0);
+    bh.registers_r[0] = (&mut stack as *mut InlineTypedStack) as i64;
+    let _ = bh.run();
+
+    assert_eq!(
+        bh.registers_i[0], 11,
+        "inline_call should return head.value"
+    );
+    assert!(
+        std::ptr::eq(stack.head as *const InlineTypedNode, &second),
+        "inline_call should write stack.head to the next node"
+    );
+    assert_eq!(stack.size, 1, "inline_call should decrement stack.size");
 }
 
 #[test]

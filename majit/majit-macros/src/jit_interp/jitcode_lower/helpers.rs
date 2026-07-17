@@ -329,6 +329,7 @@ pub(super) fn is_supported_int_cast(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => {
             type_path.path.is_ident("i64")
+                || type_path.path.is_ident("Val")
                 || type_path.path.is_ident("u64")
                 || type_path.path.is_ident("isize")
                 || type_path.path.is_ident("usize")

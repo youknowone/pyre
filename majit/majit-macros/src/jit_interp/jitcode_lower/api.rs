@@ -335,6 +335,8 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
 pub(crate) fn generate_inline_helper_jitcode_with_calls(
     func: &ItemFn,
     calls: &[crate::jit_interp::CallEntry],
+    ref_params: &[(Ident, syn::Path)],
+    ref_fields: &[crate::jit_interp::RefFieldEntry],
 ) -> syn::Result<Option<InlineHelperJitCode>> {
     if !func.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -366,10 +368,23 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             (canonical_path_segments(&entry.path), spec)
         })
         .collect();
-    let mut lowerer =
-        Lowerer::new_with_call_policies(None, call_policies, InferenceFailureMode::Panic);
+    let ref_param_structs: HashMap<String, syn::Path> = ref_params
+        .iter()
+        .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
+        .collect();
+    let inline_config = if ref_param_structs.is_empty() && ref_fields.is_empty() {
+        None
+    } else {
+        Some(LowererConfig::inline_helper(ref_fields))
+    };
+    let mut lowerer = Lowerer::new_with_call_policies(
+        inline_config.as_ref(),
+        call_policies,
+        InferenceFailureMode::Panic,
+    );
     let param_layout = inline_helper_param_layout(func)?;
     let mut max_reg = 0u16;
+    let mut seen_ref_params = HashSet::new();
     for (arg, (param_kind, reg)) in func.sig.inputs.iter().zip(param_layout.into_iter()) {
         let FnArg::Typed(pat_type) = arg else {
             return Err(syn::Error::new_spanned(
@@ -388,16 +403,35 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             InlineReturnKind::Ref => BindingKind::Ref,
             InlineReturnKind::Float => BindingKind::Float,
         };
+        let param_name = pat_ident.ident.to_string();
+        let declared_struct_type = ref_param_structs.get(&param_name).cloned();
+        if declared_struct_type.is_some() && !matches!(binding_kind, BindingKind::Ref) {
+            return Err(syn::Error::new_spanned(
+                &pat_type.ty,
+                "#[jit_inline(ref_params = { ... })] may only declare usize/pointer ref parameters",
+            ));
+        }
+        if declared_struct_type.is_some() {
+            seen_ref_params.insert(param_name.clone());
+        }
         max_reg = max_reg.max(reg.saturating_add(1));
         lowerer.bindings.insert(
-            pat_ident.ident.to_string(),
+            param_name,
             Binding {
                 reg,
                 kind: binding_kind,
                 depends_on_stack: false,
-                struct_type: None,
+                struct_type: declared_struct_type,
             },
         );
+    }
+    for (name, _) in ref_params {
+        if !seen_ref_params.contains(&name.to_string()) {
+            return Err(syn::Error::new_spanned(
+                name,
+                "#[jit_inline(ref_params = { ... })] names a parameter that does not exist",
+            ));
+        }
     }
     lowerer.next_reg = max_reg;
 

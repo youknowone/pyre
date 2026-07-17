@@ -815,6 +815,56 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
 }
 
 impl LowererConfig {
+    pub fn inline_helper(ref_fields: &[crate::jit_interp::RefFieldEntry]) -> Self {
+        let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
+            .iter()
+            .map(|entry| {
+                let struct_name = entry
+                    .struct_type
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let key = format!("{}::{}", struct_name, entry.field);
+                (
+                    key,
+                    (
+                        entry.struct_type.clone(),
+                        entry.field.clone(),
+                        entry.pointee_type.clone(),
+                    ),
+                )
+            })
+            .collect();
+        Self {
+            io_shims: Vec::new(),
+            calls: Vec::new(),
+            auto_calls: false,
+            vable_var: None,
+            vable_input_ref_reg: None,
+            vable_fields: HashMap::new(),
+            vable_arrays: HashMap::new(),
+            state_scalars: HashMap::new(),
+            state_arrays: HashMap::new(),
+            state_virt_arrays: HashMap::new(),
+            state_ref_scalars: HashMap::new(),
+            greens: Vec::new(),
+            green_type_tags: Vec::new(),
+            reds: Vec::new(),
+            state_type_name: String::new(),
+            env_type_name: String::new(),
+            residual_writes: Vec::new(),
+            pool_arrays: Vec::new(),
+            ref_fields: ref_fields_map,
+            call_returns: HashMap::new(),
+            headerless_structs: std::collections::HashSet::new(),
+            native_int_binops: Vec::new(),
+            native_tag_small: Vec::new(),
+            split_dispatch: false,
+            switch_dispatch: false,
+        }
+    }
+
     pub fn new(
         io_shims: &[(Path, Ident)],
         calls: &[crate::jit_interp::CallEntry],
@@ -2382,6 +2432,8 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2401,6 +2453,8 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2420,6 +2474,8 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");

@@ -821,7 +821,7 @@ fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
     Ok((struct_type, field))
 }
 
-fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
+pub(crate) fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();

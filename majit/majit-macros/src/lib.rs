@@ -20,8 +20,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, Ident, ItemFn, Path, ReturnType, Token, Type, parse::Parse, parse::ParseStream,
-    parse_macro_input,
+    FnArg, Ident, ItemFn, Path, ReturnType, Token, Type, parenthesized, parse::Parse,
+    parse::ParseStream, parse_macro_input,
 };
 
 mod jit_interp;
@@ -30,11 +30,15 @@ mod virtualizable;
 
 struct JitInlineArgs {
     calls: Vec<jit_interp::CallEntry>,
+    ref_params: Vec<(Ident, Path)>,
+    ref_fields: Vec<jit_interp::RefFieldEntry>,
 }
 
 impl Parse for JitInlineArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut calls: Vec<jit_interp::CallEntry> = Vec::new();
+        let mut ref_params: Vec<(Ident, Path)> = Vec::new();
+        let mut ref_fields: Vec<jit_interp::RefFieldEntry> = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -60,6 +64,23 @@ impl Parse for JitInlineArgs {
                         let _ = content.parse::<Token![,]>();
                     }
                 }
+                "ref_params" => {
+                    let content;
+                    syn::braced!(content in input);
+                    while !content.is_empty() {
+                        let name: Ident = content.parse()?;
+                        content.parse::<Token![:]>()?;
+                        content.parse::<Token![ref]>()?;
+                        let inner;
+                        parenthesized!(inner in content);
+                        let struct_type: Path = inner.parse()?;
+                        ref_params.push((name, struct_type));
+                        let _ = content.parse::<Token![,]>();
+                    }
+                }
+                "ref_fields" => {
+                    ref_fields = jit_interp::parse_ref_fields_map(input)?;
+                }
                 "helpers" => {
                     let content;
                     syn::bracketed!(content in input);
@@ -79,8 +100,161 @@ impl Parse for JitInlineArgs {
             }
             let _ = input.parse::<Token![,]>();
         }
-        Ok(Self { calls })
+        Ok(Self {
+            calls,
+            ref_params,
+            ref_fields,
+        })
     }
+}
+
+fn rewrite_jit_inline_ref_param_fields(
+    block: &syn::Block,
+    ref_params: &[(Ident, Path)],
+    ref_fields: &[jit_interp::RefFieldEntry],
+) -> syn::Block {
+    use std::collections::HashMap;
+    use syn::visit_mut::VisitMut;
+
+    struct InlineRefFieldRewriter {
+        local_ref_types: HashMap<String, syn::Path>,
+        field_pointees: HashMap<String, syn::Path>,
+    }
+
+    impl InlineRefFieldRewriter {
+        fn local_ref_struct_of_base(&self, expr: &syn::Expr) -> Option<syn::Path> {
+            let syn::Expr::Path(path) = expr else {
+                return None;
+            };
+            let ident = path.path.get_ident()?;
+            self.local_ref_types.get(&ident.to_string()).cloned()
+        }
+
+        fn field_pointee(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let struct_last = struct_path.segments.last()?.ident.to_string();
+            let key = format!("{}::{}", struct_last, field_name);
+            self.field_pointees.get(&key).cloned()
+        }
+
+        fn record_ref_field_local(&mut self, local: &syn::Local) {
+            let Some(init) = &local.init else {
+                return;
+            };
+            let syn::Expr::Field(field) = &*init.expr else {
+                return;
+            };
+            let Some(struct_path) = self.local_ref_struct_of_base(&field.base) else {
+                return;
+            };
+            let syn::Member::Named(member) = &field.member else {
+                return;
+            };
+            let Some(pointee) = self.field_pointee(&struct_path, &member.to_string()) else {
+                return;
+            };
+            if let syn::Pat::Ident(pat_ident) = &local.pat {
+                self.local_ref_types
+                    .insert(pat_ident.ident.to_string(), pointee);
+            }
+        }
+    }
+
+    impl VisitMut for InlineRefFieldRewriter {
+        fn visit_stmt_mut(&mut self, stmt: &mut syn::Stmt) {
+            if let syn::Stmt::Local(local) = stmt {
+                self.record_ref_field_local(local);
+            }
+            syn::visit_mut::visit_stmt_mut(self, stmt);
+        }
+
+        fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+            if let syn::Expr::Assign(assign) = expr {
+                if let syn::Expr::Field(lhs) = &*assign.left {
+                    if let Some(struct_path) = self.local_ref_struct_of_base(&lhs.base) {
+                        let base = (*lhs.base).clone();
+                        let member = lhs.member.clone();
+                        let member_name = match &lhs.member {
+                            syn::Member::Named(id) => id.to_string(),
+                            _ => String::new(),
+                        };
+                        let mut rhs = (*assign.right).clone();
+                        self.visit_expr_mut(&mut rhs);
+                        if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
+                            *expr = syn::parse_quote! {
+                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
+                            };
+                        } else {
+                            *expr = syn::parse_quote! {
+                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
+                            };
+                        }
+                        return;
+                    }
+                }
+            }
+
+            if let syn::Expr::Field(field) = expr {
+                if let Some(struct_path) = self.local_ref_struct_of_base(&field.base) {
+                    let base = (*field.base).clone();
+                    let member = field.member.clone();
+                    let member_name = match &field.member {
+                        syn::Member::Named(id) => id.to_string(),
+                        _ => String::new(),
+                    };
+                    if self.field_pointee(&struct_path, &member_name).is_some() {
+                        *expr = syn::parse_quote! {
+                            {
+                                let __majit_getfield_obj = #base;
+                                unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member as usize
+                                }
+                            }
+                        };
+                    } else {
+                        *expr = syn::parse_quote! {
+                            {
+                                let __majit_getfield_obj = #base;
+                                unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member
+                                }
+                            }
+                        };
+                    }
+                    return;
+                }
+            }
+
+            syn::visit_mut::visit_expr_mut(self, expr);
+        }
+    }
+
+    let field_pointees = ref_fields
+        .iter()
+        .map(|entry| {
+            let struct_last = entry
+                .struct_type
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            (
+                format!("{}::{}", struct_last, entry.field),
+                entry.pointee_type.clone(),
+            )
+        })
+        .collect();
+    let mut rewriter = InlineRefFieldRewriter {
+        local_ref_types: ref_params
+            .iter()
+            .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
+            .collect(),
+        field_pointees,
+    };
+    let mut block = block.clone();
+    if !rewriter.local_ref_types.is_empty() {
+        rewriter.visit_block_mut(&mut block);
+    }
+    block
 }
 
 fn helper_policy_fn_name(path: &Path) -> syn::Result<Ident> {
@@ -1796,6 +1970,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let helper = match jit_interp::jitcode_lower::generate_inline_helper_jitcode_with_calls(
         &func,
         &args.calls,
+        &args.ref_params,
+        &args.ref_fields,
     ) {
         Ok(Some(lowered)) => lowered,
         Ok(None) => {
@@ -1812,7 +1988,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &func.sig;
-    let block = &func.block;
+    let block =
+        rewrite_jit_inline_ref_param_fields(&func.block, &args.ref_params, &args.ref_fields);
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
     let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
