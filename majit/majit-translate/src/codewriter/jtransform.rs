@@ -335,6 +335,9 @@ enum JitMarkerKey {
     LoopHeader,
 }
 
+/// JitDriver receiver types whose `jit_merge_point`/`can_enter_jit`/`loop_header` markers are recognized; each becomes its own portal via `portal_jd_index`.
+const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &["PyPyJitDriver", "UnpackIterableJitDriver"];
+
 fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
     let CallTarget::Method {
         name,
@@ -344,7 +347,7 @@ fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
     else {
         return None;
     };
-    if receiver_root != "PyPyJitDriver" {
+    if !RECOGNIZED_JITDRIVER_RECEIVER_ROOTS.contains(&receiver_root.as_str()) {
         return None;
     }
     match name.as_str() {
@@ -7697,7 +7700,14 @@ mod tests {
     }
 
     #[test]
-    fn jit_marker_key_recognises_pypyjitdriver_methods() {
+    fn jit_marker_key_recognises_allow_listed_jitdriver_methods() {
+        let unpack_merge =
+            CallTarget::method("jit_merge_point", Some("UnpackIterableJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&unpack_merge),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+
         let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
         assert_eq!(
             jit_marker_key_from_target(&merge),
@@ -7714,9 +7724,11 @@ mod tests {
             Some(JitMarkerKey::LoopHeader)
         );
         // Other receivers or other methods must not match.
-        let other = CallTarget::method("jit_merge_point", Some("OtherDriver".into()));
+        let other = CallTarget::method("jit_merge_point", Some("SomeOtherType".into()));
         assert_eq!(jit_marker_key_from_target(&other), None);
-        let other_method = CallTarget::method("something_else", Some("PyPyJitDriver".into()));
+        let missing_receiver = CallTarget::method("jit_merge_point", None);
+        assert_eq!(jit_marker_key_from_target(&missing_receiver), None);
+        let other_method = CallTarget::method("not_a_marker", Some("PyPyJitDriver".into()));
         assert_eq!(jit_marker_key_from_target(&other_method), None);
         // Non-method targets are never markers.
         let free_fn = CallTarget::function_path(["module", "jit_merge_point"]);
