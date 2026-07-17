@@ -393,7 +393,8 @@ jobs:
       # the summaries stay clean across real PRs. The .out/.time baselines are
       # not committed, so their snapshot checks report "missing" and only the
       # jit-stats diff is exercised. Runs on Linux only (one OS is enough for a
-      # platform-independent signal), where ripgrep is preinstalled.
+      # platform-independent signal). Use the runner's standard grep instead
+      # of assuming an optional ripgrep installation.
       if: runner.os == 'Linux'
       continue-on-error: true
       env:
@@ -408,7 +409,7 @@ jobs:
             echo '```'
             out=$(${{ steps.cpython.outputs.python-path }} pyre/check.py \
               --backend "$backend" --no-synthetic --snapshot-diff 2>&1 || true)
-            echo "$out" | rg -i 'jit-stats diff|snapshot diff' \
+            echo "$out" | grep -Ei 'jit-stats diff|snapshot diff' \
               || echo '(no jit-stats output)'
             echo '```'
           done

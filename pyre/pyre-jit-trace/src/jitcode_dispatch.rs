@@ -4422,6 +4422,33 @@ fn getfield_gc_via_heapcache(
 const VABLE_CODE_FIELD_IDX: usize = 1;
 const VABLE_NAMESPACE_FIELD_IDX: usize = 5;
 
+/// Resolve the top-level walk's live frame code when the promoted `pycode`
+/// green has no concrete shadow.
+///
+/// RPython keeps `MIFrame.jitcode` on each live frame and
+/// `opimpl_jit_merge_point` reads the greens from that frame.  The full-body
+/// walker has the same per-frame identity in `snapshot_sym.jitcode`; using it
+/// here restores the missing concrete shadow without borrowing a caller or
+/// portal-global anchor.  Inline sub-walks deliberately do not use this
+/// fallback: their code comes from their own `InlineCalleeConsts`, and the
+/// existing loop-callee handling below decides whether they may cross a merge
+/// point.
+fn top_level_live_code(ctx: &WalkContext<'_, '_>) -> Option<*const ()> {
+    if !ctx.is_top_level || ctx.fbw_mode.snapshot_sym.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    let raw = unsafe { (&(*sym.jitcode).payload).code_ptr };
+    if raw.is_null() {
+        None
+    } else {
+        Some(pyre_interpreter::live_code_wrapper(raw as *const ()) as *const ())
+    }
+}
+
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
 /// callee's OWN (unseeded) portal frame to the callee's compile-time
 /// constant.  This is the walk-time mirror of the codewriter's non-portal
@@ -26649,7 +26676,8 @@ fn handle(
                             }
                         }
                     }
-                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                    top_level_live_code(ctx)
+                        .ok_or(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc })?
                 }
             };
             let key = crate::driver::make_green_key(code_ptr, next_instr);
