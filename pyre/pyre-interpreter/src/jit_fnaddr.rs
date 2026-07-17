@@ -1849,6 +1849,18 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             dictmultiobject::DICT_ITEMITERATOR_TYPE
         ),
         pytype_addr!(
+            "dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE",
+            dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE
+        ),
+        pytype_addr!(
+            "dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE",
+            dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE
+        ),
+        pytype_addr!(
+            "dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE",
+            dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE
+        ),
+        pytype_addr!(
             "interp_exceptions::EXCEPTION_TYPE",
             interp_exceptions::EXCEPTION_TYPE
         ),

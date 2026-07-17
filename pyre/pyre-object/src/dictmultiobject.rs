@@ -2963,6 +2963,12 @@ pub enum DictViewKind {
 pub static DICT_KEYITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_keyiterator");
 pub static DICT_VALUEITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_valueiterator");
 pub static DICT_ITEMITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_itemiterator");
+pub static DICT_REVERSEKEYITERATOR_TYPE: PyType =
+    crate::pyobject::new_pytype("dict_reversekeyiterator");
+pub static DICT_REVERSEVALUEITERATOR_TYPE: PyType =
+    crate::pyobject::new_pytype("dict_reversevalueiterator");
+pub static DICT_REVERSEITEMITERATOR_TYPE: PyType =
+    crate::pyobject::new_pytype("dict_reverseitemiterator");
 
 /// `dictmultiobject.py:809-845 _new_next` — captures both the source
 /// dict's `len` and the active strategy at iter() time; `next()`
@@ -2992,6 +2998,10 @@ pub struct W_BaseDictMultiIterObject {
     /// kinds (`W_DictMultiIterKeysObject` / `ValuesObject` /
     /// `ItemsObject`).
     pub kind: DictViewKind,
+    /// Whether the strategy iterator walks insertion order backwards.
+    /// PyPy represents this in the concrete `iterreversed()` implementation;
+    /// the cursor position remains the number of already-consumed entries.
+    pub reverse: bool,
     /// `:807 self.strategy = strategy` — strategy identity at iter()
     /// time, stored as the strategy pointer cast to `usize` for
     /// identity comparison (PyPy's `self.strategy is
@@ -3020,11 +3030,14 @@ impl crate::lltype::GcType for W_BaseDictMultiIterObject {
 
 /// Pick the Python-visible iterator type for a given view kind so
 /// `type(iter(d.keys())) is dict_keyiterator` (etc.).
-pub fn dict_view_iterator_type_for_kind(kind: DictViewKind) -> &'static PyType {
-    match kind {
-        DictViewKind::Keys => &DICT_KEYITERATOR_TYPE,
-        DictViewKind::Values => &DICT_VALUEITERATOR_TYPE,
-        DictViewKind::Items => &DICT_ITEMITERATOR_TYPE,
+pub fn dict_view_iterator_type_for_kind(kind: DictViewKind, reverse: bool) -> &'static PyType {
+    match (kind, reverse) {
+        (DictViewKind::Keys, false) => &DICT_KEYITERATOR_TYPE,
+        (DictViewKind::Values, false) => &DICT_VALUEITERATOR_TYPE,
+        (DictViewKind::Items, false) => &DICT_ITEMITERATOR_TYPE,
+        (DictViewKind::Keys, true) => &DICT_REVERSEKEYITERATOR_TYPE,
+        (DictViewKind::Values, true) => &DICT_REVERSEVALUEITERATOR_TYPE,
+        (DictViewKind::Items, true) => &DICT_REVERSEITEMITERATOR_TYPE,
     }
 }
 
@@ -3037,9 +3050,22 @@ pub fn dict_view_iterator_type_for_kind(kind: DictViewKind) -> &'static PyType {
 /// self.len = w_dict.length()
 /// ```
 pub fn w_dict_view_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
+    w_dict_view_iterator_new_direction(w_dict, kind, false)
+}
+
+/// Allocate the reversed concrete iterator corresponding to `kind`.
+pub fn w_dict_view_reverse_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
+    w_dict_view_iterator_new_direction(w_dict, kind, true)
+}
+
+fn w_dict_view_iterator_new_direction(
+    w_dict: PyObjectRef,
+    kind: DictViewKind,
+    reverse: bool,
+) -> PyObjectRef {
     let startlen = unsafe { w_dict_len(w_dict) };
     let start_strategy_id = unsafe { w_dict_strategy_id(w_dict) };
-    let tp = dict_view_iterator_type_for_kind(kind);
+    let tp = dict_view_iterator_type_for_kind(kind, reverse);
     crate::lltype::malloc_typed(W_BaseDictMultiIterObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
@@ -3049,6 +3075,7 @@ pub fn w_dict_view_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyOb
         startlen,
         index: 0,
         kind,
+        reverse,
         start_strategy_id,
     }) as PyObjectRef
 }
@@ -3061,6 +3088,9 @@ pub unsafe fn is_dict_view_iterator(obj: PyObjectRef) -> bool {
         py_type_check(obj, &DICT_KEYITERATOR_TYPE)
             || py_type_check(obj, &DICT_VALUEITERATOR_TYPE)
             || py_type_check(obj, &DICT_ITEMITERATOR_TYPE)
+            || py_type_check(obj, &DICT_REVERSEKEYITERATOR_TYPE)
+            || py_type_check(obj, &DICT_REVERSEVALUEITERATOR_TYPE)
+            || py_type_check(obj, &DICT_REVERSEITEMITERATOR_TYPE)
     }
 }
 
@@ -3076,6 +3106,12 @@ pub unsafe fn w_dict_view_iterator_get_dict(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_dict_view_iterator_get_kind(obj: PyObjectRef) -> DictViewKind {
     unsafe { (*(obj as *const W_BaseDictMultiIterObject)).kind }
+}
+
+/// Direction selected by the concrete iterator class.
+#[inline]
+pub unsafe fn w_dict_view_iterator_get_reverse(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_BaseDictMultiIterObject)).reverse }
 }
 
 /// # Safety

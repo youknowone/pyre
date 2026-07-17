@@ -2113,7 +2113,11 @@ pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
         let kind = pyre_object::dictmultiobject::w_dict_view_iterator_get_kind(args[0]);
         let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
-        let entries = pyre_object::w_dict_items(w_dict);
+        let reverse = pyre_object::dictmultiobject::w_dict_view_iterator_get_reverse(args[0]);
+        let mut entries = pyre_object::w_dict_items(w_dict);
+        if reverse {
+            entries.reverse();
+        }
         let mut items = Vec::new();
         for (k, v) in entries.into_iter().skip(index) {
             let item = match kind {
@@ -2132,8 +2136,12 @@ pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
+        let startlen = pyre_object::dictmultiobject::w_dict_view_iterator_get_startlen(args[0]);
+        if pyre_object::w_dict_len(w_dict) != startlen {
+            return Ok(w_int_new(0));
+        }
         let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
-        let remaining = (pyre_object::w_dict_len(w_dict) as i64) - (index as i64);
+        let remaining = (startlen as i64) - (index as i64);
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -11053,7 +11061,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 ));
             }
             let index = dv::w_dict_view_iterator_get_index(obj);
-            let Some((k, mut v)) = pyre_object::dictmultiobject::w_dict_nth_item(dict, index)
+            if index >= startlen {
+                return Err(PyError::stop_iteration());
+            }
+            let reverse = dv::w_dict_view_iterator_get_reverse(obj);
+            let storage_index = if reverse {
+                startlen.saturating_sub(index + 1)
+            } else {
+                index
+            };
+            let Some((k, mut v)) =
+                pyre_object::dictmultiobject::w_dict_nth_item(dict, storage_index)
             else {
                 return Err(PyError::stop_iteration());
             };

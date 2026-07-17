@@ -431,7 +431,7 @@ pub fn init_typeobjects() {
         // stops at the common slots per dictmultiobject.py:1831-1840
         // (values views are intentionally NOT set-like).
         let dict_keys_type =
-            new_typeobject_with_base("dict_keys", init_dict_view_set_like_type, object_type);
+            new_typeobject_with_base("dict_keys", init_dict_view_keys_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, false) };
         reg.insert(
             &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType as usize,
@@ -445,7 +445,7 @@ pub fn init_typeobjects() {
             dict_values_type as usize,
         );
         let dict_items_type =
-            new_typeobject_with_base("dict_items", init_dict_view_set_like_type, object_type);
+            new_typeobject_with_base("dict_items", init_dict_view_items_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, false) };
         reg.insert(
             &pyre_object::dictmultiobject::DICT_ITEMS_TYPE as *const PyType as usize,
@@ -852,22 +852,39 @@ pub fn init_typeobjects() {
             &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
             new_typeobject_with_base("zip", init_zip_type, object_type) as usize,
         );
-        for (pytype, name) in [
+        for (pytype, name, init) in [
             (
                 &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType,
                 "dict_keyiterator",
+                init_dict_key_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE as *const PyType,
                 "dict_valueiterator",
+                init_dict_value_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE as *const PyType,
                 "dict_itemiterator",
+                init_dict_item_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE as *const PyType,
+                "dict_reversekeyiterator",
+                init_dict_reverse_key_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE as *const PyType,
+                "dict_reversevalueiterator",
+                init_dict_reverse_value_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE as *const PyType,
+                "dict_reverseitemiterator",
+                init_dict_reverse_item_iterator_type as fn(PyObjectRef),
             ),
         ] {
-            let iterator_type =
-                new_typeobject_with_base(name, init_dict_iterator_type, object_type);
+            let iterator_type = new_typeobject_with_base(name, init, object_type);
             unsafe {
                 pyre_object::w_type_set_disallow_instantiation(iterator_type);
                 pyre_object::w_type_set_acceptable_as_base_class(iterator_type, false);
@@ -5289,21 +5306,23 @@ fn init_dict_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__reversed__",
                 |args| {
-                    // `dictmultiobject.py:207 descr_reversed`: reverse iterator
-                    // over the dict keys.
+                    // `dictmultiobject.py:207 descr_reversed`:
+                    // `strategy.w_iterreversed(self)` returns the live
+                    // `W_DictMultiIterKeysReversedObject` cursor.
+                    dict_iterator_receiver(
+                        args,
+                        "__reversed__",
+                        true,
+                        "dict",
+                        &pyre_object::DICT_TYPE,
+                    )?;
                     let d = crate::type_methods::resolve_dict_backing(args[0]);
-                    let mut keys: Vec<PyObjectRef> = if d.is_null() {
-                        Vec::new()
-                    } else {
-                        unsafe { pyre_object::w_dict_items(d) }
-                            .into_iter()
-                            .map(|(k, _)| k)
-                            .collect()
-                    };
-                    keys.reverse();
-                    let n = keys.len();
-                    let list = pyre_object::w_list_new(keys);
-                    Ok(pyre_object::w_seq_iter_new(list, n))
+                    Ok(
+                        pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
+                            d,
+                            pyre_object::dictmultiobject::DictViewKind::Keys,
+                        ),
+                    )
                 },
                 1,
             ),
@@ -5426,7 +5445,48 @@ fn init_dict_type(ns: PyObjectRef) {
 /// `dict_values` stops here; `dict_keys` / `dict_items` extend with
 /// the SetLikeDictView surface in
 /// `init_dict_view_set_like_type` below.
-fn init_dict_view_common_slots(ns: PyObjectRef) {
+fn dict_view_reversed(
+    args: &[PyObjectRef],
+    owner: &str,
+    expected: &'static PyType,
+    kind: pyre_object::dictmultiobject::DictViewKind,
+) -> crate::PyResult {
+    let view = dict_iterator_receiver(args, "__reversed__", true, owner, expected)?;
+    let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
+    Ok(pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(dict, kind))
+}
+
+fn dict_keys_reversed(args: &[PyObjectRef]) -> crate::PyResult {
+    dict_view_reversed(
+        args,
+        "dict_keys",
+        &pyre_object::dictmultiobject::DICT_KEYS_TYPE,
+        pyre_object::dictmultiobject::DictViewKind::Keys,
+    )
+}
+
+fn dict_values_reversed(args: &[PyObjectRef]) -> crate::PyResult {
+    dict_view_reversed(
+        args,
+        "dict_values",
+        &pyre_object::dictmultiobject::DICT_VALUES_TYPE,
+        pyre_object::dictmultiobject::DictViewKind::Values,
+    )
+}
+
+fn dict_items_reversed(args: &[PyObjectRef]) -> crate::PyResult {
+    dict_view_reversed(
+        args,
+        "dict_items",
+        &pyre_object::dictmultiobject::DICT_ITEMS_TYPE,
+        pyre_object::dictmultiobject::DictViewKind::Items,
+    )
+}
+
+fn init_dict_view_common_slots(
+    ns: PyObjectRef,
+    reversed_fn: fn(&[PyObjectRef]) -> crate::PyResult,
+) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -5453,18 +5513,7 @@ fn init_dict_view_common_slots(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reversed__",
-            make_builtin_function_with_arity(
-                "__reversed__",
-                |args| {
-                    let view = args[0];
-                    let mut snapshot = crate::type_methods::dict_view_snapshot(view);
-                    snapshot.reverse();
-                    let n = snapshot.len();
-                    let list = pyre_object::w_list_new(snapshot);
-                    Ok(pyre_object::w_seq_iter_new(list, n))
-                },
-                1,
-            ),
+            make_builtin_function_with_arity("__reversed__", reversed_fn, 1),
         )
     };
     unsafe {
@@ -5519,8 +5568,11 @@ fn init_dict_view_common_slots(ns: PyObjectRef) {
 /// `W_DictViewItemsObject`
 /// typedef body — common slots plus `__contains__` and the
 /// SetLikeDictView surface (comparisons, set ops, isdisjoint).
-fn init_dict_view_set_like_type(ns: PyObjectRef) {
-    init_dict_view_common_slots(ns);
+fn init_dict_view_set_like_type(
+    ns: PyObjectRef,
+    reversed_fn: fn(&[PyObjectRef]) -> crate::PyResult,
+) {
+    init_dict_view_common_slots(ns, reversed_fn);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -5548,7 +5600,15 @@ fn init_dict_view_set_like_type(ns: PyObjectRef) {
 /// have no `__contains__` / set ops / comparisons of their own;
 /// equality falls through to `object.__eq__`'s identity check.
 fn init_dict_view_values_type(ns: PyObjectRef) {
-    init_dict_view_common_slots(ns);
+    init_dict_view_common_slots(ns, dict_values_reversed);
+}
+
+fn init_dict_view_keys_type(ns: PyObjectRef) {
+    init_dict_view_set_like_type(ns, dict_keys_reversed);
+}
+
+fn init_dict_view_items_type(ns: PyObjectRef) {
+    init_dict_view_set_like_type(ns, dict_items_reversed);
 }
 
 /// `pypy/interpreter/pytraceback.py:17-101 PyTraceback.typedef` —
@@ -6805,29 +6865,26 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         )
     };
     // dictproxyobject.py:87 descr_reversed →
-    // `space.call_method(self.w_mapping, '__reversed__')`.  Pyre lacks
-    // a dedicated reverse iterator on dict, so fall back to building
-    // a list of keys in reverse insertion order.
+    // `space.call_method(self.w_mapping, '__reversed__')`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reversed__",
             make_builtin_function("__reversed__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_list_new(vec![]));
-                }
+                dict_iterator_receiver(
+                    args,
+                    "__reversed__",
+                    true,
+                    "mappingproxy",
+                    &pyre_object::MAPPING_PROXY_TYPE,
+                )?;
                 let dict = crate::type_methods::resolve_dict_backing(args[0]);
-                if dict.is_null() {
-                    return Ok(pyre_object::w_list_new(vec![]));
-                }
-                let mut keys: Vec<pyre_object::PyObjectRef> = unsafe {
-                    pyre_object::w_dict_items(dict)
-                        .into_iter()
-                        .map(|(k, _)| k)
-                        .collect()
-                };
-                keys.reverse();
-                crate::baseobjspace::iter(pyre_object::w_list_new(keys))
+                Ok(
+                    pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
+                        dict,
+                        pyre_object::dictmultiobject::DictViewKind::Keys,
+                    ),
+                )
             }),
         )
     };
@@ -20529,39 +20586,140 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
     }
 }
 
-/// PyPy `dictmultiobject.py W_DictMultiIter{Keys,Values,Items}Object.typedef`.
-fn init_dict_iterator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
-    let entries = [
-        (
-            "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
-        ),
-        (
-            "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__length_hint__",
-            make_builtin_function_with_arity(
-                "__length_hint__",
-                crate::baseobjspace::dict_view_iter_length_hint_method,
-                1,
-            ),
-        ),
-        (
-            "__reduce__",
-            make_builtin_function_with_arity(
-                "__reduce__",
-                crate::baseobjspace::dict_view_iter_reduce_method,
-                1,
-            ),
-        ),
-    ];
-    for (name, value) in entries {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+fn dict_iterator_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+    owner: &str,
+    expected: &'static PyType,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method {owner}.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of '{owner}' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::py_type_check(receiver, expected) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for '{owner}' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a '{owner}' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
     }
+    Ok(receiver)
 }
+
+/// PyPy's six concrete `W_BaseDictMultiIterObject` typedefs share their
+/// implementations, while each interp2app gateway still enforces its own
+/// concrete receiver class.
+macro_rules! define_dict_iterator_type {
+    ($init:ident, $self_fn:ident, $next_fn:ident, $len_fn:ident, $reduce_fn:ident, $owner:literal, $expected:path) => {
+        fn $self_fn(args: &[PyObjectRef]) -> crate::PyResult {
+            dict_iterator_receiver(args, "__iter__", false, $owner, &$expected)
+        }
+
+        fn $next_fn(args: &[PyObjectRef]) -> crate::PyResult {
+            dict_iterator_receiver(args, "__next__", false, $owner, &$expected)?;
+            crate::baseobjspace::next(args[0])
+        }
+
+        fn $len_fn(args: &[PyObjectRef]) -> crate::PyResult {
+            dict_iterator_receiver(args, "__length_hint__", true, $owner, &$expected)?;
+            crate::baseobjspace::dict_view_iter_length_hint_method(args)
+        }
+
+        fn $reduce_fn(args: &[PyObjectRef]) -> crate::PyResult {
+            dict_iterator_receiver(args, "__reduce__", true, $owner, &$expected)?;
+            crate::baseobjspace::dict_view_iter_reduce_method(args)
+        }
+
+        fn $init(ns: PyObjectRef) {
+            unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+            let entries = [
+                (
+                    "__iter__",
+                    make_builtin_function_with_arity("__iter__", $self_fn, 1),
+                ),
+                (
+                    "__next__",
+                    make_builtin_function_with_arity("__next__", $next_fn, 1),
+                ),
+                (
+                    "__length_hint__",
+                    make_builtin_function_with_arity("__length_hint__", $len_fn, 1),
+                ),
+                (
+                    "__reduce__",
+                    make_builtin_function_with_arity("__reduce__", $reduce_fn, 1),
+                ),
+            ];
+            for (name, value) in entries {
+                unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+            }
+        }
+    };
+}
+
+define_dict_iterator_type!(
+    init_dict_key_iterator_type,
+    dict_key_iter_self,
+    dict_key_iter_next,
+    dict_key_iter_len,
+    dict_key_iter_reduce,
+    "dict_keyiterator",
+    pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE
+);
+define_dict_iterator_type!(
+    init_dict_value_iterator_type,
+    dict_value_iter_self,
+    dict_value_iter_next,
+    dict_value_iter_len,
+    dict_value_iter_reduce,
+    "dict_valueiterator",
+    pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE
+);
+define_dict_iterator_type!(
+    init_dict_item_iterator_type,
+    dict_item_iter_self,
+    dict_item_iter_next,
+    dict_item_iter_len,
+    dict_item_iter_reduce,
+    "dict_itemiterator",
+    pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE
+);
+define_dict_iterator_type!(
+    init_dict_reverse_key_iterator_type,
+    dict_reverse_key_iter_self,
+    dict_reverse_key_iter_next,
+    dict_reverse_key_iter_len,
+    dict_reverse_key_iter_reduce,
+    "dict_reversekeyiterator",
+    pyre_object::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE
+);
+define_dict_iterator_type!(
+    init_dict_reverse_value_iterator_type,
+    dict_reverse_value_iter_self,
+    dict_reverse_value_iter_next,
+    dict_reverse_value_iter_len,
+    dict_reverse_value_iter_reduce,
+    "dict_reversevalueiterator",
+    pyre_object::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE
+);
+define_dict_iterator_type!(
+    init_dict_reverse_item_iterator_type,
+    dict_reverse_item_iter_self,
+    dict_reverse_item_iter_next,
+    dict_reverse_item_iter_len,
+    dict_reverse_item_iter_reduce,
+    "dict_reverseitemiterator",
+    pyre_object::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE
+);
 
 fn range_iterator_self(args: &[PyObjectRef]) -> crate::PyResult {
     crate::type_methods::require_range_iterator_receiver(args, "__iter__", false, false)
