@@ -1339,30 +1339,25 @@ fn memoryview_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     memoryview_release(&args[..1])
 }
 
-/// The raw logical bytes (`view.as_str`) of an operand that exports a
-/// contiguous buffer, or `None` when it exports none (so `__eq__` returns
-/// NotImplemented).  `descr__cmp` compares the two `as_str` byte strings,
-/// mirroring `space.buffer_w(w_other, space.BUF_CONTIG_RO)`: a memoryview,
-/// a bytes-like object, or a non-bytes contiguous exporter (`array.array`)
-/// are all gathered to bytes and compared.
-unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
-    unsafe {
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            // A released view has no buffer to gather (its box is dropped);
-            // `descr__cmp` falls through to identity, so report no bytes.
-            if pyre_object::memoryview::w_memoryview_released(obj) {
-                return None;
-            }
-            return Some(memoryview_gather_bytes(obj));
-        }
-        if pyre_object::bytesobject::is_bytes_like(obj) {
-            return Some(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
-        }
-        if let Ok(Some(b)) = crate::typedef::buffer_as_bytes_like(obj) {
-            return Some(pyre_object::bytesobject::bytes_like_data(b).to_vec());
-        }
-        None
+/// Gateway receiver check shared by the rich-comparison descriptors.  The
+/// type slot normally guarantees this, but direct descriptor calls must raise
+/// instead of interpreting an arbitrary object as `W_MemoryView`.
+fn memoryview_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if mv.is_null() {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of 'memoryview' object needs an argument"
+        )));
     }
+    if !unsafe { pyre_object::memoryview::is_w_memoryview(mv) } {
+        let received = crate::typedef::r#type(mv)
+            .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'memoryview' object but received a '{received}'"
+        )));
+    }
+    Ok(mv)
 }
 
 /// True when `mv` or a memoryview `other` operand is released — either side
@@ -1375,39 +1370,148 @@ unsafe fn memoryview_released_either(mv: PyObjectRef, other: PyObjectRef) -> boo
     }
 }
 
-/// `memoryview.__eq__` — `descr__cmp('eq')`: compares the two views'
-/// raw byte strings (`as_str`); NotImplemented for any other operand.
-fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+/// Python 3.14 `memory_richcompare`: equality first requires equivalent
+/// shapes, then compares unpacked element values.  Raw bytes are deliberately
+/// insufficient (`int(1)` and `float(1.0)` compare equal despite different
+/// encodings, while identical bytes can decode to unequal values).
+fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool>, crate::PyError> {
+    let mv = memoryview_receiver(args, name)?;
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        // A released view (on either side) compares by identity (`view is None`
-        // branch); its backing must not be read after release.
         if memoryview_released_either(mv, other) {
-            return Ok(w_bool_from(mv == other));
+            return Ok(Some(mv == other));
         }
-        let a = memoryview_gather_bytes(mv);
-        match memoryview_operand_bytes(other) {
-            Some(b) => Ok(w_bool_from(a == b)),
-            None => Ok(pyre_object::w_not_implemented()),
+
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(mv);
+        pyre_object::gc_roots::pin_root(other);
+        let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        let (rhs, temporary) = if pyre_object::memoryview::is_w_memoryview(other) {
+            (other, false)
+        } else {
+            match w_memoryview_new(other) {
+                Ok(view) => {
+                    pyre_object::gc_roots::pin_root(view);
+                    (pyre_object::gc_roots::shadow_stack_get(base + 2), true)
+                }
+                // `PyObject_GetBuffer(..., PyBUF_FULL_RO)` failures are
+                // cleared by CPython's `memory_richcompare`.
+                Err(_) => return Ok(None),
+            }
+        };
+        let lhs = pyre_object::gc_roots::shadow_stack_get(base);
+        let comparison = (|| -> Result<bool, crate::PyError> {
+            if pyre_object::memoryview::w_memoryview_ndim(lhs)
+                != pyre_object::memoryview::w_memoryview_ndim(rhs)
+                || pyre_object::memoryview::w_memoryview_native_shape(lhs)
+                    != pyre_object::memoryview::w_memoryview_native_shape(rhs)
+            {
+                return Ok(false);
+            }
+            let lhs_data = memoryview_gather_bytes(lhs);
+            let rhs_data = memoryview_gather_bytes(rhs);
+            let lhs_size = pyre_object::memoryview::w_memoryview_itemsize(lhs) as usize;
+            let rhs_size = pyre_object::memoryview::w_memoryview_itemsize(rhs) as usize;
+            if lhs_size == 0 || rhs_size == 0 {
+                return Ok(lhs_data.is_empty() && rhs_data.is_empty());
+            }
+            let count = lhs_data.len() / lhs_size;
+            if count != rhs_data.len() / rhs_size {
+                return Ok(false);
+            }
+            let lhs_fmt = pyre_object::memoryview::w_memoryview_format_str(lhs);
+            let rhs_fmt = pyre_object::memoryview::w_memoryview_format_str(rhs);
+            for index in 0..count {
+                let _values = pyre_object::gc_roots::push_roots();
+                let values = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                    lhs_fmt,
+                    &lhs_data,
+                    index * lhs_size,
+                    lhs_size,
+                ));
+                pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                    rhs_fmt,
+                    &rhs_data,
+                    index * rhs_size,
+                    rhs_size,
+                ));
+                if !crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(values),
+                    pyre_object::gc_roots::shadow_stack_get(values + 1),
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        if temporary {
+            let release = memoryview_release(&[rhs]);
+            if comparison.is_ok() {
+                release?;
+            }
         }
+        comparison.map(Some)
     }
 }
 
-/// `memoryview.__ne__` — `descr__cmp('ne')`, the negation of `__eq__`.
+fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(match memoryview_compare_eq(args, "__eq__")? {
+        Some(equal) => w_bool_from(equal),
+        None => pyre_object::w_not_implemented(),
+    })
+}
+
+/// `memoryview.__ne__` — the negation of the same element-wise comparison.
 fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
-    let other = args.get(1).copied().unwrap_or(w_none());
+    Ok(match memoryview_compare_eq(args, "__ne__")? {
+        Some(equal) => w_bool_from(!equal),
+        None => pyre_object::w_not_implemented(),
+    })
+}
+
+/// Python 3.14 exposes all ordering slots but `memory_richcompare` returns
+/// `NotImplemented` for them after validating the descriptor receiver.
+fn memoryview_order(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_receiver(args, name)?;
+    Ok(pyre_object::w_not_implemented())
+}
+
+fn memoryview_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__lt__")
+}
+fn memoryview_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__le__")
+}
+fn memoryview_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__gt__")
+}
+fn memoryview_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_order(args, "__ge__")
+}
+
+/// Python 3.14 `memoryview._from_flags(object, flags)`.  A memoryview input
+/// is cloned with its managed buffer and ignores flags.  For other exporters,
+/// pyre currently provides the full read-only view; the observable writable
+/// request bit is enforced here exactly like `PyBUF_WRITABLE`.
+fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let object = args.get(1).copied().unwrap_or(w_none());
+    let flags = crate::baseobjspace::c_int_w(args.get(2).copied().unwrap_or(w_none()))?;
+    let view = w_memoryview_new(object)?;
     unsafe {
-        if memoryview_released_either(mv, other) {
-            return Ok(w_bool_from(mv != other));
-        }
-        let a = memoryview_gather_bytes(mv);
-        match memoryview_operand_bytes(other) {
-            Some(b) => Ok(w_bool_from(a != b)),
-            None => Ok(pyre_object::w_not_implemented()),
+        if !pyre_object::memoryview::is_w_memoryview(object)
+            && flags & 0x0001 != 0
+            && pyre_object::memoryview::w_memoryview_readonly(view)
+        {
+            memoryview_release(&[view])?;
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "Object is not writable.",
+            ));
         }
     }
+    Ok(view)
 }
 
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
@@ -1679,6 +1783,10 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__repr__", memoryview_repr, 1),
         ("__eq__", memoryview_eq, 2),
         ("__ne__", memoryview_ne, 2),
+        ("__lt__", memoryview_lt, 2),
+        ("__le__", memoryview_le, 2),
+        ("__gt__", memoryview_gt, 2),
+        ("__ge__", memoryview_ge, 2),
         ("count", memoryview_count, 2),
         ("tobytes", memoryview_tobytes, 1),
         ("tolist", memoryview_tolist, 1),
@@ -1708,6 +1816,15 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(make_builtin_function(
                 "__class_getitem__",
                 crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_from_flags",
+            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
+                "_from_flags",
+                memoryview_from_flags,
+                3,
             )),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
