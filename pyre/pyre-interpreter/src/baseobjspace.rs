@@ -10314,6 +10314,26 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `_check_modified` (`dictmultiobject.py:1716+`) without the
         // snapshot list materialisation.
         if is_dict(obj) {
+            // `space.iter(w_mapping)` must honor a dict subclass's own
+            // `__iter__` before taking the concrete W_DictMultiObject fast
+            // path. This is load-bearing for `mappingproxy(OrderedDict)` in
+            // `inspect.Signature`: treating the subclass as an exact raw dict
+            // bypasses its iterator and casts the wrong layout.
+            let exact_dict_type = get_instantiate(&pyre_object::DICT_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact_dict_type) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact_dict_type) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
             return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
                 obj,
                 pyre_object::dictmultiobject::DictViewKind::Keys,

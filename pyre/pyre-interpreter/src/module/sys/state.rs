@@ -26,6 +26,15 @@ pub const MAX_RECURSION_LIMIT: i32 = 1_000_000;
 /// byte-budget (`PYRE_STACKTOOBIG.length`) hot in L1.
 static RECURSION_LIMIT: AtomicI32 = AtomicI32::new(DEFAULT_RECURSION_LIMIT);
 
+/// PyPy `pypy/module/sys/system.py:15-18`.
+pub const DEFAULT_MAX_STR_DIGITS: i32 = 4300;
+pub const MAX_STR_DIGITS_THRESHOLD: i32 = 640;
+
+/// `State.w_int_max_str_digits` parity (`pypy/module/sys/state.py:21`).
+/// Pyre currently has one object space, so its process-global sys module
+/// state is represented by the corresponding process-global atomic.
+static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(DEFAULT_MAX_STR_DIGITS);
+
 /// `space.sys.recursionlimit` getter. Matches
 /// `pypy/module/sys/vm.py:102 return space.newint(space.sys.recursionlimit)`.
 #[inline]
@@ -38,6 +47,24 @@ pub fn recursion_limit() -> i32 {
 #[inline]
 pub fn set_recursion_limit(new_limit: i32) {
     RECURSION_LIMIT.store(new_limit, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn int_max_str_digits() -> i32 {
+    INT_MAX_STR_DIGITS.load(Ordering::Relaxed)
+}
+
+/// `pypy/module/sys/state.py:set_int_max_str_digits` validation.
+pub fn set_int_max_str_digits(maxdigits: i32) -> Result<(), crate::PyError> {
+    if maxdigits == 0 || maxdigits >= MAX_STR_DIGITS_THRESHOLD {
+        INT_MAX_STR_DIGITS.store(maxdigits, Ordering::Relaxed);
+        Ok(())
+    } else {
+        Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            format!("maxdigits {maxdigits} must be 0 or larger than {MAX_STR_DIGITS_THRESHOLD}"),
+        ))
+    }
 }
 
 /// Reset to the default value. Used by unit tests that need a clean

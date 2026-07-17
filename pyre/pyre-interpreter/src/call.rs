@@ -4067,6 +4067,12 @@ pub unsafe fn create_all_slots(
         if let Some(w_flags) = crate::type_dict_lookup(w_type, "__abc_tpflags__") {
             if pyre_object::is_int(w_flags) {
                 let flags = pyre_object::w_int_get_value(w_flags);
+                let collection_flags = flags & ((1 << 6) | (1 << 5));
+                if collection_flags == ((1 << 6) | (1 << 5)) {
+                    return Err(crate::PyError::type_error(
+                        "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
+                    ));
+                }
                 if flags & (1 << 6) != 0 {
                     pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'M');
                 } else if flags & (1 << 5) != 0 {

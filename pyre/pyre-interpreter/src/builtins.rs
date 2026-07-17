@@ -6262,6 +6262,21 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
         }
         cleaned.push(c);
     }
+    // PyPy `pypy/objspace/std/intobject.py:_string_to_int_or_long` applies
+    // the configurable limit to every non-binary base. Underscores are not
+    // digits and have already been removed from `cleaned`.
+    if radix & (radix - 1) != 0 {
+        let maxdigits = crate::module::sys::state::int_max_str_digits();
+        if maxdigits != 0 && cleaned.len() > maxdigits as usize {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!(
+                    "Exceeds the limit ({maxdigits}) for integer string conversion: value has {} digits",
+                    cleaned.len()
+                ),
+            ));
+        }
+    }
     if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
         return Ok(w_int_new(sign * v));
     }

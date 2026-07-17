@@ -1533,9 +1533,36 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         if let Some(rdunder) = reverse_dunder(dunder) {
             let a_type = w_instance_get_type(a);
             let b_type = w_instance_get_type(b);
-            !std::ptr::eq(a_type, b_type)
-                && issubtype_cached(b_type, a_type)
-                && lookup_in_type_where(b_type, rdunder).is_some()
+            if std::ptr::eq(a_type, b_type) || !issubtype_cached(b_type, a_type) {
+                false
+            } else {
+                // PyPy `descroperation.py:_call_binop_impl` compares the
+                // classes that *define* the forward and reflected methods,
+                // not merely the operand types. An inherited `__rop__` from
+                // the same defining class must not pre-empt the lhs method.
+                // This distinction is observable for `ChainMap | Subclass`.
+                match (
+                    crate::baseobjspace::lookup_where_pair(a_type, dunder),
+                    crate::baseobjspace::lookup_where_pair(b_type, rdunder),
+                ) {
+                    (Some((left_src, _)), Some((right_src, _)))
+                        if !std::ptr::eq(left_src, right_src) =>
+                    {
+                        let left_src_below_right =
+                            match p_abstract_issubclass_w(left_src, right_src) {
+                                Ok(value) => value,
+                                Err(err) => return Some(Err(err)),
+                            };
+                        let left_type_below_right = match p_abstract_issubclass_w(a_type, right_src)
+                        {
+                            Ok(value) => value,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        !left_src_below_right && !left_type_below_right
+                    }
+                    _ => false,
+                }
+            }
         } else {
             false
         }

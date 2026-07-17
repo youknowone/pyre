@@ -365,7 +365,7 @@ thread_local! {
     ///
     /// Maps module name → initializer function that populates a GC module dict.
     /// Each builtin module is lazily created on first import.
-    pub(crate) static BUILTIN_MODULES: RefCell<HashMap<&'static str, fn(PyObjectRef)>> =
+    pub(crate) static BUILTIN_MODULES: RefCell<HashMap<&'static str, BuiltinModuleDef>> =
         RefCell::new(HashMap::new());
 
     static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
@@ -373,6 +373,12 @@ thread_local! {
         modules_dict: SYS_MODULES_DICT.with(|dict| dict as *const _),
         argv_pending: SYS_ARGV_PENDING.with(|p| p as *const _),
     };
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinModuleDef {
+    init: fn(PyObjectRef),
+    startup: Option<fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>>,
 }
 
 struct ImportRootArea {
@@ -404,7 +410,32 @@ struct ImportRootArea {
 /// PyPy equivalent: Module.install() → space.builtin_modules[name] = mod
 pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
     BUILTIN_MODULES.with(|m| {
-        m.borrow_mut().insert(name, init);
+        m.borrow_mut().insert(
+            name,
+            BuiltinModuleDef {
+                init,
+                startup: None,
+            },
+        );
+    });
+}
+
+/// Register a MixedModule initializer plus its `Module.startup` hook.
+/// The hook runs after the new module is visible in `sys.modules`, matching
+/// `getbuiltinmodule()` and allowing startup imports without a module cycle.
+pub fn register_builtin_module_with_startup(
+    name: &'static str,
+    init: fn(PyObjectRef),
+    startup: fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>,
+) {
+    BUILTIN_MODULES.with(|m| {
+        m.borrow_mut().insert(
+            name,
+            BuiltinModuleDef {
+                init,
+                startup: Some(startup),
+            },
+        );
     });
 }
 
@@ -579,7 +610,6 @@ pub fn install_builtin_modules() {
         "_heapq",
         "_tokenize",
         "_bisect",
-        "_json",
         "marshal",
         "_stat",
         "_queue",
@@ -587,7 +617,11 @@ pub fn install_builtin_modules() {
     ] {
         register_builtin_module(name, empty_module_init);
     }
-    register_builtin_module("array", crate::module::array::init_array_module);
+    register_builtin_module_with_startup(
+        "array",
+        crate::module::array::init_array_module,
+        crate::module::array::startup_array_module,
+    );
     register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_string", init_string_module);
@@ -825,7 +859,7 @@ fn init_sysconfigdata_empty(ns: PyObjectRef) {
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
 fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
-    let init_fn = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
+    let module_def = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
@@ -839,7 +873,7 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
         pyre_object::gc_roots::shadow_stack_get(save_point + 1),
     );
     // Run module-specific initializer (PyPy: interpleveldefs)
-    init_fn(w_dict);
+    (module_def.init)(w_dict);
     // MixedModule parity: interp-level builtin functions carry the module
     // name as `__module__`, so `pickle` can save them by reference
     // (`save_global`) without guessing via `whichmodule`. Snapshot owned
@@ -883,6 +917,18 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
         crate::module_ns_store(w_dict, "__builtins__", module);
     }
     Some(module)
+}
+
+fn startup_builtin_module(
+    name: &str,
+    module: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    let startup = BUILTIN_MODULES.with(|m| m.borrow().get(name).and_then(|d| d.startup));
+    if let Some(startup) = startup {
+        startup(module, execution_context)?;
+    }
+    Ok(())
 }
 
 /// Initialize sys.path with the directory containing the main script.
@@ -1851,6 +1897,7 @@ fn load_part(
             })?
         };
         set_sys_module(modulename, m);
+        startup_builtin_module(modulename, m, execution_context)?;
         return Ok(Some(m));
     }
 
@@ -1892,6 +1939,7 @@ fn load_part(
             };
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
+            startup_builtin_module(partname, m, execution_context)?;
             m
         }
     };

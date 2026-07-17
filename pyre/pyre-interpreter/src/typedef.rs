@@ -135,8 +135,12 @@ pub fn fget_co_consts(_space: PyObjectRef, _code: PyObjectRef) -> PyObjectRef {
     PY_NULL
 }
 
+/// PyPy `pypy/interpreter/typedef.py:598-599 make_weakref_descr` returns
+/// the canonical `weakref_descr` installed in a TypeDef. The class argument
+/// only participates in annotation in RPython; it is not the descriptor
+/// value itself.
 pub fn make_weakref_descr(_cls: PyObjectRef) -> PyObjectRef {
-    _cls
+    weakref_descr()
 }
 
 pub fn always_none(_self: PyObjectRef, _obj: PyObjectRef) -> PyObjectRef {
@@ -1025,6 +1029,8 @@ pub fn init_typeobjects() {
             (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
             // rangeobject.c PyRange_Type carries Py_TPFLAGS_SEQUENCE.
             (&pyre_object::functional::RANGE_TYPE, b'S'),
+            // arraymodule.c arraytype carries Py_TPFLAGS_SEQUENCE.
+            (&pyre_object::interp_array::ARRAY_TYPE, b'S'),
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as *const PyType as usize))
@@ -7048,41 +7054,72 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         )
     };
     // dictproxyobject.py:71 get_w / 75 keys_w / 78 values_w / 81 items_w /
-    // 84 copy_w — forward through `dict_method_*` (which unwraps the
-    // proxy via `resolve_dict_backing`).
+    // 84 copy_w — call the wrapped mapping's method. The mappingproxy
+    // constructor accepts any mapping, not only an exact W_DictObject, so
+    // routing these through dict_method_* would cast e.g. OrderedDict's
+    // subclass layout as a raw dict.
+    fn forward_mapping_method(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+        let proxy = *args
+            .first()
+            .ok_or_else(|| crate::PyError::type_error("unbound mappingproxy method"))?;
+        let mapping = unsafe {
+            if pyre_object::is_dict_proxy(proxy) {
+                pyre_object::w_dict_proxy_get_mapping(proxy)
+            } else {
+                proxy
+            }
+        };
+        let method = crate::baseobjspace::getattr_str(mapping, name)?;
+        crate::call::call_function_impl_result(method, &args[1..])
+    }
+    fn proxy_get(args: &[PyObjectRef]) -> crate::PyResult {
+        forward_mapping_method(args, "get")
+    }
+    fn proxy_keys(args: &[PyObjectRef]) -> crate::PyResult {
+        forward_mapping_method(args, "keys")
+    }
+    fn proxy_values(args: &[PyObjectRef]) -> crate::PyResult {
+        forward_mapping_method(args, "values")
+    }
+    fn proxy_items(args: &[PyObjectRef]) -> crate::PyResult {
+        forward_mapping_method(args, "items")
+    }
+    fn proxy_copy(args: &[PyObjectRef]) -> crate::PyResult {
+        forward_mapping_method(args, "copy")
+    }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "get",
-            make_builtin_function("get", crate::type_methods::dict_method_get),
+            make_builtin_function("get", proxy_get),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "keys",
-            make_builtin_function("keys", crate::type_methods::dict_method_keys),
+            make_builtin_function("keys", proxy_keys),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "values",
-            make_builtin_function("values", crate::type_methods::dict_method_values),
+            make_builtin_function("values", proxy_values),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "items",
-            make_builtin_function("items", crate::type_methods::dict_method_items),
+            make_builtin_function("items", proxy_items),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "copy",
-            make_builtin_function("copy", crate::type_methods::dict_method_copy),
+            make_builtin_function("copy", proxy_copy),
         )
     };
     // dictproxyobject.py:91-100 cmp methods (eq/ne/lt/le/gt/ge) →

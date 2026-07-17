@@ -579,6 +579,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    // PyPy: pypy/module/sys/state.py:get_int_max_str_digits and
+    // set_int_max_str_digits. The limit is object-space state, shared by
+    // every caller rather than thread-local state.
+    module_ns_store(
+        ns,
+        "get_int_max_str_digits",
+        make_builtin_function_with_arity(
+            "get_int_max_str_digits",
+            |_| Ok(w_int_new(crate::module::sys::state::int_max_str_digits() as i64)),
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "set_int_max_str_digits",
+        make_builtin_function_with_arity(
+            "set_int_max_str_digits",
+            |args| {
+                let maxdigits = crate::baseobjspace::c_int_w(args[0])?;
+                crate::module::sys::state::set_int_max_str_digits(maxdigits)?;
+                Ok(w_none())
+            },
+            1,
+        ),
+    );
     // sys.intern
     module_ns_store(
         ns,

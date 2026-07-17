@@ -1128,3 +1128,25 @@ pub fn init_array_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("_array_reconstructor", array_reconstructor),
     );
 }
+
+/// PyPy `pypy/module/array/moduledef.py:Module.startup`: array is a
+/// virtual `MutableSequence`, registered only after the builtin module is in
+/// `sys.modules` so importing `_collections_abc` cannot create a second array
+/// module during a cycle.
+pub fn startup_array_module(
+    _module: pyre_object::PyObjectRef,
+    execution_context: *const crate::PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    let abc_module = crate::importing::importhook(
+        "_collections_abc",
+        pyre_object::PY_NULL,
+        pyre_object::w_tuple_new(vec![pyre_object::w_str_new("MutableSequence")]),
+        0,
+        execution_context,
+    )?;
+    let mutable_sequence = crate::baseobjspace::getattr_str(abc_module, "MutableSequence")?;
+    let register = crate::baseobjspace::getattr_str(mutable_sequence, "register")?;
+    let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+    crate::call::call_function_impl_result(register, &[array_type])?;
+    Ok(())
+}
