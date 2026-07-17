@@ -8355,13 +8355,24 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
 /// items, otherwise `function(item)` is the predicate.
 pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "filter() takes no keyword arguments",
+        ));
+    }
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "filter expected 2 arguments, got {}",
             args.len()
         )));
     }
-    let func = args[0];
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(args[1]);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let func = unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) };
     // `functional.py:921-924` — a None predicate is stored as PY_NULL.
     let w_predicate = if unsafe { pyre_object::is_none(func) } {
         pyre_object::PY_NULL
@@ -8369,10 +8380,18 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         func
     };
     // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
-    let w_iterable = crate::baseobjspace::iter(args[1])?;
+    let w_iterable = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(iterable_slot)
+    })?;
+    pyre_object::gc_roots::pin_root(w_iterable);
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::functional::w_filter_new(
-        w_predicate,
-        w_iterable,
+        if w_predicate.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) }
+        },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterator_slot) },
     ))
 }
 

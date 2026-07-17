@@ -2500,8 +2500,59 @@ fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `filter.__new__(cls, predicate, iterable)` — `functional.py:917-925
 /// W_Filter.descr___new__`.
 fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = crate::builtins::builtin_filter(args.get(1..).unwrap_or(&[]))?;
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let args_w = positional.get(1..).unwrap_or(&[]);
+    if args_w.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "filter expected 2 arguments, got {}",
+            args_w.len()
+        )));
+    }
+
+    // `space.getattr` and keyword-name inspection are allowed to allocate in
+    // the source gateway. Keep the subtype and both positional arguments live
+    // before reproducing that conditional keyword check.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(args_w[0]);
+    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(args_w[1]);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let kwargs_slot = kwargs.map(|dict| {
+        pyre_object::gc_roots::pin_root(dict);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let filter_type =
+        gettypefor(&pyre_object::functional::FILTER_TYPE).unwrap_or(pyre_object::PY_NULL);
+    let init_matches = std::ptr::eq(cls, filter_type)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(cls, "__init__"),
+                crate::baseobjspace::lookup_in_type(filter_type, "__init__"),
+            ) {
+                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    let rooted_kwargs =
+        kwargs_slot.map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) });
+    if init_matches && crate::builtins::has_real_kwargs(rooted_kwargs) {
+        return Err(crate::PyError::type_error(
+            "filter() takes no keyword arguments",
+        ));
+    }
+    let value = crate::builtins::builtin_filter(&[
+        unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterable_slot) },
+    ])?;
+    pyre_object::gc_roots::pin_root(value);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE)? {
         unsafe {
             (*value).w_class = sub;
@@ -3072,9 +3123,9 @@ fn init_filter_type(ns: PyObjectRef) {
     for (name, function) in [
         (
             "__iter__",
-            crate::baseobjspace::iter_self_method as DunderFn,
+            crate::baseobjspace::filter_iter_method as DunderFn,
         ),
-        ("__next__", crate::baseobjspace::iter_next_method),
+        ("__next__", crate::baseobjspace::filter_next_method),
         ("__reduce__", crate::baseobjspace::filter_reduce_method),
     ] {
         install_functional_entry(

@@ -216,6 +216,37 @@ f = filter(None, [0, 1, "", "x"])
 assert iter(f) is f and f.__reduce__()[0] is filter
 assert list(f) == [1, "x"]
 
+
+class FilterSubclass(filter):
+    pass
+
+
+assert FilterSubclass(None, [1]).__reduce__()[0] is FilterSubclass
+
+
+class FilterInitSubclass(filter):
+    def __init__(self, *args, **kwargs):
+        self.init_args = args
+        self.init_kwargs = kwargs
+
+
+f = FilterInitSubclass(None, [1], marker=42)
+assert f.init_args == (None, [1]) and f.init_kwargs == {"marker": 42}
+try:
+    FilterSubclass(None, [1], marker=42)
+except TypeError:
+    pass
+else:
+    raise AssertionError("filter subclass without __init__ override must reject keywords")
+
+for name in ("__iter__", "__next__", "__reduce__"):
+    try:
+        getattr(filter, name)(42)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"filter.{name} must validate its receiver")
+
 z = zip([1, 2], [3, 4])
 assert iter(z) is z and next(z) == (1, 3)
 assert z.__reduce__()[0] is zip

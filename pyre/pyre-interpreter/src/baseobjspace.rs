@@ -2382,17 +2382,56 @@ pub(crate) fn reversed_next_method(args: &[PyObjectRef]) -> PyResult {
 /// `filter(predicate, iterable)`; the captured iterator carries its
 /// position.
 pub(crate) fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = filter_receiver(args, "__reduce__")?;
     unsafe {
-        let w_predicate = pyre_object::functional::w_filter_get_predicate(args[0]);
-        let w_predicate = if w_predicate.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let raw_predicate = pyre_object::functional::w_filter_get_predicate(self_);
+        let w_predicate = if raw_predicate.is_null() {
             w_none()
         } else {
-            w_predicate
+            raw_predicate
         };
-        let w_iterable = pyre_object::functional::w_filter_get_iterable(args[0]);
-        let state = w_tuple_new(vec![w_predicate, w_iterable]);
-        Ok(w_tuple_new(vec![builtin_callable("filter"), state]))
+        pyre_object::gc_roots::pin_root(w_predicate);
+        let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_iterable = pyre_object::functional::w_filter_get_iterable(self_);
+        pyre_object::gc_roots::pin_root(w_iterable);
+        let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let state = w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        ]);
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ]))
     }
+}
+
+fn filter_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_filter(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'filter' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+pub(crate) fn filter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    filter_receiver(args, "__iter__")
+}
+
+pub(crate) fn filter_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(filter_receiver(args, "__next__")?)
 }
 
 /// `functional.py:1065-1067 _raise_strict_error` — the strict zip/map
@@ -10664,7 +10703,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
                     as *const pyre_object::functional::W_Filter))
                     .w_iterable;
-                let w_obj = next(w_iterable)?;
+                let w_obj = {
+                    let _iter_roots = pyre_object::gc_roots::push_roots();
+                    pyre_object::gc_roots::pin_root(w_iterable);
+                    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+                };
                 let _r = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(w_obj);
                 let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -10674,11 +10718,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let pred = if w_predicate.is_null() {
                     is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
                 } else {
+                    pyre_object::gc_roots::pin_root(w_predicate);
+                    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                     let w_pred = crate::call::call_function_impl_result(
-                        w_predicate,
+                        pyre_object::gc_roots::shadow_stack_get(predicate_slot),
                         &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
                     )?;
-                    is_true(w_pred)?
+                    pyre_object::gc_roots::pin_root(w_pred);
+                    let pred_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    is_true(pyre_object::gc_roots::shadow_stack_get(pred_slot))?
                 };
                 if pred {
                     return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
