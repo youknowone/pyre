@@ -14605,7 +14605,7 @@ fn init_object_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__reduce_ex__",
                 |args| {
-                    let proto = unsafe { pyre_object::w_int_get_value(args[1]) };
+                    let proto = crate::builtins::space_index_w(args[1])?;
                     crate::reduce_protocol::descr_reduce_ex(args[0], proto)
                 },
                 2,
