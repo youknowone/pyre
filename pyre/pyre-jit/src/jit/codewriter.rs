@@ -4161,7 +4161,7 @@ fn filter_liveness_in_place(
     // `compute_liveness` rewrites the stream; remapped through the same
     // `remove_repeated_live` remap below.  This is the exact
     // jitcode-pc → Python-opcode inverse the full-body walk consumes
-    // (`PyJitCodeMetadata::first_jit_pc_by_py_pc`) — `pc_map`'s
+    // (formerly stored in runtime metadata) — `pc_map`'s
     // nearest-marker carry-forward shares positions across PCs and is
     // not invertible.
     let mut first_insn_pre_merge: Vec<Option<usize>> = vec![None; walker_tracked.len()];
@@ -12644,7 +12644,7 @@ impl CodeWriter {
         };
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
-        // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
+        // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
         let n_py_instrs = u32::try_from(first_jit_pc_by_py_pc.len())
             .expect("Python instruction count must fit metadata");
@@ -13016,11 +13016,9 @@ impl CodeWriter {
         let metadata = PyJitCodeMetadata {
             after_residual_call_resume_marker_by_jit_pc,
             after_residual_call_resume_pred_by_jit_pc,
-            first_jit_pc_by_py_pc,
             n_py_instrs,
             block_head_py_by_jit_pc,
             py_floor_by_jit_pc,
-            carryfwd_resume_pc,
             merge_entry_by_green,
             depth_at_py_pc: depth_at_pc,
             pcdep_by_jit_pc,
@@ -13056,34 +13054,9 @@ impl CodeWriter {
 
         if pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_enabled() {
             assert_eq!(
-                metadata.n_py_instrs as usize,
-                metadata.first_jit_pc_by_py_pc.len(),
+                n_py_instrs as usize,
+                first_jit_pc_by_py_pc.len(),
                 "PCMAP_PIVOT Python instruction count diverges from first-jit map",
-            );
-            for jit_pc in 0..jitcode.body().code.len() {
-                assert_eq!(
-                    metadata
-                        .block_head_py_by_jit_pc
-                        .binary_search_by_key(&jit_pc, |&(off, _)| off)
-                        .ok()
-                        .map(|i| metadata.block_head_py_by_jit_pc[i].1)
-                        .or_else(|| {
-                            pyre_jit_trace::pyjitcode::floor_segment_for_jitcode_pc(
-                                &metadata.py_floor_by_jit_pc,
-                                jit_pc,
-                            )
-                            .map(|(_, py)| py)
-                        }),
-                    Some(
-                        pyre_jit_trace::jitcode_dispatch::python_pc_for_jitcode_pc_legacy(
-                            &metadata, jit_pc,
-                        )
-                    ),
-                    "PCMAP_PIVOT build lookup diverges at jit_pc={jit_pc}",
-                );
-            }
-            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_sweep(
-                jitcode.body().code.len(),
             );
         }
 

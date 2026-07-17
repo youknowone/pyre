@@ -9438,14 +9438,6 @@ fn exact_floor_segment_anchor(
         .is_some_and(|(start, py)| start == jit_pc && py as usize == py_pc)
 }
 
-fn exact_first_jit_anchor_legacy(
-    first_jit_pc_by_py_pc: &[usize],
-    py_pc: usize,
-    jit_pc: usize,
-) -> bool {
-    first_jit_pc_by_py_pc.get(py_pc).copied() == Some(jit_pc)
-}
-
 /// Admit a marker at the semantic head of a portal-shaped Python opcode.
 /// `serialize_op` keeps the first op for a Python pc, so the
 /// `setfield_vable_i(last_instr)` emitted immediately before
@@ -10408,63 +10400,18 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
 /// opcode (where the walk physically is), not the resume block-head a
 /// `-live-` marker names — the marker case returns an EARLIER py_pc and
 /// makes the mirror's boundary detection oscillate.  Uses only the
-/// JitCode-PC floor pivot (largest floor boundary at-or-before `jit_pc`);
-/// falls back to the nearest-`-live-`-marker
-/// heuristic (reconstructed via [`pc_map_marker_for`])
-/// when that table is empty (skeleton / fixture installs).
+/// JitCode-PC floor pivot (largest floor boundary at-or-before `jit_pc`).
 fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
-    let first_jit = &metadata.first_jit_pc_by_py_pc;
     if !metadata.py_floor_by_jit_pc.is_empty() {
-        let pivot =
-            crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
-                .expect("drained JitCode PC floor pivot must begin at byte offset zero")
-                .1;
-        if pcmap_pivot_audit_enabled() {
-            let mut best: Option<(usize, u32)> = None;
-            for (py, &pos) in first_jit.iter().enumerate() {
-                if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
-                    best = Some((pos, py as u32));
-                }
-            }
-            assert_eq!(
-                pivot,
-                best.map_or(0, |(_, py)| py),
-                "PCMAP_PIVOT vstack floor lookup diverges at jit_pc={jit_pc}",
-            );
-        }
-        return pivot;
+        return crate::pyjitcode::floor_segment_for_jitcode_pc(
+            &metadata.py_floor_by_jit_pc,
+            jit_pc,
+        )
+        .expect("drained JitCode PC floor pivot must begin at byte offset zero")
+        .1;
     }
     pcmap_pivot_audit_record_fire("vstack_containing_py_pc", "empty_pivot_fallback");
-    if !first_jit.is_empty() {
-        let mut best: Option<(usize, u32)> = None;
-        for (py, &pos) in first_jit.iter().enumerate() {
-            if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
-                best = Some((pos, py as u32));
-            }
-        }
-        if let Some((_, py)) = best {
-            return py;
-        }
-    }
-    // Nearest-`-live-`-marker fallback (skeleton / fixture / a coordinate
-    // preceding the first op — verified to fire only at `jit_pc == 0`): the
-    // largest `py` whose resume marker offset is `<= jit_pc`, ties → larger
-    // `py`.  Reconstructs each `py`'s marker via the two surviving tables (the
-    // block-head predecessor derivation, else the sparse carry-forward
-    // sidecar) instead of the retired dense `pc_map` — identical for drained
-    // installs, where `derived.or(sidecar)` equals the dense value at every
-    // `py` by construction.
-    let mut best_py = 0u32;
-    let mut best_jc = 0usize;
-    for py in 0..first_jit.len() {
-        if let Some(jc) = pc_map_marker_for(metadata, py) {
-            if jc <= jit_pc && jc >= best_jc {
-                best_jc = jc;
-                best_py = py as u32;
-            }
-        }
-    }
-    best_py
+    0
 }
 
 fn vstack_initial_py_pc(
@@ -10497,27 +10444,6 @@ fn vstack_step_py_pc(
     } else {
         vstack_containing_py_pc(metadata, jit_pc)
     }
-}
-
-/// Reconstruct `pc_map[py]` — the `-live-` resume marker byte offset for
-/// Python PC `py` — from the two surviving tables plus the sparse carry-forward
-/// sidecar, WITHOUT the retired dense `pc_map` Vec.  Same resolution as
-/// the historical dense-map rule: the sidecar takes precedence (it holds the
-/// non-derivable divergences), everything else derives via
-/// [`crate::pyjitcode::derive_resume_marker`].  `None` when `py` is out of
-/// range or the tables are empty (skeleton / fixture).
-pub(crate) fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
-    if let Ok(i) = metadata
-        .carryfwd_resume_pc
-        .binary_search_by_key(&(py as u32), |&(p, _)| p)
-    {
-        return Some(metadata.carryfwd_resume_pc[i].1);
-    }
-    crate::pyjitcode::derive_resume_marker(
-        &metadata.first_jit_pc_by_py_pc,
-        &metadata.block_head_py_by_jit_pc,
-        py,
-    )
 }
 
 /// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
@@ -11220,78 +11146,10 @@ fn m73_outercap_carry_enabled() -> bool {
     })
 }
 
-/// Legacy py-indexed resolver retained for skeleton / fixture metadata and the
-/// pivot audit certificate.
-pub fn python_pc_for_jitcode_pc_legacy(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
-    // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
-    // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
-    // no jitcode of its own), so the containing opcode is the largest `py`
-    // whose first offset is at-or-before `jit_pc`.  The resume-marker
-    // resolution cannot serve
-    // here: it resolves each PC to its nearest `-live-` marker at-or-before
-    // (sparse markers, carry-forward repeats), so whole PC runs share one
-    // value and the inverse is ambiguous.
-    // A coordinate that lands exactly on a `-live-` marker is a block
-    // head (branch target / catch target, reached via
-    // `resolve_branch_target_through_trampoline`): it belongs to the
-    // FIRST Python opcode that resumes at that marker — the start of the
-    // marker's carry-forward run — not to the preceding opcode whose
-    // emitted region the marker byte happens to fall inside.  Real op
-    // positions never collide with marker positions (each byte belongs
-    // to exactly one instruction), so this test only fires for block
-    // heads.
-    //
-    // The `block_head_py_by_jit_pc` table is the precomputed inverse of this
-    // block-head case (marker byte offset → Python block entry), built from
-    // the same block-head marker bytes at compile time. A no-JitCode prefix is
-    // included in the entry coordinate, so a CACHE / NOT_TAKEN run followed by
-    // constant-folded loads cannot move the inverse into the middle of an arm.
-    // Drained installs carry it; skeleton / fixture installs
-    // leave it empty.
-    if !metadata.block_head_py_by_jit_pc.is_empty() {
-        if let Ok(i) = metadata
-            .block_head_py_by_jit_pc
-            .binary_search_by_key(&jit_pc, |&(off, _)| off)
-        {
-            return metadata.block_head_py_by_jit_pc[i].1;
-        }
-    }
-    let first_jit = &metadata.first_jit_pc_by_py_pc;
-    let mut best: Option<(usize, u32)> = None;
-    for (py, &pos) in first_jit.iter().enumerate() {
-        if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
-            best = Some((pos, py as u32));
-        }
-    }
-    // Both live tiers missed (skeleton / fixture, or a
-    // coordinate preceding the first op): resume at the first opcode.
-    best.map_or(0, |(_, py)| py)
-}
-
-/// `PYRE_PCMAP_PIVOT_AUDIT` exhaustively certifies each codewriter-built
-/// JitCode-PC pivot and cross-checks every production lookup against the
-/// preserved py-indexed resolver.  Off by default.
+/// `PYRE_PCMAP_PIVOT_AUDIT` records PC-pivot census counters. Off by default.
 pub fn pcmap_pivot_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT").is_some())
-}
-
-/// Record one completed exhaustive pivot sweep when a caller supplies the
-/// optional probe path. `check.py` captures child stderr, so this keeps the
-/// audit certificate's coverage count available to its caller.
-pub fn pcmap_pivot_audit_record_sweep(jitcode_byte_len: usize) {
-    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
-        return;
-    };
-    use std::io::Write;
-
-    if let Ok(mut probe) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(probe, "jitcode_bytes={jitcode_byte_len}");
-    }
 }
 
 /// Append a report-only runtime/build-time PC-map census fire.  The probe is
@@ -11348,17 +11206,10 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
                     .map(|(_, py)| py)
             })
             .expect("drained JitCode PC floor pivot must begin at byte offset zero");
-        if pcmap_pivot_audit_enabled() {
-            assert_eq!(
-                pivot,
-                python_pc_for_jitcode_pc_legacy(metadata, jit_pc),
-                "PCMAP_PIVOT runtime lookup diverges at jit_pc={jit_pc}",
-            );
-        }
         return pivot;
     }
     pcmap_pivot_audit_record_fire("python_pc_for_jitcode_pc", "empty_pivot_production");
-    python_pc_for_jitcode_pc_legacy(metadata, jit_pc)
+    0
 }
 
 /// `PYRE_PCMAP_INFLIGHT_AUDIT` records the final in-flight FOR_ITER body
@@ -12049,56 +11900,6 @@ fn branch_arm_reads_unrestorable_ref(
     true
 }
 
-fn portal_marker_first_jit_anchor_legacy(
-    first_jit_pc_by_py_pc: &[usize],
-    built_as_portal: bool,
-    portal_frame_reg: u16,
-    perfn_descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
-    code: &[u8],
-    py_pc: usize,
-    jit_pc: usize,
-    mut python_pc_for_op: impl FnMut(usize) -> usize,
-) -> bool {
-    if exact_first_jit_anchor_legacy(first_jit_pc_by_py_pc, py_pc, jit_pc) {
-        return true;
-    }
-    if !built_as_portal || portal_frame_reg > u8::MAX as u16 {
-        return false;
-    }
-    let Some(mut pc) = first_jit_pc_by_py_pc.get(py_pc).copied() else {
-        return false;
-    };
-    if pc == usize::MAX || pc >= jit_pc {
-        return false;
-    }
-    while pc < jit_pc {
-        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
-            return false;
-        };
-        if op.next_pc > jit_pc
-            || python_pc_for_op(op.pc) != py_pc
-            || op.key != "setfield_vable_i/rid"
-            || code.get(op.pc + 1).copied() != Some(portal_frame_reg as u8)
-        {
-            return false;
-        }
-        let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
-            return false;
-        };
-        let descr_index = lo as usize | ((hi as usize) << 8);
-        if !matches!(
-            perfn_descrs.get(descr_index),
-            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(
-                majit_translate::jitcode::BhDescr::VableField { index: 0 }
-            ))
-        ) {
-            return false;
-        }
-        pc = op.next_pc;
-    }
-    true
-}
-
 /// The not-taken-arm Python stack depth at a branch guard's resume target,
 /// resolved leg-INDEPENDENTLY through the `MetaInterpStaticData` jitcode
 /// store (`pyjitcode_for_jitcode_index`) rather than the full-body-walk-only
@@ -12441,11 +12242,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 (
                     py,
                     jc.index as u32,
-                    if jc.payload.metadata.n_py_instrs == 0 {
-                        jc.payload.metadata.first_jit_pc_by_py_pc.len()
-                    } else {
-                        jc.payload.metadata.n_py_instrs as usize
-                    },
+                    jc.payload.metadata.n_py_instrs as usize,
                 )
             };
             // #67/#124: synthetic loop-close guard pc overshoots past the last
@@ -16435,20 +16232,7 @@ fn try_walker_inline_user_call(
                     audit_midbody_abort_plain_twins(&callee_pjc, callee_py_pc, abort_pc);
                     let anchor_ok = match abort_kind {
                         MidBodyAbortKind::Structural => {
-                            let anchor_ok =
-                                exact_floor_segment_anchor(metadata, callee_py_pc, abort_pc);
-                            if pcmap_pivot_audit_enabled() {
-                                assert_eq!(
-                                    anchor_ok,
-                                    exact_first_jit_anchor_legacy(
-                                        &metadata.first_jit_pc_by_py_pc,
-                                        callee_py_pc,
-                                        abort_pc,
-                                    ),
-                                    "PCMAP_PIVOT midbody structural anchor diverges at jit_pc={abort_pc} py_pc={callee_py_pc}",
-                                );
-                            }
-                            anchor_ok
+                            exact_floor_segment_anchor(metadata, callee_py_pc, abort_pc)
                         }
                         MidBodyAbortKind::Marker => portal_marker_first_jit_anchor(
                             metadata,
@@ -16461,23 +16245,6 @@ fn try_walker_inline_user_call(
                             |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
                         ),
                     };
-                    if pcmap_pivot_audit_enabled() && matches!(abort_kind, MidBodyAbortKind::Marker)
-                    {
-                        assert_eq!(
-                            anchor_ok,
-                            portal_marker_first_jit_anchor_legacy(
-                                &metadata.first_jit_pc_by_py_pc,
-                                metadata.built_as_portal,
-                                metadata.portal_frame_reg,
-                                callee_perfn_descrs,
-                                body.code,
-                                callee_py_pc,
-                                abort_pc,
-                                |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
-                            ),
-                            "PCMAP_PIVOT midbody portal-marker anchor diverges at jit_pc={abort_pc} py_pc={callee_py_pc}",
-                        );
-                    }
                     if !anchor_ok {
                         return None;
                     }
@@ -26581,10 +26348,9 @@ mod tests {
     #[test]
     fn vstack_permuted_for_iter_entry_uses_block_head_target() {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
-        pyjit.metadata.first_jit_pc_by_py_pc = vec![usize::MAX; 19];
-        pyjit.metadata.first_jit_pc_by_py_pc[17] = 100;
-        pyjit.metadata.first_jit_pc_by_py_pc[18] = 120;
+        pyjit.metadata.n_py_instrs = 19;
         pyjit.metadata.block_head_py_by_jit_pc = vec![(110, 18)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (100, 17), (120, 18)];
 
         assert_eq!(vstack_containing_py_pc(&pyjit.metadata, 110), 17);
         assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, true), 18);

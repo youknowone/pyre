@@ -1045,11 +1045,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
              all known triggers — further hits are bugs.",
             jitcode_index,
             pc,
-            if payload.metadata.n_py_instrs == 0 {
-                payload.metadata.first_jit_pc_by_py_pc.len()
-            } else {
-                payload.metadata.n_py_instrs as usize
-            },
+            payload.metadata.n_py_instrs as usize,
             sd.liveness_info.len(),
         );
     })
@@ -12348,11 +12344,9 @@ mod tests {
             crate::PyJitCodeMetadata {
                 after_residual_call_resume_marker_by_jit_pc: Vec::new(),
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
-                first_jit_pc_by_py_pc: vec![0],
                 n_py_instrs: 0,
                 block_head_py_by_jit_pc: vec![(0, 0)],
                 py_floor_by_jit_pc: Vec::new(),
-                carryfwd_resume_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 2)],
