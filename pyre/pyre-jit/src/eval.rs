@@ -3977,6 +3977,7 @@ enum UnsupportedJitShape {
     None,
     CurrentFrameOnly,
     StructuralRegion,
+    NestedBreakBridgeResume,
     /// The frame's constant pool plus register file would exceed the
     /// single-byte (`< 256`) register-or-constant index encoding
     /// (`assembler.py:72 chr()`, `assembler.py:132-133`
@@ -4188,6 +4189,131 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
     for_iter_count > 1 && any_in_handler
 }
 
+/// A nested inner `for` loop `break` — a `POP_TOP` that pops the inner iterator
+/// then a `JUMP_BACKWARD` to the enclosing `FOR_ITER` — miscompiles when the
+/// break lands on the secondary edge of a conditional in the inner-loop guard:
+/// the break edge becomes a guard side-exit whose bridge resume snapshot
+/// mis-maps the outer iterator slot (a boxed value / null lands where the outer
+/// iterator must be), so the resumed `FOR_ITER` dereferences a non-iterator.
+/// Two guard shapes produce that secondary-edge break: a `POP_JUMP_IF_TRUE`
+/// whose true edge continues the loop (break is its fall-through), and a
+/// `POP_JUMP_IF_FALSE` whose false edge jumps forward to the break. Decline
+/// such a frame to the interpreter. The plain `if cond: break` idiom compiles
+/// to a `POP_JUMP_IF_FALSE` whose fall-through IS the break — the primary edge —
+/// and still compiles.
+fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> bool {
+    let num_instrs = code.instructions.len();
+    for pop_pc in 0..num_instrs {
+        let Some(target) = pop_top_jumps_back_to_for_iter(code, num_instrs, pop_pc) else {
+            continue;
+        };
+        let mut inner_header = None;
+        for header_pc in target..pop_pc {
+            if matches!(
+                pyre_interpreter::decode_instruction_at(code, header_pc),
+                Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+            ) {
+                inner_header = Some(header_pc);
+            }
+        }
+        let Some(inner_header) = inner_header else {
+            continue;
+        };
+        for guard_pc in (inner_header + 1)..pop_pc {
+            match pyre_interpreter::decode_instruction_at(code, guard_pc) {
+                Some((pyre_interpreter::Instruction::PopJumpIfTrue { .. }, _)) => {
+                    return true;
+                }
+                Some((pyre_interpreter::Instruction::PopJumpIfFalse { delta }, op_arg)) => {
+                    let jump_target = pyre_interpreter::jump_target_forward(
+                        &code.instructions,
+                        guard_pc + 1,
+                        delta.get(op_arg).as_usize(),
+                    );
+                    if skip_branch_trivia(code, jump_target) == pop_pc {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn pop_top_jumps_back_to_for_iter(
+    code: &pyre_interpreter::CodeObject,
+    num_instrs: usize,
+    pop_pc: usize,
+) -> Option<usize> {
+    if pop_pc >= num_instrs {
+        return None;
+    }
+    if !matches!(
+        pyre_interpreter::decode_instruction_at(code, pop_pc),
+        Some((pyre_interpreter::Instruction::PopTop, _))
+    ) {
+        return None;
+    }
+    let jump_pc = skip_branch_trivia(code, pop_pc + 1);
+    if jump_pc >= num_instrs {
+        return None;
+    }
+    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, jump_pc) else {
+        return None;
+    };
+    let target = match instr {
+        pyre_interpreter::Instruction::JumpBackward { delta } => {
+            skip_caches(code, jump_pc + 1).saturating_sub(delta.get(op_arg).as_usize())
+        }
+        pyre_interpreter::Instruction::JumpBackwardNoInterrupt { delta } => {
+            (jump_pc + 1).saturating_sub(delta.get(op_arg).as_usize())
+        }
+        _ => return None,
+    };
+    if target < pop_pc
+        && target < num_instrs
+        && matches!(
+            pyre_interpreter::decode_instruction_at(code, target),
+            Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+        )
+    {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+fn skip_branch_trivia(code: &pyre_interpreter::CodeObject, mut pos: usize) -> usize {
+    while pos < code.instructions.len() {
+        match pyre_interpreter::decode_instruction_at(code, pos) {
+            Some((
+                pyre_interpreter::Instruction::Cache
+                | pyre_interpreter::Instruction::ExtendedArg
+                | pyre_interpreter::Instruction::NotTaken
+                | pyre_interpreter::Instruction::Nop
+                | pyre_interpreter::Instruction::Resume { .. },
+                _,
+            )) => pos += 1,
+            _ => break,
+        }
+    }
+    pos
+}
+
+fn skip_caches(code: &pyre_interpreter::CodeObject, mut pos: usize) -> usize {
+    let mut state = pyre_interpreter::OpArgState::default();
+    while pos < code.instructions.len() {
+        let (instruction, _) = state.get(code.instructions[pos]);
+        if matches!(instruction, pyre_interpreter::Instruction::Cache) {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
 /// Upper bound on the constant-pool slots one code-object constant can
 /// contribute to the assembled jitcode. A `Tuple`/`Frozenset`/`Slice`
 /// constant can be unpacked into its elements during graph construction —
@@ -4277,6 +4403,10 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         return UnsupportedJitShape::ConstEncodingOverflow;
     }
 
+    if nested_break_bridge_resume_hazard(code) {
+        return UnsupportedJitShape::NestedBreakBridgeResume;
+    }
+
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
@@ -4354,6 +4484,13 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 "FrameShape::StructuralRegion",
             );
             let _guard = JitSuppressionGuard::new();
+            return frame_root.frame().execute_frame(None, None);
+        }
+        UnsupportedJitShape::NestedBreakBridgeResume => {
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                "FrameShape::NestedBreakBridgeResume",
+            );
             return frame_root.frame().execute_frame(None, None);
         }
         UnsupportedJitShape::ConstEncodingOverflow => {
@@ -4590,6 +4727,7 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
         UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
         UnsupportedJitShape::None
         | UnsupportedJitShape::CurrentFrameOnly
+        | UnsupportedJitShape::NestedBreakBridgeResume
         | UnsupportedJitShape::ConstEncodingOverflow => None,
     };
     portal_runner_dispatch(frame_root.frame())
