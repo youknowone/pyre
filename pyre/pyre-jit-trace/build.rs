@@ -306,17 +306,31 @@ fn real_main() {
                 call_effects: build_call_effect_overrides(),
                 ..Default::default()
             },
-            jit_drivers: vec![majit_translate::JitDriverSpec {
-                portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
-                greens: vec![
-                    "next_instr".to_string(),
-                    "is_being_profiled".to_string(),
-                    "pycode".to_string(),
-                ],
-                reds: vec!["frame".to_string(), "ec".to_string()],
-                virtualizables: vec!["frame".to_string()],
-                red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
-            }],
+            jit_drivers: vec![
+                majit_translate::JitDriverSpec {
+                    portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
+                    greens: vec![
+                        "next_instr".to_string(),
+                        "is_being_profiled".to_string(),
+                        "pycode".to_string(),
+                    ],
+                    reds: vec!["frame".to_string(), "ec".to_string()],
+                    virtualizables: vec!["frame".to_string()],
+                    red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+                },
+                majit_translate::JitDriverSpec {
+                    // pypy/interpreter/baseobjspace.py:1003 `_unpackiterable_unknown_length`;
+                    // greens=['greenkey'], reds='auto' (baseobjspace.py:29-32).
+                    portal: majit_translate::CallPath::from_segments([
+                        "baseobjspace",
+                        "_unpackiterable_unknown_length",
+                    ]),
+                    greens: vec!["greenkey".to_string()],
+                    reds: vec![],
+                    virtualizables: vec![],
+                    red_types: vec![],
+                },
+            ],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),
         },
