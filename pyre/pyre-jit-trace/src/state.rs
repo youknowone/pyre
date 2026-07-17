@@ -929,7 +929,7 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    let legacy = pjc.metadata.pcdep_color_slots.first().cloned();
+    let legacy = pjc.pcdep_for_jitcode_pc(0);
     if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
         crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "fire");
         let twin = pjc.pcdep_for_jitcode_pc(0);
