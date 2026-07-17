@@ -8708,6 +8708,39 @@ impl JitState for PyreJitState {
                 }
             }
         }
+        // Seed operand-stack slots (kept temps) whose concrete the frame-array
+        // overlay above could not source.  A kept operand's authoritative
+        // post-guard value is the RESUME DATA (`fail_values`, decoded into
+        // `bridge_stamp_orphans`), NOT the frame array — `locals_cells_stack_w`
+        // holds a bare `PY_NULL` for an operand-stack temp above the
+        // materialized `valuestackdepth`.  A CALL's `self_or_null` sentinel is
+        // one such genuine `PY_NULL`: its box decodes to `Ref(GcRef(0))`, which
+        // BOTH the frame-array seed and the orphan seed drop as a "hole",
+        // leaving `box_value == None`.  The residual then declines that arg as
+        // *unavailable* (its `null_or_self` exemption accepts a KNOWN null but
+        // not an unavailable box), the effect goes unjournaled, and the legacy
+        // replay drops the outer iteration.  Seed each still-unstamped operand
+        // opref from its own resume-data decode — INCLUDING a genuine null — so
+        // the residual sees the real (null) sentinel and executes.  Scoped to
+        // operand slots (`>= nlocals`); locals keep the frame-array overlay,
+        // and a slot already carrying a real concrete is left untouched.
+        if seed_bridge_locals {
+            if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
+                for s in nlocals..semantic_prefix_len {
+                    let Some(&opref) = semantic_mirror.get(s) else {
+                        continue;
+                    };
+                    if opref.is_none() || ctx.box_value(opref).is_some() {
+                        continue;
+                    }
+                    if let Some((_, cv)) = orphan_stamps.iter().find(|(o, _)| o == &opref) {
+                        if !matches!(cv, majit_ir::Value::Void) {
+                            ctx.try_set_opref_concrete(opref, *cv);
+                        }
+                    }
+                }
+            }
+        }
         sym.registers_r = semantic_mirror;
         sym.symbolic_local_types = {
             let mut types = bridge_local_types.clone();
