@@ -1569,12 +1569,26 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                         payload.pcdep_for_jitcode_pc(jp),
                     ) {
                         (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                        _ => (
-                            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
-                            Vec::new(),
-                        ),
+                        _ => {
+                            if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+                                crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                                    "depthfield_via_py_pc",
+                                    "twin_miss",
+                                );
+                            }
+                            (
+                                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                                Vec::new(),
+                            )
+                        }
                     }
                 } else {
+                    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+                        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+                            "depthfield_via_py_pc",
+                            "non_decodable",
+                        );
+                    }
                     (
                         via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
                         Vec::new(),
