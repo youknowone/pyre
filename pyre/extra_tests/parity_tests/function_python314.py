@@ -114,7 +114,17 @@ assert len(identity.__type_params__) == 1
 assert identity.__type_params__[0].__name__ == "T"
 assert identity(5) == 5
 
-for descriptor_name in ("__annotate__", "__type_params__"):
+for descriptor_name in (
+    "__name__",
+    "__qualname__",
+    "__defaults__",
+    "__kwdefaults__",
+    "__code__",
+    "__annotations__",
+    "__annotate__",
+    "__dict__",
+    "__type_params__",
+):
     descriptor = type(f).__dict__[descriptor_name]
     try:
         descriptor.__get__(42, int)
@@ -122,3 +132,15 @@ for descriptor_name in ("__annotate__", "__type_params__"):
         pass
     else:
         raise AssertionError(f"function {descriptor_name} accepted a foreign receiver")
+
+for method_name, args in (
+    ("__call__", ()),
+    ("__get__", (None, type(None))),
+    ("__repr__", ()),
+):
+    try:
+        type(f).__dict__[method_name](len, *args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"function {method_name} accepted a foreign receiver")

@@ -8904,6 +8904,23 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `**rawdict` pattern. Function-only slots (currently just `__get__`) and
 /// BuiltinFunction-only overrides (`__new__`, `__self__`, `__repr__`)
 /// live in their respective wrappers.
+fn function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::py_type_check(obj, &crate::function::FUNCTION_TYPE) }
+    {
+        let received = if obj.is_null() {
+            "object"
+        } else {
+            crate::typedef::r#type(obj)
+                .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+                .unwrap_or("object")
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'function' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    Ok(obj)
+}
+
 fn init_function_type_common(ns: PyObjectRef) {
     // `pypy/interpreter/typedef.py:802 __doc__ = getset_func_doc` —
     // `getset_func_doc = GetSetProperty(Function.fget_func_doc,
@@ -8918,20 +8935,26 @@ fn init_function_type_common(ns: PyObjectRef) {
     // gate inside the setter/deleter still raises `TypeError` for
     // builtin functions (`can_change_code = False`).
     let doc_getter = make_builtin_function("__doc__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__doc__",
+        )?;
         Ok(unsafe { crate::function::fget_func_doc(func) })
     });
     let doc_setter = make_builtin_function("__doc__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__doc__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_doc(func, value)? };
         Ok(pyre_object::w_none())
     });
     let doc_deleter = make_builtin_function("__doc__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__doc__",
+        )?;
         unsafe { crate::function::fdel_func_doc(func)? };
         Ok(pyre_object::w_none())
     });
@@ -8953,20 +8976,26 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `w_ann` directly).  The setter validates the new value as a
     // dict per `function.py:557-558` and clears the slot on `None`.
     let ann_getter = make_builtin_function("__annotations__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_dict_new());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__annotations__",
+        )?;
         Ok(unsafe { crate::function::function_get_annotations(func) })
     });
     let ann_setter = make_builtin_function("__annotations__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__annotations__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_annotations(func, value)? };
         Ok(pyre_object::w_none())
     });
     let ann_deleter = make_builtin_function("__annotations__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__annotations__",
+        )?;
         unsafe { crate::function::fdel_func_annotations(func)? };
         Ok(pyre_object::w_none())
     });
@@ -8990,14 +9019,17 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `typedef.py:780 getset_func_name = GetSetProperty(fget_func_name,
     //                                                    fset_func_name)`.
     let name_getter = make_builtin_function("__name__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_str_new(""));
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__name__",
+        )?;
         Ok(unsafe { crate::function::fget_func_name(func) })
     });
     let name_setter = make_builtin_function("__name__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__name__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_name(func, value)? };
         Ok(pyre_object::w_none())
@@ -9016,15 +9048,18 @@ fn init_function_type_common(ns: PyObjectRef) {
     // (function.py:476-485) instead of falling through to
     // `setdictvalue` and silently shadowing the slot.
     let qualname_getter = make_builtin_function("__qualname__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_str_new(""));
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__qualname__",
+        )?;
         let s = unsafe { crate::function::function_get_qualname(func) };
         Ok(pyre_object::w_str_new(&s))
     });
     let qualname_setter = make_builtin_function("__qualname__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__qualname__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_qualname(func, value)? };
         Ok(pyre_object::w_none())
@@ -9039,20 +9074,26 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `typedef.py:768-770 getset___module__ = GetSetProperty(
     //   Function.fget___module__, fset___module__, fdel___module__)`.
     let module_getter = make_builtin_function("__module__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__module__",
+        )?;
         Ok(unsafe { crate::function::fget___module__(func) })
     });
     let module_setter = make_builtin_function("__module__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__module__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset___module__(func, value)? };
         Ok(pyre_object::w_none())
     });
     let module_deleter = make_builtin_function("__module__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__module__",
+        )?;
         unsafe { crate::function::fdel___module__(func)? };
         Ok(pyre_object::w_none())
     });
@@ -9066,20 +9107,26 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `typedef.py:772-774 getset_func_defaults = GetSetProperty(
     //   Function.fget_func_defaults, fset_func_defaults, fdel_func_defaults)`.
     let defaults_getter = make_builtin_function("__defaults__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__defaults__",
+        )?;
         Ok(unsafe { crate::function::fget_func_defaults(func) })
     });
     let defaults_setter = make_builtin_function("__defaults__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__defaults__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_defaults(func, value)? };
         Ok(pyre_object::w_none())
     });
     let defaults_deleter = make_builtin_function("__defaults__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__defaults__",
+        )?;
         unsafe { crate::function::fdel_func_defaults(func)? };
         Ok(pyre_object::w_none())
     });
@@ -9092,20 +9139,26 @@ fn init_function_type_common(ns: PyObjectRef) {
     };
     // `typedef.py:775-777 getset_func_kwdefaults = GetSetProperty(...)`.
     let kwdefaults_getter = make_builtin_function("__kwdefaults__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__kwdefaults__",
+        )?;
         Ok(unsafe { crate::function::fget_func_kwdefaults(func) })
     });
     let kwdefaults_setter = make_builtin_function("__kwdefaults__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__kwdefaults__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_kwdefaults(func, value)? };
         Ok(pyre_object::w_none())
     });
     let kwdefaults_deleter = make_builtin_function("__kwdefaults__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__kwdefaults__",
+        )?;
         unsafe { crate::function::fdel_func_kwdefaults(func)? };
         Ok(pyre_object::w_none())
     });
@@ -9119,15 +9172,18 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `typedef.py:778-779 getset_func_code = GetSetProperty(
     //   Function.fget_func_code, fset_func_code)`.
     let code_getter = make_builtin_function("__code__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__code__",
+        )?;
         let raw = unsafe { crate::function::fget_func_code(func) };
         Ok(raw as pyre_object::PyObjectRef)
     });
     let code_setter = make_builtin_function("__code__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__code__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::fset_func_code(func, value)? };
         Ok(pyre_object::w_none())
@@ -9142,10 +9198,10 @@ fn init_function_type_common(ns: PyObjectRef) {
     // `typedef.py:813 __closure__ = GetSetProperty(Function.fget_func_closure)`
     // — read-only.
     let closure_getter = make_builtin_function("__closure__", |args| {
-        let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if func.is_null() {
-            return Ok(pyre_object::w_none());
-        }
+        let func = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__closure__",
+        )?;
         Ok(unsafe { crate::function::fget_func_closure(func) })
     });
     unsafe {
@@ -9315,7 +9371,18 @@ fn init_function_type_common(ns: PyObjectRef) {
 /// Arguments object, including keyword names, to the wrapped function.
 fn function_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let function = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let function = function_receiver(
+        positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__call__",
+    )?;
+    function_descr_call_impl(positional, kwargs, function)
+}
+
+fn function_descr_call_impl(
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+    function: PyObjectRef,
+) -> crate::PyResult {
     let call_args = positional.get(1..).unwrap_or(&[]);
     if !crate::builtins::has_real_kwargs(kwargs) {
         return crate::call::call_function_impl_result(function, call_args);
@@ -9444,7 +9511,10 @@ fn init_function_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__repr__",
                 |args| {
-                    let function = args[0];
+                    let function = function_receiver(
+                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        "__repr__",
+                    )?;
                     let qualname = unsafe { crate::function::function_get_qualname(function) };
                     Ok(pyre_object::w_str_new(&format!(
                         "<function {qualname} at {function:p}>"
@@ -9457,8 +9527,28 @@ fn init_function_type(ns: PyObjectRef) {
     // PyPy typedef.py:796 `getset_func_dict = GetSetProperty(
     // descr_get_dict, descr_set_dict, cls=Function)` — storage is the
     // typed `Function.w_func_dict` field from function.py:68.
-    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
-    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    let dict_getter = make_builtin_function_with_arity(
+        "__dict__",
+        |args| {
+            function_receiver(
+                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                "__dict__",
+            )?;
+            descr_get_dict(args)
+        },
+        2,
+    );
+    let dict_setter = make_builtin_function_with_arity(
+        "__dict__",
+        |args| {
+            function_receiver(
+                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                "__dict__",
+            )?;
+            descr_set_dict(args)
+        },
+        3,
+    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -9468,38 +9558,26 @@ fn init_function_type(ns: PyObjectRef) {
     };
     // CPython 3.14 `function.__annotate__`: callable-or-None, not deletable.
     let annotate_getter = make_builtin_function("__annotate__", |args| {
-        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if function.is_null()
-            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
-        {
-            return Err(crate::PyError::type_error(
-                "descriptor '__annotate__' requires a 'function' object",
-            ));
-        }
+        let function = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__annotate__",
+        )?;
         Ok(unsafe { crate::function::function_get_annotate(function) })
     });
     let annotate_setter = make_builtin_function("__annotate__", |args| {
-        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if function.is_null()
-            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
-        {
-            return Err(crate::PyError::type_error(
-                "descriptor '__annotate__' requires a 'function' object",
-            ));
-        }
+        let function = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__annotate__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::function_set_annotate(function, value)? };
         Ok(pyre_object::w_none())
     });
     let annotate_deleter = make_builtin_function("__annotate__", |args| {
-        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if function.is_null()
-            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
-        {
-            return Err(crate::PyError::type_error(
-                "descriptor '__annotate__' requires a 'function' object",
-            ));
-        }
+        let function = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__annotate__",
+        )?;
         unsafe { crate::function::function_set_annotate(function, pyre_object::PY_NULL)? };
         Ok(pyre_object::w_none())
     });
@@ -9512,38 +9590,26 @@ fn init_function_type(ns: PyObjectRef) {
     };
     // CPython 3.14 `function.__type_params__`: tuple-only and not deletable.
     let typeparams_getter = make_builtin_function("__type_params__", |args| {
-        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if function.is_null()
-            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
-        {
-            return Err(crate::PyError::type_error(
-                "descriptor '__type_params__' requires a 'function' object",
-            ));
-        }
+        let function = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__type_params__",
+        )?;
         Ok(unsafe { crate::function::function_get_typeparams(function) })
     });
     let typeparams_setter = make_builtin_function("__type_params__", |args| {
-        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if function.is_null()
-            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
-        {
-            return Err(crate::PyError::type_error(
-                "descriptor '__type_params__' requires a 'function' object",
-            ));
-        }
+        let function = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__type_params__",
+        )?;
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::function_set_typeparams(function, value)? };
         Ok(pyre_object::w_none())
     });
     let typeparams_deleter = make_builtin_function("__type_params__", |args| {
-        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if function.is_null()
-            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
-        {
-            return Err(crate::PyError::type_error(
-                "descriptor '__type_params__' requires a 'function' object",
-            ));
-        }
+        let function = function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__type_params__",
+        )?;
         unsafe { crate::function::function_set_typeparams(function, pyre_object::PY_NULL)? };
         Ok(pyre_object::w_none())
     });
@@ -9576,7 +9642,10 @@ fn init_function_type(ns: PyObjectRef) {
             ns,
             "__get__",
             make_builtin_function("__get__", |args| {
-                let w_function = args.first().copied().unwrap_or(pyre_object::w_none());
+                let w_function = function_receiver(
+                    args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    "__get__",
+                )?;
                 let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
                 let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
                 // function.py:464-470 descr_function_get
@@ -9634,6 +9703,24 @@ fn init_function_type(ns: PyObjectRef) {
 /// missing `dict_storage_store(ns, "__get__", ...)` call after it expresses the
 /// `del rawdict['__get__']` step. The `update({...})` overrides go below as
 /// pyre starts modeling them.
+fn builtin_function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null()
+        || !unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
+    {
+        let received = if obj.is_null() {
+            "object"
+        } else {
+            crate::typedef::r#type(obj)
+                .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+                .unwrap_or("object")
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'builtin_function_or_method' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    Ok(obj)
+}
+
 fn init_builtin_function_type(ns: PyObjectRef) {
     init_function_type_common(ns);
 
@@ -9706,16 +9793,30 @@ fn init_builtin_function_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__call__",
+            make_builtin_function("__call__", |args| {
+                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                let function = builtin_function_receiver(
+                    positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    "__call__",
+                )?;
+                function_descr_call_impl(positional, kwargs, function)
+            }),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
                 |args| {
-                    let func = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    let name = if func.is_null() {
-                        "<unknown>"
-                    } else {
-                        unsafe { crate::function_get_name(func) }
-                    };
+                    let func = builtin_function_receiver(
+                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        "__repr__",
+                    )?;
+                    let name = unsafe { crate::function_get_name(func) };
                     Ok(pyre_object::w_str_new(&format!(
                         "<built-in function {name}>"
                     )))
@@ -9732,7 +9833,13 @@ fn init_builtin_function_type(ns: PyObjectRef) {
             "__reduce__",
             make_builtin_function_with_arity(
                 "__reduce__",
-                |args| unsafe { crate::function::descr_builtin_function_reduce(args[0]) },
+                |args| unsafe {
+                    let function = builtin_function_receiver(
+                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        "__reduce__",
+                    )?;
+                    crate::function::descr_builtin_function_reduce(function)
+                },
                 1,
             ),
         )
@@ -9743,11 +9850,20 @@ fn init_builtin_function_type(ns: PyObjectRef) {
     for (name, method) in [
         (
             "__eq__",
-            (|args: &[PyObjectRef]| Ok(pyre_object::w_bool_from(std::ptr::eq(args[0], args[1]))))
-                as fn(&[PyObjectRef]) -> crate::PyResult,
+            (|args: &[PyObjectRef]| {
+                let function = builtin_function_receiver(
+                    args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    "__eq__",
+                )?;
+                Ok(pyre_object::w_bool_from(std::ptr::eq(function, args[1])))
+            }) as fn(&[PyObjectRef]) -> crate::PyResult,
         ),
         ("__ne__", |args: &[PyObjectRef]| {
-            Ok(pyre_object::w_bool_from(!std::ptr::eq(args[0], args[1])))
+            let function = builtin_function_receiver(
+                args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                "__ne__",
+            )?;
+            Ok(pyre_object::w_bool_from(!std::ptr::eq(function, args[1])))
         }),
     ] {
         unsafe {
@@ -9758,12 +9874,34 @@ fn init_builtin_function_type(ns: PyObjectRef) {
             )
         };
     }
-    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+    type BuiltinOrderFn = fn(&[PyObjectRef]) -> crate::PyResult;
+    fn order(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+        builtin_function_receiver(args.first().copied().unwrap_or(pyre_object::PY_NULL), name)?;
+        Ok(pyre_object::w_not_implemented())
+    }
+    fn lt(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__lt__")
+    }
+    fn le(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__le__")
+    }
+    fn gt(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__gt__")
+    }
+    fn ge(args: &[PyObjectRef]) -> crate::PyResult {
+        order(args, "__ge__")
+    }
+    for (name, function) in [
+        ("__lt__", lt as BuiltinOrderFn),
+        ("__le__", le),
+        ("__gt__", gt),
+        ("__ge__", ge),
+    ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_not_implemented()), 2),
+                make_builtin_function_with_arity(name, function, 2),
             )
         };
     }
@@ -9773,7 +9911,13 @@ fn init_builtin_function_type(ns: PyObjectRef) {
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
-                |args| Ok(pyre_object::w_int_new(args[0] as i64)),
+                |args| {
+                    let function = builtin_function_receiver(
+                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        "__hash__",
+                    )?;
+                    Ok(pyre_object::w_int_new(function as i64))
+                },
                 1,
             ),
         )

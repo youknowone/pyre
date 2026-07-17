@@ -54,6 +54,20 @@ for bound_builtin, owner, name in (
 assert len.__repr__() == "<built-in function len>"
 assert t.__dict__["__call__"](len, [1, 2, 3]) == 3
 
+for method_name, args in (
+    ("__call__", ()),
+    ("__eq__", (len,)),
+    ("__ne__", (len,)),
+    ("__lt__", (len,)),
+    ("__le__", (len,)),
+    ("__gt__", (len,)),
+    ("__ge__", (len,)),
+    ("__hash__", ()),
+    ("__repr__", ()),
+    ("__reduce__", ()),
+):
+    raises(TypeError, lambda n=method_name, a=args: t.__dict__[n](object(), *a))
+
 assert len == len
 assert len != abs
 assert isinstance(hash(len), int)

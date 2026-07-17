@@ -49,6 +49,12 @@ for name in MEMBERS:
     reduced = descriptor.__reduce__()
     assert reduced == (getattr, (types.FunctionType, name))
     assert reduced[0] is getattr
+    try:
+        descriptor.__get__(object(), object)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"function member {name} accepted a foreign receiver")
 
 for method_name in ("__repr__", "__reduce__"):
     try:
