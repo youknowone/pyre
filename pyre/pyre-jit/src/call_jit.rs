@@ -5608,7 +5608,7 @@ pub extern "C" fn bh_load_deref_value_fn(cell: i64, w_code_ptr: i64, deref_idx: 
 /// write barrier inside) and return the unchanged cell so the caller
 /// re-stores the same pointer into the slot; otherwise return the raw
 /// `value` so the caller writes it into the slot directly.  Runs no user
-/// code and never raises (`CallFlavor::Plain`).
+/// code and never raises (`CallFlavor::PlainCannotRaise`).
 pub extern "C" fn bh_store_deref_value_fn(cell: i64, value: i64) -> i64 {
     let slot = cell as pyre_object::PyObjectRef;
     if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {

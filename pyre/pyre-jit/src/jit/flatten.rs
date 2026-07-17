@@ -3410,8 +3410,8 @@ pub struct LoweringContext {
     /// ConstInt(fn_idx), ListR([cell, value]), Descr) → reg` via
     /// [`lower_store_deref_value_hlop_to_insn`] (the two-Ref shape); the result
     /// is the slot value the codewriter re-stores via `setarrayitem_vable_r`.
-    /// `bh_store_deref_value_fn` mutates the cell's contents (`Plain` — writes
-    /// heap, runs no user code, never raises).
+    /// `bh_store_deref_value_fn` mutates the cell's contents
+    /// (`PlainCannotRaise` — writes heap, runs no user code, never raises).
     pub store_deref_value_fn_idx: u16,
     /// `make_cell_fn` descrs-pool index.  MAKE_CELL records the
     /// `make_cell_value(current)` HLOp lowered to `residual_call_r_r(ConstInt(
@@ -5551,7 +5551,7 @@ where
 /// operand.  The result is the slot value the codewriter re-stores via
 /// `setarrayitem_vable_r`: the unchanged cell after the in-place `w_cell_set`,
 /// or the raw `value` for a non-cell slot.  Writes mutable heap but runs no
-/// user code and never raises → `Plain`.
+/// user code and never raises → `PlainCannotRaise`.
 ///
 /// Returns `None` for a non-`store_deref_value` opname or unexpected arity so
 /// the caller can fall through to other lowering arms.
@@ -5577,13 +5577,19 @@ where
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.store_deref_value_fn_idx,
         vec![cell, value],
-        CallFlavor::Plain,
+        // `bh_store_deref_value_fn` runs no user code and never raises (a
+        // `w_cell_set` heap write, or returning the raw slot value), so
+        // `PlainCannotRaise` — writes heap but omits the trailing
+        // `GUARD_NO_EXCEPTION`.  Matches the bind-site flavor in
+        // `codewriter.rs`; `pyopcode.py:574 STORE_DEREF` is `cell.set(...)`.
+        CallFlavor::PlainCannotRaise,
         // #57 Option C (Finding #1): a value-returning (`Ref`) heap WRITE — the
         // in-place cell mutation the FOR_ITER body-effect guard's Void-result
         // write proxy cannot see.  Tag it so the guard flags it as a body
         // effect and an aborting FOR_ITER walk refuses delivery (else
-        // re-running the body doubles the cell write).  The tag does not change
-        // the `Plain`/`EF_CAN_RAISE` classification.
+        // re-running the body doubles the cell write).  The tag is orthogonal
+        // to the raise classification: the FOR_ITER body-effect guard keys on
+        // this `StoreDeref` helper tag, not on the `PlainCannotRaise` flavor.
         majit_ir::PyreHelperKind::StoreDeref,
         dst_reg,
     ))
@@ -11841,8 +11847,8 @@ mod tests {
     fn lower_store_deref_value_hlop_emits_store_deref_value_fn_residual() {
         // `store_deref_value(cell, value)` →
         // `residual_call_r_r(ConstInt(store_deref_value_fn_idx),
-        // ListR([cell, value]), Descr) → reg` (Plain — mutates the cell's
-        // heap contents, runs no user code, never raises).
+        // ListR([cell, value]), Descr) → reg` (PlainCannotRaise — mutates the
+        // cell's heap contents, runs no user code, never raises).
         let cell_var = Variable::new(VariableId(8), Kind::Ref);
         let value_var = Variable::new(VariableId(9), Kind::Ref);
         let result_var = Variable::new(VariableId(10), Kind::Ref);
@@ -11908,6 +11914,25 @@ mod tests {
                         index: 102
                     }),
                 );
+                match &args[2] {
+                    Operand::Descr(rc) => match &**rc {
+                        DescrOperand::CallDescrStub(stub) => {
+                            let mut expected_ei =
+                                effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::StoreDeref;
+                            assert_eq!(
+                                stub.effect_info, expected_ei,
+                                "STORE_DEREF residual must carry PlainCannotRaise + StoreDeref tag"
+                            );
+                            assert!(
+                                !stub.effect_info.check_can_raise(false),
+                                "cannot-raise residual must omit the trailing GUARD_NO_EXCEPTION"
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Operand::Descr, got {other:?}"),
+                }
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }

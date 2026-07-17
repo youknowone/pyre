@@ -11335,8 +11335,8 @@ impl CodeWriter {
                         // `store_deref_value(cell, value)` HLOp →
                         // `residual_call_r_r(store_deref_value_fn,
                         // ListR[cell, value])` mutates the cell's contents in
-                        // place (`bh_store_deref_value_fn`, Plain — writes
-                        // heap, runs no user code) and returns the slot value:
+                        // place (`bh_store_deref_value_fn`, PlainCannotRaise —
+                        // writes heap, runs no user code) and returns the slot value:
                         // the unchanged cell for a cell slot, or the raw
                         // `value` for a non-cell slot. The result is stored
                         // back into the slot via `setarrayitem_vable_r`
