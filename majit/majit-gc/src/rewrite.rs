@@ -1093,6 +1093,12 @@ impl GcRewriterImpl {
                 // emit a NULL typeptr.
                 if vtable != 0 {
                     self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
+                    // Upstream rewrite.py:479-484 rewrites NEW_WITH_VTABLE
+                    // into allocation plus full header initialization. Pyre's
+                    // object layout carries a separate `w_class` Python-class pointer
+                    // alongside the vtable; interpreter, blackhole, and deopt-materialize
+                    // paths all write it, so compiled allocations must too or trace-time
+                    // GuardValue(w_class) folds fail deterministically on trace-made objects.
                     if let Some(w_class) = descr.w_class_obj() {
                         if w_class != 0 {
                             if let Some(w_class_fd) =

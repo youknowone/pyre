@@ -4585,6 +4585,12 @@ impl PyreSym {
             );
         }
         let valuestackdepth = if self.bridge_stack_oprefs.is_some() {
+            // Bridge resumes keep the resume-decoded root depth. Multi-frame
+            // deopt later rewrites the live frame's valuestackdepth to the
+            // innermost callee depth (eval.rs:7740-7766), while the resume
+            // payload still carries the root depth; heap state is rebuilt from
+            // resume boxes, never the reverse (rebuild_state_after_failure,
+            // pyjitpl.py:3424-3461).
             self.valuestackdepth
         } else {
             concrete_stack_depth(concrete_frame).unwrap_or(nlocals)
