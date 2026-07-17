@@ -1404,6 +1404,38 @@ pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u8, u16, u16
     })
 }
 
+/// Trivia-aware per-PC `(color, semantic_slot)` resume entries keyed directly
+/// by a JitCode byte offset. `None` when the index, offset, or trivia twin is
+/// unavailable; callers that preserve the legacy empty-result behavior may use
+/// `unwrap_or_default()`.
+pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, u16)>> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)?
+            .payload
+            .pcdep_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
+            .map(ToOwned::to_owned)
+    })
+}
+
+/// The post-regalloc Ref-bank color of the call-result operand-stack slot,
+/// keyed directly by a JitCode byte offset through the trivia-aware twin.
+/// Returns `None` for an empty stack, unavailable twin, or invalid coordinate.
+pub fn result_color_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<usize> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)?
+            .payload
+            .result_color_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
+            .map(|color| color as usize)
+            .filter(|&color| color != u16::MAX as usize)
+    })
+}
+
 /// Whether `pcdep_color_slots[pc]` maps register color `color` to a semantic
 /// frame slot — i.e. the register allocator assigned this color to a real
 /// local/stack value at `pc`, so the color does NOT carry its force-alived
@@ -13213,6 +13245,18 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // non-diverging coloring).
     let py_pc = backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc);
     let pcdep = pcdep_color_slots_at(recipe.jitcode_index, py_pc);
+    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+        let twin = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc);
+        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("a1_recipe_pcdep", "fire");
+        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
+            "a1_recipe_pcdep",
+            if twin.as_deref().unwrap_or_default() == pcdep.as_slice() {
+                "eq"
+            } else {
+                "di"
+            },
+        );
+    }
     for k in nlocals..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
