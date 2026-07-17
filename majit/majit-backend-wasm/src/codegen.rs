@@ -1270,6 +1270,10 @@ pub fn build_wasm_module(
     // Inline nursery-bump fast path for eligible `New`/`NewWithVtable`
     // (see `NurseryAllocParams`); `None` keeps allocations on the helper.
     nursery: Option<&NurseryAllocParams>,
+    // Address of the owning JitCellToken.invalidated AtomicBool in shared
+    // linear memory. GUARD_NOT_INVALIDATED reads this byte at runtime, like
+    // the native backends bake the same Arc allocation's address.
+    invalidated_flag_addr: u32,
     fail_index_base: u32,
     // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
     // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
@@ -1559,6 +1563,7 @@ pub fn build_wasm_module(
         &ref_homes,
         cells_base,
         bridge_dispatch,
+        invalidated_flag_addr,
         fail_index_base,
         external_jump_slot,
         external_jump_key,
@@ -1600,6 +1605,7 @@ fn build_function(
     ref_homes: &RefHomes,
     cells_base: u32,
     bridge_dispatch: bool,
+    invalidated_flag_addr: u32,
     fail_index_base: u32,
     external_jump_slot: u32,
     // Resume-at-LABEL dispatch key the terminal external JUMP writes before
@@ -2105,9 +2111,33 @@ fn build_function(
                 }
                 guard_idx += 1;
             }
-            // Guards that always pass in wasm MVP (no force-token /
-            // invalidation tracking yet).
-            OpCode::GuardNotInvalidated | OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+            OpCode::GuardNotInvalidated => {
+                // x86/assembler.py:4618-4637 parity: the guard site observes
+                // the owning loop token's invalidation flag on every entry.
+                // On wasm32 the Arc allocation lives in shared linear memory,
+                // so its stable pointer is directly addressable by the trace.
+                if invalidated_flag_addr != 0 {
+                    sink.i32_const(invalidated_flag_addr as i32);
+                    sink.i32_load8_u(MemArg {
+                        offset: 0,
+                        align: 0,
+                        memory_index: 0,
+                    });
+                    sink.i32_const(0);
+                    sink.i32_ne();
+                    emit_guard_if_exit(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        guard_idx,
+                        op,
+                        block_exit_depth,
+                    );
+                }
+                guard_idx += 1;
+            }
+            // Force-token guards still always pass in the wasm backend.
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                 guard_idx += 1;
             }
             OpCode::GuardNoException => {

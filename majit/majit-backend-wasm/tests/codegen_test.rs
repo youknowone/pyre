@@ -210,6 +210,7 @@ fn build_module(
         0,
         0,
         None, // nursery
+        0,    // invalidated_flag_addr
         0,    // fail_index_base
         0,    // external_jump_slot
         0,    // external_jump_key
@@ -435,7 +436,7 @@ fn test_guard_types() {
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },
-        // GuardNotInvalidated (0 args, always pass)
+        // GuardNotInvalidated (0 args; address 0 in this generic smoke test)
         {
             let op = Op::new(OpCode::GuardNotInvalidated, &[]);
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
@@ -451,6 +452,58 @@ fn test_guard_types() {
     let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
+}
+
+/// GUARD_NOT_INVALIDATED must read the owning token's live AtomicBool rather
+/// than being folded to an always-passing guard. The runtime regression is
+/// covered by global_quasiimmut_invalidation.py; this pins the emitted load.
+#[test]
+fn test_guard_not_invalidated_loads_runtime_flag() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let guard = Op::new(OpCode::GuardNotInvalidated, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let ops = vec![
+        guard,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let constants = indexmap::IndexMap::new();
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        None,
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
+        0,
+        None,
+        0x1000,
+        0,
+        0,
+        0,
+        codegen::FrameGeometry::fixed(),
+        codegen::CaParams::default(),
+    )
+    .expect("wasm codegen should succeed");
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2);
+    let mut saw_flag_load = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                if matches!(
+                    operators.read().unwrap(),
+                    wasmparser::Operator::I32Load8U { .. }
+                ) {
+                    saw_flag_load = true;
+                }
+            }
+        }
+    }
+    assert!(saw_flag_load, "GUARD_NOT_INVALIDATED omitted its flag load");
 }
 
 /// GuardNoException loads the global exception slot and fails when it is set;

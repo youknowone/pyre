@@ -1555,6 +1555,7 @@ impl majit_backend::Backend for WasmBackend {
                 alloc_array_fn_ptr,
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
+                Arc::as_ptr(&token.invalidated) as usize as u32,
                 fail_index_base,
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
@@ -1852,6 +1853,19 @@ impl majit_backend::Backend for WasmBackend {
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
         diag_bump(0); // compile_bridge entered
+
+        // PyPy patches every GUARD_NOT_INVALIDATED in a loop and its already
+        // attached bridges to their recovery stubs at invalidation time. A
+        // wasm guard reads the equivalent live token flag instead. Never add
+        // a new in-module bridge after that transition: in particular, a
+        // bridge attached to the newly failing invalidation guard could jump
+        // back into the same permanently-invalidated loop and form a closed
+        // loop↔bridge cycle without returning to the blackhole interpreter.
+        if original_token.is_invalidated() {
+            return Err(BackendError::Unsupported(
+                "wasm backend: cannot attach a bridge to an invalidated loop".into(),
+            ));
+        }
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
         // bridge whose re-entry target is plumbed via `external_jump_slot`.
@@ -2251,6 +2265,7 @@ impl majit_backend::Backend for WasmBackend {
                 alloc_array_fn_ptr,
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
+                Arc::as_ptr(&original_token.invalidated) as usize as u32,
                 base,
                 // A loop-closing bridge's terminal JUMP re-enters the target
                 // loop (own or sibling, resolved via `LABEL_TARGETS`) through
@@ -2777,11 +2792,11 @@ impl majit_backend::Backend for WasmBackend {
         crate::jit_exc_clear();
     }
 
-    fn invalidate_loop(&self, _token: &JitCellToken) {
-        // No native code to invalidate — wasm modules are immutable.
-        // A CALL_ASSEMBLER module bakes the stable dispatch entry's address;
-        // its lifetime ends only when CompiledWasmLoop::drop retracts every
-        // alias for that compiled_ptr.
+    fn invalidate_loop(&self, token: &JitCellToken) {
+        // x86/assembler.py:641-648 invalidate_loop parity. The wasm module is
+        // immutable, so GUARD_NOT_INVALIDATED loads this live flag instead of
+        // having its instruction bytes patched in place.
+        token.invalidated.store(true, Ordering::Release);
     }
 
     fn redirect_call_assembler(
