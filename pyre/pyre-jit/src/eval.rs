@@ -4201,6 +4201,13 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 /// such a frame to the interpreter. The plain `if cond: break` idiom compiles
 /// to a `POP_JUMP_IF_FALSE` whose fall-through IS the break — the primary edge —
 /// and still compiles.
+///
+/// The `POP_JUMP_IF_TRUE` test is a deliberate sound over-approximation: any
+/// such branch in the guard (e.g. one arm of a short-circuit `or`) declines the
+/// frame even when that particular arm is provably safe, because a hazardous
+/// arm elsewhere in the same guard (a compound `and`) can reach the break
+/// through it. A few extra interpreted frames are traded for a guarantee that
+/// the mis-mapped resume is never compiled.
 fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> bool {
     let num_instrs = code.instructions.len();
     for pop_pc in 0..num_instrs {

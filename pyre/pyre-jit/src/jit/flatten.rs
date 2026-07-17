@@ -11983,13 +11983,9 @@ mod tests {
             _ => panic!("unexpected var id {:?}", var.id),
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_newslice_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("3-arg newslice lowering must succeed");
+        let insn =
+            super::lower_newslice_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("3-arg newslice lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
