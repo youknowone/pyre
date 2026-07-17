@@ -175,9 +175,11 @@ fn rewire_one_range_contains_site(
     //    definition.  The single-consumer gate below is what makes this
     //    sound; here we only need to pick the producing site.
     let c_block = graph.blocks[c_idx].id;
-    let new_site = new_sites
+    let (new_site, range_trace) = new_sites
         .iter()
-        .find(|s| range_matches_new_site(graph, c_block, &range_v, &s.result_var))
+        .find_map(|s| {
+            range_matches_new_site(graph, c_block, &range_v, &s.result_var).map(|trace| (s, trace))
+        })
         .ok_or_else(|| {
             format!("{name}: range contains receiver traces to no RangeInclusive::new site")
         })?;
@@ -185,12 +187,13 @@ fn rewire_one_range_contains_site(
     // 4. Consumer-shape gate (excludes iteration-form ranges, whose
     //    range carries a stateful `exhausted` field read a second time by
     //    an iterator's `into_iter` / `next`).  The range value must be
-    //    read as an OP operand by exactly the `contains` op being folded —
-    //    link-arg threading of the same Variable is liveness forwarding,
-    //    not consumption.  Any other op reading the range declines.
-    if !range_value_single_op_consumer(graph, &new_site.result_var, &range_v, &site.result_var) {
+    //    read as an OP operand by exactly the `contains` op being folded.
+    //    Only the positional producer-to-consumer Links recorded by the
+    //    trace are permitted; any other Link carrying any traced alias means
+    //    the range survives past (or branches away from) `contains`.
+    if !range_value_single_op_consumer(graph, &range_trace, &site.result_var) {
         return Err(format!(
-            "{name}: range value has a second op consumer — declining (iteration form?)"
+            "{name}: range value has a second consumer — declining (iteration form?)"
         ));
     }
 
@@ -246,21 +249,39 @@ fn rewire_one_range_contains_site(
 /// value at the matching link-arg index, recursing on that supplied
 /// Variable until it either reaches `new_result` (match) or a block that
 /// defines it via an op (must then equal `new_result`).
+struct RangeAliasTrace {
+    aliases: Vec<Variable>,
+    /// `(predecessor block, exit index, link-argument index)` for each
+    /// positional forwarding edge on the producer-to-`contains` trace;
+    /// RPython's `Link.args` carries these Variables positionally
+    /// (`rpython/flowspace/model.py:140-149`).
+    threaded_links: Vec<(BlockId, usize, usize)>,
+}
+
 fn range_matches_new_site(
     graph: &FunctionGraph,
     c_block: BlockId,
     range_v: &Variable,
     new_result: &Variable,
-) -> bool {
+) -> Option<RangeAliasTrace> {
     let mut cur_block = c_block;
     let mut cur_var = range_v.clone();
-    let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+    let mut aliases = vec![cur_var.clone()];
+    let mut threaded_links = Vec::new();
+    let mut hops = 0usize;
     loop {
         if &cur_var == new_result {
-            return true;
+            if !aliases.contains(new_result) {
+                aliases.push(new_result.clone());
+            }
+            return Some(RangeAliasTrace {
+                aliases,
+                threaded_links,
+            });
         }
-        if !seen.insert(cur_block) {
-            return false;
+        hops += 1;
+        if hops > graph.blocks.len() {
+            return None;
         }
         // `cur_var` must be a block inputarg to trace across the edge;
         // if it is defined by an op in `cur_block` and is not
@@ -271,7 +292,7 @@ fn range_matches_new_site(
             .iter()
             .position(|v| v == &cur_var)
         else {
-            return false;
+            return None;
         };
         // Exactly one predecessor edge, carrying the source at `arg_idx`.
         let pred_edges: Vec<(BlockId, usize)> = graph
@@ -287,14 +308,18 @@ fn range_matches_new_site(
             })
             .collect();
         if pred_edges.len() != 1 {
-            return false;
+            return None;
         }
         let (pred_block, exit_idx) = pred_edges[0];
         let Some(LinkArg::Value(src)) = graph.block(pred_block).exits[exit_idx].args.get(arg_idx)
         else {
-            return false;
+            return None;
         };
+        threaded_links.push((pred_block, exit_idx, arg_idx));
         cur_var = src.clone();
+        if !aliases.contains(&cur_var) {
+            aliases.push(cur_var.clone());
+        }
         cur_block = pred_block;
     }
 }
@@ -305,9 +330,10 @@ fn range_matches_new_site(
 /// the private helper of the same name in `model::thread_undefined_op_operands`.
 fn defined_via_single_pred_chain(graph: &FunctionGraph, block: BlockId, var: &Variable) -> bool {
     let mut cur = block;
-    let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+    let mut hops = 0usize;
     loop {
-        if !seen.insert(cur) {
+        hops += 1;
+        if hops > graph.blocks.len() {
             return false;
         }
         let preds = graph.predecessors(cur);
@@ -335,25 +361,18 @@ fn can_thread_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable) ->
 /// iteration-form ranges (whose range carries a stateful `exhausted`
 /// field an iterator's `into_iter` / `next` reads a second time).
 ///
-/// "Consumed" means read as an OP operand — NOT threaded on a link arg.
-/// The front models a value that outlives its defining block by reusing
-/// the SAME `Variable` identity across the intervening blocks' link args
-/// (liveness forwarding toward its eventual drop), so the range's
-/// `new_result` legitimately appears on many `Link.args`; those are not
-/// consumers.  The gate therefore counts only op-operand reads of the
-/// range value — of `new_result` itself and, when the front minted a
-/// fresh C-inputarg for the receiver (framestate SSA), of `receiver` —
-/// and requires every such read to belong to the single `contains` op
-/// (result `contains_result`).  Any other op reading the range (an
-/// iterator, a second `contains`, a `clone`) is a second consumer →
-/// decline.  A range value driving an `exitswitch` also declines.
+/// Framestate SSA can mint a fresh inputarg at every forwarding block, so the
+/// gate checks every Variable in the positional producer trace rather than
+/// only its endpoints.  The trace's own Link slots are the only permitted
+/// forwarding reads.  Any other op, exitswitch, Link arg, exception Link
+/// payload, return, iterator, second `contains`, or clone carrying an alias is
+/// a second consumer and declines before either residual call is removed.
 fn range_value_single_op_consumer(
     graph: &FunctionGraph,
-    new_result: &Variable,
-    receiver: &Variable,
+    trace: &RangeAliasTrace,
     contains_result: &Variable,
 ) -> bool {
-    let is_range_value = |v: &Variable| v == new_result || v == receiver;
+    let is_range_value = |v: &Variable| trace.aliases.contains(v);
     for block in &graph.blocks {
         for op in &block.operations {
             let reads_range = crate::inline::op_variable_refs(&op.kind)
@@ -373,6 +392,31 @@ fn range_value_single_op_consumer(
                 return false;
             }
             _ => {}
+        }
+        for (exit_idx, link) in block.exits.iter().enumerate() {
+            for (arg_idx, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(var) = arg else { continue };
+                if is_range_value(var)
+                    && !trace
+                        .threaded_links
+                        .contains(&(block.id, exit_idx, arg_idx))
+                {
+                    return false;
+                }
+            }
+            if link
+                .last_exception
+                .as_ref()
+                .and_then(LinkArg::as_variable)
+                .is_some_and(is_range_value)
+                || link
+                    .last_exc_value
+                    .as_ref()
+                    .and_then(LinkArg::as_variable)
+                    .is_some_and(is_range_value)
+            {
+                return false;
+            }
         }
     }
     true
@@ -627,6 +671,86 @@ mod tests {
             }],
         );
         assert_eq!(rewritten, 0, "a second range consumer declines the fold");
+        assert_eq!(
+            functionpath_calls_ending(&g, &["range", "RangeInclusive", "new"]),
+            1,
+            "residual new survives",
+        );
+        assert_eq!(
+            functionpath_calls_ending(&g, &["range", "RangeInclusive", "contains"]),
+            1,
+            "residual contains survives",
+        );
+    }
+
+    /// Framestate threading gives the successor a third identity for the
+    /// range.  Carrying that alias beyond the middle `contains` block must
+    /// keep both residual calls: deleting `new` would leave the successor's
+    /// input undefined.
+    #[test]
+    fn rewrite_declines_when_successor_carries_fresh_range_alias() {
+        let mut g = FunctionGraph::new("test_range_contains_successor_alias");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(255), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target(),
+                    args: vec![a.clone(), b.clone()],
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+
+        // Middle block M consumes one alias in `contains`, then threads it
+        // onward.  The successor S receives a fresh framestate inputarg and
+        // consumes that alias independently.
+        let (m, m_args) = g.create_block_with_arg_vars(1);
+        let range_in_m = m_args[0].clone();
+        let x = g.push_op_var(m, OpKind::ConstInt(42), true).unwrap();
+        let contains = g
+            .push_op_var(
+                m,
+                OpKind::Call {
+                    target: contains_target(),
+                    args: vec![range_in_m.clone(), x],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (s, s_args) = g.create_block_with_arg_vars(1);
+        let range_in_s = s_args[0].clone();
+        let later_use = g
+            .push_op_var(
+                s,
+                OpKind::UnaryOp {
+                    op: "invert".to_string(),
+                    operand: range_in_s,
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(s, Some(later_use));
+        g.set_goto(m, s, vec![range_in_m]);
+        g.set_goto(n, m, vec![range.clone()]);
+
+        let rewritten = rewire_range_contains_call_sites(
+            &mut g,
+            &[RangeInclusiveNewSite {
+                result_var: range,
+                lo: a,
+                hi: b,
+            }],
+            &[RangeContainsSite {
+                result_var: contains,
+            }],
+        );
+        assert_eq!(rewritten, 0, "a successor range alias declines the fold");
         assert_eq!(
             functionpath_calls_ending(&g, &["range", "RangeInclusive", "new"]),
             1,

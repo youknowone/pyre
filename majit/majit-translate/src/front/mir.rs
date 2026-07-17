@@ -8243,6 +8243,23 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// One concrete type argument from an ADT signature type.  Charon stores
+    /// `Result<X, E>` as `Adt.generics.types = [X, E]`; deserialize the chosen
+    /// node back through [`TyRef`] so deduplicated and inline literal forms use
+    /// the same width-atom helpers as top-level signature inputs/outputs.
+    fn tyref_adt_type_arg(&self, ty: &TyRef, index: usize) -> Option<TyRef> {
+        let node = tyref_node(ty, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .as_object()?
+            .get("generics")?
+            .as_object()?
+            .get("types")?
+            .as_array()?
+            .get(index)?;
+        serde_json::from_value(node.clone()).ok()
+    }
+
     /// The ADT `def_id` behind a signature [`TyRef`], peeling `Ref` /
     /// `RawPtr` wrappers and dedup / hash-cons indirections first — a
     /// `bool::then` closure env arrives as `&closure`.  Mirrors the
@@ -8965,6 +8982,23 @@ impl<'a> Lowering<'a> {
         let Some(td) = self.llbc.type_by_id(def_id) else {
             return Ok(false);
         };
+        // The synthesized fits test and payload are specifically the signed
+        // machine-word conversion.  Other BigInt TryFrom impls (notably
+        // `u32::try_from(&value)` in formatting.rs::char_arg) have different
+        // bounds and must keep the ordinary residual call.  Read Result's
+        // success payload from `generics.types[0]`, then apply the same
+        // literal-width atom gate as the other integer conversion lowerings.
+        // RPython keeps signed `toint`/`fits_int` distinct from unsigned
+        // `touint` (`rpython/rlib/rbigint.py:465-485, 515-518`).
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.tyref_literal_int_atom(&success_ty),
+            Some("I64" | "Isize")
+        ) {
+            return Ok(false);
+        }
         // Route the runtime-discriminant tagged-pair ctor to the SAME
         // per-instantiation enum root a static `Ok(..)`/`Err(..)` mints,
         // by suffixing the bare template name with the `<X>` the
@@ -16941,8 +16975,55 @@ mod tests {
                 .count()
         };
         assert!(
+            range_call("new") >= 1,
+            "float range constructor stays residual (fold out of scope)"
+        );
+        assert!(
             range_call("contains") >= 1,
             "float range contains stays residual (fold out of scope)"
+        );
+    }
+
+    /// `formatting::char_arg` narrows its BigInt to `u32`, not `i64`.  The
+    /// i64-specific fits/discriminant synthesis must decline and leave the
+    /// original `TryFrom<&BigInt>` call residual.  Ignored by default because
+    /// it loads the real interpreter LLBC.
+    #[test]
+    #[ignore]
+    fn bigint_i64_try_from_real_declines_u32_result() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "char_arg").expect("lower char_arg");
+
+        let calls: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls.iter().any(|segments| {
+                super::fmt_path_ends_with(segments, &["bigint", "<Impl>", "try_from"])
+                    || super::fmt_path_ends_with(segments, &["<Impl>", "try_from"])
+            }),
+            "u32::try_from(&BigInt) must remain a residual FunctionPath call"
+        );
+        assert!(
+            !calls.iter().any(|segments| {
+                segments.last().map(String::as_str) == Some("jit_bigint_to_i64_fits")
+            }),
+            "u32 destination must not use the i64 fits/discriminant lowering"
         );
     }
 

@@ -2637,9 +2637,10 @@ pub fn fuse_boxing_alloc(
     // `ob_type` / `w_class` from it, so only the non-header setfield(s) are
     // re-emitted (oracle: `box_trace.rs trace_box_float` / `trace_box_int`).
     // This mirrors the type-generic malloc lowering in the front end
-    // (`rbuiltin.py` `rtype_malloc` / `rclass.py` reads the lltype's field
-    // layout); `struct_field_attrs` is the already-computed layout map the
-    // front end owns, so this pass performs no front-end (Llbc) reads.
+    // (`rpython/rtyper/rbuiltin.py:349-385` `rtype_malloc`; `rclass.py` reads
+    // the exact lltype's field layout); `struct_field_attrs` is the
+    // already-computed layout map the front end owns, so this pass performs no
+    // front-end (Llbc) reads.
     //
     // The ctor carries the bare struct leaf (`W_FloatObject`) while the map is
     // keyed by the crate-stripped qualified path (`floatobject::W_FloatObject`),
@@ -2650,12 +2651,21 @@ pub fn fuse_boxing_alloc(
         owner: &str,
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     ) -> Option<Vec<(String, ValueType)>> {
-        let rows = struct_field_attrs.get(owner).or_else(|| {
-            struct_field_attrs
+        let rows = if let Some(exact) = struct_field_attrs.get(owner) {
+            exact
+        } else {
+            let mut leaf_matches = struct_field_attrs
                 .iter()
-                .find(|(k, _)| k.rsplit("::").next() == Some(owner))
-                .map(|(_, v)| v)
-        })?;
+                .filter(|(k, _)| k.rsplit("::").next() == Some(owner));
+            let (_, only) = leaf_matches.next()?;
+            if leaf_matches.next().is_some() {
+                // The layout owner is ambiguous.  As with an unknown owner,
+                // leave malloc_typed residual instead of choosing one map row
+                // by HashMap iteration order.
+                return None;
+            }
+            only
+        };
         Some(
             rows.iter()
                 .filter(|(name, _)| name != "ob_header")
@@ -6183,6 +6193,33 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(ret.clone()));
+
+        let mut ambiguous_graph = graph.clone();
+        let mut ambiguous_attrs = numeric_boxing_attrs();
+        ambiguous_attrs.insert(
+            "shadow::W_FloatObject".to_string(),
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("wrong_payload".to_string(), ValueType::Int),
+            ],
+        );
+        assert_eq!(
+            fuse_boxing_alloc(&mut ambiguous_graph, &ambiguous_attrs),
+            0,
+            "two qualified owners with the same leaf must decline fusion"
+        );
+        assert!(
+            ambiguous_graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "ambiguous leaf layout keeps malloc_typed residual"
+        );
 
         let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
         assert_eq!(fused, 1, "exactly one boxing cluster must fuse");

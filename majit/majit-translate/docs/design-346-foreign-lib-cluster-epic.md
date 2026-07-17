@@ -2,7 +2,53 @@
 
 ## Why this epic exists
 
-On base `eca75827fe4` the JIT-prepass census has **268 distinct `[PREPASS phaseA fail]`** paths.
+The measurements in this document have the following provenance. They are not
+three readings of one unchanged input set:
+
+- **268 total phaseA failures:** commit `eca75827fe43618b24328653c150751f9b5399e8`,
+  release profile, default features, the then-current frozen `build/llbc`
+  snapshot (not re-extracted), and `PYRE_RTYPER_VERBOSE=1`. The exact command
+  was:
+
+  ```text
+  touch pyre/pyre-jit-trace/build.rs
+  PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
+  stderr=$(ls -t target/release/build/pyre-jit-trace-*/stderr | head -1)
+  rg --no-config 'PREPASS phaseA fail' "$stderr" | sort -u | wc -l
+  ```
+
+- **16 `try_from`-headed phaseA failures:** commit
+  `ccdc1a52be2237365154976149e7b573db811d82`, release profile, default
+  features, that worktree's frozen `build/llbc` snapshot, and
+  `PYRE_RTYPER_VERBOSE=1`. This is a filtered diagnostic count, not a total:
+
+  ```text
+  touch pyre/pyre-jit-trace/build.rs
+  PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
+  stderr=$(ls -t target/release/build/pyre-jit-trace-*/stderr | head -1)
+  rg --no-config 'PREPASS phaseA fail' "$stderr" | rg --no-config 'try_from' | sort -u | wc -l
+  ```
+
+- **276 total post-Slice-A phaseA failures:** commit
+  `bb6ee8d179c70f170ee4e3a3cb9b4dce99d96d9b`, release profile, default
+  features, and `PYRE_RTYPER_VERBOSE=1`. Slice A changed `pyre-object`, so this
+  run first re-extracted the default LLBC set with the repository's pinned
+  Charon, then rebuilt and counted:
+
+  ```text
+  python3 scripts/extract-llbc.py
+  touch pyre/pyre-jit-trace/build.rs
+  PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
+  stderr=$(ls -t target/release/build/pyre-jit-trace-*/stderr | head -1)
+  rg --no-config 'PREPASS phaseA fail' "$stderr" | sort -u | wc -l
+  ```
+
+The 276 run is **not** a direct 268→276 Slice-A delta: `bb6ee8d179c` descends
+from `eca75827fe4` through intervening changes and uses re-extracted LLBC, while
+268 used the older frozen snapshot. The 268 figure is therefore the historical
+pre-Slice-A planning baseline only; the separately configured 276 run is the
+post-Slice-A baseline for Slice-B scoping.
+
 A root-cause analysis (deepest-root, per-record all-blockers) ranked the leaves by "sole-unblock"
 leverage. The top three (`box_assume_init` / vec!, `malachite ::try_from`, and the
 `Wtf8`/`Map::collect`/`IndexMap` group) looked independently high-value, but a **peel-and-recensus**
@@ -18,7 +64,7 @@ of each proved otherwise:
 `w_list_setitem`, `setitem_bytearray`, `plain_int_w`) is guarded by a **stack** of foreign-std walls.
 Peeling one exposes the next:
 
-```
+```text
 box_assume_init (vec!) → malachite ::try_from → String::new → core::slice::get / join
   → Wtf8Buf::with_capacity → Enumerate::next → IndexMap::insert / get
 ```
@@ -44,8 +90,10 @@ default arm and emits `newlist/r>r` — an opname with no blackhole handler — 
 
 ### Slice A — malachite `try_from` (task #21, FIRST, no deps)
 
-**Census (base `ccdc1a52be2`):** 16 phaseA graphs have a `try_from` first wall, split into TWO
+**Census (filtered run at `ccdc1a52be2237365154976149e7b573db811d82`; exact
+configuration and command above):** 16 phaseA graphs have a `try_from` first wall, split into TWO
 unrelated families:
+
 - **13 graphs = malachite** (`["malachite_bigint","bigint","<Impl>","try_from"]`) — the Slice-A target.
 - **3 graphs = int-to-int** (`["core","convert","num","<Impl>","try_from"]`: `int_pow`, `pow`,
   `opcode_get_iter`) — NOT malachite. `int_pow` is `u32::try_from(vb)` with a genuine
@@ -116,7 +164,9 @@ Err arm — MUST still raise IndexError/ValueError, not panic).
 
 ### Slice B — String / Wtf8 / IndexMap / slice / iter-adapter residuals (task #22, after A)
 
-Scoped 7/17 on the post-Slice-A census (base `bb6ee8d179c`, 276 phaseA): **46 distinct unregistered
+Scoped 7/17 on the separate post-Slice-A census run
+(`bb6ee8d179c70f170ee4e3a3cb9b4dce99d96d9b`, 276 total phaseA; exact
+configuration and command above): **46 distinct unregistered
 residual paths**, saved to `/tmp/sliceB_residual_ranking.txt` (de-escape `\"`→`"` before counting).
 The three walls that gate the hot dispatcher heads (innermost per record):
 
@@ -170,6 +220,7 @@ co-land):**
 - **B3 (LAST in B, real rtyper work)** — the (N) native lowerings.
 
 ### Slice C — vec!/NewList recognizer + repr-generic rtype_newlist (task #20, LAST, capstone)
+
 - **Ca** Re-add the front/mir recognizer (verbatim from reverted `f41cb0496dc`): match
   `box_assume_init_into_vec_unsafe(box [e0..eN])` → `OpKind::NewList{args}`. Helpers
   `read_array_literal_elements` (mir.rs:13581) + `fmt_path_ends_with` (mir.rs:13673) still in tree.
@@ -192,8 +243,15 @@ Verify each slice: `cargo test -p majit-translate` + census phaseA set-diff (cou
 `check.py` bit-exact 3-backend.
 
 ## Metric
-Distinct `[PREPASS phaseA fail]` count in the census (268 on base `ccdc1a52be2`). Each slice measured
-by set-diff. GOTCHA: the census **stderr** logs only phaseA *reasons* — the emitted `newlist/r>r`
+
+The metric is the distinct `[PREPASS phaseA fail]` count produced by the exact
+commands and configurations recorded above. Use set-diff only between runs made
+from the same source commit ancestry and the same extracted LLBC snapshot. In
+particular, 268 at `eca75827fe4` is the historical pre-Slice-A planning baseline,
+16 at `ccdc1a52be2` is only the filtered `try_from` subset, and 276 at
+`bb6ee8d179c` is a separately configured post-Slice-A baseline; do not treat
+268→276 as a Slice-A regression. GOTCHA: the census **stderr** logs only phaseA
+*reasons* — the emitted `newlist/r>r`
 opname lives in `insns.bin` (build OUT_DIR `target/debug/build/pyre-jit-trace-<hash>/out/insns.bin`;
 `strings insns.bin | rg newlist`), not stderr. The cluster's hot graphs (`setitem_list`,
 `getitem_list`, `w_list_setitem`, `setitem_bytearray`) only lift once ALL their stacked walls close —
