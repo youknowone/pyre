@@ -12672,6 +12672,82 @@ impl CodeWriter {
             result_color_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
+        // Compose the py-indexed predecessor tier with the exact one-byte
+        // block-head override into a JitCode-PC boundary table.  This is the
+        // same resolver as `python_pc_for_jitcode_pc_legacy`, constructed from
+        // its two input tiers rather than by sampling it at every byte.
+        let mut floor_boundaries: Vec<(usize, u32)> = first_jit_pc_by_py_pc
+            .iter()
+            .enumerate()
+            .filter_map(|(py, &pos)| {
+                (pos != usize::MAX).then_some((
+                    pos,
+                    u32::try_from(py).expect("Python PC must fit the JitCode pivot"),
+                ))
+            })
+            .collect();
+        floor_boundaries.sort_unstable_by_key(|&(pos, py)| (pos, py));
+        let mut unique_floor_boundaries: Vec<(usize, u32)> =
+            Vec::with_capacity(floor_boundaries.len());
+        for (pos, py) in floor_boundaries {
+            if let Some((previous_pos, previous_py)) = unique_floor_boundaries.last_mut()
+                && *previous_pos == pos
+            {
+                // The legacy scan updates on `pos >= best`, so the later py
+                // wins when multiple Python PCs begin at one JitCode offset.
+                *previous_py = py;
+            } else {
+                unique_floor_boundaries.push((pos, py));
+            }
+        }
+        let floor_boundaries = unique_floor_boundaries;
+        let floor_py_at = |jit_pc: usize| {
+            floor_boundaries
+                .partition_point(|&(pos, _)| pos <= jit_pc)
+                .checked_sub(1)
+                .map_or(0, |idx| floor_boundaries[idx].1)
+        };
+        // Priority order at a shared offset: floor boundary < one-byte
+        // re-open < exact block head.  The last event at an offset wins.
+        let mut pivot_events: Vec<(usize, u8, u32)> = floor_boundaries
+            .iter()
+            .map(|&(off, py)| (off, 0, py))
+            .collect();
+        for &(off, head_py) in &block_head_py_by_jit_pc {
+            pivot_events.push((off, 2, head_py));
+            if let Some(next) = off.checked_add(1) {
+                if floor_boundaries
+                    .binary_search_by_key(&next, |&(floor_off, _)| floor_off)
+                    .is_err()
+                {
+                    pivot_events.push((next, 1, floor_py_at(next)));
+                }
+            }
+        }
+        pivot_events.sort_unstable_by_key(|&(off, priority, _)| (off, priority));
+        let mut py_by_jit_pc: Vec<(u32, u32)> = Vec::with_capacity(pivot_events.len() + 1);
+        let mut event = 0;
+        while event < pivot_events.len() {
+            let (off, _, mut py) = pivot_events[event];
+            event += 1;
+            while event < pivot_events.len() && pivot_events[event].0 == off {
+                py = pivot_events[event].2;
+                event += 1;
+            }
+            if py_by_jit_pc
+                .last()
+                .is_none_or(|&(_, previous_py)| previous_py != py)
+            {
+                py_by_jit_pc.push((
+                    u32::try_from(off).expect("JitCode PC must fit the pivot"),
+                    py,
+                ));
+            }
+        }
+        if py_by_jit_pc.first().is_none_or(|&(off, _)| off != 0) {
+            py_by_jit_pc.insert(0, (0, 0));
+        }
+
         // task#50 sparse carry-forward sidecar: capture ONLY the py_pcs whose
         // dense marker the on-demand `derive_resume_marker` derivation cannot
         // reproduce from `first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`.
@@ -12975,6 +13051,7 @@ impl CodeWriter {
             after_residual_call_resume_pred_by_jit_pc,
             first_jit_pc_by_py_pc,
             block_head_py_by_jit_pc,
+            py_by_jit_pc,
             carryfwd_resume_pc,
             merge_entry_by_green,
             depth_at_py_pc: depth_at_pc,
@@ -13008,6 +13085,26 @@ impl CodeWriter {
             const_ref_slots_by_jit_pc,
             is_drained: true,
         };
+
+        if pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+            for jit_pc in 0..jitcode.body().code.len() {
+                assert_eq!(
+                    pyre_jit_trace::pyjitcode::py_for_jitcode_pc_pivot(
+                        &metadata.py_by_jit_pc,
+                        jit_pc,
+                    ),
+                    Some(
+                        pyre_jit_trace::jitcode_dispatch::python_pc_for_jitcode_pc_legacy(
+                            &metadata, jit_pc,
+                        )
+                    ),
+                    "PCMAP_PIVOT build lookup diverges at jit_pc={jit_pc}",
+                );
+            }
+            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_sweep(
+                jitcode.body().code.len(),
+            );
+        }
 
         PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),

@@ -12346,6 +12346,7 @@ mod tests {
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
+                py_by_jit_pc: Vec::new(),
                 carryfwd_resume_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],

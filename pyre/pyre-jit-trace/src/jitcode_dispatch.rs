@@ -11173,7 +11173,9 @@ fn m73_outercap_carry_enabled() -> bool {
     })
 }
 
-pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
+/// Legacy py-indexed resolver retained for skeleton / fixture metadata and the
+/// pivot audit certificate.
+pub fn python_pc_for_jitcode_pc_legacy(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
     // no jitcode of its own), so the containing opcode is the largest `py`
@@ -11217,6 +11219,48 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // Both live tiers missed (skeleton / fixture, or a
     // coordinate preceding the first op): resume at the first opcode.
     best.map_or(0, |(_, py)| py)
+}
+
+/// `PYRE_PCMAP_PIVOT_AUDIT` exhaustively certifies each codewriter-built
+/// JitCode-PC pivot and cross-checks every production lookup against the
+/// preserved py-indexed resolver.  Off by default.
+pub fn pcmap_pivot_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT").is_some())
+}
+
+/// Record one completed exhaustive pivot sweep when a caller supplies the
+/// optional probe path. `check.py` captures child stderr, so this keeps the
+/// audit certificate's coverage count available to its caller.
+pub fn pcmap_pivot_audit_record_sweep(jitcode_byte_len: usize) {
+    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
+        return;
+    };
+    use std::io::Write;
+
+    if let Ok(mut probe) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(probe, "jitcode_bytes={jitcode_byte_len}");
+    }
+}
+
+pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
+    if !metadata.py_by_jit_pc.is_empty() {
+        let pivot = crate::pyjitcode::py_for_jitcode_pc_pivot(&metadata.py_by_jit_pc, jit_pc)
+            .expect("drained JitCode PC pivot must begin at byte offset zero");
+        if pcmap_pivot_audit_enabled() {
+            assert_eq!(
+                pivot,
+                python_pc_for_jitcode_pc_legacy(metadata, jit_pc),
+                "PCMAP_PIVOT runtime lookup diverges at jit_pc={jit_pc}",
+            );
+        }
+        return pivot;
+    }
+    python_pc_for_jitcode_pc_legacy(metadata, jit_pc)
 }
 
 /// `PYRE_PCMAP_INFLIGHT_AUDIT` records the final in-flight FOR_ITER body
