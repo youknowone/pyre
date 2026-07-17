@@ -10090,7 +10090,6 @@ mod tests {
         pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.is_drained = true;
-        pyjit.metadata.depth_at_py_pc.push(1);
         // Per-PC (color, slot) entries the codewriter publishes at pc 0:
         // local 0 -> color 0 (slot 0), local 1 -> color 1 (slot 1), and the
         // live operand-stack slot (depth 0 = abs slot nlocals+0 = 2) -> color

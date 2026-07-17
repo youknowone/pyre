@@ -13470,10 +13470,7 @@ fn walker_capture_multi_frame_inline_snapshot(
                 .pcdep_for_jitcode_pc(callee_op_pc)
                 .unwrap_or_default();
             let depth = callee_pjc
-                .metadata
-                .depth_at_py_pc
-                .get(callee_py_pc as usize)
-                .copied()
+                .depth_for_jitcode_pc_pred(callee_op_pc)
                 .unwrap_or(0);
             let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
                 callee_jitcode_index as i32,
@@ -16354,15 +16351,7 @@ fn try_walker_inline_resolved_user_call(
                         return None;
                     }
                     let depth_twin = callee_pjc.depth_for_jitcode_pc_pred(abort_pc);
-                    if depth_twin.is_none() {
-                        pcmap_pivot_audit_record_fire(
-                            "midbody_producer_depth",
-                            "py_pc_legacy_or_else",
-                        );
-                    }
-                    let Some(depth) =
-                        depth_twin.or_else(|| metadata.depth_at_py_pc.get(callee_py_pc).copied())
-                    else {
+                    let Some(depth) = depth_twin else {
                         return None;
                     };
                     let depth = depth as usize;

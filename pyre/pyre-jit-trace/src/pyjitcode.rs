@@ -91,8 +91,6 @@ pub struct PyJitCodeMetadata {
     /// per materialized trace-entry green. Sorted ascending by green py_pc for
     /// binary search; empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
-    /// Value-stack depth at each Python PC, in slots above stack_base.
-    pub depth_at_py_pc: Vec<u16>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
     /// color→slot list of the py_pc that `python_pc_for_jitcode_pc(off)` returns
@@ -893,7 +891,6 @@ impl PyJitCode {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 result_color_after_residual_marker_by_jit_pc: Vec::new(),
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
-                depth_at_py_pc: Vec::new(),
                 result_color_by_jit_pc: Vec::new(),
                 // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,

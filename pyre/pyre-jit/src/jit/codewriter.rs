@@ -13394,7 +13394,6 @@ impl CodeWriter {
             block_head_py_by_jit_pc,
             py_floor_by_jit_pc,
             merge_entry_by_green,
-            depth_at_py_pc: depth_at_pc,
             pcdep_by_jit_pc,
             depth_pred_by_jit_pc,
             depth_trivia_marker_by_jit_pc,
