@@ -3314,6 +3314,15 @@ pub struct LoweringContext {
     /// `runtime_ops::binary_slice_values` (a user `__getitem__` fallback may
     /// force virtualizables → `MayForce`).
     pub binary_slice_fn_idx: u16,
+    /// `build_slice_fn` descrs-pool index — see codewriter.rs
+    /// `register_helper_fn_pointers` (`bind(assembler, cpu.build_slice_fn,
+    /// CallFlavor::Plain)`).  BUILD_SLICE records the `newslice(start, stop,
+    /// step)` HLOp (argc=2 synthesizes a None step at emit time) lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([3]), ListR([start, stop,
+    /// step]), Descr) → reg` via [`lower_newslice_hlop_to_insn`];
+    /// `bh_build_slice_fn` runs `w_slice_new` (a fresh `W_SliceObject`
+    /// allocation, no user code → `Plain`).
+    pub build_slice_fn_idx: u16,
     /// `delete_subscr_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` (`bind(assembler, cpu.delete_subscr_fn,
     /// CallFlavor::MayForce)`).  DELETE_SUBSCR records the `delete_subscr(obj,
@@ -5100,6 +5109,9 @@ where
     if let Some(insn) = lower_binary_slice_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_newslice_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_store_slice_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5514,6 +5526,57 @@ where
         vec![obj, start, stop],
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the BUILD_SLICE pyre HLOp `newslice(start, stop, step)` → `result:
+/// Ref` to `residual_call_ir_r(ConstInt(build_slice_fn_idx), ListI([3]),
+/// ListR([start, stop, step]), Descr) → reg`.  `emit_frontend_newslice`
+/// always records three ref operands — BUILD_SLICE argc=2 synthesizes a None
+/// step at emit time — so the call is always the argc=3 shape
+/// `bh_build_slice_fn(3, start, stop, step)` = `w_slice_new(start, stop,
+/// step)`, a fresh `W_SliceObject` with no user code (`CallFlavor::Plain`).
+/// Operand-based (unlike the raw-register
+/// [`build_build_slice_fn_residual_call_ir_r_insn`]) so a constant slice
+/// bound — `lst[::-1]` lowers start/stop to `None` and step to `-1` — is
+/// representable.
+///
+/// Returns `None` for non-`newslice` opnames so the caller can fall through.
+pub fn lower_newslice_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "newslice" || op.args.len() != 3 {
+        return None;
+    }
+    let start = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let stop = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let step = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Ref],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.build_slice_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(3)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![start, stop, step])),
+            descr_operand,
+        ],
         dst_reg,
     ))
 }
@@ -11064,6 +11127,7 @@ mod tests {
             store_attr_fn_idx: 95,
             build_map_from_array_fn_idx: 96,
             binary_slice_fn_idx: 97,
+            build_slice_fn_idx: 133,
             delete_subscr_fn_idx: 98,
             delete_attr_fn_idx: 99,
             build_set_from_array_fn_idx: 100,
@@ -11866,6 +11930,103 @@ mod tests {
                                 assert_eq!(stop.index, 105, "ListR[2] must be stop");
                             }
                             other => panic!("ListR must be [obj, start, stop], got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_newslice_hlop_emits_build_slice_fn_residual() {
+        // `newslice(start, stop, step)` →
+        // `residual_call_ir_r(ConstInt(build_slice_fn_idx), ListI([3]),
+        // ListR([start, stop, step]), Descr) → reg`.  Always the argc=3 shape
+        // (`emit_frontend_newslice` synthesizes a None step for argc=2).
+        let start_var = Variable::new(VariableId(10), Kind::Ref);
+        let stop_var = Variable::new(VariableId(12), Kind::Ref);
+        let step_var = Variable::new(VariableId(14), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "newslice",
+            vec![start_var.into(), stop_var.into(), step_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(12) => Register {
+                kind: Kind::Ref,
+                index: 105,
+            },
+            VariableId(14) => Register {
+                kind: Kind::Ref,
+                index: 107,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_newslice_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("3-arg newslice lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(133)),
+                    "build_slice_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(list.content[..], [Operand::ConstInt(3)]),
+                            "argc list must be [3], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI argc, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(start),
+                                Operand::Register(stop),
+                                Operand::Register(step),
+                            ] => {
+                                assert_eq!(start.index, 103, "ListR[0] must be start");
+                                assert_eq!(stop.index, 105, "ListR[1] must be stop");
+                                assert_eq!(step.index, 107, "ListR[2] must be step");
+                            }
+                            other => panic!("ListR must be [start, stop, step], got {other:?}"),
                         }
                     }
                     other => panic!("expected ListR, got {other:?}"),
