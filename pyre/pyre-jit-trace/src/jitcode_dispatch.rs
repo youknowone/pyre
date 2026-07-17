@@ -13082,8 +13082,20 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         None,
                     );
                 }
+                let entry_jitcode_pc = unsafe {
+                    let metadata = &(&*sym.jitcode).payload.metadata;
+                    (guard_jitcode_pc >= 0)
+                        .then(|| {
+                            crate::pyjitcode::floor_segment_for_jitcode_pc(
+                                &metadata.py_floor_by_jit_pc,
+                                guard_jitcode_pc as usize,
+                            )
+                        })
+                        .flatten()
+                        .map_or(majit_ir::resumedata::NO_JITCODE_PC, |(pc, _)| pc as i32)
+                };
                 (
-                    guard_jitcode_pc,
+                    entry_jitcode_pc,
                     OuterActiveBoxesEntryTwin::Plain,
                     "guard_snapshot_guard_pc",
                 )
