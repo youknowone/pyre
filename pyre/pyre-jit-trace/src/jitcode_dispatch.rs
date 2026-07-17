@@ -7392,11 +7392,17 @@ fn collect_outer_active_boxes(
                             .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                             .unwrap_or(0)
                             as usize,
-                        _ => crate::liveness::liveness_for(payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(entry_py_pc as usize)
-                            .copied()
-                            .unwrap_or(0) as usize,
+                        _ => {
+                            pcmap_pivot_audit_record_fire(
+                                "collect_outer_active_boxes_depth",
+                                "py_pc_entry",
+                            );
+                            crate::liveness::liveness_for(payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(entry_py_pc as usize)
+                                .copied()
+                                .unwrap_or(0) as usize
+                        }
                     }
                 };
                 (
@@ -7434,13 +7440,18 @@ fn collect_outer_active_boxes(
                     .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                     .map(ToOwned::to_owned)
                     .unwrap_or_default(),
-                _ => jc
-                    .payload
-                    .metadata
-                    .pcdep_color_slots
-                    .get(entry_py_pc as usize)
-                    .cloned()
-                    .unwrap_or_default(),
+                _ => {
+                    pcmap_pivot_audit_record_fire(
+                        "collect_outer_active_boxes_pcdep",
+                        "py_pc_entry",
+                    );
+                    jc.payload
+                        .metadata
+                        .pcdep_color_slots
+                        .get(entry_py_pc as usize)
+                        .cloned()
+                        .unwrap_or_default()
+                }
             }
         }
     };
@@ -10423,6 +10434,7 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
         }
         return pivot;
     }
+    pcmap_pivot_audit_record_fire("vstack_containing_py_pc", "empty_pivot_fallback");
     if !first_jit.is_empty() {
         let mut best: Option<(usize, u32)> = None;
         for (py, &pos) in first_jit.iter().enumerate() {
@@ -11282,6 +11294,28 @@ pub fn pcmap_pivot_audit_record_sweep(jitcode_byte_len: usize) {
     }
 }
 
+/// Append a report-only runtime/build-time PC-map census fire.  The probe is
+/// intentionally shared by the trace crate and codewriter so a corpus run can
+/// distinguish derivation work done while building metadata from runtime
+/// fallback use.
+pub fn pcmap_pivot_audit_record_fire(site: &'static str, arm: &'static str) {
+    if !pcmap_pivot_audit_enabled() {
+        return;
+    }
+    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
+        return;
+    };
+    use std::io::Write;
+
+    if let Ok(mut probe) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(probe, "pcmap_fire\t{site}\t{arm}");
+    }
+}
+
 fn floor_boundary_at_or_after(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,
@@ -11289,6 +11323,17 @@ fn floor_boundary_at_or_after(
     let table = &metadata.py_floor_by_jit_pc;
     let idx = table.partition_point(|&(off, _)| (off as usize) < jit_pc);
     table.get(idx).map(|&(off, py)| (off as usize, py))
+}
+
+fn first_floor_boundary_for_py(
+    metadata: &crate::PyJitCodeMetadata,
+    py_pc: u32,
+) -> Option<(usize, u32)> {
+    metadata
+        .py_floor_by_jit_pc
+        .iter()
+        .find(|&&(_, py)| py == py_pc)
+        .map(|&(off, py)| (off as usize, py))
 }
 
 /// Report-only census for the remaining guard-capture entry-anchor read.
@@ -11331,6 +11376,61 @@ fn pcmap_pivot_audit_entry_anchor(
     }
 }
 
+/// Report-only census for the two fallthrough entry-anchor candidates.  The
+/// marker-following candidate is derivable only when its floor owner is the
+/// liveness Python PC; the inverse candidate misses when shared-offset
+/// deduplication removed that Python PC's floor boundary.
+fn pcmap_pivot_audit_entry_anchor_fallthrough(
+    liveness_py_pc: u32,
+    legacy: Option<usize>,
+    marker_candidate: Option<(usize, u32)>,
+    inverse_candidate: Option<(usize, u32)>,
+    source_jit_pc: Option<usize>,
+    marker_jit_pc: Option<usize>,
+) {
+    if !pcmap_pivot_audit_enabled() {
+        return;
+    }
+    let marker_candidate = marker_candidate
+        .filter(|&(_, py)| py == liveness_py_pc)
+        .map(|(pc, _)| pc);
+    let inverse_candidate = inverse_candidate.map(|(pc, _)| pc);
+    let resolution = match (marker_candidate, inverse_candidate) {
+        (Some(_), Some(_)) => "both",
+        (Some(_), None) => "marker-following",
+        (None, Some(_)) => "inverse-query",
+        (None, None) => "neither",
+    };
+    let verdict = |candidate| match (legacy, candidate) {
+        (_, None) => "miss",
+        (None, Some(_)) => "legacy-unavailable",
+        (Some(legacy), Some(candidate)) if legacy == candidate => "eq",
+        (Some(_), Some(_)) => "di",
+    };
+    let inverse_status = if inverse_candidate.is_some() {
+        "resolved"
+    } else {
+        "inverse-miss"
+    };
+    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
+        return;
+    };
+    use std::io::Write;
+
+    if let Ok(mut probe) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            probe,
+            "entry_anchor\tentry_anchor_fallthrough\tresolution={resolution}\tmarker_comparison={}\tinverse_comparison={}\tinverse_status={inverse_status}\tliveness_py_pc={liveness_py_pc}\tlegacy={legacy:?}\tmarker_candidate={marker_candidate:?}\tinverse_candidate={inverse_candidate:?}\tsource_jit_pc={source_jit_pc:?}\tmarker_jit_pc={marker_jit_pc:?}",
+            verdict(marker_candidate),
+            verdict(inverse_candidate),
+        );
+    }
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     if !metadata.py_floor_by_jit_pc.is_empty() {
         let pivot = metadata
@@ -11352,6 +11452,7 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
         }
         return pivot;
     }
+    pcmap_pivot_audit_record_fire("python_pc_for_jitcode_pc", "empty_pivot_production");
     python_pc_for_jitcode_pc_legacy(metadata, jit_pc)
 }
 
@@ -12530,11 +12631,17 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 if !code_ptr.is_null() {
                     let resume_depth = match resume_depth_twin {
                         Some(depth) => depth as usize,
-                        None => crate::liveness::liveness_for(code_ptr)
-                            .depth_at_py_pc()
-                            .get(py_pc as usize)
-                            .copied()
-                            .unwrap_or(0) as usize,
+                        None => {
+                            pcmap_pivot_audit_record_fire(
+                                "guard_capture_depth",
+                                "vstack_reconcile_twin_none",
+                            );
+                            crate::liveness::liveness_for(code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .unwrap_or(0) as usize
+                        }
                     };
                     let code = unsafe { &*code_ptr };
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth);
@@ -12588,12 +12695,18 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     } else {
                         match resume_depth_twin {
                             Some(d) => (sym.nlocals + d as usize) as i64,
-                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .map(|d| (sym.nlocals + d as usize) as i64)
-                                .unwrap_or(sym.valuestackdepth as i64),
+                            None => {
+                                pcmap_pivot_audit_record_fire(
+                                    "guard_capture_depth",
+                                    "valuestackdepth_twin_none",
+                                );
+                                crate::liveness::liveness_for(jc.payload.code_ptr)
+                                    .depth_at_py_pc()
+                                    .get(py_pc as usize)
+                                    .copied()
+                                    .map(|d| (sym.nlocals + d as usize) as i64)
+                                    .unwrap_or(sym.valuestackdepth as i64)
+                            }
                         }
                     }
                 };
@@ -12642,11 +12755,17 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     } else {
                         match resume_depth_twin {
                             Some(depth) => depth as usize,
-                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .unwrap_or(0) as usize,
+                            None => {
+                                pcmap_pivot_audit_record_fire(
+                                    "guard_capture_depth",
+                                    "stack_sync_twin_none",
+                                );
+                                crate::liveness::liveness_for(jc.payload.code_ptr)
+                                    .depth_at_py_pc()
+                                    .get(py_pc as usize)
+                                    .copied()
+                                    .unwrap_or(0) as usize
+                            }
                         }
                     }
                 };
@@ -13119,8 +13238,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         } else {
                             payload.resume_marker_for_jitcode_pc(op_pc)
                         };
-                        pcmap_pivot_audit_entry_anchor(
-                            "entry_anchor_fallthrough",
+                        pcmap_pivot_audit_entry_anchor_fallthrough(
                             liveness_py_pc,
                             metadata
                                 .first_jit_pc_by_py_pc
@@ -13128,6 +13246,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                 .copied()
                                 .filter(|&pc| pc != usize::MAX),
                             marker.and_then(|pc| floor_boundary_at_or_after(metadata, pc)),
+                            first_floor_boundary_for_py(metadata, liveness_py_pc),
                             Some(op_pc),
                             marker,
                         );
@@ -16530,16 +16649,28 @@ fn try_walker_inline_user_call(
                     {
                         return None;
                     }
-                    let Some(depth) = callee_pjc
-                        .depth_for_jitcode_pc_pred(abort_pc)
-                        .or_else(|| metadata.depth_at_py_pc.get(callee_py_pc).copied())
+                    let depth_twin = callee_pjc.depth_for_jitcode_pc_pred(abort_pc);
+                    if depth_twin.is_none() {
+                        pcmap_pivot_audit_record_fire(
+                            "midbody_producer_depth",
+                            "py_pc_legacy_or_else",
+                        );
+                    }
+                    let Some(depth) =
+                        depth_twin.or_else(|| metadata.depth_at_py_pc.get(callee_py_pc).copied())
                     else {
                         return None;
                     };
                     let depth = depth as usize;
                     let nlocals = callee_code.varnames.len();
-                    let Some(entries) = callee_pjc
-                        .pcdep_for_jitcode_pc(abort_pc)
+                    let pcdep_twin = callee_pjc.pcdep_for_jitcode_pc(abort_pc);
+                    if pcdep_twin.is_none() {
+                        pcmap_pivot_audit_record_fire(
+                            "midbody_producer_pcdep",
+                            "py_pc_legacy_or_else",
+                        );
+                    }
+                    let Some(entries) = pcdep_twin
                         .or_else(|| metadata.pcdep_color_slots.get(callee_py_pc).cloned())
                     else {
                         return None;

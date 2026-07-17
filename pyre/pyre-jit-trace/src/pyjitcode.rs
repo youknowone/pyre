@@ -416,11 +416,23 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 ///
 /// `None` when the tables are empty (skeleton / fixture) or
 /// no at-or-after py emitted a real op.
+#[track_caller]
 pub fn derive_resume_marker(
     first_jit_pc_by_py_pc: &[usize],
     block_head_py_by_jit_pc: &[(usize, u32)],
     py_pc: usize,
 ) -> Option<usize> {
+    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
+        let caller = std::panic::Location::caller().file();
+        let arm = if caller.ends_with("/codewriter.rs") {
+            "codewriter_build_time"
+        } else if block_head_py_by_jit_pc.is_empty() {
+            "empty_pivot_fallback"
+        } else {
+            "production"
+        };
+        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("derive_resume_marker", arm);
+    }
     if block_head_py_by_jit_pc.is_empty() {
         return None;
     }
