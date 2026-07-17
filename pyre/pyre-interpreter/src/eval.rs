@@ -1295,6 +1295,13 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
             return false;
         }
     }
+    // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
+    // record for the frame that performed the re-raise only.  Once that frame's
+    // record/trace decision is made, the flag is cleared so that if no handler
+    // is found here and the exception propagates to the caller, that outer frame
+    // records its own traceback entry — mirroring the special-exception being
+    // unwrapped to a plain OperationError after one frame.
+    err.attach_tb = true;
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
@@ -2839,7 +2846,15 @@ impl OpcodeStepExecutor for PyFrame {
                 if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 } else if unsafe { pyre_object::is_exception(exc) } {
-                    Err(unsafe { PyError::from_exc_object(exc) })
+                    // RAISE_VARARGS(nbargs=0) re-raises the active exception via
+                    // RaiseWithExplicitTraceback, i.e. without recording a fresh
+                    // traceback for this frame.  Preserving the exception's existing
+                    // w_traceback keeps its identity stable (mirroring the RERAISE
+                    // opcode below), which the except* metadata check
+                    // (_is_same_exception_metadata) relies on.
+                    let mut err = unsafe { PyError::from_exc_object(exc) };
+                    err.attach_tb = false;
+                    Err(err)
                 } else {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 }

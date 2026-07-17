@@ -5259,6 +5259,22 @@ fn exception_group_notes(w_exc: PyObjectRef) -> Result<Option<PyObjectRef>, crat
     }
 }
 
+/// Identity comparison of a `__traceback__`/`__cause__`/`__context__` slot,
+/// treating an unset (raw NULL) slot and the `None` singleton as the same
+/// Python-level value.  `_is_same_exception_metadata` reads these through the
+/// attribute layer, which normalizes an unset slot to `None`; the raw slot
+/// accessors do not, so a copy made via getattr/setattr (holding `None`) would
+/// otherwise not compare equal to a source whose slot was never materialized.
+fn exception_group_meta_ref_eq(w_left: PyObjectRef, w_right: PyObjectRef) -> bool {
+    let left_none = w_left.is_null() || unsafe { pyre_object::is_none(w_left) };
+    let right_none = w_right.is_null() || unsafe { pyre_object::is_none(w_right) };
+    if left_none || right_none {
+        left_none && right_none
+    } else {
+        std::ptr::eq(w_left, w_right)
+    }
+}
+
 fn exception_group_same_metadata(
     w_left: PyObjectRef,
     w_right: PyObjectRef,
@@ -5273,13 +5289,13 @@ fn exception_group_same_metadata(
         return Ok(false);
     }
     Ok(unsafe {
-        std::ptr::eq(
+        exception_group_meta_ref_eq(
             pyre_object::interp_exceptions::w_exception_get_traceback(w_left),
             pyre_object::interp_exceptions::w_exception_get_traceback(w_right),
-        ) && std::ptr::eq(
+        ) && exception_group_meta_ref_eq(
             pyre_object::interp_exceptions::w_exception_get_cause(w_left),
             pyre_object::interp_exceptions::w_exception_get_cause(w_right),
-        ) && std::ptr::eq(
+        ) && exception_group_meta_ref_eq(
             pyre_object::interp_exceptions::w_exception_get_context(w_left),
             pyre_object::interp_exceptions::w_exception_get_context(w_right),
         )
