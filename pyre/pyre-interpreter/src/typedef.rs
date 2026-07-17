@@ -18784,6 +18784,44 @@ fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) }
 }
 
+fn setlike_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let size = std::mem::size_of::<pyre_object::setobject::W_SetObject>()
+        + unsafe { pyre_object::w_set_capacity(args[0]) }
+            * std::mem::size_of::<pyre_object::dictmultiobject::ObjectKey>();
+    Ok(pyre_object::w_int_new(size as i64))
+}
+
+fn setlike_descr_contains_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(pyre_object::w_bool_from(set_descr_contains(
+        args[0], args[1],
+    )?))
+}
+
+fn setlike_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::reduce_protocol::set_reduce(args[0])
+}
+
+fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
+        return Ok(pyre_object::w_bool_from(set_is_disjoint_from(
+            args[0], args[1],
+        )?));
+    }
+    for item in crate::builtins::collect_iterable(args[1])? {
+        if crate::type_methods::set_contains_checked(args[0], item)? {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+    }
+    Ok(pyre_object::w_bool_from(true))
+}
+
+fn setlike_descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::setobject::FROZENSET_TYPE) } {
+        return Ok(args[0]);
+    }
+    Ok(set_copy_real(args[0]))
+}
+
 macro_rules! setlike_wrapper_gateways {
     ($set_fn:ident, $frozenset_fn:ident, $name:literal, $implementation:ident) => {
         fn $set_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -18793,6 +18831,20 @@ macro_rules! setlike_wrapper_gateways {
 
         fn $frozenset_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::type_methods::require_frozenset_receiver(args, $name, false)?;
+            $implementation(args)
+        }
+    };
+}
+
+macro_rules! setlike_method_gateways {
+    ($set_fn:ident, $frozenset_fn:ident, $name:literal, $implementation:ident) => {
+        fn $set_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::require_set_receiver(args, $name, true)?;
+            $implementation(args)
+        }
+
+        fn $frozenset_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::require_frozenset_receiver(args, $name, true)?;
             $implementation(args)
         }
     };
@@ -18860,6 +18912,72 @@ setlike_wrapper_gateways!(set_gateway_le, frozenset_gateway_le, "__le__", set_de
 setlike_wrapper_gateways!(set_gateway_ge, frozenset_gateway_ge, "__ge__", set_descr_ge);
 setlike_wrapper_gateways!(set_gateway_lt, frozenset_gateway_lt, "__lt__", set_descr_lt);
 setlike_wrapper_gateways!(set_gateway_gt, frozenset_gateway_gt, "__gt__", set_descr_gt);
+setlike_method_gateways!(
+    set_gateway_sizeof,
+    frozenset_gateway_sizeof,
+    "__sizeof__",
+    setlike_descr_sizeof
+);
+setlike_method_gateways!(
+    set_gateway_contains,
+    frozenset_gateway_contains,
+    "__contains__",
+    setlike_descr_contains_impl
+);
+setlike_method_gateways!(
+    set_gateway_reduce,
+    frozenset_gateway_reduce,
+    "__reduce__",
+    setlike_descr_reduce
+);
+setlike_method_gateways!(
+    set_gateway_union,
+    frozenset_gateway_union,
+    "union",
+    set_method_union
+);
+setlike_method_gateways!(
+    set_gateway_intersection,
+    frozenset_gateway_intersection,
+    "intersection",
+    set_method_intersection
+);
+setlike_method_gateways!(
+    set_gateway_difference,
+    frozenset_gateway_difference,
+    "difference",
+    set_method_difference
+);
+setlike_method_gateways!(
+    set_gateway_symmetric_difference,
+    frozenset_gateway_symmetric_difference,
+    "symmetric_difference",
+    set_method_symmetric_difference
+);
+setlike_method_gateways!(
+    set_gateway_issubset,
+    frozenset_gateway_issubset,
+    "issubset",
+    set_method_le
+);
+setlike_method_gateways!(
+    set_gateway_issuperset,
+    frozenset_gateway_issuperset,
+    "issuperset",
+    set_method_ge
+);
+setlike_method_gateways!(
+    set_gateway_isdisjoint,
+    frozenset_gateway_isdisjoint,
+    "isdisjoint",
+    setlike_descr_isdisjoint
+);
+setlike_method_gateways!(
+    set_gateway_copy,
+    frozenset_gateway_copy,
+    "copy",
+    setlike_descr_copy
+);
 
 fn setlike_gateway(
     frozen: bool,
@@ -18880,12 +18998,7 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "__sizeof__",
             make_builtin_function_with_arity(
                 "__sizeof__",
-                |args| {
-                    let size = std::mem::size_of::<pyre_object::setobject::W_SetObject>()
-                        + unsafe { pyre_object::w_set_capacity(args[0]) }
-                            * std::mem::size_of::<pyre_object::dictmultiobject::ObjectKey>();
-                    Ok(pyre_object::w_int_new(size as i64))
-                },
+                setlike_gateway(frozen, set_gateway_sizeof, frozenset_gateway_sizeof),
                 1,
             ),
         )
@@ -18896,19 +19009,7 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "__contains__",
             make_builtin_function_with_arity(
                 "__contains__",
-                |args| {
-                    if args.len() < 2 {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    unsafe {
-                        if pyre_object::is_set_or_frozenset(args[0]) {
-                            return Ok(pyre_object::w_bool_from(set_descr_contains(
-                                args[0], args[1],
-                            )?));
-                        }
-                    }
-                    Ok(pyre_object::w_bool_from(false))
-                },
+                setlike_gateway(frozen, set_gateway_contains, frozenset_gateway_contains),
                 2,
             ),
         )
@@ -18952,7 +19053,7 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "__reduce__",
             make_builtin_function_with_arity(
                 "__reduce__",
-                |args| crate::reduce_protocol::set_reduce(args[0]),
+                setlike_gateway(frozen, set_gateway_reduce, frozenset_gateway_reduce),
                 1,
             ),
         )
@@ -19115,21 +19216,34 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "union",
-            make_builtin_function("union", set_method_union),
+            make_builtin_function(
+                "union",
+                setlike_gateway(frozen, set_gateway_union, frozenset_gateway_union),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection",
-            make_builtin_function("intersection", set_method_intersection),
+            make_builtin_function(
+                "intersection",
+                setlike_gateway(
+                    frozen,
+                    set_gateway_intersection,
+                    frozenset_gateway_intersection,
+                ),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "difference",
-            make_builtin_function("difference", set_method_difference),
+            make_builtin_function(
+                "difference",
+                setlike_gateway(frozen, set_gateway_difference, frozenset_gateway_difference),
+            ),
         )
     };
     unsafe {
@@ -19138,7 +19252,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "symmetric_difference",
             make_builtin_function_with_arity(
                 "symmetric_difference",
-                set_method_symmetric_difference,
+                setlike_gateway(
+                    frozen,
+                    set_gateway_symmetric_difference,
+                    frozenset_gateway_symmetric_difference,
+                ),
                 2,
             ),
         )
@@ -19147,14 +19265,22 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "issubset",
-            make_builtin_function_with_arity("issubset", set_method_le, 2),
+            make_builtin_function_with_arity(
+                "issubset",
+                setlike_gateway(frozen, set_gateway_issubset, frozenset_gateway_issubset),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "issuperset",
-            make_builtin_function_with_arity("issuperset", set_method_ge, 2),
+            make_builtin_function_with_arity(
+                "issuperset",
+                setlike_gateway(frozen, set_gateway_issuperset, frozenset_gateway_issuperset),
+                2,
+            ),
         )
     };
     unsafe {
@@ -19163,26 +19289,7 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "isdisjoint",
             make_builtin_function_with_arity(
                 "isdisjoint",
-                |args| {
-                    if args.len() < 2 {
-                        return Ok(pyre_object::w_bool_from(true));
-                    }
-                    // `setobject.py descr_isdisjoint` — a set operand is
-                    // compared through its storage.
-                    if unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
-                        return Ok(pyre_object::w_bool_from(set_is_disjoint_from(
-                            args[0], args[1],
-                        )?));
-                    }
-                    // `:383-385` — any other iterable is walked and each key
-                    // hashed by the lookup, which raises on an unhashable one.
-                    for item in crate::builtins::collect_iterable(args[1])? {
-                        if crate::type_methods::set_contains_checked(args[0], item)? {
-                            return Ok(pyre_object::w_bool_from(false));
-                        }
-                    }
-                    Ok(pyre_object::w_bool_from(true))
-                },
+                setlike_gateway(frozen, set_gateway_isdisjoint, frozenset_gateway_isdisjoint),
                 2,
             ),
         )
@@ -19195,20 +19302,7 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             // storage over rather than hashing the elements again.
             make_builtin_function_with_arity(
                 "copy",
-                |args| {
-                    if args.is_empty() {
-                        return Ok(pyre_object::w_set_new());
-                    }
-                    // setobject.py — only the exact built-in
-                    // frozenset is immutable enough for copy() to return
-                    // itself.  A subclass is copied into a base frozenset.
-                    if unsafe {
-                        pyre_object::is_exact_type(args[0], &pyre_object::setobject::FROZENSET_TYPE)
-                    } {
-                        return Ok(args[0]);
-                    }
-                    Ok(set_copy_real(args[0]))
-                },
+                setlike_gateway(frozen, set_gateway_copy, frozenset_gateway_copy),
                 1,
             ),
         )
