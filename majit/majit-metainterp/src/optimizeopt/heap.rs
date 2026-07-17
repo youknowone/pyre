@@ -47,6 +47,22 @@ use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::operand::Operand;
 
+fn same_ptr_info(ctx: &OptContext, left: OpRef, right: OpRef) -> bool {
+    let left_box = ctx.get_box_replacement_operand_opt(left);
+    let right_box = ctx.get_box_replacement_operand_opt(right);
+    match (
+        left_box.as_ref().and_then(|b| ctx.getptrinfo_handle(b)),
+        right_box.as_ref().and_then(|b| ctx.getptrinfo_handle(b)),
+    ) {
+        // heap.py possible_aliasing_two_infos: opinfo1.same_info(opinfo2).
+        (Some(left_info), Some(right_info)) => left_info.same_info(&right_info),
+        // Both normal callers install PtrInfo via ensure_ptr_info_arg0 before
+        // reaching this path. Keep synthetic tests conservative without adding
+        // a parallel store.
+        _ => ctx.same_box(left, right),
+    }
+}
+
 #[inline]
 fn make_nonnull_box(ctx: &mut OptContext, arg: &Operand) {
     if let Some(box_ref) = ctx.resolve_operand_operand_opt(arg) {
@@ -151,13 +167,9 @@ impl CachedField {
     /// heap.py:59-65 AbstractCachedEntry.possible_aliasing
     ///
     /// `not info.getptrinfo(self._lazy_set.getarg(0)).same_info(opinfo)`.
-    /// For Ref operands `same_info` is box identity (two distinct Live
-    /// structs hold distinct PtrInfo objects, so `is` ⟺ same terminal box)
-    /// plus ConstPtrInfo value comparison (info.py:774-777) — exactly
-    /// `same_box` on the struct boxes.
     fn possible_aliasing(&self, struct_opref: OpRef, ctx: &OptContext) -> bool {
         match &self.lazy_set {
-            Some(lazy_op) => !ctx.same_box(lazy_op.arg(0).to_opref(), struct_opref),
+            Some(lazy_op) => !same_ptr_info(ctx, lazy_op.arg(0).to_opref(), struct_opref),
             None => false,
         }
     }
@@ -255,7 +267,7 @@ impl CachedField {
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if let Some(lazy_op) = &self.lazy_set {
-            if ctx.get_replacement_opref(lazy_op.arg(0).to_opref()) == struct_opref {
+            if same_ptr_info(ctx, lazy_op.arg(0).to_opref(), struct_opref) {
                 let rhs = Self::_get_rhs_from_set_op(lazy_op);
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
                     ctx.materialize_operand_at(rhs),
@@ -443,11 +455,10 @@ impl ArrayCachedItem {
 
     /// heap.py:59-65 AbstractCachedEntry.possible_aliasing
     ///
-    /// `not info.getptrinfo(self._lazy_set.getarg(0)).same_info(opinfo)`;
-    /// for Ref operands `same_info` ⟺ `same_box` on the array boxes.
+    /// `not info.getptrinfo(self._lazy_set.getarg(0)).same_info(opinfo)`.
     fn possible_aliasing(&self, array_opref: OpRef, ctx: &OptContext) -> bool {
         match &self.lazy_set {
-            Some(lazy_op) => !ctx.same_box(lazy_op.arg(0).to_opref(), array_opref),
+            Some(lazy_op) => !same_ptr_info(ctx, lazy_op.arg(0).to_opref(), array_opref),
             None => false,
         }
     }
@@ -592,7 +603,7 @@ impl ArrayCachedItem {
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if let Some(lazy_op) = &self.lazy_set {
-            if ctx.get_replacement_opref(lazy_op.arg(0).to_opref()) == array_opref {
+            if same_ptr_info(ctx, lazy_op.arg(0).to_opref(), array_opref) {
                 let rhs = Self::_get_rhs_from_set_op(lazy_op);
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
                     ctx.materialize_operand_at(rhs),
@@ -2091,9 +2102,9 @@ impl OptHeap {
         if let Some(cf) = self.get_cached_field(&descr) {
             if let Some(lazy_op) = &cf.lazy_set {
                 let lazy_struct = lazy_op.arg(0).to_opref();
-                // heap.py:69 possible_aliasing_two_infos: opinfo1.same_info(opinfo2)
-                //   → MUST_ALIAS. For Ref operands same_info ⟺ same_box.
-                if ctx.same_box(lazy_struct, obj) {
+                // heap.py:69 possible_aliasing_two_infos:
+                // opinfo1.same_info(opinfo2) → MUST_ALIAS.
+                if same_ptr_info(ctx, lazy_struct, obj) {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1).to_opref();
                     let b_old = Operand::from_bound_op(op_rc);
@@ -2672,9 +2683,9 @@ impl OptHeap {
             {
                 if let Some(lazy_op) = &cai.lazy_set {
                     let lazy_struct = lazy_op.arg(0).to_opref();
-                    // heap.py:69 possible_aliasing_two_infos: same_info → MUST_ALIAS.
-                    // For Ref operands same_info ⟺ same_box.
-                    if ctx.same_box(lazy_struct, array) {
+                    // heap.py:69 possible_aliasing_two_infos:
+                    // opinfo1.same_info(opinfo2) → MUST_ALIAS.
+                    if same_ptr_info(ctx, lazy_struct, array) {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2).to_opref();
                         let b_old = Operand::from_bound_op(op_rc);
