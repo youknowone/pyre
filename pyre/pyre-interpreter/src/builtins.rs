@@ -8555,7 +8555,13 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             args.len()
         )));
     }
-    let obj = args[0];
+    // `descr___new__2` can execute `__reversed__`, `__len__`, or allocate an
+    // iterator. The translated RPython argument remains a GC root throughout;
+    // keep the Rust carrier in the shadow stack and reload at each call site.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let obj = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
     unsafe {
         // EXACT builtin list → `iterobject.py W_ReverseSeqIterObject` (the
         // Python 3.14-visible `list_reverseiterator`); tuple and the other
@@ -8568,11 +8574,17 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if pyre_object::is_exact_builtin_instance(obj) {
             if pyre_object::is_list(obj) {
                 let n = pyre_object::w_list_len(obj) as i64;
-                return Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1));
+                return Ok(pyre_object::w_list_reverse_iter_new(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    n - 1,
+                ));
             }
             if pyre_object::is_tuple(obj) {
                 let n = pyre_object::w_tuple_len(obj) as i64;
-                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    n - 1,
+                ));
             }
             // bytes / bytearray expose the sequence protocol at the C level but
             // not as `__getitem__` / `__len__` type slots, so they would miss
@@ -8582,48 +8594,41 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 || pyre_object::bytearrayobject::is_bytearray(obj)
             {
                 let n = crate::baseobjspace::len_w(obj)?;
-                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    n - 1,
+                ));
             }
         }
         // range: functional.py W_Range.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator. (range is
         // not subclassable, so no override can apply.)
         if pyre_object::is_w_range(obj) {
-            return Ok(pyre_object::w_range_reversed(obj));
-        }
-        // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
-        // can also be reversed. Mirror `W_IntRangeIterator`'s live
-        // `(current, remaining, step)` cursor by starting at the last
-        // remaining item, keeping the same count, and negating the step.
-        if pyre_object::is_range_iter(obj) {
-            let (current, remaining, step) = pyre_object::w_range_iter_fields(obj);
-            if remaining <= 0 {
-                return Ok(pyre_object::w_range_iter_new(0, 0, 1));
-            }
-            let last = current + (remaining - 1) * step;
-            return Ok(pyre_object::w_range_iter_new(last, remaining, -step));
-        }
-        // bytes / bytearray: yield the byte values in reverse.
-        if pyre_object::bytesobject::is_bytes_like(obj) {
-            let n = pyre_object::bytesobject::bytes_like_len(obj);
-            let mut items = Vec::with_capacity(n);
-            for i in (0..n).rev() {
-                items.push(w_int_new(
-                    pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
-                ));
-            }
-            return Ok(pyre_object::w_seq_iter_new(
-                pyre_object::w_list_new(items),
-                n,
+            return Ok(pyre_object::w_range_reversed(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
             ));
         }
     }
     // `__reversed__` resolved through the type MRO (`functional.py:362-366`) —
     // honors a subclass override and the inherited builtin `list.__reversed__`,
     // and any user object defining `__reversed__`.
+    let obj = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
     if let Some(tp) = crate::typedef::r#type(obj) {
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__reversed__") } {
-            return Ok(crate::call_function(method, &[obj]));
+            // Python 3.14 `slot1` semantics: explicitly assigning None disables
+            // the protocol and does not fall back to `__len__`/`__getitem__`.
+            if unsafe { pyre_object::is_none(method) } {
+                return Err(crate::PyError::type_error(format!(
+                    "'{}' object is not reversible",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                )));
+            }
+            pyre_object::gc_roots::pin_root(method);
+            let method_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            return Ok(crate::call_function(
+                unsafe { pyre_object::gc_roots::shadow_stack_get(method_slot) },
+                &[unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) }],
+            ));
         }
     }
     // functional.py:351 — without `__reversed__`, require the sequence
@@ -8636,7 +8641,10 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if has_getitem {
             // `functional.py:354-359` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
-            return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
+            return Ok(pyre_object::functional::w_reversed_new(
+                unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
+                n - 1,
+            ));
         }
     }
     Err(crate::PyError::type_error(format!(

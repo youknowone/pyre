@@ -61,11 +61,126 @@ for name in ("__iter__", "__next__", "__reduce__"):
     else:
         raise AssertionError(f"enumerate.{name} must validate its receiver")
 
+
+class EnumerateSubclass(enumerate):
+    pass
+
+
+assert EnumerateSubclass([1]).__reduce__()[0] is EnumerateSubclass
+
 r = reversed([1, 2, 3])
 assert iter(r) is r and operator.length_hint(r) == 3
 assert next(r) == 3 and operator.length_hint(r) == 2
 r.__setstate__(0)
 assert list(r) == [1]
+
+
+class Sequence:
+    def __init__(self, values):
+        self.values = values
+
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+
+seq = Sequence([0, 1, 2])
+r = reversed(seq)
+assert type(r) is reversed
+assert r.__reduce__()[0] is reversed
+assert r.__reduce__()[1] == (seq,)
+assert r.__reduce__()[2] == 2
+assert operator.length_hint(r) == 3
+assert next(r) == 2
+r.__setstate__(99)
+assert operator.length_hint(r) == 3 and next(r) == 2
+r.__setstate__(-99)
+assert operator.length_hint(r) == 0
+try:
+    next(r)
+except StopIteration:
+    pass
+else:
+    raise AssertionError("reversed negative state must clamp to exhaustion")
+
+# The length hint re-reads the live sequence length, as required by PyPy and
+# CPython's dedicated regression test.
+seq = Sequence([0, 1, 2])
+r = reversed(seq)
+seq.values[:] = [0]
+assert operator.length_hint(r) == 0
+
+
+class ReversedSubclass(reversed):
+    pass
+
+
+r = ReversedSubclass((1, 2))
+assert r.__reduce__()[0] is ReversedSubclass
+assert list(r) == [2, 1]
+assert r.__reduce__()[0] is ReversedSubclass
+
+for name, call_args in [
+    ("__iter__", (42,)),
+    ("__next__", (42,)),
+    ("__length_hint__", (42,)),
+    ("__reduce__", (42,)),
+    ("__setstate__", (42, 0)),
+]:
+    try:
+        getattr(reversed, name)(*call_args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"reversed.{name} must validate its receiver")
+
+
+class IndexState:
+    def __index__(self):
+        return 1
+
+
+class IntState:
+    def __int__(self):
+        return 1
+
+
+for state in (IndexState(), IntState(), 1.25):
+    try:
+        reversed(Sequence([1])).__setstate__(state)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("reversed state must be a concrete Python int")
+
+try:
+    reversed(Sequence([1])).__setstate__(10**30)
+except OverflowError:
+    pass
+else:
+    raise AssertionError("reversed state must fit Py_ssize_t")
+
+for non_reversible in (iter(range(3)), iter([1, 2])):
+    try:
+        reversed(non_reversible)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("iterators are not reversible in Python 3.14")
+
+
+class DisabledReversed(Sequence):
+    __reversed__ = None
+
+
+try:
+    reversed(DisabledReversed([1]))
+except TypeError:
+    pass
+else:
+    raise AssertionError("__reversed__ = None must disable sequence fallback")
 
 m = map(lambda x: x + 1, [1, 2])
 assert iter(m) is m and next(m) == 2

@@ -2160,6 +2160,9 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         pyre_object::gc_roots::pin_root(args[0]);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let i64_index = pyre_object::functional::w_enumerate_get_index(self_);
         let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_);
         let w_iter = if raw.is_null() {
@@ -2199,7 +2202,7 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         pyre_object::gc_roots::pin_root(state);
         let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         Ok(w_tuple_new(vec![
-            builtin_callable("enumerate"),
+            pyre_object::gc_roots::shadow_stack_get(self_type_slot),
             pyre_object::gc_roots::shadow_stack_get(state_slot),
         ]))
     }
@@ -2235,22 +2238,46 @@ pub(crate) fn enumerate_next_method(args: &[PyObjectRef]) -> PyResult {
 /// `reversed.__reduce__()` — `functional.py:407-417
 /// W_ReversedIterator.descr___reduce__`: `(reversed, (sequence,),
 /// remaining)` while live; `(reversed, ((),))` once exhausted (the slot
-/// is cleared to `PY_NULL`).  The reconstructor is the `reversed`
-/// builtin so `pickle` recreates the iterator via `reversed(sequence)`.
+/// is cleared to `PY_NULL`).  As in PyPy, the reconstructor is
+/// `space.type(self)`, preserving subclasses while recreating the iterator
+/// through the same reversed-sequence constructor protocol.
 pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = reversed_receiver(args, "__reduce__")?;
     unsafe {
-        let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let seq = pyre_object::functional::w_reversed_get_sequence(self_);
         if !seq.is_null() {
-            let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
-            let state = w_tuple_new(vec![seq]);
+            pyre_object::gc_roots::pin_root(seq);
+            let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
+            let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(seq_slot)]);
+            pyre_object::gc_roots::pin_root(state);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_remaining = w_int_new(remaining);
+            pyre_object::gc_roots::pin_root(w_remaining);
+            let remaining_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             Ok(w_tuple_new(vec![
-                builtin_callable("reversed"),
-                state,
-                w_int_new(remaining),
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                pyre_object::gc_roots::shadow_stack_get(remaining_slot),
             ]))
         } else {
-            let state = w_tuple_new(vec![w_tuple_new(vec![])]);
-            Ok(w_tuple_new(vec![builtin_callable("reversed"), state]))
+            let empty = w_tuple_new(vec![]);
+            pyre_object::gc_roots::pin_root(empty);
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(empty_slot)]);
+            pyre_object::gc_roots::pin_root(state);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ]))
         }
     }
 }
@@ -2259,16 +2286,40 @@ pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
 /// (`n == len(sequence)`, or 0 once exhausted).
 pub(crate) fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut remaining = int_w(args[1])?;
+    let self_ = reversed_receiver(args, "__setstate__")?;
+    let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if state.is_null()
+        || !unsafe {
+            pyre_object::is_int(state) || pyre_object::is_long(state) || pyre_object::is_bool(state)
+        }
+    {
+        return Err(PyError::type_error("an integer is required"));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut remaining = int_w(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
-        let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
-        let n = if !seq.is_null() { len_w(seq)? } else { 0 };
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let seq = pyre_object::functional::w_reversed_get_sequence(self_);
+        pyre_object::gc_roots::pin_root(seq);
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let n = if !seq.is_null() {
+            len_w(pyre_object::gc_roots::shadow_stack_get(seq_slot))?
+        } else {
+            0
+        };
         if remaining < -1 {
             remaining = -1;
         } else if remaining > n - 1 {
             remaining = n - 1;
         }
-        pyre_object::functional::w_reversed_set_remaining(args[0], remaining);
+        pyre_object::functional::w_reversed_set_remaining(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            remaining,
+        );
     }
     Ok(w_none())
 }
@@ -2276,12 +2327,23 @@ pub(crate) fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `reversed.__length_hint__()` — `functional.py:374-383
 /// descr_length_hint`: elements not yet produced, `0` once exhausted.
 pub(crate) fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = reversed_receiver(args, "__length_hint__")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
-        let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
         let mut res = 0i64;
         if remaining >= 0 {
-            let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
-            let total = if !seq.is_null() { len_w(seq)? } else { 0 };
+            let seq = pyre_object::functional::w_reversed_get_sequence(self_);
+            pyre_object::gc_roots::pin_root(seq);
+            let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let total = if !seq.is_null() {
+                len_w(pyre_object::gc_roots::shadow_stack_get(seq_slot))?
+            } else {
+                0
+            };
             let rem_length = remaining + 1;
             if rem_length <= total {
                 res = rem_length;
@@ -2289,6 +2351,29 @@ pub(crate) fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
         }
         Ok(w_int_new(res))
     }
+}
+
+fn reversed_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_reversed(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'reversed' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+/// `W_ReversedIterator.descr___iter__` with the receiver check supplied by
+/// PyPy's `interp2app` gateway before its one-line `return self` body.
+pub(crate) fn reversed_iter_method(args: &[PyObjectRef]) -> PyResult {
+    reversed_receiver(args, "__iter__")
+}
+
+/// `W_ReversedIterator.descr_next` gateway wrapper. The state-machine body is
+/// shared with the interpreter's [`next`] dispatcher below.
+pub(crate) fn reversed_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(reversed_receiver(args, "__next__")?)
 }
 
 /// `filter.__reduce__()` — `functional.py:944-949 W_Filter.descr_reduce`:
@@ -10955,8 +11040,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _roots = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(obj);
                 let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let seq = ro::w_reversed_get_sequence(obj);
-                match getitem(seq, w_int_new(remaining)) {
+                let seq =
+                    ro::w_reversed_get_sequence(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+                pyre_object::gc_roots::pin_root(seq);
+                let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let index = w_int_new(remaining);
+                pyre_object::gc_roots::pin_root(index);
+                let index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                match getitem(
+                    pyre_object::gc_roots::shadow_stack_get(seq_slot),
+                    pyre_object::gc_roots::shadow_stack_get(index_slot),
+                ) {
                     Ok(w_item) => {
                         ro::w_reversed_set_remaining(
                             pyre_object::gc_roots::shadow_stack_get(obj_slot),

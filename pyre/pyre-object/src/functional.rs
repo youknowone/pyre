@@ -208,6 +208,7 @@ pub unsafe fn w_reversed_get_sequence(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_reversed_set_sequence(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ReversedIterator)).w_sequence = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 

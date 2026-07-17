@@ -2524,8 +2524,15 @@ fn zip_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// object.
 fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let value = crate::builtins::builtin_reversed(args.get(1..).unwrap_or(&[]))?;
+    pyre_object::gc_roots::pin_root(value);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
     if unsafe { pyre_object::functional::is_reversed(value) } {
+        let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
         if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE)? {
             unsafe {
                 (*value).w_class = sub;
@@ -2993,10 +3000,10 @@ fn init_reversed_type(ns: PyObjectRef) {
     for (name, function, arity) in [
         (
             "__iter__",
-            crate::baseobjspace::iter_self_method as DunderFn,
+            crate::baseobjspace::reversed_iter_method as DunderFn,
             1,
         ),
-        ("__next__", crate::baseobjspace::iter_next_method, 1),
+        ("__next__", crate::baseobjspace::reversed_next_method, 1),
         (
             "__length_hint__",
             crate::baseobjspace::reversed_length_hint_method,
