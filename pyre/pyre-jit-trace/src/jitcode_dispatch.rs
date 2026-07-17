@@ -11282,6 +11282,55 @@ pub fn pcmap_pivot_audit_record_sweep(jitcode_byte_len: usize) {
     }
 }
 
+fn floor_boundary_at_or_after(
+    metadata: &crate::PyJitCodeMetadata,
+    jit_pc: usize,
+) -> Option<(usize, u32)> {
+    let table = &metadata.py_floor_by_jit_pc;
+    let idx = table.partition_point(|&(off, _)| (off as usize) < jit_pc);
+    table.get(idx).map(|&(off, py)| (off as usize, py))
+}
+
+/// Report-only census for the remaining guard-capture entry-anchor read.
+/// A candidate whose floor owner disagrees with `liveness_py_pc` is deliberately
+/// underivable: that coordinate cannot name `first_jit[liveness_py_pc]`.
+fn pcmap_pivot_audit_entry_anchor(
+    site: &'static str,
+    liveness_py_pc: u32,
+    legacy: Option<usize>,
+    candidate: Option<(usize, u32)>,
+    source_jit_pc: Option<usize>,
+    marker_jit_pc: Option<usize>,
+) {
+    if !pcmap_pivot_audit_enabled() {
+        return;
+    }
+    let candidate = candidate
+        .filter(|&(_, py)| py == liveness_py_pc)
+        .map(|(pc, _)| pc);
+    let verdict = match (legacy, candidate) {
+        (_, None) => "candidate-underivable",
+        (None, Some(_)) => "legacy-unavailable",
+        (Some(legacy), Some(candidate)) if legacy == candidate => "eq",
+        (Some(_), Some(_)) => "diverge",
+    };
+    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
+        return;
+    };
+    use std::io::Write;
+
+    if let Ok(mut probe) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            probe,
+            "entry_anchor\t{site}\t{verdict}\tliveness_py_pc={liveness_py_pc}\tlegacy={legacy:?}\tcandidate={candidate:?}\tsource_jit_pc={source_jit_pc:?}\tmarker_jit_pc={marker_jit_pc:?}",
+        );
+    }
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     if !metadata.py_floor_by_jit_pc.is_empty() {
         let pivot = metadata
@@ -13005,6 +13054,34 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // pc, so it keeps the merge `py_pc` and its exact resume-translation.
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
             let (entry_jitcode_pc, entry_twin, entry_caller) = if guard_py_pc.is_some() {
+                if pcmap_pivot_audit_enabled() {
+                    let (legacy, candidate) = unsafe {
+                        let metadata = &(&*sym.jitcode).payload.metadata;
+                        (
+                            metadata
+                                .first_jit_pc_by_py_pc
+                                .get(liveness_py_pc as usize)
+                                .copied()
+                                .filter(|&pc| pc != usize::MAX),
+                            (guard_jitcode_pc >= 0)
+                                .then(|| {
+                                    crate::pyjitcode::floor_segment_for_jitcode_pc(
+                                        &metadata.py_floor_by_jit_pc,
+                                        guard_jitcode_pc as usize,
+                                    )
+                                })
+                                .flatten(),
+                        )
+                    };
+                    pcmap_pivot_audit_entry_anchor(
+                        "entry_anchor_guard",
+                        liveness_py_pc,
+                        legacy,
+                        candidate,
+                        (guard_jitcode_pc >= 0).then_some(guard_jitcode_pc as usize),
+                        None,
+                    );
+                }
                 (
                     guard_jitcode_pc,
                     OuterActiveBoxesEntryTwin::Plain,
@@ -13018,9 +13095,28 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // pcdep rows.  A `-live-` marker is a block-head coordinate and
                 // can instead select an earlier opcode in the same block.
                 let entry = unsafe {
-                    (&*sym.jitcode)
-                        .payload
-                        .metadata
+                    let payload = &(&*sym.jitcode).payload;
+                    let metadata = &payload.metadata;
+                    if pcmap_pivot_audit_enabled() {
+                        let marker = if after_residual_call {
+                            payload.after_residual_marker_for_jitcode_pc(op_pc)
+                        } else {
+                            payload.resume_marker_for_jitcode_pc(op_pc)
+                        };
+                        pcmap_pivot_audit_entry_anchor(
+                            "entry_anchor_fallthrough",
+                            liveness_py_pc,
+                            metadata
+                                .first_jit_pc_by_py_pc
+                                .get(liveness_py_pc as usize)
+                                .copied()
+                                .filter(|&pc| pc != usize::MAX),
+                            marker.and_then(|pc| floor_boundary_at_or_after(metadata, pc)),
+                            Some(op_pc),
+                            marker,
+                        );
+                    }
+                    metadata
                         .first_jit_pc_by_py_pc
                         .get(liveness_py_pc as usize)
                         .copied()
