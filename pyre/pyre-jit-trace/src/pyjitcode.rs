@@ -63,19 +63,8 @@ pub struct PyJitCodeMetadata {
     /// `python_pc_for_jitcode_pc`. Empty for skeleton / fixture metadata.
     pub after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
-    /// py_pc → jitcode byte offset of the FIRST instruction the opcode
-    /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
-    /// trivia, folded ops).  The dense marker resolution that
-    /// `derive_resume_marker` now reproduces maps each PC to its nearest
-    /// `-live-` marker at-or-before, so adjacent PCs share marker
-    /// positions and that resolution is not invertible; the full-body walk needs
-    /// the exact inverse (jitcode pc → containing Python opcode) for
-    /// guard resume coordinates, which this table provides.  Same length
-    pub first_jit_pc_by_py_pc: Vec<usize>,
-    /// Number of Python instructions in the source CodeObject. Drained
-    /// installs source this from the same allocation length as
-    /// `first_jit_pc_by_py_pc`; zero retains the table-length fallback for
-    /// skeleton and fixture metadata.
+    /// Number of Python instructions in the source CodeObject. Empty skeleton
+    /// and fixture metadata carry zero.
     pub n_py_instrs: u32,
     /// Inverse of the derived marker resolution's block-head case: each distinct
     /// `-live-` marker byte offset that some PC resolves to → the first Python PC
@@ -85,8 +74,7 @@ pub struct PyJitCodeMetadata {
     /// former dense-map block-head scan in
     /// `python_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
     /// a block head — branch/catch target — and belongs to the first opcode
-    /// resuming there). Empty for skeleton / fixture metadata,
-    /// where the legacy scan remains the fallback.
+    /// resuming there). Empty for skeleton / fixture metadata.
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
     /// JitCode byte-offset → containing Python PC floor boundary table. Each
     /// entry starts a piecewise-constant opcode-emission segment; the first
@@ -94,18 +82,6 @@ pub struct PyJitCodeMetadata {
     /// predecessor op-start tier: exact block-head marker precedence remains in
     /// `block_head_py_by_jit_pc`. Empty for skeleton / fixture metadata.
     pub py_floor_by_jit_pc: Vec<(u32, u32)>,
-    /// task#50 sparse carry-forward sidecar: the `-live-` marker byte offset
-    /// for each py_pc whose dense marker the on-demand [`derive_resume_marker`]
-    /// derivation cannot reproduce from `first_jit_pc_by_py_pc` +
-    /// `block_head_py_by_jit_pc`. The derivation covers a py's own first op AND
-    /// the trivia / next-op forward-carry; the genuinely non-invertible residual
-    /// — uncond-jump forward-carry to a jump TARGET, can-raise / branch re-keys
-    /// keyed off the stream position — diverges and is stored here. Built by
-    /// comparing the derivation against the dense map at compile time and
-    /// keeping exactly the divergences. Sorted ascending by py_pc for
-    /// binary search; sparse (most graphs need zero entries, the majority a
-    /// handful); empty for skeleton / fixture metadata.
-    pub carryfwd_resume_pc: Vec<(u32, usize)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. This is the restriction of resume-marker resolution to
     /// function entry and loop headers, built at codewrite time, not a general
@@ -120,8 +96,8 @@ pub struct PyJitCodeMetadata {
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
     /// color→slot list of the py_pc that `python_pc_for_jitcode_pc(off)` returns
-    /// (block-head marker precedence, else the largest `first_jit_pc_by_py_pc`
-    /// at-or-before `off`). A PREDECESSOR binary search (largest offset ≤ jit_pc)
+    /// (block-head marker precedence, else the predecessor op-start boundary).
+    /// A PREDECESSOR binary search (largest offset ≤ jit_pc)
     /// then reproduces `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` for
     /// the carried resume coordinates reaching the decode re-inversion at
     /// `bridge_semantic_maps_at_with_jitcode_pc`. Both sides are compile-time
@@ -131,7 +107,7 @@ pub struct PyJitCodeMetadata {
     pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
     /// built alongside `pcdep_by_jit_pc` with the same `python_pc_for_jitcode_pc`
-    /// resolution (marker precedence + first_jit predecessor). Predecessor-covers
+    /// resolution (marker precedence + op-start predecessor). Predecessor-covers
     /// op offsets, so it agrees with the depth read at the decode seam for every
     /// carried coordinate: it equals
     /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction.
@@ -274,8 +250,8 @@ pub struct PyJitCodeMetadata {
     /// gh#73 S3.2: predecessor-keyed jitcode-pc twin of `const_ref_slots_at_pc`.
     /// Each entry `(off, slots)` maps a JitCode byte offset to the const
     /// operand-stack slot list of the py_pc that `python_pc_for_jitcode_pc(off)`
-    /// returns (block-head marker precedence, else the largest
-    /// `first_jit_pc_by_py_pc` at-or-before `off`). A PREDECESSOR binary search
+    /// returns (block-head marker precedence, else the predecessor op-start
+    /// boundary at-or-before `off`). A PREDECESSOR binary search
     /// (largest offset ≤ jit_pc) reproduces
     /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` for a carried
     /// resume coordinate. Built in the same `by_off` loop as `pcdep_by_jit_pc`;
@@ -400,7 +376,7 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 /// Two tiers reproduce the carry-forward rules that
 /// `derive_pc_live_indices_from_sparse` (codewriter) baked into the dense map:
 ///
-/// * A py_pc that emitted its own first op (`first_jit != usize::MAX`) resolves
+/// * A py_pc that emitted its own first op (`first_op != usize::MAX`) resolves
 ///   to the largest block-head marker at-or-before that first offset — no
 ///   marker lies strictly between a block head and the first op emitted inside
 ///   the block, so this equals the dense value.
@@ -411,14 +387,14 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 ///   resolve THAT. This reproduces the common trivia-forward-carry; the
 ///   genuinely non-invertible residual (uncond-jump forward-carry to a
 ///   backward/forward jump TARGET, can-raise / branch re-keys keyed off the
-///   stream position) diverges here and is captured in the sparse
-///   `carryfwd_resume_pc` sidecar instead.
+///   stream position) diverges here and is captured in a build-time
+///   carry-forward sidecar instead.
 ///
-/// `None` when the tables are empty (skeleton / fixture) or
+/// `None` when the tables are empty or
 /// no at-or-after py emitted a real op.
 #[track_caller]
 pub fn derive_resume_marker(
-    first_jit_pc_by_py_pc: &[usize],
+    first_op_by_py_pc: &[usize],
     block_head_py_by_jit_pc: &[(usize, u32)],
     py_pc: usize,
 ) -> Option<usize> {
@@ -438,7 +414,7 @@ pub fn derive_resume_marker(
     }
     // Real-op offset for `py_pc`, else the first at-or-after py that emitted an
     // op (trivia / next-op forward-carry).
-    let first_val = first_jit_pc_by_py_pc
+    let first_val = first_op_by_py_pc
         .get(py_pc..)?
         .iter()
         .copied()
@@ -866,11 +842,9 @@ impl PyJitCode {
             PyJitCodeMetadata {
                 after_residual_call_resume_marker_by_jit_pc: Vec::new(),
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
-                first_jit_pc_by_py_pc: Vec::new(),
                 n_py_instrs: 0,
                 block_head_py_by_jit_pc: Vec::new(),
                 py_floor_by_jit_pc: Vec::new(),
-                carryfwd_resume_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: Vec::new(),
