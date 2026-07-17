@@ -1831,6 +1831,17 @@ pub trait Backend: Send {
         false
     }
 
+    /// Whether CALL_ASSEMBLER may target a `compile_tmp_callback` token
+    /// (compile.py:1101-1150) whose body reaches the portal runner.
+    ///
+    /// The wasm backend admits CALL_ASSEMBLER only against a published
+    /// compiled target with no trampoline calls, and a tmp-callback body
+    /// calls the portal runner through a host trampoline, so it resolves
+    /// pending tokens instead.
+    fn supports_tmp_callback_call_assembler(&self) -> bool {
+        true
+    }
+
     /// Execute compiled code with integer-only arguments.
     ///
     /// Avoids the `Value::Int` wrapping/unwrapping overhead when all

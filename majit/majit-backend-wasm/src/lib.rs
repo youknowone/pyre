@@ -1367,6 +1367,16 @@ impl majit_backend::Backend for WasmBackend {
         "wasm"
     }
 
+    fn supports_tmp_callback_call_assembler(&self) -> bool {
+        // `general_int_call_assembler_target` admits CALL_ASSEMBLER only
+        // against a published compiled target without trampoline calls; a
+        // tmp-callback body reaches the portal runner through a host
+        // trampoline, so its target is never admissible. Resolution keeps
+        // the pending token; the self-recursive bootstrap publishes it and
+        // redirects on the real compile.
+        false
+    }
+
     fn bridge_decline_is_terminal(&self) -> bool {
         // Every `compile_bridge` `Unsupported` return is a deterministic
         // structural decline — a function of the (ops, source-loop) shape that

@@ -13489,6 +13489,13 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(arc) = self.get_loop_token_arc(green_key) {
             return Some(Arc::clone(arc));
         }
+        // A backend that cannot enter tmp-callback bodies (wasm: CA admission
+        // rejects trampoline-calling targets) keeps the pending token — its
+        // self-recursive bootstrap publishes that token and redirects when the
+        // real loop compiles.
+        if !self.backend.supports_tmp_callback_call_assembler() {
+            return self.get_pending_token_arc(green_key).map(Arc::clone);
+        }
         // The real portal driver has greens; the empty
         // `ensure_default_driver_sd` placeholder (jitdrivers_sd[0]) has none.
         let idx = self
