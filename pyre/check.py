@@ -405,6 +405,8 @@ def scaled_timeout(base, scale):
 def fmt_time(t):
     if t is None or t == "-":
         return "-"
+    if isinstance(t, (int, float)):
+        return f"{t:.2f}s"
     return f"{t}s"
 
 
@@ -1115,7 +1117,7 @@ class Check:
                 return
             if retry_note:
                 elapsed = checked_elapsed
-                t_pypy = f"{checked_baseline:.2f}"
+                t_pypy = checked_baseline
                 ratio = _ratio(elapsed, t_pypy)
 
         snap_status, snap_reason = self._apply_snapshot_gate(
@@ -1167,16 +1169,16 @@ class Check:
             sys.stdout.write(f"    {'cpython':<10s}")
             sys.stdout.flush()
             cpython_output, t_cpu, cpython_code, _ = run_timed([PYTHON3, script])
-            t_cpython = f"{t_cpu:.2f}"
+            t_cpython = t_cpu
             if cpython_code != 0:
                 print(f"{red('CRASH')} (exit {cpython_code})")
             else:
-                print(f"{dim('done')}  {t_cpython}s")
+                print(f"{dim('done')}  {t_cpython:.2f}s")
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
         pypy_output, pypy_cpu, pypy_code, _ = run_timed([PYPY3, script])
-        t_pypy = f"{pypy_cpu:.2f}" if pypy_code == 0 else "-"
+        t_pypy = pypy_cpu if pypy_code == 0 else "-"
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
             for backend in ALL_BACKENDS:
@@ -1184,7 +1186,7 @@ class Check:
                     self._record(backend, False, name, "pypy crash")
                     self._append_comparison(backend, name, t_cpython, "-", "FAIL")
             return
-        print(f"{dim('done')}  {t_pypy}s")
+        print(f"{dim('done')}  {t_pypy:.2f}s")
 
         for backend, vs_cpython, vs_pypy in [
             ("dynasm", dynasm_vs_cpython, dynasm_vs_pypy),
@@ -1295,8 +1297,8 @@ class Check:
                     self._append_comparison(backend, name, "-", "-", "FAIL")
             return
         else:
-            t_cpython = f"{cpython_time:.2f}"
-            print(f"{dim('done')}  {t_cpython}s")
+            t_cpython = cpython_time
+            print(f"{dim('done')}  {t_cpython:.2f}s")
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
@@ -1310,8 +1312,8 @@ class Check:
                     self._record(backend, False, name, "pypy crash")
                     self._append_comparison(backend, name, t_cpython, "-", "FAIL")
             return
-        t_pypy = f"{pypy_time:.2f}"
-        print(f"{dim('done')}  {t_pypy}s")
+        t_pypy = pypy_time
+        print(f"{dim('done')}  {t_pypy:.2f}s")
 
         if cpython_output is not None and cpython_output != pypy_output:
             print(f"    {'baseline':<10s}{red('WRONG')}  cpython output differs from pypy")

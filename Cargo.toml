@@ -71,6 +71,7 @@ rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev 
 rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "238bed66fbb0102a83dd9b5c8244e0276fbe8eac" }
 rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "238bed66fbb0102a83dd9b5c8244e0276fbe8eac" }
 rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "238bed66fbb0102a83dd9b5c8244e0276fbe8eac" }
+num-complex = "0.4"
 rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "238bed66fbb0102a83dd9b5c8244e0276fbe8eac" }
 rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "238bed66fbb0102a83dd9b5c8244e0276fbe8eac" }
 rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "238bed66fbb0102a83dd9b5c8244e0276fbe8eac" }

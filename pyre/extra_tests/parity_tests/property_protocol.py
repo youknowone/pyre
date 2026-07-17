@@ -157,6 +157,21 @@ class ReadOnly:
     item = property()
 
 
+class RaisingDescriptor:
+    def __get__(self, instance, owner):
+        raise AttributeError("descriptor miss")
+
+
+class PropertyWithGetattr(property):
+    missing = RaisingDescriptor()
+
+    def __getattr__(self, name):
+        return f"fallback:{name}"
+
+
+assert PropertyWithGetattr().missing == "fallback:missing"
+
+
 try:
     ReadOnly().item
 except AttributeError as exc:
@@ -189,5 +204,12 @@ for action in (
         pass
     else:
         assert False, "invalid property constructor arguments must raise"
+
+try:
+    property.__delete__(property())
+except TypeError:
+    pass
+else:
+    raise AssertionError("property.__delete__ accepted a missing target")
 
 print("OK")

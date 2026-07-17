@@ -147,6 +147,15 @@ assert type(sub) is StaticMethodSubclass
 assert sub(5, b=6) == "11"
 assert sub.__func__ is wrapped
 
+
+class CallingStaticMethod(staticmethod):
+    def __call__(self, *args, **kwargs):
+        return "override", args, kwargs
+
+
+calling_sub = CallingStaticMethod(wrapped)
+assert calling_sub(5, b=6) == ("override", (5,), {"b": 6})
+
 alias = staticmethod[int]
 assert type(alias).__name__ == "GenericAlias"
 assert alias.__origin__ is staticmethod

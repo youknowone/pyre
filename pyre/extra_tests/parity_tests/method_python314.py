@@ -117,4 +117,11 @@ assert reconstructor is getattr
 assert reduce_args == (c, "method")
 assert reconstructor(*reduce_args).__func__ is function
 
+try:
+    types.MethodType.__getattribute__(bound, 123)
+except TypeError:
+    pass
+else:
+    raise AssertionError("method.__getattribute__ accepted a non-string name")
+
 print("OK")

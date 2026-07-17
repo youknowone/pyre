@@ -421,9 +421,11 @@ where
                 on_user(callable)
             }
         } else {
+            let type_name = crate::typedef::r#type(callable)
+                .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+                .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
             Err(PyError::type_error(format!(
-                "'{}' object is not callable",
-                (*(*callable).ob_type).name
+                "'{type_name}' object is not callable"
             )))
         }
     }

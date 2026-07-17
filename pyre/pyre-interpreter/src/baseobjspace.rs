@@ -4946,11 +4946,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     if (name == "__reduce__" || name == "__reduce_ex__")
         && unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
     {
-        let reduce_fn: fn(&[PyObjectRef]) -> PyResult = |args| {
-            Ok(w_str_new(&unsafe {
-                crate::function::function_get_qualname(args[0])
-            }))
-        };
+        let reduce_fn: fn(&[PyObjectRef]) -> PyResult =
+            |args| unsafe { crate::function::descr_builtin_function_reduce(args[0]) };
         let (sname, arity): (&'static str, u16) = if name == "__reduce_ex__" {
             ("__reduce_ex__", 2)
         } else {
@@ -4978,8 +4975,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let w_descr = lookup_in_type_where(w_type, name);
                 if let Some(descr) = w_descr {
                     if is_data_descr(descr) {
-                        if let Some(result) = get(descr, obj, w_type)? {
-                            return Ok(result);
+                        match get(descr, obj, w_type) {
+                            Ok(Some(result)) => return Ok(result),
+                            Ok(None) => {}
+                            Err(e) if e.kind == PyErrorKind::AttributeError => {
+                                return instance_getattr_hook_or_err(w_type, obj, name, e);
+                            }
+                            Err(e) => return Err(e),
                         }
                     }
                 }
@@ -4993,8 +4995,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     if crate::is_function(descr) {
                         return Ok(pyre_object::w_method_new(descr, obj, w_type));
                     }
-                    if let Some(result) = get(descr, obj, w_type)? {
-                        return Ok(result);
+                    match get(descr, obj, w_type) {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {}
+                        Err(e) if e.kind == PyErrorKind::AttributeError => {
+                            return instance_getattr_hook_or_err(w_type, obj, name, e);
+                        }
+                        Err(e) => return Err(e),
                     }
                     return Ok(descr);
                 }
@@ -11081,7 +11088,9 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__delete__")?;
-        let obj = args[1];
+        let obj = args.get(1).copied().ok_or_else(|| {
+            crate::PyError::type_error("property.__delete__() takes exactly one argument (0 given)")
+        })?;
         let fdel = w_property_get_fdel(prop);
         if fdel.is_null() || is_none(fdel) {
             return Err(property_no_accessor(prop, obj, "deleter")?);

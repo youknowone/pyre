@@ -172,6 +172,12 @@ class ClassMethodSubclass(classmethod):
 sub = ClassMethodSubclass(wrapped)
 assert type(sub) is ClassMethodSubclass
 assert sub.__func__ is wrapped
+try:
+    sub()
+except TypeError as exc:
+    assert str(exc) == "'ClassMethodSubclass' object is not callable"
+else:
+    raise AssertionError("a classmethod subclass without __call__ was callable")
 
 
 class CallableClassMethod(classmethod):
@@ -188,5 +194,12 @@ alias = classmethod[int]
 assert type(alias).__name__ == "GenericAlias"
 assert alias.__origin__ is classmethod
 assert alias.__args__ == (int,)
+
+try:
+    classmethod(wrapped).__get__(None, None)
+except TypeError:
+    pass
+else:
+    raise AssertionError("classmethod.__get__(None, None) must fail")
 
 print("OK")

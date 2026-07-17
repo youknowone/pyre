@@ -469,7 +469,7 @@ unsafe fn require_code(
         )));
     }
     let ptr = unsafe { w_code_get_ptr(obj) } as *const crate::CodeObject;
-    if ptr.is_null() {
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(std::mem::align_of::<crate::CodeObject>()) {
         return Err(crate::PyError::type_error("code object has no code body"));
     }
     Ok(unsafe { &*ptr })
@@ -576,8 +576,8 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let posonly = unsafe { read_code_u32(args[2], "posonlyargcount")? };
     let kwonly = unsafe { read_code_u32(args[3], "kwonlyargcount")? };
     let nlocals = unsafe { read_code_u32(args[4], "nlocals")? };
-    let stacksize_value = unsafe { crate::builtins::space_index_w(args[5])? };
-    let flags_value = unsafe { crate::builtins::space_index_w(args[6])? };
+    let stacksize_value = unsafe { read_code_c_int(args[5])? };
+    let flags_value = unsafe { read_code_c_int(args[6])? };
     if stacksize_value < 0 || flags_value < 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
@@ -598,7 +598,7 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let source_path = unsafe { read_code_str(args[11], "filename")? };
     let obj_name = unsafe { read_code_str(args[12], "name")? };
     let qualname = unsafe { read_code_str(args[13], "qualname")? };
-    let first_line = unsafe { crate::builtins::space_index_w(args[14])? };
+    let first_line = unsafe { read_code_c_int(args[14])? } as i64;
     let first_line_number = if first_line <= 0 {
         None
     } else {
@@ -683,6 +683,8 @@ fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
         && a.freevars == b.freevars
         && a.cellvars == b.cellvars
         && a.names == b.names
+        && a.linetable == b.linetable
+        && a.exceptiontable == b.exceptiontable
         && crate::pyframe::code_constants(a)
             .iter()
             .zip(crate::pyframe::code_constants(b).iter())
@@ -784,6 +786,14 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         &mut result,
         pyre_object::bytesobject::w_bytes_from_bytes(&code.instructions.original_bytes()),
     )?;
+    add_obj(
+        &mut result,
+        pyre_object::bytesobject::w_bytes_from_bytes(&code.linetable),
+    )?;
+    add_obj(
+        &mut result,
+        pyre_object::bytesobject::w_bytes_from_bytes(&code.exceptiontable),
+    )?;
     for names in [&code.varnames, &code.freevars, &code.cellvars, &code.names] {
         for name in names.iter() {
             add_obj(&mut result, w_str_new(name))?;
@@ -833,10 +843,15 @@ pub unsafe fn code_varname_from_oparg(
             return Ok(w_str_new(name));
         }
         index -= code.varnames.len() as i64;
-        if let Some(name) = code.cellvars.get(index as usize) {
+        let pure_cellvars = code
+            .cellvars
+            .iter()
+            .filter(|cell| !code.varnames.iter().any(|var| var == *cell));
+        let pure_cellvar_count = pure_cellvars.clone().count();
+        if let Some(name) = pure_cellvars.skip(index as usize).next() {
             return Ok(w_str_new(name));
         }
-        index -= code.cellvars.len() as i64;
+        index -= pure_cellvar_count as i64;
         if let Some(name) = code.freevars.get(index as usize) {
             return Ok(w_str_new(name));
         }
@@ -977,16 +992,14 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     if let Some(v) = get("co_kwonlyargcount") {
         code.kwonlyarg_count = unsafe { read_code_u32(v, "co_kwonlyargcount")? };
     }
-    // co_nlocals is derived from the varnames length; it is accepted for
-    // constructor-signature compatibility but carries no independent field.
-    if let Some(v) = get("co_nlocals") {
-        let _ = unsafe { read_code_u32(v, "co_nlocals")? };
-    }
+    let requested_nlocals = get("co_nlocals")
+        .map(|v| unsafe { read_code_u32(v, "co_nlocals") })
+        .transpose()?;
     if let Some(v) = get("co_stacksize") {
         code.max_stackdepth = unsafe { read_code_u32(v, "co_stacksize")? };
     }
     if let Some(v) = get("co_flags") {
-        let value = unsafe { crate::builtins::space_index_w(v)? };
+        let value = unsafe { read_code_c_int(v)? };
         if value < 0 {
             return Err(crate::PyError::value_error(
                 "co_flags must be a positive integer",
@@ -996,7 +1009,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.flags = crate::bytecode::CodeFlags::from_bits_retain(bits);
     }
     if let Some(v) = get("co_firstlineno") {
-        let n = unsafe { crate::builtins::space_index_w(v)? };
+        let n = unsafe { read_code_c_int(v)? } as i64;
         if n < 0 {
             return Err(crate::PyError::value_error(
                 "co_firstlineno must be a positive integer",
@@ -1043,12 +1056,50 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.instructions = unsafe { read_code_units(v)? };
     }
 
+    if requested_nlocals.is_some_and(|n| n as usize != code.varnames.len()) {
+        return Err(crate::PyError::value_error(
+            "code: co_nlocals != len(co_varnames)",
+        ));
+    }
+    if code.posonlyarg_count > code.arg_count {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "Objects/codeobject.c: bad argument to internal function",
+        ));
+    }
+    if code.arg_count as usize + code.kwonlyarg_count as usize > code.varnames.len() {
+        return Err(crate::PyError::value_error(
+            "code: co_varnames is too small",
+        ));
+    }
+
+    // CPython's locals-plus table marks local/cell aliases in their existing
+    // local slot, then appends pure cells and free variables.
+    let mut localspluskinds = vec![crate::bytecode::CO_FAST_LOCAL; code.varnames.len()];
+    for cell in code.cellvars.iter() {
+        if let Some(index) = code.varnames.iter().position(|name| name == cell) {
+            localspluskinds[index] |= crate::bytecode::CO_FAST_CELL;
+        } else {
+            localspluskinds.push(crate::bytecode::CO_FAST_CELL);
+        }
+    }
+    localspluskinds.extend(std::iter::repeat_n(
+        crate::bytecode::CO_FAST_FREE,
+        code.freevars.len(),
+    ));
+    code.localspluskinds = localspluskinds.into_boxed_slice();
+    code.locations = rustpython_compiler_core::marshal::linetable_to_locations(
+        &code.linetable,
+        firstlineno_raw,
+        code.instructions.len(),
+    );
+
     Ok(box_code_constant_with_firstlineno(&code, firstlineno_raw))
 }
 
 /// A non-negative `co_*` count argument as `u32`.
 unsafe fn read_code_u32(v: PyObjectRef, field: &str) -> Result<u32, crate::PyError> {
-    let n = unsafe { crate::builtins::space_index_w(v)? };
+    let n = unsafe { read_code_c_int(v)? } as i64;
     if n < 0 {
         let message = if field.starts_with("co_") {
             format!("{field} must be a positive integer")
@@ -1058,6 +1109,17 @@ unsafe fn read_code_u32(v: PyObjectRef, field: &str) -> Result<u32, crate::PyErr
         return Err(crate::PyError::value_error(message));
     }
     Ok(n as u32)
+}
+
+/// Argument Clinic converts every public code-object integer through C `int`.
+unsafe fn read_code_c_int(v: PyObjectRef) -> Result<i32, crate::PyError> {
+    let n = unsafe { crate::builtins::space_index_w(v)? };
+    i32::try_from(n).map_err(|_| {
+        crate::PyError::new(
+            crate::PyErrorKind::OverflowError,
+            "Python int too large to convert to C int",
+        )
+    })
 }
 
 /// A `str` `co_*` field as an owned `String` (the compiler `Name` type).
@@ -1174,6 +1236,14 @@ unsafe fn obj_to_constant_data(
                 value: pyre_object::w_float_get_value(obj),
             });
         }
+        if pyre_object::is_complex(obj) {
+            return Ok(ConstantData::Complex {
+                value: num_complex::Complex64::new(
+                    pyre_object::w_complex_get_real(obj),
+                    pyre_object::w_complex_get_imag(obj),
+                ),
+            });
+        }
         if pyre_object::is_str(obj) {
             return Ok(ConstantData::Str {
                 value: pyre_object::w_str_get_wtf8(obj).to_owned(),
@@ -1193,6 +1263,13 @@ unsafe fn obj_to_constant_data(
                 elements.push(obj_to_constant_data(e)?);
             }
             return Ok(ConstantData::Tuple { elements });
+        }
+        if pyre_object::setobject::is_frozenset(obj) {
+            let elements = pyre_object::w_set_items(obj)
+                .into_iter()
+                .map(|item| obj_to_constant_data(item))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(ConstantData::Frozenset { elements });
         }
         if is_code(obj) {
             let ptr = w_code_get_ptr(obj) as *const crate::CodeObject;

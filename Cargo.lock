@@ -2161,6 +2161,7 @@ dependencies = [
  "majit-macros",
  "majit-metainterp",
  "malachite-bigint",
+ "num-complex",
  "num-integer",
  "num-traits",
  "paste",

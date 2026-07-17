@@ -41,6 +41,16 @@ assert len.__self__ is builtins
 assert math.sqrt.__self__ is math
 assert len.__reduce__() == "len"
 assert len.__reduce_ex__(4) == "len"
+for bound_builtin, owner, name in (
+    (int.__new__, int, "__new__"),
+    (dict.fromkeys, dict, "fromkeys"),
+):
+    reconstructor, reduce_args = bound_builtin.__reduce__()
+    assert reconstructor is getattr
+    assert reduce_args == (owner, name)
+    rebuilt = reconstructor(*reduce_args)
+    assert rebuilt.__self__ is owner
+    assert rebuilt.__name__ == name
 assert len.__repr__() == "<built-in function len>"
 assert t.__dict__["__call__"](len, [1, 2, 3]) == 3
 

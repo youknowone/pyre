@@ -977,6 +977,28 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
     Ok(Some(bound))
 }
 
+/// Resolve a `__call__` introduced by a staticmethod subtype. Exact builtin
+/// wrappers use the direct unwrap fast path; subtypes honor their override.
+fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if !unsafe { pyre_object::is_staticmethod(callable) }
+        || unsafe {
+            pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE)
+        }
+    {
+        return Ok(None);
+    }
+    let Some(w_type) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
+    let Some(call_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    else {
+        return Ok(None);
+    };
+    let bound =
+        unsafe { crate::baseobjspace::get(call_descr, callable, w_type) }?.unwrap_or(call_descr);
+    Ok(Some(bound))
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -1009,7 +1031,7 @@ fn call_callable_with_mode(
 
     // staticmethod → unwrap
     // PyPy: function.py StaticMethod.descr_call
-    if unsafe { pyre_object::is_staticmethod(callable) } {
+    if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_callable_with_mode(frame, func, args, mode);
     }
@@ -1669,16 +1691,24 @@ pub fn call_with_kwargs(
     // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
     // no implicit argument; forward the original positional and keyword
     // collections unchanged to its w_function.
-    if unsafe { pyre_object::is_staticmethod(callable) } {
+    if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_with_kwargs(frame, func, pos_args, kwargs);
+    }
+    if let Some(bound) = staticmethod_call_override(callable)? {
+        return call_with_kwargs(frame, bound, pos_args, kwargs);
     }
 
     if unsafe { pyre_object::is_classmethod(callable) } {
         if let Some(bound) = classmethod_call_override(callable)? {
             return call_with_kwargs(frame, bound, pos_args, kwargs);
         }
-        return Err(PyError::type_error("'classmethod' object is not callable"));
+        let type_name = crate::typedef::r#type(callable)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .unwrap_or("classmethod");
+        return Err(PyError::type_error(format!(
+            "'{type_name}' object is not callable"
+        )));
     }
 
     // Unwrap bound methods: prepend receiver to pos_args.
@@ -2310,9 +2340,12 @@ pub fn call_function_impl_result(
         }
         // staticmethod → unwrap and call the wrapped function
         // PyPy: function.py StaticMethod.descr_staticmethod__call__
-        if pyre_object::is_staticmethod(callable) {
+        if pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) {
             let func = pyre_object::w_staticmethod_get_func(callable);
             return call_function_impl_result(func, args);
+        }
+        if let Some(bound) = staticmethod_call_override(callable)? {
+            return call_function_impl_result(bound, args);
         }
         if let Some(bound) = classmethod_call_override(callable)? {
             return call_function_impl_result(bound, args);
@@ -2341,9 +2374,11 @@ pub fn call_function_impl_result(
             }
         }
     }
+    let type_name = crate::typedef::r#type(callable)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+        .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
     Err(PyError::type_error(format!(
-        "'{}' object is not callable",
-        unsafe { (*(*callable).ob_type).name }
+        "'{type_name}' object is not callable"
     )))
 }
 

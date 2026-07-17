@@ -121,9 +121,9 @@ else:
 calls = []
 
 
-def annotate(format):
-    calls.append(format)
-    return {"answer": format}
+def annotate(annotation_format):
+    calls.append(annotation_format)
+    return {"answer": annotation_format}
 
 
 module.__annotations__ = {"old": True}
@@ -145,12 +145,31 @@ else:
     raise AssertionError("module.__annotate__ deletion succeeded")
 
 module = types.ModuleType("sample")
-module.__annotate__ = lambda format: 1
+module.__annotate__ = lambda _annotation_format: 1
 try:
     module.__annotations__
 except TypeError as exc:
     assert str(exc) == "__annotate__ returned non-dict of type 'int'"
 else:
     raise AssertionError("non-dict annotations result was accepted")
+
+for method_name, args in (
+    ("__repr__", (42,)),
+    ("__getattribute__", (42, "x")),
+    ("__dir__", (42,)),
+):
+    try:
+        getattr(types.ModuleType, method_name)(*args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"module {method_name} accepted a foreign receiver")
+
+try:
+    types.ModuleType.__init__(name="missing-self")
+except TypeError:
+    pass
+else:
+    raise AssertionError("module.__init__ accepted a missing receiver")
 
 print("OK")

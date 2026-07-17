@@ -206,6 +206,10 @@ unsafe fn walk_raw_function_roots(
         visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_text_signature as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // BuiltinFunction.w_moduleobj is an ordinary movable module reference.
+        // Builtin functions are immortal, so only this raw-root walker can
+        // forward the slot during a collection.
+        visitor(&mut *(&mut func.w_moduleobj as *mut PyObjectRef as *mut majit_ir::GcRef));
     }
 }
 

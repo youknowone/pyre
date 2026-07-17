@@ -382,10 +382,13 @@ pub(crate) fn function_new_impl(
     // part of the same `malloc_typed` call, so it never spans a
     // collection point.
     let _roots = pyre_object::gc_roots::push_roots();
+    let closure_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(closure);
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(code as PyObjectRef);
     // `function.py:57 self.w_func_globals = w_globals` stores the dict
     // object directly as the function's sole globals carrier.
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
     // CPython 3.14 `_PyEval_BuiltinsFromGlobals` at function construction:
@@ -404,7 +407,16 @@ pub(crate) fn function_new_impl(
             selected
         }
     };
+    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_builtins);
+
+    // `pick_builtin_obj` and later allocations may collect.  Reload every
+    // pinned input before embedding it in the new Function; the original raw
+    // locals are not rewritten when the shadow-stack slots are forwarded.
+    let closure = pyre_object::gc_roots::shadow_stack_get(closure_slot);
+    let code = pyre_object::gc_roots::shadow_stack_get(code_slot) as *const ();
+    let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+    let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
 
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
     let function = Function {
@@ -611,6 +623,25 @@ pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
     } else {
         w_self
     }
+}
+
+/// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through
+/// `getattr(__self__, __name__)`; module-level builtins reduce by qualname.
+pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {
+    let w_self = unsafe { function_get_self_or_none(obj) };
+    if !w_self.is_null()
+        && !unsafe { pyre_object::is_none(w_self) }
+        && !unsafe { pyre_object::is_module(w_self) }
+    {
+        let name = pyre_object::w_str_new(unsafe { crate::function_get_name(obj) });
+        return Ok(pyre_object::w_tuple_new(vec![
+            crate::baseobjspace::builtin_callable("getattr"),
+            pyre_object::w_tuple_new(vec![w_self, name]),
+        ]));
+    }
+    Ok(pyre_object::w_str_new(&unsafe {
+        function_get_qualname(obj)
+    }))
 }
 
 /// Stamp PyPy `BuiltinFunction.w_moduleobj` after the defining module object
@@ -2196,6 +2227,9 @@ pub unsafe fn descr_method_getattribute(
     obj: PyObjectRef,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { pyre_object::is_str(name) } {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    }
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
         return Err(crate::PyError::type_error("attribute name must be string"));
     };

@@ -105,7 +105,7 @@ try:
 except TypeError:
     pass
 else:
-    assert False, "cell arithmetic must not operate on its contents"
+    raise AssertionError("cell arithmetic must not operate on its contents")
 
 
 def _make(x):

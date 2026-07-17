@@ -1607,6 +1607,11 @@ fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// in the module dict.
 fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.is_empty() {
+        return Err(crate::PyError::type_error(
+            "descriptor '__init__' of 'module' object needs an argument",
+        ));
+    }
     let given = positional.len().saturating_sub(1);
     if given > 2 {
         return Err(crate::PyError::type_error(format!(
@@ -1680,7 +1685,17 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// `_frozen_importlib._module_repr`, which implements the spec/file/name
 /// precedence shared by CPython 3.14.
 fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(pyre_object::w_str_new(&module_repr_string(args[0])?))
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    Ok(pyre_object::w_str_new(&module_repr_string(module)?))
+}
+
+fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::is_module(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'module' objects doesn't apply to this object"
+        )));
+    }
+    Ok(obj)
 }
 
 pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::PyError> {
@@ -1754,14 +1769,14 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::P
 /// module-specific AttributeError wording, so the descriptor is the direct
 /// entry point into that same implementation.
 fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[0];
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__getattribute__")?;
     let name = crate::baseobjspace::text_w(args[1])?;
     crate::baseobjspace::getattr_str(module, name)
 }
 
 /// module.py:164-173 `Module.descr_module__dir__`.
 fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[0];
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__")?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     if w_dict.is_null()
         || (!unsafe { pyre_object::is_dict(w_dict) }
@@ -1782,7 +1797,7 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[1];
+    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1823,7 +1838,7 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[1];
+    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
     let value = args[2];
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1846,7 +1861,7 @@ fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[1];
+    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1868,7 +1883,7 @@ fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[1];
+    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     if let Some(annotate) = crate::baseobjspace::finditem_str(w_dict, "__annotate__")? {
         return Ok(annotate);
@@ -1879,7 +1894,7 @@ fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn module_annotate_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = args[1];
+    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
     let value = args[2];
     if !unsafe { pyre_object::is_none(value) } && !crate::baseobjspace::callable_w(value) {
         return Err(crate::PyError::type_error(
@@ -9190,16 +9205,37 @@ fn init_function_type(ns: PyObjectRef) {
     // CPython 3.14 `function.__annotate__`: callable-or-None, not deletable.
     let annotate_getter = make_builtin_function("__annotate__", |args| {
         let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if function.is_null()
+            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
+        {
+            return Err(crate::PyError::type_error(
+                "descriptor '__annotate__' requires a 'function' object",
+            ));
+        }
         Ok(unsafe { crate::function::function_get_annotate(function) })
     });
     let annotate_setter = make_builtin_function("__annotate__", |args| {
         let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if function.is_null()
+            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
+        {
+            return Err(crate::PyError::type_error(
+                "descriptor '__annotate__' requires a 'function' object",
+            ));
+        }
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::function_set_annotate(function, value)? };
         Ok(pyre_object::w_none())
     });
     let annotate_deleter = make_builtin_function("__annotate__", |args| {
         let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if function.is_null()
+            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
+        {
+            return Err(crate::PyError::type_error(
+                "descriptor '__annotate__' requires a 'function' object",
+            ));
+        }
         unsafe { crate::function::function_set_annotate(function, pyre_object::PY_NULL)? };
         Ok(pyre_object::w_none())
     });
@@ -9213,16 +9249,37 @@ fn init_function_type(ns: PyObjectRef) {
     // CPython 3.14 `function.__type_params__`: tuple-only and not deletable.
     let typeparams_getter = make_builtin_function("__type_params__", |args| {
         let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if function.is_null()
+            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
+        {
+            return Err(crate::PyError::type_error(
+                "descriptor '__type_params__' requires a 'function' object",
+            ));
+        }
         Ok(unsafe { crate::function::function_get_typeparams(function) })
     });
     let typeparams_setter = make_builtin_function("__type_params__", |args| {
         let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if function.is_null()
+            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
+        {
+            return Err(crate::PyError::type_error(
+                "descriptor '__type_params__' requires a 'function' object",
+            ));
+        }
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         unsafe { crate::function::function_set_typeparams(function, value)? };
         Ok(pyre_object::w_none())
     });
     let typeparams_deleter = make_builtin_function("__type_params__", |args| {
         let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        if function.is_null()
+            || !unsafe { pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE) }
+        {
+            return Err(crate::PyError::type_error(
+                "descriptor '__type_params__' requires a 'function' object",
+            ));
+        }
         unsafe { crate::function::function_set_typeparams(function, pyre_object::PY_NULL)? };
         Ok(pyre_object::w_none())
     });
@@ -9411,11 +9468,7 @@ fn init_builtin_function_type(ns: PyObjectRef) {
             "__reduce__",
             make_builtin_function_with_arity(
                 "__reduce__",
-                |args| {
-                    Ok(pyre_object::w_str_new(&unsafe {
-                        crate::function::function_get_qualname(args[0])
-                    }))
-                },
+                |args| unsafe { crate::function::descr_builtin_function_reduce(args[0]) },
                 1,
             ),
         )
@@ -10375,6 +10428,11 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 "__repr__",
                 |args| {
                     let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    if member.is_null() || !unsafe { pyre_object::typedef::is_member(member) } {
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__repr__' requires a 'member_descriptor' object",
+                        ));
+                    }
                     Ok(pyre_object::w_str_new(&unsafe {
                         member_descriptor_repr(member)
                     }))
@@ -10392,6 +10450,11 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 "__reduce__",
                 |args| {
                     let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    if member.is_null() || !unsafe { pyre_object::typedef::is_member(member) } {
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__reduce__' requires a 'member_descriptor' object",
+                        ));
+                    }
                     let owner = unsafe { pyre_object::w_member_get_cls(member) };
                     let name =
                         pyre_object::w_str_new(unsafe { pyre_object::w_member_get_name(member) });
@@ -11020,6 +11083,9 @@ fn classmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
     let w_obj = args.get(1).copied().unwrap_or(PY_NULL);
     let mut w_klass = args.get(2).copied().unwrap_or(PY_NULL);
     if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
+        if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
+            return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+        }
         w_klass = r#type(w_obj).unwrap_or(PY_NULL);
     }
     let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
@@ -11517,9 +11583,10 @@ fn init_property_type(ns: PyObjectRef) {
         ),
         (
             "__delete__",
-            make_builtin_function(
+            make_builtin_function_with_arity(
                 "__delete__",
                 crate::baseobjspace::property_descr_delete_impl,
+                2,
             ),
         ),
         (

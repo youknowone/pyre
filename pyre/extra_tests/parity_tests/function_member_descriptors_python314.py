@@ -50,6 +50,14 @@ for name in MEMBERS:
     assert reduced == (getattr, (types.FunctionType, name))
     assert reduced[0] is getattr
 
+for method_name in ("__repr__", "__reduce__"):
+    try:
+        getattr(types.MemberDescriptorType, method_name)(1)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"member descriptor {method_name} accepted an int")
+
 
 def make_closure(value):
     def inner():

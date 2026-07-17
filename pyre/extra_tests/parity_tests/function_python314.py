@@ -60,8 +60,8 @@ else:
 assert f.__annotate__ is None
 
 
-def annotate(format):
-    assert format == 1
+def annotate(annotation_format):
+    assert annotation_format == 1
     return {"value": int}
 
 
@@ -113,3 +113,12 @@ def identity[T](value: T) -> T:
 assert len(identity.__type_params__) == 1
 assert identity.__type_params__[0].__name__ == "T"
 assert identity(5) == 5
+
+for descriptor_name in ("__annotate__", "__type_params__"):
+    descriptor = type(f).__dict__[descriptor_name]
+    try:
+        descriptor.__get__(42, int)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"function {descriptor_name} accepted a foreign receiver")

@@ -1044,12 +1044,23 @@ impl ExecutionContext {
         // W_ModuleDictObject in `self.builtins_module`; wrap it
         // through `w_module_new_aliasing_dict` without a raw storage
         // pointer (the strategy storage IS the canonical store).
+        // Enumerating a dict materialises key objects and can collect.  Keep
+        // only owned key strings across that operation; raw values must be
+        // looked up again after the module allocation.
+        let keys: Vec<String> = unsafe { pyre_object::w_dict_str_entries(self.builtins_module) }
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
         let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
         // function.py:797-815 BuiltinFunction.w_moduleobj. The defining
         // module object does not exist while `new_builtin_module_dict` fills
         // the namespace, so bind each builtin's `__self__` now.
-        for (_, value) in unsafe { pyre_object::w_dict_str_entries(self.builtins_module) } {
-            unsafe { crate::function::builtin_function_set_module_obj(value, module) };
+        for key in keys {
+            if let Some(value) =
+                unsafe { pyre_object::w_dict_getitem_str(self.builtins_module, &key) }
+            {
+                unsafe { crate::function::builtin_function_set_module_obj(value, module) };
+            }
         }
         self.builtin_dict_cache.set(module);
         // `pypy/interpreter/baseobjspace.py:647` —
