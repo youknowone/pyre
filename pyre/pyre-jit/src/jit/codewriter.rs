@@ -1580,6 +1580,23 @@ fn handler_entry_has_explicit_raise_source(
     })
 }
 
+fn next_non_aux_instruction(code: &CodeObject, mut pc: usize) -> Option<(usize, Instruction)> {
+    while pc < code.instructions.len() {
+        let (instruction, _) = pyre_interpreter::decode_instruction_at(code, pc)?;
+        if !matches!(
+            instruction,
+            Instruction::Nop
+                | Instruction::Cache
+                | Instruction::NotTaken
+                | Instruction::ExtendedArg
+        ) {
+            return Some((pc, instruction));
+        }
+        pc += 1;
+    }
+    None
+}
+
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -11527,6 +11544,47 @@ impl CodeWriter {
                             if fbw_delete_fast_enabled() {
                                 let idx = var_num.get(op_arg).as_usize();
                                 if current_state.local_value_at(idx).is_none() {
+                                    emit_abort_permanent!(py_pc);
+                                    continue;
+                                }
+                                // The implicit cleanup of a named `except E as m:`
+                                // whose body bare-re-raises compiles to
+                                // `DELETE_FAST m; RERAISE` immediately followed by
+                                // a sibling clause's `LOAD_GLOBAL <T>; CHECK_EXC_MATCH`.
+                                // The covered RERAISE must route to the outer
+                                // re-raise landing, but the walker-native bound
+                                // continuation of this DELETE_FAST falls through
+                                // into that sibling type check with the current
+                                // exception not re-seeded, so CHECK_EXC_MATCH peeks
+                                // a null operand. Decline this shape — and any
+                                // catch-covered DELETE_FAST in a function that
+                                // contains it — so the interpreter runs it.
+                                let cleanup_reraise_to_sibling = |delete_pc: usize| {
+                                    let next = next_non_aux_instruction(code, delete_pc + 1);
+                                    let after_next = next
+                                        .and_then(|(pc, _)| next_non_aux_instruction(code, pc + 1));
+                                    let after_after_next = after_next
+                                        .and_then(|(pc, _)| next_non_aux_instruction(code, pc + 1));
+                                    next.is_some_and(|(pc, instruction)| {
+                                        catch_for_pc.get(pc).copied().flatten().is_some()
+                                            && matches!(instruction, Instruction::Reraise { .. })
+                                    }) && after_next.is_some_and(|(_, instruction)| {
+                                        matches!(instruction, Instruction::LoadGlobal { .. })
+                                    }) && after_after_next.is_some_and(|(_, instruction)| {
+                                        matches!(instruction, Instruction::CheckExcMatch)
+                                    })
+                                };
+                                let function_has_cleanup_reraise_to_sibling =
+                                    (0..num_instrs).any(|pc| {
+                                        matches!(
+                                            pyre_interpreter::decode_instruction_at(code, pc),
+                                            Some((Instruction::DeleteFast { .. }, _))
+                                        ) && cleanup_reraise_to_sibling(pc)
+                                    });
+                                if cleanup_reraise_to_sibling(py_pc)
+                                    || (catch_for_pc.get(py_pc).copied().flatten().is_some()
+                                        && function_has_cleanup_reraise_to_sibling)
+                                {
                                     emit_abort_permanent!(py_pc);
                                     continue;
                                 }
