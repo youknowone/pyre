@@ -282,6 +282,37 @@ pub(crate) fn require_set_receiver(
     Ok(receiver)
 }
 
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_FrozensetObject.descr_*)` gateway.  The inherited
+/// `W_BaseSetObject` implementation is shared with set, while the gateway
+/// still requires a frozenset receiver.
+pub(crate) fn require_frozenset_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method frozenset.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'frozenset' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_frozenset(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'frozenset' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a 'frozenset' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.

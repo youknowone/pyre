@@ -18770,7 +18770,110 @@ fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool,
     }
 }
 
-fn init_setlike_common(ns: PyObjectRef) {
+fn setlike_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(pyre_object::w_int_new(
+        unsafe { pyre_object::w_set_len(args[0]) } as i64,
+    ))
+}
+
+fn setlike_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(pyre_object::w_set_iter_new(args[0]))
+}
+
+fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) }
+}
+
+macro_rules! setlike_wrapper_gateways {
+    ($set_fn:ident, $frozenset_fn:ident, $name:literal, $implementation:ident) => {
+        fn $set_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::require_set_receiver(args, $name, false)?;
+            $implementation(args)
+        }
+
+        fn $frozenset_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::require_frozenset_receiver(args, $name, false)?;
+            $implementation(args)
+        }
+    };
+}
+
+setlike_wrapper_gateways!(
+    set_gateway_len,
+    frozenset_gateway_len,
+    "__len__",
+    setlike_descr_len
+);
+setlike_wrapper_gateways!(
+    set_gateway_iter,
+    frozenset_gateway_iter,
+    "__iter__",
+    setlike_descr_iter
+);
+setlike_wrapper_gateways!(
+    set_gateway_repr,
+    frozenset_gateway_repr,
+    "__repr__",
+    setlike_descr_repr
+);
+setlike_wrapper_gateways!(set_gateway_or, frozenset_gateway_or, "__or__", set_op_or);
+setlike_wrapper_gateways!(
+    set_gateway_and,
+    frozenset_gateway_and,
+    "__and__",
+    set_op_and
+);
+setlike_wrapper_gateways!(
+    set_gateway_sub,
+    frozenset_gateway_sub,
+    "__sub__",
+    set_op_sub
+);
+setlike_wrapper_gateways!(
+    set_gateway_xor,
+    frozenset_gateway_xor,
+    "__xor__",
+    set_op_xor
+);
+setlike_wrapper_gateways!(
+    set_gateway_rsub,
+    frozenset_gateway_rsub,
+    "__rsub__",
+    set_op_rsub
+);
+setlike_wrapper_gateways!(
+    set_gateway_rand,
+    frozenset_gateway_rand,
+    "__rand__",
+    set_op_and
+);
+setlike_wrapper_gateways!(set_gateway_ror, frozenset_gateway_ror, "__ror__", set_op_or);
+setlike_wrapper_gateways!(
+    set_gateway_rxor,
+    frozenset_gateway_rxor,
+    "__rxor__",
+    set_op_xor
+);
+setlike_wrapper_gateways!(set_gateway_eq, frozenset_gateway_eq, "__eq__", set_descr_eq);
+setlike_wrapper_gateways!(set_gateway_ne, frozenset_gateway_ne, "__ne__", set_descr_ne);
+setlike_wrapper_gateways!(set_gateway_le, frozenset_gateway_le, "__le__", set_descr_le);
+setlike_wrapper_gateways!(set_gateway_ge, frozenset_gateway_ge, "__ge__", set_descr_ge);
+setlike_wrapper_gateways!(set_gateway_lt, frozenset_gateway_lt, "__lt__", set_descr_lt);
+setlike_wrapper_gateways!(set_gateway_gt, frozenset_gateway_gt, "__gt__", set_descr_gt);
+
+fn setlike_gateway(
+    frozen: bool,
+    set_gateway: crate::gateway::BuiltinCodeFn,
+    frozenset_gateway: crate::gateway::BuiltinCodeFn,
+) -> crate::gateway::BuiltinCodeFn {
+    if frozen {
+        frozenset_gateway
+    } else {
+        set_gateway
+    }
+}
+
+fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -18816,19 +18919,7 @@ fn init_setlike_common(ns: PyObjectRef) {
             "__len__",
             make_builtin_function_with_arity(
                 "__len__",
-                |args| {
-                    if args.is_empty() {
-                        return Ok(pyre_object::w_int_new(0));
-                    }
-                    unsafe {
-                        if pyre_object::is_set_or_frozenset(args[0]) {
-                            return Ok(pyre_object::w_int_new(
-                                pyre_object::w_set_len(args[0]) as i64
-                            ));
-                        }
-                    }
-                    Ok(pyre_object::w_int_new(0))
-                },
+                setlike_gateway(frozen, set_gateway_len, frozenset_gateway_len),
                 1,
             ),
         )
@@ -18839,12 +18930,7 @@ fn init_setlike_common(ns: PyObjectRef) {
             "__iter__",
             make_builtin_function_with_arity(
                 "__iter__",
-                |args| {
-                    if args.is_empty() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    crate::baseobjspace::iter(args[0])
-                },
+                setlike_gateway(frozen, set_gateway_iter, frozenset_gateway_iter),
                 1,
             ),
         )
@@ -18855,7 +18941,7 @@ fn init_setlike_common(ns: PyObjectRef) {
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
-                |args| unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0])?)) },
+                setlike_gateway(frozen, set_gateway_repr, frozenset_gateway_repr),
                 1,
             ),
         )
@@ -18875,98 +18961,154 @@ fn init_setlike_common(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__or__",
-            make_builtin_function_with_arity("__or__", set_op_or, 2),
+            make_builtin_function_with_arity(
+                "__or__",
+                setlike_gateway(frozen, set_gateway_or, frozenset_gateway_or),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__and__",
-            make_builtin_function_with_arity("__and__", set_op_and, 2),
+            make_builtin_function_with_arity(
+                "__and__",
+                setlike_gateway(frozen, set_gateway_and, frozenset_gateway_and),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__sub__",
-            make_builtin_function_with_arity("__sub__", set_op_sub, 2),
+            make_builtin_function_with_arity(
+                "__sub__",
+                setlike_gateway(frozen, set_gateway_sub, frozenset_gateway_sub),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__xor__",
-            make_builtin_function_with_arity("__xor__", set_op_xor, 2),
+            make_builtin_function_with_arity(
+                "__xor__",
+                setlike_gateway(frozen, set_gateway_xor, frozenset_gateway_xor),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rsub__",
-            make_builtin_function_with_arity("__rsub__", set_op_rsub, 2),
+            make_builtin_function_with_arity(
+                "__rsub__",
+                setlike_gateway(frozen, set_gateway_rsub, frozenset_gateway_rsub),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rand__",
-            make_builtin_function_with_arity("__rand__", set_op_and, 2),
+            make_builtin_function_with_arity(
+                "__rand__",
+                setlike_gateway(frozen, set_gateway_rand, frozenset_gateway_rand),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ror__",
-            make_builtin_function_with_arity("__ror__", set_op_or, 2),
+            make_builtin_function_with_arity(
+                "__ror__",
+                setlike_gateway(frozen, set_gateway_ror, frozenset_gateway_ror),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rxor__",
-            make_builtin_function_with_arity("__rxor__", set_op_xor, 2),
+            make_builtin_function_with_arity(
+                "__rxor__",
+                setlike_gateway(frozen, set_gateway_rxor, frozenset_gateway_rxor),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function_with_arity("__eq__", set_descr_eq, 2),
+            make_builtin_function_with_arity(
+                "__eq__",
+                setlike_gateway(frozen, set_gateway_eq, frozenset_gateway_eq),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ne__",
-            make_builtin_function_with_arity("__ne__", set_descr_ne, 2),
+            make_builtin_function_with_arity(
+                "__ne__",
+                setlike_gateway(frozen, set_gateway_ne, frozenset_gateway_ne),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__le__",
-            make_builtin_function_with_arity("__le__", set_descr_le, 2),
+            make_builtin_function_with_arity(
+                "__le__",
+                setlike_gateway(frozen, set_gateway_le, frozenset_gateway_le),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ge__",
-            make_builtin_function_with_arity("__ge__", set_descr_ge, 2),
+            make_builtin_function_with_arity(
+                "__ge__",
+                setlike_gateway(frozen, set_gateway_ge, frozenset_gateway_ge),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__lt__",
-            make_builtin_function_with_arity("__lt__", set_descr_lt, 2),
+            make_builtin_function_with_arity(
+                "__lt__",
+                setlike_gateway(frozen, set_gateway_lt, frozenset_gateway_lt),
+                2,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__gt__",
-            make_builtin_function_with_arity("__gt__", set_descr_gt, 2),
+            make_builtin_function_with_arity(
+                "__gt__",
+                setlike_gateway(frozen, set_gateway_gt, frozenset_gateway_gt),
+                2,
+            ),
         )
     };
     unsafe {
@@ -19711,7 +19853,7 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function("__init__", set_descr_init),
         )
     };
-    init_setlike_common(ns);
+    init_setlike_common(ns, false);
     // setobject.py `__hash__ = None` — keep the slot visible to
     // introspection as well as the unhashable fast path in builtin_hash.
     unsafe {
@@ -19932,7 +20074,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
             )),
         )
     };
-    init_setlike_common(ns);
+    init_setlike_common(ns, true);
     // setobject.py descr_hash.  The Result-bearing hash helper walks the
     // elements and propagates an element hash error; the storage itself is not
     // rebuilt and no set element is re-inserted.
@@ -19943,6 +20085,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__hash__",
                 |args| {
+                    crate::type_methods::require_frozenset_receiver(args, "__hash__", false)?;
                     Ok(pyre_object::w_int_new(crate::builtins::try_hash_value(
                         args[0],
                     )?))
