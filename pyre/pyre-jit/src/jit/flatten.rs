@@ -3424,6 +3424,14 @@ pub struct LoweringContext {
     /// `bh_store_deref_value_fn` mutates the cell's contents
     /// (`PlainCannotRaise` — writes heap, runs no user code, never raises).
     pub store_deref_value_fn_idx: u16,
+    /// `build_slice_fn` descrs-pool index.  BUILD_SLICE records the
+    /// `newslice(start, stop, step)` HLOp lowered to `residual_call_ir_r(
+    /// ConstInt(fn_idx), ListI([argc]), ListR([start, stop, step]), Descr) →
+    /// reg` via [`lower_newslice_hlop_to_insn`].  `bh_build_slice_fn` allocates
+    /// a slice (`Plain` — runs no user code; matches the bind-site flavor). The
+    /// walker always emits three ref operands (an argc=2 slice synthesizes a
+    /// `None` step), so `argc` is 3.
+    pub build_slice_fn_idx: u16,
     /// `make_cell_fn` descrs-pool index.  MAKE_CELL records the
     /// `make_cell_value(current)` HLOp lowered to `residual_call_r_r(ConstInt(
     /// fn_idx), ListR([current]), Descr) → reg` via
@@ -5103,6 +5111,9 @@ where
     if let Some(insn) = lower_store_slice_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_newslice_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_delsubscr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5600,6 +5611,55 @@ where
                 vec![Operand::ConstInt(deref_idx)],
             )),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![cell, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the BUILD_SLICE pyre HLOp `newslice(start, stop, step) → result: Ref`
+/// to `residual_call_ir_r(ConstInt(build_slice_fn_idx), ListI([3]),
+/// ListR([start, stop, step]), Descr) → reg`, the same ir_r shape as
+/// [`lower_load_deref_value_hlop_to_insn`].  The walker always records three ref
+/// operands — an argc=2 slice synthesizes a `None` step — so `argc` is 3 and
+/// `bh_build_slice_fn` uses the step operand directly (`w_slice_new`).
+/// Allocates a slice but runs no user code → `Plain`, matching the bind-site
+/// flavor in `codewriter.rs`.
+///
+/// Returns `None` for a non-`newslice` opname or unexpected arity so the caller
+/// can fall through to other lowering arms.
+pub fn lower_newslice_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "newslice" || op.args.len() != 3 {
+        return None;
+    }
+    let start = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let stop = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let step = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Ref],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.build_slice_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(3)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![start, stop, step])),
             descr_operand,
         ],
         dst_reg,
@@ -11082,6 +11142,7 @@ mod tests {
             unary_negative_fn_idx: 112,
             list_extend_fn_idx: 113,
             store_deref_value_fn_idx: 114,
+            build_slice_fn_idx: 133,
             make_cell_fn_idx: 115,
             make_function_fn_idx: 131,
             set_function_attribute_fn_idx: 132,
@@ -12035,6 +12096,113 @@ mod tests {
                                 !stub.effect_info.check_can_raise(false),
                                 "cannot-raise residual must omit the trailing GUARD_NO_EXCEPTION"
                             );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Operand::Descr, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_newslice_hlop_emits_build_slice_fn_residual() {
+        // `newslice(start, stop, step)` →
+        // `residual_call_ir_r(ConstInt(build_slice_fn_idx), ListI([3]),
+        // ListR([start, stop, step]), Descr) → reg` (Plain — allocates a slice,
+        // runs no user code; matches the bind-site flavor).
+        let start_var = Variable::new(VariableId(8), Kind::Ref);
+        let stop_var = Variable::new(VariableId(9), Kind::Ref);
+        let step_var = Variable::new(VariableId(10), Kind::Ref);
+        let result_var = Variable::new(VariableId(11), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "newslice",
+            vec![start_var.into(), stop_var.into(), step_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(11) => Register {
+                kind: Kind::Ref,
+                index: 104,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn =
+            super::lower_newslice_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("3-arg newslice lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(133)),
+                    "build_slice_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(3)]),
+                            "ListI must be [argc=3], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(a), Operand::Register(b), Operand::Register(c)] => {
+                                assert_eq!(a.index, 101, "ListR[0] must be start");
+                                assert_eq!(b.index, 102, "ListR[1] must be stop");
+                                assert_eq!(c.index, 103, "ListR[2] must be step");
+                            }
+                            other => panic!("ListR must be [start, stop, step], got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 104
+                    }),
+                );
+                match &args[3] {
+                    Operand::Descr(rc) => match &**rc {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.effect_info,
+                                effect_info_for_call_flavor(CallFlavor::Plain),
+                                "newslice residual must carry the Plain effect (matches bind site)"
+                            );
+                            assert_eq!(
+                                stub.arg_kinds,
+                                vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Ref]
+                            );
+                            assert_eq!(stub.result_kind, Some(Kind::Ref));
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },

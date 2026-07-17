@@ -5498,7 +5498,7 @@ impl CodeWriter {
                 },
             build_slice_fn:
                 HelperHandle {
-                    idx: _build_slice_fn_idx,
+                    idx: build_slice_fn_idx,
                     flavor: _build_slice_fn_flavor,
                 },
             normalize_raise_varargs_fn:
@@ -5970,6 +5970,7 @@ impl CodeWriter {
                 super_attr_unwrap_fn_idx,
                 load_deref_value_fn_idx,
                 store_deref_value_fn_idx,
+                build_slice_fn_idx,
                 make_cell_fn_idx,
                 make_function_fn_idx,
                 set_function_attribute_fn_idx,
