@@ -8185,11 +8185,12 @@ fn raiseattrerror(obj: PyObjectRef, name: &str, w_descr: Option<PyObjectRef>) ->
                 None => (*(*obj).ob_type).name.to_string(),
             }
         };
-        return PyError::attribute_error_with_context(
-            format!("'{tp_name}' object attribute '{name}' is read-only"),
-            obj,
-            name,
-        );
+        // The read-only branch raises a plain AttributeError: unlike the
+        // missing-attribute path it does not set the `name`/`obj` context,
+        // so `e.name` / `e.obj` read back as None.
+        return PyError::attribute_error(format!(
+            "'{tp_name}' object attribute '{name}' is read-only"
+        ));
     }
     let subject = unsafe {
         if is_type(obj) {
