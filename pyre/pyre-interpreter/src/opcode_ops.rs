@@ -243,44 +243,20 @@ pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObje
 /// sources, generic iterator-protocol fallback otherwise (which surfaces
 /// "Value after * must be an iterable, not <T>" when not iterable).
 pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
-    unsafe {
-        if pyre_object::is_list(iterable) {
-            let src_len = pyre_object::w_list_len(iterable);
-            for j in 0..src_len {
-                if let Some(item) = pyre_object::w_list_getitem(iterable, j as i64) {
-                    pyre_object::w_list_append(list, item);
-                }
-            }
-            return Ok(());
-        }
-        if pyre_object::is_tuple(iterable) {
-            let src_len = pyre_object::w_tuple_len(iterable);
-            for j in 0..src_len {
-                if let Some(item) = pyre_object::w_tuple_getitem(iterable, j as i64) {
-                    pyre_object::w_list_append(list, item);
-                }
-            }
-            return Ok(());
-        }
-        // Generic iter-protocol fallback for dict/set/range/generator/etc.
-        let iter = crate::baseobjspace::iter(iterable).map_err(|_| {
+    // pyopcode.py LIST_EXTEND calls the target list's `extend` method.  The
+    // builtin body preserves exact-list/tuple storage fast paths while list
+    // and tuple subclasses go through `iter()` so an overridden `__iter__`
+    // is observed.
+    match crate::type_methods::list_method_extend(&[list, iterable]) {
+        Ok(_) => Ok(()),
+        Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
+        Err(_) => unsafe {
             let type_name = (*(*iterable).ob_type).name;
-            PyError::type_error(format!(
-                "Value after * must be an iterable, not {}",
-                type_name
-            ))
-        })?;
-        loop {
-            match crate::baseobjspace::next(iter) {
-                Ok(item) => {
-                    pyre_object::w_list_append(list, item);
-                }
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                Err(e) => return Err(e),
-            }
-        }
+            Err(PyError::type_error(format!(
+                "Value after * must be an iterable, not {type_name}"
+            )))
+        },
     }
-    Ok(())
 }
 
 /// SET_ADD — `set.add(value)` (or `list.append` for the list-shaped

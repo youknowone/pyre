@@ -130,4 +130,20 @@ assert values == [0, "a", "b", 1, 2, 3, 4, 5]
 values[6:2] = []
 assert values == [0, "a", "b", 1, 2, 3, 4, 5]
 
+for base in (object, list, tuple):
+    side_effects = [1]
+
+    class IterableSubclass(base):
+        def __iter__(self):
+            side_effects.append(2)
+
+            def inner():
+                yield 3
+                side_effects.append(4)
+
+            return inner()
+
+    unpacked = [*side_effects, *IterableSubclass(), *side_effects.copy()]
+    assert unpacked == [1, 3, 1, 2, 4]
+
 print("OK")
