@@ -5365,11 +5365,10 @@ fn init_dict_type(ns: PyObjectRef) {
                     // regardless of key type by dispatching through the
                     // strategy's `clear` (`celldict.py:162-164` for
                     // module dicts).  `w_dict_clear` does the dispatch.
-                    if !args.is_empty() {
-                        let d = crate::type_methods::resolve_dict_backing(args[0]);
-                        if !d.is_null() {
-                            unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
-                        }
+                    crate::type_methods::arity_no_args(args, "dict.clear")?;
+                    let d = crate::type_methods::resolve_dict_backing(args[0]);
+                    if !d.is_null() {
+                        unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -17836,7 +17835,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "append", 1)?;
+    crate::type_methods::arity_exact(args, "bytearray.append", 1)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
@@ -17962,6 +17961,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `bytearrayobject.py:descr_reverse` — reverse the bytes in place.
 fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "reverse")?;
+    crate::type_methods::arity_no_args(args, "bytearray.reverse")?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).reverse() };
     Ok(pyre_object::w_none())
 }
@@ -17969,6 +17969,7 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
+    crate::type_methods::arity_no_args(args, "bytearray.clear")?;
     unsafe {
         crate::builtins::bytearray_check_exports(args[0])?;
         pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
@@ -17980,6 +17981,7 @@ fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// same bytes.
 fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "copy")?;
+    crate::type_methods::arity_no_args(args, "bytearray.copy")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
 }
@@ -18892,6 +18894,12 @@ fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 fn setlike_descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.copy"
+    } else {
+        "set.copy"
+    };
+    crate::type_methods::arity_no_args(args, name)?;
     if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::setobject::FROZENSET_TYPE) } {
         return Ok(args[0]);
     }

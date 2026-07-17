@@ -520,6 +520,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// PyPy: listobject.py descr_clear — list.clear()
 pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "clear", true)?;
+    arity_no_args(args, "list.clear")?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
     Ok(w_none())
 }
@@ -527,6 +528,7 @@ pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "copy", true)?;
+    arity_no_args(args, "list.copy")?;
     let list = args[0];
     unsafe {
         let n = w_list_len(list);
@@ -543,6 +545,7 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// PyPy: listobject.py descr_reverse — list.reverse()
 pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "reverse", true)?;
+    arity_no_args(args, "list.reverse")?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
     Ok(w_none())
 }
@@ -5317,6 +5320,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// so popping the last entry matches the spec.
 pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "popitem")?;
+    arity_no_args(args, "dict.popitem")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
