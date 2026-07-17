@@ -152,6 +152,20 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::JumpBackwardNoInterrupt { .. }
         | Instruction::ReturnValue => VstackOpClass::PopOnlyOrSideStore,
 
+        // TO_BOOL: pops TOS and pushes its bool (net 0, liveness `(d, d)`) and
+        // emits no JitCode (codewriter `Instruction::ToBool => {}`), so it has
+        // no `write_ref_reg` box for the pushed bool.  Its result is always
+        // consumed by the immediately following branch (POP_JUMP_IF_*), never
+        // kept below a guard, so the untracked TOS box is inert; model it as a
+        // net-0 side effect that truncates to the (unchanged) depth and keeps
+        // every surviving box in place — crucially the operand-stack slots
+        // BELOW the tested value.  Classifying it as `Unmodeled` here (the
+        // former `_` fallthrough) latched `vstack_valid = false` whenever the
+        // after-residual guard-capture reconcile re-entered at the TO_BOOL pc
+        // (`prev_pypc == new_pypc`), dropping the kept accumulator below a
+        // residual-call condition (`s = s + (i if f(...) else 0)`).
+        Instruction::ToBool => VstackOpClass::PopOnlyOrSideStore,
+
         // LOAD_GLOBAL: the global value is the new TOS = the last Ref written.
         // When `namei & 1` the lowering also pushes a NULL sentinel BENEATH the
         // result (net +2, for the upcoming method CALL).  Exactly like the
@@ -223,10 +237,11 @@ pub(crate) fn classify_vstack_opcode(
         Instruction::ForIter { .. } => VstackOpClass::ResultToTos,
 
         // Everything else is not modeled — decline; the overlay then omits
-        // the affected slots, which resume re-materializes.  TO_BOOL emits no
-        // JitCode (codewriter.rs:8598
-        // `Instruction::ToBool => {}`) so it never reaches this classifier;
-        // the py-pc boundary mapping skips it.
+        // the affected slots, which resume re-materializes.  The forward walk
+        // maps JitCode pc -> py_pc and so never lands ON a no-JitCode opcode
+        // (TO_BOOL), but the after-residual guard-capture reconcile passes an
+        // explicit resume py_pc that CAN coincide with the TO_BOOL pc, so
+        // TO_BOOL is modeled explicitly above rather than left to this arm.
         _ => VstackOpClass::Unmodeled,
     }
 }
