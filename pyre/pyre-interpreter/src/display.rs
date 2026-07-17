@@ -698,8 +698,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // GenericAlias.__repr__ (`_pypy_generic_alias.py:57`).
             return crate::_pypy_generic_alias::repr(obj);
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
-            let name = pyre_object::w_module_get_name(obj);
-            format!("<module '{name}'>")
+            crate::typedef::module_repr_string(obj)?
         } else if std::ptr::eq(
             tp,
             &pyre_object::pyobject::MAPPING_PROXY_TYPE as *const PyType,
