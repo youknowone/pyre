@@ -229,6 +229,7 @@ fn build() -> AllJitCodes {
                         "pycode".to_string(),
                     ],
                     reds: vec!["frame".to_string(), "ec".to_string()],
+                    autoreds: false,
                     virtualizables: vec!["frame".to_string()],
                     red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
                 }],

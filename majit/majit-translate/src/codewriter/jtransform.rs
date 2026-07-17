@@ -393,6 +393,130 @@ fn split_args_by_kind(
     (ints, refs, floats)
 }
 
+/// Pyre's frontend materialises source constants as SSA Variables. Recover
+/// the upstream `Constant`/`Variable` distinction at the graph boundary.
+fn is_source_constant_variable(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            if op.result.as_ref() != Some(variable) {
+                return false;
+            }
+            match &op.kind {
+                OpKind::ConstInt(_)
+                | OpKind::ConstBool(_)
+                | OpKind::ConstFloat(_)
+                | OpKind::ConstRef(_)
+                | OpKind::ConstRefNull
+                | OpKind::ConstRefAddr(_) => true,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => segments.first().is_some_and(|s| s == "__str_const"),
+                _ => false,
+            }
+        })
+    })
+}
+
+/// RPython: `support.autodetect_jit_markers_redvars` (support.py:64-102).
+/// Compute the Variables live across the portal's `jit_merge_point`, remove
+/// its greens, filter Constants/Void, and return INT/REF/FLOAT order.
+fn autodetect_jit_markers_redvars(
+    graph: &FunctionGraph,
+    greens: &[crate::flowspace::model::Variable],
+) -> Vec<crate::flowspace::model::Variable> {
+    use crate::codewriter::type_state::ConcreteType;
+    use crate::flowspace::model::Variable;
+
+    let (block, marker_index, marker_receiver, marker_greens) = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block.operations.iter().enumerate().find_map(|(index, op)| {
+                let OpKind::Call { target, args, .. } = &op.kind else {
+                    return None;
+                };
+                (jit_marker_key_from_target(target) == Some(JitMarkerKey::JitMergePoint)).then(
+                    || {
+                        (
+                            block,
+                            index,
+                            args.first().cloned(),
+                            args.iter()
+                                .skip(1)
+                                .take(greens.len())
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
+                    },
+                )
+            })
+        })
+        .expect("autoreds portal graph must contain a jit_merge_point");
+
+    let mut alive_v: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    for link in &block.exits {
+        alive_v.extend(
+            link.args
+                .iter()
+                .filter_map(|arg| arg.as_variable())
+                .cloned(),
+        );
+        for extra in [&link.last_exception, &link.last_exc_value] {
+            if let Some(variable) = extra.as_ref().and_then(|arg| arg.as_variable()) {
+                alive_v.remove(variable);
+            }
+        }
+    }
+    for op in block.operations[marker_index + 1..].iter().rev() {
+        if let Some(result) = &op.result {
+            alive_v.remove(result);
+        }
+        alive_v.extend(crate::inline::op_variable_refs(&op.kind));
+    }
+    for green in greens {
+        alive_v.remove(green);
+    }
+    // RPython subtracts `op.args[2:]` from the same graph operation it
+    // scanned. During pyre's in-place block rewrite `greens` can already be
+    // alias-remapped while the links still carry graph-resident identities,
+    // so subtract that exact marker payload as the canonical green set.
+    for green in &marker_greens {
+        alive_v.remove(green);
+    }
+    // RPython's `op.args[1]` is the JitDriver Constant. Pyre's Rust frontend
+    // materialises the singleton receiver as a Variable and can thread it
+    // through loop links, so remove that exact marker receiver identity.
+    if let Some(receiver) = &marker_receiver {
+        alive_v.remove(receiver);
+    }
+
+    let mut reds_v: Vec<Variable> = alive_v
+        .into_iter()
+        .filter(|variable| {
+            FunctionGraph::concretetype_of(variable) != ConcreteType::Void
+                && !is_source_constant_variable(graph, variable)
+        })
+        .collect();
+    // RPython's `sort_vars` is stable within each kind because its set order
+    // is stable for a translation. Rust HashSet iteration is randomized, so
+    // use Variable identity as a deterministic secondary key; otherwise the
+    // emitted jitcode layout could differ between translator runs.
+    reds_v.sort_by_key(|variable| {
+        let kind_rank = match FunctionGraph::concretetype_of(variable) {
+            ConcreteType::Signed => 1,
+            ConcreteType::GcRef | ConcreteType::Unknown => 2,
+            ConcreteType::Float => 3,
+            ConcreteType::Void => 4,
+        };
+        (kind_rank, variable.id())
+    });
+    reds_v
+}
+
 impl<'a> Transformer<'a> {
     /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
     /// (`jtransform.py:62-66`). Pyre keeps `cpu` / `callcontrol` behind
@@ -4236,9 +4360,11 @@ impl<'a> Transformer<'a> {
                 Some(self.handle_jit_marker__loop_header(jitdriver_index))
             }
             JitMarkerKey::JitMergePoint => {
-                let cc = self.callcontrol.as_deref()?;
-                let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
-                let num_greens = jd.greens.len();
+                let (num_greens, autoreds) = {
+                    let cc = self.callcontrol.as_deref()?;
+                    let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
+                    (jd.greens.len(), jd.autoreds)
+                };
                 // Skip the receiver: pyre lowers `driver.jit_merge_point(...)`
                 // (`front::mir`) as a method call whose
                 // `Call.args[0]` is the `PyPyJitDriver` receiver; the user-facing
@@ -4255,7 +4381,27 @@ impl<'a> Transformer<'a> {
                 // jtransform.py:1695 `ops = self.promote_greens(...)` —
                 // prepends per-green `-live-` + `{kind}_guard_value` pairs.
                 let greens_raw = &user_args[..num_greens];
-                let reds_raw = &user_args[num_greens..];
+                // support.py:70-71 guards the portal scan on `autoreds`.
+                // Explicit-red drivers retain the existing call-site payload
+                // path byte-for-byte.
+                let detected_reds =
+                    autoreds.then(|| autodetect_jit_markers_redvars(graph, greens_raw));
+                let reds_raw = detected_reds.as_deref().unwrap_or(&user_args[num_greens..]);
+                if autoreds {
+                    let jd = self
+                        .callcontrol
+                        .as_deref_mut()?
+                        .jitdriver_sd_from_jitdriver_mut(jitdriver_index)?;
+                    if let Some(numreds) = jd.numreds {
+                        assert_eq!(
+                            numreds,
+                            reds_raw.len(),
+                            "there are multiple jit_merge_points with the same jitdriver"
+                        );
+                    } else {
+                        jd.numreds = Some(reds_raw.len());
+                    }
+                }
                 // jtransform.py:1699-1701 `assert isinstance(v,
                 // Variable), "Constant specified red in
                 // jit_merge_point()"` — a Constant passed as red is
@@ -4279,29 +4425,11 @@ impl<'a> Transformer<'a> {
                 // operands.  A constant value laundered through a
                 // value-copying op is not chased; upstream's
                 // `isinstance(v, Variable)` does not chase it either.
-                let red_ids: std::collections::HashSet<_> =
-                    reds_raw.iter().map(|v| v.id()).collect();
-                for block in &graph.blocks {
-                    for def in &block.operations {
-                        let Some(result) = &def.result else { continue };
-                        if !red_ids.contains(&result.id()) {
-                            continue;
-                        }
-                        let is_const_def = match &def.kind {
-                            OpKind::ConstInt(_)
-                            | OpKind::ConstBool(_)
-                            | OpKind::ConstFloat(_)
-                            | OpKind::ConstRef(_)
-                            | OpKind::ConstRefNull
-                            | OpKind::ConstRefAddr(_) => true,
-                            OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
-                                ..
-                            } => segments.first().is_some_and(|s| s == "__str_const"),
-                            _ => false,
-                        };
-                        assert!(!is_const_def, "Constant specified red in jit_merge_point()");
-                    }
+                for red in reds_raw {
+                    assert!(
+                        !is_source_constant_variable(graph, red),
+                        "Constant specified red in jit_merge_point()"
+                    );
                 }
                 let mut ops = self.promote_greens(greens_raw);
                 let (greens_i, greens_r, greens_f) = split_args_by_kind(greens_raw);
@@ -7700,6 +7828,98 @@ mod tests {
     }
 
     #[test]
+    fn autodetect_jit_markers_redvars_finds_live_non_green_vars_in_kind_order() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::Variable;
+        use crate::model::{Link, LinkArg, ValueType};
+
+        let mut graph = crate::model::FunctionGraph::new("autoreds_portal");
+        let receiver = Variable::named("driver");
+        let green = Variable::named("greenkey");
+        let remapped_green = Variable::named("greenkey_alias");
+        let red_i = Variable::named("red_i");
+        let w_iterator = Variable::named("w_iterator");
+        let items = Variable::named("items");
+        let red_f = Variable::named("red_f");
+        let void = Variable::named("void");
+        let last_exception = Variable::named("last_exception");
+        let last_exc_value = Variable::named("last_exc_value");
+        let constant = Variable::named("constant");
+        let after_result = Variable::named("after_result");
+        for variable in [&receiver, &green, &remapped_green, &w_iterator, &items] {
+            FunctionGraph::set_concretetype_of_inline(variable, ConcreteType::GcRef);
+        }
+        FunctionGraph::set_concretetype_of_inline(&red_i, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&red_f, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&void, ConcreteType::Void);
+        FunctionGraph::set_concretetype_of_inline(&constant, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&after_result, ConcreteType::Signed);
+
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(constant.clone()),
+                kind: OpKind::ConstInt(7),
+            });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("UnpackIterableJitDriver".into()),
+                    ),
+                    args: vec![receiver.clone(), green.clone()],
+                    result_ty: ValueType::Void,
+                },
+            });
+        // Reverse liveness must discard this result and add its operands.
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(after_result.clone()),
+                kind: OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: red_i.clone(),
+                    rhs: green.clone(),
+                    result_ty: ValueType::Int,
+                },
+            });
+        let link_args = vec![
+            red_i.clone(),
+            w_iterator.clone(),
+            items.clone(),
+            red_f.clone(),
+            green.clone(),
+            receiver,
+            void,
+            constant,
+            after_result,
+            last_exception.clone(),
+            last_exc_value.clone(),
+        ];
+        let (target, _) = graph.create_block_with_arg_vars(link_args.len());
+        graph.blocks[graph.startblock.0].exits = vec![
+            Link::new_mixed(
+                link_args.into_iter().map(LinkArg::Value).collect(),
+                target,
+                None,
+            )
+            .extravars(
+                Some(LinkArg::Value(last_exception)),
+                Some(LinkArg::Value(last_exc_value)),
+            ),
+        ];
+
+        assert_eq!(
+            autodetect_jit_markers_redvars(&graph, &[remapped_green]),
+            vec![red_i, w_iterator, items, red_f],
+            "reds must be INT<REF<FLOAT with deterministic Variable-id order within a kind"
+        );
+    }
+
+    #[test]
     fn jit_marker_key_recognises_allow_listed_jitdriver_methods() {
         let unpack_merge =
             CallTarget::method("jit_merge_point", Some("UnpackIterableJitDriver".into()));
@@ -7746,6 +7966,7 @@ mod tests {
             CallPath::from_segments(["pyre_jit", "other_portal"]),
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
         );
@@ -7758,6 +7979,7 @@ mod tests {
                 "pycode".into(),
             ],
             vec!["frame".into(), "ec".into()],
+            false,
             Vec::new(),
             Vec::new(),
         );
@@ -7853,6 +8075,7 @@ mod tests {
             crate::parse::CallPath::from_segments(["portal"]),
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
         );
@@ -8017,6 +8240,7 @@ mod tests {
             CallPath::from_segments(["test", "portal"]),
             vec!["green1".into(), "green2".into()],
             vec!["red1".into()],
+            false,
             Vec::new(),
             Vec::new(),
         );
@@ -8113,6 +8337,7 @@ mod tests {
             CallPath::from_segments(["test", "portal"]),
             vec!["green1".into()],
             vec!["red1".into()],
+            false,
             Vec::new(),
             Vec::new(),
         );

@@ -420,6 +420,11 @@ pub struct JitDriverStaticData {
     pub greens: Vec<String>,
     /// RPython: `jitdriver.reds` — loop-variant variable names.
     pub reds: Vec<String>,
+    /// RPython: `jitdriver.autoreds` — true for `reds='auto'` drivers.
+    pub autoreds: bool,
+    /// RPython: `jitdriver.numreds` — fixed immediately for explicit reds,
+    /// populated by the portal liveness scan for auto reds.
+    pub numreds: Option<usize>,
     /// RPython: `jitdriver.virtualizables` — names of red variables
     /// declared as virtualizable.  Drives warmspot.py:527-545
     /// `make_virtualizable_infos` selection.
@@ -2427,7 +2432,7 @@ impl CallControl {
     /// with no green/red layout. Used by tests that need a portal without a
     /// full driver registration; production seeds via `setup_jitdriver`.
     pub fn mark_portal(&mut self, path: CallPath) {
-        self.setup_jitdriver(path, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        self.setup_jitdriver(path, Vec::new(), Vec::new(), false, Vec::new(), Vec::new());
     }
 
     /// `codewriter.py:91-94 CodeWriter.setup_vrefinfo(self, vrefinfo)`.
@@ -2471,6 +2476,7 @@ impl CallControl {
         portal_graph: CallPath,
         greens: Vec<String>,
         reds: Vec<String>,
+        autoreds: bool,
         virtualizables: Vec<String>,
         red_types: Vec<String>,
     ) {
@@ -2483,7 +2489,9 @@ impl CallControl {
             index,
             active: true,
             greens,
+            numreds: if autoreds { None } else { Some(reds.len()) },
             reds,
+            autoreds,
             virtualizables,
             red_types,
             portal_graph,
@@ -2767,6 +2775,15 @@ impl CallControl {
     /// name so call sites mirror RPython.
     pub fn jitdriver_sd_from_jitdriver(&self, index: usize) -> Option<&JitDriverStaticData> {
         self.jitdrivers_sd.get(index)
+    }
+
+    /// Mutable counterpart used by warmspot-time metadata discovery such as
+    /// `support.autodetect_jit_markers_redvars` setting `jitdriver.numreds`.
+    pub fn jitdriver_sd_from_jitdriver_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut JitDriverStaticData> {
+        self.jitdrivers_sd.get_mut(index)
     }
 
     /// call.py:375-385 `get_vinfo(VTYPEPTR)`.
@@ -8712,6 +8729,7 @@ mod tests {
             CallPath::from_segments(["portal_runner"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            false,
             vec![],
             vec![],
         );
@@ -8745,6 +8763,7 @@ mod tests {
             CallPath::from_segments(["portal_runner_b"]),
             vec![],
             vec![],
+            false,
             vec![],
             vec![],
         );
@@ -8813,6 +8832,7 @@ mod tests {
             CallPath::from_segments(["execute_opcode_step"]),
             vec!["pc".into()],
             vec!["frame".into(), "ec".into()],
+            false,
             vec!["frame".into()],
             vec!["PyFrame".into(), "ExecutionContext".into()],
         );
@@ -8837,6 +8857,7 @@ mod tests {
             CallPath::from_segments(["portal"]),
             vec!["frame.code".into()],
             vec!["frame".into()],
+            false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
         );
@@ -8851,6 +8872,7 @@ mod tests {
             CallPath::from_segments(["portal"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            false,
             vec![],
             vec![],
         );
@@ -8873,6 +8895,7 @@ mod tests {
             CallPath::from_segments(["portal_with_greenfield"]),
             vec!["frame.code".into(), "pc".into()],
             vec!["frame".into()],
+            false,
             vec![],
             vec!["PyFrame".into()],
         );
@@ -8898,6 +8921,7 @@ mod tests {
             CallPath::from_segments(["portal_a"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
         );
@@ -8905,6 +8929,7 @@ mod tests {
             CallPath::from_segments(["portal_b"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
         );
@@ -8941,6 +8966,7 @@ mod tests {
             CallPath::from_segments(["portal"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
         );

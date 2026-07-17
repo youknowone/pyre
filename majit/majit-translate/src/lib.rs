@@ -1655,6 +1655,7 @@ fn register_configured_jitdrivers(
             spec.portal.clone(),
             spec.greens.clone(),
             spec.reds.clone(),
+            spec.autoreds,
             spec.virtualizables.clone(),
             spec.red_types.clone(),
         );
@@ -1784,6 +1785,7 @@ mod portal_driver_tests {
             portal,
             greens: Vec::new(),
             reds: Vec::new(),
+            autoreds: false,
             virtualizables: Vec::new(),
             red_types: Vec::new(),
         }
@@ -1828,5 +1830,89 @@ mod portal_driver_tests {
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
         assert!(call_control.jitcodes().contains_key(&portal));
+    }
+
+    #[test]
+    fn make_jitcodes_keeps_explicit_driver_reds_from_marker_callsite() {
+        use crate::codewriter::flatten::FlatOp;
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let mut graph = FunctionGraph::new("eval_loop_jit");
+        let receiver = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![
+            receiver.clone(),
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: vec![
+                        receiver,
+                        next_instr,
+                        is_being_profiled,
+                        pycode,
+                        frame.clone(),
+                        ec.clone(),
+                    ],
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+            }],
+            register_trait_families: Vec::new(),
+        };
+        register_configured_jitdrivers(&mut call_control, &config.jit_drivers);
+        let mut policy = policy::DefaultJitPolicy::new();
+        call_control.find_all_graphs(&mut policy);
+
+        let (jitcodes, _, _) = make_jitcodes(&config, &mut call_control);
+        let merge = jitcodes[0]
+            .body()
+            ._ssarepr
+            .as_ref()
+            .expect("assembled portal keeps its SSA representation")
+            .insns
+            .iter()
+            .find_map(|flat_op| match flat_op {
+                FlatOp::Op(SpaceOperation {
+                    kind: OpKind::JitMergePoint { reds_r, .. },
+                    ..
+                }) => Some(reds_r),
+                _ => None,
+            })
+            .expect("portal emits a jit_merge_point");
+        assert_eq!(merge, &vec![frame, ec]);
+        let jd0 = &call_control.jitdrivers_sd()[0];
+        assert!(!jd0.autoreds);
+        assert_eq!(jd0.numreds, Some(2));
     }
 }

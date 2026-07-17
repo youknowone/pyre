@@ -27,6 +27,11 @@ pub struct JitDriverSpec {
     pub portal: CallPath,
     pub greens: Vec<String>,
     pub reds: Vec<String>,
+    /// RPython: `jitdriver.autoreds` — true when the driver declared
+    /// `reds='auto'` and the portal marker reds must be discovered by
+    /// `autodetect_jit_markers_redvars`.
+    #[serde(default)]
+    pub autoreds: bool,
     /// Optional explicit virtualizable red names. Empty means no
     /// virtualizable, which matches the common non-pyre case.
     #[serde(default)]
@@ -207,6 +212,7 @@ mod tests {
                 portal: CallPath::from_segments(["engine", "mainloop"]),
                 greens: Vec::new(),
                 reds: Vec::new(),
+                autoreds: false,
                 virtualizables: Vec::new(),
                 red_types: Vec::new(),
             }],
