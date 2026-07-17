@@ -3487,21 +3487,7 @@ fn set_init_from_iterable(
 /// so anything beyond `(self, iterable)` raises TypeError; pyre enforces the
 /// same maxargs explicitly here.
 fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let set_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    // gateway.interp2app(W_SetObject.descr_init) enforces that `self` is a
-    // W_SetObject before the body runs; without this check pyre would cast
-    // arbitrary args[0] values straight to the set layout below.
-    if set_obj.is_null() || !unsafe { pyre_object::is_set(set_obj) } {
-        let tp_name = if set_obj.is_null() {
-            "NoneType".to_string()
-        } else {
-            unsafe { (*(*set_obj).ob_type).name.to_string() }
-        };
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '__init__' requires a 'set' object but received a '{}'",
-            tp_name,
-        )));
-    }
+    let set_obj = crate::type_methods::require_set_receiver(args, "__init__", false)?;
     // setobject.py `descr_init(self, space, w_iterable=None, __posonly__=None)`
     // — `iterable` is a single positional-only optional argument.  Parse the
     // gateway args against that signature (gateway interp2app `parse_into_scope`)
@@ -19653,6 +19639,7 @@ fn set_symmetric_difference_storage(
 fn set_op_inplace_sub(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_receiver(args, "__isub__", false)?;
     if set_op_requires_set(args) {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -19662,6 +19649,7 @@ fn set_op_inplace_sub(
 fn set_op_inplace_and(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_receiver(args, "__iand__", false)?;
     if set_op_requires_set(args) {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -19671,6 +19659,7 @@ fn set_op_inplace_and(
 fn set_op_inplace_or(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_receiver(args, "__ior__", false)?;
     if set_op_requires_set(args) {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -19680,6 +19669,7 @@ fn set_op_inplace_or(
 fn set_op_inplace_xor(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_receiver(args, "__ixor__", false)?;
     if set_op_requires_set(args) {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -19738,6 +19728,7 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "add",
                 |args| {
+                    crate::type_methods::require_set_receiver(args, "add", true)?;
                     if args.len() >= 2 {
                         // `try_hash_value` may run a user `__hash__` that
                         // allocates and triggers a moving minor collection;
@@ -19769,6 +19760,7 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "discard",
                 |args| {
+                    crate::type_methods::require_set_receiver(args, "discard", true)?;
                     if args.len() >= 2 {
                         set_discard_from_set(args[0], args[1])?;
                     }
@@ -19785,6 +19777,7 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "remove",
                 |args| {
+                    crate::type_methods::require_set_receiver(args, "remove", true)?;
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("remove() requires an argument"));
                     }
@@ -19804,12 +19797,7 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "pop",
                 |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::KeyError,
-                            "pop from an empty set",
-                        ));
-                    }
+                    crate::type_methods::require_set_receiver(args, "pop", true)?;
                     if let Some(item) = unsafe { pyre_object::w_set_popitem(args[0]) } {
                         return Ok(item);
                     }
@@ -19829,9 +19817,8 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "clear",
                 |args| {
-                    if !args.is_empty() {
-                        unsafe { pyre_object::w_set_clear(args[0]) };
-                    }
+                    crate::type_methods::require_set_receiver(args, "clear", true)?;
+                    unsafe { pyre_object::w_set_clear(args[0]) };
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -19842,7 +19829,10 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "update",
-            make_builtin_function("update", set_method_update),
+            make_builtin_function("update", |args| {
+                crate::type_methods::require_set_receiver(args, "update", true)?;
+                set_method_update(args)
+            }),
         )
     };
     // `setobject.py W_BaseSetObject.descr_difference_update` /
@@ -19853,24 +19843,34 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "difference_update",
-            make_builtin_function("difference_update", set_method_difference_update),
+            make_builtin_function("difference_update", |args| {
+                crate::type_methods::require_set_receiver(args, "difference_update", true)?;
+                set_method_difference_update(args)
+            }),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection_update",
-            make_builtin_function("intersection_update", set_method_intersection_update),
+            make_builtin_function("intersection_update", |args| {
+                crate::type_methods::require_set_receiver(args, "intersection_update", true)?;
+                set_method_intersection_update(args)
+            }),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "symmetric_difference_update",
-            make_builtin_function(
-                "symmetric_difference_update",
-                set_method_symmetric_difference_update,
-            ),
+            make_builtin_function("symmetric_difference_update", |args| {
+                crate::type_methods::require_set_receiver(
+                    args,
+                    "symmetric_difference_update",
+                    true,
+                )?;
+                set_method_symmetric_difference_update(args)
+            }),
         )
     };
     // `setobject.py` __isub__/__iand__/__ior__/__ixor__ — mutable-set-only

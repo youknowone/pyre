@@ -253,6 +253,35 @@ pub(crate) fn require_tuple_receiver(
     Ok(receiver)
 }
 
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_SetObject.descr_*)` gateway.  CPython 3.14 exposes set's
+/// slot wrappers and ordinary methods as two descriptor kinds with distinct
+/// public mismatch messages.
+pub(crate) fn require_set_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method set.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'set' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_set(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!("descriptor '{name}' for 'set' objects doesn't apply to a '{received}' object")
+        } else {
+            format!("descriptor '{name}' requires a 'set' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.
