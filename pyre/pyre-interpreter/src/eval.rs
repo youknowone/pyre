@@ -751,17 +751,28 @@ fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         if exc.is_null() {
             return;
         }
-        // The exception object is off-GC (std::alloc-backed, outside the managed
-        // nursery/old-gen), so the collector cannot reach it as a root and cannot
-        // trace its slots. Forward its GC-managed traceback chain head directly
-        // instead, keeping the whole chain live. The traceback is old-gen
-        // non-moving, so the visitor never rewrites the slot — reading a copy is
-        // safe and avoids a mid-collection write-back that would re-enter the
-        // barrier.
-        let mut wtb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
-        if !wtb.is_null() {
-            visitor(unsafe { &mut *(&mut wtb as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        }
+        // Forward the exception OBJECT slot itself. A GC-managed exception
+        // (oldgen-stable `w_exception_new_empty`) is marked here and the
+        // collector then recurses into its `W_BASE_EXCEPTION_GC_PTR_OFFSETS`
+        // slots via offset tracing, keeping the whole graph alive. The
+        // exception is oldgen-stable (non-moving), so the slot is not rewritten,
+        // but marking is what matters. Mirrors the value-stack walker, which
+        // forwards the on-stack exception slot then walks its raw children.
+        let slot = c.as_ptr();
+        // SAFETY: `slot` points at the `Cell<PyObjectRef>`'s interior, which is
+        // valid for the duration of this closure. `PyObjectRef` and `GcRef`
+        // share layout (`*mut PyObject`).
+        unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
+        // Off-GC fallback: when the GC is not installed the exception is
+        // `malloc_typed`-immortal, so the visitor above is a no-op and the
+        // collector never traces its slots. Forward ALL its GC-managed children
+        // in place — the whole `W_BASE_EXCEPTION_GC_PTR_OFFSETS` set (args_w,
+        // w_cause, w_context, the w_traceback chain, w_dict, and the per-subclass
+        // slots). Read the object AFTER the visitor so a (hypothetically) moved
+        // exception is the live one. The slots are forwarded by address (not the
+        // barriered setter), so a moving child is relocated with no re-entry.
+        let exc = unsafe { *(slot as *const PyObjectRef) };
+        unsafe { walk_raw_exception_roots(exc, visitor) };
     });
 }
 

@@ -501,13 +501,25 @@ pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
 /// (`exc_constructor`) and the message helpers above attach `args_w`
 /// afterwards via `w_exception_set_args`.
 pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
+    w_exception_new_empty_impl(kind, false)
+}
+
+/// Immortal variant for the prebuilt singletons (`memory_error_singleton` /
+/// `standard_exc_instance`): they are cached in `OnceLock<usize>` (GC-invisible)
+/// and baked into JIT constant pools as immediate pointers, so they must never
+/// be swept — keep them `malloc_typed`-immortal (stable, never reclaimed).
+pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
+    w_exception_new_empty_impl(kind, true)
+}
+
+fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
     let w_class = lookup_exc_class_for_kind(kind);
     let w_class = if w_class != PY_NULL {
         w_class
     } else {
         get_instantiate(&EXCEPTION_TYPE)
     };
-    crate::lltype::malloc_typed(W_BaseException {
+    let value = W_BaseException {
         ob_header: PyObject {
             ob_type: exc_kind_to_pytype(kind) as *const PyType,
             w_class,
@@ -551,7 +563,29 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
         // `interp_exceptions.py:113 w_dict = None` — allocated on the
         // first `getdict` (`:222-225`).
         w_dict: PY_NULL,
-    }) as PyObjectRef
+    };
+    if !immortal {
+        // GC-manage the exception object: allocate it in the non-moving
+        // oldgen so accessors can deref a bare `*W_BaseException` and the
+        // JIT can carry it as a raw i64 across allocating opcodes without
+        // it moving. Oldgen is mark-sweep, so all carriers must root it
+        // (`walk_in_flight_exception`, the value-stack walker, and the
+        // raw-i64 JIT carriers). Mirrors `w_generator_new`.
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+            W_BASE_EXCEPTION_GC_TYPE_ID,
+            W_BASE_EXCEPTION_SIZE,
+        );
+        if !raw.is_null() {
+            unsafe {
+                std::ptr::write(raw as *mut W_BaseException, value);
+            }
+            crate::gc_interp::note_alloc();
+            crate::gc_hook::try_gc_write_barrier(raw);
+            return raw as PyObjectRef;
+        }
+        return crate::lltype::malloc_typed(value) as PyObjectRef;
+    }
+    crate::lltype::malloc_typed(value) as PyObjectRef
 }
 
 /// Per-`ExcKind` class-pointer registry. Populated by
@@ -1219,11 +1253,13 @@ pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
 ///
 /// Stored as `usize` because `PyObjectRef` is `*mut PyObject`, which is
 /// neither `Send` nor `Sync` — `OnceLock<usize>` is the standard escape
-/// hatch.  The `W_BaseException` lives forever (`malloc_typed` is
-/// `Box::into_raw` today; future GC integration must root it).
+/// hatch.  The `W_BaseException` lives forever: it is cached in the
+/// GC-invisible `OnceLock` and baked into JIT constant pools, so it must
+/// stay immortal (`w_exception_new_empty_immortal`), never GC-swept.
 pub fn memory_error_singleton() -> PyObjectRef {
     static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MEMORY_ERROR_SINGLETON.get_or_init(|| w_exception_new(ExcKind::MemoryError, "") as usize)
+    *MEMORY_ERROR_SINGLETON
+        .get_or_init(|| w_exception_new_empty_immortal(ExcKind::MemoryError) as usize)
         as PyObjectRef
 }
 
@@ -1243,7 +1279,7 @@ pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
     static INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
         [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
     let slot = &INSTANCES[kind as u8 as usize];
-    *slot.get_or_init(|| w_exception_new(kind, "") as usize) as PyObjectRef
+    *slot.get_or_init(|| w_exception_new_empty_immortal(kind) as usize) as PyObjectRef
 }
 
 /// Check if an object is an exception instance.
