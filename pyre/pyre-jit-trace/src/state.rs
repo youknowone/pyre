@@ -13243,18 +13243,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // frame/ec seeding so a reused color resolves to the live stack value.
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
-    let py_pc = backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc);
-    let pcdep = pcdep_color_slots_at(recipe.jitcode_index, py_pc);
+    let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
     if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-        let twin = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc);
-        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("a1_recipe_pcdep", "fire");
-        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-            "a1_recipe_pcdep",
-            if twin.as_deref().unwrap_or_default() == pcdep.as_slice() {
-                "eq"
-            } else {
-                "di"
-            },
+        let py_pc = backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc);
+        assert_eq!(
+            pcdep,
+            pcdep_color_slots_at(recipe.jitcode_index, py_pc),
+            "pcdep trivia twin vs backxlat consumer diverges at jit_pc={}",
+            recipe.jitcode_pc
         );
     }
     for k in nlocals..valuestackdepth {
