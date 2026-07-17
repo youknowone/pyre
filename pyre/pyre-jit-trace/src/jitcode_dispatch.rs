@@ -8446,6 +8446,26 @@ fn fbw_loadattr_fold_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_INLINE_BINOP` — gate the speculative inline of a plain-Python
+/// `__add__` at a BINARY_OP `+` whose numeric specializations declined
+/// ([`try_walker_inline_user_binop`]).  When on, a user-class `+` folds to a
+/// class + version-tag guard plus the inlined dunder body instead of the opaque
+/// `jit_binary_value_from_tag` residual, so a `raise` inside the dunder becomes
+/// a traced raise the optimizer can virtualize (removing the per-iteration
+/// exception allocation).  Default ON (`0`/`false` opts out as the kill switch);
+/// verified byte-exact on synth dynasm + cranelift and a differential `__add__`
+/// fuzz.
+pub(crate) fn fbw_inline_binop_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_BINOP") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_STOREATTR_FOLD` — gate the full-body-walker STORE_ATTR fast path
 /// ([`try_walker_specialize_store_attr`]).  When on, a plain same-type unboxed
 /// integer store folds to guards + a non-forcing raw longlong-list write
@@ -17003,13 +17023,9 @@ fn try_walker_inline_user_binop(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // This speculative path is inert unless the development flag is set to a
-    // non-zero value.
-    let binop_inline_enabled =
-        std::env::var("PYRE_FBW_INLINE_BINOP").is_ok_and(|value| value != "0");
     if !ctx.is_authoritative_executor
         || !ctx.is_full_body_walk
-        || !binop_inline_enabled
+        || !fbw_inline_binop_enabled()
         || dst_bank != 'r'
         || r_args.len() != 2
     {
