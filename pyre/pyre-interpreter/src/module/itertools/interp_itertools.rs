@@ -4,6 +4,34 @@
 
 
 /// itertools stub
+const GROUPBY_SRC: &str = r#"
+class groupby:
+    __module__ = 'itertools'
+    def __init__(self, iterable, key=None):
+        if key is None:
+            key = lambda x: x
+        self.keyfunc = key
+        self.it = iter(iterable)
+        self.tgtkey = self.currkey = self.currvalue = object()
+    def __iter__(self):
+        return self
+    def __next__(self):
+        self.id = object()
+        while self.currkey == self.tgtkey:
+            self.currvalue = next(self.it)
+            self.currkey = self.keyfunc(self.currvalue)
+        self.tgtkey = self.currkey
+        return (self.currkey, self._grouper(self.tgtkey, self.id))
+    def _grouper(self, tgtkey, id):
+        while self.id is id and self.currkey == tgtkey:
+            yield self.currvalue
+            try:
+                self.currvalue = next(self.it)
+            except StopIteration:
+                return
+            self.currkey = self.keyfunc(self.currvalue)
+"#;
+
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     // chain(*iterables) — W_Chain___new__: store `iter(newtuple(args))` as
     // the source-iterables iterator.  W_Chain.next_w (baseobjspace::next)
@@ -147,12 +175,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(pyre_object::w_seq_iter_new(list, n))
         }),
     );
-    // groupby
-    crate::module_ns_store(
-        ns,
-        "groupby",
-        crate::make_builtin_function("groupby", |_| Ok(pyre_object::w_none())),
-    );
+    // groupby(iterable, key=None) — the itertools-docs pure-Python
+    // equivalent.  The parent and each group share the `currkey/currvalue`
+    // cursor plus an `id` token that invalidates a group once the parent
+    // advances; expressing that shared state directly in Python avoids a
+    // second native iterator type.
+    crate::importing::appleveldef_install(ns, GROUPBY_SRC, "<inline>", &["groupby"]);
     // permutations(iterable, r=None) — PyPy: pypy/module/itertools/interp_itertools.py
     crate::module_ns_store(
         ns,
