@@ -3495,6 +3495,16 @@ impl Optimization for OptHeap {
             .collect();
         sort_descr_item_refs_untranslated(&mut field_entries);
         for (descr, (field_idx, cf)) in field_entries {
+            let effect_idx = Self::field_effect_index(descr);
+            if majit_ir::effectinfo::compute_bitstrings_has_run()
+                && effect_idx == u32::MAX
+                && !descr.is_always_pure()
+            {
+                // Match force_from_effectinfo's conservatism for mutable
+                // descrs outside the bitstring universe: a residual call may
+                // write them, so they must be read live in each peeled body.
+                continue;
+            }
             cf.produce_potential_short_preamble_ops(sb, descr, field_idx, ctx);
         }
         // heap.py:374-377:
@@ -3502,6 +3512,14 @@ impl Optimization for OptHeap {
         //         for index, d in submap.const_indexes.items():
         //             d.produce_potential_short_preamble_ops(self.optimizer, sb, descr, index)
         for (_, descr, submap) in &self.cached_arrayitems {
+            let effect_idx = Self::array_effect_index(descr);
+            if majit_ir::effectinfo::compute_bitstrings_has_run()
+                && effect_idx == u32::MAX
+                && !descr.is_always_pure()
+            {
+                // Same rule for runtime-minted mutable array descrs.
+                continue;
+            }
             for (_, cai) in &submap.const_indexes {
                 cai.produce_potential_short_preamble_ops(sb, &descr, ctx);
             }
