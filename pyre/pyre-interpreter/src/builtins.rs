@@ -4836,13 +4836,16 @@ fn make_exc_type_with_init(
                                         "add_note() missing 1 required positional argument: 'note'",
                                     )
                                 })?;
-                                // `interp_exceptions.py:238-239` — accept
+                                // `interp_exceptions.py:257-260` — accept
                                 // `str` and any `str` subclass
-                                // (`isinstance_w(w_note, space.w_unicode)`).
+                                // (`isinstance_w(w_note, space.w_unicode)`);
+                                // otherwise `oefmt("note must be a str, not %T")`.
                                 if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
-                                    return Err(crate::PyError::type_error(
-                                        "note must be a string",
-                                    ));
+                                    let tp_name =
+                                        crate::baseobjspace::object_functionstr_type_name(w_note);
+                                    return Err(crate::PyError::type_error(format!(
+                                        "note must be a str, not {tp_name}"
+                                    )));
                                 }
                                 // `interp_exceptions.py:240-254` — lazy
                                 // list allocation on first call; if the
