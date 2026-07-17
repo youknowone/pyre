@@ -7,30 +7,28 @@
 //! not modelled.
 
 use pyre_object::*;
+use std::sync::OnceLock;
 
 fn context_type() -> PyObjectRef {
-    thread_local! {
-        static CELL: std::cell::OnceCell<PyObjectRef> =
-            const { std::cell::OnceCell::new() };
-    }
-    CELL.with(|c| {
-        *c.get_or_init(|| {
-            crate::typedef::make_builtin_type("Context", |ns| {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        "run",
-                        crate::make_builtin_function("run", |args| {
-                            let callable = args.get(1).copied().ok_or_else(|| {
-                                crate::PyError::type_error("run() missing callable argument")
-                            })?;
-                            crate::call::call_function_impl_result(callable, &args[2..])
-                        }),
-                    )
-                };
-            })
-        })
-    })
+    // PyPy exposes one interpreter-level Context typedef; the type identity
+    // must not split when the importing thread changes.
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        crate::typedef::make_builtin_type("Context", |ns| {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "run",
+                    crate::make_builtin_function("run", |args| {
+                        let callable = args.get(1).copied().ok_or_else(|| {
+                            crate::PyError::type_error("run() missing callable argument")
+                        })?;
+                        crate::call::call_function_impl_result(callable, &args[2..])
+                    }),
+                )
+            };
+        }) as usize
+    }) as PyObjectRef
 }
 
 fn new_context(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -41,17 +39,12 @@ fn new_context(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// can be stored as instance attributes.  Plain `object` instances reject
 /// `setattr`, leaving the shell without its methods.
 fn context_var_type() -> PyObjectRef {
-    thread_local! {
-        static CELL: std::cell::OnceCell<PyObjectRef> =
-            const { std::cell::OnceCell::new() };
-    }
-    CELL.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("ContextVar", |_| {});
-            unsafe { typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("ContextVar", |_| {});
+        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

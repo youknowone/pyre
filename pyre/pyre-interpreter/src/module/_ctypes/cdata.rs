@@ -14,7 +14,7 @@
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::cell::RefCell;
+use std::sync::OnceLock;
 
 /// Reserved instance-dict key holding the backing `bytearray` (root storage,
 /// or — for a sub-view — a shared reference to the **root's** bytearray).
@@ -32,24 +32,18 @@ const BADDR_KEY: &str = "_baddr_";
 /// Lazily-created keepalive dict on a root object.
 const OBJECTS_KEY: &str = "_objects_";
 
-thread_local! {
-    static CDATA_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-    static SIMPLECDATA_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static SIMPLECDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
 /// PyPy/CPython/RustPython's private `_CData` base shared by every ctypes
 /// value family.  It is discovered as `Structure.__base__` rather than
 /// exported from the module namespace.
 pub(super) fn cdata_type() -> PyObjectRef {
-    CDATA_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("_CData", init_cdata_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *CDATA_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_CData", init_cdata_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_cdata_type(ns: PyObjectRef) {
@@ -254,17 +248,15 @@ fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// The native `_SimpleCData` type object (cached, `hasdict=true`).
 pub(super) fn simplecdata_type() -> PyObjectRef {
-    SIMPLECDATA_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type_with_base(
-                "_SimpleCData",
-                init_simplecdata_type,
-                cdata_type(),
-            );
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *SIMPLECDATA_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "_SimpleCData",
+            init_simplecdata_type,
+            cdata_type(),
+        );
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_simplecdata_type(ns: PyObjectRef) {
@@ -784,22 +776,6 @@ pub(super) fn cdata_write(obj: PyObjectRef, off: usize, bytes: &[u8]) {
 
 // ── sub-views, keepalive, and the cdata-instance predicate ─────────────
 
-thread_local! {
-    /// The ctypes base types whose instances are CData (registered at module
-    /// init): `_SimpleCData`, `Structure`, `Union`, `Array`, `_Pointer`.
-    static CDATA_BASES: RefCell<Vec<PyObjectRef>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Register `tp` as a CData base type (widens [`is_cdata_instance`]).
-pub(super) fn register_cdata_base(tp: PyObjectRef) {
-    CDATA_BASES.with(|b| {
-        let mut v = b.borrow_mut();
-        if !v.iter().any(|&t| t == tp) {
-            v.push(tp);
-        }
-    });
-}
-
 /// Whether `obj` owns its buffer (a root object, not a sub-view or external
 /// view) — the precondition for `resize`.
 pub(super) fn owns_buffer(obj: PyObjectRef) -> bool {
@@ -811,14 +787,10 @@ pub(super) fn owns_buffer(obj: PyObjectRef) -> bool {
     has(CDATA_BUFFER_KEY) && !has(BBASE_KEY) && !has(BADDR_KEY)
 }
 
-/// Whether `obj` is an instance of any registered CData base type.
+/// Whether `obj` is an instance of the common `_CData` base, matching PyPy's
+/// CData inheritance test without a parallel per-thread type registry.
 pub(super) fn is_cdata_instance(obj: PyObjectRef) -> bool {
-    !obj.is_null()
-        && CDATA_BASES.with(|b| {
-            b.borrow()
-                .iter()
-                .any(|&base| unsafe { crate::baseobjspace::isinstance_w(obj, base) })
-        })
+    !obj.is_null() && unsafe { crate::baseobjspace::isinstance_w(obj, cdata_type()) }
 }
 
 /// A field/element sub-view of `parent` at `field_offset`, aliasing its memory

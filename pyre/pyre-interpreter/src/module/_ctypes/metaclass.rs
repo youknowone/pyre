@@ -19,7 +19,7 @@ use super::stginfo::{self, StgInfoData};
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::cell::RefCell;
+use std::sync::OnceLock;
 
 type PyResult = Result<PyObjectRef, crate::PyError>;
 
@@ -27,11 +27,9 @@ type PyResult = Result<PyObjectRef, crate::PyError>;
 
 macro_rules! cached_type {
     ($cell:ident, $f:ident, $build:expr) => {
-        thread_local! {
-            static $cell: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-        }
+        static $cell: OnceLock<usize> = OnceLock::new();
         pub(super) fn $f() -> PyObjectRef {
-            $cell.with(|c| *c.get_or_init($build))
+            *$cell.get_or_init(|| $build() as usize) as PyObjectRef
         }
     };
 }

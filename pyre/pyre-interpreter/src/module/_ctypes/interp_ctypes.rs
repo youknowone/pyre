@@ -346,9 +346,6 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     let cfuncptr_tp = super::funcptr::cfuncptr_type();
     crate::module_ns_store(ns, "CFuncPtr", cfuncptr_tp);
 
-    // Widen `is_cdata_instance` (sizeof/addressof/byref) to every CData base.
-    super::cdata::register_cdata_base(super::cdata::cdata_type());
-
     // ── sizeof / addressof / byref / alignment / resize ──
     crate::module_ns_store(
         ns,
@@ -518,35 +515,31 @@ fn ctypes_resize(
 // ── byref carrier ──────────────────────────────────────────────────────
 
 #[cfg(all(unix, feature = "host_env"))]
-thread_local! {
-    static CARG_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static CARG_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// The minimal `byref` carrier type — holds `_ptr` (address) and `_obj`
 /// (the referenced instance, kept alive).  Foreign-call consumption of the
 /// carrier (the CArgObject P-tag path) is a later slice.
 #[cfg(all(unix, feature = "host_env"))]
 fn carg_type() -> pyre_object::PyObjectRef {
-    CARG_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("CArgObject", |ns| {
-                super::type_ns_store(
-                    ns,
-                    "__repr__",
-                    crate::make_builtin_function("__repr__", |args| {
-                        let d = crate::baseobjspace::getdict(args[0]);
-                        let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
-                            .unwrap_or_else(pyre_object::w_none);
-                        let rendered = unsafe { crate::display::py_repr(value) }?;
-                        Ok(pyre_object::w_str_new(&format!("<cparam {rendered}>")))
-                    }),
-                );
-            });
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    let raw = *CARG_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("CArgObject", |ns| {
+            super::type_ns_store(
+                ns,
+                "__repr__",
+                crate::make_builtin_function("__repr__", |args| {
+                    let d = crate::baseobjspace::getdict(args[0]);
+                    let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
+                        .unwrap_or_else(pyre_object::w_none);
+                    let rendered = unsafe { crate::display::py_repr(value) }?;
+                    Ok(pyre_object::w_str_new(&format!("<cparam {rendered}>")))
+                }),
+            );
+        });
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    });
+    raw as pyre_object::PyObjectRef
 }
 
 #[cfg(all(unix, feature = "host_env"))]

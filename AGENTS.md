@@ -102,7 +102,9 @@ lines, e.g. `GcType`→`n`; pass `rg --no-config` when bucketing.)
 
 ## Data structure parity with RPython/PyPy
 
-**Do not casually introduce `HashMap` (or any Rust-native collection) when porting RPython/PyPy code.**
+**Treat every `HashMap` and every thread-local (`thread_local!`, TLS) as
+suspicious when porting RPython/PyPy code.** Find the corresponding PyPy or
+RPython owner and storage shape before choosing a Rust container or lifetime.
 
 majit and pyre are line-by-line ports. The data structure choice is part of
 the port — it must match what RPython/PyPy actually uses, even when a Rust
@@ -114,6 +116,12 @@ collection looks more convenient.
    `BTreeMap`, etc., find the corresponding RPython attribute and check what
    container it uses (`dict`, `list`, an attribute on a class instance, a
    field on `_forwarded`, …). Port that exact shape.
+
+   A Rust `HashMap` is not the default translation of a Python `dict`. When
+   lookup is over a small/dense key space, stable insertion order matters, or
+   identity/index lookup is sufficient, `VecMap`, `IndexMap`, or an ordinary
+   `Vec` is often the closer representation. Prove the required semantics from
+   the upstream code before choosing among them.
 
 2. **Side-tables are usually wrong.** RPython optimizers store information
    *on the box itself* via `box._forwarded` / `PtrInfo` / `IntBound` /
@@ -136,6 +144,22 @@ collection looks more convenient.
    rewritten to a shortcut — the shortcut diverges from RPython and the
    next porter will have no idea why their `heap.py` line-by-line port
    no longer compiles.
+
+5. **TLS is almost never the right owner for runtime state.** Type objects,
+   module state, registries, semantic caches, and any value whose identity or
+   contents must be visible across threads are process-global or
+   interpreter-owned in PyPy and must remain shared in pyre. Never duplicate
+   them per thread merely to make a raw pointer satisfy Rust's `Sync` rules;
+   use the proper global/interpreter owner (for example the established
+   process-global immortal-type `OnceLock<usize>` pattern) and preserve GC
+   rooting as required.
+
+   TLS is acceptable only when the PyPy/RPython source makes the state itself
+   thread-specific (for example the current thread/execution context or errno),
+   or for a disposable temporary cache that cannot affect observable identity,
+   semantics, lifetime, or GC reachability. Every other TLS use requires an
+   upstream citation and a written justification in the code. When in doubt,
+   assume TLS is wrong and find the shared owner.
 
 ### Why
 
@@ -163,7 +187,9 @@ If RPython stores it on an object attribute, store it on the equivalent
 Rust struct field. If RPython stores it on `box._forwarded`, route it
 through `OptContext::with_intbound_mut` / `set_ptr_info` / etc. Reach
 for `HashMap` only after you have proven that RPython itself uses a
-dict-like container in that exact spot.
+dict-like container in that exact spot. Apply the same test to TLS: locate the
+upstream owner, then preserve whether it is global, interpreter-local,
+execution-context-local, or genuinely thread-local.
 
 ## RPython Parity Rules
 - When porting from RPython/PyPy, do STRICT line-by-line structural parity. Do NOT take shortcuts, reimplement from scratch, or declare phases 'complete' without the literal refactor.

@@ -7,6 +7,7 @@
 
 use pyre_object::*;
 use std::cell::Cell;
+use std::sync::OnceLock;
 
 thread_local! {
     // The runtime is single-OS-threaded, but a synchronous emulation of a
@@ -126,17 +127,14 @@ mod thread_handle_class {
 /// `__dict__` for per-thread attribute storage; pyre is single-threaded
 /// so there's no real per-thread isolation.
 fn local_type() -> PyObjectRef {
-    thread_local! {
-        static CELL: std::cell::OnceCell<PyObjectRef> =
-            const { std::cell::OnceCell::new() };
-    }
-    CELL.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("_local", |_| {});
-            unsafe { typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // PyPy's Local.typedef is shared; only each Local instance's dictionaries
+    // are execution-context-specific.
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_local", |_| {});
+        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 // `_thread.start_new_thread(function, args[, kwargs])` — pyre is

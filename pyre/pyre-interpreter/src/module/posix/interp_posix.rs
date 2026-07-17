@@ -815,8 +815,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 (None, None)
             };
-            rustpython_host_env::posix::rename(&src, src_b, &dst, dst_b)
-                .map_err(|e| io_err(e, &src))?;
+            host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
             Ok(pyre_object::w_none())
         }),
     );

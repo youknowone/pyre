@@ -19,6 +19,7 @@ use super::stginfo;
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
+use std::sync::OnceLock;
 
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
 const FUNCFLAG_USE_ERRNO: i64 = 0x8;
@@ -35,24 +36,19 @@ const INTERNAL_MEMORYVIEW_AT_ADDR: usize = 4;
 const INTERNAL_PYBYTES_FROMSTRINGANDSIZE: usize = 5;
 const INTERNAL_PYOS_SNPRINTF: usize = 6;
 
-thread_local! {
-    static CFUNCPTR_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static CFUNCPTR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
 /// The native `CFuncPtr` type object (cached, `hasdict=true`).
 pub(super) fn cfuncptr_type() -> PyObjectRef {
-    CFUNCPTR_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type_with_base(
-                "CFuncPtr",
-                init_cfuncptr_type,
-                cdata::cdata_type(),
-            );
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *CFUNCPTR_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "CFuncPtr",
+            init_cfuncptr_type,
+            cdata::cdata_type(),
+        );
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_cfuncptr_type(ns: PyObjectRef) {
