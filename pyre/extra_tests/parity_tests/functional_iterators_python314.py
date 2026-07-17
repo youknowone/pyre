@@ -21,6 +21,46 @@ assert reduced[0] is enumerate and reduced[1][1] == 11
 alias = enumerate[str]
 assert alias.__origin__ is enumerate and alias.__args__ == (str,)
 
+
+class HugeIndex:
+    def __index__(self):
+        return 10**30
+
+
+for start, expected in [
+    (10**30, 10**30),
+    (-(10**30), -(10**30)),
+    (HugeIndex(), 10**30),
+]:
+    e = enumerate(["x", "y"], start)
+    assert next(e) == (expected, "x")
+    reduced = e.__reduce__()
+    assert reduced[0] is enumerate
+    assert reduced[1][1] == expected + 1
+    assert next(e) == (expected + 1, "y")
+
+# Crossing the machine-word boundary promotes the counter to the same bigint
+# state used when construction starts outside the fast range.
+e = enumerate(iter([1, 2]), 2**63 - 1)
+assert next(e) == (2**63 - 1, 1)
+assert next(e) == (2**63, 2)
+assert e.__reduce__()[1][1] == 2**63 + 1
+
+try:
+    enumerate([], None)
+except TypeError:
+    pass
+else:
+    raise AssertionError("an explicit None start must be passed through __index__")
+
+for name in ("__iter__", "__next__", "__reduce__"):
+    try:
+        getattr(enumerate, name)(42)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"enumerate.{name} must validate its receiver")
+
 r = reversed([1, 2, 3])
 assert iter(r) is r and operator.length_hint(r) == 3
 assert next(r) == 3 and operator.length_hint(r) == 2

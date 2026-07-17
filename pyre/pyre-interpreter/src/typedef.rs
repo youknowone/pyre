@@ -2956,12 +2956,12 @@ fn init_enumerate_type(ns: PyObjectRef) {
     install_functional_entry(
         ns,
         "__iter__",
-        make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        make_builtin_function_with_arity("__iter__", crate::baseobjspace::enumerate_iter_method, 1),
     );
     install_functional_entry(
         ns,
         "__next__",
-        make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        make_builtin_function_with_arity("__next__", crate::baseobjspace::enumerate_next_method, 1),
     );
     install_functional_entry(
         ns,

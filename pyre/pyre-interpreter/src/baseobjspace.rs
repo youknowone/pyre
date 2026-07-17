@@ -2145,9 +2145,23 @@ pub(crate) fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResul
 /// `enumerate.__reduce__()` — `functional.py W_Enumerate.descr_reduce`:
 /// `(enumerate, (source_iter, index))`.
 pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_enumerate(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '__reduce__' for 'enumerate' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
     unsafe {
-        let i64_index = pyre_object::functional::w_enumerate_get_index(args[0]);
-        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(args[0]);
+        // `descr___reduce__` may allocate while normalising the list fast path.
+        // Keep `self` live and reload it before every later field read, matching
+        // the GC-transformed RPython object's rooted `self` local.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(args[0]);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let i64_index = pyre_object::functional::w_enumerate_get_index(self_);
+        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_);
         let w_iter = if raw.is_null() {
             // Exhausted enumerate (`:294-295` set `w_iter_or_list` to
             // null); substitute an empty seq-iter so the reduce stays
@@ -2167,15 +2181,55 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         } else {
             raw
         };
-        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(args[0]);
+        pyre_object::gc_roots::pin_root(w_iter);
+        let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(self_);
         let index = if w_index_slot.is_null() {
             w_int_new(i64_index)
         } else {
             w_index_slot
         };
-        let state = w_tuple_new(vec![w_iter, index]);
-        Ok(w_tuple_new(vec![builtin_callable("enumerate"), state]))
+        pyre_object::gc_roots::pin_root(index);
+        let index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let state = w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(iter_slot),
+            pyre_object::gc_roots::shadow_stack_get(index_slot),
+        ]);
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        Ok(w_tuple_new(vec![
+            builtin_callable("enumerate"),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ]))
     }
+}
+
+/// `W_Enumerate.descr___iter__` receiver-unwrapping parity. PyPy's
+/// `interp2app` binds `self: W_Enumerate`, so a direct descriptor call with a
+/// foreign object raises before the body returns `self`.
+pub(crate) fn enumerate_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_enumerate(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '__iter__' requires a 'enumerate' object but received a '{}'",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+/// `W_Enumerate.descr_next` receiver-unwrapping parity; the actual line-by-line
+/// iteration state machine remains in [`next`].
+pub(crate) fn enumerate_next_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_enumerate(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '__next__' requires a 'enumerate' object but received a '{}'",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    next(self_)
 }
 
 /// `reversed.__reduce__()` — `functional.py:407-417
@@ -10790,6 +10844,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         if pyre_object::functional::is_enumerate(obj) {
             use pyre_object::functional as eo;
+            // `space.add` and `space.next` below can allocate or invoke Python.
+            // RPython's GC transform keeps `self` and the active bigint Box
+            // rooted; mirror that explicitly and reload fields after calls.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
             let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
             let mut w_item: PyObjectRef = pyre_object::PY_NULL;
@@ -10820,10 +10881,23 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                             // Promote to bigint slot per `:299-302`.
                             let w_idx =
                                 pyre_object::w_long_new(::malachite_bigint::BigInt::from(index));
+                            pyre_object::gc_roots::pin_root(w_idx);
+                            let w_idx_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                             let one =
                                 pyre_object::w_long_new(::malachite_bigint::BigInt::from(1i64));
-                            let bumped = add(w_idx, one)?;
-                            eo::w_enumerate_set_w_index(obj, bumped);
+                            pyre_object::gc_roots::pin_root(one);
+                            let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                            let bumped = add(
+                                pyre_object::gc_roots::shadow_stack_get(w_idx_slot),
+                                pyre_object::gc_roots::shadow_stack_get(one_slot),
+                            )?;
+                            pyre_object::gc_roots::pin_root(bumped);
+                            let bumped_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            eo::w_enumerate_set_w_index(
+                                obj,
+                                pyre_object::gc_roots::shadow_stack_get(bumped_slot),
+                            );
                             eo::w_enumerate_set_index(obj, -1);
                         }
                     }
@@ -10831,21 +10905,42 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 w_index = pyre_object::w_int_new(index);
             } else {
                 // Bigint slot active — bump via `space.add`.
+                pyre_object::gc_roots::pin_root(w_index_slot);
+                let w_index_slot_root = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let one = pyre_object::w_int_new(1);
-                let bumped = add(w_index_slot, one)?;
-                eo::w_enumerate_set_w_index(obj, bumped);
-                w_index = w_index_slot;
+                pyre_object::gc_roots::pin_root(one);
+                let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let bumped = add(
+                    pyre_object::gc_roots::shadow_stack_get(w_index_slot_root),
+                    pyre_object::gc_roots::shadow_stack_get(one_slot),
+                )?;
+                pyre_object::gc_roots::pin_root(bumped);
+                let bumped_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                eo::w_enumerate_set_w_index(
+                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(bumped_slot),
+                );
+                w_index = pyre_object::gc_roots::shadow_stack_get(w_index_slot_root);
             }
+            pyre_object::gc_roots::pin_root(w_index);
+            let result_index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             if w_item.is_null() {
                 // Re-read slot — list fast-path already set w_item;
                 // otherwise we need to pull from the iterator.
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
                 if w_iter_or_list.is_null() {
                     return Err(PyError::stop_iteration());
                 }
-                w_item = next(w_iter_or_list)?;
+                pyre_object::gc_roots::pin_root(w_iter_or_list);
+                let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                w_item = next(pyre_object::gc_roots::shadow_stack_get(iter_slot))?;
             }
-            return Ok(pyre_object::w_tuple_new(vec![w_index, w_item]));
+            return Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(result_index_slot),
+                w_item,
+            ]));
         }
         // `pypy/module/__builtin__/functional.py:385-405
         // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`

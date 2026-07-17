@@ -85,6 +85,7 @@ pub unsafe fn w_enumerate_get_iter_or_list(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_enumerate_set_iter_or_list(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Enumerate)).w_iter_or_list = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 
@@ -117,6 +118,7 @@ pub unsafe fn w_enumerate_get_w_index(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_enumerate_set_w_index(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Enumerate)).w_index = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 

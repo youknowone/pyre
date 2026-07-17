@@ -8491,28 +8491,53 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     } else {
         kwarg_get(kwargs, "start")
     };
-    // `functional.py:255-264 descr___new__` — `space.index(w_start)`
-    // then `space.int_w(w_start)`; on OverflowError, drop into bigint
-    // slot.  Pyre uses i64 directly and would overflow on bigint
-    // start; TODO: W_Enumerate
-    // can still promote during iteration once start fits in i64).
-    let start = match start_obj {
-        Some(o) if !unsafe { pyre_object::is_none(o) } => space_index_w(o)?,
-        _ => 0,
+    // The constructor can execute user `__index__` and allocate. Keep both
+    // arguments in the shadow stack exactly as the translated RPython locals
+    // remain GC-visible across `space.index` / `space.iter`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(source);
+    let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let raw_start = start_obj.unwrap_or(pyre_object::PY_NULL);
+    pyre_object::gc_roots::pin_root(raw_start);
+    let raw_start_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    // `functional.py:255-264 descr___new__` — `space.index(w_start)` then
+    // `space.int_w(w_start)`; ONLY OverflowError activates the bigint slot.
+    // This preserves an arbitrary-precision start object verbatim, while a
+    // machine-sized int/long/bool stays in the unboxed `index` fast path.
+    let (start, w_start) = if raw_start.is_null() {
+        (0, pyre_object::PY_NULL)
+    } else {
+        let indexed = crate::baseobjspace::space_index(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(raw_start_slot)
+        })?;
+        pyre_object::gc_roots::pin_root(indexed);
+        let indexed_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        match crate::baseobjspace::int_w(indexed) {
+            Ok(value) => (value, pyre_object::PY_NULL),
+            Err(e) if e.kind == crate::PyErrorKind::OverflowError => (-1, unsafe {
+                pyre_object::gc_roots::shadow_stack_get(indexed_slot)
+            }),
+            Err(e) => return Err(e),
+        }
     };
+    pyre_object::gc_roots::pin_root(w_start);
+    let w_start_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // `functional.py:268-271` — `if start == 0 and type(w_iterable) is
     // W_ListObject: w_iter = w_iterable` (skip space.iter for the
     // common list-source case so __next__ can `getitem(index)`
     // directly).  Otherwise call `space.iter(w_iterable)`.
-    let w_iter_or_list = if start == 0 && unsafe { pyre_object::is_list(source) } {
-        source
-    } else {
-        crate::baseobjspace::iter(source)?
-    };
+    let source = unsafe { pyre_object::gc_roots::shadow_stack_get(source_slot) };
+    let w_iter_or_list =
+        if start == 0 && w_start.is_null() && unsafe { pyre_object::is_list(source) } {
+            source
+        } else {
+            crate::baseobjspace::iter(source)?
+        };
     Ok(pyre_object::functional::w_enumerate_new(
         w_iter_or_list,
         start,
-        pyre_object::PY_NULL, // i64 fast-path active per :225-227
+        unsafe { pyre_object::gc_roots::shadow_stack_get(w_start_slot) },
     ))
 }
 
