@@ -222,6 +222,37 @@ pub(crate) fn require_list_receiver(
     Ok(receiver)
 }
 
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_AbstractTupleObject.descr_*)` gateway.  As with list,
+/// CPython 3.14 distinguishes slot-wrapper and method-descriptor mismatch
+/// messages on the public surface.
+pub(crate) fn require_tuple_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method tuple.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'tuple' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_tuple(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'tuple' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a 'tuple' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.
@@ -5270,25 +5301,29 @@ mod dict_method_tests {
 
 /// PyPy: tupleobject.py descr_index — tuple.index(value)
 pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_tuple_receiver(args, "index", true)?;
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
             "index expected at least 1 argument, got {}",
             args.len().saturating_sub(1)
         )));
     }
+    if args.len() > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "index expected at most 3 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     let tup = args[0];
     let value = args[1];
-    unsafe {
-        let n = w_tuple_len(tup);
-        for i in 0..n {
-            if let Some(item) = w_tuple_getitem(tup, i as i64) {
-                if std::ptr::eq(item, value) {
-                    return Ok(w_int_new(i as i64));
-                }
-                if is_int(item) && is_int(value) && w_int_get_value(item) == w_int_get_value(value)
-                {
-                    return Ok(w_int_new(i as i64));
-                }
+    let length = unsafe { w_tuple_len(tup) } as i64;
+    let w_start = args.get(2).copied().unwrap_or_else(|| w_int_new(0));
+    let w_stop = args.get(3).copied().unwrap_or_else(|| w_int_new(i64::MAX));
+    let (start, stop) = crate::sliceobject::unwrap_start_stop(length, w_start, w_stop)?;
+    for i in start..stop.min(length) {
+        if let Some(item) = unsafe { w_tuple_getitem(tup, i) } {
+            if crate::baseobjspace::eq_w(item, value)? {
+                return Ok(w_int_new(i));
             }
         }
     }
@@ -5299,6 +5334,7 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: tupleobject.py descr_count — tuple.count(value)
 pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_tuple_receiver(args, "count", true)?;
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "tuple.count() takes exactly one argument ({} given)",
@@ -5312,11 +5348,7 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         let n = w_tuple_len(tup);
         for i in 0..n {
             if let Some(item) = w_tuple_getitem(tup, i as i64) {
-                if std::ptr::eq(item, value)
-                    || (is_int(item)
-                        && is_int(value)
-                        && w_int_get_value(item) == w_int_get_value(value))
-                {
+                if crate::baseobjspace::eq_w(item, value)? {
                     count += 1;
                 }
             }

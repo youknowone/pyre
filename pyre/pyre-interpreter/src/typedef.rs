@@ -6992,7 +6992,11 @@ fn init_tuple_type(ns: PyObjectRef) {
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
-                |args| Ok(w_str_new(&unsafe { crate::display::tuple_repr(args[0])? })),
+                |args| {
+                    let tuple =
+                        crate::type_methods::require_tuple_receiver(args, "__repr__", false)?;
+                    Ok(w_str_new(&unsafe { crate::display::tuple_repr(tuple)? }))
+                },
                 1,
             ),
         )
@@ -7003,7 +7007,11 @@ fn init_tuple_type(ns: PyObjectRef) {
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
-                |args| Ok(w_int_new(crate::builtins::try_hash_value(args[0])?)),
+                |args| {
+                    let tuple =
+                        crate::type_methods::require_tuple_receiver(args, "__hash__", false)?;
+                    Ok(w_int_new(crate::builtins::try_hash_value(tuple)?))
+                },
                 1,
             ),
         )
@@ -7041,6 +7049,7 @@ fn init_tuple_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__contains__",
                 |args| {
+                    crate::type_methods::require_tuple_receiver(args, "__contains__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     Ok(pyre_object::w_bool_from(
                         crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
@@ -7057,12 +7066,11 @@ fn init_tuple_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__len__",
                 |args| {
-                    if args.is_empty() {
-                        return Ok(pyre_object::w_int_new(0));
-                    }
+                    let tuple =
+                        crate::type_methods::require_tuple_receiver(args, "__len__", false)?;
                     crate::type_methods::arity_slot(args, 0)?;
                     Ok(pyre_object::w_int_new(
-                        unsafe { pyre_object::w_tuple_len(args[0]) } as i64,
+                        unsafe { pyre_object::w_tuple_len(tuple) } as i64,
                     ))
                 },
                 1,
@@ -7079,10 +7087,8 @@ fn init_tuple_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__iter__",
                 |args| {
-                    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if obj.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
+                    let obj = crate::type_methods::require_tuple_receiver(args, "__iter__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
                     Ok(pyre_object::w_tuple_iter_new(obj))
                 },
                 1,
@@ -7096,6 +7102,7 @@ fn init_tuple_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__getitem__",
                 |args| {
+                    crate::type_methods::require_tuple_receiver(args, "__getitem__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     crate::baseobjspace::getitem_slot(args[0], args[1])
                 },
@@ -7114,6 +7121,7 @@ fn init_tuple_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__add__",
                 |args| {
+                    crate::type_methods::require_tuple_receiver(args, "__add__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     if unsafe { pyre_object::is_tuple(args[1]) } {
                         unsafe { crate::objspace::descroperation::tuple_concat(args[0], args[1]) }
@@ -7136,7 +7144,7 @@ fn init_tuple_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", tuple_descr_mul, 2),
+            make_builtin_function_with_arity("__rmul__", tuple_descr_rmul, 2),
         )
     };
     for (name, func) in [
@@ -7163,7 +7171,9 @@ fn init_tuple_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__getnewargs__",
                 |args| {
-                    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
+                    let tuple =
+                        crate::type_methods::require_tuple_receiver(args, "__getnewargs__", true)?;
+                    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(tuple) };
                     Ok(pyre_object::w_tuple_new(vec![pyre_object::w_tuple_new(
                         items,
                     )]))
@@ -7177,6 +7187,15 @@ fn init_tuple_type(ns: PyObjectRef) {
 /// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
 /// raises the `__index__` TypeError.
 fn tuple_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    tuple_descr_mul_impl(args, "__mul__")
+}
+
+fn tuple_descr_rmul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    tuple_descr_mul_impl(args, "__rmul__")
+}
+
+fn tuple_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_tuple_receiver(args, name, false)?;
     crate::type_methods::arity_slot(args, 1)?;
     // tupleobject descr_mul routes the count through getindex_w, so a custom
     // __index__ repeats the tuple (and an out-of-range one overflows).
@@ -12624,15 +12643,29 @@ list_cmp_dunder!(list_dunder_lt, "__lt__", Lt);
 list_cmp_dunder!(list_dunder_le, "__le__", Le);
 list_cmp_dunder!(list_dunder_gt, "__gt__", Gt);
 list_cmp_dunder!(list_dunder_ge, "__ge__", Ge);
-cmp_dunder_set!(
-    tuple_dunder_eq,
-    tuple_dunder_ne,
-    tuple_dunder_lt,
-    tuple_dunder_le,
-    tuple_dunder_gt,
-    tuple_dunder_ge,
-    cmp_guard_tuple
-);
+macro_rules! tuple_cmp_dunder {
+    ($function:ident, $name:literal, $op:ident) => {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::require_tuple_receiver(args, $name, false)?;
+            crate::type_methods::arity_slot(args, 1)?;
+            if cmp_guard_tuple(args[1]) {
+                crate::objspace::descroperation::compare_slot(
+                    args[0],
+                    args[1],
+                    crate::objspace::descroperation::CompareOp::$op,
+                )
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+tuple_cmp_dunder!(tuple_dunder_eq, "__eq__", Eq);
+tuple_cmp_dunder!(tuple_dunder_ne, "__ne__", Ne);
+tuple_cmp_dunder!(tuple_dunder_lt, "__lt__", Lt);
+tuple_cmp_dunder!(tuple_dunder_le, "__le__", Le);
+tuple_cmp_dunder!(tuple_dunder_gt, "__gt__", Gt);
+tuple_cmp_dunder!(tuple_dunder_ge, "__ge__", Ge);
 cmp_dunder_set!(
     bytes_dunder_eq,
     bytes_dunder_ne,
