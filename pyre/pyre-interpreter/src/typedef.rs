@@ -7180,26 +7180,45 @@ fn tuple_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 // PyPy: pypy/objspace/std/typeobject.py TypeDef("type", ...)
 
 /// types.UnionType — PyPy: _pypy_generic_alias.py UnionType
-/// sliceobject.py:148 `W_SliceObject.descr_indices`.
-fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 2 {
+fn slice_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() {
         return Err(crate::PyError::type_error(format!(
-            "indices() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
+            "descriptor '{name}' of 'slice' object needs an argument"
         )));
     }
-    let length = crate::builtins::getindex_w(args[1])?;
+    if !unsafe { pyre_object::sliceobject::is_slice(self_) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'slice' object but received a '{}'",
+            type_name_of(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+/// sliceobject.py:148 `W_SliceObject.descr_indices`.
+fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = slice_receiver(args, "indices")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(args[1]);
+    let length_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let length = crate::builtins::getindex_w(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(length_slot)
+    })?;
     if length < 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
             "length should not be negative".to_string(),
         ));
     }
+    let self_ = unsafe { pyre_object::gc_roots::shadow_stack_get(self_slot) };
     let (start, stop, step) = unsafe {
         crate::sliceobject::indices3(
-            pyre_object::sliceobject::w_slice_get_start(args[0]),
-            pyre_object::sliceobject::w_slice_get_stop(args[0]),
-            pyre_object::sliceobject::w_slice_get_step(args[0]),
+            pyre_object::sliceobject::w_slice_get_start(self_),
+            pyre_object::sliceobject::w_slice_get_stop(self_),
+            pyre_object::sliceobject::w_slice_get_step(self_),
             length,
         )?
     };
@@ -7212,7 +7231,10 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// sliceobject.py `W_SliceObject.descr__new__` — `slice([start,] stop[, step])`.
 fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (params, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let slice_type = gettypefor(&pyre_object::sliceobject::SLICE_TYPE).unwrap_or(PY_NULL);
+    check_user_subclass(slice_type, cls)?;
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args.get(1..).unwrap_or(&[]));
     if crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
             "slice() takes no keyword arguments",
@@ -7254,28 +7276,75 @@ fn slice_getter(
 
 /// sliceobject.py `descr_repr` — `"slice(%r, %r, %r)"`.
 fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(&unsafe { crate::display::py_repr(args[0])? }))
+    let self_ = slice_receiver(args, "__repr__")?;
+    Ok(w_str_new(&unsafe { crate::display::py_repr(self_)? }))
 }
 
 /// sliceobject.py `descr_eq` / `descr_ne` — compare the three components.
 /// `slice is slice` is always equal even with non-comparable params.
 fn slice_components_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate::PyError> {
-    unsafe {
-        Ok(crate::baseobjspace::eq_w(
-            pyre_object::sliceobject::w_slice_get_start(a),
-            pyre_object::sliceobject::w_slice_get_start(b),
-        )? && crate::baseobjspace::eq_w(
-            pyre_object::sliceobject::w_slice_get_stop(a),
-            pyre_object::sliceobject::w_slice_get_stop(b),
-        )? && crate::baseobjspace::eq_w(
-            pyre_object::sliceobject::w_slice_get_step(a),
-            pyre_object::sliceobject::w_slice_get_step(b),
-        )?)
-    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(a);
+    let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(b);
+    let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    Ok(
+        slice_component_eq(a_slot, b_slot, pyre_object::sliceobject::w_slice_get_start)?
+            && slice_component_eq(a_slot, b_slot, pyre_object::sliceobject::w_slice_get_stop)?
+            && slice_component_eq(a_slot, b_slot, pyre_object::sliceobject::w_slice_get_step)?,
+    )
+}
+
+fn slice_component_eq(
+    a_slot: usize,
+    b_slot: usize,
+    field: unsafe fn(PyObjectRef) -> PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    let (left, right) = unsafe {
+        (
+            field(pyre_object::gc_roots::shadow_stack_get(a_slot)),
+            field(pyre_object::gc_roots::shadow_stack_get(b_slot)),
+        )
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(left);
+    let left_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(right);
+    let right_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::baseobjspace::eq_w(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(left_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(right_slot) },
+    )
+}
+
+fn slice_components_tuple(s: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(s);
+    let s_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let start = unsafe {
+        pyre_object::sliceobject::w_slice_get_start(pyre_object::gc_roots::shadow_stack_get(s_slot))
+    };
+    pyre_object::gc_roots::pin_root(start);
+    let start_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let stop = unsafe {
+        pyre_object::sliceobject::w_slice_get_stop(pyre_object::gc_roots::shadow_stack_get(s_slot))
+    };
+    pyre_object::gc_roots::pin_root(stop);
+    let stop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let step = unsafe {
+        pyre_object::sliceobject::w_slice_get_step(pyre_object::gc_roots::shadow_stack_get(s_slot))
+    };
+    pyre_object::gc_roots::pin_root(step);
+    let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    w_tuple_new(vec![
+        unsafe { pyre_object::gc_roots::shadow_stack_get(start_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(stop_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(step_slot) },
+    ])
 }
 
 fn slice_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (a, b) = (args[0], args[1]);
+    let (a, b) = (slice_receiver(args, "__eq__")?, args[1]);
     if a == b {
         return Ok(pyre_object::w_bool_from(true));
     }
@@ -7287,7 +7356,7 @@ fn slice_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn slice_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (a, b) = (args[0], args[1]);
+    let (a, b) = (slice_receiver(args, "__ne__")?, args[1]);
     if a == b {
         return Ok(pyre_object::w_bool_from(false));
     }
@@ -7327,7 +7396,14 @@ fn slice_descr_richcompare(
     args: &[PyObjectRef],
     op: crate::baseobjspace::CompareOp,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (a, b) = (args[0], args[1]);
+    let name = match op {
+        crate::baseobjspace::CompareOp::Lt => "__lt__",
+        crate::baseobjspace::CompareOp::Le => "__le__",
+        crate::baseobjspace::CompareOp::Gt => "__gt__",
+        crate::baseobjspace::CompareOp::Ge => "__ge__",
+        _ => unreachable!(),
+    };
+    let (a, b) = (slice_receiver(args, name)?, args[1]);
     if !unsafe { pyre_object::sliceobject::is_slice(b) } {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -7337,34 +7413,48 @@ fn slice_descr_richcompare(
             crate::baseobjspace::CompareOp::Le | crate::baseobjspace::CompareOp::Ge
         )));
     }
-    let components = |s| unsafe {
-        w_tuple_new(vec![
-            pyre_object::sliceobject::w_slice_get_start(s),
-            pyre_object::sliceobject::w_slice_get_stop(s),
-            pyre_object::sliceobject::w_slice_get_step(s),
-        ])
-    };
-    crate::baseobjspace::compare(components(a), components(b), op)
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(a);
+    let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(b);
+    let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let left = slice_components_tuple(unsafe { pyre_object::gc_roots::shadow_stack_get(a_slot) });
+    pyre_object::gc_roots::pin_root(left);
+    let left_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let right = slice_components_tuple(unsafe { pyre_object::gc_roots::shadow_stack_get(b_slot) });
+    pyre_object::gc_roots::pin_root(right);
+    let right_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::baseobjspace::compare(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(left_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(right_slot) },
+        op,
+    )
 }
 
 /// CPython 3.14 `slice_hash`, copied from the tuplehash-style three-lane
 /// mixer in `Objects/sliceobject.c`.
 fn slice_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_int_new(crate::builtins::try_hash_value(args[0])?))
+    let self_ = slice_receiver(args, "__hash__")?;
+    Ok(w_int_new(crate::builtins::try_hash_value(self_)?))
 }
 
 /// sliceobject.py `descr__reduce__` — `(type(self), (start, stop, step))`.
 fn slice_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let s = args[0];
+    let s = slice_receiver(args, "__reduce__")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(s);
+    let s_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let ty = r#type(s).unwrap_or(pyre_object::PY_NULL);
-    let components = unsafe {
-        w_tuple_new(vec![
-            pyre_object::sliceobject::w_slice_get_start(s),
-            pyre_object::sliceobject::w_slice_get_stop(s),
-            pyre_object::sliceobject::w_slice_get_step(s),
-        ])
-    };
-    Ok(w_tuple_new(vec![ty, components]))
+    pyre_object::gc_roots::pin_root(ty);
+    let ty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let components =
+        slice_components_tuple(unsafe { pyre_object::gc_roots::shadow_stack_get(s_slot) });
+    pyre_object::gc_roots::pin_root(components);
+    let components_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    Ok(w_tuple_new(vec![
+        unsafe { pyre_object::gc_roots::shadow_stack_get(ty_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(components_slot) },
+    ]))
 }
 
 fn init_slice_type(ns: PyObjectRef) {
@@ -7388,28 +7478,28 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function("__repr__", slice_descr_repr),
+            make_builtin_function_with_arity("__repr__", slice_descr_repr, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function("__eq__", slice_descr_eq),
+            make_builtin_function_with_arity("__eq__", slice_descr_eq, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ne__",
-            make_builtin_function("__ne__", slice_descr_ne),
+            make_builtin_function_with_arity("__ne__", slice_descr_ne, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__lt__",
-            make_builtin_function("__lt__", slice_descr_lt),
+            make_builtin_function_with_arity("__lt__", slice_descr_lt, 2),
         )
     };
     for (name, func) in [
@@ -7421,7 +7511,7 @@ fn init_slice_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function(name, func),
+                make_builtin_function_with_arity(name, func, 2),
             )
         };
     }
@@ -7430,14 +7520,14 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function("__hash__", slice_descr_hash),
+            make_builtin_function_with_arity("__hash__", slice_descr_hash, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function("__reduce__", slice_descr_reduce),
+            make_builtin_function_with_arity("__reduce__", slice_descr_reduce, 1),
         )
     };
     unsafe {
@@ -7486,7 +7576,7 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "indices",
-            make_builtin_function("indices", slice_method_indices),
+            make_builtin_function_with_arity("indices", slice_method_indices, 2),
         )
     };
 }

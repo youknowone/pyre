@@ -33,4 +33,38 @@ except TypeError:
 else:
     raise AssertionError("slice component hash error")
 
+for name, call_args in (
+    ("__repr__", (42,)),
+    ("__hash__", (42,)),
+    ("__reduce__", (42,)),
+    ("__eq__", (42, a)),
+    ("__ne__", (42, a)),
+    ("__lt__", (42, a)),
+    ("__le__", (42, a)),
+    ("__gt__", (42, a)),
+    ("__ge__", (42, a)),
+    ("indices", (42, 3)),
+):
+    try:
+        getattr(slice, name)(*call_args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"slice.{name} accepted a foreign receiver")
+
+for name in ("__repr__", "__hash__", "__reduce__"):
+    try:
+        getattr(slice, name)()
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"slice.{name} accepted a missing receiver")
+
+try:
+    slice.__new__(42, 1)
+except TypeError:
+    pass
+else:
+    raise AssertionError("slice.__new__ accepted a non-type class")
+
 print("OK")
