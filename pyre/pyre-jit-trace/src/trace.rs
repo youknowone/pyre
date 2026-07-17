@@ -1517,7 +1517,11 @@ fn run_perfn_walk(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={}); declining walk",
-                pjc.metadata.first_jit_pc_by_py_pc.len()
+                if pjc.metadata.n_py_instrs == 0 {
+                    pjc.metadata.first_jit_pc_by_py_pc.len()
+                } else {
+                    pjc.metadata.n_py_instrs as usize
+                }
             );
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
@@ -3087,7 +3091,11 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
          built_as_portal={}",
         code.len(),
-        pjc.metadata.first_jit_pc_by_py_pc.len(),
+        if pjc.metadata.n_py_instrs == 0 {
+            pjc.metadata.first_jit_pc_by_py_pc.len()
+        } else {
+            pjc.metadata.n_py_instrs as usize
+        },
         start_pc,
         entry,
         pjc.jitcode.num_regs_r(),
