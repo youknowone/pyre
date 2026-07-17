@@ -9418,7 +9418,20 @@ fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
 }
 
-fn exact_first_jit_anchor(first_jit_pc_by_py_pc: &[usize], py_pc: usize, jit_pc: usize) -> bool {
+fn exact_floor_segment_anchor(
+    metadata: &crate::PyJitCodeMetadata,
+    py_pc: usize,
+    jit_pc: usize,
+) -> bool {
+    crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+        .is_some_and(|(start, py)| start == jit_pc && py as usize == py_pc)
+}
+
+fn exact_first_jit_anchor_legacy(
+    first_jit_pc_by_py_pc: &[usize],
+    py_pc: usize,
+    jit_pc: usize,
+) -> bool {
     first_jit_pc_by_py_pc.get(py_pc).copied() == Some(jit_pc)
 }
 
@@ -9430,7 +9443,7 @@ fn exact_first_jit_anchor(first_jit_pc_by_py_pc: &[usize], py_pc: usize, jit_pc:
 /// unsupported opcode. Anything except that same-pc write to this portal
 /// frame declines.
 fn portal_marker_first_jit_anchor(
-    first_jit_pc_by_py_pc: &[usize],
+    metadata: &crate::PyJitCodeMetadata,
     built_as_portal: bool,
     portal_frame_reg: u16,
     perfn_descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
@@ -9439,16 +9452,18 @@ fn portal_marker_first_jit_anchor(
     jit_pc: usize,
     mut python_pc_for_op: impl FnMut(usize) -> usize,
 ) -> bool {
-    if exact_first_jit_anchor(first_jit_pc_by_py_pc, py_pc, jit_pc) {
+    if exact_floor_segment_anchor(metadata, py_pc, jit_pc) {
         return true;
     }
     if !built_as_portal || portal_frame_reg > u8::MAX as u16 {
         return false;
     }
-    let Some(mut pc) = first_jit_pc_by_py_pc.get(py_pc).copied() else {
+    let Some((mut pc, floor_py_pc)) =
+        crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+    else {
         return false;
     };
-    if pc == usize::MAX || pc >= jit_pc {
+    if floor_py_pc as usize != py_pc || pc >= jit_pc {
         return false;
     }
     while pc < jit_pc {
@@ -11973,6 +11988,56 @@ fn branch_arm_reads_unrestorable_ref(
         }
         if op.next_pc <= pc {
             return true;
+        }
+        pc = op.next_pc;
+    }
+    true
+}
+
+fn portal_marker_first_jit_anchor_legacy(
+    first_jit_pc_by_py_pc: &[usize],
+    built_as_portal: bool,
+    portal_frame_reg: u16,
+    perfn_descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
+    code: &[u8],
+    py_pc: usize,
+    jit_pc: usize,
+    mut python_pc_for_op: impl FnMut(usize) -> usize,
+) -> bool {
+    if exact_first_jit_anchor_legacy(first_jit_pc_by_py_pc, py_pc, jit_pc) {
+        return true;
+    }
+    if !built_as_portal || portal_frame_reg > u8::MAX as u16 {
+        return false;
+    }
+    let Some(mut pc) = first_jit_pc_by_py_pc.get(py_pc).copied() else {
+        return false;
+    };
+    if pc == usize::MAX || pc >= jit_pc {
+        return false;
+    }
+    while pc < jit_pc {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.next_pc > jit_pc
+            || python_pc_for_op(op.pc) != py_pc
+            || op.key != "setfield_vable_i/rid"
+            || code.get(op.pc + 1).copied() != Some(portal_frame_reg as u8)
+        {
+            return false;
+        }
+        let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
+            return false;
+        };
+        let descr_index = lo as usize | ((hi as usize) << 8);
+        if !matches!(
+            perfn_descrs.get(descr_index),
+            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(
+                majit_translate::jitcode::BhDescr::VableField { index: 0 }
+            ))
+        ) {
+            return false;
         }
         pc = op.next_pc;
     }
@@ -16291,13 +16356,24 @@ fn try_walker_inline_user_call(
                     let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
                     audit_midbody_abort_plain_twins(&callee_pjc, callee_py_pc, abort_pc);
                     let anchor_ok = match abort_kind {
-                        MidBodyAbortKind::Structural => exact_first_jit_anchor(
-                            &metadata.first_jit_pc_by_py_pc,
-                            callee_py_pc,
-                            abort_pc,
-                        ),
+                        MidBodyAbortKind::Structural => {
+                            let anchor_ok =
+                                exact_floor_segment_anchor(metadata, callee_py_pc, abort_pc);
+                            if pcmap_pivot_audit_enabled() {
+                                assert_eq!(
+                                    anchor_ok,
+                                    exact_first_jit_anchor_legacy(
+                                        &metadata.first_jit_pc_by_py_pc,
+                                        callee_py_pc,
+                                        abort_pc,
+                                    ),
+                                    "PCMAP_PIVOT midbody structural anchor diverges at jit_pc={abort_pc} py_pc={callee_py_pc}",
+                                );
+                            }
+                            anchor_ok
+                        }
                         MidBodyAbortKind::Marker => portal_marker_first_jit_anchor(
-                            &metadata.first_jit_pc_by_py_pc,
+                            metadata,
                             metadata.built_as_portal,
                             metadata.portal_frame_reg,
                             callee_perfn_descrs,
@@ -16307,6 +16383,23 @@ fn try_walker_inline_user_call(
                             |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
                         ),
                     };
+                    if pcmap_pivot_audit_enabled() && matches!(abort_kind, MidBodyAbortKind::Marker)
+                    {
+                        assert_eq!(
+                            anchor_ok,
+                            portal_marker_first_jit_anchor_legacy(
+                                &metadata.first_jit_pc_by_py_pc,
+                                metadata.built_as_portal,
+                                metadata.portal_frame_reg,
+                                callee_perfn_descrs,
+                                body.code,
+                                callee_py_pc,
+                                abort_pc,
+                                |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
+                            ),
+                            "PCMAP_PIVOT midbody portal-marker anchor diverges at jit_pc={abort_pc} py_pc={callee_py_pc}",
+                        );
+                    }
                     if !anchor_ok {
                         return None;
                     }
@@ -36042,13 +36135,12 @@ mod tests {
     }
 
     #[test]
-    fn structural_midbody_anchor_requires_exact_first_jit_pc() {
-        let mut first = vec![usize::MAX; 30];
-        first[28] = 101;
-        first[29] = 115;
-        assert!(super::exact_first_jit_anchor(&first, 28, 101));
-        assert!(!super::exact_first_jit_anchor(&first, 28, 102));
-        assert!(!super::exact_first_jit_anchor(&first, 27, 101));
+    fn structural_midbody_anchor_requires_exact_floor_segment_start() {
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (101, 28), (115, 29)];
+        assert!(super::exact_floor_segment_anchor(&pyjit.metadata, 28, 101));
+        assert!(!super::exact_floor_segment_anchor(&pyjit.metadata, 28, 102));
+        assert!(!super::exact_floor_segment_anchor(&pyjit.metadata, 27, 101));
     }
 
     #[test]
@@ -36066,12 +36158,12 @@ mod tests {
             .get("int_copy/c>i")
             .expect("int_copy/c>i must exist");
         let descrs = [RuntimeBhDescr::Descr(BhDescr::VableField { index: 0 })];
-        let mut first = vec![usize::MAX; 30];
-        first[29] = 0;
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 29)];
         let portal_gap = [setfield, 1, 7, 0, 0, abort];
 
         assert!(super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             true,
             1,
             &descrs,
@@ -36081,7 +36173,7 @@ mod tests {
             |_| 29,
         ));
         assert!(!super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             true,
             1,
             &descrs,
@@ -36093,7 +36185,7 @@ mod tests {
 
         let computation_gap = [int_copy, 1, 7, abort];
         assert!(!super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             true,
             1,
             &descrs,
@@ -36103,9 +36195,9 @@ mod tests {
             |_| 29,
         ));
 
-        first[29] = 5;
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (5, 29)];
         assert!(super::portal_marker_first_jit_anchor(
-            &first,
+            &pyjit.metadata,
             false,
             u16::MAX,
             &[],
