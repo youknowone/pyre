@@ -5004,6 +5004,7 @@ pub(crate) fn set_contains_checked(
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;
+    arity_at_most(args, "get", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
@@ -5339,6 +5340,7 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `strategy.setdefault` as a single atomic operation (one hash).
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "setdefault", 1)?;
+    arity_at_most(args, "setdefault", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
