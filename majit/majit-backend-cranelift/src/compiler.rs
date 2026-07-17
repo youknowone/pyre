@@ -2551,7 +2551,7 @@ fn install_call_assembler_expectations(
 }
 
 fn register_call_assembler_target(
-    token: &mut JitCellToken,
+    token: &JitCellToken,
     compiled: &CompiledLoop,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
@@ -2559,11 +2559,11 @@ fn register_call_assembler_target(
     token.set_ll_function_addr(compiled.code_ptr as usize);
     let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
-    let num_scalar_inputargs = if token.num_scalar_inputargs > 0 {
-        token.num_scalar_inputargs
+    let num_scalar_inputargs = if token.num_scalar_inputargs() > 0 {
+        token.num_scalar_inputargs()
     } else {
         // Derive from types: first N header entries.
-        token.inputarg_types.len().min(compiled.num_inputs)
+        token.inputarg_types().len().min(compiled.num_inputs)
     };
     // Preserve an existing registered CLT Arc when this token number is
     // re-registered, so metadata pointers already baked into callers remain
@@ -2572,13 +2572,9 @@ fn register_call_assembler_target(
     if let Some(existing_clt) = with_call_assembler_registry(|m| {
         m.get(&token.number).map(|t| t.compiled_loop_token.clone())
     }) {
-        token.compiled_loop_token = Some(existing_clt);
+        token.set_compiled_loop_token(Some(existing_clt));
     }
-    let clt = token
-        .compiled_loop_token
-        .as_ref()
-        .expect("JitCellToken missing compiled_loop_token")
-        .clone();
+    let clt = token.compiled_loop_token_expect();
     // `regalloc.py:861-871` `_set_initial_bindings`: contiguous layout
     // → `locs[i] = i * SIZEOFSIGNED`.
     *clt._ll_initial_locs.lock() = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
@@ -2592,7 +2588,7 @@ fn register_call_assembler_target(
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
-        green_key: token.green_key,
+        green_key: token.green_key(),
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
         fail_descrs: compiled.fail_descrs.clone(),
@@ -2600,11 +2596,11 @@ fn register_call_assembler_target(
         num_inputs: compiled.num_inputs,
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
-        inputarg_types: token.inputarg_types.clone(),
+        inputarg_types: token.inputarg_types().to_vec(),
         // virtualizable.py:86 read_boxes: header = frame + static fields.
         num_scalar_inputargs,
         index_of_virtualizable: token
-            .virtualizable_arg_index
+            .virtualizable_arg_index()
             .map(|i| i as i32)
             .unwrap_or(-1),
         compiled_loop_token: clt,
@@ -7934,7 +7930,7 @@ impl CraneliftBackend {
     ) {
         let compiled = match current_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())
         {
             Some(c) => c,
@@ -7944,7 +7940,7 @@ impl CraneliftBackend {
         for prev in previous_tokens {
             if let Some(prev_compiled) = prev
                 .compiled
-                .as_ref()
+                .get()
                 .and_then(|c| c.downcast_ref::<CompiledLoop>())
             {
                 for prev_d in &prev_compiled.fail_descrs {
@@ -8083,7 +8079,7 @@ impl CraneliftBackend {
         // `CompiledLoop::fail_descr_cells` for the life of the CLT
         // they belong to; this tracer keeps the descrs alive for the
         // same scope.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(descrs.to_vec());
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
@@ -14448,7 +14444,7 @@ impl CraneliftBackend {
         token: &majit_backend::JitCellToken,
         table: Arc<majit_gc::GcTable>,
     ) {
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
@@ -15460,25 +15456,25 @@ impl majit_backend::Backend for CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[OpRc],
-        token: &mut JitCellToken,
+        token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` and open the
         // `jit-mem-looptoken-alloc` debug section at the same point
         // PyPy's `assemble_loop` creates the `CompiledLoopToken`.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
-            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
+        if let Some(clt) = token.compiled_loop_token() {
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
         // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
         // boundary; backend stages do not depend on `_forwarded` sharing).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-        token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
         let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None)?;
-        compiled.green_key = token.green_key;
+        compiled.green_key = token.green_key();
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,
@@ -15508,7 +15504,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // between codegen and metainterp.  The stamp here lands on the
         // same `op.descr` Arc that `pyjitpl.rs::record_loop_or_bridge`
         // touches; the two writes converge on a single identity per fail.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             for descr in &compiled.fail_descrs {
                 // `compile.py:185` `isinstance(descr, ResumeDescr)`
                 // covers both `ResumeGuardDescr` and
@@ -15519,12 +15515,12 @@ impl majit_backend::Backend for CraneliftBackend {
                     continue;
                 }
                 fd.set_rd_loop_token_clt(
-                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+                    std::sync::Arc::clone(&clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
                 );
             }
         }
 
-        token.compiled = Some(Box::new(compiled));
+        token.set_compiled(Box::new(compiled));
         Ok(info)
     }
 
@@ -15597,7 +15593,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Result<AsmInfo, BackendError> {
         // `x86/runner.py:100-101` parity — bump this backend's
         // tracker and the per-loop bridges_count before assembling.
-        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+        if let Some(clt) = original_token.compiled_loop_token() {
             clt.compiling_a_bridge(&self.cpu_tracker);
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
@@ -15607,7 +15603,7 @@ impl majit_backend::Backend for CraneliftBackend {
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
         let original_compiled = original_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())
             .ok_or_else(|| {
                 BackendError::CompilationFailed("original token has no compiled loop".to_string())
@@ -15667,7 +15663,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // original token in place just like RPython's update_frame_depth.
         let bridge_frame_depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
         let baseofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
-        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+        if let Some(clt) = original_token.compiled_loop_token() {
             clt.frame_info
                 .lock()
                 .update_frame_depth(baseofs, bridge_frame_depth);
@@ -15704,7 +15700,7 @@ impl majit_backend::Backend for CraneliftBackend {
             header_pc: compiled.header_pc,
             source_guard: Some((source_trace_id, fail_descr.fail_index_per_trace())),
         };
-        let clt_arc = original_token.compiled_loop_token.clone();
+        let clt_arc = original_token.compiled_loop_token();
         for descr in &compiled.fail_descrs {
             let fd = as_fd(descr);
             fail_descr_set_trace_info(fd, bridge_trace_info.clone());
@@ -15777,7 +15773,7 @@ impl majit_backend::Backend for CraneliftBackend {
             for prev_token in previous_tokens {
                 if let Some(prev_compiled) = prev_token
                     .compiled
-                    .as_ref()
+                    .get()
                     .and_then(|c| c.downcast_ref::<CompiledLoop>())
                 {
                     if let Some(prev_descr) = find_fail_descr_in_fail_descrs(
@@ -15836,7 +15832,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>());
         if let Some(compiled) = compiled {
             for (i, &hash) in hashes.iter().enumerate() {
@@ -15873,7 +15869,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>());
         if let Some(compiled) = compiled {
             // Use recursive search matching compiled_bridge_fail_descr_layouts.
@@ -15904,11 +15900,11 @@ impl majit_backend::Backend for CraneliftBackend {
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
         let old_compiled = old_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>());
         let new_compiled = new_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>());
         let (Some(old), Some(new)) = (old_compiled, new_compiled) else {
             return;
@@ -15960,7 +15956,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
@@ -15985,7 +15981,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> DeadFrame {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
@@ -16009,7 +16005,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
@@ -16024,7 +16020,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> majit_backend::RawExecResult {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
@@ -16289,7 +16285,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         Some(build_per_trace_layouts(
             &compiled.fail_descrs,
@@ -16305,7 +16301,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let original_compiled = original_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         // Use recursive search to find fail_descrs nested inside bridges.
         let source_descr = find_fail_descr_in_fail_descrs(
@@ -16328,7 +16324,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         if compiled.trace_id == trace_id {
             return Some(build_per_trace_layouts(
@@ -16345,7 +16341,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         Some(compiled.terminal_exit_layouts_ref().clone())
     }
@@ -16358,7 +16354,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
         let original_compiled = original_token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
             let fd = as_fd(descr);
@@ -16376,7 +16372,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         if compiled.trace_id == trace_id {
             return Some(compiled.terminal_exit_layouts_ref().clone());
@@ -16391,7 +16387,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> Option<CompiledTraceInfo> {
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         if compiled.trace_id == trace_id {
             return Some(CompiledTraceInfo {
@@ -16417,7 +16413,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> bool {
         let Some(compiled) = token
             .compiled
-            .as_ref()
+            .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
         else {
             return false;
@@ -16514,13 +16510,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // so without this every redirected call allocates a frame sized for
         // the old (tmp-callback) body and the new loop's prologue reallocs it
         // on every call.
-        if let (Some(new_clt), Some(old_clt)) = (
-            new.compiled_loop_token.as_ref(),
-            old.compiled_loop_token.as_ref(),
-        ) {
+        if let (Some(new_clt), Some(old_clt)) =
+            (new.compiled_loop_token(), old.compiled_loop_token())
+        {
             let baseofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
-            let old_weak = Arc::downgrade(old_clt);
-            new_clt.update_frame_info(old_clt, old_weak, baseofs);
+            let old_weak = Arc::downgrade(&old_clt);
+            new_clt.update_frame_info(&old_clt, old_weak, baseofs);
         }
         redirect_call_assembler_target(old.number, new.number)
     }
@@ -21549,7 +21544,7 @@ mod tests {
         let real_fail_descr = std::sync::Arc::clone(
             &token
                 .compiled
-                .as_ref()
+                .get()
                 .unwrap()
                 .downcast_ref::<CompiledLoop>()
                 .unwrap()
@@ -21609,7 +21604,7 @@ mod tests {
             backend.execute_token(&token, &[Value::Int(0)]);
             let compiled = token
                 .compiled
-                .as_ref()
+                .get()
                 .unwrap()
                 .downcast_ref::<CompiledLoop>()
                 .unwrap();
@@ -21621,7 +21616,7 @@ mod tests {
         backend.execute_token(&token, &[Value::Int(1)]);
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .unwrap()
             .downcast_ref::<CompiledLoop>()
             .unwrap();
@@ -21698,7 +21693,7 @@ mod tests {
         let real_fail_descr = std::sync::Arc::clone(
             &token
                 .compiled
-                .as_ref()
+                .get()
                 .unwrap()
                 .downcast_ref::<CompiledLoop>()
                 .unwrap()
@@ -21818,7 +21813,7 @@ mod tests {
 
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .unwrap()
             .downcast_ref::<CompiledLoop>()
             .unwrap();
@@ -22498,7 +22493,7 @@ mod tests {
 
         let compiled = token
             .compiled
-            .as_ref()
+            .get()
             .unwrap()
             .downcast_ref::<CompiledLoop>()
             .unwrap();

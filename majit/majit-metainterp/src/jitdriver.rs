@@ -2927,7 +2927,7 @@ impl<S: JitState> JitDriver<S> {
                     .meta
                     .warm_state_ref()
                     .get_compiled(green_key)
-                    .map(|compiled| compiled.inputarg_types.len())
+                    .map(|compiled| compiled.inputarg_types().len())
                     .unwrap_or(0);
                 eprintln!(
                     "[callee-rca][entry] green_key={green_key} target_pc={target_pc} \
@@ -3740,7 +3740,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .warm_state_ref()
             .get_compiled(green_key)?
-            .inputarg_types
+            .inputarg_types()
             .len();
         if compiled_inputs <= live_values.len() {
             return Some(live_values);
@@ -4800,7 +4800,7 @@ impl<S: JitState> JitDriver<S> {
             majit_metainterp::mc_diag_bump(14); // sbt early: no owning jct
             return false;
         };
-        let green_key = jct.green_key;
+        let green_key = jct.green_key();
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {

@@ -4,8 +4,8 @@
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
 use std::cell::Cell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
@@ -1126,7 +1126,11 @@ pub struct JitCellToken {
     /// Green key hash identifying the loop entry point.
     /// Set by MetaInterp before compile_loop. Used by the backend's
     /// bridge threshold callback to find the compiled loop metadata.
-    pub green_key: u64,
+    ///
+    /// `Cell<u64>` because `configure_loop_token_for_driver` writes it
+    /// through `&JitCellToken` while self-recursive trace ops already hold
+    /// `Arc` clones of the same pending token (`Arc::get_mut` would fail).
+    pub green_key: Cell<u64>,
     /// Types of the input arguments, recorded at compile_loop time from
     /// the finalised inputargs. RPython does not carry this list on
     /// `JitCellToken` itself — there, backend code recovers types by
@@ -1138,21 +1142,37 @@ pub struct JitCellToken {
     /// Front-end (tracer) code MUST NOT read this; use
     /// `MetaInterp::front_target_inputarg_types` instead, which derives
     /// types from the LABEL op + `TreeLoop.inputargs` per RPython.
-    pub inputarg_types: Vec<Type>,
+    ///
+    /// `OnceLock` because the backend's `compile_loop` writes it exactly
+    /// once through `&JitCellToken` (the token may already have `Arc`
+    /// clones on recorded CALL_ASSEMBLER ops). Read via `inputarg_types()`.
+    pub inputarg_types: OnceLock<Vec<Type>>,
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.
-    pub num_scalar_inputargs: usize,
+    ///
+    /// `Cell<usize>` — written by `configure_loop_token_for_driver`
+    /// through `&JitCellToken`.
+    pub num_scalar_inputargs: Cell<usize>,
     /// warmspot.py / rewrite.py parity: JitDriverSD.index_of_virtualizable.
     /// Index inside the original CALL_ASSEMBLER arglist before rewrite
     /// collapses it to `[frame]` or `[frame, virtualizable]`.
-    pub virtualizable_arg_index: Option<usize>,
+    ///
+    /// `Cell<Option<usize>>` — written by `configure_loop_token_for_driver`
+    /// through `&JitCellToken`.
+    pub virtualizable_arg_index: Cell<Option<usize>>,
     /// compile.py:168 `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`.
     ///
     /// The backend crate stores the registered jitdriver slot index
     /// rather than a direct metainterp object pointer.
     pub outermost_jitdriver_index: Option<usize>,
     /// Backend-specific compiled data.
-    pub compiled: Option<Box<dyn std::any::Any + Send>>,
+    ///
+    /// `OnceLock` because the backend's `compile_loop` stores it exactly
+    /// once through `&JitCellToken` and the hot execute path reads it via a
+    /// cheap `get()`. Recompilation mints a fresh token, so a token's
+    /// compiled slot is never overwritten (`reset_compiled` takes it via
+    /// `&mut self`).
+    pub compiled: OnceLock<Box<dyn std::any::Any + Send>>,
     /// Flag indicating whether the compiled code has been invalidated.
     /// When set to `true`, any `GUARD_NOT_INVALIDATED` in the compiled
     /// code will fail, causing execution to bail out to the interpreter.
@@ -1187,7 +1207,13 @@ pub struct JitCellToken {
     /// Interior mutability on fields uses `parking_lot::Mutex` because
     /// bridge compilation and execution may see `&JitCellToken` from
     /// multiple threads (compile_bridge receives `&JitCellToken`).
-    pub compiled_loop_token: Option<Arc<CompiledLoopToken>>,
+    ///
+    /// The `Option<Arc<..>>` slot itself is wrapped in `parking_lot::Mutex`
+    /// because `register_call_assembler_target` reassigns it through
+    /// `&JitCellToken` when a token number is re-registered (preserving the
+    /// previously baked CLT pointer). Read a cloned handle via
+    /// `compiled_loop_token()`.
+    pub compiled_loop_token: parking_lot::Mutex<Option<Arc<CompiledLoopToken>>>,
     /// `rpython/jit/backend/x86/assembler.py:599`
     /// `looptoken._ll_function_addr = rawstart + functionpos` —
     /// address of the compiled loop entry.
@@ -1308,12 +1334,12 @@ impl JitCellToken {
     pub fn new(number: u64) -> Self {
         JitCellToken {
             number,
-            green_key: 0,
-            inputarg_types: Vec::new(),
-            num_scalar_inputargs: 0,
-            virtualizable_arg_index: None,
+            green_key: Cell::new(0),
+            inputarg_types: OnceLock::new(),
+            num_scalar_inputargs: Cell::new(0),
+            virtualizable_arg_index: Cell::new(None),
             outermost_jitdriver_index: None,
-            compiled: None,
+            compiled: OnceLock::new(),
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
             keepalive_tokens: parking_lot::Mutex::new(Vec::new()),
@@ -1321,7 +1347,9 @@ impl JitCellToken {
             // `compiled_loop_token` at the start of `assemble_loop` —
             // i.e., lazily when the backend compiles the token. pyre
             // initializes it eagerly here so the field is always present.
-            compiled_loop_token: Some(Arc::new(CompiledLoopToken::new(number))),
+            compiled_loop_token: parking_lot::Mutex::new(Some(Arc::new(CompiledLoopToken::new(
+                number,
+            )))),
             _ll_function_addr: AtomicUsize::new(0),
             // memmgr.py:38 default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
@@ -1334,21 +1362,35 @@ impl JitCellToken {
         }
     }
 
-    /// `rpython/jit/backend/llsupport/assembler.py:184-188`
-    /// `get_asmmemmgr_blocks(self, looptoken)` parity.
+    /// Clone the current `compiled_loop_token` handle out of its `Mutex`.
+    /// `None` only before the eager `JitCellToken::new` init is observed
+    /// (never in practice) or on a token whose CLT was cleared.
+    #[inline]
+    pub fn compiled_loop_token(&self) -> Option<Arc<CompiledLoopToken>> {
+        self.compiled_loop_token.lock().clone()
+    }
+
+    /// Reassign the `compiled_loop_token` slot through `&JitCellToken`.
+    /// `register_call_assembler_target` calls this to reuse a previously
+    /// registered CLT Arc so metadata pointers baked into callers stay
+    /// stable across a token-number re-registration.
+    #[inline]
+    pub fn set_compiled_loop_token(&self, clt: Option<Arc<CompiledLoopToken>>) {
+        *self.compiled_loop_token.lock() = clt;
+    }
+
+    /// The token's `compiled_loop_token`, panicking if absent. Callers keep
+    /// the returned `Arc` alive while locking its inner mutexes
+    /// (`asmmemmgr_blocks`, `frame_info`, ...).
     ///
-    /// Returns a mutex guard over the `asmmemmgr_blocks` vec on this
-    /// token's `compiled_loop_token`. Panics if the token has no
-    /// `compiled_loop_token` — `JitCellToken::new` sets this eagerly, so
+    /// `rpython/jit/backend/llsupport/assembler.py:184-188`
+    /// `get_asmmemmgr_blocks(self, looptoken)` reaches `asmmemmgr_blocks`
+    /// through this Arc.  `JitCellToken::new` sets the CLT eagerly, so
     /// production callers never hit the panic.
-    pub fn asmmemmgr_blocks(
-        &self,
-    ) -> parking_lot::MutexGuard<'_, Vec<Box<dyn std::any::Any + Send>>> {
-        self.compiled_loop_token
-            .as_ref()
+    #[inline]
+    pub fn compiled_loop_token_expect(&self) -> Arc<CompiledLoopToken> {
+        self.compiled_loop_token()
             .expect("JitCellToken missing compiled_loop_token")
-            .asmmemmgr_blocks
-            .lock()
     }
 
     /// history.py:451-453: record_jump_to — record that this loop can
@@ -1416,7 +1458,16 @@ impl JitCellToken {
     /// model.py: has_compiled_code()
     /// Whether this token has compiled code attached.
     pub fn has_compiled_code(&self) -> bool {
-        self.compiled.is_some()
+        self.compiled.get().is_some()
+    }
+
+    /// Store the backend-specific compiled data through `&JitCellToken`.
+    /// Write-once: `compile_loop` runs at most once per token (recompiles
+    /// mint fresh tokens), so a second call is a no-op on the already-set
+    /// slot.
+    #[inline]
+    pub fn set_compiled(&self, compiled: Box<dyn std::any::Any + Send>) {
+        let _ = self.compiled.set(compiled);
     }
 
     /// model.py: get_number()
@@ -1424,10 +1475,42 @@ impl JitCellToken {
         self.number
     }
 
+    /// The input-arg types recorded at `compile_loop`.  Empty until the
+    /// backend has compiled this token.
+    #[inline]
+    pub fn inputarg_types(&self) -> &[Type] {
+        self.inputarg_types.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Record the typed input signature through `&JitCellToken` at
+    /// `compile_loop` (write-once).
+    #[inline]
+    pub fn set_inputarg_types(&self, types: Vec<Type>) {
+        let _ = self.inputarg_types.set(types);
+    }
+
+    /// The loop's green key, set by `configure_loop_token_for_driver`.
+    #[inline]
+    pub fn green_key(&self) -> u64 {
+        self.green_key.get()
+    }
+
+    /// The virtualizable arg index, set by `configure_loop_token_for_driver`.
+    #[inline]
+    pub fn virtualizable_arg_index(&self) -> Option<usize> {
+        self.virtualizable_arg_index.get()
+    }
+
+    /// The scalar-inputarg count, set by `configure_loop_token_for_driver`.
+    #[inline]
+    pub fn num_scalar_inputargs(&self) -> usize {
+        self.num_scalar_inputargs.get()
+    }
+
     /// model.py: reset_compiled()
     /// Remove the compiled code (e.g., after invalidation).
     pub fn reset_compiled(&mut self) {
-        self.compiled = None;
+        self.compiled.take();
     }
 
     /// Get a clone of the invalidated flag (for registering with QuasiImmut).
@@ -1629,11 +1712,17 @@ pub trait Backend: Send {
     }
 
     /// Compile a loop trace into native code.
+    ///
+    /// `token` is shared (`&JitCellToken`): a self-recursive loop's own
+    /// `CALL_ASSEMBLER` descr can hold an `Arc` clone of this same token,
+    /// which the backend dereferences while emitting the call.  The late
+    /// fields (`compiled`, `inputarg_types`, `compiled_loop_token`) are
+    /// interior-mutable so they can be written through the shared reference.
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
         ops: &[OpRc],
-        token: &mut JitCellToken,
+        token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Register the typed constant pool (`OpRef` → `Const`) consumed by

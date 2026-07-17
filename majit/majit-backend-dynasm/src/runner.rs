@@ -1155,7 +1155,8 @@ impl DynasmBackend {
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> usize {
-        let blocks = token.asmmemmgr_blocks();
+        let blocks_clt = token.compiled_loop_token_expect();
+        let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter().rev() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.source_guard == Some((source_trace_id, source_fail_index)) {
@@ -1273,7 +1274,7 @@ impl DynasmBackend {
         // machine code, so the tracer must keep them alive — recovery
         // (`recover_fail_descr_cell`) does `Arc::increment_strong_count`
         // against these live cells and would UB-fault otherwise.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(cells.to_vec());
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
@@ -1292,7 +1293,7 @@ impl DynasmBackend {
         token: &majit_backend::JitCellToken,
         table: Arc<majit_gc::GcTable>,
     ) {
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
@@ -1580,7 +1581,7 @@ impl DynasmBackend {
     fn get_compiled(token: &JitCellToken) -> &CompiledCode {
         token
             .compiled
-            .as_ref()
+            .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledCode>()
             .expect("compiled data is not CompiledCode")
@@ -1757,7 +1758,8 @@ impl DynasmBackend {
         }
 
         // Search bridge fail_descrs in asmmemmgr_blocks
-        let blocks = token.asmmemmgr_blocks();
+        let blocks_clt = token.compiled_loop_token_expect();
+        let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if let Some(found) = bridge
@@ -1832,7 +1834,7 @@ impl DynasmBackend {
         // contract.
         let compiled = token
             .compiled
-            .as_ref()?
+            .get()?
             .downcast_ref::<CompiledCode>()
             .expect("compiled data is not CompiledCode");
         // RPython looks up the faildescr by object identity (the resume
@@ -1856,7 +1858,8 @@ impl DynasmBackend {
                 return Some(found.descr.clone());
             }
         }
-        let blocks = token.asmmemmgr_blocks();
+        let blocks_clt = token.compiled_loop_token_expect();
+        let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.trace_id == trace_id {
@@ -1872,9 +1875,9 @@ impl DynasmBackend {
     /// `rpython/jit/backend/x86/assembler.py:599` parity: store
     /// `_ll_function_addr` after the loop is fully assembled and retain the
     /// compiled-loop metadata for GC rewrite callbacks.
-    fn register_call_assembler_target(token: &mut JitCellToken, code_addr: usize) {
+    fn register_call_assembler_target(token: &JitCellToken, code_addr: usize) {
         let token_number = token.number;
-        let index_of_virtualizable = token.virtualizable_arg_index.map_or(-1_i32, |i| i as i32);
+        let index_of_virtualizable = token.virtualizable_arg_index().map_or(-1_i32, |i| i as i32);
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm][ca-target] register token={} addr=0x{:x}",
@@ -1889,14 +1892,10 @@ impl DynasmBackend {
                     // Preserve the registered CLT Arc when this token number
                     // is re-registered, so metadata pointers already baked
                     // into callers remain stable.
-                    token.compiled_loop_token = Some(Arc::clone(&existing.compiled_loop_token));
+                    token.set_compiled_loop_token(Some(Arc::clone(&existing.compiled_loop_token)));
                 }
                 None => {
-                    let clt = token
-                        .compiled_loop_token
-                        .as_ref()
-                        .expect("JitCellToken missing compiled_loop_token")
-                        .clone();
+                    let clt = token.compiled_loop_token_expect();
                     guard.insert(
                         token_number,
                         DynasmCaTarget {
@@ -1943,7 +1942,7 @@ impl Backend for DynasmBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[OpRc],
-        token: &mut JitCellToken,
+        token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         // `x86/assembler.py:514` parity: PyPy creates the
         // `CompiledLoopToken` inside `assemble_loop`, and that's where
@@ -1952,8 +1951,8 @@ impl Backend for DynasmBackend {
         // CLT creation makes that point unreachable from
         // `CompiledLoopToken::new`; defer both to here so the counter
         // matches PyPy at the same structural moment.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
-            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
+        if let Some(clt) = token.compiled_loop_token() {
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
         // Deep-clone Op out of OpRc for the internal pipeline. Backend
         // stages do not depend on shared `_forwarded` identity with the
@@ -1961,7 +1960,7 @@ impl Backend for DynasmBackend {
         // time ops reach `compile_loop` (history.py:528 vs. the
         // backend-emit `Vec<Op>` boundary).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
-        token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
@@ -2042,13 +2041,13 @@ impl Backend for DynasmBackend {
         // hold the same `DescrRef`s the metainterp stamped onto each
         // guard op (unified descr), so the write lands on the
         // same `ResumeGuardDescr` Arc upstream targets.
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             for descr in &compiled.fail_descrs {
                 if !descr.is_resume_guard() {
                     continue;
                 }
                 if let Some(fd) = descr.as_fail_descr() {
-                    fd.set_rd_loop_token_clt(std::sync::Arc::clone(clt)
+                    fd.set_rd_loop_token_clt(std::sync::Arc::clone(&clt)
                         as std::sync::Arc<dyn std::any::Any + Send + Sync>);
                 }
             }
@@ -2062,7 +2061,7 @@ impl Backend for DynasmBackend {
         // equivalent here is populating its fields with the real values
         // computed during assembly.
         let baseofs = Self::get_baseofs_of_frame_field();
-        if let Some(clt) = token.compiled_loop_token.as_ref() {
+        if let Some(clt) = token.compiled_loop_token() {
             // `x86/assembler.py:526-530` frame_info = malloc_aligned + set
             // jfi_frame_depth/jfi_frame_size. pyre's frame_info lives on
             // the CLT already; just populate via update_frame_depth.
@@ -2083,7 +2082,7 @@ impl Backend for DynasmBackend {
         // rawstart + functionpos`. pyre stores the single entry point
         // so `_ll_function_addr` = compiled-code base.
         token.set_ll_function_addr(code_addr);
-        token.compiled = Some(Box::new(compiled));
+        token.set_compiled(Box::new(compiled));
 
         Ok(AsmInfo {
             code_addr,
@@ -2193,7 +2192,7 @@ impl Backend for DynasmBackend {
         // Bumps this backend's `cpu.tracker.total_compiled_bridges`,
         // the per-loop `bridges_count`, and emits the
         // `jit-mem-looptoken-alloc` debug section.
-        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+        if let Some(clt) = original_token.compiled_loop_token() {
             clt.compiling_a_bridge(&self.cpu_tracker);
         }
         // Deep-clone Op out of OpRc for the internal pipeline (see
@@ -2297,7 +2296,7 @@ impl Backend for DynasmBackend {
         // callee's jf_frame_info, so llfi ends up at input0).
         let bridge_frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         let baseofs = Self::get_baseofs_of_frame_field();
-        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+        if let Some(clt) = original_token.compiled_loop_token() {
             clt.frame_info
                 .lock()
                 .update_frame_depth(baseofs, bridge_frame_depth);
@@ -2356,19 +2355,23 @@ impl Backend for DynasmBackend {
         // inherit the original loop's CompiledLoopToken.  See the
         // sibling `compile_loop` site for the parity rationale on the
         // `is_resume_guard()` predicate (`compile.py:185`).
-        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+        if let Some(clt) = original_token.compiled_loop_token() {
             for descr in &compiled.fail_descrs {
                 if !descr.is_resume_guard() {
                     continue;
                 }
                 if let Some(fd) = descr.as_fail_descr() {
-                    fd.set_rd_loop_token_clt(std::sync::Arc::clone(clt)
+                    fd.set_rd_loop_token_clt(std::sync::Arc::clone(&clt)
                         as std::sync::Arc<dyn std::any::Any + Send + Sync>);
                 }
             }
         }
 
-        original_token.asmmemmgr_blocks().push(Box::new(compiled));
+        original_token
+            .compiled_loop_token_expect()
+            .asmmemmgr_blocks
+            .lock()
+            .push(Box::new(compiled));
 
         Ok(AsmInfo {
             code_addr: bridge_addr,
@@ -2396,10 +2399,7 @@ impl Backend for DynasmBackend {
         // the frame — the same sizing the JIT uses for the callee frames it
         // allocates itself, so the former `.max(args/fail*4/64)` cushion was
         // a runner-only over-allocation with no upstream basis.
-        let clt = token
-            .compiled_loop_token
-            .as_ref()
-            .expect("JitCellToken missing compiled_loop_token");
+        let clt = token.compiled_loop_token_expect();
         let (fi_ptr, num_slots) = {
             let info = clt.frame_info.lock();
             // The Arc-pinned `JitFrameInfo` address stays valid past the
@@ -2589,10 +2589,7 @@ impl Backend for DynasmBackend {
         // `execute_token` (jitframe.py:51) — the bridge realloc slowpath
         // needs the frame_info, and the depth matches cranelift's
         // `max_output_slots`-sized raw outputs (compiler.rs:14994).
-        let clt = token
-            .compiled_loop_token
-            .as_ref()
-            .expect("JitCellToken missing compiled_loop_token");
+        let clt = token.compiled_loop_token_expect();
         let (fi_ptr, num_slots) = {
             let info = clt.frame_info.lock();
             // Same non-null frame_info + `jfi_frame_depth` sizing as
@@ -2799,10 +2796,9 @@ impl Backend for DynasmBackend {
         // `cpu.get_baseofs_of_frame_field()` so `jfi_frame_size` follows
         // jitframe.py:19-22 `base_ofs + new_depth * SIZEOFSIGNED`.
         let baseofs = Self::get_baseofs_of_frame_field();
-        if let (Some(new_clt), Some(old_clt)) = (
-            new.compiled_loop_token.as_ref(),
-            old.compiled_loop_token.as_ref(),
-        ) {
+        if let (Some(new_clt), Some(old_clt)) =
+            (new.compiled_loop_token(), old.compiled_loop_token())
+        {
             // Seed new's CompiledLoopToken.frame_info.jfi_frame_depth
             // from the backend-specific compiled code depth so
             // update_frame_info has a non-zero value to propagate.
@@ -2814,8 +2810,8 @@ impl Backend for DynasmBackend {
             // model.py:316-329 update_frame_info — pass old CLT with a
             // weak ref for the "append self to chain" step (line 328
             // `new_loop_tokens.append(weakref.ref(oldlooptoken))`).
-            let old_weak = Arc::downgrade(old_clt);
-            new_clt.update_frame_info(old_clt, old_weak, baseofs);
+            let old_weak = Arc::downgrade(&old_clt);
+            new_clt.update_frame_info(&old_clt, old_weak, baseofs);
             // Keep the backend-specific frame_depth in lockstep so bridge
             // codegen's existing readers (CompiledCode.frame_depth) also
             // see the propagated value. TODO: RPython
@@ -2865,7 +2861,8 @@ impl Backend for DynasmBackend {
         if bridge_addr == 0 {
             return;
         }
-        let blocks = token.asmmemmgr_blocks();
+        let blocks_clt = token.compiled_loop_token_expect();
+        let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
@@ -3451,7 +3448,8 @@ impl Backend for DynasmBackend {
             );
         }
         // Search bridge fail_descrs in asmmemmgr_blocks.
-        let blocks = token.asmmemmgr_blocks();
+        let blocks_clt = token.compiled_loop_token_expect();
+        let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.trace_id == trace_id {
@@ -3491,7 +3489,8 @@ impl Backend for DynasmBackend {
         if bridge_addr == 0 {
             return None;
         }
-        let blocks = original_token.asmmemmgr_blocks();
+        let blocks_clt = original_token.compiled_loop_token_expect();
+        let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
@@ -3872,7 +3871,7 @@ mod tests {
         let mut token = JitCellToken::new(1499);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
-        assert_eq!(token.inputarg_types, vec![Type::Ref, Type::Int]);
+        assert_eq!(token.inputarg_types().to_vec(), vec![Type::Ref, Type::Int]);
     }
 
     #[test]
@@ -4435,7 +4434,7 @@ mod tests {
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(1614);
-        token.virtualizable_arg_index = Some(0);
+        token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
 
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
@@ -4548,7 +4547,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
         let mut callee_token = JitCellToken::new(1617);
-        callee_token.virtualizable_arg_index = Some(0);
+        callee_token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
@@ -4578,7 +4577,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
         let mut caller_token = JitCellToken::new(1618);
-        caller_token.virtualizable_arg_index = Some(0);
+        caller_token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
             .unwrap();
@@ -4621,7 +4620,7 @@ mod tests {
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(1615);
-        token.virtualizable_arg_index = Some(0);
+        token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
 
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
@@ -4721,7 +4720,7 @@ mod tests {
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(1616);
-        token.virtualizable_arg_index = Some(0);
+        token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
 
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));

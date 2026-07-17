@@ -3858,7 +3858,7 @@ mod tests {
             &mut self,
             _inputargs: &[majit_ir::InputArg],
             _ops: &[majit_ir::OpRc],
-            _token: &mut majit_backend::JitCellToken,
+            _token: &majit_backend::JitCellToken,
         ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
             unimplemented!("SanityTestCpu::compile_loop")
         }

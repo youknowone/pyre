@@ -1592,7 +1592,7 @@ fn jit_blackhole_resume_from_guard(
     // JIT or a portal whose first fail arg is a scalar.  Keying resume
     // storage by descr identity directly would remove the need for this
     // recovery block.
-    let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
+    let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key()) {
         Some(gk) => gk,
         None if num_fail_values >= 1 => {
             let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
@@ -2394,7 +2394,7 @@ fn bridge_source_identity_from_descr(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
 ) -> Option<(u64, u64, u32)> {
     let descr_fd = descr_arc.as_fail_descr()?;
-    let green_key = majit_backend::descr_owning_jct(descr_fd)?.green_key;
+    let green_key = majit_backend::descr_owning_jct(descr_fd)?.green_key();
     let trace_id = descr_fd.trace_id();
     let fail_index = descr_fd.fail_index_per_trace();
     Some((green_key, trace_id, fail_index))
@@ -3294,7 +3294,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             Outcome::Finished(backend.get_ref_value(&frame, 0).as_usize() as i64)
         } else {
             let green_key = majit_backend::descr_owning_jct(descr)
-                .map(|jct| jct.green_key)
+                .map(|jct| jct.green_key())
                 .unwrap_or(0);
             let exit_layout = mi.build_exit_layout_for_descr(green_key, descr);
             let raw_values: Vec<i64> = descr

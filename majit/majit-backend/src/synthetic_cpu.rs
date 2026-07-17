@@ -102,7 +102,7 @@ impl crate::Backend for SyntheticCpu {
         &mut self,
         _inputargs: &[majit_ir::InputArg],
         _ops: &[majit_ir::OpRc],
-        _token: &mut crate::JitCellToken,
+        _token: &crate::JitCellToken,
     ) -> Result<crate::AsmInfo, crate::BackendError> {
         unreachable!("SyntheticCpu does not compile native code; only services bh_call_* dispatch")
     }

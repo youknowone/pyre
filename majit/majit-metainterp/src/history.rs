@@ -4459,7 +4459,7 @@ impl TraceCtx {
             target.number,
             arg_types,
             ret_type,
-            target.virtualizable_arg_index,
+            target.virtualizable_arg_index(),
         );
         self.record_op_with_descr(opcode, args, descr)
     }
@@ -5051,7 +5051,7 @@ mod history_record_tests {
     fn call_assembler_typed_preserves_mixed_arg_types_and_target_token() {
         let (mut ctx, args) = make_ctx_with_mixed_inputs();
         let mut token = JitCellToken::new(777);
-        token.virtualizable_arg_index = Some(1);
+        token.virtualizable_arg_index = std::cell::Cell::new(Some(1));
         let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);

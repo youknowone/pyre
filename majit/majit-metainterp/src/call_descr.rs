@@ -129,7 +129,7 @@ impl CallDescr for MetaCallAssemblerDescr {
         Some(self.target_token.number)
     }
     fn call_virtualizable_index(&self) -> Option<usize> {
-        self.target_token.virtualizable_arg_index
+        self.target_token.virtualizable_arg_index()
     }
     fn get_extra_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
@@ -146,7 +146,7 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {
-        self.target_token.virtualizable_arg_index
+        self.target_token.virtualizable_arg_index()
     }
 
     fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
@@ -756,8 +756,8 @@ pub fn make_call_assembler_descr_by_number(
     result_type: Type,
     virtualizable_arg_index: Option<usize>,
 ) -> DescrRef {
-    let mut tok = JitCellToken::new(target_number);
-    tok.virtualizable_arg_index = virtualizable_arg_index;
+    let tok = JitCellToken::new(target_number);
+    tok.virtualizable_arg_index.set(virtualizable_arg_index);
     make_call_assembler_descr(Arc::new(tok), arg_types, result_type)
 }
 
