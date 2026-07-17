@@ -8685,27 +8685,32 @@ pub fn iterator_greenkey(w_iterable: PyObjectRef) -> PyObjectRef {
     crate::typedef::r#type(w_iterable).unwrap_or(pyre_object::PY_NULL)
 }
 
-/// pypy/interpreter/baseobjspace.py:1010 `unpackiterable_driver`
-/// JitDriver merge-point hint.
+/// pypy/interpreter/baseobjspace.py:29-32
+/// `unpackiterable_driver = JitDriver(greens=['greenkey'], reds='auto',
+/// name='unpackiterable')`.
 ///
-/// PyPy declares `unpackiterable_driver = JitDriver(greens=['greenkey'],
-/// reds='auto', name='unpackiterable')` and calls
-/// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)` once per
-/// loop turn so the JIT specialises the loop trace per
-/// `iterator_greenkey(w_iterator)` value.
-///
-/// Pyre's metainterp drives compilation from bytecode-level
-/// `BC_JIT_MERGE_POINT` opcodes; an in-Rust `_unpackiterable_unknown_length`
-/// is residual-call'd from the JIT'd interpreter loop, so the merge-point
-/// inside this body is not visible to the live tracer.  The structural
-/// port keeps the greenkey computation + the call so the per-greenkey
-/// dispatch contract is documented at the call site; the runtime hook
-/// is a no-op until the metainterp grows a Rust-callee merge-point
-/// observer.
-#[inline]
-fn unpackiterable_driver_jit_merge_point(_greenkey: PyObjectRef) {
-    // No-op: see doc comment above.
+/// The metainterp recognizes `unpackiterable_driver.jit_merge_point(greenkey)`
+/// (a `CallTarget::Method` on this receiver type) and lowers it to a
+/// `BC_JIT_MERGE_POINT` once this graph is registered as a portal.
+struct UnpackIterableJitDriver;
+
+impl UnpackIterableJitDriver {
+    /// pypy/interpreter/baseobjspace.py:1012
+    /// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
+    #[inline]
+    fn jit_merge_point(&self, greenkey: PyObjectRef) {
+        let _ = greenkey;
+    }
 }
+
+/// pypy/interpreter/baseobjspace.py:29 `unpackiterable_driver`.
+#[allow(non_upper_case_globals)]
+const unpackiterable_driver: UnpackIterableJitDriver = UnpackIterableJitDriver;
+
+/// pypy/interpreter/generator.py:330
+/// `jitdriver.jit_merge_point(pycode=pycode)`, with `greens=['pycode']`.
+#[inline]
+fn generator_unpack_driver_jit_merge_point(_pycode: PyObjectRef) {}
 
 /// pypy/interpreter/generator.py:317-343 `_create_unpack_into` body.
 ///
@@ -8761,7 +8766,7 @@ fn generator_unpack_into(
         let pycode = frame.pycode as PyObjectRef;
         loop {
             // generator.py:330 `jitdriver.jit_merge_point(pycode=pycode)`.
-            unpackiterable_driver_jit_merge_point(pycode);
+            generator_unpack_driver_jit_merge_point(pycode);
             // generator.py:331 `space = self.space`.
             // generator.py:332-336 `try: w_result =
             //   self._invoke_execute_frame(space.w_None)`.
@@ -8859,7 +8864,7 @@ fn _unpackiterable_unknown_length(
     loop {
         // baseobjspace.py:1012
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
-        unpackiterable_driver_jit_merge_point(greenkey);
+        unpackiterable_driver.jit_merge_point(greenkey);
         match next(w_iterator) {
             Ok(w_item) => items.push(w_item),
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
