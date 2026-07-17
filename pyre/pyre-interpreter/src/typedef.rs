@@ -6037,6 +6037,16 @@ fn mappingproxy_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn init_mappingproxy_type(ns: PyObjectRef) {
+    // Python 3.14 `PyDictProxy_Type`: "Read-only proxy of a mapping."
+    // PyPy's module doc spells out the same contract, while its TypeDef
+    // predates the explicit type-doc slot.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new("Read-only proxy of a mapping."),
+        )
+    };
     // dictproxyobject.py:105 __new__=interp2app(descr_new)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -6147,6 +6157,33 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     "'|=' is not supported by mappingproxy; use '|' instead",
                 ))
             }),
+        )
+    };
+    // Python 3.14 `mappingproxy_hash`: delegate to the wrapped mapping.
+    // This is newer than PyPy's current `dictproxyobject.py` TypeDef. A
+    // proxy around dict therefore raises `unhashable type: 'dict'`, while a
+    // proxy around a custom hashable mapping returns that mapping's hash.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| {
+                    let proxy = args[0];
+                    if !unsafe { pyre_object::is_dict_proxy(proxy) } {
+                        let received = unsafe { (*(*proxy).ob_type).name };
+                        return Err(crate::PyError::type_error(format!(
+                            "descriptor '__hash__' requires a 'mappingproxy' object but received a '{received}'"
+                        )));
+                    }
+                    let mapping = unsafe { pyre_object::w_dict_proxy_get_mapping(proxy) };
+                    Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
+                        mapping,
+                    )?))
+                },
+                1,
+            ),
         )
     };
     // dictproxyobject.py:51 descr_or →
