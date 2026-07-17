@@ -2894,7 +2894,12 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     };
     if step == 1 {
         let s_lo = start.max(0) as usize;
-        let s_hi = stop.max(0) as usize;
+        // listobject.py passes `(start, step, slicelength)` to `setslice`;
+        // its contiguous replacement range is therefore
+        // `start..start+slicelength`.  A normalized slice such as `5:2`
+        // has zero length and inserts/deletes at 5, rather than forming the
+        // invalid Rust range `5..2`.
+        let s_hi = stop.max(start).max(0) as usize;
         pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
             .expect("w_other is always a valid list");
         return Ok(w_none());

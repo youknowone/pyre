@@ -193,6 +193,35 @@ pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), c
     Ok(())
 }
 
+/// The receiver check normally supplied by PyPy's
+/// `interp2app(W_ListObject.descr_*)` gateway.  CPython 3.14 exposes list's
+/// slot wrappers and ordinary methods as two descriptor kinds with distinct
+/// public mismatch messages, so callers identify which surface they expose.
+pub(crate) fn require_list_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method list.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'list' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_list(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!("descriptor '{name}' for 'list' objects doesn't apply to a '{received}' object")
+        } else {
+            format!("descriptor '{name}' requires a 'list' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.
@@ -215,12 +244,14 @@ pub(crate) fn require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), cr
 // All take self (list) as first arg.
 
 pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "append", true)?;
     arity_exact(args, "list.append", 1)?;
     unsafe { w_list_append(args[0], args[1]) };
     Ok(w_none())
 }
 
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "extend", true)?;
     arity_exact(args, "list.extend", 1)?;
     let list = args[0];
     let other = args[1];
@@ -277,6 +308,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
 pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "insert", true)?;
     arity_exact_unpack(args, "insert", 2)?;
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`; `get_positive_index` then clamps to `[0, len]`
@@ -290,7 +322,7 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// listobject.py:759-772 — empty list raises "pop from empty list",
 /// otherwise out-of-range raises "pop index out of range".
 pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "pop")?;
+    require_list_receiver(args, "pop", true)?;
     // `descr_pop` checks arity before touching the list, so `pop(1, 2)` on an
     // empty list reports the surplus argument rather than "pop from empty list".
     arity_at_most(args, "pop", 1)?;
@@ -319,14 +351,14 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// PyPy: listobject.py descr_clear — list.clear()
 pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "clear")?;
+    require_list_receiver(args, "clear", true)?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
     Ok(w_none())
 }
 
 /// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "copy")?;
+    require_list_receiver(args, "copy", true)?;
     let list = args[0];
     unsafe {
         let n = w_list_len(list);
@@ -342,14 +374,14 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: listobject.py descr_reverse — list.reverse()
 pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "reverse")?;
+    require_list_receiver(args, "reverse", true)?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
     Ok(w_none())
 }
 
 /// PyPy: listobject.py descr_sort — list.sort()
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "sort")?;
+    require_list_receiver(args, "sort", true)?;
     let list = args[0];
     // Keep the argument decoding shared with `sorted()` before changing the
     // receiver's visible storage.
@@ -420,6 +452,7 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// listobject.py:795 `descr_index` — list.index(value[, start[, stop]]).
 pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "index", true)?;
     arity_at_least(args, "index", 1)?;
     arity_at_most(args, "index", 3)?;
     let list = args[0];
@@ -461,6 +494,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:744 `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "count", true)?;
     arity_exact(args, "list.count", 1)?;
     let list = args[0];
     let value = args[1];
@@ -475,6 +509,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:782 `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_list_receiver(args, "remove", true)?;
     arity_exact(args, "list.remove", 1)?;
     crate::listobject::w_list_remove(args[0], args[1])?;
     Ok(w_none())

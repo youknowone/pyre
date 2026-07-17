@@ -2507,12 +2507,7 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let list = params.first().copied().unwrap_or(pyre_object::PY_NULL);
-    if list.is_null() || !unsafe { pyre_object::is_list(list) } {
-        return Err(crate::PyError::type_error(
-            "descriptor '__init__' requires a 'list' object",
-        ));
-    }
+    let list = crate::type_methods::require_list_receiver(params, "__init__", false)?;
     if crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
             "list() takes no keyword arguments",
@@ -3594,7 +3589,10 @@ fn init_list_type(ns: PyObjectRef) {
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
-                |args| Ok(w_str_new(&unsafe { crate::display::list_repr(args[0])? })),
+                |args| {
+                    let list = crate::type_methods::require_list_receiver(args, "__repr__", false)?;
+                    Ok(w_str_new(&unsafe { crate::display::list_repr(list)? }))
+                },
                 1,
             ),
         )
@@ -3607,12 +3605,14 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__sizeof__",
                 |args| {
+                    let list =
+                        crate::type_methods::require_list_receiver(args, "__sizeof__", true)?;
                     // CPython 3.14's PyListObject header is five machine
                     // words; the item array contributes one pointer per
                     // allocated slot. This is the version oracle where PyPy
                     // does not expose a list-specific descriptor.
                     let size = 5 * std::mem::size_of::<usize>()
-                        + unsafe { pyre_object::w_list_capacity(args[0]) }
+                        + unsafe { pyre_object::w_list_capacity(list) }
                             * std::mem::size_of::<PyObjectRef>();
                     Ok(w_int_new(size as i64))
                 },
@@ -3724,6 +3724,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__getitem__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__getitem__", true)?;
                     crate::type_methods::arity_exact(args, "list.__getitem__", 1)?;
                     crate::baseobjspace::getitem_slot(args[0], args[1])
                 },
@@ -3738,6 +3739,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__setitem__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__setitem__", false)?;
                     crate::type_methods::arity_exact_unpack(args, "__setitem__", 2)?;
                     crate::baseobjspace::setitem_slot(args[0], args[1], args[2])?;
                     Ok(pyre_object::w_none())
@@ -3753,6 +3755,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__delitem__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__delitem__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     crate::baseobjspace::delitem_slot(args[0], args[1])?;
                     Ok(pyre_object::w_none())
@@ -3768,6 +3771,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__len__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__len__", false)?;
                     crate::type_methods::arity_slot(args, 0)?;
                     crate::baseobjspace::len_slot(args[0])
                 },
@@ -3782,6 +3786,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__contains__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__contains__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     let found = crate::baseobjspace::contains_slot(args[0], args[1])?;
                     Ok(pyre_object::w_bool_from(found))
@@ -3800,10 +3805,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__iter__",
                 |args| {
-                    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if obj.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
+                    let obj = crate::type_methods::require_list_receiver(args, "__iter__", false)?;
                     crate::type_methods::arity_slot(args, 0)?;
                     Ok(pyre_object::w_list_iter_new(obj))
                 },
@@ -3821,8 +3823,9 @@ fn init_list_type(ns: PyObjectRef) {
                     // `listobject.py:737 descr_reversed` — a lazy reverse iterator
                     // over the list, the same `W_ReversedIterator` representation as
                     // `reversed(list)` (walks `getitem(seq, remaining)` downward).
+                    let obj =
+                        crate::type_methods::require_list_receiver(args, "__reversed__", true)?;
                     crate::type_methods::arity_no_args(args, "list.__reversed__")?;
-                    let obj = args[0];
                     let n = unsafe { pyre_object::w_list_len(obj) } as i64;
                     Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1))
                 },
@@ -3841,6 +3844,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__add__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__add__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     if unsafe { pyre_object::is_list(args[1]) } {
                         unsafe { crate::objspace::descroperation::list_concat(args[0], args[1]) }
@@ -3863,7 +3867,7 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", list_descr_mul, 2),
+            make_builtin_function_with_arity("__rmul__", list_descr_rmul, 2),
         )
     };
     unsafe {
@@ -3873,6 +3877,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__iadd__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__iadd__", false)?;
                     // Validate the slot arity before delegating so a bad call
                     // reports "expected 1 argument, got M" rather than the
                     // `extend` message surfaced by the shared implementation.
@@ -3891,6 +3896,7 @@ fn init_list_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__imul__",
                 |args| {
+                    crate::type_methods::require_list_receiver(args, "__imul__", false)?;
                     // listobject.py descr_inplace_mul: the count goes through
                     // `__index__`; a non-index operand becomes NotImplemented.
                     crate::type_methods::arity_slot(args, 1)?;
@@ -3962,6 +3968,15 @@ fn list_repeat_index(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::P
 /// `listobject.c:list_repeat` — `list * n` / `n * list`.  The count goes
 /// through `__index__`, so any object implementing it repeats the list.
 fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    list_descr_mul_impl(args, "__mul__")
+}
+
+fn list_descr_rmul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    list_descr_mul_impl(args, "__rmul__")
+}
+
+fn list_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_list_receiver(args, name, false)?;
     crate::type_methods::arity_slot(args, 1)?;
     let Some(w_count) = list_repeat_index(args[1])? else {
         return Ok(pyre_object::w_not_implemented());
@@ -12586,15 +12601,29 @@ cmp_dunder_set!(
     str_dunder_ge,
     cmp_guard_str
 );
-cmp_dunder_set!(
-    list_dunder_eq,
-    list_dunder_ne,
-    list_dunder_lt,
-    list_dunder_le,
-    list_dunder_gt,
-    list_dunder_ge,
-    cmp_guard_list
-);
+macro_rules! list_cmp_dunder {
+    ($function:ident, $name:literal, $op:ident) => {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::require_list_receiver(args, $name, false)?;
+            crate::type_methods::arity_slot(args, 1)?;
+            if cmp_guard_list(args[1]) {
+                crate::objspace::descroperation::compare_slot(
+                    args[0],
+                    args[1],
+                    crate::objspace::descroperation::CompareOp::$op,
+                )
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+list_cmp_dunder!(list_dunder_eq, "__eq__", Eq);
+list_cmp_dunder!(list_dunder_ne, "__ne__", Ne);
+list_cmp_dunder!(list_dunder_lt, "__lt__", Lt);
+list_cmp_dunder!(list_dunder_le, "__le__", Le);
+list_cmp_dunder!(list_dunder_gt, "__gt__", Gt);
+list_cmp_dunder!(list_dunder_ge, "__ge__", Ge);
 cmp_dunder_set!(
     tuple_dunder_eq,
     tuple_dunder_ne,
