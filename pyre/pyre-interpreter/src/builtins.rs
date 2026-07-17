@@ -8459,17 +8459,42 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
-    let strict = kwarg_get(kwargs, "strict")
-        .map(|v| crate::baseobjspace::is_true(v))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let strict_slot = kwarg_get(kwargs, "strict").map(|value| {
+        pyre_object::gc_roots::pin_root(value);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let strict = strict_slot
+        .map(|slot| {
+            crate::baseobjspace::is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+        })
         .transpose()?
         .unwrap_or(false);
     // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
-    let mut iters = Vec::with_capacity(args.len());
-    for &arg in args {
-        iters.push(crate::baseobjspace::iter(arg)?);
+    let mut iter_slots = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        let w_iter = crate::baseobjspace::iter(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(args_base + index)
+        })?;
+        pyre_object::gc_roots::pin_root(w_iter);
+        iter_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
     }
-    let w_iterators = pyre_object::w_list_new(iters);
-    Ok(pyre_object::functional::w_zip_new(w_iterators, strict))
+    let w_iterators = pyre_object::w_list_new(
+        iter_slots
+            .into_iter()
+            .map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+            .collect(),
+    );
+    pyre_object::gc_roots::pin_root(w_iterators);
+    let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    Ok(pyre_object::functional::w_zip_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
+        strict,
+    ))
 }
 
 /// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`

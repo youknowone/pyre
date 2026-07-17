@@ -2464,6 +2464,7 @@ unsafe fn pull_iterator_tuple(
     w_iterators: PyObjectRef,
     strict: bool,
     func_name: &str,
+    w_zip: Option<PyObjectRef>,
 ) -> Result<Option<Vec<PyObjectRef>>, PyError> {
     let n = pyre_object::w_list_len(w_iterators) as usize;
     if n == 0 {
@@ -2479,6 +2480,16 @@ unsafe fn pull_iterator_tuple(
     // later iterations dereference it again — a raw local would go stale.
     pyre_object::gc_roots::pin_root(w_iterators);
     let iters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let zip_slot = w_zip.map(|zip| {
+        pyre_object::gc_roots::pin_root(zip);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    if let Some(slot) = zip_slot {
+        pyre_object::functional::w_zip_set_iteration_progress(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            0,
+        );
+    }
     let base = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n {
         let it = pyre_object::w_list_getitem(
@@ -2487,15 +2498,30 @@ unsafe fn pull_iterator_tuple(
         )
         .unwrap();
         match next(it) {
-            Ok(v) => pyre_object::gc_roots::pin_root(v),
+            Ok(v) => {
+                pyre_object::gc_roots::pin_root(v);
+                if let Some(slot) = zip_slot {
+                    pyre_object::functional::w_zip_set_iteration_progress(
+                        pyre_object::gc_roots::shadow_stack_get(slot),
+                        i + 1,
+                    );
+                }
+            }
             Err(e) if e.kind == PyErrorKind::StopIteration => {
                 if !strict {
                     return Ok(None);
                 }
                 // A StopIteration in strict mode is a length mismatch.
                 // `i` iterators yielded before this one ran dry.
-                if i > 0 {
-                    return Err(strict_zip_error(func_name, i, "shorter"));
+                let iteration_progress = if let Some(slot) = zip_slot {
+                    pyre_object::functional::w_zip_get_iteration_progress(
+                        pyre_object::gc_roots::shadow_stack_get(slot),
+                    )
+                } else {
+                    i
+                };
+                if iteration_progress > 0 {
+                    return Err(strict_zip_error(func_name, iteration_progress, "shorter"));
                 }
                 if n == 1 {
                     // A single iterable can never mismatch.
@@ -2636,19 +2662,45 @@ pub(crate) fn map_next_method(args: &[PyObjectRef]) -> PyResult {
 /// `zip.__reduce__()` — `functional.py:1081-1087 W_Zip.descr_reduce`:
 /// `(zip, (*iterators))`, with a trailing `True` when `strict`.
 pub(crate) fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let self_ = zip_receiver(args, "__reduce__")?;
     unsafe {
-        let w_iterators = pyre_object::functional::w_zip_get_iterators(args[0]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_);
+        let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type = crate::typedef::r#type(self_).unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(self_type);
+        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_iterators = pyre_object::functional::w_zip_get_iterators(self_);
+        pyre_object::gc_roots::pin_root(w_iterators);
+        let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize);
         for i in 0..n {
-            state_items.push(pyre_object::w_list_getitem(w_iterators, i as i64).unwrap());
+            let w_iter = pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                i as i64,
+            )
+            .unwrap();
+            pyre_object::gc_roots::pin_root(w_iter);
+            state_items.push(w_iter);
         }
         let state = w_tuple_new(state_items);
-        let zip_fn = builtin_callable("zip");
-        if pyre_object::functional::w_zip_get_strict(args[0]) {
-            Ok(w_tuple_new(vec![zip_fn, state, w_bool_from(true)]))
+        pyre_object::gc_roots::pin_root(state);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        if pyre_object::functional::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
+            self_slot,
+        )) {
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                w_bool_from(true),
+            ]))
         } else {
-            Ok(w_tuple_new(vec![zip_fn, state]))
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(self_type_slot),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ]))
         }
     }
 }
@@ -2656,11 +2708,40 @@ pub(crate) fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `zip.__setstate__(strict)` — `functional.py:1089-1091
 /// W_Zip.descr_setstate`: `self.strict = bool(state)`.
 pub(crate) fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let strict = is_true(args[1])?;
+    let self_ = zip_receiver(args, "__setstate__")?;
+    let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let strict = is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
-        pyre_object::functional::w_zip_set_strict(args[0], strict);
+        pyre_object::functional::w_zip_set_strict(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            strict,
+        );
     }
     Ok(w_none())
+}
+
+fn zip_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if self_.is_null() || !unsafe { pyre_object::functional::is_zip(self_) } {
+        return Err(PyError::type_error(format!(
+            "descriptor '{name}' for 'zip' objects doesn't apply to a '{}' object",
+            object_functionstr_type_name(self_),
+        )));
+    }
+    Ok(self_)
+}
+
+pub(crate) fn zip_iter_method(args: &[PyObjectRef]) -> PyResult {
+    zip_receiver(args, "__iter__")
+}
+
+pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
+    next(zip_receiver(args, "__next__")?)
 }
 
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
@@ -10750,6 +10831,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 pyre_object::gc_roots::shadow_stack_get(iterators_slot),
                 strict,
                 "map",
+                None,
             )? {
                 Some(items) => {
                     let items_base = pyre_object::gc_roots::shadow_stack_len();
@@ -10776,10 +10858,26 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // mismatch).
         if pyre_object::functional::is_zip(obj) {
             use pyre_object::functional as zo;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_iterators = zo::w_zip_get_iterators(obj);
+            pyre_object::gc_roots::pin_root(w_iterators);
+            let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let strict = zo::w_zip_get_strict(obj);
-            return match pull_iterator_tuple(w_iterators, strict, "zip")? {
-                Some(items) => Ok(pyre_object::w_tuple_new(items)),
+            return match pull_iterator_tuple(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                strict,
+                "zip",
+                Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+            )? {
+                Some(items) => {
+                    for &item in &items {
+                        pyre_object::gc_roots::pin_root(item);
+                    }
+                    Ok(pyre_object::w_tuple_new(items))
+                }
                 None => Err(PyError::stop_iteration()),
             };
         }

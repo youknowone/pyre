@@ -252,6 +252,31 @@ assert iter(z) is z and next(z) == (1, 3)
 assert z.__reduce__()[0] is zip
 assert list(z) == [(2, 4)]
 
+
+class ZipSubclass(zip):
+    pass
+
+
+z = ZipSubclass([1], [2])
+assert z.__reduce__()[0] is ZipSubclass
+z.__setstate__([1])
+assert z.__reduce__()[2] is True
+z.__setstate__([])
+assert len(z.__reduce__()) == 2
+
+for name, call_args in [
+    ("__iter__", (42,)),
+    ("__next__", (42,)),
+    ("__reduce__", (42,)),
+    ("__setstate__", (42, True)),
+]:
+    try:
+        getattr(zip, name)(*call_args)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"zip.{name} must validate its receiver")
+
 try:
     list(zip([1], [2, 3], strict=True))
 except ValueError:

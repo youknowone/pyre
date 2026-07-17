@@ -403,6 +403,10 @@ pub struct W_Zip {
     pub w_iterators: PyObjectRef,
     /// `functional.py:1014 self.strict`; `descr_setstate` toggles it.
     pub strict: bool,
+    /// `functional.py:1017 self._iteration_progress` — number of iterators
+    /// already consumed in the current tuple, used by strict mismatch
+    /// reporting when a later iterator stops.
+    pub iteration_progress: usize,
 }
 
 /// Allocate a `W_Zip`.  `w_iterators` is a `list` of already-built
@@ -417,6 +421,7 @@ pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
         },
         w_iterators,
         strict,
+        iteration_progress: 0,
     })
 }
 
@@ -448,6 +453,22 @@ pub unsafe fn w_zip_set_strict(obj: PyObjectRef, value: bool) {
     unsafe {
         (*(obj as *mut W_Zip)).strict = value;
     }
+}
+
+/// # Safety
+/// `obj` must point to a valid `W_Zip`.
+#[inline]
+pub unsafe fn w_zip_set_iteration_progress(obj: PyObjectRef, value: usize) {
+    unsafe {
+        (*(obj as *mut W_Zip)).iteration_progress = value;
+    }
+}
+
+/// # Safety
+/// `obj` must point to a valid `W_Zip`.
+#[inline]
+pub unsafe fn w_zip_get_iteration_progress(obj: PyObjectRef) -> usize {
+    unsafe { (*(obj as *const W_Zip)).iteration_progress }
 }
 /// Machine-int range iterator object.
 ///
