@@ -3158,7 +3158,6 @@ fn recipe_parent_frame_from_recipe(
     recipe: &majit_metainterp::ReconstructRecipe,
     root_ec: *const pyre_interpreter::PyExecutionContext,
 ) -> Option<InlineParentFrame> {
-    let py_pc = crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize;
     let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return None;
@@ -3191,22 +3190,10 @@ fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(recipe.jitcode_index);
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
-    let result_color = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc);
-    if pcmap_recipe_resultcolor_audit_enabled() {
-        // `recipe.jitcode_pc` is the reconstructed frame's resolved RESUME
-        // coordinate. The trivia twin has the same marker/predecessor anchor
-        // tiers as that coordinate's inversion and includes its forward-trivia
-        // semantics, so it is the candidate native replacement for this read.
-        let twin = pjc
-            .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
-            .map(|color| color as usize)
-            .filter(|&color| color != u16::MAX as usize);
-        pcmap_recipe_resultcolor_audit_probe("recipe_parent_result_color", "fire");
-        pcmap_recipe_resultcolor_audit_probe(
-            "recipe_parent_result_color",
-            if twin == result_color { "eq" } else { "di" },
-        );
-    }
+    let result_color = pjc
+        .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
+        .map(|c| c as usize)
+        .filter(|&c| c != u16::MAX as usize);
 
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         recipe.jitcode_index,

@@ -5848,7 +5848,13 @@ fn reconstruct_inline_recipe(
         None
     };
     let pending_result_color = if in_a_call {
-        Some(result_color_at_pc_at(frame.jitcode_index, py_pc)?)
+        Some(
+            pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
+                p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
+                    .map(|c| c as usize)
+                    .filter(|&c| c != u16::MAX as usize)
+            })?,
+        )
     } else {
         None
     };
