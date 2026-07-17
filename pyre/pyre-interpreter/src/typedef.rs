@@ -18529,6 +18529,28 @@ fn descr_get_weakref(
 
 #[cfg(test)]
 mod tests {
+    /// Concurrent `init_typeobjects` callers must not observe the
+    /// post-registration patch passes mid-write: the libtest harness
+    /// calls it from many test threads, and an unsynchronized second
+    /// caller used to probe `object`'s type dict while the first was
+    /// still inserting `__class__` into it (IndexMap read/write race).
+    /// Only the first init in the process has the race window, so this
+    /// mainly guards the fix's `Once` barrier when scheduled early.
+    #[test]
+    fn init_typeobjects_races_no_corruption() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(crate::typedef::init_typeobjects))
+            .collect();
+        for t in threads {
+            t.join().expect("concurrent init_typeobjects must not panic");
+        }
+        // Also init on this thread: installs the thread-local hash hook the
+        // dict probe below needs, and exercises the already-initialized path.
+        crate::typedef::init_typeobjects();
+        let object_type = crate::typedef::w_object();
+        assert!(crate::type_dict_contains(object_type, "__class__"));
+    }
+
     #[test]
     fn test_ellipsis_has_registered_typeobject() {
         crate::typedef::init_typeobjects();
