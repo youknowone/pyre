@@ -29515,36 +29515,36 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        fbw_finish_payload_reset();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
             outcome,
             DispatchOutcome::Terminate,
-            "top-level walk must convert uncaught SubRaise to Terminate \
-             after recording the outermost FINISH",
+            "top-level walk must convert uncaught SubRaise to Terminate",
         );
         drop(wc);
+        // The bubbled exception is stashed as an `is_exception` finish payload,
+        // NOT recorded inline: `full_body_walk_trace`'s Terminate arm builds
+        // `TraceAction::Finish { exit_with_exception: true }` and the compile
+        // consumer records the single FINISH against
+        // `exit_frame_with_exception_descr`.  So no op is recorded in `walk()`.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "exactly one FINISH must be recorded",
+            ops_before,
+            "propagated SubRaise must NOT record an inline FINISH — the payload is deferred",
         );
-        let last = tc.ops().last().expect("FINISH must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
-        assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![arg_value],
-            "FINISH args must carry the bubbled exc OpRef",
-        );
-        let recorded_descr = last
-            .getdescr()
-            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
-            "FINISH descr must be exit_frame_with_exception_descr_ref",
+            fbw_finish_is_exception(),
+            "a top-level propagated SubRaise must mark the finish payload as an exception exit",
         );
+        let (finish_value, finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
+        assert_eq!(
+            finish_value, arg_value,
+            "the stashed payload must carry the bubbled exc OpRef",
+        );
+        let _ = &descr_exc;
     }
 
     #[test]
@@ -30686,20 +30686,34 @@ mod tests {
             live_after_jit_pc: usize::MAX,
         };
         // `raise/r` emits the GuardClass during dispatch, then surfaces
-        // `SubRaise`; `walk()`'s top-level SubRaise arm records the FINISH.
+        // `SubRaise`; the top-level SubRaise arm stashes the exception as a
+        // deferred `is_exception` finish payload.
         wc.outer_jitcode_index = test_outer_resume_jitcode_index();
         wc.outer_resume_marker_jit_pc = Some(0);
+        fbw_finish_payload_reset();
         let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         drop(wc);
 
-        // Expect two ops recorded: GuardClass(exc, cls_const) then
-        // Finish(exc) (the GUARD_CLASS precedes FINISH per
-        // `pyjitpl.py:1690-1696`).
+        // Only the GuardClass op lands inline: `raise/r` records it during
+        // dispatch (the GUARD_CLASS precedes the FINISH per
+        // `pyjitpl.py:1690-1696`), then the top-level SubRaise stashes the
+        // exception as an `is_exception` finish payload — the FINISH is
+        // recorded by the FBW Terminate arm's compile consumer, not inline.
         assert_eq!(
             tc.num_ops(),
-            ops_before + 2,
-            "raise/r with pinned concrete exc must record GuardClass + Finish",
+            ops_before + 1,
+            "raise/r with pinned concrete exc must record GuardClass (FINISH deferred)",
+        );
+        assert!(
+            fbw_finish_is_exception(),
+            "top-level raise/r must mark the finish payload as an exception exit",
+        );
+        let (finish_value, _finish_ty) =
+            fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        assert_eq!(
+            finish_value, exc_box,
+            "the stashed payload must carry the exception OpRef",
         );
         let ops = tc.ops();
         let guard = &ops[ops_before];
