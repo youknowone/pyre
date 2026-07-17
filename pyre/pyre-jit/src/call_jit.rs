@@ -2390,7 +2390,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// returning `false` to drop into blackhole resume.
 // dont_look_inside: bridge-compile identity machinery the tracer must not enter.
 #[majit_macros::dont_look_inside]
-fn bridge_source_identity_from_descr(
+pub(crate) fn bridge_source_identity_from_descr(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
 ) -> Option<(u64, u64, u32)> {
     let descr_fd = descr_arc.as_fail_descr()?;

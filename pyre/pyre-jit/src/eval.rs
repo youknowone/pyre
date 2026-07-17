@@ -5258,12 +5258,22 @@ fn handle_fail(
             };
             match resolution {
                 crate::call_jit::BridgeResolution::CompiledContinue => {
+                    if let Some((green_key, _, _)) =
+                        crate::call_jit::bridge_source_identity_from_descr(descr_arc)
+                    {
+                        register_quasi_immutable_deps(green_key);
+                    }
                     // compile.py:708: bridge compiled → ContinueRunningNormally.
                     // RPython: the bridge is attached to the guard descr;
                     // re-entering compiled code will follow the bridge.
                     return HandleFailOutcome::BridgeCompiled;
                 }
                 crate::call_jit::BridgeResolution::Finished(cv) => {
+                    if let Some((green_key, _, _)) =
+                        crate::call_jit::bridge_source_identity_from_descr(descr_arc)
+                    {
+                        register_quasi_immutable_deps(green_key);
+                    }
                     // #177: the walk ran the resumed frame forward to its
                     // return and captured the concrete result; hand it back
                     // as `DoneWithThisFrame` (`interpret()` raising it from
@@ -5277,6 +5287,11 @@ fn handle_fail(
                     return HandleFailOutcome::BridgeFinished(v);
                 }
                 crate::call_jit::BridgeResolution::FinishedException(cv) => {
+                    if let Some((green_key, _, _)) =
+                        crate::call_jit::bridge_source_identity_from_descr(descr_arc)
+                    {
+                        register_quasi_immutable_deps(green_key);
+                    }
                     return HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv));
                 }
                 crate::call_jit::BridgeResolution::ResumeBlackhole => {}

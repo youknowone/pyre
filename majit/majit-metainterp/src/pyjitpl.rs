@@ -3554,6 +3554,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn prepare_trace_start_runtime(&mut self) {
+        self.last_compiled_key = None;
         // pyjitpl.py:2884-2892 `compile_and_run_once` body, line-by-line:
         //   debug_start('jit-tracing')                  # OUTER open
         //   self.staticdata._setup_once()
@@ -10847,6 +10848,8 @@ impl<M: Clone> MetaInterp<M> {
                 // (could be a previous_tokens entry on cross-loop or
                 // post-recompile failures), not the current running loop's
                 // latest token.
+                self.last_quasi_immutable_deps =
+                    std::mem::take(&mut optimizer.quasi_immutable_deps);
                 self.record_loop_or_bridge(&source_jct, &mut optimized_ops, bridge_trace_id);
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
