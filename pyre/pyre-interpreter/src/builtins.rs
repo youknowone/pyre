@@ -6146,7 +6146,7 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
         }
     }
     Err(crate::PyError::type_error(format!(
-        "int() second argument must be an integer, not '{}'",
+        "'{}' object cannot be interpreted as an integer",
         unsafe { (*(*w_obj).ob_type).name }
     )))
 }
