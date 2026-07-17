@@ -313,6 +313,39 @@ pub(crate) fn require_frozenset_receiver(
     Ok(receiver)
 }
 
+/// The receiver check supplied by PyPy's
+/// `interp2app(W_SetIterObject.descr_*)` gateway.  Python 3.14 exposes
+/// `__iter__`/`__next__` as slot wrappers and the remaining operations as
+/// method descriptors.
+pub(crate) fn require_set_iterator_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method set_iterator.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'set_iterator' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe { pyre_object::is_set_iterator(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'set_iterator' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!(
+                "descriptor '{name}' requires a 'set_iterator' object but received a '{received}'"
+            )
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// Receiver-only arity for `str` methods that take no arguments (`isspace`,
 /// `lower`, …).  Rejects a missing receiver and any extra positional argument,
 /// matching `str.{name}() takes no arguments (N given)`.

@@ -20191,14 +20191,16 @@ fn init_frozenset_type(ns: PyObjectRef) {
 }
 
 fn set_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(args[0])
+    crate::type_methods::require_set_iterator_receiver(args, "__iter__", false)
 }
 
 fn set_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_iterator_receiver(args, "__next__", false)?;
     crate::baseobjspace::next(args[0])
 }
 
 fn set_iter_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_iterator_receiver(args, "__length_hint__", true)?;
     unsafe {
         let w_set = pyre_object::w_set_iter_get_set(args[0]);
         let startlen = pyre_object::w_set_iter_get_startlen(args[0]);
@@ -20213,6 +20215,7 @@ fn set_iter_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// setobject.py `W_SetIterObject.descr_reduce`: materialize only
 /// the clone's remaining entries, then return `(iter, (list,))`.
 fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_iterator_receiver(args, "__reduce__", true)?;
     unsafe {
         let w_set = pyre_object::w_set_iter_get_set(args[0]);
         let startlen = pyre_object::w_set_iter_get_startlen(args[0]);
