@@ -932,29 +932,8 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
         return false;
     }
     let payload = unsafe { &(*sym.jitcode).payload };
-    let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
     let result_reg = residual_ref_call_dst_before(payload.jitcode.code.as_slice(), root_pc)
         .or_else(|| {
-            if crate::jitcode_dispatch::result_color_audit_enabled() {
-                let py_pc =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc)
-                        as usize;
-                assert_eq!(
-                    payload.result_color_for_jitcode_pc_pred(root_pc),
-                    payload.metadata.result_color_at_pc.get(py_pc).copied(),
-                    "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
-                );
-                let root_py_pc =
-                    crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
-                assert_eq!(
-                    payload
-                        .result_color_trivia_for_jitcode_pc(root_pc)
-                        .map(|c| c as usize)
-                        .filter(|&c| c != u16::MAX as usize),
-                    crate::state::result_color_at_pc_at(jitcode_index, root_py_pc),
-                    "result_color trivia twin vs backxlat consumer diverges at jit_pc={root_pc}"
-                );
-            }
             payload
                 .result_color_trivia_for_jitcode_pc(root_pc)
                 .map(|c| c as usize)
