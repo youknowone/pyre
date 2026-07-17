@@ -13483,6 +13483,16 @@ impl<M: Clone> MetaInterp<M> {
             self.get_loop_token_arc(green_key)
         {
             std::sync::Arc::clone(arc)
+        } else if !self.backend.supports_tmp_callback_call_assembler() {
+            // A backend whose CALL_ASSEMBLER admission rejects tmp-callback
+            // bodies (wasm: the body reaches the portal runner through a host
+            // trampoline) resolves the pending token published at trace start
+            // instead; if none exists yet, abort rather than record an
+            // unadmittable tmp-callback target.
+            match self.get_pending_token_arc(green_key) {
+                Some(arc) => std::sync::Arc::clone(arc),
+                None => return (None, None),
+            }
         } else {
             // warmstate.py:714-723 — cell has no procedure_token yet, so
             // synthesise one via `compile_tmp_callback`. If the real loop is

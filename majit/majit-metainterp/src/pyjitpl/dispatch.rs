@@ -6047,9 +6047,12 @@ where
                 ctx.vrefs_after_residual_call();
                 // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
                 //    direct_assembler_call → history.record_nospec)
-                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
-                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
-                );
+                // A standalone runtime (or a token number not yet attached to
+                // warmstate) resolves to `None`; the concrete call already ran,
+                // so abort this trace rather than panic.
+                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+                    return TraceAction::Abort;
+                };
                 ctx.call_assembler_void_arc_typed(arc, &args, &arg_types);
                 // 6. vable_after_residual_call + GUARD_NOT_FORCED
                 //    (pyjitpl.py:2078-2079)
