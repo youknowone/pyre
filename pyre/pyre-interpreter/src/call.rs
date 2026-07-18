@@ -1035,6 +1035,9 @@ fn call_callable_with_mode(
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_callable_with_mode(frame, func, args, mode);
     }
+    if let Some(bound) = staticmethod_call_override(callable)? {
+        return call_callable_with_mode(frame, bound, args, mode);
+    }
     if let Some(bound) = classmethod_call_override(callable)? {
         return call_callable_with_mode(frame, bound, args, mode);
     }

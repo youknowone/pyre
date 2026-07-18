@@ -154,6 +154,7 @@ class CallingStaticMethod(staticmethod):
 
 
 calling_sub = CallingStaticMethod(wrapped)
+assert calling_sub(5) == ("override", (5,), {})
 assert calling_sub(5, b=6) == ("override", (5,), {"b": 6})
 
 alias = staticmethod[int]
