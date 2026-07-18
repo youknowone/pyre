@@ -28,27 +28,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::setattr_str(chain_fn, "from_iterable", from_iterable_fn)
         .expect("attach itertools.chain.from_iterable");
     crate::module_ns_store(ns, "chain", chain_fn);
-    // starmap(function, iterable) — PyPy: W_StarMap.  Calls
-    // `function(*args)` for each `args` tuple produced by the iterable.
+    // PyPy exports W_StarMap.typedef itself; its __new__ stores a live source
+    // iterator and next_w performs one expanded call at a time.
     crate::module_ns_store(
         ns,
         "starmap",
-        crate::make_builtin_function_with_arity(
-            "starmap",
-            |args| {
-                let func = args[0];
-                let items = crate::builtins::collect_iterable(args[1])?;
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    let call_args = crate::builtins::collect_iterable(item)?;
-                    out.push(crate::call::call_function_impl_result(func, &call_args)?);
-                }
-                let n = out.len();
-                let list = pyre_object::w_list_new(out);
-                Ok(pyre_object::w_seq_iter_new(list, n))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::STARMAP_TYPE)
+            .expect("itertools.starmap TypeDef initialized"),
     );
     // PyPy exposes W_Count.typedef / W_Repeat.typedef themselves from the
     // module, not function-shaped constructor shims.  Their `__new__` slots

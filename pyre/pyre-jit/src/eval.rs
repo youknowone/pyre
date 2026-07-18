@@ -2512,6 +2512,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::interp_itertools::W_Compress
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_StarMap (`itertools.starmap`) — AUTO-ID; the function and live
+    // source iterator are traced edges.  Append after every existing type so
+    // this new registration cannot renumber one.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_StarMap
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

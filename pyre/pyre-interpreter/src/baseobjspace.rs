@@ -3969,6 +3969,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
             || pyre_object::interp_itertools::is_compress(obj)
+            || pyre_object::interp_itertools::is_starmap(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10066,6 +10067,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
             || pyre_object::interp_itertools::is_compress(obj)
+            || pyre_object::interp_itertools::is_starmap(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10312,6 +10314,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
             || pyre_object::interp_itertools::is_compress(obj)
+            || pyre_object::interp_itertools::is_starmap(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10808,6 +10811,41 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(pyre_object::gc_roots::shadow_stack_get(item_slot));
                 }
             }
+        }
+        // itertools.starmap — interp_itertools.py W_StarMap.next_w:
+        // fetch one argument bundle and call `w_fun(*bundle)`.  Every edge is
+        // re-read from the rooted owner across calls that may move the heap.
+        if pyre_object::interp_itertools::is_starmap(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                as *const pyre_object::interp_itertools::W_StarMap))
+                .w_iterable;
+            pyre_object::gc_roots::pin_root(w_iterable);
+            let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_obj = next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+            pyre_object::gc_roots::pin_root(w_obj);
+            let obj_args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let call_args = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(obj_args_slot),
+            )?;
+            let first_arg_slot = pyre_object::gc_roots::shadow_stack_len();
+            for &arg in &call_args {
+                pyre_object::gc_roots::pin_root(arg);
+            }
+            let rooted_args: Vec<_> = (0..call_args.len())
+                .map(|index| pyre_object::gc_roots::shadow_stack_get(first_arg_slot + index))
+                .collect();
+            let w_fun = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                as *const pyre_object::interp_itertools::W_StarMap))
+                .w_fun;
+            pyre_object::gc_roots::pin_root(w_fun);
+            let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            return crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(fun_slot),
+                &rooted_args,
+            );
         }
         // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
         // (reverse=False): pull from the iterator until the predicate (or

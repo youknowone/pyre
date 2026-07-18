@@ -959,6 +959,15 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.starmap",
+                init_starmap_type,
+                object_type,
+                &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
         );
@@ -21304,6 +21313,50 @@ fn compress_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::next(obj)
 }
 
+fn starmap_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // interp_itertools.py W_StarMap___new__, kept in source order.
+    let exact = gettypefor(&pyre_object::interp_itertools::STARMAP_TYPE).unwrap_or(PY_NULL);
+    let (cls, w_fun, w_iterable) = itertools_twoarg_new(args, exact, "starmap")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_fun);
+    let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_iterable);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let iterator = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(iterable_slot)
+    })?;
+    let obj = pyre_object::interp_itertools::w_starmap_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(fun_slot) },
+        iterator,
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn starmap_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
+    singleton_receiver(
+        args,
+        "itertools.starmap",
+        "__iter__",
+        pyre_object::interp_itertools::is_starmap,
+    )
+}
+
+fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = singleton_receiver(
+        args,
+        "itertools.starmap",
+        "__next__",
+        pyre_object::interp_itertools::is_starmap,
+    )?;
+    crate::baseobjspace::next(obj)
+}
+
 fn init_takewhile_type(ns: PyObjectRef) {
     // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
     // entries between __next__ and __doc__).
@@ -21394,6 +21447,30 @@ fn init_compress_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return data elements corresponding to true selector elements.\n\nForms a shorter iterator from selected data elements using the selectors to\nchoose the data elements.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_starmap_type(ns: PyObjectRef) {
+    // interp_itertools.py W_StarMap.typedef, with Python 3.14's public doc.
+    let entries = [
+        ("__new__", make_new_descr(starmap_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", starmap_iter_self, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", starmap_iter_next, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return an iterator whose values are returned from the function evaluated with an argument tuple taken from the given sequence.",
             ),
         ),
     ];
