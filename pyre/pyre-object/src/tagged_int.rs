@@ -30,7 +30,7 @@ use crate::pyobject::PyObjectRef;
 /// point is to avoid putting `& 1` tag checks on every object — they are
 /// gated on this static, which is kept in lockstep with the GC
 /// `taggedpointers` config (`pyre-jit` `build_gc`).
-pub const CAN_BE_TAGGED: bool = true;
+pub const CAN_BE_TAGGED: bool = false;
 
 /// `value` fits the tagged immediate range, i.e. the payload survives
 /// `<< 1` within pointer width. Callers range-check with this before
