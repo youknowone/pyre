@@ -98,18 +98,9 @@ pub fn walk_pending_call_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // holds the only reference for its duration and does not re-borrow the
         // cell, so no borrow-flag conflict with a walker-triggered path.
         let opt = unsafe { &mut *slot.as_ptr() };
-        let Some(err) = opt.as_mut() else {
-            return;
-        };
-        let mut forward = |r: &mut PyObjectRef| {
-            if !r.is_null() {
-                // SAFETY: `PyObjectRef` and `GcRef` are layout-compatible.
-                unsafe { visitor(&mut *(r as *mut PyObjectRef as *mut majit_ir::GcRef)) };
-            }
-        };
-        forward(&mut err.exc_object);
-        forward(&mut err.w_name_context);
-        forward(&mut err.w_obj_context);
+        if let Some(err) = opt.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
     });
 }
 

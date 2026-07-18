@@ -2616,6 +2616,13 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_pyframe_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_jit_exc_value);
+    // Stored `PyError` carriers whose GC refs the precise collector cannot
+    // reach through their raw TLS cells: the call-assembler FFI stash and the
+    // no-handler trace→portal stash. Mirrors `walk_pending_call_error`.
+    majit_gc::shadow_stack::register_extra_root_walker(crate::call_jit::walk_last_ca_exception);
+    majit_gc::shadow_stack::register_extra_root_walker(
+        pyre_jit_trace::trace::walk_walk_end_propagated_exception,
+    );
 }
 
 fn register_thread_root_areas() {

@@ -902,6 +902,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // the free-threading root-area work, deferred with the rest of the EXC set.
     walk_bh_last_exception(visitor);
     crate::call::walk_pending_call_error(visitor);
+    crate::baseobjspace::walk_pending_hash_error(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor

@@ -114,6 +114,24 @@ pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
     LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
+/// Root the exception parked in `LAST_CA_EXCEPTION` across the call-assembler
+/// FFI boundary. Compiled code runs between `set_pending_ca_exception` and
+/// `take_ca_exception` — it can drive a major collection and can overwrite the
+/// single in-flight-exception cell with a later raise — so the parked
+/// `PyError`'s GC refs must be forwarded here or the stashed exception is swept
+/// before it surfaces. Never materialises the lazy-null `exc_object`.
+pub fn walk_last_ca_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    LAST_CA_EXCEPTION.with(|c| {
+        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
+        // holds the only reference for its duration and does not re-borrow the
+        // cell, so no borrow-flag conflict with a walker-triggered path.
+        let opt = unsafe { &mut *c.as_ptr() };
+        if let Some(err) = opt.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
+    });
+}
+
 /// Park a Python exception that needs to surface across an FFI boundary
 /// (callback emitted by compiled code → here → eventually picked up by
 /// `take_ca_exception` in the eval loop).

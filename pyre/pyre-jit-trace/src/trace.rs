@@ -68,6 +68,23 @@ pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError>
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
+/// Root the no-handler exception parked in `WALK_END_PROPAGATED_EXCEPTION`
+/// across the trace→portal boundary until `take_walk_end_propagated_exception`
+/// consumes it. The parked `PyError`'s GC refs are unreachable through the raw
+/// `RefCell`; forward them in place via `PyError::walk_gc_refs`. Never
+/// materialises the lazy-null `exc_object`.
+pub fn walk_walk_end_propagated_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| {
+        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
+        // holds the only reference for its duration and does not re-borrow the
+        // cell, so no borrow-flag conflict with a walker-triggered path.
+        let opt = unsafe { &mut *c.as_ptr() };
+        if let Some(err) = opt.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
+    });
+}
+
 pub fn take_walk_end_restart_pc() -> Option<usize> {
     WALK_END_RESTART_PC.with(|c| c.replace(None))
 }

@@ -364,6 +364,28 @@ pub struct PyError {
     pub w_obj_context: PyObjectRef,
 }
 
+impl PyError {
+    /// Forward the up-to-three GC-managed references a `PyError` holds — the
+    /// cached exception object and the lazy NameError/AttributeError name/obj
+    /// context — to a root-walk visitor. The precise collector does not reach
+    /// these through the Rust struct, so any `PyError` parked in a TLS slot
+    /// across a collection must be walked through here. Each non-null slot is
+    /// forwarded BY ADDRESS so the visitor relocates a moved child in place;
+    /// the lazy-null `exc_object` is never materialised. `PyErrorKind` carries
+    /// no object payload, so these three fields are the complete GC-ref set.
+    pub fn walk_gc_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        let mut forward = |r: &mut PyObjectRef| {
+            if !r.is_null() {
+                // SAFETY: `PyObjectRef` and `GcRef` are layout-compatible.
+                unsafe { visitor(&mut *(r as *mut PyObjectRef as *mut majit_ir::GcRef)) };
+            }
+        };
+        forward(&mut self.exc_object);
+        forward(&mut self.w_name_context);
+        forward(&mut self.w_obj_context);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PyErrorKind {
     TypeError,

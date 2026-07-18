@@ -52,6 +52,23 @@ pub fn take_pending_hash_error() -> PyError {
     })
 }
 
+/// Root the exception parked in `PENDING_HASH_ERROR` while a raising
+/// `__hash__`/`__eq__` propagates across a dict probe. Its `PyError` holds GC
+/// refs the precise collector does not reach through the raw `Cell`; forward
+/// them in place via [`PyError::walk_gc_refs`]. Never materialises the
+/// lazy-null `exc_object`.
+pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    PENDING_HASH_ERROR.with(|cell| {
+        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
+        // holds the only reference for its duration and does not re-borrow the
+        // cell, so no borrow-flag conflict with a walker-triggered path.
+        let opt = unsafe { &mut *cell.as_ptr() };
+        if let Some(err) = opt.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
+    });
+}
+
 /// Compatibility alias for PyPy's base-object type.
 /// PyPy frequently models interpreter values as subclasses of `W_Root`.
 pub type W_Root = PyObjectRef;
