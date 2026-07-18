@@ -2906,19 +2906,31 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
 
 #[inline(never)]
 unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let len = w_list_len(obj) as i64;
-    let (start, stop, step) = normalize_slice(index, len)?;
-    // listobject.py:709-714 wraps non-list iterables into a
-    // temporary W_ListObject so the strategy-aware setslice
-    // (`listobject.py:1746-1758`) and extended-slice
-    // (`listobject.py:descr_setitem` step != 1 branch) paths
-    // see a list operand.
-    let w_other = if pyre_object::is_list(value) {
+    // CPython 3.14 `list_ass_subscript_lock_held`: unpack the slice first,
+    // materialize the replacement next, and only then adjust the bounds
+    // against the list's live length. Materializing an arbitrary iterable may
+    // mutate `obj` (gh-120384), so using its earlier length is incorrect.
+    let (raw_start, raw_stop, step) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
+    // PyPy listobject.py:709-714 wraps non-list iterables into a temporary
+    // W_ListObject so the strategy-aware setslice path sees a list operand.
+    // CPython additionally protects `a[::-1] = a` with a shallow copy.
+    let w_other = if obj == value {
+        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec(
+            value,
+        ))
+    } else if pyre_object::is_list(value) {
         value
     } else {
         let items = crate::builtins::collect_iterable(value)?;
         pyre_object::listobject::w_list_new(items)
     };
+    let len = w_list_len(obj) as i64;
+    let (start, stop, step, slicelength) =
+        crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
     if step == 1 {
         let s_lo = start.max(0) as usize;
         // listobject.py passes `(start, step, slicelength)` to `setslice`;
@@ -2935,13 +2947,15 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     // W_ListObject.descr_setitem` enforces equal length
     // ("attempt to assign sequence of size %d to extended
     // slice of size %d") and writes positions in order.
-    let mut indices = Vec::new();
+    let mut indices = Vec::with_capacity(slicelength as usize);
     let mut i = start;
-    while (step > 0 && i < stop) || (step < 0 && i > stop) {
-        if i >= 0 && i < len {
-            indices.push(i);
+    for n in 0..slicelength {
+        indices.push(i);
+        // Do not compute an unused successor: `step` may have been clamped
+        // from an arbitrarily large Python integer to i64::MAX.
+        if n + 1 < slicelength {
+            i += step;
         }
-        i += step;
     }
     let other_len = pyre_object::w_list_len(w_other);
     if other_len != indices.len() {
@@ -13187,8 +13201,14 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
     unsafe {
         if is_list(obj) {
             if is_slice(index) {
+                let (raw_start, raw_stop, step) = crate::sliceobject::slice_unpack(
+                    w_slice_get_start(index),
+                    w_slice_get_stop(index),
+                    w_slice_get_step(index),
+                )?;
                 let len = w_list_len(obj) as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
+                let (start, stop, step, slicelength) =
+                    crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
                 if step == 1 {
                     w_list_delslice(obj, start.max(0) as usize, stop.max(start) as usize);
                     return Ok(());
@@ -13196,16 +13216,13 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 // Extended-slice delete: gather the selected indices, then
                 // pop them in descending order so earlier removals do not
                 // shift the positions of later targets.
-                let mut indices: Vec<i64> = Vec::new();
+                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
                 let mut i = start;
-                if step > 0 {
-                    while i < stop {
-                        indices.push(i);
-                        i += step;
-                    }
-                } else {
-                    while i > stop {
-                        indices.push(i);
+                for n in 0..slicelength {
+                    indices.push(i);
+                    // Like PyPy's range over the computed slice length, avoid
+                    // forming a successor after the final selected item.
+                    if n + 1 < slicelength {
                         i += step;
                     }
                 }

@@ -924,3 +924,39 @@ class ClearSelfList:
 list3 = [ClearSelfList()]
 list4 = [1]
 assert not list3 == list4
+
+
+same = list(range(4))
+same[::-1] = same
+assert same == [3, 2, 1, 0]
+
+
+class ClearAssignedList:
+    def __init__(self, target):
+        self.target = target
+
+    def __iter__(self):
+        yield from self.target
+        self.target.clear()
+
+
+assigned = list(range(5))
+try:
+    assigned[::-1] = ClearAssignedList(assigned)
+except ValueError:
+    pass
+else:
+    raise AssertionError("mutating extended-slice operand must raise ValueError")
+
+
+class ListSubclassWithNew(list):
+    def __new__(cls, seq, newarg=None):
+        self = super().__new__(cls, seq)
+        self.newarg = newarg
+        return self
+
+
+subclass_with_new = ListSubclassWithNew([1, 2], newarg=3)
+assert type(subclass_with_new) is ListSubclassWithNew
+assert subclass_with_new == [1, 2]
+assert subclass_with_new.newarg == 3

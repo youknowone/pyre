@@ -2604,7 +2604,22 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let list = crate::type_methods::require_list_receiver(params, "__init__", false)?;
-    if crate::builtins::has_real_kwargs(kwargs) {
+    // CPython 3.14 clinic/listobject.c.h `list___init__`: keywords are
+    // rejected for exact list and subclasses which inherit list.__new__, but
+    // ignored here when the subclass overrides __new__ (that override already
+    // received them through type.__call__).
+    let list_type = gettypeobject(&pyre_object::LIST_TYPE);
+    let instance_type = crate::typedef::r#type(list).unwrap_or(list_type);
+    let inherits_list_new = unsafe {
+        match (
+            crate::baseobjspace::lookup_in_type(instance_type, "__new__"),
+            crate::baseobjspace::lookup_in_type(list_type, "__new__"),
+        ) {
+            (Some(instance_new), Some(list_new)) => std::ptr::eq(instance_new, list_new),
+            _ => true,
+        }
+    };
+    if inherits_list_new && crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
             "list() takes no keyword arguments",
         ));
