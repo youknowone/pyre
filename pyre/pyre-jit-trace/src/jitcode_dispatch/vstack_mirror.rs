@@ -364,7 +364,10 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             if ctx.vstack_boxes.len() < new_depth {
                 ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
             }
-            if new_depth > 0 && ctx.vstack_last_ref != OpRef::NONE {
+            if new_depth > 0 {
+                // `NONE` means the result was produced in an unboxed bank;
+                // leave an intentional hole so the capture overlay around
+                // stack_sync omits the slot and resume rematerializes it.
                 ctx.vstack_boxes[new_depth - 1] = ctx.vstack_last_ref;
             }
         }
