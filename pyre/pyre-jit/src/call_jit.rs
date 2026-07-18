@@ -4264,6 +4264,25 @@ bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 /// execution context's top frame (`space.getexecutioncontext()
 /// .gettopframe()`), matching the upstream frame-less ABI.
 fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyObjectRef]) -> i64 {
+    // RPython's blackhole residual-call thunk is itself translated, so its
+    // incoming GCREF arguments are shadowstack roots for the whole helper
+    // call.  This Rust ABI boundary is outside that transform: the backend
+    // gcmap keeps the caller objects alive, but a moving collection cannot
+    // rewrite these copied native parameters.  Root them immediately and
+    // dispatch only values reloaded from the forwarded slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    pyre_object::gc_roots::pin_root(null_or_self);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let null_or_self = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let rooted_args: Vec<PyObjectRef> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
+        .collect();
+    let args = rooted_args.as_slice();
     // eval.rs:3216-3226 — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.

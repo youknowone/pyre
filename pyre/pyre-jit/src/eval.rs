@@ -391,6 +391,7 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         if pyre_object::gc_hook::try_gc_owns_object(gen_obj.frame_ptr) {
@@ -1805,20 +1806,6 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,
         );
     }
-    // The three dict-view iterator PyTypes (`W_BaseDictMultiIterObject`) are
-    // likewise `malloc_typed`-immortal and not `#[pyre_class]`, and (unlike the
-    // views) have no GC vtable registration site; register their `w_dict`
-    // back-pointer offset for the generic immortal-root walker directly.
-    for tp in [
-        &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE,
-        &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE,
-        &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE,
-    ] {
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            tp as *const _ as usize,
-            &pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS,
-        );
-    }
     // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
     // — fget/fset/fdel/doc/reqcls/name are W_Root references.
     // Pyre's `GetSetProperty` ports them as inline fields; the
@@ -2521,6 +2508,59 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::interp_itertools::W_StarMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // PyPy GeneratorOrCoroutine gives GeneratorIterator and Coroutine the
+    // same payload shape, but rclass requires distinct vtable hierarchy ids.
+    // Host allocation stamps coroutine payloads with W_GENERATOR_GC_TYPE_ID
+    // so the collector uses the shared layout/custom trace; this tail id is
+    // the independent vtable axis used by GUARD_CLASS/GUARD_SUBCLASS.
+    let coroutine_vtable_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::generator::GeneratorIterator>(),
+        object_tid,
+        generator_object_custom_trace,
+    ));
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::generator::COROUTINE_TYPE as *const _ as usize,
+        coroutine_vtable_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::generator::COROUTINE_TYPE as *const _ as usize,
+        coroutine_vtable_tid,
+    );
+    // generator.py CoroutineWrapper — the iterator returned by
+    // Coroutine.__await__, with one traced edge back to the coroutine.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::generator::CoroutineWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // dictmultiobject.py W_BaseDictMultiIterObject is a normal GC object.
+    // The six concrete Python types (forward + reversed × keys/values/items)
+    // share one payload layout and the traced `w_dict` edge, just as the
+    // W_DictMultiIter*Object subclasses do in PyPy.  Auto-register at the tail
+    // so no fixed frame/type ids shift.
+    let w_dict_view_iterator_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
+        object_tid,
+        pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS.to_vec(),
+    ));
+    pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_TYPE_ID.set(w_dict_view_iterator_tid);
+    for tp in [
+        &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE,
+        &pyre_object::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE,
+    ] {
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            w_dict_view_iterator_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_iterator_tid);
+    }
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges
@@ -3054,10 +3094,21 @@ unsafe fn pyre_object_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
+    let mut changed = 0usize;
     unsafe {
         pyre_object::gc_roots::walk_shadow_stack_area(data, |slot| {
+            let before = *slot;
             visit_pyobject_root(slot, visitor);
+            if *slot != before {
+                changed += 1;
+                if std::env::var_os("PYRE_ROOT_WALK_DIAG").is_some() {
+                    eprintln!("[pyre-object-root] {before:p} -> {:p}", *slot);
+                }
+            }
         });
+    }
+    if changed != 0 && std::env::var_os("PYRE_ROOT_WALK_DIAG").is_some() {
+        eprintln!("[pyre-object-roots] changed={changed}");
     }
 }
 

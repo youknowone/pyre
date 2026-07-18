@@ -4,8 +4,10 @@
 //! YIELD_VALUE (produces a value) or RETURN_VALUE (raises StopIteration).
 
 use crate::pyobject::*;
+use pyre_macros::pyre_class;
 
 pub static GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("generator");
+pub static COROUTINE_TYPE: PyType = crate::pyobject::new_pytype("coroutine");
 
 /// Generator object: holds a boxed frame that can be resumed.
 ///
@@ -30,6 +32,19 @@ pub struct GeneratorIterator {
     /// Per-generator writable `__qualname__` override. NULL means read the
     /// suspended frame code's original qualified name.
     pub qualname: PyObjectRef,
+    /// PyPy: `Coroutine.w_cr_origin`. Generators keep this at `PY_NULL`;
+    /// coroutines initialise it to `None` until origin tracking captures a
+    /// tuple of frame summaries.
+    pub cr_origin: PyObjectRef,
+    /// PyPy: `Coroutine._warned_unawaited`.
+    pub warned_unawaited: bool,
+}
+
+/// PyPy `generator.py CoroutineWrapper`: the iterator returned by
+/// `Coroutine.__await__`, holding the coroutine as its sole GC edge.
+#[pyre_class("coroutine_wrapper", static_name = "COROUTINE_WRAPPER")]
+pub struct CoroutineWrapper {
+    pub coroutine: PyObjectRef,
 }
 
 /// GC type id assigned to `GeneratorIterator` at JitDriver init time.
@@ -45,11 +60,19 @@ impl crate::lltype::GcType for GeneratorIterator {
     const SIZE: usize = W_GENERATOR_OBJECT_SIZE;
 }
 
-pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
+fn w_generator_or_coroutine_new(frame_ptr: *mut u8, coroutine: bool) -> PyObjectRef {
     let value = GeneratorIterator {
         ob: PyObject {
-            ob_type: &GENERATOR_TYPE as *const PyType,
-            w_class: get_instantiate(&GENERATOR_TYPE),
+            ob_type: if coroutine {
+                &COROUTINE_TYPE as *const PyType
+            } else {
+                &GENERATOR_TYPE as *const PyType
+            },
+            w_class: if coroutine {
+                get_instantiate(&COROUTINE_TYPE)
+            } else {
+                get_instantiate(&GENERATOR_TYPE)
+            },
         },
         frame_ptr,
         started: false,
@@ -57,6 +80,8 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
         running: false,
         name: PY_NULL,
         qualname: PY_NULL,
+        cr_origin: if coroutine { crate::w_none() } else { PY_NULL },
+        warned_unawaited: false,
     };
     // A generator must be GC-managed, not immortal `malloc_typed`: the
     // collector never reaches an immortal object, so the registered
@@ -82,9 +107,49 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
 
+pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
+    w_generator_or_coroutine_new(frame_ptr, false)
+}
+
+pub fn w_coroutine_new(frame_ptr: *mut u8) -> PyObjectRef {
+    w_generator_or_coroutine_new(frame_ptr, true)
+}
+
+pub fn w_coroutine_wrapper_new(coroutine: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(coroutine);
+    CoroutineWrapper::allocate(CoroutineWrapper {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        coroutine,
+    })
+}
+
 #[inline]
 pub unsafe fn is_generator(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &GENERATOR_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_coroutine(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COROUTINE_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_generator_or_coroutine(obj: PyObjectRef) -> bool {
+    unsafe { is_generator(obj) || is_coroutine(obj) }
+}
+
+#[inline]
+pub unsafe fn is_coroutine_wrapper(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COROUTINE_WRAPPER_TYPE) }
+}
+
+#[inline]
+pub unsafe fn w_coroutine_wrapper_get_coroutine(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const CoroutineWrapper)).coroutine }
 }
 
 pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
@@ -141,6 +206,11 @@ pub unsafe fn w_generator_get_qualname(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_generator_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).qualname = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_coroutine_get_origin(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).cr_origin }
 }
 
 #[cfg(test)]

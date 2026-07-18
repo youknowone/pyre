@@ -3078,21 +3078,12 @@ impl ExtendedShortPreambleBuilder {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        let inputargs = if self.label_args.is_empty() {
-            &self.short_inputargs
-        } else {
-            &self.label_args
-        };
-        let mut sp = build_short_preamble_struct_from_ops(
-            inputargs,
+        build_short_preamble_struct_from_ops(
+            &self.short_inputargs,
             &ops,
             &self.used_boxes,
             &self.short_jump_args,
-        );
-        if inputargs != self.short_inputargs.as_slice() {
-            sp.phase1_inputargs = Some(self.short_inputargs.clone());
-        }
-        sp
+        )
     }
 
     pub fn extra_same_as(&self) -> &[Op] {

@@ -2913,7 +2913,7 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
         // value, not the marker, so it must not be stripped.
         let is_marker = unsafe {
             is_dict(last)
-                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
                     .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
         };
         if is_marker {
@@ -6654,7 +6654,13 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 }
 
 pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let it = crate::baseobjspace::iter(obj)?;
+    // `iter(obj)` itself can execute arbitrary allocating Python code.  Root
+    // the input before that first collection point, matching the root that
+    // RPython's shadowstack transform emits around `space.iter`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
     // Each `next` runs arbitrary allocating code (a generator body, a JIT
     // callee that boxes a fresh int) which can trigger a moving minor
     // collection. A raw `Vec<PyObjectRef>` on the malloc heap is invisible to
@@ -6664,9 +6670,17 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
     // then read the forwarded slots back out — the manual equivalent of the
     // translator's shadowstack save/restore around a collecting call
     // (framework.py:853-856).
-    let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(it);
+    // Dict-view iterators are currently off-GC RPython-style carriers.  Their
+    // registered raw-field walker covers frame/value-stack reachability, but
+    // this helper keeps the iterator on the shadow stack directly; retain its
+    // source dict explicitly for the duration of the native loop.
+    if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(it) } {
+        let w_dict = unsafe { pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(it) };
+        pyre_object::gc_roots::pin_root(w_dict);
+    }
+    let item_base = pyre_object::gc_roots::shadow_stack_len();
     let mut count = 0usize;
     loop {
         // The iterator may itself have moved during a prior `next`; reload it
@@ -6681,10 +6695,10 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
             Err(e) => return Err(e),
         }
     }
-    // Read the forwarded element slots back out. The elements sit at
-    // `base + 1 ..= base + count` (the iterator occupies `base`).
+    // Read the forwarded element slots back out. `item_base` follows the
+    // iterator and any carrier-specific backing roots above.
     let items = (0..count)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + 1 + i))
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(item_base + i))
         .collect();
     Ok(items)
 }

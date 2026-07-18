@@ -425,6 +425,21 @@ impl pyre_interpreter::TruthOpcodeHandler for crate::state::MIFrame {
 }
 
 impl pyre_interpreter::IterOpcodeHandler for crate::state::MIFrame {
+    fn iter_value(
+        &mut self,
+        iterable: Self::Value,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = iterable.concrete.to_pyobj();
+        let concrete_iterator = if concrete.is_null() {
+            crate::state::ConcreteValue::Null
+        } else {
+            crate::state::ConcreteValue::from_pyobj(pyre_interpreter::baseobjspace::iter(concrete)?)
+        };
+        let opref = self.trace_get_iter(iterable.opref)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete_iterator))
+    }
+
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), pyre_interpreter::PyError> {
         self.with_ctx(|this, ctx| {
             crate::state::MIFrame::guard_range_iter(this, ctx, iter.opref);

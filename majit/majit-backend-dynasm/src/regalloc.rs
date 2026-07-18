@@ -4954,6 +4954,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             0
         })));
+        let mut force_store_refs = Vec::new();
         for (arg_index, arg) in op.getarglist().iter().enumerate() {
             let arg = arg.to_opref();
             let tp = if arg_index >= first_arg_index {
@@ -4962,6 +4963,14 @@ impl<'a> RegAlloc<'a> {
                 self.tp(arg)
             };
             arglocs.push(self.loc(arg, tp));
+            // callbuilder.py keeps every GC argument alive for the duration
+            // of a collecting call, even when this call is its last SSA use.
+            // Without force_store, before_call's `max_age <= position` arm
+            // drops that binding and get_gcmap omits it; a temporary such as
+            // `Counter(dict(generator))` can then be swept inside the callee.
+            if tp == Type::Ref && !arg.is_constant() {
+                force_store_refs.push(arg);
+            }
         }
 
         // aarch64/regalloc.py:622-628 — then _call → before_call → after_call.
@@ -4979,7 +4988,7 @@ impl<'a> RegAlloc<'a> {
             &self.op_pos,
         );
         self.rm.before_call(
-            &[],
+            &force_store_refs,
             save_regs,
             &mut self.longevity,
             &mut self.fm,
@@ -5055,6 +5064,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             0
         })));
+        let mut force_store_refs = Vec::new();
         for (arg_index, &arg) in args.iter().enumerate() {
             let tp = if arg_index >= first_arg_index {
                 calldescr.arg_types()[arg_index - first_arg_index]
@@ -5062,6 +5072,9 @@ impl<'a> RegAlloc<'a> {
                 self.tp(arg)
             };
             arglocs.push(self.loc(arg, tp));
+            if tp == Type::Ref && !arg.is_constant() {
+                force_store_refs.push(arg);
+            }
         }
 
         let can_collect = calldescr.get_extra_info().check_can_collect();
@@ -5079,7 +5092,7 @@ impl<'a> RegAlloc<'a> {
             &self.op_pos,
         );
         self.rm.before_call(
-            &[],
+            &force_store_refs,
             save_regs,
             &mut self.longevity,
             &mut self.fm,

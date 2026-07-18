@@ -967,14 +967,14 @@ pub(crate) unsafe fn get_and_call_function(
     crate::call::call_function_impl_result(w_impl, args_w)
 }
 
-/// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from
-/// `generator.py:569`, collapsed onto pyre's single generator object: an
-/// `async def` coroutine and a `@types.coroutine`-marked generator both carry
-/// their marker on the suspended frame's code (`CO_COROUTINE` /
-/// `CO_ITERABLE_COROUTINE`), so the distinct PyPy `Coroutine` class becomes a
-/// code-flag test here.
+/// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy
+/// `generator.py`.  Only a GeneratorIterator may use the
+/// `CO_ITERABLE_COROUTINE` marker; native coroutines have their own type.
 fn is_coroutine(w_obj: PyObjectRef) -> bool {
     unsafe {
+        if pyre_object::generator::is_coroutine(w_obj) {
+            return true;
+        }
         if !pyre_object::generator::is_generator(w_obj) {
             return false;
         }
@@ -988,7 +988,7 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
         (*frame_ptr)
             .code()
             .flags
-            .intersects(crate::CodeFlags::COROUTINE | crate::CodeFlags::ITERABLE_COROUTINE)
+            .contains(crate::CodeFlags::ITERABLE_COROUTINE)
     }
 }
 
@@ -996,20 +996,7 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
 /// `@types.coroutine`-wrapped generators (`CO_ITERABLE_COROUTINE`).  Mirrors
 /// `PyCoro_CheckExact`, which gates the GET_AWAITABLE already-awaited guard.
 fn is_native_coroutine(w_obj: PyObjectRef) -> bool {
-    unsafe {
-        if !pyre_object::generator::is_generator(w_obj) {
-            return false;
-        }
-        let frame_ptr =
-            pyre_object::generator::w_generator_get_frame(w_obj) as *const crate::pyframe::PyFrame;
-        if frame_ptr.is_null() {
-            return false;
-        }
-        (*frame_ptr)
-            .code()
-            .flags
-            .contains(crate::CodeFlags::COROUTINE)
-    }
+    unsafe { pyre_object::generator::is_coroutine(w_obj) }
 }
 
 /// `generator.py:563 get_awaitable_iter` — return the iterator implementing the
@@ -11477,7 +11464,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
         }
     }
-    Err(PyError::type_error("not an iterator"))
+    Err(PyError::type_error(format!(
+        "'{}' object is not an iterator",
+        unsafe { obj_type_name(obj) }
+    )))
 }
 
 /// `descriptor.py:256-273 W_Property._copy` — clone the property with
@@ -11806,7 +11796,13 @@ fn resume_yield_from(
             return Err(err);
         }
         Some(err) => throw_yield_from(w_yf, err, throw_args),
-        None if unsafe { pyre_object::is_none(w_arg) } => next(w_yf),
+        None if unsafe { pyre_object::is_none(w_arg) } => {
+            if unsafe { pyre_object::generator::is_generator_or_coroutine(w_yf) } {
+                generator_send_ex(w_yf, w_none(), None, None)
+            } else {
+                next(w_yf)
+            }
+        }
         None => {
             let send = getattr_str(w_yf, "send")?;
             crate::call::call_function_impl_result(send, &[w_arg])
@@ -11835,7 +11831,7 @@ fn throw_yield_from(
     throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> PyResult {
     unsafe {
-        if pyre_object::generator::is_generator(w_yf) {
+        if pyre_object::generator::is_generator_or_coroutine(w_yf) {
             return generator_send_ex(w_yf, w_none(), Some(err), throw_args);
         }
     }
@@ -11858,7 +11854,7 @@ fn throw_yield_from(
 /// in the same resume path so nested delegation unwinds one frame at a time.
 fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
     unsafe {
-        if pyre_object::generator::is_generator(w_yf) {
+        if pyre_object::generator::is_generator_or_coroutine(w_yf) {
             let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
             return match generator_send_ex(w_yf, w_none(), Some(exit), None) {
                 Ok(_) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
@@ -12171,6 +12167,41 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         }
         Err(e) => Err(e),
     }
+}
+
+/// PyPy `Coroutine.descr__await__`: return a distinct iterator wrapper rather
+/// than making the coroutine object itself iterable.
+pub(crate) fn coroutine_await_method(args: &[PyObjectRef]) -> PyResult {
+    let coroutine = args.first().copied().unwrap_or(PY_NULL);
+    Ok(pyre_object::generator::w_coroutine_wrapper_new(coroutine))
+}
+
+pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
+    let wrapper = args.first().copied().unwrap_or(PY_NULL);
+    let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
+    generator_send_ex(coroutine, w_none(), None, None)
+}
+
+pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
+    let wrapper = args.first().copied().unwrap_or(PY_NULL);
+    let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
+    let value = args.get(1).copied().unwrap_or_else(w_none);
+    generator_send_ex(coroutine, value, None, None)
+}
+
+pub(crate) fn coroutine_wrapper_throw_method(args: &[PyObjectRef]) -> PyResult {
+    let wrapper = args.first().copied().unwrap_or(PY_NULL);
+    let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
+    let mut forwarded = Vec::with_capacity(args.len());
+    forwarded.push(coroutine);
+    forwarded.extend_from_slice(args.get(1..).unwrap_or(&[]));
+    generator_throw_method(&forwarded)
+}
+
+pub(crate) fn coroutine_wrapper_close_method(args: &[PyObjectRef]) -> PyResult {
+    let wrapper = args.first().copied().unwrap_or(PY_NULL);
+    let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
+    generator_close_method(&[coroutine])
 }
 
 /// generator.py:302 `_finalize_` — called by the GC finalizer when a suspended generator

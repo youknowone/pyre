@@ -3014,8 +3014,12 @@ pub struct W_BaseDictMultiIterObject {
 pub const DICT_VIEW_ITER_W_DICT_OFFSET: usize =
     std::mem::offset_of!(W_BaseDictMultiIterObject, w_dict);
 
-/// GC type id — next free slot after enumerate (=41).
-pub const W_DICT_VIEW_ITERATOR_GC_TYPE_ID: u32 = 42;
+/// Runtime-assigned GC type id shared by the three concrete iterator types.
+/// PyPy's `W_BaseDictMultiIterObject` is a GC object whose `w_dict` edge is
+/// traced.  Keep this auto-numbered because the fixed registration chain has
+/// grown past the historical slot 42.
+pub static W_DICT_VIEW_ITERATOR_GC_TYPE_ID: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 pub const W_DICT_VIEW_ITERATOR_OBJECT_SIZE: usize =
     std::mem::size_of::<W_BaseDictMultiIterObject>();
 
@@ -3023,7 +3027,7 @@ pub const W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS: [usize; 1] = [DICT_VIEW_ITER_W_DI
 
 impl crate::lltype::GcType for W_BaseDictMultiIterObject {
     fn type_id() -> u32 {
-        W_DICT_VIEW_ITERATOR_GC_TYPE_ID
+        W_DICT_VIEW_ITERATOR_GC_TYPE_ID.get()
     }
     const SIZE: usize = W_DICT_VIEW_ITERATOR_OBJECT_SIZE;
 }
@@ -3063,21 +3067,36 @@ fn w_dict_view_iterator_new_direction(
     kind: DictViewKind,
     reverse: bool,
 ) -> PyObjectRef {
-    let startlen = unsafe { w_dict_len(w_dict) };
-    let start_strategy_id = unsafe { w_dict_strategy_id(w_dict) };
     let tp = dict_view_iterator_type_for_kind(kind, reverse);
-    crate::lltype::malloc_typed(W_BaseDictMultiIterObject {
+    let _roots = crate::gc_roots::push_roots();
+    let dict_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_dict);
+    let startlen = unsafe { w_dict_len(crate::gc_roots::shadow_stack_get(dict_slot)) };
+    let start_strategy_id =
+        unsafe { w_dict_strategy_id(crate::gc_roots::shadow_stack_get(dict_slot)) };
+    let value = W_BaseDictMultiIterObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
             w_class: get_instantiate(tp),
         },
-        w_dict,
+        w_dict: crate::gc_roots::shadow_stack_get(dict_slot),
         startlen,
         index: 0,
         kind,
         reverse,
         start_strategy_id,
-    }) as PyObjectRef
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_DICT_VIEW_ITERATOR_GC_TYPE_ID.get(),
+        W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
+    );
+    if raw.is_null() {
+        crate::lltype::malloc_typed(value) as PyObjectRef
+    } else {
+        unsafe { std::ptr::write(raw as *mut W_BaseDictMultiIterObject, value) };
+        crate::gc_hook::try_gc_write_barrier(raw);
+        raw as PyObjectRef
+    }
 }
 
 /// # Safety
@@ -3205,14 +3224,26 @@ pub fn dict_view_type_for_kind(kind: DictViewKind) -> &'static PyType {
 /// Allocate a fresh dict view bound to `w_dict`.
 pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
     let tp = dict_view_type_for_kind(kind);
-    crate::lltype::malloc_typed(W_DictViewObject {
+    let _roots = crate::gc_roots::push_roots();
+    let dict_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_dict);
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
+    let value = W_DictViewObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
             w_class: get_instantiate(tp),
         },
         kind,
-        w_dict,
-    }) as PyObjectRef
+        w_dict: crate::gc_roots::shadow_stack_get(dict_slot),
+    };
+    if raw.is_null() {
+        crate::lltype::malloc_typed(value) as PyObjectRef
+    } else {
+        unsafe { std::ptr::write(raw as *mut W_DictViewObject, value) };
+        crate::gc_hook::try_gc_write_barrier(raw);
+        raw as PyObjectRef
+    }
 }
 
 /// Test whether `obj` is any of the three view types.

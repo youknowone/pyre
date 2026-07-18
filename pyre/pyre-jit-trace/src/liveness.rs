@@ -543,7 +543,7 @@ fn propagate_defined(
     }
 }
 
-fn stack_effects(
+pub(crate) fn stack_effects(
     instr: &pyre_interpreter::bytecode::Instruction,
     op_arg: pyre_interpreter::OpArg,
     depth: usize,

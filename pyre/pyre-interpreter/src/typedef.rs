@@ -758,6 +758,30 @@ pub fn init_typeobjects() {
             &pyre_object::generator::GENERATOR_TYPE as *const PyType as usize,
             generator_type as usize,
         );
+        let coroutine_type =
+            new_typeobject_with_base("coroutine", init_coroutine_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(coroutine_type);
+            pyre_object::w_type_set_acceptable_as_base_class(coroutine_type, false);
+            pyre_object::w_type_set_weakrefable(coroutine_type, true);
+        }
+        reg.insert(
+            &pyre_object::generator::COROUTINE_TYPE as *const PyType as usize,
+            coroutine_type as usize,
+        );
+        let coroutine_wrapper_type = new_typeobject_with_base(
+            "coroutine_wrapper",
+            init_coroutine_wrapper_type,
+            object_type,
+        );
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(coroutine_wrapper_type);
+            pyre_object::w_type_set_acceptable_as_base_class(coroutine_wrapper_type, false);
+        }
+        reg.insert(
+            &pyre_object::generator::COROUTINE_WRAPPER_TYPE as *const PyType as usize,
+            coroutine_wrapper_type as usize,
+        );
         let range_iterator_type =
             new_typeobject_with_base("range_iterator", init_range_iterator_type, object_type);
         unsafe {
@@ -3531,7 +3555,17 @@ fn set_init_from_iterable(
         unsafe { pyre_object::w_set_copy_storage_from(w_set, w_iterable) };
         return Ok(());
     }
+    // RPython's shadowstack transformation keeps `self` live across
+    // `space.listview(w_iterable)`.  `collect_iterable` can execute a long
+    // generator and trigger a major collection, so mirror that generated
+    // root explicitly: the set body is non-moving old-gen storage, but it
+    // must still be marked live instead of being swept while Rust holds the
+    // only reference.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_set);
     let items = crate::builtins::collect_iterable(w_iterable)?;
+    let w_set = pyre_object::gc_roots::shadow_stack_get(sp);
     crate::builtins::builtin_set_add_items(w_set, &items)
 }
 
@@ -20595,6 +20629,15 @@ fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     )))
 }
 
+fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let name = generator_name_value(args[0], true)?;
+    Ok(w_str_new(&format!(
+        "<coroutine object {} at {:p}>",
+        unsafe { pyre_object::w_str_get_value(name) },
+        args[0]
+    )))
+}
+
 fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     let override_value = unsafe {
         if qualname {
@@ -20618,10 +20661,20 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     }))
 }
 
-fn generator_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
+fn generator_getter_for(args: &[PyObjectRef], field: usize, coroutine: bool) -> crate::PyResult {
     let obj = args.get(1).copied().unwrap_or(PY_NULL);
-    if !unsafe { pyre_object::generator::is_generator(obj) } {
-        return Err(crate::PyError::type_error("descriptor is for 'generator'"));
+    let matches = unsafe {
+        if coroutine {
+            pyre_object::generator::is_coroutine(obj)
+        } else {
+            pyre_object::generator::is_generator(obj)
+        }
+    };
+    if !matches {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor is for '{}'",
+            if coroutine { "coroutine" } else { "generator" }
+        )));
     }
     let frame = generator_frame(obj);
     Ok(match field {
@@ -20662,6 +20715,14 @@ fn generator_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
     })
 }
 
+fn generator_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
+    generator_getter_for(args, field, false)
+}
+
+fn coroutine_getter(args: &[PyObjectRef], field: usize) -> crate::PyResult {
+    generator_getter_for(args, field, true)
+}
+
 fn generator_get_running(args: &[PyObjectRef]) -> crate::PyResult {
     generator_getter(args, 0)
 }
@@ -20683,10 +20744,55 @@ fn generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 fn generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_getter(args, 6)
 }
+fn coroutine_get_running(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 0)
+}
+fn coroutine_get_suspended(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 1)
+}
+fn coroutine_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 2)
+}
+fn coroutine_get_code(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 3)
+}
+fn coroutine_get_await(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 4)
+}
+fn coroutine_get_origin(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args.get(1).copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::generator::is_coroutine(obj) } {
+        return Err(crate::PyError::type_error("descriptor is for 'coroutine'"));
+    }
+    Ok(unsafe { pyre_object::generator::w_coroutine_get_origin(obj) })
+}
+fn coroutine_get_name(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 5)
+}
+fn coroutine_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 6)
+}
 
-fn generator_set_name_common(args: &[PyObjectRef], qualname: bool) -> crate::PyResult {
+fn generator_set_name_common(
+    args: &[PyObjectRef],
+    qualname: bool,
+    coroutine: bool,
+) -> crate::PyResult {
     let obj = args[1];
     let value = args[2];
+    let matches = unsafe {
+        if coroutine {
+            pyre_object::generator::is_coroutine(obj)
+        } else {
+            pyre_object::generator::is_generator(obj)
+        }
+    };
+    if !matches {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor is for '{}'",
+            if coroutine { "coroutine" } else { "generator" }
+        )));
+    }
     if !unsafe { pyre_object::is_str(value) } {
         return Err(crate::PyError::type_error(format!(
             "__{}__ must be set to a string object",
@@ -20704,10 +20810,16 @@ fn generator_set_name_common(args: &[PyObjectRef], qualname: bool) -> crate::PyR
 }
 
 fn generator_set_name(args: &[PyObjectRef]) -> crate::PyResult {
-    generator_set_name_common(args, false)
+    generator_set_name_common(args, false, false)
 }
 fn generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
-    generator_set_name_common(args, true)
+    generator_set_name_common(args, true, false)
+}
+fn coroutine_set_name(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_set_name_common(args, false, true)
+}
+fn coroutine_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_set_name_common(args, true, true)
 }
 
 fn generator_descr_sizeof(_args: &[PyObjectRef]) -> crate::PyResult {
@@ -20792,6 +20904,117 @@ fn init_generator_type(ns: PyObjectRef) {
                 make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
             )
         };
+    }
+}
+
+/// PyPy `generator.py Coroutine.typedef`.
+fn init_coroutine_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+    for (name, function, arity) in [
+        ("__repr__", coroutine_descr_repr as DunderFn, 1),
+        ("send", crate::baseobjspace::generator_send_method, 2),
+        ("close", crate::baseobjspace::generator_close_method, 1),
+        ("__await__", crate::baseobjspace::coroutine_await_method, 1),
+        ("__del__", crate::baseobjspace::generator_close_method, 1),
+        ("__sizeof__", generator_descr_sizeof, 1),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "throw",
+            make_builtin_function("throw", crate::baseobjspace::generator_throw_method),
+        );
+    }
+    for (name, getter) in [
+        ("cr_running", coroutine_get_running as DunderFn),
+        ("cr_suspended", coroutine_get_suspended as DunderFn),
+        ("cr_frame", coroutine_get_frame as DunderFn),
+        ("cr_code", coroutine_get_code as DunderFn),
+        ("cr_await", coroutine_get_await as DunderFn),
+        ("cr_origin", coroutine_get_origin as DunderFn),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    name,
+                ),
+            )
+        };
+    }
+    for (name, getter, setter) in [
+        (
+            "__name__",
+            coroutine_get_name as DunderFn,
+            coroutine_set_name as DunderFn,
+        ),
+        (
+            "__qualname__",
+            coroutine_get_qualname as DunderFn,
+            coroutine_set_qualname as DunderFn,
+        ),
+    ] {
+        let get = make_builtin_function_with_arity(name, getter, 2);
+        let set = make_builtin_function_with_arity(name, setter, 3);
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
+            )
+        };
+    }
+}
+
+/// PyPy `generator.py CoroutineWrapper.typedef`.
+fn init_coroutine_wrapper_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+    for (name, function, arity) in [
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as DunderFn,
+            1,
+        ),
+        (
+            "__next__",
+            crate::baseobjspace::coroutine_wrapper_next_method,
+            1,
+        ),
+        (
+            "send",
+            crate::baseobjspace::coroutine_wrapper_send_method,
+            2,
+        ),
+        (
+            "close",
+            crate::baseobjspace::coroutine_wrapper_close_method,
+            1,
+        ),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, arity),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "throw",
+            make_builtin_function("throw", crate::baseobjspace::coroutine_wrapper_throw_method),
+        );
     }
 }
 

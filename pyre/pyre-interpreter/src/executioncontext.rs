@@ -1920,7 +1920,7 @@ impl UserDelAction {
     }
 
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
-        if unsafe { pyre_object::generator::is_generator(w_obj) } {
+        if unsafe { pyre_object::generator::is_generator_or_coroutine(w_obj) } {
             if self.gc_disabled(w_obj) {
                 return;
             }

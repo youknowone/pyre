@@ -447,7 +447,20 @@ impl FrameBox {
         // block is non-moving (old-gen when GC-managed, `std::alloc`
         // otherwise), so only the locals array needs protecting.
         let _root = FrameLocalsRoot::new(frame_ptr);
-        let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
+        // generator.py: GeneratorIterator / Coroutine — native `async def`
+        // frames have their own object type.  In particular, a Coroutine is
+        // awaitable but is not itself an iterator; `__await__` supplies the
+        // separate CoroutineWrapper iterator.
+        let generator = if unsafe {
+            (*frame_ptr)
+                .code()
+                .flags
+                .contains(crate::CodeFlags::COROUTINE)
+        } {
+            pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8)
+        } else {
+            pyre_object::generator::w_generator_new(frame_ptr as *mut u8)
+        };
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
@@ -3190,14 +3203,32 @@ impl PyFrame {
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Result<Self, crate::PyError> {
-        let w_builtin =
-            crate::baseobjspace::frame_builtin_obj_checked(w_globals, execution_context)?;
-        Ok(Self::finish_for_call_with_globals_obj(
-            code,
-            args,
-            w_globals,
+        // The RPython shadowstack transform roots every live call argument
+        // around `pick_builtin`, which may allocate or execute a mapping
+        // lookup.  A JIT residual call passes Rust copies of gcmap-backed
+        // values here; after a collection only the gcmap/shadow slots are
+        // forwarded, so never carry the original slice across that call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(code as PyObjectRef);
+        pyre_object::gc_roots::pin_root(w_globals);
+        pyre_object::gc_roots::pin_root(closure);
+        for &arg in args {
+            pyre_object::gc_roots::pin_root(arg);
+        }
+        let w_builtin = crate::baseobjspace::frame_builtin_obj_checked(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
             execution_context,
-            closure,
+        )?;
+        let current_args: Vec<PyObjectRef> = (0..args.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i))
+            .collect();
+        Ok(Self::finish_for_call_with_globals_obj(
+            pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
+            &current_args,
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            execution_context,
+            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
             w_builtin,
             allocation,
         ))
@@ -3219,13 +3250,27 @@ impl PyFrame {
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Self {
-        let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
-        Self::finish_for_call_with_globals_obj(
-            code,
-            args,
-            w_globals,
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(code as PyObjectRef);
+        pyre_object::gc_roots::pin_root(w_globals);
+        pyre_object::gc_roots::pin_root(closure);
+        for &arg in args {
+            pyre_object::gc_roots::pin_root(arg);
+        }
+        let w_builtin = crate::baseobjspace::frame_builtin_obj(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
             execution_context,
-            closure,
+        );
+        let current_args: Vec<PyObjectRef> = (0..args.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i))
+            .collect();
+        Self::finish_for_call_with_globals_obj(
+            pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
+            &current_args,
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            execution_context,
+            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
             w_builtin,
             allocation,
         )
@@ -3243,8 +3288,22 @@ impl PyFrame {
         w_builtin: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Self {
+        // `alloc_frame_locals_array` is a collection point.  Keep the call
+        // inputs in real shadow-stack slots and populate the new locals array
+        // from those forwarded slots, matching gctransform/framework.py's
+        // push_roots/pop_roots around a GC allocation.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(code as PyObjectRef);
+        pyre_object::gc_roots::pin_root(w_globals);
+        pyre_object::gc_roots::pin_root(closure);
+        pyre_object::gc_roots::pin_root(w_builtin);
+        for &arg in args {
+            pyre_object::gc_roots::pin_root(arg);
+        }
         let code_ref = unsafe {
-            &*(crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject)
+            &*(crate::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(root_base))
+                as *const CodeObject)
         };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
@@ -3261,7 +3320,7 @@ impl PyFrame {
             // Bind positional arguments directly -- no intermediate Vec.
             let nargs = args.len().min(num_locals);
             for i in 0..nargs {
-                arr[i] = args[i];
+                arr[i] = pyre_object::gc_roots::shadow_stack_get(root_base + 4 + i);
             }
 
             // CPython 3.11+ `co_localsplusnames` unified slot layout:
@@ -3275,6 +3334,7 @@ impl PyFrame {
             for i in 0..npure {
                 arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
             }
+            let closure = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
             if !closure.is_null() {
                 let nfreevars = code_ref.freevars.len();
                 for i in 0..nfreevars {
@@ -3292,13 +3352,16 @@ impl PyFrame {
         // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
         // gated debugdata snapshot retired in favour of `w_globals`).
         unsafe {
-            crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
+            crate::w_code_frame_stores_global(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            );
         }
 
         let mut frame = PyFrame {
             ob_header: frame_ob_header(),
             execution_context,
-            pycode: code,
+            pycode: pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
             locals_cells_stack_w,
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
@@ -3310,8 +3373,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            w_builtin,
-            w_globals,
+            w_builtin: pyre_object::gc_roots::shadow_stack_get(root_base + 3),
+            w_globals: pyre_object::gc_roots::shadow_stack_get(root_base + 1),
         };
         frame.init_cells();
         frame

@@ -3529,30 +3529,8 @@ impl OptUnroll {
             // inline_short_preamble's `len(short_inputargs) == len(jump_args)`
             // (unroll.py:393) holds.
             //
-            // Pyre diverges for a virtualizable-frame loop whose locals are
-            // carried UNBOXED: the reduced loop-body target token
-            // (LoopTargetDescr(N)) finalizes its short-preamble inputargs to the
-            // non-virtual loop label only (`ShortBoxes::with_label_args`,
-            // shortpreamble.rs:558) and reconstructs the boxed-int forms from
-            // those args via its own ops — it does NOT expect the virtual-box
-            // slots as inputargs. Appending `virtuals` then makes
-            // `short_jump_args` longer than the target's `short_inputargs` and
-            // trips the contract (the `except`-handler bridge: target_args=4,
-            // virtuals=2 [boxed s/i], but sp.inputargs=4 → 6 != 4 InvalidLoop).
-            //
-            // Match the target's actual short-inputarg arity: append `virtuals`
-            // only when the target short preamble has slots for them. The
-            // loop-self-build path (sp.inputargs already includes the virtual
-            // slots) is unchanged; only the reduced-target bridge retarget that
-            // would otherwise InvalidLoop is affected.
             let mut short_jump_args = target_args.clone();
-            let target_expects_virtuals = target_token
-                .short_preamble
-                .as_ref()
-                .map_or(true, |sp| sp.inputargs.len() != short_jump_args.len());
-            if target_expects_virtuals {
-                short_jump_args.extend(virtuals);
-            }
+            short_jump_args.extend(virtuals);
 
             // Ensure jump_args carry PtrInfo from Phase 2 body.
             // RPython Box identity preserves info across forwarding.

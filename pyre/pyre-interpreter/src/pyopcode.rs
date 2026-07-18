@@ -306,6 +306,10 @@ pub trait StackOpcodeHandler: SharedOpcodeHandler {
 }
 
 pub trait IterOpcodeHandler: SharedOpcodeHandler {
+    /// PyPy `GET_ITER`: `w_iterable = popvalue(); pushvalue(space.iter(w_iterable))`.
+    fn iter_value(&mut self, iterable: Self::Value) -> Result<Self::Value, PyError>;
+    /// Legacy in-place conversion hook retained while out-of-tree opcode
+    /// executors migrate to `iter_value`; the shared opcode no longer calls it.
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError>;
     // FOR_ITER drives a single space.next (pyopcode.py:1288).
     // Ok(Some(v)) = next value; Ok(None) = StopIteration (exhausted);
@@ -659,8 +663,9 @@ pub fn opcode_swap<H: StackOpcodeHandler + ?Sized>(
 }
 
 pub fn opcode_get_iter<H: IterOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
-    let iter = handler.peek_at(0)?;
-    handler.ensure_iter_value(iter)
+    let iterable = handler.pop_value()?;
+    let iterator = handler.iter_value(iterable)?;
+    handler.push_value(iterator)
 }
 
 pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(

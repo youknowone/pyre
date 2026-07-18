@@ -1590,6 +1590,24 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
     }
 }
 
+/// Residual PyPy `GET_ITER` operation.  `space.iter` may execute a user
+/// `__iter__`, so the trace treats this as may-force and consumes the
+/// published exception through the ordinary guards.
+#[majit_macros::jit_may_force]
+pub extern "C" fn jit_get_iter(iterable: i64) -> i64 {
+    match crate::baseobjspace::iter(iterable as PyObjectRef) {
+        Ok(iterator) => iterator as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            if exc_obj != PY_NULL {
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            }
+            jit_publish_exception(exc_obj);
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -644,15 +644,36 @@ fn set_orig_class(result: PyObjectRef, alias: PyObjectRef) -> Result<(), crate::
 // `as_ref` read out of any traced graph.
 #[majit_macros::dont_look_inside]
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    let func = unsafe { builtin_code_get(code) };
-    if let Some(sig) = unsafe { crate::builtin_code_get_signature(code) } {
+    // `gateway.py:824 BuiltinCode.funcrun` is translated with both its code
+    // object and `Arguments.arguments_w` live across gateway dispatch.  A
+    // collection between the outer `space.call_function` reload and this
+    // indirect Rust function-pointer call updates the outer shadow slots but
+    // not the copied native slice, so mirror the gateway's own root frame and
+    // reload immediately before invoking the builtin.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(code);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let current_code = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let current_args = || {
+        (0..args.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
+            .collect::<Vec<_>>()
+    };
+
+    let func = unsafe { builtin_code_get(current_code()) };
+    if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code()) } {
         if sig.has_vararg() || sig.has_kwarg() || sig.num_kwonlyargnames() > 0 {
-            let fname = unsafe { crate::builtin_code_name(code) };
-            let bound = bind_kwargs_to_signature(sig, fname, args, &[])?;
+            let fname = unsafe { crate::builtin_code_name(current_code()) };
+            let args = current_args();
+            let bound = bind_kwargs_to_signature(sig, fname, &args, &[])?;
             return func(&bound);
         }
     }
-    func(args)
+    let args = current_args();
+    func(&args)
 }
 
 /// Leaf execution mode for a user-function call reached through
@@ -2296,12 +2317,31 @@ pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
+    // `baseobjspace.py:1195-1198 call_function` is translated RPython: its
+    // callable and `args_w` entries are shadow-stack roots across the entry
+    // stack check, and the GC transform reloads their possibly moved
+    // addresses afterwards.  Rust's incoming slice only contains copied raw
+    // pointers, so establish the same roots before the first collecting call
+    // and dispatch from freshly reloaded values.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+
     // rpython/rlib/rstack.py:42 stack_check(): every interpreter call
     // boundary checks the native stack synchronously, so deep recursion
     // raises RecursionError instead of letting the OS abort on a
     // guard-page hit. Also drain any JIT-prologue pending overflow.
     crate::stack_check::drain_jit_pending_exception()?;
     crate::stack_check::stack_check()?;
+
+    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let rooted_args = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
+        .collect::<Vec<_>>();
+    let args = rooted_args.as_slice();
 
     unsafe {
         if pyre_object::is_method(callable) {
@@ -2472,33 +2512,55 @@ pub fn type_call_instantiate(
 /// Type call without a PyFrame.
 /// PyPy: typeobject.py descr_call
 fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    if let Err(e) = check_type_instantiable(w_type) {
+    // typeobject.py descr_call keeps `w_type`, every argument, and the new
+    // instance live across both Python calls.  In translated RPython the GC
+    // transform reloads these from shadow-stack slots after `__new__`; Rust
+    // slices are only copies and otherwise retain pre-move addresses.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_type);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let current_args = || {
+        (0..args.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
+            .collect::<Vec<_>>()
+    };
+
+    if let Err(e) = check_type_instantiable(current_type()) {
         set_call_error(e);
         return PY_NULL;
     }
     // Step 1: __new__
-    let instance =
-        if let Some(new_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") } {
-            let mut new_args = Vec::with_capacity(1 + args.len());
-            new_args.push(w_type);
-            new_args.extend_from_slice(args);
-            call_function_impl(new_fn, &new_args)
-        } else {
-            pyre_object::w_instance_new(w_type)
-        };
+    let instance = if let Some(new_fn) =
+        unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") }
+    {
+        let mut new_args = Vec::with_capacity(1 + args.len());
+        new_args.push(current_type());
+        new_args.extend(current_args());
+        call_function_impl(new_fn, &new_args)
+    } else {
+        pyre_object::w_instance_new(current_type())
+    };
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(instance);
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy checks the Python-level type(instance), so builtin-layout subtypes
     // like set subclasses still run __init__.
-    if let Some(w_insttype) = type_call_init_type(instance, w_type)
-        && !type_call_type_x_shortcut(w_type, args.len(), true)
+    if let Some(w_insttype) = type_call_init_type(
+        pyre_object::gc_roots::shadow_stack_get(instance_slot),
+        current_type(),
+    ) && !type_call_type_x_shortcut(current_type(), args.len(), true)
     {
         if let Some(init_fn) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
         {
             let mut init_args = Vec::with_capacity(1 + args.len());
-            init_args.push(instance);
-            init_args.extend_from_slice(args);
+            init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
+            init_args.extend(current_args());
             let res = call_function_impl(init_fn, &init_args);
             if res.is_null() {
                 // `__init__` raised — error already stashed; propagate it.
@@ -2511,7 +2573,7 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         }
     }
 
-    instance
+    pyre_object::gc_roots::shadow_stack_get(instance_slot)
 }
 
 /// `typeobject.py descr_call` — `__init__` must return None.  A non-null,

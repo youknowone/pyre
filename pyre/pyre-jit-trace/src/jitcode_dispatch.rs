@@ -409,8 +409,9 @@ pub struct InlineFrame {
     /// reaches [`FBW_MAX_INLINE_RECURSION`], the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py:1388-1416`).
     pub w_code: usize,
-    /// Paused caller snapshot for the multi-frame path. `None` preserves the
-    /// straight-line single-frame collapse while retaining the callee level.
+    /// Paused caller snapshot for this Python frame.  RPython keeps one
+    /// `MIFrame` per inlined call; a missing parent is therefore only valid
+    /// for a frame that is not entered as an inline Python callee.
     pub parent: Option<InlineParentFrame>,
 }
 
@@ -10392,6 +10393,8 @@ fn reconcile_vstack_at_boundary(
         ctx.vstack_reorder_ceiling = prev_pypc as u32;
     }
     let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
+    let (fallthrough_depth, branch_depth) =
+        crate::liveness::stack_effects(&instr, op_arg, ctx.vstack_depth);
     if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
             "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
@@ -10400,6 +10403,20 @@ fn reconcile_vstack_at_boundary(
             ctx.vstack_depth, ctx.vstack_last_ref
         );
     }
+    // A JitCode's block layout can visit source-PC floor segments out of
+    // Python bytecode order.  In that case `vstack_cur_pypc` is only the
+    // preceding layout segment, not the opcode whose stack effect produced
+    // this boundary.  Applying its effect is unsound: a LOAD_FAST segment
+    // whose expected depth is `d + 1` can otherwise overwrite a surviving
+    // FOR_ITER iterator when the observed depth stayed at `d`.
+    //
+    // RPython reads the live MIFrame registers and never reconstructs this
+    // transition from source PCs.  Preserve the slots that demonstrably
+    // survive at the observed depth whenever neither real successor depth
+    // matches; holes remain conservative and are handled by the shadow fill
+    // below.
+    let layout_only_boundary = new_depth != fallthrough_depth && new_depth != branch_depth;
+
     // PER-OP RECONCILE.  In the SEQUENTIAL case the previous opcode's stack
     // effect explains the depth change: a producer (`ResultToTos`) lands its
     // result box (`vstack_last_ref`) on the new TOS; a pop / side-store just
@@ -10415,6 +10432,17 @@ fn reconcile_vstack_at_boundary(
         class
     };
     match effective_class {
+        // A layout-only boundary (the observed depth matches neither real
+        // successor of the previous opcode) means the per-op effect cannot
+        // explain this transition; preserve the surviving slots instead of
+        // replaying a stale effect.  The reorder region is already served by
+        // the `ShadowReseed` arm, so exclude it here.
+        _ if layout_only_boundary && !in_reorder_region => {
+            ctx.vstack_boxes.truncate(new_depth);
+            if ctx.vstack_boxes.len() < new_depth {
+                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            }
+        }
         VstackOpClass::ResultToTos => {
             ctx.vstack_boxes.truncate(new_depth);
             if ctx.vstack_boxes.len() < new_depth {
@@ -12031,23 +12059,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // At resume, RPython's blackhole interpreter re-enters each frame's
     // jitcode and replays from the saved pc.
     //
-    // Pyre's blackhole interpreter only knows how to run *pyjitcode*
-    // bytecode (Python bytecode), not helper jitcodes — pyre's
-    // per-opcode arm jitcodes and sub-jitcode helpers are walker-only
-    // structures with no blackhole entry point.  The structural
-    // consequence: any walker-emitted guard, regardless of how deep
-    // the sub-walk nesting is, must resume to the *outer* Python
-    // opcode boundary (`sym.jitcode` at `entry_py_pc`) — that is the
-    // only resume point pyre's blackhole can re-enter.  The
-    // framestack-collapse is a deliberate adaptation, not a parity
-    // miss; the walker context carries the outer Python frame only.
-    // Inline-traced Python frames (`build_pending_inline_frame`) are
-    // not reachable from this entry point because the production
-    // walker allow-list does not yet enable opcodes that drive inline
-    // tracing — when that expands, `WalkContext` must grow a parent-
-    // Python-frame chain (analogous to `MIFrame.parent_frames`) and
-    // this helper switches to
-    // `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`.
+    // Helper jitcodes remain walker-only, but an inlined *Python* call is a
+    // real RPython `MIFrame` and must retain its own jitcode/pycode/globals and
+    // locals.  Such calls are handled by the multi-frame branch below; only
+    // guards in the root Python frame use the single-frame capture here.
     //
     // The snapshot is therefore a single Python frame at the outer
     // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
@@ -12084,13 +12099,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // capture below, which resumes at the CALL site (re-execute the
     // call on deopt — see `fbw_mode.inline_subwalk`).
     let inline_subwalk = ctx.fbw_mode.inline_subwalk;
-    // #68 multi-frame inline guard: a guard emitted inside an inlined callee
-    // sub-walk with paused caller frames on the walk framestack resumes
-    // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
-    // point), instead of collapsing to the caller boundary (re-execute).  Only
-    // the gated forward-branch inline path (`PYRE_FBW_INLINE_MULTIFRAME`)
-    // populates the chain; straight-line callees keep the empty chain + the
-    // single-frame collapse below.
+    // A guard emitted inside an inlined Python callee resumes BOTH the callee
+    // (at its own pc) and its caller chain (at each CALL return point), exactly
+    // like RPython's `MIFrame` framestack.  Never collapse a Python callee onto
+    // the root frame: that can resume a different code object at the same
+    // register/call shape.
     if inline_subwalk {
         // Fire the multi-frame snapshot only when the paused-caller chain
         // covers the FULL current inline depth: framestack levels with parents
@@ -12132,6 +12145,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 scope,
             );
         }
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op_pc });
     }
     if !inline_subwalk && !full_body_sym.is_null() {
         // SAFETY: the pointer is set only for the lifetime of the
@@ -15974,20 +15988,17 @@ fn try_walker_inline_resolved_user_call(
         // frame (a decode / `LOAD_FAST` overrun) and re-applies the callee's
         // committed side effect on deopt.
         //
-        // Best effort: `compute_inline_caller_frame` returns `Unavailable` for a caller
-        // shape it cannot build yet (a CALL inside a try-block, or no result on
-        // the operand stack at the return point).  Fall back to the single-frame
-        // collapse there (do NOT decline the inline — that shape is served
-        // correctly today), so this never removes a working inline.
-        compute_inline_caller_frame(ctx, op.pc).ok()
+        // If the caller snapshot cannot be represented yet, leave the call
+        // residual.  RPython has no path that drops the caller MIFrame and
+        // substitutes the root frame, so neither do we.
+        Some(
+            compute_inline_caller_frame(ctx, op.pc)
+                .map_err(|_| DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc })?,
+        )
     } else {
-        // Single-frame collapse (resume at the CALL boundary, re-execute the
-        // whole call on deopt): a nested strict callee
-        // (`inline_depth >= fbw_max_multiframe_depth()`, task #126), an un-seedable
-        // strict callee, or a callee neither seed served.  Sound for a pure
-        // value-returning leaf (idempotent re-execute) and for a nested
-        // straight-line callee (its pre-multiframe behavior).
-        None
+        // The current resume encoder cannot represent this callee frame.
+        // Residualize the call instead of inventing a root-frame substitute.
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     };
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
@@ -27716,6 +27727,17 @@ fn handle(
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
                 if !has_partial && has_targets {
+                    // pyjitpl.py:2967-2969 `reached_loop_header`: the dummy
+                    // GUARD_FUTURE_CONDITION is recorded before compile_trace
+                    // so unroll can attach this exact merge-point snapshot to
+                    // artificial short-preamble guards.  The ordinary
+                    // CloseLoop outcome records the same guard later through
+                    // `close_loop_args_at`; this in-walk compile_trace path
+                    // returns before that post-processing step, so it must
+                    // record the guard here.
+                    ctx.trace_ctx
+                        .record_guard(OpCode::GuardFutureCondition, &[], 0);
+                    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
                     let outcome = match bridge_origin {
                         // Guard-origin: existing bridge path.
                         Some(_) => {

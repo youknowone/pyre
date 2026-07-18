@@ -363,6 +363,13 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
+            name: "iter_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
             name: "on_iter_exhausted",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },

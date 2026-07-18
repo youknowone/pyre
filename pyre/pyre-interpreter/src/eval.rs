@@ -902,6 +902,11 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_bh_last_exception(visitor);
     crate::call::walk_pending_call_error(visitor);
     crate::baseobjspace::walk_pending_hash_error(visitor);
+    // `reduce_protocol`'s app-level interphook handles are process-global
+    // off-GC slots.  RPython stores them in the space's ordinary object graph;
+    // expose the equivalent slots on every collection so both minor moves and
+    // major marking preserve their functions and private globals namespace.
+    crate::reduce_protocol::walk_handle_roots(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -2097,6 +2102,10 @@ unsafe fn load_global_via_cache(
 /// PyPy: pyopcode.py GET_ITER → space.iter(w_iterable)
 ///       pyopcode.py FOR_ITER → space.next(w_iterator)
 impl IterOpcodeHandler for PyFrame {
+    fn iter_value(&mut self, iterable: Self::Value) -> Result<Self::Value, PyError> {
+        crate::baseobjspace::iter(iterable)
+    }
+
     /// GET_ITER: convert iterable to iterator.
     /// PyPy: space.iter(w_iterable) → calls __iter__ or wraps in seq_iter.
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
@@ -3763,7 +3772,15 @@ impl OpcodeStepExecutor for PyFrame {
         let value = self.pop();
         let iter = self.peek();
         let result = if unsafe { pyre_object::is_none(value) } {
-            crate::baseobjspace::next(iter)
+            // generator.py / pyopcode.py `next_yield_from`: coroutine
+            // objects are not public iterators, but the interpreter's SEND
+            // machinery resumes both GeneratorIterator and Coroutine through
+            // their shared `send_ex(None)` path.
+            if unsafe { pyre_object::generator::is_generator_or_coroutine(iter) } {
+                crate::baseobjspace::generator_next_method(&[iter])
+            } else {
+                crate::baseobjspace::next(iter)
+            }
         } else {
             let send = crate::baseobjspace::getattr_str(iter, "send")?;
             crate::call::call_function_impl_result(send, &[value])
