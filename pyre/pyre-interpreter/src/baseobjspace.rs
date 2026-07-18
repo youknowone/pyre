@@ -4816,6 +4816,37 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     name,
                 ),
             );
+        } else if call_getattr && is_type(obj) {
+            // objspace.py:664 runs the `__getattribute__` gate on
+            // `space.type(w_obj)` for every receiver kind.  For a type receiver
+            // that is the metaclass; a metaclass overriding `__getattribute__`
+            // customises class-attribute access (`C.x`), replacing the builtin
+            // `type.__getattribute__` inlined in `object_getattr_miss`.  The
+            // gate returns `None` for the default (metaclass inherits
+            // `object.__getattribute__`), leaving the fast path untouched for
+            // ordinary classes.  Only `space.getattr` (`call_getattr`) routes
+            // here; the bare `object.__getattribute__` slot runs the terminal
+            // lookup without re-dispatching to the override.
+            if let Some(w_metatype) = crate::typedef::r#type(obj) {
+                if let Some(slot) = getattribute_if_not_from_object(w_metatype) {
+                    let name_obj = w_str_new(name);
+                    // objspace.py:666 — bind the metaclass `__getattribute__`
+                    // through `__get__` and call it with the attribute name.
+                    match get_and_call_function(slot, obj, w_metatype, &[name_obj]) {
+                        Ok(v) => return Ok(v),
+                        Err(e) if e.kind == PyErrorKind::AttributeError => {
+                            return type_getattr_hook_or_err(
+                                obj,
+                                &[Some(w_metatype), None],
+                                name,
+                                e,
+                                call_getattr,
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
         }
     }
 
@@ -9227,6 +9258,23 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 let w_name = w_str_new(name);
                 return crate::call::call_function_impl_result(da, &[obj, w_name])
                     .map(|_| w_none());
+            }
+        } else if is_type(obj) {
+            // descroperation.py:254 looks up __delattr__ on the receiver type
+            // regardless of receiver kind.  For a type receiver that is the
+            // metaclass; a metaclass overriding __delattr__ customises
+            // `del C.x`.  Only a real override (≠ object.__delattr__) needs
+            // invoking — the default terminal path is object_delattr.
+            if let Some(w_metatype) = crate::typedef::r#type(obj) {
+                if let Some(da) = lookup_in_type(w_metatype, "__delattr__") {
+                    let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
+                        .is_some_and(|d| std::ptr::eq(da, d));
+                    if !is_default {
+                        let w_name = w_str_new(name);
+                        return crate::call::call_function_impl_result(da, &[obj, w_name])
+                            .map(|_| w_none());
+                    }
+                }
             }
         }
     }
