@@ -1055,20 +1055,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
-    let active = get_current_exception();
-    if !active.is_null()
-        && active != exc
-        && unsafe { !pyre_object::is_none(active) }
-        && unsafe { pyre_object::is_exception(exc) }
-    {
-        // `interp_exceptions.py:115 W_BaseException.w_context = None`
-        // class default — only write if no `__context__` is already
-        // stamped on the exception (mirrors `or_insert` semantics).
-        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
-        if existing.is_null() {
-            unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
-        }
-    }
+    crate::error::chain_context(exc, get_current_exception());
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
             // `interp_exceptions.py:166-174 descr_setcause` — writes
@@ -1230,6 +1217,11 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     if err.exc_object.is_null() {
         err.exc_object = exc_obj;
     }
+    // Implicit __context__ chaining: any exception raised while another is being
+    // handled records that active exception as its __context__, not only an
+    // explicit `raise`.  Recorded once (skipped when a __context__ is already
+    // stamped), so it lands at the frame where the exception first surfaces.
+    crate::error::chain_context(err.exc_object, get_current_exception());
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the

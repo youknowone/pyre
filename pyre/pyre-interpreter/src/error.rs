@@ -268,6 +268,30 @@ fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<
     Ok(())
 }
 
+/// Record `active` as `exc.__context__` when `exc` is raised while `active`
+/// is the exception currently being handled — the shared primitive for both
+/// explicit (`raise`) and implicit (builtin/operator) raises.  Only writes
+/// when no `__context__` is already stamped (so an exception that already
+/// carries one — e.g. an explicit `raise ... from` or a re-raise — is left
+/// untouched) and skips self-context; any cycle through the context chain is
+/// broken first via `_break_context_cycle`.
+pub fn chain_context(exc: PyObjectRef, active: PyObjectRef) {
+    if exc.is_null()
+        || active.is_null()
+        || std::ptr::eq(exc, active)
+        || unsafe { pyre_object::is_none(active) }
+        || !unsafe { pyre_object::is_exception(exc) }
+        || !unsafe { pyre_object::is_exception(active) }
+    {
+        return;
+    }
+    let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
+    if existing.is_null() {
+        let _ = _break_context_cycle(exc, active);
+        unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
+    }
+}
+
 impl From<OperationError> for PyError {
     fn from(value: OperationError) -> Self {
         let message = if value.w_value.is_null() {
