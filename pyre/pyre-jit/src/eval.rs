@@ -1005,6 +1005,47 @@ where
     }
 }
 
+/// Register a leaf storage-box type whose host container has no inner GC
+/// references (for example bytes/str/long-style storage). The auto-assigned id
+/// is published to pyre-object through `set_id`. This is the generic form of
+/// the raw `BigInt` registration at the tail of [`build_gc`].
+///
+/// Callers must register storage boxes only at the absolute tail of the type-id
+/// sequence, after every fixed-const type registration. S0 deliberately has no
+/// caller; S1 will publish the first live storage-box id.
+fn register_leaf_storage_box<T: 'static>(
+    gc: &mut dyn majit_gc::GcAllocator,
+    destructor: majit_gc::trace::DestructorFn,
+    set_id: impl FnOnce(u32),
+) {
+    let tid = gc.register_type(majit_gc::trace::TypeInfo::with_destructor(
+        std::mem::size_of::<T>(),
+        destructor,
+    ));
+    set_id(tid);
+}
+
+/// Register a storage-box type whose host container holds GC references walked
+/// by `custom_trace`. Composes the custom trace with the generic drop-glue
+/// destructor, as `TypeInfo::with_custom_trace(...).with_destructor_fn(...)`
+/// does for other traced owners of off-GC allocations.
+///
+/// As with [`register_leaf_storage_box`], callers must add registrations only
+/// at the absolute tail of [`build_gc`], after all fixed-const type ids. S0 has
+/// no caller so the existing registration order remains unchanged.
+fn register_traced_storage_box<T: 'static>(
+    gc: &mut dyn majit_gc::GcAllocator,
+    custom_trace: majit_gc::trace::CustomTraceFn,
+    destructor: majit_gc::trace::DestructorFn,
+    set_id: impl FnOnce(u32),
+) {
+    let tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(std::mem::size_of::<T>(), custom_trace)
+            .with_destructor_fn(destructor),
+    );
+    set_id(tid);
+}
+
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<dyn majit_gc::GcAllocator> {

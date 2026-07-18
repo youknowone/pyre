@@ -117,19 +117,31 @@ host 컨테이너를 쓰기 때문에 필요한 PRE-EXISTING-ADAPTATION의 확�
 3-backend green. **dormant 기반**, 안전.
 
 ### S1 — set/frozenset `items` (Slice C wall 직접 타깃)
-- `w_set_new`/`w_frozenset_new`: `malloc_raw(IndexMap)` → `gc_alloc_storage_box`.
-- `set_object_custom_trace`를 2단으로: set이 `items` 블록 슬롯 forward → 블록 custom
-  trace가 IndexMap 훑음. (또는 set trace가 그대로 IndexMap 훑되 블록 슬롯도 forward해
-  greying — mapdict `storage` 패턴.)
-- 블록 destructor = `drop IndexMap` glue. `set_object_destructor`
-  (`w_set_dealloc_items`/`Box::from_raw`) **제거**.
+- `w_set_new`/`w_frozenset_new`: `malloc_raw(IndexMap)` → `gc_alloc_storage_box(IndexMap,
+  SET_ITEMS_TID)`. 박스 TID는 auto-id(S0 `register_traced_storage_box` 또는 **leaf**로
+  등록, 아래 trace 전략 참조), `set_set_items_gc_type_id`로 pyre-object에 발행.
+- **trace 전략 = mapdict leaf 패턴** (2단 custom-trace보다 저위험, 검증된 선례):
+  박스는 **leaf**(내부를 varsize/custom walker가 훑지 않음). 기존
+  `set_object_custom_trace`(eval.rs:590)가 지금처럼 IndexMap을 직접 훑되(내부
+  `ObjectKey.obj` 슬롯 forward), 거기에 **`items` 박스-슬롯 포인터 자체를 forward**하는
+  한 줄을 추가해 major GC가 박스를 greying하게 한다. 이것이 `object_object_custom_trace`
+  (eval.rs:541-545)가 mapdict `storage` 블록을 유지하는 방식과 정확히 동형 — 블록은
+  leaf지만 소유 객체 trace가 (a) 블록 슬롯 forward로 sweep 방지 + (b) 내부 슬롯을 직접
+  forward. `try_gc_owns_object(items)` 가드로 std::alloc fallback 블록 구분.
+- 박스 leaf 등록에 **destructor = `storage_box_destructor::<IndexMap<ObjectKey,()>>`**
+  부착(=drop glue). `set_object_destructor`(`w_set_dealloc_items`/`Box::from_raw`)
+  **제거**.
 - `w_set_copy_storage_from`: `*d.items = clone()` (__deref_write) →
-  `d.items = gc_alloc_storage_box((*src.items).clone())` (**setfield_gc**). 옛 블록은
-  GC가 회수 → `w_set_dealloc_items` 불필요.
-- `w_set_difference_update_from_set`의 storage 교체 경로도 재대입으로.
+  `d.items = gc_alloc_storage_box((*src.items).clone(), SET_ITEMS_TID)` (**setfield_gc**).
+  옛 블록은 GC가 회수 → `w_set_dealloc_items` 불필요.
+- `w_set_difference_update_from_set`의 small-self storage 교체 경로
+  (`w_set_copy_storage_from(dst, result)`)도 자동으로 재대입 형태가 됨.
+- `w_set_clear`는 `(*s.items).clear()` — pointee in-place clear는 그대로 둠(재대입 아님,
+  storage 컨테이너 재사용; PyPy `d.clear()`와 동형, `__deref_write` 아님).
 검증: LLBC 재추출(`LLBC_FORCE_REEXTRACT=1 … pyre-object`) 후 census —
 `w_set_copy_storage_from` wall(`__deref_write`) 소멸, set-storage-copy chain wall
-소멸; 3-backend bit-exact (set 연산 + `frozenset({1})|{2}` GC-stress).
+소멸; 3-backend bit-exact (set 연산 + `frozenset({1})|{2}` GC-stress);
+`set_object_destructor` 제거 후 leak/double-free 없음(GC-stress + valgrind-류 오라클).
 
 ### S2 — regular dict `dstorage` (Object/Int/Bytes/Unicode 전략)
 - `w_dict_new`/`w_dict_new_kwargs`/전략 switch: `malloc_raw` → storage-box.
@@ -170,9 +182,15 @@ typeobject/module/function/typedef.
 2. **non-moving 요구**: 저장소는 self-mutating 메서드가 raw self 포인터를 재유도하므로
    `try_gc_alloc_stable_raw`(old-gen, non-moving)여야 함 — mapdict storage와 동일.
    moving nursery에 두면 안 됨.
-3. **Rc<RefCell> (moduledict caches)**: GC 블록에 non-`'static`/non-Copy Rc를 담는
-   soundness. S3에서 별도 판단, 최악의 경우 moduledict는 off-GC 유지(정당한 예외로
-   문서화).
+3. **Rc<RefCell> (moduledict caches)**: `ModuleDictStrategy.caches` =
+   `Option<HashMap<String, Rc<RefCell<GlobalCache>>>>` (celldict.rs:551). 사전 점검
+   결과: `Rc`를 GC storage-box에 담아도 clone/drop refcount는 정상; 박스 drop glue가
+   `HashMap::drop`을 호출하면 `Rc` refcount가 정상 감소한다(현 `Box::from_raw`와 동일).
+   GC가 forward해야 할 건 `GlobalCache.cell`의 PyObjectRef인데 이미
+   `w_module_dict_walk_gc_cells` custom trace가 처리 중 → S3도 leaf-box + 기존 custom
+   trace 조합으로 **가능**. 단 3-way 저장소(dstorage/mstrategy/object_storage)라 슬라이스
+   중 가장 복잡; 현 순서(S3, 뒤쪽)가 타당. 예상외 soundness 문제 시 moduledict만 off-GC
+   유지(정당한 예외로 문서화) — fallback.
 4. **`__deref_write`의 다른 소비자**: `w_set_copy_storage_from` 외에 pointee-whole-
    assign을 쓰는 사이트가 더 있는지 census로 확인 — 전부 재대입 형태로 정통화 가능한지.
 5. **census 회귀**: 각 슬라이스마다 LLBC 재추출 필수(pyre-object 소스 변경은 census에

@@ -27,6 +27,7 @@ pub mod functional;
 pub mod gc_hook;
 pub mod gc_interp;
 pub mod gc_roots;
+pub mod gc_storage;
 pub mod generator;
 pub mod identitydict;
 pub mod int_array;
