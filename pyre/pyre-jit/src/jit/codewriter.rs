@@ -7418,14 +7418,17 @@ impl CodeWriter {
         // flowcontext.py:402-405 `while self.pendingblocks: block =
         // self.pendingblocks.popleft(); if not block.dead: self.record_block(block)`.
         //
-        // Outer loop: outer loop wraps main drain + catch landings
-        // emit so handler-entry blocks queued by
-        // `emit_goto!(handler_py_pc)` in catch landings get drained by
-        // a second main-drain pass.  Without this, handler-entry blocks
-        // would be orphans with 0 ops + 0 exits + framestate-wide
-        // inputargs, tripping `make_return`'s 1-or-2-arg invariant in
-        // canonical `flatten_graph` (`flatten.py:107-109`).
-        let mut catch_landings_processed = false;
+        // Outer loop interleaves the ordinary pending-block drain with
+        // newly reachable catch landings.  Upstream's
+        // `flowcontext.py:124-153 guessexception` puts every exception
+        // EggBlock directly on `pendingblocks`, and `build_flow` keeps
+        // draining that queue to a fixed point (`flowcontext.py:399-405`).
+        // Pyre emits its synthetic catch-landing sequence separately, so
+        // mirror the same fixed point with one processed bit per site.
+        // A handler block drained after the first landing pass can itself
+        // expose a nested cleanup landing; a one-shot pass leaves that
+        // regular block live with inputargs but no exits.
+        let mut catch_landings_processed = vec![false; catch_sites.len()];
         loop {
             while let Some(pending_block) = pendingblocks.pop_front() {
                 if pending_block.dead() {
@@ -11349,10 +11352,12 @@ impl CodeWriter {
                         // resolves the variable name with.
                         Instruction::LoadFastCheck { var_num } => {
                             let idx = var_num.get(op_arg).as_usize() as u16;
-                            // A local proven unbound at compile time (a
-                            // `ConstantValue::None` slot, e.g. after a preceding
-                            // DELETE_FAST) makes LOAD_FAST_CHECK unconditionally
-                            // raise UnboundLocalError.  Emitting the
+                            // An absent `locals_w` slot means the local is
+                            // undefined on at least one predecessor
+                            // (`framestate.py:105-114 union`); the legacy
+                            // `ConstantValue::None` sentinel represents the
+                            // statically-unbound form.  The walker has no SSA
+                            // value for either shape.  Emitting the
                             // `load_fast_check` residual + `GuardNoException` +
                             // push leaves a normal-return `Finish` continuation;
                             // a later guard-failure bridge resolves into that
@@ -11360,11 +11365,14 @@ impl CodeWriter {
                             // the interpreter so it raises, mirroring the
                             // constant-folded `if w_value is None` failure arm
                             // (matches the DeleteFast known-unbound handling).
-                            if matches!(
-                                current_state.local_value_at(idx as usize),
-                                Some(super::flow::FlowValue::Constant(c))
-                                    if c.value == super::flow::ConstantValue::None
-                            ) {
+                            let local_value = current_state.local_value_at(idx as usize);
+                            if local_value.is_none()
+                                || matches!(
+                                    local_value,
+                                    Some(super::flow::FlowValue::Constant(c))
+                                        if c.value == super::flow::ConstantValue::None
+                                )
+                            {
                                 emit_abort_permanent!(py_pc);
                                 continue;
                             }
@@ -11735,10 +11743,7 @@ impl CodeWriter {
                                     ),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), true);
-                                let mut bound_state = current_state.clone();
-                                bound_state.next_offset = py_pc + 1;
-                                bound_state.blocklist =
-                                    frame_blocks_for_offset(code, bound_state.next_offset);
+                                let bound_state = current_state.clone();
                                 let bound_block = SpamBlockRef::new(
                                     graph.new_block(Vec::new()),
                                     Some(bound_state.clone()),
@@ -11751,15 +11756,6 @@ impl CodeWriter {
                                     output_link(&current_state, &bound_state, bound_block.block()),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), false);
-                                // The successful check continues at the next
-                                // bytecode in this block. Register that block
-                                // as the next-PC candidate so a handler or
-                                // exception-table joinpoint at the same PC
-                                // cannot replace the DELETE_FAST continuation.
-                                joinpoints
-                                    .entry(py_pc + 1)
-                                    .or_insert_with(Vec::new)
-                                    .insert(0, bound_block.clone());
 
                                 // The unbound arm raises before any clear,
                                 // matching pyopcode.py:998 DELETE_FAST. Keep
@@ -11830,8 +11826,36 @@ impl CodeWriter {
                                     None,
                                     py_pc as i64,
                                 );
-                                current_state
-                                    .store_local_value(idx, super::flow::Constant::none().into());
+                                // `framestate.py:105-114 union`: an undefined
+                                // local is `None`, not a Constant(None).  The
+                                // graph-side vable write above still carries
+                                // the runtime PY_NULL sentinel.
+                                current_state.clear_local_value(idx);
+                                // The successful branch egg has now executed
+                                // the clear.  Close it into the next bytecode
+                                // through the ordinary joinpoint machinery,
+                                // exactly as `flowcontext.py:424-475
+                                // mergeblock` closes every branch arrival.
+                                // Directly inserting this block into the
+                                // candidate list strands an older candidate
+                                // at the same PC when conditional control flow
+                                // already reaches the continuation.
+                                let next_py_pc = py_pc + 1;
+                                let mut continuation_state = current_state.clone();
+                                continuation_state.next_offset = next_py_pc;
+                                continuation_state.blocklist =
+                                    frame_blocks_for_offset(code, next_py_pc);
+                                let _ = mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &continuation_state,
+                                    next_py_pc,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+                                needs_fallthrough = false;
                             } else {
                                 emit_abort_permanent!(py_pc);
                             }
@@ -12068,19 +12092,18 @@ impl CodeWriter {
                 }
             } // end inner while-let pendingblocks
 
-            // Outer loop outer loop logic.  After main drain
-            // exhausts pendingblocks, catch landings emit (below) runs
-            // ONCE (gated on `catch_landings_processed`).  `emit_goto!`
-            // in catch landings queues handler-entry blocks onto
-            // pendingblocks; the next outer-loop iteration's inner
-            // while-let drains them so they don't end up as orphan
-            // empty-exits blocks with framestate-wide inputargs.
-            if catch_landings_processed {
-                break;
-            }
-            catch_landings_processed = true;
-
-            for site in &catch_sites {
+            // Match `build_flow`'s queue fixed point: emit each newly
+            // reachable landing once, then return to the pending-block
+            // drain.  Handler code can discover another exception edge,
+            // making a later site's landing reachable only after an
+            // earlier landing has been processed.
+            let mut emitted_catch_landing = false;
+            for (site_index, site) in catch_sites.iter().enumerate() {
+                if catch_landings_processed[site_index] || site.landing.framestate().is_none() {
+                    continue;
+                }
+                catch_landings_processed[site_index] = true;
+                emitted_catch_landing = true;
                 emit_mark_label_catch_landing!(site.landing_label);
                 // `emit_mark_label_catch_landing!` reassigns
                 // `current_block` to the pre-allocated catch landing
@@ -12284,6 +12307,9 @@ impl CodeWriter {
                 depth += 1;
                 emit_vsd!(depth, site.handler_py_pc);
                 emit_goto!(site.handler_py_pc);
+            }
+            if !emitted_catch_landing {
+                break;
             }
         } // end outer drain loop
 
@@ -15594,6 +15620,47 @@ def run(iters):
                 .is_some(),
             "walker must produce a jitcode for the with/exception loop \
              without tripping the make_return empty-exits invariant"
+        );
+    }
+
+    #[test]
+    fn walker_conditional_delete_closes_merge_and_nested_catch_landings() {
+        let source = "\
+def f(n):
+    for i in range(n):
+        x = 1
+        if i & 1:
+            del x
+        try:
+            y = x
+        except NameError:
+            pass
+    return i
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        // DELETE_FAST's successful branch must merge into the pre-existing
+        // fall-through candidate at the following NOP.  The NameError handler
+        // is then drained after its catch landing is emitted, and its protected
+        // POP_EXCEPT path exposes a nested cleanup landing.  Both stages must
+        // follow flowcontext.py:399-475's queue/merge fixed point.
+        writer.make_jitcodes();
+
+        assert!(
+            writer
+                .callcontrol()
+                .find_compiled_jitcode_arc(code_ptr)
+                .is_some(),
+            "walker must close catch landings discovered while draining a handler"
         );
     }
 
