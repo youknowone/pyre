@@ -1997,38 +1997,6 @@ impl MIFrame {
         ctx_ref.get_opref_type(value).unwrap_or(Type::Ref)
     }
 
-    /// The true per-slot Int signal for the merge-point contract. `value_type`
-    /// returns the OpRef's intrinsic Box type (Ref for a boxed W_Int, because the
-    /// producer boxes to Ref via store_local_value/push_typed_value). This recovers
-    /// the observed Int-ness from the tracked concrete so a loop-carried int local
-    /// can be declared Type::Int at close (Approach A). Returns None for genuine
-    /// object slots (so they stay Ref).
-    ///
-    /// Tag-safe: is_int short-circuits a tagged immediate before any ob_type deref
-    /// (intobject.rs:157). The Int-ness is a runtime observation; the raw carry it
-    /// enables is guard-backed by trace_guarded_int_payload, so this is a trace
-    /// specialization, not an unchecked assertion.
-    pub(crate) fn observed_slot_int_type(&self, ctx: &TraceCtx, value: OpRef) -> Option<Type> {
-        if value.is_none() {
-            return None;
-        }
-        if ctx.get_opref_type(value) == Some(Type::Int) {
-            return Some(Type::Int);
-        }
-        match ctx.concrete_of_opref(value) {
-            Some(majit_ir::Value::Int(_)) => Some(Type::Int),
-            Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
-                let obj = r.as_usize() as pyre_object::PyObjectRef;
-                if !obj.is_null() && unsafe { pyre_object::is_int(obj) } {
-                    Some(Type::Int)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
     /// RPython Box push: symbolic OpRef + concrete value together.
     ///
     /// Parity: the operand stack for virtualizable portal frames lives
@@ -3334,16 +3302,11 @@ impl MIFrame {
             lastblock,
             namespace,
         ]);
-        // Collect each slot's target type during materialize so the S3 reset
-        // below can restore a per-slot type map instead of a uniform Ref.
-        let mut local_target_types: Vec<Type> = Vec::with_capacity(locals.len());
-        let mut stack_target_types: Vec<Type> = Vec::with_capacity(stack.len());
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(num_scalars + idx)
                 .copied()
                 .unwrap_or(Type::Ref);
-            local_target_types.push(target_type);
             // Materialize NONE slots from concrete frame before boxing.
             // RPython's live_arg_boxes never contains holes at loop closure
             // because MIFrame.run_one_step always updates all live registers.
@@ -3371,7 +3334,6 @@ impl MIFrame {
                 .get(num_scalars + nlocals + stack_idx)
                 .copied()
                 .unwrap_or(Type::Ref);
-            stack_target_types.push(target_type);
             let value = if stack_idx >= live_stack_len {
                 let typed_null = extract_concrete_typed_value(target_type, PY_NULL);
                 fail_arg_opref_for_typed_value(ctx, typed_null)
@@ -3382,28 +3344,15 @@ impl MIFrame {
         }
         // virtualizable.py:44 parity (delayed): now that all materialize_loop_
         // carried_value calls have consulted each OpRef's actual type, flip the
-        // symbolic type maps to the post-loop invariant — each slot's declared
-        // type is the merge-point target type it was materialized against (Ref
-        // for a boxed slot, Int for a slot carried raw). Downstream consumers
-        // (reached_loop_header's live_types, the merge-point snapshot it stores)
-        // observe that per-slot contract while the box/unbox decisions above
-        // still see the pre-loop truth.
+        // symbolic type maps to the post-loop invariant where every array slot
+        // is Ref. Downstream consumers (reached_loop_header's live_types, the
+        // merge-point snapshot it stores) observe the Ref contract while the
+        // box/unbox decisions above still see the pre-loop truth.
         {
             let s = self.sym_mut();
             let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
-            // Slot-aware reset: derive each slot's post-loop declared type from
-            // the per-slot target type used in the materialize loops above,
-            // rather than a uniform Ref. Deferred until AFTER materialize so
-            // value_type() is not poisoned during box/unbox decisions. Until an
-            // int slot is declared Int, every target_type is Ref, so this equals
-            // the prior hardcode.
-            let mut local_types = local_target_types;
-            local_types.resize(concrete_nlocals, Type::Ref);
-            let mut stack_types = stack_target_types;
-            stack_types.truncate(stack_only);
-            stack_types.resize(stack_only, Type::Ref);
-            s.symbolic_local_types = local_types;
-            s.symbolic_stack_types = stack_types;
+            s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
+            s.symbolic_stack_types = vec![Type::Ref; stack_only];
         }
         // pyjitpl.py:2934-2965 remove_consts_and_duplicates:
         //     def remove_consts_and_duplicates(self, boxes, endindex, duplicates):
@@ -9959,37 +9908,6 @@ mod tests {
     #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
     fn pending_jit_exception_raw() -> i64 {
         0
-    }
-
-    #[test]
-    fn observed_slot_int_type_detects_boxed_int() {
-        // Slot 0 models the S7 box: a Ref-typed OpRef whose tracked
-        // concrete is a heap W_IntObject. Slot 1 is a genuine (non-int)
-        // object. The helper must report Int for slot 0 even though
-        // value_type() reports Ref, and None for slot 1.
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-
-        let boxed_int = OpRef::input_arg_ref(0);
-        let ref_slot = OpRef::input_arg_ref(1);
-        let int_obj = pyre_object::intobject::w_int_new_unique(7);
-        let float_obj = pyre_object::floatobject::w_float_new(1.5);
-        ctx.set_opref_concrete(boxed_int, Value::Ref(GcRef(int_obj as usize)));
-        ctx.set_opref_concrete(ref_slot, Value::Ref(GcRef(float_obj as usize)));
-
-        let frame = test_miframe(&mut ctx, &mut sym);
-
-        // (2) value_type sees only the Ref box (S7 boxing), not Int-ness.
-        assert_eq!(frame.value_type(boxed_int), Type::Ref);
-        // (1) helper recovers the true Int-ness from the concrete.
-        assert_eq!(
-            frame.observed_slot_int_type(&ctx, boxed_int),
-            Some(Type::Int)
-        );
-        // (3a) a genuine object concrete stays Ref (None).
-        assert_eq!(frame.observed_slot_int_type(&ctx, ref_slot), None);
-        // (3b) no concrete / OpRef::NONE stays Ref (None).
-        assert_eq!(frame.observed_slot_int_type(&ctx, OpRef::NONE), None);
     }
 
     #[test]
