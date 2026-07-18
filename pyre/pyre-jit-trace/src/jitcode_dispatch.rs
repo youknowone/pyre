@@ -15409,6 +15409,7 @@ fn try_walker_inline_user_call(
         nparams,
         has_closure,
         None,
+        None,
         false,
         false,
     )
@@ -15446,6 +15447,7 @@ fn try_walker_inline_resolved_user_call(
     nparams: usize,
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
+    arg_class_guard: Option<(OpRef, i64)>,
     allow_method_load_attr: bool,
     require_str_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -15677,6 +15679,9 @@ fn try_walker_inline_resolved_user_call(
             w_class,
             version_tag,
         )?;
+    }
+    if let Some((arg, w_class)) = arg_class_guard {
+        walker_guard_class(ctx, op.pc, arg, w_class)?;
     }
 
     let callable_expected = ctx
@@ -16588,6 +16593,7 @@ fn try_walker_inline_exception_string_override(
         nparams,
         has_closure,
         Some((r_args[2], concrete_receiver, w_class, version_tag)),
+        None,
         true,
         true,
     )?
@@ -16706,6 +16712,7 @@ fn try_walker_inline_user_binop(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
+        Some((rhs, w_typ_r as i64)),
         false,
         false,
     )?
@@ -16721,6 +16728,15 @@ fn try_walker_inline_user_binop(
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
             return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+        if !result.is_constant() {
+            let not_implemented = ctx
+                .trace_ctx
+                .const_ref(pyre_object::special::w_not_implemented() as i64);
+            let is_not_implemented = ctx
+                .trace_ctx
+                .record_op(OpCode::PtrEq, &[result, not_implemented]);
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardFalse, &[is_not_implemented])?;
         }
     }
     Ok(Some(inlined))
@@ -16832,6 +16848,7 @@ fn try_walker_inline_user_compareop(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
+        Some((rhs, w_typ_r as i64)),
         false,
         false,
     )?
@@ -16847,6 +16864,15 @@ fn try_walker_inline_user_compareop(
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
             return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+        if !result.is_constant() {
+            let not_implemented = ctx
+                .trace_ctx
+                .const_ref(pyre_object::special::w_not_implemented() as i64);
+            let is_not_implemented = ctx
+                .trace_ctx
+                .record_op(OpCode::PtrEq, &[result, not_implemented]);
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardFalse, &[is_not_implemented])?;
         }
     }
     Ok(Some(inlined))
