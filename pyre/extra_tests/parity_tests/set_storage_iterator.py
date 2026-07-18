@@ -98,4 +98,16 @@ for _ in range(2):
         raise AssertionError("set size mutation did not invalidate iterator")
 assert it.__length_hint__() == 0
 
+# GET_ITER must use the same live set iterator as iter(s), not a snapshot
+# sequence iterator.  CPython test_set.test_changingSizeWhileIterating and
+# PyPy W_SetIterObject both require the next FOR_ITER step to see the growth.
+s = {1, 2, 3}
+try:
+    for value in s:
+        s.update([4])
+except RuntimeError as exc:
+    assert str(exc) == "Set changed size during iteration"
+else:
+    raise AssertionError("set for-loop did not observe a size mutation")
+
 print("OK")

@@ -1532,7 +1532,7 @@ unsafe fn is_generic_seq_iter(iter: PyObjectRef) -> bool {
 
 /// FOR_ITER iterator kinds that advance through `space.next` rather than
 /// the inline range helper: generic sequence-protocol iterators, generators,
-/// itertools/enumerate/reversed/filter/map/zip/dictview/sre, callable
+/// itertools/enumerate/reversed/filter/map/zip/set/dictview/sre, callable
 /// iterators, and user `__next__` instances. Shared so the interpreter
 /// `iter_next` and the tracer agree on which iterators take the `space.next`
 /// leg.
@@ -1555,6 +1555,11 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
             || pyre_object::functional::is_map(iter)
             || pyre_object::functional::is_zip(iter)
             || pyre_object::operation::is_callable_iterator(iter)
+            // setobject.py `W_SetIterObject.next` delegates to its live
+            // `IteratorImplementation.next`, whose length guard must run on
+            // every FOR_ITER step.  It is not one of the scalar range/seq
+            // layouts handled by `range_iter_continues`.
+            || pyre_object::setobject::is_set_iterator(iter)
             || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
             || pyre_object::interp_sre::is_sre_scanner(iter)
             || crate::module::r#struct::is_unpack_iter(iter)
@@ -1725,5 +1730,13 @@ mod tests {
             );
         }
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn set_iter_uses_space_next_for_live_size_guard() {
+        let set = pyre_object::w_set_new();
+        let iter = pyre_object::w_set_iter_new(set);
+        assert!(via_space_next(iter));
+        assert!(range_iter_continues(iter).is_err());
     }
 }

@@ -2139,6 +2139,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::is_list_iter(iter)
                 || pyre_object::is_list_reverse_iter(iter)
                 || pyre_object::is_tuple_iter(iter)
+                || pyre_object::is_set_iterator(iter)
                 || pyre_object::generator::is_generator(iter)
                 || pyre_object::interp_itertools::is_repeat(iter)
                 || pyre_object::interp_itertools::is_count(iter)
@@ -2255,15 +2256,14 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = it;
                 return Ok(());
             }
-            // set / frozenset → iterate via insertion order (PyPy:
-            // setobject.py W_BaseSetObject.descr_iter)
+            // setobject.py W_BaseSetObject.descr_iter returns a live
+            // W_SetIterObject over the set implementation.  Do not snapshot
+            // the elements into a list: IteratorImplementation.next must see
+            // a size change and make RuntimeError sticky.
             if pyre_object::is_set_or_frozenset(iter) {
-                let items = pyre_object::w_set_items(iter);
-                let len = items.len();
-                let key_list = pyre_object::w_list_new(items);
-                let seq_iter = pyre_object::w_seq_iter_new(key_list, len);
+                let set_iter = pyre_object::w_set_iter_new(iter);
                 let tos = self.valuestackdepth - 1;
-                self.locals_w_mut()[tos] = seq_iter;
+                self.locals_w_mut()[tos] = set_iter;
                 return Ok(());
             }
             // array.array → seq_iter cursor (interp_array.py descr_iter
