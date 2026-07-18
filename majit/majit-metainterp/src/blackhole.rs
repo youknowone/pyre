@@ -7044,6 +7044,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "abort_permanent/".to_string(),
         majit_translate::insns::BC_ABORT_PERMANENT,
     );
+    // blackhole.py:954-960 bhimpl_switch. `handler_switch` is wired in
+    // `wire_bhimpl_handlers` but the byte was absent from this builder's
+    // insns map, so a deopt through a `switch/id` op landed on the
+    // unwired-opcode placeholder. RPython's setup_insns binds every opname.
+    insns.insert("switch/id".to_string(), majit_translate::insns::BC_SWITCH);
     // Sub-slice C.3+C.4 (`subslice_c_register_width_axis_plan_2026_05_07.md`):
     // residual_call family — `JitCodeBuilder::emit_canonical_call_void` /
     // `emit_canonical_call_typed` (assembler.rs:1688, 1923) emit each
