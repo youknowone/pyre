@@ -4145,6 +4145,35 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             );
+            // A `LIST_APPEND` (inlined-comprehension accumulator) body is
+            // admitted only when the body performs no CALL: a per-element call
+            // that enters a user Python frame (a class ctor / user function)
+            // sets the FOR_ITER in-flight body-effect flag, and a subsequent
+            // mid-body abort then routes through `fbw_foriter_inflight_take`,
+            // which REFUSES delivery to avoid a double-apply — dropping the
+            // trace-attempt iteration's item. The append itself is exact-resume
+            // safe, but the accompanying user-frame call is not yet, so decline
+            // the whole body to interpretation (a correct, if un-compiled, run)
+            // rather than compile a loop that drops an element. Call-free
+            // comprehension bodies (`[j for j in it]`, arithmetic, subscript)
+            // never enter a user frame and stay admissible.
+            let body_has_call = {
+                let mut scan_state = pyre_interpreter::OpArgState::default();
+                let mut scan_pc = pc + 1;
+                let mut found = false;
+                while scan_pc < exit && scan_pc < instructions.len() {
+                    let (scan_instr, _) = scan_state.get(instructions[scan_pc]);
+                    if matches!(
+                        scan_instr,
+                        I::Call { .. } | I::CallKw { .. } | I::CallFunctionEx | I::CallIntrinsic1 { .. }
+                    ) {
+                        found = true;
+                        break;
+                    }
+                    scan_pc += 1;
+                }
+                found
+            };
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
@@ -4160,7 +4189,7 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::DeleteSubscr
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
-                    );
+                    ) || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
                     return false;
                 }

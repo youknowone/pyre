@@ -858,6 +858,15 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// boundary; read by [`reconcile_vstack_at_boundary`] for the
     /// RESULT-TO-TOS class.
     pub vstack_last_ref: OpRef,
+    /// #389(b): the py_pc the walk backed off FROM when it entered the
+    /// codewriter's out-of-order FOR_ITER-entry permutation lowering
+    /// (`SWAP`/`BUILD_LIST`/`SWAP` before a `FOR_ITER`, lowered non-monotonically
+    /// in jitcode).  `u32::MAX` when not inside such a region.  While set, the
+    /// per-op reconcile is invalid (the walk re-visits already-passed py_pcs out
+    /// of order), so `reconcile_vstack_at_boundary` reseeds the whole mirror from
+    /// the virtualizable shadow instead of replaying stack effects.  Cleared once
+    /// the walk advances past this ceiling (py-pc order is monotonic again).
+    pub vstack_reorder_ceiling: u32,
     /// #73: the jitcode offset of the `-live-` byte that
     /// precedes the CURRENT opcode's guard resume point — the `-live-`
     /// BEFORE (`pyjitpl.py:198`, normal guard resume reads at
@@ -2952,6 +2961,7 @@ pub fn dispatch_via_miframe(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -3441,6 +3451,7 @@ fn drive_bridge_frame_subwalk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
@@ -3773,6 +3784,7 @@ pub(crate) fn drive_outer_frame_continuation(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
@@ -10516,10 +10528,33 @@ fn reconcile_vstack_at_boundary(
         return;
     };
     let class = classify_vstack_opcode(&instr, op_arg);
+    // #389(b): the py3.14 inlined comprehension emits a
+    // `SWAP`/`BUILD_LIST`/`SWAP` preamble before its `FOR_ITER`, which the
+    // codewriter lowers NON-MONOTONICALLY in jitcode — the JitCode-PC floor
+    // pivot maps a later jit_pc back to an EARLIER py_pc, so the walk re-visits
+    // those preamble py_pcs OUT OF ORDER (a backward py transition, then a
+    // forward re-walk of the just-visited py_pcs).  A `SWAP`/`COPY` never
+    // branches, so a backward py transition whose PREDECESSOR is a permutation
+    // op is unambiguously this lowering artifact, not real re-execution (a
+    // genuine loop back-edge leaves a `JUMP`/branch as the predecessor, class
+    // `PopOnlyOrSideStore`).  In the region the per-op replay is WRONG: it
+    // re-applies the `SWAP` effect and reuses a stale `vstack_last_ref`,
+    // dropping the just-built list from the mirror.  Reseed the whole mirror
+    // from the authoritative virtualizable shadow (kept current by the portal
+    // `setarrayitem_vable_r` pushes) instead, until the walk advances PAST the
+    // py_pc it backed off from (py order monotonic again).
+    if matches!(class, VstackOpClass::Swap(_) | VstackOpClass::Copy(_))
+        && (new_pypc as usize) < prev_pypc
+        && ctx.vstack_reorder_ceiling == u32::MAX
+    {
+        ctx.vstack_reorder_ceiling = prev_pypc as u32;
+    }
+    let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
     if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
             "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
-             new_depth={new_depth} prev_depth={} class={class:?} last_ref={:?} instr={instr:?}",
+             new_depth={new_depth} prev_depth={} class={class:?} reorder={in_reorder_region} \
+             last_ref={:?} instr={instr:?}",
             ctx.vstack_depth, ctx.vstack_last_ref
         );
     }
@@ -10530,7 +10565,14 @@ fn reconcile_vstack_at_boundary(
     // (LOAD_FAST / LOAD_NAME / COPY results) — values that may NOT be present
     // in the virtualizable shadow (function-local LOAD_FAST temps live only
     // in the walk register bank, never written through to the portal array).
-    match class {
+    // Inside the out-of-order permutation region the per-op replay is invalid;
+    // reseed from the shadow (same shape as `ShadowReseed`).
+    let effective_class = if in_reorder_region {
+        VstackOpClass::ShadowReseed
+    } else {
+        class
+    };
+    match effective_class {
         VstackOpClass::ResultToTos => {
             ctx.vstack_boxes.truncate(new_depth);
             if ctx.vstack_boxes.len() < new_depth {
@@ -10647,6 +10689,12 @@ fn reconcile_vstack_at_boundary(
         ctx.vstack_cur_pypc = new_pypc;
         ctx.vstack_depth = new_depth;
         ctx.vstack_last_ref = OpRef::NONE;
+    }
+    // #389(b): leave the out-of-order permutation region once the walk has
+    // advanced PAST the py_pc it backed off from — py order is monotonic again
+    // and the per-op reconcile is valid from here.
+    if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
+        ctx.vstack_reorder_ceiling = u32::MAX;
     }
 }
 
@@ -16509,6 +16557,7 @@ fn try_walker_inline_resolved_user_call(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
@@ -25372,6 +25421,7 @@ fn run_sub_jitcode_walk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28154,6 +28204,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28225,6 +28276,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28286,6 +28338,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28365,6 +28418,7 @@ mod tests {
                 vstack_cur_pypc: 0,
                 vstack_valid: false,
                 vstack_last_ref: OpRef::NONE,
+                vstack_reorder_ceiling: u32::MAX,
                 live_before_jit_pc: usize::MAX,
                 live_after_jit_pc: usize::MAX,
             };
@@ -28555,6 +28609,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28617,6 +28672,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28678,6 +28734,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28748,6 +28805,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28810,6 +28868,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -28871,6 +28930,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29141,6 +29201,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29315,6 +29376,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29437,6 +29499,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29553,6 +29616,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29658,6 +29722,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29760,6 +29825,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29843,6 +29909,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29905,6 +29972,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -29963,6 +30031,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30030,6 +30099,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30095,6 +30165,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30163,6 +30234,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30247,6 +30319,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30319,6 +30392,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30392,6 +30466,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30453,6 +30528,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30517,6 +30593,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30581,6 +30658,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30693,6 +30771,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30753,6 +30832,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30826,6 +30906,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -30930,6 +31011,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31035,6 +31117,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31117,6 +31200,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31176,6 +31260,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31299,6 +31384,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31426,6 +31512,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31500,6 +31587,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31571,6 +31659,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31633,6 +31722,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31694,6 +31784,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31775,6 +31866,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31844,6 +31936,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31904,6 +31997,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -31963,6 +32057,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32033,6 +32128,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32229,6 +32325,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32371,6 +32468,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32465,6 +32563,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32537,6 +32636,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32634,6 +32734,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32711,6 +32812,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32771,6 +32873,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32833,6 +32936,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32903,6 +33007,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -32965,6 +33070,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33054,6 +33160,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33125,6 +33232,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33214,6 +33322,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33314,6 +33423,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33488,6 +33598,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33579,6 +33690,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33641,6 +33753,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33718,6 +33831,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33819,6 +33933,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -33924,6 +34039,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34004,6 +34120,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34072,6 +34189,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34135,6 +34253,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34209,6 +34328,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34285,6 +34405,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34381,6 +34502,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34466,6 +34588,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34550,6 +34673,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34614,6 +34738,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34716,6 +34841,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34817,6 +34943,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -34926,6 +35053,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35067,6 +35195,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35144,6 +35273,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35207,6 +35337,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35294,6 +35425,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35426,6 +35558,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35534,6 +35667,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35641,6 +35775,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35727,6 +35862,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35816,6 +35952,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35903,6 +36040,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -35995,6 +36133,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36085,6 +36224,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36164,6 +36304,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36264,6 +36405,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36342,6 +36484,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36408,6 +36551,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36486,6 +36630,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36584,6 +36729,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36672,6 +36818,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36738,6 +36885,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36830,6 +36978,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36905,6 +37054,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -36991,6 +37141,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37065,6 +37216,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37390,6 +37542,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37474,6 +37627,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37569,6 +37723,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -37638,6 +37793,7 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
