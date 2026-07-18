@@ -2585,11 +2585,7 @@ fn jit_exc_value_peek_backend() -> i64 {
 fn jit_exc_value_peek_backend() -> i64 {
     majit_backend_dynasm::jit_exc_value_peek()
 }
-#[cfg(not(any(
-    target_arch = "wasm32",
-    feature = "cranelift",
-    feature = "dynasm"
-)))]
+#[cfg(not(any(target_arch = "wasm32", feature = "cranelift", feature = "dynasm")))]
 fn jit_exc_value_peek_backend() -> i64 {
     0
 }

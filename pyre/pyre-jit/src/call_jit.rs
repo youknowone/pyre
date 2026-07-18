@@ -842,7 +842,8 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     match crate::eval::portal_runner_result(frame) {
         Ok(result) => result as i64,
         Err(err) => {
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                .with(|c| c.set(err.to_exc_object() as i64));
             pyre_object::PY_NULL as i64
         }
     }
