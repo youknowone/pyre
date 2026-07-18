@@ -7049,6 +7049,39 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // insns map, so a deopt through a `switch/id` op landed on the
     // unwired-opcode placeholder. RPython's setup_insns binds every opname.
     insns.insert("switch/id".to_string(), majit_translate::insns::BC_SWITCH);
+    // GC heap field load/store — `blackhole.py:1432-1481 bhimpl_
+    // {get,set}field_gc_{i,r,f}`.  `handler_{get,set}field_gc_*` are wired
+    // in `wire_bhimpl_handlers` and the canonical bytes exist in
+    // `wellknown_bh_insns`, but the whole family was absent from this
+    // builder's insns map — so a deopt replaying a struct field access
+    // (e.g. an aheui Stack/Queue `size` store, `setfield_gc_i/rid` =
+    // BC_SETFIELD_GC_I 0xac) landed on the unwired-opcode placeholder.
+    // Canonical `rd`/`r{i,r,f}d` argcodes only (aheui accesses fields off
+    // a ref base); intbase (`id`/`iid`/`ird`) forms have no canonical byte
+    // and are not emitted here.  Additive: every byte is currently unwired.
+    for (key, byte) in [
+        ("getfield_gc_i/rd>i", majit_translate::insns::BC_GETFIELD_GC_I),
+        ("getfield_gc_r/rd>r", majit_translate::insns::BC_GETFIELD_GC_R),
+        ("getfield_gc_f/rd>f", majit_translate::insns::BC_GETFIELD_GC_F),
+        ("setfield_gc_i/rid", majit_translate::insns::BC_SETFIELD_GC_I),
+        ("setfield_gc_i/rcd", majit_translate::insns::BC_SETFIELD_GC_I_C),
+        ("setfield_gc_r/rrd", majit_translate::insns::BC_SETFIELD_GC_R),
+        ("setfield_gc_f/rfd", majit_translate::insns::BC_SETFIELD_GC_F),
+        (
+            "getfield_gc_i_pure/rd>i",
+            majit_translate::insns::BC_GETFIELD_GC_I_PURE,
+        ),
+        (
+            "getfield_gc_r_pure/rd>r",
+            majit_translate::insns::BC_GETFIELD_GC_R_PURE,
+        ),
+        (
+            "getfield_gc_f_pure/rd>f",
+            majit_translate::insns::BC_GETFIELD_GC_F_PURE,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
     // Sub-slice C.3+C.4 (`subslice_c_register_width_axis_plan_2026_05_07.md`):
     // residual_call family — `JitCodeBuilder::emit_canonical_call_void` /
     // `emit_canonical_call_typed` (assembler.rs:1688, 1923) emit each
