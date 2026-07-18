@@ -427,3 +427,23 @@ assert_raises(TypeError, arity_dict.copy, None)
 assert_raises(TypeError, arity_dict.keys, None)
 assert_raises(TypeError, arity_dict.values, None)
 assert_raises(TypeError, arity_dict.items, None)
+
+
+class DictKeyCallbackError(Exception):
+    pass
+
+
+class FailingDictKey:
+    fail = False
+
+    def __hash__(self):
+        if self.fail:
+            raise DictKeyCallbackError
+        return 42
+
+
+failing_dict_key = FailingDictKey()
+callback_dict = {failing_dict_key: 1}
+failing_dict_key.fail = True
+assert_raises(DictKeyCallbackError, callback_dict.setdefault, failing_dict_key, 2)
+assert_raises(DictKeyCallbackError, callback_dict.pop, failing_dict_key)

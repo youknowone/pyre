@@ -1950,6 +1950,28 @@ pub unsafe fn w_dict_setdefault_checked(
         w_dict_store_checked(obj, key, value)?;
         return Ok(value);
     }
+    if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+        // `ObjectDictStrategy.setdefault` inherits DictStrategy.setdefault
+        // (`dictmultiobject.py:487-493`).  RPython's r_dict entry probe hashes
+        // and compares once, then either returns the occupied value or fills
+        // the vacant entry.  Keep that single-probe shape with IndexMap's
+        // entry API so a callback exception aborts before insertion.
+        let object_key = object_key_for_checked(key)?;
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let entry = entries.entry(object_key);
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        return match entry {
+            indexmap::map::Entry::Occupied(entry) => Ok(*entry.get()),
+            indexmap::map::Entry::Vacant(entry) => {
+                entry.insert(value);
+                dict_write_barrier(obj);
+                Ok(value)
+            }
+        };
+    }
     let result = strategy.setdefault(obj, key, value);
     if take_dict_key_error() {
         return Err(DictKeyError);
@@ -1983,6 +2005,20 @@ pub unsafe fn w_dict_pop_checked(
         }
     } else {
         let strategy = (*(obj as *const W_DictObject)).dstrategy;
+        if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+            // `DictStrategy.pop` (`dictmultiobject.py:624-634`) performs one
+            // r_dict lookup followed by removal.  IndexMap's checked removal
+            // is the equivalent single hash/equality probe; a comparison
+            // exception reads as no match and is observed before returning.
+            let object_key = object_key_for_checked(key)?;
+            let dict = &mut *(obj as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+            let result = entries.shift_remove(&object_key);
+            if take_dict_key_error() {
+                return Err(DictKeyError);
+            }
+            return Ok(result);
+        }
         match strategy.pop(obj, key, None) {
             Ok(val) => {
                 if take_dict_key_error() {
