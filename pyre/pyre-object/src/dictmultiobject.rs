@@ -461,10 +461,16 @@ pub struct W_DictObject {
     /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py:47`).
     /// PyPy's `rerased`-erased storage; pyre uses `*mut u8` for the
     /// same opacity contract.  Each strategy `unerase(dict.dstorage)`
-    /// via a typed accessor (`w_dict_object_storage*` for the unified
-    /// `Vec<(PyObjectRef, PyObjectRef)>` shape).  Per-strategy native
-    /// storage layouts (`Vec<(i64, _)>`, `IndexMap<String, _>`, etc.)
-    /// follow in subsequent slices.
+    /// via a typed accessor.  The erased pointer is a GC-managed storage
+    /// box (`gc_alloc_storage_box`, one per-strategy concrete type:
+    /// [`ObjectDictStorage`] / [`IntDictStorage`] / [`BytesDictStorage`] /
+    /// `identitydict::IdentityDictStorage` / `kwargsdict::KwargsDictStorage`),
+    /// so `w_dict.dstorage = strategy.erase(new)` is a `setfield_gc` and the
+    /// old box is reclaimed by the sweep — matching PyPy's `r_dict` =
+    /// GcStruct("dicttable") (rdict.py:210).  A MapDictStrategy `dstorage` is
+    /// instead the backing instance (a GC edge, mapdict.rs); the side-table
+    /// holder ([`w_dict_new_unmanaged_side_table_value`]) keeps an off-GC
+    /// `malloc_raw` box.
     pub dstorage: *mut u8,
     pub dstrategy: &'static dyn crate::dictmultiobject::DictStrategy,
     /// Mutation state carried implicitly by PyPy's live strategy iterator.
@@ -564,6 +570,98 @@ pub unsafe fn w_dict_bytes_storage_mut<'a>(
 
 /// GC type id assigned to `W_DictObject` at JitDriver init time.
 pub const W_DICT_GC_TYPE_ID: u32 = 29;
+
+// ── dstorage GC-managed storage boxes ───────────────────────────────
+//
+// PyPy's `W_DictMultiObject.dstorage` (`dictmultiobject.py:47`) erases an
+// `r_dict` = `GcStruct("dicttable")` (rdict.py:210) — GC-managed, so
+// `w_dict.dstorage = strategy.erase(new)` is a `setfield_gc` and the old
+// table is reclaimed by the collector. pyre stores the same erased handle
+// as a `*mut u8`, but each concrete strategy backs it with a native Rust
+// container. Those containers now live in a GC-managed leaf box
+// (`gc_alloc_storage_box`, [`crate::gc_storage`]) tagged with a per-type
+// runtime-assigned id — the mapdict `W_MAPDICT_STORAGE_GC_TYPE_ID` leaf
+// precedent (`object_array.rs`). The box has no walker of its own; the
+// owning `W_DictObject`'s custom trace forwards the `dstorage` field slot
+// (keeping the box alive) and `DictStrategy::walk_gc_refs` walks the inner
+// PyObjectRef slots in place. Box reassignment on a strategy switch is a
+// plain field store; the unreachable old box is reclaimed by the sweep,
+// which runs the box tid's `storage_box_destructor` drop glue.
+//
+// Ids are auto-assigned (like the bigint box, `longobject.rs`) so they land
+// at the registry tail and don't perturb the fixed-const tid chain.
+
+/// `ObjectDictStrategy` / `UnicodeDictStrategy` backing — erased
+/// `r_dict(dict_keys_equal, hash_w)` (`dictmultiobject.py:1209`). Also the
+/// universal `switch_to_object_strategy` sink and the identity-dict
+/// promotion target.
+pub type ObjectDictStorage = indexmap::IndexMap<ObjectKey, PyObjectRef>;
+/// `IntDictStrategy` backing — erased `Dict[int, W_Root]`
+/// (`dictmultiobject.py:1339`).
+pub type IntDictStorage = indexmap::IndexMap<i64, PyObjectRef>;
+/// `BytesDictStrategy` backing — erased `Dict[str, W_Root]`
+/// (`dictmultiobject.py:1244`).
+pub type BytesDictStorage = indexmap::IndexMap<Vec<u8>, PyObjectRef>;
+
+macro_rules! dict_storage_gc_type_id {
+    ($atomic:ident, $setter:ident, $getter:ident, $ty:ty, $doc:literal) => {
+        #[doc = $doc]
+        static $atomic: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        #[doc = concat!("Record the GC type id registered for the `", stringify!($ty), "` box.")]
+        pub fn $setter(id: u32) {
+            $atomic.store(id, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[doc = concat!("Read the runtime-assigned GC type id for the `", stringify!($ty), "` box.")]
+        #[majit_macros::dont_look_inside]
+        pub fn $getter() -> u32 {
+            $atomic.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    };
+}
+
+dict_storage_gc_type_id!(
+    OBJECT_DICT_STORAGE_GC_TYPE_ID,
+    set_object_dict_storage_gc_type_id,
+    object_dict_storage_gc_type_id,
+    ObjectDictStorage,
+    "Runtime-assigned GC type id for the `ObjectDictStorage` box."
+);
+dict_storage_gc_type_id!(
+    INT_DICT_STORAGE_GC_TYPE_ID,
+    set_int_dict_storage_gc_type_id,
+    int_dict_storage_gc_type_id,
+    IntDictStorage,
+    "Runtime-assigned GC type id for the `IntDictStorage` box."
+);
+dict_storage_gc_type_id!(
+    BYTES_DICT_STORAGE_GC_TYPE_ID,
+    set_bytes_dict_storage_gc_type_id,
+    bytes_dict_storage_gc_type_id,
+    BytesDictStorage,
+    "Runtime-assigned GC type id for the `BytesDictStorage` box."
+);
+
+/// Reclaim an off-GC `ObjectDictStorage` box that is NOT collector-owned.
+///
+/// After the storage-box migration, a regular dict's `dstorage` is a
+/// GC-managed box reclaimed by the sweep (its tid carries the drop glue), so
+/// the sweep-time `dict_object_destructor` must not free it. The sole
+/// off-GC exception is [`w_dict_new_unmanaged_side_table_value`], whose
+/// holder is not GC-managed (root-walked, never custom-traced) and keeps a
+/// `malloc_raw` `ObjectDictStorage`. `try_gc_owns_object` discriminates —
+/// mirrors `object_array::dealloc_items_block`.
+///
+/// # Safety
+/// `dstorage` must be null or a valid `ObjectDictStorage` pointer.
+#[inline]
+pub unsafe fn dealloc_offgc_object_dict_storage(dstorage: *mut u8) {
+    if dstorage.is_null() {
+        return;
+    }
+    if !crate::gc_hook::try_gc_owns_object(dstorage) {
+        drop(Box::from_raw(dstorage as *mut ObjectDictStorage));
+    }
+}
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_DictObject>();
@@ -757,8 +855,10 @@ pub unsafe fn module_dict_register_version_watcher(
 /// when EmptyDictStrategy is active the Vec is observationally
 /// empty (the trait readers return empty without touching the slot).
 pub fn w_dict_new() -> PyObjectRef {
-    let entries: *mut indexmap::IndexMap<ObjectKey, PyObjectRef> =
-        crate::lltype::malloc_raw(indexmap::IndexMap::new());
+    let entries: *mut ObjectDictStorage = crate::gc_storage::gc_alloc_storage_box(
+        indexmap::IndexMap::new(),
+        object_dict_storage_gc_type_id(),
+    );
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
@@ -823,9 +923,14 @@ pub fn w_dict_new_with(
 /// These tables are not part of the translated object graph yet, so the dict
 /// holder itself must keep a stable raw address. The table walker traces the
 /// entries through [`w_dict_walk_entries_mut`] instead.
+///
+/// Unlike a regular dict, this holder is not GC-managed (it is `malloc_typed`'d
+/// with an object-root id and root-walked, never `dict_object_custom_trace`d),
+/// so its `dstorage` stays an off-GC `malloc_raw` box — the sole exception to
+/// the S2 GC-managed storage-box migration. `dealloc_offgc_object_dict_storage`
+/// frees it (its `try_gc_owns_object` guard is false for this box).
 pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
-    let entries: *mut indexmap::IndexMap<ObjectKey, PyObjectRef> =
-        crate::lltype::malloc_raw(indexmap::IndexMap::new());
+    let entries: *mut ObjectDictStorage = crate::lltype::malloc_raw(indexmap::IndexMap::new());
     crate::lltype::malloc_typed(W_DictObject {
         ob_header: PyObject {
             ob_type: &DICT_TYPE as *const PyType,
@@ -950,14 +1055,14 @@ pub struct W_ModuleDictObject {
 
 /// Free the three off-GC `malloc_raw` storages owned by a
 /// `W_ModuleDictObject`.  Called from the GC-sweep destructor
-/// (`pyre-jit::eval::module_dict_object_destructor`).  Mirrors
-/// `W_DictObject`'s `dstrategy.dealloc_storage`: the GC frees the
-/// `W_ModuleDictObject` cell itself, but its `dstorage`/`mstrategy`/
-/// `object_storage` are plain `Box::into_raw` allocations the GC never
-/// sees, so they must be reclaimed here.  Null-checked and nulled after
-/// free so a second call is a no-op.  The `PyObjectRef` values inside the
-/// dropped containers are `Copy` (no `Drop`), so dropping frees only the
-/// container heap, never a GC object.
+/// (`pyre-jit::eval::module_dict_object_destructor`).  A regular
+/// `W_DictObject`'s `dstorage` is a GC-managed storage box reclaimed by its
+/// own tid drop glue (off-GC storage epic S2), but a module dict's
+/// `dstorage`/`mstrategy`/`object_storage` are still plain `Box::into_raw`
+/// allocations the GC never sees, so they must be reclaimed here (S3 scope).
+/// Null-checked and nulled after free so a second call is a no-op.  The
+/// `PyObjectRef` values inside the dropped containers are `Copy` (no `Drop`),
+/// so dropping frees only the container heap, never a GC object.
 ///
 /// # Safety
 /// `obj` must point at a valid `W_ModuleDictObject` whose Boxes are not
@@ -2241,16 +2346,16 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     dst_dict.dstrategy = copy_dict.dstrategy;
     dst_dict.dstorage = copy_dict.dstorage;
     // `w_copy` is a consumed temporary.  Move, rather than alias, its storage:
-    // once W_DictObject has a GC destructor, leaving both dicts pointing at the
-    // same Box would let the temporary free the destination's live backing.
+    // leaving both dicts pointing at the same box would let the temporary's
+    // GC-box sweep reclaim the destination's live backing.  Null the copy's
+    // slot so only `dst` roots the moved box.
     copy_dict.dstorage = std::ptr::null_mut();
     dict_write_barrier(dst);
 
-    if !old_dstorage.is_null() {
-        drop(Box::from_raw(
-            old_dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
-        ));
-    }
+    // The destination previously held a placeholder Object-shape box; now
+    // unreachable, it is reclaimed by the sweep.  The off-GC side-table case
+    // is freed via the shared guarded helper.
+    dealloc_offgc_object_dict_storage(old_dstorage);
 }
 
 /// Get a value by int key (convenience wrapper).  Wraps the raw i64
@@ -3528,15 +3633,6 @@ pub trait DictStrategy {
     /// freshly-allocated erased storage for this strategy.  Required.
     fn get_empty_storage(&self) -> *mut u8;
 
-    /// Free the out-of-line `dstorage` container owned by this dict on
-    /// collection. Frees the Rust map/Vec backing ONLY; the `PyObjectRef`
-    /// keys/values are GC-managed and reclaimed by the collector.
-    ///
-    /// # Safety
-    /// `w_dict` must be a valid `W_DictObject` whose strategy is `self`, and
-    /// called at most once (from the GC destructor of a swept dict).
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef);
-
     /// `dictmultiobject.py:469-470 getitem` — required.
     ///
     /// # Safety
@@ -3943,24 +4039,19 @@ impl EmptyDictStrategy {
     ///     w_dict.dstorage = storage
     /// ```
     ///
-    /// Pyre additionally drops the legacy empty
-    /// `Vec<(PyObjectRef, PyObjectRef)>` allocated by `w_dict_new`
-    /// (`malloc_raw`/`Box::into_raw` pair) before installing the
-    /// fresh `IntDictStrategy::get_empty_storage` typed `Vec<(i64,
-    /// PyObjectRef)>` — PyPy's GC reclaims the unreachable storage
-    /// automatically; pyre needs the explicit `Box::from_raw` drop.
+    /// The placeholder Object-shape box allocated by `w_dict_new` is a
+    /// GC-managed storage box; overwriting `dstorage` with the fresh
+    /// `IntDictStrategy::get_empty_storage` box leaves the old one
+    /// unreachable, and the sweep reclaims it — matching `w_dict.dstorage
+    /// = storage`, where the GC frees the previous backing.
     ///
     /// # Safety
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
     /// is currently `EmptyDictStrategy`.
     unsafe fn switch_to_int_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        if !dict.dstorage.is_null() {
-            drop(Box::from_raw(
-                dict.dstorage
-                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-            ));
-        }
+        // Overwrite the placeholder box (`setfield_gc`); the unreachable old
+        // Object-shape box is reclaimed by the sweep.
         dict.dstorage = INT_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &INT_DICT_STRATEGY;
     }
@@ -3974,21 +4065,14 @@ impl EmptyDictStrategy {
     ///     w_dict.dstorage = storage
     /// ```
     ///
-    /// Pyre drops the legacy empty `Vec<(PyObjectRef, PyObjectRef)>`
-    /// before installing the typed `Vec<(Vec<u8>, PyObjectRef)>` from
-    /// `BytesDictStrategy::get_empty_storage` — same lifetime
-    /// contract as `switch_to_int_strategy`.
+    /// The field overwrite is a `setfield_gc`; the unreachable old
+    /// Object-shape placeholder box is reclaimed by the sweep — same
+    /// lifetime contract as `switch_to_int_strategy`.
     ///
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_bytes_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        if !dict.dstorage.is_null() {
-            drop(Box::from_raw(
-                dict.dstorage
-                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-            ));
-        }
         dict.dstorage = BYTES_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &BYTES_DICT_STRATEGY;
     }
@@ -4013,12 +4097,6 @@ impl EmptyDictStrategy {
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_identity_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        if !dict.dstorage.is_null() {
-            drop(Box::from_raw(
-                dict.dstorage
-                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-            ));
-        }
         dict.dstorage = crate::identitydict::IDENTITY_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &crate::identitydict::IDENTITY_DICT_STRATEGY;
     }
@@ -4108,10 +4186,6 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     fn get_empty_storage(&self) -> *mut u8 {
         EMPTY_DICT_STRATEGY.get_empty_storage()
     }
-
-    /// `w_dict_new_kwargs` represents `erased(None)` with a null pointer;
-    /// there is no allocation to reclaim while this strategy is active.
-    unsafe fn dealloc_storage(&self, _w_dict: PyObjectRef) {}
 
     /// An empty kwargs dict has the `erased(None)` null `dstorage` from
     /// `w_dict_new_kwargs` and holds no entries — `setitem`/`setitem_str`
@@ -4220,32 +4294,15 @@ impl DictStrategy for EmptyDictStrategy {
         std::ptr::null_mut()
     }
 
-    /// Regular empty dicts carry a per-dict Object-shape placeholder allocated
-    /// by `w_dict_new`; it is not the shared/null `erased(None)` sentinel.
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage
-                as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-        ));
-    }
-
     /// `dictmultiobject.py:732-736 EmptyDictStrategy.switch_to_object_strategy`
     /// — `storage = strategy.get_empty_storage(); w_dict.set_strategy(strategy);
-    /// w_dict.dstorage = storage`.  Allocates a fresh Object-shape Vec
+    /// w_dict.dstorage = storage`.  Allocates a fresh Object-shape box
     /// so subclasses whose `dstorage` is null (`w_dict_new_kwargs`)
     /// don't end up with an OBJECT_DICT_STRATEGY label over a null
-    /// pointer.  Regular `w_dict_new` already keeps a non-null legacy
-    /// Vec; the drop+replace mirrors PyPy's `dstorage = storage`
-    /// assignment.
+    /// pointer.  The field overwrite is a `setfield_gc`; the unreachable
+    /// old placeholder box is reclaimed by the sweep.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        if !dict.dstorage.is_null() {
-            drop(Box::from_raw(
-                dict.dstorage
-                    as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-            ));
-        }
         dict.dstorage = OBJECT_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &OBJECT_DICT_STRATEGY;
     }
@@ -4416,18 +4473,13 @@ impl DictStrategy for ObjectDictStrategy {
         // hash_w)`.  Pyre's typed map is
         // `IndexMap<ObjectKey, PyObjectRef>` — hash bucket for O(1)
         // lookup that also preserves insertion order (CPython 3.7+ /
-        // PyPy3 dict semantics).
-        let v: Box<indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>> =
-            Box::new(indexmap::IndexMap::new());
-        Box::into_raw(v) as *mut u8
-    }
-
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage
-                as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-        ));
+        // PyPy3 dict semantics).  GC-managed box (`gc_alloc_storage_box`):
+        // `w_dict.dstorage = strategy.erase(new)` is a `setfield_gc`, the
+        // old box reclaimed by the sweep.
+        crate::gc_storage::gc_alloc_storage_box(
+            crate::dictmultiobject::ObjectDictStorage::new(),
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `dictmultiobject.py:1213-1215 getitem` — `self.unerase
@@ -4518,9 +4570,11 @@ impl DictStrategy for ObjectDictStrategy {
     /// the proxy survive.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage
-            as *const indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>);
-        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        let storage = &*(dict.dstorage as *const crate::dictmultiobject::ObjectDictStorage);
+        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            storage.clone(),
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        );
         crate::dictmultiobject::w_dict_new_with(&OBJECT_DICT_STRATEGY, new_storage as *mut u8)
     }
 }
@@ -4575,14 +4629,19 @@ impl DictStrategy for BytesDictStrategy {
     /// `w_bytes_from_bytes`, drops the typed box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
-        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
-            indexmap::IndexMap::with_capacity(old.len());
+        // Borrow the old typed box (its field stays live, so it is traced
+        // while the migration allocates keys); after the store the box is
+        // unreachable and the sweep reclaims it.
+        let old = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
+        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
         for (k, v) in old.iter() {
             let w_key = crate::w_bytes_from_bytes(k.as_slice());
             new_map.insert(crate::dictmultiobject::object_key_for(w_key), *v);
         }
-        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
+        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+            new_map,
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        ) as *mut u8;
         dict.dstrategy = &OBJECT_DICT_STRATEGY;
     }
 
@@ -4590,17 +4649,12 @@ impl DictStrategy for BytesDictStrategy {
     /// with `mark_dict_non_null` hint.  Pyre stores the typed map as
     /// `IndexMap<Vec<u8>, PyObjectRef>`: a hash bucket for O(1) lookup
     /// that also preserves insertion order (CPython 3.7+ / PyPy3 dict
-    /// semantics).
+    /// semantics).  GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<indexmap::IndexMap<Vec<u8>, PyObjectRef>> = Box::new(indexmap::IndexMap::new());
-        Box::into_raw(v) as *mut u8
-    }
-
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>,
-        ));
+        crate::gc_storage::gc_alloc_storage_box(
+            crate::dictmultiobject::BytesDictStorage::new(),
+            crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
@@ -4703,8 +4757,11 @@ impl DictStrategy for BytesDictStrategy {
     /// with the same BytesDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage as *const indexmap::IndexMap<Vec<u8>, PyObjectRef>);
-        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
+        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            storage.clone(),
+            crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
+        );
         crate::dictmultiobject::w_dict_new_with(&BYTES_DICT_STRATEGY, new_storage as *mut u8)
     }
 }
@@ -4759,17 +4816,11 @@ impl DictStrategy for UnicodeDictStrategy {
         // shares ObjectDictStrategy's `IndexMap<ObjectKey, PyObjectRef>`
         // backing — str-keyed `dict_keys_equal` matches `unicode_eq`
         // for the str fast-path callers (`dictmultiobject.py:1311-1318`).
-        let v: Box<indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>> =
-            Box::new(indexmap::IndexMap::new());
-        Box::into_raw(v) as *mut u8
-    }
-
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage
-                as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
-        ));
+        // GC-managed box (`setfield_gc` on reassign).
+        crate::gc_storage::gc_alloc_storage_box(
+            crate::dictmultiobject::ObjectDictStorage::new(),
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
@@ -4903,9 +4954,11 @@ impl DictStrategy for UnicodeDictStrategy {
     /// route through `w_dict_copy`'s union-walk fallback.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage
-            as *const indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>);
-        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        let storage = &*(dict.dstorage as *const crate::dictmultiobject::ObjectDictStorage);
+        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            storage.clone(),
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        );
         crate::dictmultiobject::w_dict_new_with(&UNICODE_DICT_STRATEGY, new_storage as *mut u8)
     }
 }
@@ -4971,14 +5024,19 @@ impl DictStrategy for IntDictStrategy {
     /// `IndexMap<i64, PyObjectRef>` box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
-        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
-            indexmap::IndexMap::with_capacity(old.len());
+        // Borrow the old typed box (its field stays live, so it is traced
+        // while the migration allocates keys); after the store the box is
+        // unreachable and the sweep reclaims it.
+        let old = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
+        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
         for (&k, &v) in old.iter() {
             let w_key = crate::w_int_new(k);
             new_map.insert(crate::dictmultiobject::object_key_for(w_key), v);
         }
-        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
+        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+            new_map,
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        ) as *mut u8;
         dict.dstrategy = &OBJECT_DICT_STRATEGY;
     }
 
@@ -4986,17 +5044,13 @@ impl DictStrategy for IntDictStrategy {
     /// — `erase({})` (typed `Dict[int, W_Root]` in RPython).  Pyre
     /// stores the typed map as `IndexMap<i64, PyObjectRef>`: a hash
     /// bucket for O(1) lookup that also preserves insertion order
-    /// (CPython 3.7+ / PyPy3 dict semantics).
+    /// (CPython 3.7+ / PyPy3 dict semantics).  GC-managed box
+    /// (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<indexmap::IndexMap<i64, PyObjectRef>> = Box::new(indexmap::IndexMap::new());
-        Box::into_raw(v) as *mut u8
-    }
-
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>,
-        ));
+        crate::gc_storage::gc_alloc_storage_box(
+            crate::dictmultiobject::IntDictStorage::new(),
+            crate::dictmultiobject::int_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
@@ -5095,8 +5149,11 @@ impl DictStrategy for IntDictStrategy {
     /// the same IntDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage as *const indexmap::IndexMap<i64, PyObjectRef>);
-        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        let storage = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
+        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            storage.clone(),
+            crate::dictmultiobject::int_dict_storage_gc_type_id(),
+        );
         crate::dictmultiobject::w_dict_new_with(&INT_DICT_STRATEGY, new_storage as *mut u8)
     }
 }

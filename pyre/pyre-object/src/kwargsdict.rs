@@ -53,6 +53,26 @@ pub struct KwargsDictStrategy;
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
 pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
 
+/// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays
+/// (`kwargsdict.py:27-29`). GC-managed storage box (mirrors the other
+/// dict strategies; see `dictmultiobject::ObjectDictStorage`).
+pub type KwargsDictStorage = (Vec<PyObjectRef>, Vec<PyObjectRef>);
+
+/// Runtime-assigned GC type id for the [`KwargsDictStorage`] box.
+static KWARGS_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the [`KwargsDictStorage`] box.
+pub fn set_kwargs_dict_storage_gc_type_id(id: u32) {
+    KWARGS_DICT_STORAGE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the [`KwargsDictStorage`] box.
+#[majit_macros::dont_look_inside]
+pub fn kwargs_dict_storage_gc_type_id() -> u32 {
+    KWARGS_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `kwargsdict.py:62` size threshold past which the strategy
 /// promotes itself to UnicodeDictStrategy to avoid O(n) lookup
 /// degeneracy on too-large kwarg dicts.
@@ -91,8 +111,13 @@ impl KwargsDictStrategy {
     /// further promote to ObjectDictStrategy.
     unsafe fn switch_to_unicode_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
-        let (keys_w, values_w) = *old;
+        // Drain the parallel arrays out of the old box (leaving it holding
+        // empty Vecs); after `dstorage` is overwritten the box is unreachable
+        // and the sweep drops it. `std::mem::take` mirrors the old
+        // `Box::from_raw` move without freeing the GC-managed box here.
+        let old = &mut *(dict.dstorage as *mut KwargsDictStorage);
+        let keys_w = std::mem::take(&mut old.0);
+        let values_w = std::mem::take(&mut old.1);
         dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY;
         for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
@@ -107,16 +132,12 @@ impl DictStrategy for KwargsDictStrategy {
     }
 
     /// `kwargsdict.py:30-32 get_empty_storage` — erased `([], [])`.
+    /// GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<(Vec<PyObjectRef>, Vec<PyObjectRef>)> = Box::new((Vec::new(), Vec::new()));
-        Box::into_raw(v) as *mut u8
-    }
-
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>),
-        ));
+        crate::gc_storage::gc_alloc_storage_box(
+            KwargsDictStorage::default(),
+            kwargs_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `kwargsdict.py:134-141 switch_to_object_strategy` — walk
@@ -124,14 +145,19 @@ impl DictStrategy for KwargsDictStrategy {
     /// retire the typed parallel-array box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
-        let (keys_w, values_w) = *old;
-        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
-            indexmap::IndexMap::with_capacity(keys_w.len());
-        for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
-            new_map.insert(crate::dictmultiobject::object_key_for(k), v);
+        // Borrow the old typed box (its field stays live, so it is traced
+        // while the migration builds the object map); after the store the
+        // box is unreachable and the sweep reclaims it. `PyObjectRef` is a
+        // raw pointer (Copy), so iterate by reference and copy each slot.
+        let old = &*(dict.dstorage as *const KwargsDictStorage);
+        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.0.len());
+        for (k, v) in old.0.iter().zip(old.1.iter()) {
+            new_map.insert(crate::dictmultiobject::object_key_for(*k), *v);
         }
-        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
+        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+            new_map,
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        ) as *mut u8;
         dict.dstrategy = &OBJECT_DICT_STRATEGY;
     }
 
@@ -222,17 +248,14 @@ impl DictStrategy for KwargsDictStrategy {
     }
 
     /// `kwargsdict.py:131-132 clear` — `w_dict.dstorage =
-    /// self.get_empty_storage()`.  Pyre drops the typed parallel-array
-    /// box and installs a fresh empty pair.
+    /// self.get_empty_storage()`.  The field overwrite is a `setfield_gc`;
+    /// the unreachable old parallel-array box is reclaimed by the sweep.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>));
         if !storage.0.is_empty() {
             dict.keys_version = dict.keys_version.wrapping_add(1);
         }
-        drop(Box::from_raw(
-            dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>),
-        ));
         dict.dstorage = self.get_empty_storage();
     }
 
@@ -263,7 +286,10 @@ impl DictStrategy for KwargsDictStrategy {
     /// same KwargsDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let storage = kwargs_storage(w_dict);
-        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            storage.clone(),
+            kwargs_dict_storage_gc_type_id(),
+        );
         crate::dictmultiobject::w_dict_new_with(&KWARGS_DICT_STRATEGY, new_storage as *mut u8)
     }
 }

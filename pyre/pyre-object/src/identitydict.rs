@@ -40,6 +40,26 @@ impl PartialEq for IdentityKey {
 
 impl Eq for IdentityKey {}
 
+/// `IdentityDictStrategy` backing — erased identity-keyed `{}`
+/// (`identitydict.py:30`). GC-managed storage box (mirrors the other
+/// dict strategies; see `dictmultiobject::ObjectDictStorage`).
+pub type IdentityDictStorage = indexmap::IndexMap<IdentityKey, PyObjectRef>;
+
+/// Runtime-assigned GC type id for the [`IdentityDictStorage`] box.
+static IDENTITY_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the [`IdentityDictStorage`] box.
+pub fn set_identity_dict_storage_gc_type_id(id: u32) {
+    IDENTITY_DICT_STORAGE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the [`IdentityDictStorage`] box.
+#[majit_macros::dont_look_inside]
+pub fn identity_dict_storage_gc_type_id() -> u32 {
+    IDENTITY_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Typed read accessor — `dictmultiobject.py:1063 IdentityDictStrategy.unerase
 /// (w_dict.dstorage)`.
 ///
@@ -129,13 +149,18 @@ impl DictStrategy for IdentityDictStrategy {
     /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let old = Box::from_raw(dict.dstorage as *mut indexmap::IndexMap<IdentityKey, PyObjectRef>);
-        let mut new_map: indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef> =
-            indexmap::IndexMap::with_capacity(old.len());
+        // Borrow the old typed box (its field stays live, so it is traced
+        // while the migration builds the object map); after the store the
+        // box is unreachable and the sweep reclaims it.
+        let old = &*(dict.dstorage as *const IdentityDictStorage);
+        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
         for (k, &v) in old.iter() {
             new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
         }
-        dict.dstorage = Box::into_raw(Box::new(new_map)) as *mut u8;
+        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+            new_map,
+            crate::dictmultiobject::object_dict_storage_gc_type_id(),
+        ) as *mut u8;
         dict.dstrategy = &OBJECT_DICT_STRATEGY;
     }
 
@@ -143,17 +168,12 @@ impl DictStrategy for IdentityDictStrategy {
     /// non-null hint.  Pyre stores
     /// `IndexMap<IdentityKey, PyObjectRef>` — identity-keyed hash
     /// bucket for O(1) lookup + insertion-order preserving iteration.
+    /// GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        let v: Box<indexmap::IndexMap<IdentityKey, PyObjectRef>> =
-            Box::new(indexmap::IndexMap::new());
-        Box::into_raw(v) as *mut u8
-    }
-
-    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        drop(Box::from_raw(
-            dict.dstorage as *mut indexmap::IndexMap<IdentityKey, PyObjectRef>,
-        ));
+        crate::gc_storage::gc_alloc_storage_box(
+            IdentityDictStorage::new(),
+            identity_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem` —
@@ -238,7 +258,10 @@ impl DictStrategy for IdentityDictStrategy {
     /// same IdentityDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let storage = identity_storage(w_dict);
-        let new_storage = Box::into_raw(Box::new(storage.clone()));
+        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            storage.clone(),
+            identity_dict_storage_gc_type_id(),
+        );
         crate::dictmultiobject::w_dict_new_with(&IDENTITY_DICT_STRATEGY, new_storage as *mut u8)
     }
 

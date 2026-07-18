@@ -150,12 +150,57 @@ host 컨테이너를 쓰기 때문에 필요한 PRE-EXISTING-ADAPTATION의 확�
 소멸; 3-backend bit-exact (set 연산 + `frozenset({1})|{2}` GC-stress);
 `set_object_destructor` 제거 후 leak/double-free 없음(GC-stress + valgrind-류 오라클).
 
-### S2 — regular dict `dstorage` (Object/Int/Bytes/Unicode 전략)
-- `w_dict_new`/`w_dict_new_kwargs`/전략 switch: `malloc_raw` → storage-box.
-- 각 전략의 `dealloc_storage` (`Box::from_raw`) 제거; `dict_object_custom_trace`
-  (strategy `walk_gc_refs`)를 블록-2단으로.
-- `switch_to_object_strategy` 등 저장소 교체 = 재대입.
-검증: dict 연산 census wall 감소; GC-stress dict.
+### S2 — regular dict `dstorage` (Object/Int/Bytes/Unicode/Identity/Kwargs 전략) ✅ 구현 완료(미커밋)
+**⚠️ census-NEUTRAL 판정**: S1 랜딩 후 새 census(294 heads, LLBC 재추출)에서 dict/set 어느
+head도 storage box에서 **먼저** 막히지 않음 — 전부 host-container 메서드
+(`IndexMap::insert`/`get`, `box_assume_init_into_vec`, `Map::collect`)가 박스 **앞**에서
+막는다. `Box::from_raw`(`dealloc_storage`)는 GC-sweep 때만 실행 → 애초에 census 벽 아님.
+따라서 S2는 census head 0개 감소. 사용자가 "parity cleanup 계속" 선택 → RPython GC-managed
+`r_dict` 대비 NEW-DEVIATION(off-GC storage) 정통화 목적으로만 진행.
+
+구현(5개 erased concrete 타입 전부 한 번에 — sub-slice는 mixed state로 더 지저분):
+- 타입 별칭 + auto-id TID atomic + set/get fn: `ObjectDictStorage`(Object/Unicode/Empty
+  placeholder/모든 switch_to_object sink), `IntDictStorage`, `BytesDictStorage`
+  (dictmultiobject.rs, macro `dict_storage_gc_type_id!`), `IdentityDictStorage`
+  (identitydict.rs), `KwargsDictStorage`=(Vec,Vec) (kwargsdict.rs).
+- 각 `get_empty_storage`/`copy` → `gc_alloc_storage_box`.
+- `switch_to_object_strategy` migration: 옛 박스를 **borrow**로 읽음(Box::from_raw 아님 —
+  필드가 살아있어 per-elem `w_int_new`/`w_bytes` 할당 동안 traced), 스택 `new_map` 구축,
+  최종 store = gc 박스. kwargs `switch_to_unicode`는 `mem::take(&mut old.0/1)`로 drain.
+- 모든 `Box::from_raw` dealloc_storage / switch_to_int/bytes/identity 옛-free /
+  kwargs clear() free / `w_dict_adopt` 옛-free **제거** →
+  `dealloc_offgc_object_dict_storage(dstorage)` (try_gc_owns_object 가드; 유일한 off-GC
+  경우 = `w_dict_new_unmanaged_side_table_value` 사이드테이블, malloc_raw 유지,
+  custom-trace 아니라 root-walk).
+- eval.rs: `dict_object_custom_trace`가 `strategy_kind != Map && try_gc_owns_object`일 때
+  dstorage 박스-슬롯 forward (Map dstorage=backing instance, 자기 walk_gc_refs가 forward).
+  build_gc tail에 5개 leaf 박스 등록(set 박스 뒤, freeze_types 전), auto-id → fixed-const
+  TID chain 불변.
+- **`W_DictObject`에서 `.with_destructor_fn(dict_object_destructor)` 제거**(S1 set과 동일):
+  박스가 자기 tid drop glue로 유일 회수자. 두 회수자(owner destructor + box destructor)를
+  destructor 리스트에 두면 **sweep-order double-free** — 박스가 owner dict보다 먼저 sweep되면
+  oldgen에서 빠져 `try_gc_owns_object`가 false → dict destructor가 이미 free된 버퍼를
+  `Box::from_raw` → 이중 free. native malloc은 조용히 허용, **wasm dlmalloc만 assert**
+  (`psize >= size + min_overhead`). `dict_object_destructor` fn 삭제(re-wire 함정).
+  유일한 off-GC dstorage(side table)는 **immortal `malloc_typed` holder**로 sweep 안 됨 →
+  dict destructor 필요 없었음. `DictStrategy::dealloc_storage` 체인은 dead → cleanup으로
+  **trait method + 10개 impl 전부 삭제**(dictmultiobject ×6, EmptyKwargs, identitydict,
+  kwargsdict, celldict ModuleDict, mapdict MapDict; RPython GC-managed `r_dict`에는 per-strategy
+  dealloc 없음 = orthodox). `dealloc_offgc_object_dict_storage`는 `w_dict_adopt`의 LIVE 변이
+  경로(:2259, off-GC side-table placeholder만 free) 한 곳에서만 유지.
+- **GC-safety 검증**: gc_alloc_storage_box=try_gc_alloc_stable_raw NON-collecting
+  (object_array.rs:189); w_dict_new의 alloc_dict_object(false)=try_gc_alloc NO-collect 훅
+  (gc_hook.rs:145)→박스+dict 할당 사이 safepoint 없음(S1 set과 동일); migration 루프
+  safepoint-free(w_int_new=stable, 경로에 safepoint() 없음).
+✅ 검증 전부 통과: 단위 pyre-object 213 + pyre-jit 312+6 pass (w_dict_tid debug_assert chain 유지);
+wasm double-free 크래시 수정 확인 (`dict_update_hot` wasm PASS 25.2x, 이전 dlmalloc JIT-PANIC);
+gc-stress dict oracle ok; check.py 3-backend ALL PASSED (dynasm 223/cranelift 223/wasm 222);
+**census EXACTLY neutral 294→294** (S1-base와 S2-fix를 동일 방법론(LLBC 재추출→캐시 클리어→census
+빌드)으로 각각 측정: 0 added / 0 removed). 이전 세션의 "+1 typing_intrinsic"은 stale-methodology
+아티팩트로 판명 — zero-leverage 예측 재확인.
+**⚠️ S3-S5 LANDMINE**: off-GC 저장소를 GC 박스로 옮기면 owner의 sweep-time storage
+destructor를 반드시 삭제. `.with_destructor_fn` on owner + `storage_box_destructor` on box
+= 잠복 double-free(wasm만 노출). moduledict/bytes/bytearray/unicode/long 동일 점검.
 
 ### S3 — moduledict (dstorage/mstrategy/object_storage 3-way)
 `celldict.rs` `ModuleDictStorage` + `ModuleDictStrategy.caches` (Rc<RefCell>!) —
