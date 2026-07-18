@@ -1487,10 +1487,7 @@ impl MIFrame {
                 // resume coordinate at this capture seam. A missing twin uses
                 // the existing trace-abort path below rather than guessing a
                 // block-head position from `live_pc`.
-                match self
-                    .loop_close_marker_jit_pc
-                    .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
-                {
+                match self.loop_close_marker_jit_pc {
                     Some(jit_pc) => Some(jit_pc),
                     None => {
                         // This (parent) frame reports a `live_pc` the jitcode
@@ -4060,14 +4057,10 @@ impl MIFrame {
                 &[]
             };
             let parent_pc = Self::marker_aware_parent_resume_pc(parent.call_pc, parent.resume_pc);
-            let parent_word = if crate::jitcode_dispatch::m369_pframe_carry_enabled() {
-                parent
-                    .resume_marker_jit_pc
-                    .map(|m| m as i32)
-                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-            } else {
-                majit_ir::resumedata::NO_JITCODE_PC
-            };
+            let parent_word = parent
+                .resume_marker_jit_pc
+                .map(|m| m as i32)
+                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
             let parent_pc_word =
                 crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
                     .and_then(|payload| {
@@ -4129,13 +4122,10 @@ impl MIFrame {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let top_snapshot_types = &top_snapshot_types_full[n..];
         let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
-        let top_word = if crate::jitcode_dispatch::m73_loopclose_carry_enabled() {
-            self.loop_close_marker_jit_pc
-                .map(|m| m as i32)
-                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-        } else {
-            majit_ir::resumedata::NO_JITCODE_PC
-        };
+        let top_word = self
+            .loop_close_marker_jit_pc
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
         let payload = unsafe { &(&*self.sym().jitcode).payload };
         let resolved = payload.resolve_resume_pc_with_jitcode_pc(top_word, crate::state::op_live());
         if resolved.is_none() {

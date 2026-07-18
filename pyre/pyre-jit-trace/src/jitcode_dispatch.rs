@@ -759,8 +759,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// snapshot frame's Python PC.
     pub entry_py_pc: EntryPyPc,
     /// Codewrite-time resume-marker twin for the outer snapshot coordinate
-    /// (`entry_py_pc`), carried by the arm-path snapshot word under
-    /// `PYRE_M73_ARMPATH_CARRY`. `None` when the creation site has no
+    /// (`entry_py_pc`), carried by the arm-path snapshot word. `None` when the
+    /// creation site has no
     /// jitcode-native outer coordinate.
     pub outer_resume_marker_jit_pc: Option<usize>,
     /// JitCode index of the **outer** `PyJitCode.jitcode` — the Python
@@ -963,8 +963,7 @@ pub enum DispatchOutcome {
         jump_args: Vec<OpRef>,
         loop_header_pc: usize,
         /// Codewrite-time resume-marker twin at the merge point op's jitcode
-        /// offset, carried into the loop-close guards' snapshot words under
-        /// `PYRE_M73_LOOPCLOSE_CARRY`.
+        /// offset, carried into the loop-close guards' snapshot words.
         loop_header_marker_jit_pc: Option<usize>,
     },
     /// `jit_merge_point/cIRFIRF` reached a loop header that already has
@@ -3063,7 +3062,7 @@ fn compute_bridge_root_parent_frame(
     let root_word = ((root_pc as i32) != majit_ir::resumedata::NO_JITCODE_PC
         && (root_pc as i32) >= 0)
         .then_some(root_pc);
-    let root_liveness_word = match root_word.filter(|_| m73_outercap_carry_enabled()) {
+    let root_liveness_word = match root_word {
         Some(w) => w as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
@@ -3078,8 +3077,7 @@ fn compute_bridge_root_parent_frame(
         None,
         // Key the query off the same carried root-frame word the snapshot and
         // decode side read from `frames[0].jitcode_pc`, so both resolve the
-        // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
-        // the sentinel-based decode path.
+        // identical liveness window.
         root_liveness_word,
         root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
@@ -3668,7 +3666,7 @@ pub(crate) fn drive_outer_frame_continuation(
         // Mirror `compute_bridge_root_parent_frame` so scatter reads the banks in collection order.
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             outer_jitcode_index as i32,
-            match root_word.filter(|_| m73_outercap_carry_enabled()) {
+            match root_word {
                 Some(w) => w as i32,
                 None => majit_ir::resumedata::NO_JITCODE_PC,
             },
@@ -7495,8 +7493,8 @@ fn collect_outer_active_boxes(
                             .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                             .unwrap_or(0)
                             as usize,
-                        // A non-default gate-off configuration can still supply
-                        // no entry coordinate. It has no entry metadata.
+                        // Defensive default for a genuinely absent entry
+                        // coordinate (marker miss); 0-fire across the corpus.
                         _ => 0,
                     }
                 };
@@ -7535,6 +7533,8 @@ fn collect_outer_active_boxes(
                     .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                     .map(ToOwned::to_owned)
                     .unwrap_or_default(),
+                // Defensive default for a genuinely absent entry coordinate
+                // (marker miss); 0-fire across the corpus.
                 _ => Vec::new(),
             }
         }
@@ -8175,38 +8175,6 @@ pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
 pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOOP_CALLEE_CA") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M366_NONBRANCH_PC` (#366, default OFF): carry a direct JitCode
-/// resume pc for the non-branch specialization guards (`GuardValue` /
-/// `GuardClass`) instead of the `NO_JITCODE_PC` sentinel, so their resume
-/// decode consults the carried word rather than the stored Python pc →
-/// jitcode translation.
-///
-/// The carried word is the guard's codewrite-time `-live-` marker offset —
-/// not the guard op's raw
-/// `op_pc`.  These guards resume by re-executing their own opcode at
-/// `orgpc` with a deterministic operand stack (no kept temp), so the
-/// marker is a valid startpoint
-/// (`can_decode_live_vars`
-/// holds) AND identical to what the decoder would translate to — the encoder
-/// (`collect_outer_active_boxes` reg banks) and decoder (`setposition` /
-/// liveness) resolve the same offset, keeping the box layout symmetric.
-/// Carrying the raw `op_pc` (which may sit mid-opcode,
-/// `op_pc != marker`) is what broke the earlier attempt;
-/// anchoring to the marker
-/// avoids that.  Default ON — corpus-wide OFF/ON byte-equality validated on
-/// both backends (171/171 dynasm + cranelift); opt out with
-/// `PYRE_M366_NONBRANCH_PC=0`.
-pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M366_NONBRANCH_PC") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -11000,185 +10968,6 @@ fn pcmap_entrypc_audit_ctx_read(ctx: &WalkContext<'_, '_>, site: &'static str) {
     pcmap_entrypc_audit_probe(site, ctx.entry_py_pc.audit_variant(), "-");
 }
 
-/// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
-/// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
-/// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
-/// `pyjitpl.py:198`) instead of a py_pc-keyed block-head
-/// block-head marker — the genuine JitCode cursor the migration authors resume
-/// data from. Byte-behavior-identical: the per-op anchor coincides with the
-/// marker for 99%+ of specialization captures (`PYRE_M73_PEROP_AUDIT` census),
-/// and the divergent minority resumes correctly (per-op == `self.pc -
-/// SIZE_LIVE_OP`). Validated OFF==ON on check.py (155x2), cpython_tests
-/// (39x2), and extra_tests (219x2), both backends. Opt out with
-/// `PYRE_M73_PEROP_CARRY=0`.
-pub(crate) fn m73_perop_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_PEROP_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_BRANCH_CARRY` (#73 S3.5, default ON): the terminal branch-guard
-/// flip. A depth-0 `GuardTrue`/`GuardFalse` sources its resume word from the
-/// walk's arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
-/// `orgpc`) TAGGED into the negative space of the `jitcode_pc` word (plus a
-/// 1-bit flavor), instead of a py_pc-keyed block-head
-/// marker. Byte-identical by construction: encode carries the tagged word only
-/// when its decode-side expansion ([`expand_branch_carried`]) reproduces the
-/// baseline `marker` (self-cert), and decode expands it back to that same
-/// `marker` before any consumer reads it. Disabled (`PYRE_M73_BRANCH_CARRY=0`)
-/// → encode never emits a tagged word, so the decode expand is a no-op and the
-/// carried word is the block-head `marker` as before. Certified by
-/// `PYRE_M73_FLIP_AUDIT` (S3.4) and check.py (159×2, on and off).
-pub(crate) fn m73_branch_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_BRANCH_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_S1MARKER_CARRY` (#73 S5 phase-3 slice-1, default ON): source
-/// the remaining nonbranch guard resume words from the codewrite-time
-/// jitcode-keyed resume-marker twin. Twin-`None` rows retain the sentinel.
-/// Certified by the `M73_S1MARKER` census (100% eq=1, 1575 captures across
-/// 119 bench+synth programs) and check.py (161×2, on and off). Disable with
-/// `PYRE_M73_S1MARKER_CARRY=0`.
-pub(crate) fn m73_s1marker_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_S1MARKER_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_PFMARKER_CARRY` (#73 S5 phase-3 slice-3, default ON): carry
-/// each paused parent frame's codewrite-time resume-marker twin in its frame
-/// word. Certified by the `M73_PFMARKER` census (inline rows 447/447 eq=1;
-/// twin-`None` rows keep the sentinel) and check.py (162×2, on and off).
-/// Disable with `PYRE_M73_PFMARKER_CARRY=0`.
-pub(crate) fn m73_pfmarker_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_PFMARKER_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M369_PFRAME_CARRY` (gh#369 phase-1 slice-1, default ON): carry
-/// trace-opcode framestack parent resume-marker twins in their frame words.
-/// Disable with `PYRE_M369_PFRAME_CARRY=0`.
-pub(crate) fn m369_pframe_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M369_PFRAME_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_ARMPATH_CARRY` (#73 S5 phase-3 slice-4, default ON): carry
-/// the outer snapshot coordinate's codewrite-time resume-marker twin in the
-/// per-opcode arm-path snapshot word. Certified by the `M73_ARMPATH` census
-/// (2105 captures across 8 bench+synth programs, 100% eq=1; twin-`None`
-/// rows keep the sentinel) and check.py (162×2, on and off). Disable with
-/// `PYRE_M73_ARMPATH_CARRY=0`.
-pub(crate) fn m73_armpath_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMPATH_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_LOOPCLOSE_CARRY` (#73 S5 phase-3 slice-6, default ON): carry
-/// the merge-point resume-marker twin into the back-edge eval-breaker poll
-/// and `GuardFutureCondition` loop-close snapshot words. Certified by the
-/// `M73_LOOPCLOSE` census (362 captures across pyre/bench + synth, 100%
-/// eq=1) and check.py (162×2, on and off). Disable with
-/// `PYRE_M73_LOOPCLOSE_CARRY=0`.
-pub(crate) fn m73_loopclose_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LOOPCLOSE_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_LCLIVE_CARRY` (#73 S5 phase-5 slice-2, default ON): resolve
-/// the loop-close guards' liveness coordinate in
-/// `get_list_of_active_boxes` from the merge-point resume-marker twin
-/// (`MIFrame::loop_close_marker_jit_pc`) instead of the
-/// legacy block-head translation. Certified by the
-/// `M73_LCLIVE` census (362 captures across pyre/bench + synth, 100%
-/// eq=1) and check.py (162×2, on and off). Disable with
-/// `PYRE_M73_LCLIVE_CARRY=0`.
-pub(crate) fn m73_lclive_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LCLIVE_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// #73 S5 p5-s6: key the paused inline-caller frame's liveness query off the
-/// after-residual marker twin already carried in the frame's snapshot word
-/// (`resume_marker_jit_pc`), instead of the sentinel +
-/// legacy block-head translation. Certified by the
-/// M73_INLCALLER census (bank equality) and the p3-s2 M73_PFMARKER identity.
-/// `PYRE_M73_INLCALLER_CARRY=0` opts out.
-pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_INLCALLER_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// #73 S5 p5-s7: key the remaining outer-frame capture liveness queries
-/// (bridge-root parent frame + its register scatter, inline-call outer capture,
-/// list-append outer capture) off the jitcode-keyed word already in hand
-/// (carried root frame word / call-site marker twin) instead of the sentinel +
-/// historical block-head translation. Certified by the M73_OUTERCAP census
-/// (bank equality). `PYRE_M73_OUTERCAP_CARRY=0` opts out.
-fn m73_outercap_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_OUTERCAP_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 /// `PYRE_PCMAP_PIVOT_AUDIT` records PC-pivot census counters. Off by default.
 pub fn pcmap_pivot_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -12640,10 +12429,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
             //
             // Every other guard (guard_value / guard_class / guard_no_exception,
             // the `after_residual_call` family) resumes at a `py_pc` whose
-            // operand stack is in a deterministic state with no kept temp, so
-            // its resume-translation is already exact; it keeps the sentinel
-            // and decodes via `py_pc → jitcode`, identical to the flag-off
-            // baseline.  Carrying `op_pc` for those broke encoder ↔ decoder
+            // operand stack is in a deterministic state with no kept temp.
+            // Carrying `op_pc` for those broke encoder ↔ decoder
             // symmetry: `collect_outer_active_boxes` resolves the reg banks at
             // the carried coordinate but `live_locals` / `stack_color_map` at
             // `entry_py_pc`, and for a non-branch guard
@@ -12654,8 +12441,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // `MIFrame.pc`) — the ONE carried word not sourced from the
                 // resume-translation.
                 guard_jc_pc as i32
-            } else if m366_nonbranch_pc_enabled()
-                && !after_residual_call
+            } else if !after_residual_call
                 && matches!(
                     ctx.trace_ctx.last_guard_opcode(),
                     Some(
@@ -12682,7 +12468,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
                 let marker = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) };
-                // #73 S2 flip (`PYRE_M73_PEROP_CARRY`, default OFF): a
+                // #73 S2: a
                 // specialization guard (`GuardValue`/`GuardClass`) sources its
                 // resume coordinate from the walk cursor's per-op `-live-`
                 // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py:198`)
@@ -12693,8 +12479,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // decode identically for every consumer (banks + bridge maps +
                 // const refill) where the anchor coincides, and flags the
                 // divergent minority for the check.py output-equality gate.
-                // #73 S3.5 flip (`PYRE_M73_BRANCH_CARRY`, default ON, opt-out
-                // `=0`/`false`): a depth-0
+                // #73 S3.5: a depth-0
                 // branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
                 // arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
                 // `orgpc`) TAGGED into the negative space of the word plus the
@@ -12712,8 +12497,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     ctx.trace_ctx.last_guard_opcode(),
                     Some(OpCode::GuardTrue | OpCode::GuardFalse)
                 );
-                if m73_branch_carry_enabled()
-                    && is_branch
+                if is_branch
                     && ctx.live_before_jit_pc != usize::MAX
                     && ctx.live_before_jit_pc <= majit_ir::resumedata::BRANCH_ORGPC_MAX
                     && marker.is_some()
@@ -12732,8 +12516,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     }
                 {
                     majit_ir::resumedata::encode_branch_orgpc(ctx.live_before_jit_pc, flavor_true)
-                } else if m73_perop_carry_enabled()
-                    && marker.is_some()
+                } else if marker.is_some()
                     && ctx.live_before_jit_pc != usize::MAX
                     && matches!(
                         ctx.trace_ctx.last_guard_opcode(),
@@ -12747,7 +12530,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         None => majit_ir::resumedata::NO_JITCODE_PC,
                     }
                 }
-            } else if m366_nonbranch_pc_enabled() && after_residual_call {
+            } else if after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
                 // guard family (`GuardException`/`GuardNoException`/
                 // `GuardNotForced`/`GuardAlwaysFails` — exactly what the
@@ -12796,24 +12579,16 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
-            } else if m366_nonbranch_pc_enabled() && m73_s1marker_carry_enabled() {
+            } else {
                 // #73 S5 p3-s1: the remaining nonbranch guards (outside the
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
-                // twin at the guard's own `op_pc`.  Nested under the #366
-                // nonbranch opt-out so `PYRE_M366_NONBRANCH_PC=0` keeps the
-                // sentinel for every nonbranch guard.
+                // twin at the guard's own `op_pc`.
                 let twin = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) };
-                if m73_s1marker_carry_enabled() {
-                    match twin {
-                        Some(jp) => jp as i32,
-                        None => majit_ir::resumedata::NO_JITCODE_PC,
-                    }
-                } else {
-                    majit_ir::resumedata::NO_JITCODE_PC
+                match twin {
+                    Some(jp) => jp as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
-            } else {
-                majit_ir::resumedata::NO_JITCODE_PC
             };
             // #124 Approach B: when the carrier holds the guard's own pc (a
             // branch guard whose not-taken arm is reached by RE-EXECUTING
@@ -12962,13 +12737,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // the carried static outer JitCode coordinate; an absent coordinate
     // declines instead of reconstructing one from the Python pc.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let arm_word = if m73_armpath_carry_enabled() {
-        ctx.outer_resume_marker_jit_pc
-            .map(|m| m as i32)
-            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-    } else {
-        majit_ir::resumedata::NO_JITCODE_PC
-    };
+    let arm_word = ctx
+        .outer_resume_marker_jit_pc
+        .map(|m| m as i32)
+        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
     let Some(arm_pc_word) =
         crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
             .and_then(|payload| {
@@ -13232,8 +13004,7 @@ fn compute_inline_caller_frame(
     }
     // The after-residual marker names the same `-live-` the fallthrough
     // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
-    let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
-    {
+    let caller_liveness_word = match resume_marker_jit_pc {
         Some(m) => m as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
@@ -13352,10 +13123,9 @@ fn compute_nested_inline_caller_frame(
     }
     // The after-residual marker names the same `-live-` the fallthrough
     // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
-    // Without a marker there is no coordinate to encode against, so the sentinel
-    // declines the caller frame (`PYRE_M73_INLCALLER_CARRY=0` forces that).
-    let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
-    {
+    // Without a marker there is no coordinate to encode against, so the
+    // sentinel declines the caller frame.
+    let caller_liveness_word = match resume_marker_jit_pc {
         Some(m) => m as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
@@ -13592,13 +13362,10 @@ fn walker_capture_multi_frame_inline_snapshot(
     // top frame last (innermost).
     let mut frames: Vec<(u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
-        let pf_word = if m73_pfmarker_carry_enabled() {
-            pf.resume_marker_jit_pc
-                .map(|m| m as i32)
-                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-        } else {
-            majit_ir::resumedata::NO_JITCODE_PC
-        };
+        let pf_word = pf
+            .resume_marker_jit_pc
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
         let Some(pf_pc_word) = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
             .and_then(|payload| {
                 let resolved =
@@ -16165,8 +15932,7 @@ fn try_walker_inline_resolved_user_call(
                 };
                 let call_site_py_pc =
                     crate::state::backxlat_py_pc(call_site_jc_index as i32, op.pc as i32) as u32;
-                let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled())
-                {
+                let call_site_word = match call_site_marker {
                     Some(m) => m as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 };
@@ -21711,7 +21477,7 @@ fn orthodox_list_append_commit(
             Value::Int(vsd_value),
         );
     }
-    let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled()) {
+    let call_site_word = match call_site_marker {
         Some(m) => m as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
