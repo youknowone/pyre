@@ -666,6 +666,21 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
+    // The `list_write_barrier` residual (the #171 object-append fold's Object
+    // arm leaves it as a residual because it is `#[dont_look_inside]`) is pure
+    // idempotent GC bookkeeping — re-running it on a body replay only re-adds
+    // the list to the remembered set, never doubling user-visible state.  It
+    // must still EXECUTE concretely below (pyre has no backend GC-rewrite pass,
+    // so the barrier runs during the walk for GC correctness), but it is not a
+    // body effect: keep it out of the in-flight-FOR_ITER body-effect accounting
+    // so an Object-strategy comprehension append (`[(i, i) for …]`, `[None …]`)
+    // is not refuse-dropped.  RPython treats the write barrier the same way —
+    // `COND_CALL_GC_WB` is never executed by pyjitpl
+    // (`rpython/jit/metainterp/executor.py:446`), is neither can-raise nor a
+    // call (`resoperation.py:1124-1125`), and is inserted only by the backend
+    // GC rewrite pass after optimization (`backend/llsupport/rewrite.py:948`),
+    // so it never participates in the metainterp's side-effect analysis.
+    let is_idempotent_gc_barrier = pyre_interpreter::is_list_write_barrier(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
@@ -984,8 +999,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         None
     };
-    let body_effect_candidate =
-        !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
+    let body_effect_candidate = !provably_side_effect_free
+        && !is_idempotent_gc_barrier
+        && writes_live_heap
+        && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
     // discriminator above cannot see a body effect committed through USER
     // PYTHON CODE by a value-returning (`Ref`), `PyreHelperKind::None`,
@@ -1025,7 +1042,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
-    if !provably_side_effect_free {
+    if !provably_side_effect_free && !is_idempotent_gc_barrier {
         fbw_mark_executed_nonpure_residual();
         // Count only a FOREIGN non-pure residual: a self-recursive call is the
         // fold target running because its fold declined, not a body side effect.
@@ -1115,6 +1132,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the forward flush if a callee sub-walk moved it — re-executing the CALL
     // would double the effect.
     if !provably_side_effect_free
+        && !is_idempotent_gc_barrier
         && (writes_live_heap
             || heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before))

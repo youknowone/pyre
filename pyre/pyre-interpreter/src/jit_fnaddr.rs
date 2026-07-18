@@ -284,6 +284,47 @@ pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
     addrs.contains(&(addr as i64))
 }
 
+/// True when `addr` is the `list_write_barrier` residual fnaddr.
+///
+/// The #171 object-append fold descends `w_list_append`; its Object-strategy
+/// arm stores a GC ref and runs `list_write_barrier(obj)`
+/// (`pyre_object::listobject:::869`/`:872`), which residualizes (registered in
+/// [`jit_trace_fnaddrs`]) because it is `#[dont_look_inside]`. The barrier is
+/// pure GC bookkeeping — `try_gc_write_barrier` adds `obj` to the remembered
+/// set — and is idempotent: re-running it on a body replay only re-adds `obj`,
+/// never doubling any user-visible state. It is therefore not a "body effect"
+/// in the FBW replay sense, and the full-body walker uses this predicate to
+/// keep it out of the in-flight-FOR_ITER body-effect accounting.
+///
+/// This matches RPython, where the write barrier is not a metatracing
+/// operation at all: `COND_CALL_GC_WB` is in the "never executed by pyjitpl"
+/// set (`rpython/jit/metainterp/executor.py:446`), is neither can-raise nor a
+/// call (`resoperation.py:1124-1125`, outside those ranges), and is inserted
+/// only by the backend GC rewrite pass after optimization
+/// (`backend/llsupport/rewrite.py:948`). pyre has no separate backend rewrite
+/// pass, so the barrier surfaces as a residual during the walk; exempting it
+/// from the FBW body-effect gate restores the parity RPython gets for free.
+///
+/// Matches the registered fnaddr (not `list_write_barrier as *const ()`) for
+/// the same address-stability reason as [`is_pyframe_operand_stack_accessor`]:
+/// the codewriter bakes the [`jit_trace_fnaddrs`] value into the JitCode
+/// constant pool.
+pub fn is_list_write_barrier(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static BARRIER_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = BARRIER_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::listobject::list_write_barrier")
+                    || *path == "pyre_object::list_write_barrier"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -2325,7 +2366,7 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_pyframe_operand_stack_accessor, jit_trace_fnaddrs};
+    use super::{is_list_write_barrier, is_pyframe_operand_stack_accessor, jit_trace_fnaddrs};
     use std::collections::HashMap;
 
     #[test]
@@ -2531,6 +2572,16 @@ mod tests {
         let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
         assert!(!is_pyframe_operand_stack_accessor(nlocals as usize));
         assert!(!is_pyframe_operand_stack_accessor(0));
+    }
+
+    #[test]
+    fn is_list_write_barrier_matches_registered_barrier() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let barrier = bindings["pyre_object::listobject::list_write_barrier"];
+        assert!(is_list_write_barrier(barrier as usize));
+        let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
+        assert!(!is_list_write_barrier(nlocals as usize));
+        assert!(!is_list_write_barrier(0));
     }
 
     /// Negative parity guard: pyre intentionally does NOT publish a

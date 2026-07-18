@@ -4970,70 +4970,81 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             );
-            // A `LIST_APPEND` body is admitted only in the canonical
-            // bare-accumulator shape. Any value-producing op (arithmetic,
-            // container build, format, constant load, call) can make the append
-            // use a list Object-strategy whose Void `setarrayitem_gc` residual
-            // trips the FBW body-effect gate; `fbw_foriter_inflight_take` then
-            // refuses delivery of the in-flight FOR_ITER item and drops that
-            // trace-attempt iteration. Those bodies stay in the interpreter
-            // until the orthodox fold recovery handles them.
-            let body_has_list_append = {
+            // A `LIST_APPEND` (inlined-comprehension accumulator) body is
+            // admitted only when the body performs no CALL: a per-element call
+            // that enters a user Python frame (a class ctor / user function)
+            // bumps the eval-loop entry odometer, and a subsequent mid-body
+            // abort routes through `fbw_foriter_inflight_take`, which REFUSES
+            // delivery to avoid a double-apply — dropping the trace-attempt
+            // iteration's item. That user-frame in-flight-delivery gap is a
+            // separate concern (single-executor tracing, gh#73/#34); decline
+            // call-bearing bodies to interpretation until it is closed.
+            //
+            // A value-producing but call-free body — arithmetic, subscript, or
+            // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
+            // `[{i: i} …]`, `[f"{i}" …]`) — is admissible. Its append is
+            // exact-resume safe: the only residual an Object-strategy append
+            // leaves in the folded body is the idempotent `list_write_barrier`,
+            // now exempt from the FBW body-effect accounting (it is not a body
+            // effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl never
+            // executes and the optimizer never treats as a side effect).
+            //
+            // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is the one
+            // value-producing shape held back: the fold virtualizes the inner
+            // list, but its separately allocated backing block (`NewArray` /
+            // `NewArrayClear`) is not threaded into the append commit sub-walk's
+            // guard-exit resume data — `collect_outer_active_boxes` seeds the
+            // sub-walk's box set from jitcode liveness only, and the backing
+            // block has no liveness slot — so a deopt resolves it to a null
+            // OpRef and crashes. The orthodox recovery is recursive virtual-list
+            // forcing at the guard, threading each inner element box + length
+            // into resume data (mirroring `_visitor_walk_recursive` /
+            // `VArrayInfo`); until that lands the shape declines. An empty `[]`
+            // element is Empty-strategy (no backing block) and unaffected;
+            // tuple / set / dict elements take non-list allocation paths.
+            let (body_has_call, body_has_nonempty_list_build) = {
                 let mut scan_state = pyre_interpreter::OpArgState::default();
                 let mut scan_pc = pc + 1;
-                let mut found = false;
+                let mut has_call = false;
+                let mut has_nonempty_list_build = false;
                 while scan_pc < exit && scan_pc < instructions.len() {
-                    let (scan_instr, _) = scan_state.get(instructions[scan_pc]);
-                    if matches!(scan_instr, I::ListAppend { .. }) {
-                        found = true;
+                    let (scan_instr, scan_op_arg) = scan_state.get(instructions[scan_pc]);
+                    match scan_instr {
+                        I::Call { .. }
+                        | I::CallKw { .. }
+                        | I::CallFunctionEx
+                        | I::CallIntrinsic1 { .. } => has_call = true,
+                        I::BuildList { count } if count.get(scan_op_arg) > 0 => {
+                            has_nonempty_list_build = true
+                        }
+                        _ => {}
+                    }
+                    if has_call && has_nonempty_list_build {
                         break;
                     }
                     scan_pc += 1;
                 }
-                found
+                (has_call, has_nonempty_list_build)
             };
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
                 let (body_instr, _) = body_state.get(instructions[body_pc]);
-                let permitted = if body_has_list_append {
-                    matches!(
+                let permitted = for_iter_body_op_is_jit_safe(body_instr)
+                    || matches!(
                         body_instr,
-                        I::LoadFast { .. }
-                            | I::LoadFastBorrow { .. }
-                            | I::LoadFastLoadFast { .. }
-                            | I::LoadFastBorrowLoadFastBorrow { .. }
-                            | I::LoadFastCheck { .. }
-                            | I::LoadFastAndClear { .. }
-                            | I::StoreFast { .. }
-                            | I::StoreFastLoadFast { .. }
-                            | I::StoreFastStoreFast { .. }
-                            | I::ListAppend { .. }
-                            | I::Copy { .. }
-                            | I::Swap { .. }
-                            | I::PopTop
-                            | I::PushNull
-                            | I::Nop
-                            | I::NotTaken
-                            | I::JumpBackward { .. }
-                            | I::JumpBackwardNoInterrupt { .. }
-                            | I::ExtendedArg
-                            | I::Cache
+                        I::StoreSubscr
+                            | I::StoreAttr { .. }
+                            | I::StoreName { .. }
+                            | I::StoreGlobal { .. }
+                            | I::StoreDeref { .. }
+                            | I::DeleteSubscr
+                            | I::DeleteAttr { .. }
+                            | I::LoadName { .. }
                     )
-                } else {
-                    for_iter_body_op_is_jit_safe(body_instr)
-                        || matches!(
-                            body_instr,
-                            I::StoreSubscr
-                                | I::StoreAttr { .. }
-                                | I::StoreName { .. }
-                                | I::StoreGlobal { .. }
-                                | I::StoreDeref { .. }
-                                | I::DeleteSubscr
-                                | I::DeleteAttr { .. }
-                                | I::LoadName { .. }
-                        )
-                };
+                    || (!body_has_call
+                        && !body_has_nonempty_list_build
+                        && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
                     return false;
                 }
@@ -10057,13 +10068,61 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_value_producing_list_append_comprehension_body_declines() {
+    fn for_iter_value_producing_list_append_comprehension_body_is_jit_safe() {
+        // A call-free LIST_APPEND body whose element is an Object-strategy value
+        // or an empty nested container is admitted: an Object-strategy append's
+        // only residual is the idempotent `list_write_barrier`, exempt from the
+        // FBW body-effect gate. An empty `[]` element is Empty-strategy (no
+        // backing block), so it does not hit the nested-backing-block gap below.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [i + 1 for i in range(n)]\n",
             "def f(n):\n    return [-i for i in range(n)]\n",
             "def f(n):\n    return [(i, i) for i in range(n)]\n",
             "def f(n):\n    return ['s' for i in range(n)]\n",
+            "def f(n):\n    return [None for i in range(n)]\n",
+            "def f(n):\n    return [{i: i} for i in range(n)]\n",
+            "def f(n):\n    return [f'{i}' for i in range(n)]\n",
+            "def f(n):\n    return [[] for i in range(n)]\n",
+        ] {
+            let module = compile_exec(source).expect("test code should compile");
+            let code = function_code_from_module(&module, "f");
+            assert!(for_iter_bodies_all_jit_safe(&code));
+            assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        }
+    }
+
+    #[test]
+    fn for_iter_nonempty_nested_list_comprehension_body_declines() {
+        // A non-empty nested `BUILD_LIST` element (`[[i] …]`) declines: the fold
+        // virtualizes the inner list but leaves its separately allocated backing
+        // block unthreaded into the append commit sub-walk's guard-exit resume
+        // data, so a deopt crashes on a null OpRef. Held back until the orthodox
+        // recursive virtual-list forcing lands.
+        use pyre_interpreter::compile_exec;
+        for source in [
+            "def f(n):\n    return [[i] for i in range(n)]\n",
+            "def f(n):\n    return [[i, i + 1] for i in range(n)]\n",
+        ] {
+            let module = compile_exec(source).expect("test code should compile");
+            let code = function_code_from_module(&module, "f");
+            assert!(!for_iter_bodies_all_jit_safe(&code));
+            assert_eq!(
+                unsupported_jit_shape(&code),
+                UnsupportedJitShape::CurrentFrameOnly
+            );
+        }
+    }
+
+    #[test]
+    fn for_iter_call_bearing_list_append_comprehension_body_declines() {
+        // A per-element CALL enters a user Python frame; a mid-body abort then
+        // refuses the in-flight FOR_ITER delivery (a separate user-frame gap,
+        // gh#73/#34), so a call-bearing LIST_APPEND body stays interpreter-only.
+        use pyre_interpreter::compile_exec;
+        for source in [
+            "def f(n):\n    return [str(i) for i in range(n)]\n",
+            "def f(n):\n    def g(x):\n        return x\n    return [g(i) for i in range(n)]\n",
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
