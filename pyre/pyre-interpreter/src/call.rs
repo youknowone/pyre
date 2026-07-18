@@ -4244,7 +4244,21 @@ pub unsafe fn create_all_slots(
                 // typeobject.py:1211: slot_name = mangle(slot_name, w_self.name)
                 let mangled = mangle(&newslotnames[i], type_name);
                 if crate::type_dict_contains(w_type, mangled.as_str()) {
-                    // typeobject.py:1219-1220: name conflict → skip this slot
+                    // `create_slot`: a name already present is a conflict — a
+                    // duplicate `__slots__` entry (a Member of this very type)
+                    // is silently ignored, but a class variable of the same
+                    // name is a ValueError.
+                    let is_dup_slot = crate::type_dict_lookup(w_type, mangled.as_str())
+                        .map(|w_prev| unsafe {
+                            pyre_object::is_member(w_prev)
+                                && std::ptr::eq(pyre_object::w_member_get_cls(w_prev), w_type)
+                        })
+                        .unwrap_or(false);
+                    if !is_dup_slot {
+                        return Err(crate::PyError::value_error(format!(
+                            "'{mangled}' in __slots__ conflicts with class variable"
+                        )));
+                    }
                     newslotnames.remove(i);
                 } else {
                     // typeobject.py:1216-1217: create_slot
