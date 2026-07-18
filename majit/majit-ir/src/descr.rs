@@ -670,6 +670,18 @@ pub struct GcCache {
     _cache_call_order: Vec<DescrRef>,
     _cache_interiorfield_order: Vec<DescrRef>,
 
+    /// Superseded SizeDescr Arcs retired by `register_keyed_size`'s
+    /// fuller-layout upgrade.  PyPy's `_cache_size[STRUCT]` holds a single
+    /// canonical SizeDescr that is never freed, so field descrs' Weak parent
+    /// back-references stay valid for the process lifetime.  pyre registers
+    /// struct layouts incrementally and replaces the cached SizeDescr with a
+    /// fuller one; without this vec the replaced Arc would drop while field
+    /// descrs already baked into recorded ops still hold Weak refs to it,
+    /// dangling their `get_parent_descr()`.  Kept OUT of `_cache_size_order`
+    /// so `setup_descrs` descr_index assignment is unchanged — these are
+    /// retired, not re-registered; they exist only to keep the Weak alive.
+    _size_keepalive: Vec<DescrRef>,
+
     /// `gctypelayout.py:301-357 TypeLayoutBuilder.get_type_id` analog —
     /// the shared dense sequential GC type-id allocator covering both
     /// `GcStruct` and `GcArray`.  PyPy's `type_info_group.add_member`
@@ -700,6 +712,7 @@ impl GcCache {
             _cache_arraylen_order: Vec::new(),
             _cache_call_order: Vec::new(),
             _cache_interiorfield_order: Vec::new(),
+            _size_keepalive: Vec::new(),
             // tid 0 is reserved as "no class" / sentinel —
             // `gctypelayout.py:328-331 make_type_info_group` adds a
             // DUMMY member at index 0.
@@ -1155,6 +1168,14 @@ impl GcCache {
             }
         };
         if should_insert {
+            // PyPy never frees a cached SizeDescr; retire the superseded one
+            // into an immortal keepalive so any field descr already baked into
+            // a recorded op keeps a live Weak parent (get_parent_descr()).
+            if let Some(old) = self._cache_size.get(&key) {
+                if !arc_in_vec(&self._size_keepalive, old) {
+                    self._size_keepalive.push(old.clone());
+                }
+            }
             self._cache_size.insert(key.clone(), descr.clone());
             self._cache_size_order.retain(|d| {
                 // Remove the old entry for this key (if any) from the
@@ -1203,10 +1224,21 @@ impl GcCache {
         // Weak can still upgrade; if not, replace it with the new descr
         // whose parent Weak points to the current (upgraded) SizeDescr.
         let inner = self._cache_field.entry(struct_key).or_default();
-        let should_replace = inner
-            .get(&field_name)
-            .map(|existing| existing.get_parent_descr().is_none())
-            .unwrap_or(true); // no entry yet → insert
+        // PyPy's cached field descr always parents the single canonical (fullest)
+        // SizeDescr.  pyre registers incrementally, so replace the cached field
+        // descr when the incoming one's parent carries MORE fields — this keeps
+        // future getfield recordings baking the fullest-layout parent.  (The old
+        // Weak-liveness check is now inert: register_keyed_size retires superseded
+        // SizeDescrs into _size_keepalive instead of freeing them.)
+        let parent_field_count = |fd: &SimpleFieldDescr| -> usize {
+            fd.get_parent_descr()
+                .and_then(|p| p.as_size_descr().map(|sd| sd.all_fielddescrs().len()))
+                .unwrap_or(0)
+        };
+        let should_replace = match inner.get(&field_name) {
+            None => true, // no entry yet -> insert
+            Some(existing) => parent_field_count(&descr) > parent_field_count(existing),
+        };
         if should_replace {
             // Remove stale entry from _order if present.
             if let Some(old) = inner.get(&field_name) {
