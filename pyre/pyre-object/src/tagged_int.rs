@@ -79,10 +79,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enabled_after_flip() {
-        // #22 enablement: the tag path is live and consumers take the
-        // `& 1` precheck; the GC `taggedpointers` config is in lockstep.
-        assert!(CAN_BE_TAGGED);
+    fn defaults_to_untagged() {
+        // The scaffolding is inert behind `CAN_BE_TAGGED`: tagging mainline
+        // ints is off by default (mirrors `taggedpointers` off by default).
+        assert!(!CAN_BE_TAGGED);
     }
 
     #[test]
