@@ -13686,6 +13686,18 @@ fn abstract_instantiation_error(cls: PyObjectRef) -> crate::PyError {
     ))
 }
 
+/// Identity comparison of two MRO lookups (`space.is_w`), used to decide
+/// whether a type inherits `object`'s `__new__`/`__init__` unchanged.  An
+/// inherited slot resolves to the very object stored in `object`'s dict, so
+/// pointer identity suffices; an override resolves to a distinct object.
+fn same_inherited_slot(a: Option<PyObjectRef>, b: Option<PyObjectRef>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // objectobject.py:118 descr__new__ — `w_type` is a mandatory argument.
     if args.is_empty() {
@@ -13696,6 +13708,26 @@ fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let cls = args[0];
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
+        // objectobject.py descr__new__ — surplus arguments are accepted only
+        // when __new__ or __init__ is overridden; the bare object() takes
+        // none.  A type that overrides __new__ but forwards excess args to
+        // object.__new__ hits the first error.
+        if args.len() > 1 {
+            let obj = w_object();
+            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
+            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(obj, "__new__") };
+            if !same_inherited_slot(tp_new, obj_new) {
+                return Err(crate::PyError::type_error(
+                    "object.__new__() takes exactly one argument (the type to instantiate)",
+                ));
+            }
+            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
+            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
+            if same_inherited_slot(tp_init, obj_init) {
+                let name = unsafe { pyre_object::w_type_get_name(cls) };
+                return Err(crate::PyError::type_error(format!("{name}() takes no arguments")));
+            }
+        }
         // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
         if unsafe { pyre_object::w_type_is_abstract(cls) } {
             return Err(abstract_instantiation_error(cls));
@@ -13706,8 +13738,31 @@ fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_instance_new(PY_NULL))
 }
 
-/// `object.__init__(self)` — no-op base __init__.
-fn object_descr_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `object.__init__(self)` — no-op base __init__.  Surplus arguments are
+/// accepted only when __init__ or __new__ is overridden (objectobject.py
+/// descr__init__); otherwise the bare object initializer takes none.
+fn object_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() > 1 {
+        let w_obj = args[0];
+        if let Some(w_type) = crate::typedef::r#type(w_obj) {
+            let obj = w_object();
+            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
+            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
+            if !same_inherited_slot(tp_init, obj_init) {
+                return Err(crate::PyError::type_error(
+                    "object.__init__() takes exactly one argument (the instance to initialize)",
+                ));
+            }
+            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
+            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(obj, "__new__") };
+            if same_inherited_slot(tp_new, obj_new) {
+                let name = unsafe { pyre_object::w_type_get_name(w_type) };
+                return Err(crate::PyError::type_error(format!(
+                    "{name}.__init__() takes exactly one argument (the instance to initialize)"
+                )));
+            }
+        }
+    }
     Ok(w_none())
 }
 
