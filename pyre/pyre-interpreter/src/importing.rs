@@ -2258,10 +2258,27 @@ pub fn import_from(
         }
     }
 
-    Err(crate::PyError::new(
-        crate::PyErrorKind::ImportError,
-        format!("cannot import name '{name}'"),
-    ))
+    // The name is neither a real attribute nor an importable submodule.
+    // `error.py:new_import_error` — raise `ImportError(msg, name=pkgname,
+    // path=pkgpath)`: `pkgname` is the package `__name__` (default "<unknown
+    // module name>"), `pkgpath` its `__file__` (`get_path`, default "unknown
+    // location").  pyopcode.py:1152 resolves the name via
+    // `space.getattr(w_module, '__name__')` and importing.py:460-470 `get_path`
+    // via `space.getattr(w_module, '__file__')`, so a descriptor- or
+    // `__getattr__`-supplied value and a non-module `from` target are honored;
+    // a missing / non-str attribute takes the default.
+    let w_pkgname = match crate::baseobjspace::getattr_str(module, "__name__") {
+        Ok(v) if unsafe { pyre_object::is_str(v) } => v,
+        _ => pyre_object::w_str_new("<unknown module name>"),
+    };
+    let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
+        Ok(v) if unsafe { pyre_object::is_str(v) } => v,
+        _ => pyre_object::w_str_new("unknown location"),
+    };
+    let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) };
+    let pkgpath = unsafe { pyre_object::w_str_get_value(w_pkgpath) };
+    let msg = format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})");
+    Err(crate::PyError::import_error_name_path(msg, w_pkgname, w_pkgpath))
 }
 
 // ── import_all_from ──────────────────────────────────────────────────

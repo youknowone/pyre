@@ -669,6 +669,40 @@ impl PyError {
         }
     }
 
+    /// `error.py:new_import_error` — `ImportError(msg, name=name, path=path)`.
+    /// A failed `from X import Y` (pyopcode.py import_from) raises through
+    /// this so `.name` (the package) and `.path` (its file) are readable,
+    /// which `PyError::new(ImportError, msg)` cannot carry.
+    pub fn import_error_name_path(
+        msg: impl Into<String>,
+        w_name: PyObjectRef,
+        w_path: PyObjectRef,
+    ) -> Self {
+        let message = msg.into();
+        let exc = w_exception_new(ExcKind::ImportError, &message);
+        // `ImportError.__init__` mirrors args[0] into the dedicated `msg`
+        // slot; the prebuilt-instance path bypasses it, so stamp it here.
+        let w_msg = if message.is_empty() {
+            pyre_object::w_none()
+        } else {
+            pyre_object::w_str_new(&message)
+        };
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(exc, w_msg);
+            pyre_object::interp_exceptions::w_exception_set_name(exc, w_name);
+            pyre_object::interp_exceptions::w_exception_set_import_path(exc, w_path);
+        }
+        PyError {
+            kind: PyErrorKind::ImportError,
+            message,
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
     /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
     /// when the referent of a proxy is no longer alive.
     pub fn reference_error(msg: impl Into<String>) -> Self {
