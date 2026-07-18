@@ -5865,8 +5865,39 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // PyPy: space.type(w_obj) → W_TypeObject → MRO lookup in type dict.
     // Each builtin type (list, str, dict, etc.) has a W_TypeObject with
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
+    //
     if let Some(w_type) = crate::typedef::r#type(obj) {
-        if let Some(method) = unsafe { lookup_in_type_where(w_type, name) } {
+        // A heap subclass (`class T(tuple): ...`) has its own instance dict, so
+        // an instance attribute must shadow a same-named non-data-descriptor
+        // class attribute. Run the `object.__getattribute__` protocol for such
+        // types: a data descriptor wins, then the instance dict, then a
+        // non-data descriptor / class var. Exact builtins carry no instance
+        // dict (`hasdict` false) and take the direct class-attr fast path.
+        if unsafe { pyre_object::w_type_get_hasdict(w_type) } {
+            let w_descr = unsafe { lookup_in_type_where(w_type, name) };
+            if let Some(descr) = w_descr {
+                if unsafe { is_data_descr(descr) } {
+                    if let Some(result) = unsafe { get(descr, obj, w_type)? } {
+                        return Ok(result);
+                    }
+                }
+            }
+            let w_dict = getdict_backing(obj);
+            if !w_dict.is_null() {
+                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+                    return Ok(value);
+                }
+            }
+            if let Some(method) = w_descr {
+                if unsafe { crate::is_function(method) } {
+                    return Ok(pyre_object::w_method_new(method, obj, w_type));
+                }
+                if let Some(result) = unsafe { get(method, obj, w_type)? } {
+                    return Ok(result);
+                }
+                return Ok(method);
+            }
+        } else if let Some(method) = unsafe { lookup_in_type_where(w_type, name) } {
             if unsafe { crate::is_function(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type));
             }
