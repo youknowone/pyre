@@ -1173,7 +1173,8 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let count = repeat_count(n)?;
     // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
     // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.
-    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE) {
+    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE)
+    {
         return Ok(s);
     }
     let cap = data

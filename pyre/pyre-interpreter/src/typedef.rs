@@ -913,8 +913,11 @@ pub fn init_typeobjects() {
         // `iter(callable, sentinel)` produces a `_CallableIterator`; register
         // its type so `type(it)` / `it.__class__` resolve like the other
         // iterators. Not directly instantiable.
-        let callable_iterator_type =
-            new_typeobject_with_base("callable_iterator", init_callable_iterator_type, object_type);
+        let callable_iterator_type = new_typeobject_with_base(
+            "callable_iterator",
+            init_callable_iterator_type,
+            object_type,
+        );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(callable_iterator_type);
             pyre_object::w_type_set_acceptable_as_base_class(callable_iterator_type, false);

@@ -2278,7 +2278,9 @@ pub fn import_from(
     let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) };
     let pkgpath = unsafe { pyre_object::w_str_get_value(w_pkgpath) };
     let msg = format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})");
-    Err(crate::PyError::import_error_name_path(msg, w_pkgname, w_pkgpath))
+    Err(crate::PyError::import_error_name_path(
+        msg, w_pkgname, w_pkgpath,
+    ))
 }
 
 // ── import_all_from ──────────────────────────────────────────────────
