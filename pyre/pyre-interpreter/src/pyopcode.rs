@@ -180,23 +180,44 @@ pub fn decode_instruction_for_dispatch(
 
 /// pypy/interpreter/pyopcode.py:213-237 dispatch loop forward decode.
 ///
-/// Forward-only single-pass decode for the hot dispatch path: reads units
-/// starting at `pc`, accumulating any `ExtendedArg` prefix forward with a
-/// fresh `OpArgState`, and returns the real opcode's `(pc, instruction,
-/// op_arg)` without ever scanning backward.
+/// Single-pass decode for the hot dispatch path: returns the real opcode's
+/// `(pc, instruction, op_arg)` for a `pc` that names either a logical
+/// instruction start (a real opcode, or the first `ExtendedArg` of a prefix
+/// run) or a real opcode sitting *past* its own `ExtendedArg` prefix.
 ///
-/// `pc` must be a logical-instruction start (a real opcode, or the first
-/// `ExtendedArg` of a prefix run). `OpArgState` resets its accumulator after
-/// every real opcode, so a fresh state accumulated forward from such a `pc`
-/// yields the same triple `decode_instruction_for_dispatch` returns, sharing
-/// its `u8 < 44` malformed-chain guard and `BytecodeCorruption` on out of
-/// bounds.
+/// `OpArgState` resets its accumulator after every real opcode, so the fully
+/// accumulated oparg at a real opcode depends only on the contiguous
+/// `ExtendedArg` run immediately preceding it. The dispatch loop reaches a
+/// real opcode both by fall-through from its prefix (interpreter) and by a
+/// jump/loop-header/resume coordinate that points at the real opcode past the
+/// prefix (`jump_target_backward` targets the opcode, not its `ExtendedArg`).
+/// To reconstruct the same triple in either case, back up to the logical
+/// start over any immediately-preceding `ExtendedArg` units, then accumulate
+/// forward with a fresh state. The back-up loop body runs zero times in the
+/// common no-prefix case (the unit before a real opcode is not `ExtendedArg`),
+/// so the hot path stays a single forward pass.
+///
+/// Shares `decode_instruction_for_dispatch`'s `u8 < 44` malformed-chain guard
+/// and returns `BytecodeCorruption` on out of bounds.
 #[inline]
 pub fn decode_instruction_forward(
     code: &CodeObject,
     pc: usize,
 ) -> Result<(usize, Instruction, OpArg), crate::pycode::BytecodeCorruption> {
-    let mut opcode_pc = pc;
+    // Back up over any `ExtendedArg` prefix so accumulation starts at the
+    // logical instruction start. Zero iterations when `pc` is already a
+    // logical start (no preceding `ExtendedArg`).
+    let mut start = pc;
+    while start > 0
+        && code
+            .instructions
+            .get(start - 1)
+            .is_some_and(|unit| matches!(unit.op, Instruction::ExtendedArg))
+    {
+        start -= 1;
+    }
+
+    let mut opcode_pc = start;
     let mut state = OpArgState::default();
     loop {
         let unit = *code
@@ -208,7 +229,7 @@ pub fn decode_instruction_forward(
             opcode_pc += 1;
             continue;
         }
-        if opcode_pc != pc && u8::from(instruction) < 44 {
+        if opcode_pc != start && u8::from(instruction) < 44 {
             return Err(crate::pycode::BytecodeCorruption);
         }
         return Ok((opcode_pc, instruction, op_arg));
@@ -3681,17 +3702,18 @@ mod tests {
         );
         assert_eq!(u32::from(fwd_arg), u32::from(decoded_arg));
 
-        // Entered at target_pc (mid-prefix, past the ExtendedArg), a fresh
-        // forward state lands on the same opcode; the accumulated arg reflects
-        // only target_pc's own unit, so pc and opcode match but the extended
-        // arg bits do not.
-        let (fwd_target_pc, fwd_target_instr, _) =
+        // Entered directly at target_pc (the real opcode past its ExtendedArg
+        // prefix — the coordinate a jump/loop-header/resume lands on), the
+        // decode backs up over the prefix and reconstructs the full triple,
+        // including the extended arg bits, matching the prefix-start entry.
+        let (fwd_target_pc, fwd_target_instr, fwd_target_arg) =
             decode_instruction_forward(&code, target_pc).expect("forward decode at target failed");
         assert_eq!(fwd_target_pc, target_pc);
         assert_eq!(
             std::mem::discriminant(&fwd_target_instr),
             std::mem::discriminant(&target_instr)
         );
+        assert_eq!(u32::from(fwd_target_arg), u32::from(target_arg));
     }
 
     #[test]
@@ -3769,6 +3791,20 @@ mod tests {
             );
             assert_eq!(u32::from(fwd_arg), u32::from(disp_arg));
 
+            // Entering directly at the real opcode `real` (the coordinate a
+            // JIT jump/loop-header/resume targets — past any ExtendedArg
+            // prefix) must reconstruct the identical triple: same pc, same
+            // opcode, and the full accumulated arg. This is the getwidth
+            // FOR_ITER case where `real > i`.
+            let (real_pc, real_instr, real_arg) = decode_instruction_forward(&code, real)
+                .expect("forward decode at real opcode failed");
+            assert_eq!(real_pc, real);
+            assert_eq!(
+                std::mem::discriminant(&real_instr),
+                std::mem::discriminant(&full[real].0)
+            );
+            assert_eq!(u32::from(real_arg), u32::from(full[real].1));
+
             i = real + 1;
         }
 
@@ -3791,5 +3827,69 @@ mod tests {
             code.instructions.replace_op(1, Instruction::GetIter);
         }
         assert!(decode_instruction_forward(&code, 0).is_err());
+    }
+
+    // A JIT jump/loop-header/resume coordinate points at the real opcode past
+    // its ExtendedArg prefix (e.g. the getwidth outer FOR_ITER at a pc whose
+    // preceding unit is EXTENDED_ARG). Entered there, the forward decode must
+    // recover the full extended oparg, not just the real opcode's own byte.
+    #[test]
+    fn forward_decode_at_real_opcode_recovers_extended_arg() {
+        // A loop over a long-enough body forces the FOR_ITER jump delta above
+        // 255, so its oparg needs an EXTENDED_ARG prefix. The 300 statements
+        // push the END_FOR/JUMP_BACKWARD past the one-byte range.
+        let body = (0..300)
+            .map(|i| format!("    x{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!("for e in seq:\n{body}\n");
+        let code = compile_exec(&source).expect("compile failed");
+
+        // Reference: naive full-scan decode at every index.
+        let full: Vec<_> = {
+            let mut state = OpArgState::default();
+            code.instructions
+                .iter()
+                .copied()
+                .map(|unit| state.get(unit))
+                .collect()
+        };
+
+        // Find a real opcode (not ExtendedArg) whose immediately preceding
+        // unit is ExtendedArg — the shape a JIT resume/loop-header pc lands on.
+        let real_with_prefix = (1..code.instructions.len())
+            .find(|&pc| {
+                matches!(code.instructions[pc - 1].op, Instruction::ExtendedArg)
+                    && !matches!(code.instructions[pc].op, Instruction::ExtendedArg)
+            })
+            .expect("expected a real opcode preceded by ExtendedArg");
+
+        // The recovered arg must exceed the single-byte range, proving the
+        // high byte from the prefix was folded in rather than dropped.
+        let expected_arg = u32::from(full[real_with_prefix].1);
+        assert!(
+            expected_arg > 0xff,
+            "test setup: expected an extended (>255) oparg, got {expected_arg}"
+        );
+
+        let (pc, instr, arg) = decode_instruction_forward(&code, real_with_prefix)
+            .expect("forward decode at real opcode failed");
+        assert_eq!(pc, real_with_prefix);
+        assert_eq!(
+            std::mem::discriminant(&instr),
+            std::mem::discriminant(&full[real_with_prefix].0)
+        );
+        assert_eq!(u32::from(arg), expected_arg);
+
+        // Equivalent to the backward-scanning dispatch decode at the same pc.
+        let (disp_pc, disp_instr, disp_arg) =
+            decode_instruction_for_dispatch(&code, real_with_prefix)
+                .expect("dispatch decode failed");
+        assert_eq!(pc, disp_pc);
+        assert_eq!(
+            std::mem::discriminant(&instr),
+            std::mem::discriminant(&disp_instr)
+        );
+        assert_eq!(u32::from(arg), u32::from(disp_arg));
     }
 }
