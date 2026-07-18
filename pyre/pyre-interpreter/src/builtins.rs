@@ -8286,6 +8286,35 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // read-only view hashes its raw bytes, cached in `_hash`.
             return memoryview_hash_value(obj);
         }
+        // A tuple/frozenset *subclass* can set `__hash__ = None` to become
+        // unhashable, or override `__hash__` with its own method; the
+        // structural fast paths below hash by contents and would ignore both.
+        // For a non-exact receiver consult the `__hash__` slot: `None` raises,
+        // a genuine override dispatches, and the inherited structural hash
+        // falls through to the fast path.
+        let is_tuple_recv = is_tuple(obj);
+        let is_frozenset_recv = pyre_object::is_frozenset(obj);
+        if (is_tuple_recv && !is_exact_type(obj, &TUPLE_TYPE))
+            || (is_frozenset_recv && !is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE))
+        {
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+                    if pyre_object::is_none(method) {
+                        return Err(unhashable_type_error(obj));
+                    }
+                    let base = if is_tuple_recv {
+                        crate::typedef::gettypefor(&TUPLE_TYPE)
+                    } else {
+                        crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
+                    };
+                    let base_hash =
+                        base.and_then(|b| crate::baseobjspace::lookup_in_type(b, "__hash__"));
+                    if Some(method) != base_hash {
+                        return hash_call_normalize(method, obj);
+                    }
+                }
+            }
+        }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);
             let mut hashes = Vec::with_capacity(n);
@@ -8946,21 +8975,6 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ))
 }
 
-/// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`
-/// parity:
-///
-/// ```python
-/// def descr_new(space, w_subtype, w_iterable, w_start=None):
-///     ...
-///     if w_start is None:
-///         start = 0
-///     else:
-///         start = space.index_w(w_start)
-///     ...
-/// ```
-///
-/// `space.index_w` accepts ANY object exposing `__index__`
-/// (subclasses of int, NumPy ints, etc.) — not just exact int.  The
 /// kwarg surface is also strict: anything other than `start=` is a
 /// TypeError per the gateway's parsed signature.
 // `pypy/module/__builtin__/functional.py:253-275 W_Enumerate.descr___new__`
