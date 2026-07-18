@@ -240,10 +240,10 @@ pub(crate) fn branch_resume_target_stack_depth(
 /// `stack_slot_color_map` read the gate used to inspect: every kept-slot kind
 /// has a per-PC source — a live Variable
 /// through `pcdep_color_slots` (inspect its concrete register), a Ref constant
-/// (the hoisted boxed int `pcdep_color_slots` omits) through
-/// `const_ref_slots_at_pc` (inspect the raw value).  A kept slot in NEITHER map
-/// is unrestorable / a non-Ref constant the per-PC sources cannot prove safe,
-/// so it forces the decline too — strictly no less conservative than the flat
+/// (the hoisted boxed int `pcdep_color_slots` omits) through the jitcode-pc
+/// const Ref slot twin (inspect the raw value).  A kept slot in NEITHER map is
+/// unrestorable / a non-Ref constant the per-PC sources cannot prove safe, so
+/// it forces the decline too — strictly no less conservative than the flat
 /// read.
 pub(crate) fn kept_stack_has_boxed_int_hazard(
     frame: &ActiveResumeFrame,

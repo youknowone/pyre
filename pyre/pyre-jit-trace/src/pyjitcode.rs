@@ -128,11 +128,11 @@ pub struct PyJitCodeMetadata {
     pub pcdep_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// Predecessor-op-start tier of the trivia-aware `pcdep_color_slots` twin.
     pub pcdep_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
-    /// Reproduces `const_ref_slots_at_pc[skip_python_trivia_forward(
-    /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
-    /// and predecessor-op-start tiers as the trivia-aware depth twin.
+    /// Const Ref operand-stack slots after Python trivia, resolved with the
+    /// same exact-marker and predecessor-op-start tiers as the trivia-aware
+    /// depth twin.
     pub const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
-    /// Predecessor-op-start tier of the trivia-aware `const_ref_slots_at_pc` twin.
+    /// Predecessor-op-start tier of the trivia-aware const Ref slot twin.
     pub const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
     /// #73-core: trivia-aware twin of `result_color_at_pc`, split into the
     /// SAME exact-marker / predecessor-op-start tiers as the depth-trivia
@@ -205,25 +205,15 @@ pub struct PyJitCodeMetadata {
     /// `nlocals + ncells + max_stackdepth`). Sized to the static peak, not
     /// `max(depth_at_pc)` — JIT-traced PCs may not reach `co_stacksize`.
     pub max_stackdepth: usize,
-    /// Per-Python-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`).
-    /// `pcdep_color_slots` records live restorable Variables only; for the
-    /// virtualizable ROOT frame the operand-stack constants are rematerialized
-    /// from the value-stack resumedata's const pool, but an INLINED CALLEE
-    /// frame has no virtualizable payload. `reconstruct_inline_recipe` reads
-    /// this table to refill the registerless constant slots a guard resume
-    /// leaves empty after the `pcdep_color_slots` color→slot inversion.
-    /// Indexed by `py_pc`; empty for jitcodes with no inlined-callee resume.
-    pub const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
-    /// gh#73 S3.2: predecessor-keyed jitcode-pc twin of `const_ref_slots_at_pc`.
+    /// gh#73 S3.2: predecessor-keyed jitcode-pc const Ref operand-stack slots.
     /// Each entry `(off, slots)` maps a JitCode byte offset to the const
     /// operand-stack slot list of the py_pc that `python_pc_for_jitcode_pc(off)`
     /// returns (block-head marker precedence, else the predecessor op-start
-    /// boundary at-or-before `off`). A PREDECESSOR binary search
-    /// (largest offset ≤ jit_pc) reproduces
-    /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` for a carried
-    /// resume coordinate. Built in the same `by_off` loop as `pcdep_by_jit_pc`;
-    /// empty for skeleton / fixture. Read on the decode-identity
-    /// path of `const_ref_slots_at_pc_at`, mirroring the `pcdep_by_jit_pc` /
+    /// boundary at-or-before `off`). A PREDECESSOR binary search (largest
+    /// offset ≤ jit_pc) returns the slots for a carried resume coordinate.
+    /// Built in the same `by_off` loop as `pcdep_by_jit_pc`; empty for skeleton
+    /// / fixture. Read on the decode-identity path of
+    /// `const_ref_slots_at_pc_at`, mirroring the `pcdep_by_jit_pc` /
     /// `depth_pred_by_jit_pc` twins' production use.
     pub const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
     /// True once `assembler.assemble`'s setup-time drain has run and stamped
@@ -550,9 +540,8 @@ impl PyJitCode {
     }
 
     /// gh#73 S3.2: const operand-stack slots keyed by a JitCode byte offset via
-    /// the `const_ref_slots_by_jit_pc` predecessor twin. Equals
-    /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction
-    /// for a carried resume coordinate; `None` when the twin is empty (skeleton /
+    /// the `const_ref_slots_by_jit_pc` predecessor twin. Returns the slots for
+    /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Consumed on the decode-identity path of
     /// `const_ref_slots_at_pc_at`.
     pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
@@ -842,7 +831,6 @@ impl PyJitCode {
                 stack_base: 0,
                 max_stackdepth: 0,
                 has_color_map: false,
-                const_ref_slots_at_pc: Vec::new(),
                 const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: false,
             },

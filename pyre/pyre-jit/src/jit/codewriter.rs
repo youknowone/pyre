@@ -13481,7 +13481,6 @@ impl CodeWriter {
             built_as_portal: true,
             stack_base: frame_stack_base,
             max_stackdepth: code.max_stackdepth as usize,
-            const_ref_slots_at_pc,
             const_ref_slots_by_jit_pc,
             is_drained: true,
         };

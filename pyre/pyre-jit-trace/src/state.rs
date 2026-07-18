@@ -1555,18 +1555,14 @@ pub(crate) fn bridge_semantic_maps_from_pc(jitcode_index: i32, pc: i32) -> Bridg
     bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, pc, pc)
 }
 
-/// Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`) at the
-/// resume PC of a jitcode. The pcdep color map records live Variables only;
+/// Operand-stack Ref constants (`(semantic_slot, raw_ref)`) at the resume PC of
+/// a jitcode. The pcdep color map records live Variables only;
 /// `reconstruct_inline_recipe` uses this to refill the registerless constant
 /// slots an inlined-callee guard resume leaves empty after the color→slot
-/// inversion. When the carried `jitcode_pc` is set, sources the slots from the
-/// predecessor-keyed `const_ref_slots_by_jit_pc` twin so the constant lookup
-/// uses the same coordinate as `pcdep_entries` and the liveness decode.
-pub(crate) fn const_ref_slots_at_pc_at(
-    jitcode_index: i32,
-    pc: i32,
-    jitcode_pc: i32,
-) -> Vec<(u16, i64)> {
+/// inversion. Sources the slots from the predecessor-keyed
+/// `const_ref_slots_by_jit_pc` twin so the constant lookup uses the same
+/// coordinate as `pcdep_entries` and the liveness decode.
+pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> Vec<(u16, i64)> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1577,40 +1573,25 @@ pub(crate) fn const_ref_slots_at_pc_at(
         // before the `>= 0` / offset uses below. No-op for offsets /
         // NO_JITCODE_PC (flip-off), so byte-identical when off.
         let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(&jc.payload, jitcode_pc);
-        let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+        if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
                 // gh#73 S3.2: source the const slots directly from the carried
                 // genuine `jitcode_pc` via the predecessor-keyed twin — the same
                 // decode-identity shape the pcdep/depth twins use at
                 // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
-                // returns `Some` (an empty slot list is a legitimate hit). A twin
-                // miss degrades to the merge-target PC (the same fallback the
-                // non-decodable path uses below) rather than the retired
-                // `python_pc_for_jitcode_pc` re-inversion; a skeleton / portal
-                // bridge has an empty `const_ref_slots_at_pc`, so both resolve to
-                // the same empty slot list.
+                // returns `Some` (an empty slot list is a legitimate hit).
                 if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
                     return slots;
                 }
-                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
-            } else {
-                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
             }
-        } else {
-            majit_ir::resumedata::decode_resume_pc(pc).0 as usize
-        };
-        jc.payload
-            .metadata
-            .const_ref_slots_at_pc
-            .get(real_pc)
-            .cloned()
-            .unwrap_or_default()
+        }
+        Vec::new()
     })
 }
 
 pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
-    const_ref_slots_at_pc_at(jitcode_index, pc, pc)
+    const_ref_slots_at_pc_at(jitcode_index, pc)
 }
 
 /// Return the post-regalloc Ref-bank colors of the portal red args
@@ -12540,7 +12521,6 @@ mod tests {
                 built_as_portal: true,
                 stack_base: 1,
                 max_stackdepth: 0,
-                const_ref_slots_at_pc: Vec::new(),
                 const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: true,
             },
