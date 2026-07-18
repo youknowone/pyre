@@ -4145,31 +4145,21 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             );
-            // A `LIST_APPEND` (inlined-comprehension accumulator) body is
-            // admitted only when the body performs no CALL: a per-element call
-            // that enters a user Python frame (a class ctor / user function)
-            // sets the FOR_ITER in-flight body-effect flag, and a subsequent
-            // mid-body abort then routes through `fbw_foriter_inflight_take`,
-            // which REFUSES delivery to avoid a double-apply — dropping the
-            // trace-attempt iteration's item. The append itself is exact-resume
-            // safe, but the accompanying user-frame call is not yet, so decline
-            // the whole body to interpretation (a correct, if un-compiled, run)
-            // rather than compile a loop that drops an element. Call-free
-            // comprehension bodies (`[j for j in it]`, arithmetic, subscript)
-            // never enter a user frame and stay admissible.
-            let body_has_call = {
+            // A `LIST_APPEND` body is admitted only in the canonical
+            // bare-accumulator shape. Any value-producing op (arithmetic,
+            // container build, format, constant load, call) can make the append
+            // use a list Object-strategy whose Void `setarrayitem_gc` residual
+            // trips the FBW body-effect gate; `fbw_foriter_inflight_take` then
+            // refuses delivery of the in-flight FOR_ITER item and drops that
+            // trace-attempt iteration. Those bodies stay in the interpreter
+            // until the orthodox fold recovery handles them.
+            let body_has_list_append = {
                 let mut scan_state = pyre_interpreter::OpArgState::default();
                 let mut scan_pc = pc + 1;
                 let mut found = false;
                 while scan_pc < exit && scan_pc < instructions.len() {
                     let (scan_instr, _) = scan_state.get(instructions[scan_pc]);
-                    if matches!(
-                        scan_instr,
-                        I::Call { .. }
-                            | I::CallKw { .. }
-                            | I::CallFunctionEx
-                            | I::CallIntrinsic1 { .. }
-                    ) {
+                    if matches!(scan_instr, I::ListAppend { .. }) {
                         found = true;
                         break;
                     }
@@ -4181,19 +4171,44 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
                 let (body_instr, _) = body_state.get(instructions[body_pc]);
-                let permitted = for_iter_body_op_is_jit_safe(body_instr)
-                    || matches!(
+                let permitted = if body_has_list_append {
+                    matches!(
                         body_instr,
-                        I::StoreSubscr
-                            | I::StoreAttr { .. }
-                            | I::StoreName { .. }
-                            | I::StoreGlobal { .. }
-                            | I::StoreDeref { .. }
-                            | I::DeleteSubscr
-                            | I::DeleteAttr { .. }
-                            | I::LoadName { .. }
+                        I::LoadFast { .. }
+                            | I::LoadFastBorrow { .. }
+                            | I::LoadFastLoadFast { .. }
+                            | I::LoadFastBorrowLoadFastBorrow { .. }
+                            | I::LoadFastCheck { .. }
+                            | I::LoadFastAndClear { .. }
+                            | I::StoreFast { .. }
+                            | I::StoreFastLoadFast { .. }
+                            | I::StoreFastStoreFast { .. }
+                            | I::ListAppend { .. }
+                            | I::Copy { .. }
+                            | I::Swap { .. }
+                            | I::PopTop
+                            | I::PushNull
+                            | I::Nop
+                            | I::NotTaken
+                            | I::JumpBackward { .. }
+                            | I::JumpBackwardNoInterrupt { .. }
+                            | I::ExtendedArg
+                            | I::Cache
                     )
-                    || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
+                } else {
+                    for_iter_body_op_is_jit_safe(body_instr)
+                        || matches!(
+                            body_instr,
+                            I::StoreSubscr
+                                | I::StoreAttr { .. }
+                                | I::StoreName { .. }
+                                | I::StoreGlobal { .. }
+                                | I::StoreDeref { .. }
+                                | I::DeleteSubscr
+                                | I::DeleteAttr { .. }
+                                | I::LoadName { .. }
+                        )
+                };
                 if !permitted {
                     return false;
                 }
@@ -9052,6 +9067,35 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("test source should contain function code {name}"))
+    }
+
+    #[test]
+    fn for_iter_bare_list_append_comprehension_body_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec("def f(n):\n    return [i for i in range(n)]\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_value_producing_list_append_comprehension_body_declines() {
+        use pyre_interpreter::compile_exec;
+        for source in [
+            "def f(n):\n    return [i + 1 for i in range(n)]\n",
+            "def f(n):\n    return [-i for i in range(n)]\n",
+            "def f(n):\n    return [(i, i) for i in range(n)]\n",
+            "def f(n):\n    return ['s' for i in range(n)]\n",
+        ] {
+            let module = compile_exec(source).expect("test code should compile");
+            let code = function_code_from_module(&module, "f");
+            assert!(!for_iter_bodies_all_jit_safe(&code));
+            assert_eq!(
+                unsupported_jit_shape(&code),
+                UnsupportedJitShape::CurrentFrameOnly
+            );
+        }
     }
 
     #[test]
