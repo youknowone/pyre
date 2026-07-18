@@ -479,6 +479,12 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     // `PY_NULL` so `args` reads as `()`), matching the prebuilt
     // singletons (`MemoryError`, `StopIteration`).
     if !message.is_empty() {
+        // Root the fresh managed exception across the arg-list build: `exc`
+        // lives only in this Rust local while `w_list_new` allocates, so a
+        // collection there could sweep the unrooted (non-moving oldgen)
+        // exception before `w_exception_set_args` writes through it.
+        let _roots = crate::gc_roots::push_roots();
+        crate::gc_roots::pin_root(exc);
         let arg = crate::unicodeobject::w_str_new(message);
         unsafe { w_exception_set_args(exc, crate::listobject::w_list_new(vec![arg])) };
     }
@@ -490,6 +496,9 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
     let exc = w_exception_new_empty(kind);
     if !message.is_empty() {
+        // See `w_exception_new`: pin `exc` across the allocating arg build.
+        let _roots = crate::gc_roots::push_roots();
+        crate::gc_roots::pin_root(exc);
         let arg = crate::unicodeobject::w_str_from_wtf8(message.to_wtf8_buf());
         unsafe { w_exception_set_args(exc, crate::listobject::w_list_new(vec![arg])) };
     }

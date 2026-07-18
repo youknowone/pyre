@@ -686,6 +686,12 @@ impl PyError {
             return self.exc_object;
         }
         let exc = w_exception_new(self.to_exc_kind(), &self.message);
+        // Root the fresh managed exception across the message/context stamping
+        // below: `exc` lives only in this Rust local while `w_list_new` (and the
+        // setters) run, so a collection there could sweep the unrooted
+        // (non-moving oldgen) exception before it is written through.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg = pyre_object::w_str_new(&self.message);
             let args_list = pyre_object::w_list_new(vec![msg]);
