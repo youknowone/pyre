@@ -493,12 +493,6 @@ unsafe fn bytearray_object_destructor(obj_addr: usize) {
     unsafe { pyre_object::bytearrayobject::w_bytearray_dealloc(obj) };
 }
 
-/// Reclaim the off-GC item container of a swept set object.
-unsafe fn set_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::setobject::w_set_dealloc_items(obj) };
-}
-
 /// Reclaim the off-GC name string of a swept function object.
 unsafe fn function_object_destructor(obj_addr: usize) {
     let obj = obj_addr as pyre_object::PyObjectRef;
@@ -590,6 +584,14 @@ unsafe fn module_dict_object_custom_trace(
 
 unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
+    // Keep the stable leaf storage box alive by forwarding its owning field
+    // slot. The box has no walker of its own; this trace also walks its inner
+    // ObjectKey slots below, matching the mapdict leaf-storage pattern.
+    // A no-GC-hook fallback allocation is not collector-owned.
+    if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
+        let items_slot = std::ptr::addr_of_mut!(set.items);
+        f(items_slot as *mut majit_ir::GcRef);
+    }
     let entries = unsafe { &mut *set.items };
     for (key, _) in entries.iter_mut() {
         // ObjectKey.hash is identity-stable across GC moves, so writing the
@@ -1586,14 +1588,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_SetObject carries `items: *mut IndexMap<ObjectKey, ()>`. Register a
     // custom trace hook so GC forwarding updates indirect key object slots.
     // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
-    let w_set_tid = gc.register_type(
-        TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
-            object_tid,
-            set_object_custom_trace,
-        )
-        .with_destructor_fn(set_object_destructor),
-    );
+    let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
+        object_tid,
+        set_object_custom_trace,
+    ));
     debug_assert_eq!(w_set_tid, W_SET_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2772,6 +2771,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
              next collection.  Register each in build_gc: {unregistered:?}",
         );
     }
+    // PyPy setobject.py:875/963 stores a copied r_dict behind the set's GC
+    // pointer field; rdict.py:210 makes that table a GcStruct("dicttable").
+    // The box is a leaf because `set_object_custom_trace` owns both edges:
+    // it greys this box through `items` and forwards every ObjectKey.obj slot.
+    // Keep this runtime id at the absolute registration tail.
+    register_leaf_storage_box::<pyre_object::setobject::SetItemsStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetItemsStorage>,
+        pyre_object::setobject::set_set_items_gc_type_id,
+    );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

@@ -6120,7 +6120,11 @@ impl<'a> Lowering<'a> {
                 //   • `typedef::set_method_difference`: `&args[1..]` →
                 //     `core::slice::index::<Impl>::index` (unregistered), and the
                 //     `set_copy_real` → `w_set_copy_storage_from` storage-copy
-                //     chain.
+                //     chain (its `__deref_write` wall is gone as of the off-GC
+                //     storage box S1 — `w_set_copy_storage_from` reassigns the
+                //     `items` GC field; the chain now walls only on the
+                //     `w_set_new` `setattr("items")`/`d.len` `int ∪ r_uint`
+                //     annotator UnionError).
                 // Until BOTH graphs fully lift (slice-iterator + slice-index +
                 // the collect_parameters UnionError — all annotator-completeness
                 // axis walls, not vec! walls), the unconditional recognizer is

@@ -79,13 +79,14 @@ pub unsafe fn w_set_iter_set_index(obj: PyObjectRef, index: usize) {
 
 /// Python set object.
 ///
-/// Layout: `[ob_type | items | len]`. `items` is a heap-owned hashed
-/// `IndexMap<ObjectKey, ()>`, mirroring the dict object strategy while
-/// keeping the struct trivially `Copy`-friendly for the JIT raw-pointer model.
+/// Layout: `[ob_type | items | len]`. `items` points to a GC-managed hashed
+/// [`SetItemsStorage`], matching PyPy's `sstorage` field: its `r_dict` table is
+/// an `rdict.py:210` `GcStruct("dicttable")`, and `setobject.py:875` replaces
+/// that GC pointer field with `get_storage_copy()`.
 #[repr(C)]
 pub struct W_SetObject {
     pub ob_header: PyObject,
-    pub items: *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, ()>,
+    pub items: *mut SetItemsStorage,
     pub len: usize,
     /// setobject.py:584 `W_FrozensetObject.hash = DEFAULT_HASH`.
     pub hash: i64,
@@ -93,6 +94,25 @@ pub struct W_SetObject {
 
 /// GC type id assigned to `W_SetObject` at JitDriver init time.
 pub const W_SET_GC_TYPE_ID: u32 = 30;
+
+/// GC-managed element table shared by `set` and `frozenset` bodies.
+pub type SetItemsStorage = indexmap::IndexMap<crate::dictmultiobject::ObjectKey, ()>;
+
+/// Runtime-assigned GC type id for [`SetItemsStorage`]. Like the bigint
+/// payload id, this is published by `pyre-jit::eval` after the fixed-constant
+/// type registrations and is never embedded in a JIT allocation descriptor.
+static SET_ITEMS_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for [`SetItemsStorage`].
+pub fn set_set_items_gc_type_id(id: u32) {
+    SET_ITEMS_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for [`SetItemsStorage`].
+#[majit_macros::dont_look_inside]
+pub fn set_items_gc_type_id() -> u32 {
+    SET_ITEMS_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
@@ -102,19 +122,6 @@ impl crate::lltype::GcType for W_SetObject {
         W_SET_GC_TYPE_ID
     }
     const SIZE: usize = W_SET_OBJECT_SIZE;
-}
-
-/// Free the off-GC item container owned by a `W_SetObject`.
-///
-/// # Safety
-/// `obj` must point at a valid `W_SetObject` whose `items` Box is not aliased
-/// by another owner.
-pub unsafe fn w_set_dealloc_items(obj: PyObjectRef) {
-    let raw = &mut *(obj as *mut W_SetObject);
-    if !raw.items.is_null() {
-        drop(Box::from_raw(raw.items));
-        raw.items = std::ptr::null_mut();
-    }
 }
 
 #[inline]
@@ -145,10 +152,8 @@ fn set_write_barrier(obj: PyObjectRef) {
 
 /// Allocate an empty `set`.
 pub fn w_set_new() -> PyObjectRef {
-    let items = crate::lltype::malloc_raw(indexmap::IndexMap::<
-        crate::dictmultiobject::ObjectKey,
-        (),
-    >::new());
+    let items =
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
     let header = PyObject {
         ob_type: &SET_TYPE as *const PyType,
         w_class: get_instantiate(&SET_TYPE),
@@ -190,10 +195,8 @@ pub fn w_set_new() -> PyObjectRef {
 /// Same body as [`w_set_new`] with the constant `&FROZENSET_TYPE` baked
 /// into `ob_type`; see that constructor for the GC old-gen rationale.
 pub fn w_frozenset_new() -> PyObjectRef {
-    let items = crate::lltype::malloc_raw(indexmap::IndexMap::<
-        crate::dictmultiobject::ObjectKey,
-        (),
-    >::new());
+    let items =
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
     let header = PyObject {
         ob_type: &FROZENSET_TYPE as *const PyType,
         w_class: get_instantiate(&FROZENSET_TYPE),
@@ -596,22 +599,25 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// Take over a copy of another set's storage, keeping the digest each element
 /// was stored under.
 ///
-/// `setobject.py set_strategy_and_setdata` hands a set operand's
-/// storage to the new set (`w_set.sstorage = w_iterable.get_storage_copy()`)
-/// rather than walking its elements back in, and `setobject.py
-/// ObjectSetStrategy.get_storage_copy` makes that copy with `d.copy()` — one
-/// bulk copy of the table, not an element-by-element refill. Copying the
-/// buckets is what makes the operand's elements reach the new set without
-/// being handed to a user `__hash__` (or `__eq__`) a second time.
+/// `setobject.py:875` assigns a fresh storage table to the GC pointer field
+/// (`w_set.sstorage = w_other.get_storage_copy()`), while
+/// `ObjectSetStrategy.get_storage_copy` (`setobject.py:963`) creates that table
+/// with `self.erase(d.copy())`. PyPy's underlying table is the GC-managed
+/// `rdict.py:210` `GcStruct("dicttable")`. Do the same field reassignment here,
+/// rather than overwriting the old table's pointee. Copying the buckets is
+/// what makes the operand's elements reach the new set without handing them
+/// to a user `__hash__` (or `__eq__`) a second time.
 ///
-/// Because nothing here allocates or calls back into user code, there is no
-/// collection point between reading `src`'s table and installing it.
+/// Cloning does not call back into user code, and the storage box uses the
+/// non-collecting stable old-generation allocator, so there is no collection
+/// point between reading `src`'s table and installing the new field value.
 ///
 /// # Safety
 /// `dst` and `src` must point to valid `W_SetObject`s.
 pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     let d = &mut *(dst as *mut W_SetObject);
-    *d.items = (*(*(src as *const W_SetObject)).items).clone();
+    let copied = (*(*(src as *const W_SetObject)).items).clone();
+    d.items = crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id());
     d.len = (*d.items).len();
     d.hash = -1;
     set_write_barrier(dst);

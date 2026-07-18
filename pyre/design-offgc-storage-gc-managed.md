@@ -103,6 +103,13 @@ host 컨테이너를 쓰기 때문에 필요한 PRE-EXISTING-ADAPTATION의 확�
 각 슬라이스는 독립적으로 landable(3-backend green + census 비회귀)이어야 한다.
 저장소 종류별로 나눈다. 순서는 leverage(Slice C wall) + 리스크로 정렬.
 
+**진행 상태**: ✅ S0 LANDED (`7d4d89567d1`, dormant 프리미티브). ✅ S1 DONE
+(set/frozenset `items` GC 박스화; `__deref_write` wall 완전 제거 census S0:6→S1:0;
+3-backend ALL PASSED dynasm 223/cranelift 223/wasm 222; 단위 311+6+213 pass; census net
++1 = `w_set_len` — `__deref_write` 제거로 annotator가 `d.len=(*d.items).len()`(usize) ∪
+`len -= 1`(int) union까지 도달해 노출된 latent wall, 정확성 무관, task#2 annotator axis로
+이관). S2~S6 pending.
+
 ### S0 — GC-managed storage-box 프리미티브 (기반)
 `pyre-object/src/lltype.rs` (또는 새 `gc_storage.rs`)에:
 - `gc_alloc_storage_box<T>(value: T, tid: u32) -> *mut T` — `try_gc_alloc_stable_raw`
