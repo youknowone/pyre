@@ -3094,21 +3094,10 @@ unsafe fn pyre_object_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    let mut changed = 0usize;
     unsafe {
         pyre_object::gc_roots::walk_shadow_stack_area(data, |slot| {
-            let before = *slot;
             visit_pyobject_root(slot, visitor);
-            if *slot != before {
-                changed += 1;
-                if std::env::var_os("PYRE_ROOT_WALK_DIAG").is_some() {
-                    eprintln!("[pyre-object-root] {before:p} -> {:p}", *slot);
-                }
-            }
         });
-    }
-    if changed != 0 && std::env::var_os("PYRE_ROOT_WALK_DIAG").is_some() {
-        eprintln!("[pyre-object-roots] changed={changed}");
     }
 }
 

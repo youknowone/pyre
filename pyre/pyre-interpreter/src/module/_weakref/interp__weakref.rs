@@ -41,11 +41,21 @@ const ATTR_W_HASH: &str = "w_hash";
 /// `baseobjspace::getattr_str` would otherwise force the receiver and recurse
 /// indefinitely while the proxy is reading its OWN `w_obj_weak`/etc.
 fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
-    let w_dict = crate::baseobjspace::getdict(obj);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let w_dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(root_base));
     if w_dict.is_null() {
         return PY_NULL;
     }
-    let value = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) }.unwrap_or(PY_NULL);
+    pyre_object::gc_roots::pin_root(w_dict);
+    let value = unsafe {
+        pyre_object::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            name,
+        )
+    }
+    .unwrap_or(PY_NULL);
     if value.is_null() || unsafe { pyre_object::is_none(value) } {
         return PY_NULL;
     }
@@ -55,9 +65,20 @@ fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
 /// Mirror of `read_attr` for writes — direct dict access keeps lifeline /
 /// proxy / weakref bookkeeping out of the fast-path's force loop.
 fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
-    let w_dict = crate::baseobjspace::getdict(obj);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    pyre_object::gc_roots::pin_root(value);
+    let w_dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(root_base));
     if !w_dict.is_null() {
-        unsafe { pyre_object::w_dict_setitem_str(w_dict, name, value) };
+        pyre_object::gc_roots::pin_root(w_dict);
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+                name,
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            )
+        };
     }
 }
 
@@ -657,18 +678,21 @@ pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
 ///     return self.w_hash
 /// ```
 pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_self = args[0];
-    let cached = read_attr(w_self, ATTR_W_HASH);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let current_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let cached = read_attr(current_self(), ATTR_W_HASH);
     if !cached.is_null() {
         return Ok(cached);
     }
-    let w_obj = dereference(w_self);
+    let w_obj = dereference(current_self());
     if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
         return Err(PyError::type_error("weak object has gone away".to_string()));
     }
     // pyre's hash: identity-based for non-int/non-str. Mirrors space.hash(w_obj).
     let h = pyre_object::w_int_new(w_obj as i64);
-    write_attr(w_self, ATTR_W_HASH, h);
+    write_attr(current_self(), ATTR_W_HASH, h);
     Ok(h)
 }
 

@@ -5156,22 +5156,22 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     pyre_object::gc_roots::pin_root(w_data);
     let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    let other_raw = resolve_dict_backing(data());
     unsafe {
-        let fast_path_eligible = other_raw.is_null() == false
-            && pyre_object::is_dict(other_raw)
+        let fast_path_eligible = !resolve_dict_backing(data()).is_null()
+            && pyre_object::is_dict(resolve_dict_backing(data()))
             && dict_subclass_uses_default_iter(data());
         if fast_path_eligible {
             // `dictmultiobject.py:1401-1406 update1_dict_dict`
             let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict());
             if dst_is_empty {
-                let w_copy = pyre_object::dictmultiobject::w_dict_copy(other_raw);
+                let w_copy =
+                    pyre_object::dictmultiobject::w_dict_copy(resolve_dict_backing(data()));
                 pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
                     dict(),
                     w_copy,
                 );
             } else {
-                let items = pyre_object::w_dict_items(other_raw);
+                let items = pyre_object::w_dict_items(resolve_dict_backing(data()));
                 let item_base = pyre_object::gc_roots::shadow_stack_len();
                 for &(k, v) in &items {
                     pyre_object::gc_roots::pin_root(k);
@@ -5248,19 +5248,33 @@ pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "update")?;
-    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
+    // `dictmultiobject.py:1430 init_or_update` receives an `Arguments`
+    // object whose `arguments_w` entries are roots in translated RPython.
+    // Keep the flat Rust ABI's equivalent slots live before inspecting the
+    // trailing kwargs vehicle or passing an operand to `update1`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let rooted_args = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
+        .collect::<Vec<_>>();
+    require_receiver(&rooted_args, "update")?;
+    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&rooted_args);
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most 1 argument, got {}",
             positional.len() - 1
         )));
     }
-    let dict = positional[0];
-    if let Some(other) = positional.get(1).copied() {
-        dict_update1(dict, other)?;
+    if positional.len() > 1 {
+        dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        )?;
     }
-    let backing = resolve_dict_backing(dict);
+    let backing = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(root_base));
     if backing.is_null() {
         // A dict subclass declared with `__slots__` has no attribute storage
         // for its item backing (pyre keeps a dict subclass's items in an
@@ -5268,7 +5282,8 @@ pub fn dict_init_or_update(
         // slotted-dict-subclass support needs intrinsic dict backing.
         return Ok(w_none());
     }
-    if let Some(kwargs) = kwargs_dict {
+    if kwargs_dict.is_some() {
+        let kwargs = pyre_object::gc_roots::shadow_stack_get(root_base + args.len() - 1);
         unsafe {
             for (k, v) in pyre_object::w_dict_items(kwargs) {
                 if pyre_object::is_str(k)
