@@ -7449,6 +7449,19 @@ impl CodeWriter {
                 // every new block iteration so a previous block's
                 // queued switch doesn't bleed into this one.
                 block_switch_pending = false;
+                // Blocks are dequeued in a non-sequential order, so the
+                // running EXTENDED_ARG accumulator must not persist across
+                // block boundaries: a block that ends on an EXTENDED_ARG
+                // code unit would otherwise fold its stale high bits into
+                // the next dequeued block's first instruction argument
+                // (e.g. COMPARE_OP 148 decoded as (1 << 8) | 148 = 404,
+                // rejected by Arg<ComparisonOperator>::try_from). Within a
+                // block the walk is sequential (start_pc..num_instrs) and
+                // every branch/handler target lands on an instruction start
+                // (the EXTENDED_ARG prefix is included), so a clean reset at
+                // block entry keeps in-block prefixes intact while cutting
+                // the cross-block leak.
+                arg_state.reset();
                 // Note — upstream `flowcontext.py:407-416`
                 // drives per-block op accumulation via `while True:
                 // handle_bytecode(...)` until a terminator, then
