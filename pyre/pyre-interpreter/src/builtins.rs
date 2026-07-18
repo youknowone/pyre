@@ -6666,6 +6666,15 @@ pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyE
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
     let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    collect_iterator(it)
+}
+
+/// Consume an iterator that has already been obtained.  Kept separate from
+/// [`collect_iterable`] for CPython `PySequence_Fast` parity: callers such as
+/// dict sequence-pair conversion must distinguish an error from `iter(obj)`
+/// from an error raised later by `next()`.
+pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     // Each `next` runs arbitrary allocating code (a generator body, a JIT
     // callee that boxes a fresh int) which can trigger a moving minor
     // collection. A raw `Vec<PyObjectRef>` on the malloc heap is invisible to

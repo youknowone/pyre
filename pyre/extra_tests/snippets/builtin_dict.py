@@ -491,3 +491,24 @@ class DictKeyWithTypeErrorSubclass:
 with assert_raises(DictHashTypeErrorSubclass) as cm:
     unhashable_dict.get(DictKeyWithTypeErrorSubclass())
 assert str(cm.exception) == "keep me"
+
+
+with assert_raises(TypeError) as cm:
+    {}.update([object()])
+assert str(cm.exception) == "object is not iterable"
+assert cm.exception.__notes__ == [
+    "Cannot convert dictionary update sequence element #0 to a sequence"
+]
+
+
+def failing_dict_pair():
+    yield "key"
+    raise TypeError("pair iteration failed")
+
+
+with assert_raises(TypeError) as cm:
+    dict([failing_dict_pair()])
+assert str(cm.exception) == "pair iteration failed"
+assert cm.exception.__notes__ == [
+    "Cannot convert dictionary update sequence element #0 to a sequence"
+]

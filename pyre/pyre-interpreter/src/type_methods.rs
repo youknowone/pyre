@@ -5190,13 +5190,13 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                         Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
                         Err(e) => return Err(e),
                     };
+                    let _iteration_roots = pyre_object::gc_roots::push_roots();
                     let iteration_roots = pyre_object::gc_roots::shadow_stack_len();
                     pyre_object::gc_roots::pin_root(pyre_object::w_tuple_getitem(pair, 0).unwrap());
                     pyre_object::gc_roots::pin_root(pyre_object::w_tuple_getitem(pair, 1).unwrap());
                     let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
                     let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     dict_store_checked(dict(), k, v)?;
-                    pyre_object::gc_roots::truncate_shadow_stack(iteration_roots);
                 }
             }
         } else {
@@ -5224,7 +5224,9 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     dict_store_checked(dict(), k, v)?;
                 }
             } else {
-                // `dictmultiobject.py:1410-1418 update1_pairs`
+                // PyPy `dictmultiobject.py:update1_pairs`, with Python 3.14
+                // `merge_from_seq2_lock_held`'s PySequence_Fast error/note
+                // semantics where the versions differ.
                 let pairs = crate::builtins::collect_iterable(data())?;
                 let pairs_base = pyre_object::gc_roots::shadow_stack_len();
                 for &pair in &pairs {
@@ -5232,7 +5234,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 }
                 for idx in 0..pairs.len() {
                     let pair = pyre_object::gc_roots::shadow_stack_get(pairs_base + idx);
-                    let entries = crate::builtins::collect_iterable(pair)?;
+                    let entries = dict_update_pair_entries(pair, idx)?;
                     if entries.len() != 2 {
                         return Err(crate::PyError::value_error(format!(
                             "dictionary update sequence element #{idx} has length {}; 2 is required",
@@ -5250,6 +5252,77 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
         }
     }
     Ok(())
+}
+
+/// CPython 3.14 `merge_from_seq2_lock_held`'s
+/// `PySequence_Fast(item, "object is not iterable")` conversion.  An exact
+/// list/tuple is already a fast sequence; for other objects, only a TypeError
+/// from obtaining the iterator is replaced.  A TypeError raised later by the
+/// iterator keeps its original message.
+fn dict_update_pair_entries(
+    pair: PyObjectRef,
+    idx: usize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pair);
+    let pair = pyre_object::gc_roots::shadow_stack_get(pair_slot);
+    unsafe {
+        if is_exact_list(pair) {
+            let len = w_list_len(pair);
+            return Ok((0..len)
+                .filter_map(|i| w_list_getitem(pair, i as i64))
+                .collect());
+        }
+        if is_exact_tuple(pair) {
+            let len = w_tuple_len(pair);
+            return Ok((0..len)
+                .filter_map(|i| w_tuple_getitem(pair, i as i64))
+                .collect());
+        }
+    }
+    let iter = match crate::baseobjspace::iter(pair) {
+        Ok(iter) => iter,
+        Err(err) if err.kind == crate::PyErrorKind::TypeError => {
+            return Err(dict_update_pair_note(
+                crate::PyError::type_error("object is not iterable"),
+                idx,
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    crate::builtins::collect_iterator(iter).map_err(|err| dict_update_pair_note(err, idx))
+}
+
+/// CPython 3.14 `_PyErr_FormatNote` / `_PyException_AddNote` parity for a
+/// failed dict sequence-pair conversion.  Notes live directly in the
+/// exception instance dict, so an overridden Python-level `add_note` method
+/// cannot intercept this internal operation.
+fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError {
+    if err.kind != crate::PyErrorKind::TypeError {
+        return err;
+    }
+    let exc = err.to_exc_object();
+    err.exc_object = exc;
+    let note = w_str_new(&format!(
+        "Cannot convert dictionary update sequence element #{idx} to a sequence"
+    ));
+    unsafe {
+        let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
+        let notes = match w_dict_getitem_str(dict, "__notes__") {
+            Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
+            Some(_) => {
+                return crate::PyError::type_error("Cannot add note: __notes__ is not a list");
+            }
+            None => {
+                let notes = w_list_new(Vec::new());
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, "__notes__", notes);
+                notes
+            }
+        };
+        w_list_append(notes, note);
+    }
+    err
 }
 
 /// `dictmultiobject.py:1430-1443 init_or_update` — shared by `dict.__init__`
