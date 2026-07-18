@@ -420,3 +420,10 @@ class RaisingDictKey:
 
 
 assert_raises(DictContainsError, {}.__contains__, RaisingDictKey())
+
+
+arity_dict = {"key": "value"}
+assert_raises(TypeError, arity_dict.copy, None)
+assert_raises(TypeError, arity_dict.keys, None)
+assert_raises(TypeError, arity_dict.values, None)
+assert_raises(TypeError, arity_dict.items, None)

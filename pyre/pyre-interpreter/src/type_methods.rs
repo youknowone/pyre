@@ -5031,6 +5031,7 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// mutations on the dict are visible through the view, matching
 /// `W_DictViewKeysObject`'s behaviour.
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    arity_exact(args, "keys", 0)?;
     require_receiver(args, "keys")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
@@ -5052,6 +5053,7 @@ pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `pypy/objspace/std/dictmultiobject.py:descr_values` parity — same
 /// shape as `descr_keys`, kind tag `Values`.
 pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    arity_exact(args, "values", 0)?;
     require_receiver(args, "values")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
@@ -5069,6 +5071,7 @@ pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `pypy/objspace/std/dictmultiobject.py:descr_items` parity — same
 /// shape as `descr_keys`, kind tag `Items`.
 pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    arity_exact(args, "items", 0)?;
     require_receiver(args, "items")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
@@ -5123,9 +5126,7 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
 /// `dict.copy()` and (via `resolve_dict_backing` proxy unwrap) by
 /// `mappingproxy.copy()` (`dictproxyobject.py:84 copy_w`).
 pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Ok(pyre_object::w_dict_new());
-    }
+    arity_exact(args, "copy", 0)?;
     let src = resolve_dict_backing(args[0]);
     if src.is_null() {
         return Ok(pyre_object::w_dict_new());
