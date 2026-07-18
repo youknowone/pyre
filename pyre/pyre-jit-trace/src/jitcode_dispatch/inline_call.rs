@@ -1389,9 +1389,11 @@ pub(crate) fn try_walker_inline_resolved_user_call(
         if self_recursive {
             // RPython `opimpl_recursive_call` / `do_recursive_call`
             // (`pyjitpl.py:1376-1432`) unroll within `max_unroll_recursion`,
-            // then falls back to the assembler-call path.  Keep pyre's
-            // default fold-only route unchanged; the opt-in flag lets a
-            // primary trace spend the multiframe budget on recursion unrolls.
+            // then fall back to the assembler-call path.  Default-on
+            // (`fbw_rec_multiframe_enabled`): a primary trace spends the
+            // multiframe budget unrolling recursion below the depth bound
+            // before folding the deepest call to the recursive portal
+            // `CALL_ASSEMBLER`.
             let unroll = fbw_rec_multiframe_enabled()
                 && !ctx.fbw_mode.carrier_resume
                 && ctx.session.borrow().framestack.len() < fbw_max_multiframe_depth();

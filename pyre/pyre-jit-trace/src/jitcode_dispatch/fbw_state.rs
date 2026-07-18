@@ -79,15 +79,19 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_REC_MULTIFRAME` (default OFF): route primary-trace
-/// self-recursive Python calls through the multiframe inline path while below
-/// `PYRE_FBW_MULTIFRAME_DEPTH`, instead of folding immediately to the
-/// recursive portal `CALL_ASSEMBLER`.
+/// `PYRE_FBW_REC_MULTIFRAME` (default ON; `=0`/`false` opts out): route
+/// primary-trace self-recursive Python calls through the multiframe inline path
+/// while below `PYRE_FBW_MULTIFRAME_DEPTH`, instead of folding immediately to
+/// the recursive portal `CALL_ASSEMBLER`.
 ///
-/// RPython parity target: `opimpl_recursive_call` / `do_recursive_call`
-/// (`pyjitpl.py:1376-1432`) inline within `max_unroll_recursion`; once the
-/// cap is reached, recursion falls back to the assembler-call path.  Pyre keeps
-/// this route opt-in while the default remains the existing fold-only policy.
+/// RPython parity: `opimpl_recursive_call` / `do_recursive_call`
+/// (`pyjitpl.py:1376-1432`) inline within `max_unroll_recursion`; only once the
+/// cap is reached does recursion fall back to the assembler-call path.  The
+/// prior fold-only default (every self-recursive call cut straight to
+/// `CALL_ASSEMBLER`) was the pyre deviation; inlining below the depth bound is
+/// the parity behavior, so this is default-on.  The depth bound
+/// (`fbw_max_multiframe_depth`, default 1) still caps how deep the inline
+/// unrolls before falling back to `CALL_ASSEMBLER`.
 pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MULTIFRAME") {
@@ -95,7 +99,7 @@ pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
