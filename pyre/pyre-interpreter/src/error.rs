@@ -685,12 +685,23 @@ impl PyError {
         if !self.exc_object.is_null() {
             return self.exc_object;
         }
+        // Root the deferred name/obj context references across the exception
+        // allocation below: they live only in this Rust `PyError`, which the
+        // precise collector does not scan, so a collection inside
+        // `w_exception_new` could sweep them before they are stamped onto `exc`
+        // at the `set_name` / `set_attr_obj` calls.
+        let _roots = pyre_object::gc_roots::push_roots();
+        if !self.w_name_context.is_null() {
+            pyre_object::gc_roots::pin_root(self.w_name_context);
+        }
+        if !self.w_obj_context.is_null() {
+            pyre_object::gc_roots::pin_root(self.w_obj_context);
+        }
         let exc = w_exception_new(self.to_exc_kind(), &self.message);
         // Root the fresh managed exception across the message/context stamping
         // below: `exc` lives only in this Rust local while `w_list_new` (and the
         // setters) run, so a collection there could sweep the unrooted
         // (non-moving oldgen) exception before it is written through.
-        let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg = pyre_object::w_str_new(&self.message);
