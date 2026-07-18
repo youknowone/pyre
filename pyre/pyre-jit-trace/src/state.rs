@@ -3495,6 +3495,30 @@ fn live_frame_array_values(
         .collect()
 }
 
+/// Write one decoded Ref back into the live frame's locals_cells_stack_w
+/// (the GC-rooted virtualizable array), re-asserting the resume-decoded
+/// vable image after the guard-failure vsd correction cleared root slots
+/// in callee coordinates.  A no-op for a null frame/array, an out-of-range
+/// slot, or a non-Ref value.
+fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: majit_ir::Value) {
+    let majit_ir::Value::Ref(r) = value else {
+        return;
+    };
+    if vable_ptr == 0 {
+        return;
+    }
+    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let lp = f.locals_cells_stack_w;
+    if lp.is_null() {
+        return;
+    }
+    let arr = unsafe { &mut *lp };
+    if slot >= arr.len() {
+        return;
+    }
+    arr.as_mut_slice()[slot] = r.as_usize() as pyre_object::PyObjectRef;
+}
+
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
 /// `co_nlocals + ncellvars + nfreevars + co_stacksize`. Returns the
 /// full heap-side array length (matching `virtualizable.py:86-99
@@ -8333,6 +8357,13 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if idx >= vable_array_start {
+                store_live_frame_array_slot(
+                    sym.concrete_vable_ptr as usize,
+                    idx - vable_array_start,
+                    val,
+                );
+            }
             oprefs.push(op);
             concrete_values.push(val);
         }
@@ -9157,17 +9188,13 @@ impl JitState for PyreJitState {
             }
         }
 
-        // pyjitpl.py:3443 `synchronize_virtualizable()` inside
-        // `rebuild_state_after_failure` (pyjitpl.py:3454) writes
-        // `virtualizable_boxes` to the heap via `write_boxes()`
-        // (virtualizable.py:101-113). This is the ONLY call in
-        // RPython's bridge-resume path — there is no second call.
-        //
-        // In pyre, the equivalent write is `sync_virtualizable_after_
-        // guard_failure` (eval.rs:5709, `ResumeVableMode::
-        // GuardFailureSync`) which runs in the compiled bridge's
-        // guard-failure recovery chain BEFORE `setup_bridge_sym`.
-        // No additional synchronize call is needed here.
+        // `sync_virtualizable_after_guard_failure` runs before bridge setup,
+        // but on the multi-frame inlined-callee path its resume-decoded array
+        // image is then clobbered by the vsd-correction `clear_stack_above`
+        // (eval.rs:7766-7774), which applies a callee-coordinate depth to the
+        // root frame before `setup_bridge_sym` reads it. The per-item write in
+        // the vvals loop above re-asserts that array image immediately after
+        // each decode; the statics retain the deliberate PR#569 override.
 
         // Multi-frame bridge. The body above reconstructed
         // the portal (`frames[0]`) into the caller-visible root `sym`. When
