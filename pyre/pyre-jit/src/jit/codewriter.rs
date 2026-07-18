@@ -13018,20 +13018,14 @@ impl CodeWriter {
         // reads at control-flow entries, so the dense-map owner is already the
         // correct inverse.
         let mut block_head_py_by_jit_pc: Vec<(usize, u32)> = Vec::new();
-        // #73 metadata inventory: retain the existing py_pc-keyed result
-        // color table as the source of truth and derive its JitCode-pc twin
-        // beside the block-head inverse for audit only.
-        let mut result_color_by_jit_pc: Vec<(usize, u16)> = Vec::new();
         {
             let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
             for (py, &off) in pc_map_bytes.iter().enumerate() {
                 if seen.insert(off) {
                     block_head_py_by_jit_pc.push((off, py as u32));
-                    result_color_by_jit_pc.push((off, result_color_at_pc[py]));
                 }
             }
             block_head_py_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            result_color_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
         // Build the JitCode-PC floor tier from the py-indexed predecessor
@@ -13410,7 +13404,6 @@ impl CodeWriter {
             after_residual_marker_pred_by_jit_pc,
             result_color_after_residual_marker_by_jit_pc,
             result_color_after_residual_pred_by_jit_pc,
-            result_color_by_jit_pc,
             has_color_map: !pcdep_color_slots.is_empty(),
             portal_frame_reg,
             portal_ec_reg,

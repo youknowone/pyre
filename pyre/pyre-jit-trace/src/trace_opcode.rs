@@ -1791,7 +1791,7 @@ impl MIFrame {
                                 .then(|| unsafe { &*jitcode_ptr })
                                 .and_then(|jc| {
                                     resume_jit_pc.and_then(|jit_pc| {
-                                        jc.payload.result_color_for_jitcode_pc_pred(jit_pc)
+                                        jc.payload.result_color_trivia_for_jitcode_pc(jit_pc)
                                     })
                                 })
                                 .and_then(|c| (c != u16::MAX).then_some(c as usize));

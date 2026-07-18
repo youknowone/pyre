@@ -167,11 +167,6 @@ pub struct PyJitCodeMetadata {
     /// fallback. Empty for skeleton / fixture.
     pub result_color_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
-    /// #73 metadata-inventory twin of `result_color_at_pc`, keyed by JitCode
-    /// byte offset. Entries retain the first Python PC for each shared resume
-    /// marker and are sorted for predecessor lookup. Audit-only for now; the
-    /// py_pc-keyed table remains the runtime source of truth.
-    pub result_color_by_jit_pc: Vec<(usize, u16)>,
     /// Whether codewriter register allocation assigned non-identity frame
     /// colors. Skeleton and portal metadata leave this false.
     pub has_color_map: bool,
@@ -566,18 +561,6 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1)
     }
 
-    /// #73 metadata-inventory predecessor twin of `result_color_at_pc`.
-    /// Returns the value for the largest JitCode byte offset at or before
-    /// `jit_pc`, or `None` when the audit-only twin is empty.
-    pub fn result_color_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
-        let table = &self.metadata.result_color_by_jit_pc;
-        if table.is_empty() {
-            return None;
-        }
-        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1)
-    }
-
     /// gh#73 S3.2: const operand-stack slots keyed by a JitCode byte offset via
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Equals
     /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction
@@ -891,7 +874,6 @@ impl PyJitCode {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 result_color_after_residual_marker_by_jit_pc: Vec::new(),
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
-                result_color_by_jit_pc: Vec::new(),
                 // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
                 // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both

@@ -12983,7 +12983,7 @@ fn compute_inline_caller_frame(
     // carries no pcdep entry.
     let result_color = match resume_marker_jit_pc {
         Some(marker) => unsafe { &(*caller_sym.jitcode).payload }
-            .result_color_for_jitcode_pc_pred(marker)
+            .result_color_trivia_for_jitcode_pc(marker)
             .filter(|&color| color != u16::MAX)
             .map(|color| color as usize),
         // Marker-miss: the after-residual result-color twin keys the same
@@ -13103,7 +13103,7 @@ fn compute_nested_inline_caller_frame(
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
     let result_color = match resume_marker_jit_pc {
         Some(marker) => pjc
-            .result_color_for_jitcode_pc_pred(marker)
+            .result_color_trivia_for_jitcode_pc(marker)
             .filter(|&color| color != u16::MAX)
             .map(|color| color as usize),
         None => pjc
