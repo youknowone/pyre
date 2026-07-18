@@ -1314,17 +1314,6 @@ fn int_eq_float(ival: i64, fval: f64) -> bool {
     fval as i64 == ival
 }
 
-/// listobject.py:2103-2125 FloatListStrategy._safe_find_or_count
-/// Fast path for float lists: handles NaN via bit-pattern comparison.
-unsafe fn float_find(items: &[f64], value: f64) -> Option<usize> {
-    if !value.is_nan() {
-        items.iter().position(|&v| v == value)
-    } else {
-        let bits = value.to_bits();
-        items.iter().position(|&v| v.to_bits() == bits)
-    }
-}
-
 /// Outcome of `W_ListObject.find_or_count` fast path. Mirrors the
 /// short-circuit return in `IntegerListStrategy.find_or_count`
 /// (listobject.py:1613) and `FloatListStrategy.find_or_count` — when the
