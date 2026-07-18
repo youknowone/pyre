@@ -450,6 +450,14 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let root_base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(list);
             pyre_object::gc_roots::pin_root(other);
+            // listobject.py:1052 _extend_from_iterable — consult the length
+            // hint before iterating.  A `__length_hint__` returning a negative
+            // value raises ValueError, and one exceeding a C ssize_t raises
+            // OverflowError (via `int_w`), rather than being silently ignored.
+            crate::baseobjspace::length_hint(
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                0,
+            )?;
             let iterator =
                 crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
             pyre_object::gc_roots::pin_root(iterator);
