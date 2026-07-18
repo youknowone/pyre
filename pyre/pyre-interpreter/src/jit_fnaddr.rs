@@ -2065,6 +2065,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             interp_itertools::FILTERFALSE_TYPE
         ),
         pytype_addr!(
+            "interp_itertools::COMPRESS_TYPE",
+            interp_itertools::COMPRESS_TYPE
+        ),
+        pytype_addr!(
             "interp_itertools::PAIRWISE_TYPE",
             interp_itertools::PAIRWISE_TYPE
         ),

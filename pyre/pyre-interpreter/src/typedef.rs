@@ -950,6 +950,15 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.compress",
+                init_compress_type,
+                object_type,
+                &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
         );
@@ -21243,6 +21252,58 @@ fn filterfalse_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     itertools_alloc_for_class(cls, exact, obj)
 }
 
+fn compress_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // PyPy W_Compress__new__ allocates the subtype and applies space.iter to
+    // both inputs.  Python 3.14's Argument Clinic surface additionally
+    // accepts the `data` and `selectors` keyword names.
+    let exact = gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE).unwrap_or(PY_NULL);
+    let (cls, scope_w) =
+        itertools_constructor_scope(args, "compress", vec!["data", "selectors"], &[])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(scope_w[0]);
+    let data_arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(scope_w[1]);
+    let selectors_arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_data = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(data_arg_slot)
+    })?;
+    pyre_object::gc_roots::pin_root(w_data);
+    let data_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_selectors = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(selectors_arg_slot)
+    })?;
+    let obj = pyre_object::interp_itertools::w_compress_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(data_slot) },
+        w_selectors,
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn compress_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
+    singleton_receiver(
+        args,
+        "itertools.compress",
+        "__iter__",
+        pyre_object::interp_itertools::is_compress,
+    )
+}
+
+fn compress_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = singleton_receiver(
+        args,
+        "itertools.compress",
+        "__next__",
+        pyre_object::interp_itertools::is_compress,
+    )?;
+    crate::baseobjspace::next(obj)
+}
+
 fn init_takewhile_type(ns: PyObjectRef) {
     // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
     // entries between __next__ and __doc__).
@@ -21308,6 +21369,31 @@ fn init_filterfalse_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return those items of iterable for which function(item) is false.\n\nIf function is None, return the items that are false.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_compress_type(ns: PyObjectRef) {
+    // interp_itertools.py W_Compress.typedef, in source order.  Python 3.14
+    // uses the shorter public docstring below.
+    let entries = [
+        ("__new__", make_new_descr(compress_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", compress_iter_self, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", compress_iter_next, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return data elements corresponding to true selector elements.\n\nForms a shorter iterator from selected data elements using the selectors to\nchoose the data elements.",
             ),
         ),
     ];

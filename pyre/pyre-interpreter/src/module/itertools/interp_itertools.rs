@@ -380,30 +380,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(pyre_object::w_seq_iter_new(list, n))
         }),
     );
-    // compress(data, selectors)
+    // W_Compress.typedef is exported directly, matching PyPy's dedicated
+    // live iterator rather than materializing both inputs into a list.
     crate::module_ns_store(
         ns,
         "compress",
-        crate::make_builtin_function_with_arity(
-            "compress",
-            |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_list_new(vec![]));
-                }
-                let data = crate::builtins::collect_iterable(args[0])?;
-                let selectors = crate::builtins::collect_iterable(args[1])?;
-                let mut out = Vec::new();
-                for (d, s) in data.iter().zip(selectors.iter()) {
-                    if crate::baseobjspace::is_true(*s)? {
-                        out.push(*d);
-                    }
-                }
-                let n = out.len();
-                let list = pyre_object::w_list_new(out);
-                Ok(pyre_object::w_seq_iter_new(list, n))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE)
+            .expect("itertools.compress TypeDef initialized"),
     );
     // PyPy exposes these W_Root subclasses through their TypeDefs.  Their
     // `__new__` slots retain the two-argument/subclass-init gateway behavior.

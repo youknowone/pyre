@@ -2502,6 +2502,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::iterobject::W_TupleIterObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_Compress (`itertools.compress`) — AUTO-ID; the live data and
+    // selectors iterators are both traced edges.  Keep this at the absolute
+    // tail, after the fixed FrameDebugData/FrameBlock slots and every prior
+    // AUTO-ID type, so adding it cannot renumber an existing GC type.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Compress
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

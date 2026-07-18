@@ -322,6 +322,50 @@ pub unsafe fn is_filterfalse(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FILTERFALSE_TYPE) }
 }
 
+// ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
+//
+// ```python
+// class W_Compress(W_Root):
+//     def __init__(self, space, w_data, w_selectors):
+//         self.space = space
+//         self.w_data = space.iter(w_data)
+//         self.w_selectors = space.iter(w_selectors)
+// ```
+//
+// `next_w` lives in the interpreter because it invokes both iterators and
+// selector truth testing.  The two live iterators are traced GC edges.
+
+#[pyre_class("itertools.compress", static_name = "COMPRESS")]
+pub struct W_Compress {
+    pub w_data: PyObjectRef,
+    pub w_selectors: PyObjectRef,
+}
+
+/// Both arguments must already have had `space.iter` applied, matching
+/// `W_Compress.__init__`.
+pub fn w_compress_new(w_data: PyObjectRef, w_selectors: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_data);
+    crate::gc_roots::pin_root(w_selectors);
+    W_Compress::allocate(W_Compress {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_data,
+        w_selectors,
+    })
+}
+
+/// Check if an object is a `W_Compress`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_compress(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMPRESS_TYPE) }
+}
+
 // ── W_Pairwise — pypy/module/itertools/interp_itertools.py:class W_Pairwise ──
 //
 // ```python
@@ -592,6 +636,23 @@ mod tests {
         assert_eq!(
             <W_FilterFalse as crate::lltype::GcType>::SIZE,
             W_FILTERFALSE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_compress_gc_descriptor_traces_both_iterator_fields() {
+        assert_eq!(W_COMPRESS_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(
+            W_COMPRESS_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_Compress, w_data)
+        );
+        assert_eq!(
+            W_COMPRESS_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_Compress, w_selectors)
+        );
+        assert_eq!(
+            <W_Compress as crate::lltype::GcType>::SIZE,
+            W_COMPRESS_OBJECT_SIZE
         );
     }
 

@@ -3968,6 +3968,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_takewhile(obj)
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_compress(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10064,6 +10065,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_takewhile(obj)
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_compress(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10309,6 +10311,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::interp_itertools::is_takewhile(obj)
             || pyre_object::interp_itertools::is_dropwhile(obj)
             || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_compress(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
@@ -10771,6 +10774,38 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 };
                 if !pred {
                     return Ok(w_obj);
+                }
+            }
+        }
+        // itertools.compress — interp_itertools.py W_Compress.next_w.
+        // Pull data first, then its matching selector; exhaustion of either
+        // input stops the iterator.  Keep the owner and yielded data item
+        // rooted across both arbitrary Python iterator/truth calls.
+        if pyre_object::interp_itertools::is_compress(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            loop {
+                let _iteration_roots = pyre_object::gc_roots::push_roots();
+                let w_data = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_Compress))
+                    .w_data;
+                pyre_object::gc_roots::pin_root(w_data);
+                let data_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_item = next(pyre_object::gc_roots::shadow_stack_get(data_slot))?;
+                pyre_object::gc_roots::pin_root(w_item);
+                let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+                let w_selectors = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                    as *const pyre_object::interp_itertools::W_Compress))
+                    .w_selectors;
+                pyre_object::gc_roots::pin_root(w_selectors);
+                let selectors_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_selector = next(pyre_object::gc_roots::shadow_stack_get(selectors_slot))?;
+                pyre_object::gc_roots::pin_root(w_selector);
+                let selector_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                if is_true(pyre_object::gc_roots::shadow_stack_get(selector_slot))? {
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(item_slot));
                 }
             }
         }
