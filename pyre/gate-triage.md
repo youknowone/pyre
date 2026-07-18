@@ -6,6 +6,7 @@ read-expression at every source site (four census passes). Polarity rule:
 `is_some()`/`=="1"`/`.unwrap_or(false)` → default **OFF**; `is_none()` /
 `!= Ok("0")` / `.unwrap_or(true)` → default **ON**; a parse of
 number/path/list/mode → **VALUE** (config, not a boolean gate).
+Re-audited 2026-07-18 on branch `nbody`: §1c added; 10 rows retired.
 
 The charter (§3.6, A7) says a gate is a staging area, not a home: each live
 default-ON experiment gate is kept only until its epic closes, then its OFF
@@ -16,10 +17,12 @@ to retire and when.
 
 The raw `rg 'PYRE_[A-Z0-9_]+'` count (~119) overstates the debt. **~20 of the
 matches are not env gates at all** (Rust consts, macro-generated identifiers,
-runtime symbols, or comment-only dead references). Real live env vars ≈ 99, of
-which ~33 are default-ON experiment gates. Of those 33, the **wasm trio** and
-the **#171 pair** were cleanly settled (epic closed / merged) and are retired
-this pass; the rest are load-bearing kill switches for open reworks.
+runtime symbols, or comment-only dead references). The 2026-07-05 audit found
+that the **wasm trio** and the **#171 pair** were cleanly settled (epic closed
+/ merged) and retired in that pass. The 2026-07-18 re-audit found no new live
+default-ON gate that is safely retirable right now; §1c is book-keeping for
+rows whose source readers were already deleted by closed epics after the
+original audit.
 
 ## §1 — Retired this pass (5)
 
@@ -64,26 +67,31 @@ opt-in dead code.
 **Deferred, not retired** (active on other branches; touching them on pc-map
 would only manufacture conflicts):
 
-- **P2 quintet** (`PYRE_P2_DRAIN`, `_FRAMESTACK`, `_COMPILE`, `_FS_COMPILE`,
-  `_AUTHORITATIVE`) — one dependency tree, owned by the #215 session on
-  `fib_recursive` (PR#374). A full scaffold deletion (`765b24e3ba`, −1931 L)
-  was authored there and then deliberately reverted + reset away: the carrier
-  turned out load-bearing (without it a `frames.len()>1` resume compiles a
-  degenerate single-frame bridge — wrong values/SEGV), and `8731115130` now
-  installs it unconditionally, leaving the gates as driver selectors only.
-  Their fate belongs to that branch.
-- **PYRE_SAME_GREENKEY** — the gated path is broken by construction (its
-  ConstInt filter over `green_boxes` InputArg placeholders is always empty, so
-  it declines every close and hangs); the real fix (close compares ALL greens
-  vs `header_greens`, gate dropped) already exists on the local `aheui` branch
-  (`019a494e13`). Delegated there untouched.
+- **PYRE_P2_DRAIN** — sole live P2 gate left from the former P2 quintet.
+  It remains keep-WIP while epic #343 is open; the other four P2 gates retired
+  when the compile/framestack legs went production-default in PR#607 / PR#374.
 
-**Judged KEEP** (genuine WIP parity ports): `PYRE_SINGLE_PASS` +
-`PYRE_AUTHORITATIVE` (two stages of the gh#344 single-executor epic;
-rework.md F2 "must finish"), `PYRE_INNER_CLOSE` (the missing half of
-`pyjitpl.py:3018-3060 reached_loop_header`; implied ON by single-pass, and
-`PYRE_NO_INNER_CLOSE` stays with it), `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam of
-the vable-owner rework toward `direct_assembler_call` scalar args).
+**Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam
+of the vable-owner rework toward `direct_assembler_call` scalar args).
+
+## §1c — Retired since the 2026-07-05 audit (10): reader already deleted by a closed epic
+
+Book-keeping only: these OFF-paths were deleted in source by the cited epics
+after the 2026-07-05 audit; this pass removes their stale registry rows. The
+2026-07-18 re-audit verified 0 Rust source read sites for each gate.
+
+| gate | reader deleted by | note |
+|---|---|---|
+| PYRE_57_INLINE_NEXT | PR#387 (`e18ec90cac1`); follow-up `c6cfcb758c2` retired the kill-switch | stale §4 row removed |
+| PYRE_SINGLE_PASS | PR#427 (`57849b62664`) | stale §1b keep mention and §5 list entry removed |
+| PYRE_AUTHORITATIVE | PR#427 (`57849b62664`) + PR#415 (`7e3db1cc490`) | stale §1b keep mention and §5 list entry removed; `PYRE_PROBE_AUTHORITATIVE` is separate and remains live |
+| PYRE_INNER_CLOSE | PR#427 (`57849b62664`) | stale §1b keep mention and §5 list entry removed |
+| PYRE_NO_INNER_CLOSE | PR#427 (`57849b62664`); issue #152 closed 2026-07-13 | stale §1b keep mention, §4 row, and §5 list entry removed |
+| PYRE_P2_COMPILE | PR#607 (`e1c43d3ff08`); follow-up `ca2640e797b` removed the gate | stale §5 deferred entry removed |
+| PYRE_P2_FRAMESTACK | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
+| PYRE_P2_FS_COMPILE | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
+| PYRE_P2_AUTHORITATIVE | reader gone; attribution #374 per re-audit | stale §5 deferred entry removed |
+| PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`); follow-up `111bdb4eeb8` dropped the gate | stale §1b deferred mention and §5 list entry removed |
 
 ## §2 — Not gates (11): Rust identifiers, not env vars
 
@@ -134,9 +142,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
 | PYRE_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interp collect A/B | WS3 / #355 / F3 GC rework |
-| PYRE_57_INLINE_NEXT | FOR_ITER inline-next fastpath | #57 / task#50 (has admitted unsoundness) |
 | PYRE_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
-| PYRE_NO_INNER_CLOSE | cross-loop-cut inner-close override | #152 cross-loop residency |
 
 `PYRE_GC_INTERP` is default-ON on wasm32 only (`unwrap_or(cfg!(wasm32))`),
 default-OFF on native — not a clean removal candidate.
@@ -156,12 +162,10 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (10 remaining)** — triaged in §1b (4 retired, 4
-  kept as WIP parity ports, 6 deferred to their owning branches):
-  `PYRE_FBW_VABLE_SCALAR_CA`, `PYRE_SINGLE_PASS`, `PYRE_AUTHORITATIVE`,
-  `PYRE_INNER_CLOSE` (keep); `PYRE_P2_AUTHORITATIVE`, `_COMPILE`, `_DRAIN`,
-  `_FRAMESTACK`, `_FS_COMPILE` (fib_recursive/PR#374), `PYRE_SAME_GREENKEY`
-  (aheui).
+- **Default-OFF experiments (2 remaining)** — triaged in §1b/§1c (4 retired
+  in the 2026-07-05 pass, 8 retired since then, 1 kept as a WIP parity port,
+  1 deferred to its owning epic):
+  `PYRE_FBW_VABLE_SCALAR_CA` (keep); `PYRE_P2_DRAIN` (epic #343).
 - **Config / value / master switches (~18)** — tuning, paths, modes; keep:
   `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
@@ -174,11 +178,11 @@ Kept as-is; listed for completeness.
 
 | bucket | count |
 |---|---|
-| retired (§1 default-ON pass + §1b default-OFF pass) | 5 + 4 |
+| retired (§1 default-ON pass + §1b default-OFF pass + §1c re-audit book-keeping) | 5 + 4 + 10 |
 | not gates (identifiers) | 11 |
 | dead (no read site) | 9 |
-| live default-ON, kept until epic closes | ~28 |
+| live default-ON, kept until epic closes | ~26 |
 | diagnostics (OFF) | ~34 |
-| default-OFF experiments (4 keep + 6 deferred) | 10 |
+| default-OFF experiments (1 keep + 1 deferred) | 2 |
 | config / value / master | ~18 |
 | test harness | 1 |
