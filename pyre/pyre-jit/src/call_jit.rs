@@ -530,7 +530,7 @@ extern "C" fn jit_call_user_function_from_frame(
             // PyError through a side channel — that would let the
             // interpreter-side eval loop surface it before the guard
             // machinery sees it, bypassing try/except.
-            let exc_obj = err.exc_object;
+            let exc_obj = err.to_exc_object();
             if exc_obj != pyre_object::PY_NULL {
                 store_jit_exception(exc_obj as i64);
             }
@@ -842,7 +842,7 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     match crate::eval::portal_runner_result(frame) {
         Ok(result) => result as i64,
         Err(err) => {
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.exc_object as i64));
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
             pyre_object::PY_NULL as i64
         }
     }
@@ -1532,7 +1532,7 @@ fn jit_blackhole_resume_from_guard(
         return match crate::eval::portal_runner_result(frame) {
             Ok(result) => Some(result as i64),
             Err(err) => {
-                let exc_obj = err.exc_object;
+                let exc_obj = err.to_exc_object();
                 if exc_obj != pyre_object::PY_NULL {
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
                     store_jit_exception(exc_obj as i64);
@@ -2293,7 +2293,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → raise");
             }
-            let exc_obj = err.exc_object;
+            let exc_obj = err.to_exc_object();
             if exc_obj != pyre_object::PY_NULL {
                 // Symmetric with the regular-exception fall-through
                 // below (line 2120-2122) and with `lib.rs::jit_exc_raise`
@@ -2355,7 +2355,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             match crate::eval::portal_runner_result(frame) {
                 Ok(result) => Some(result as i64),
                 Err(err) => {
-                    let exc_obj = err.exc_object;
+                    let exc_obj = err.to_exc_object();
                     if exc_obj != pyre_object::PY_NULL {
                         majit_metainterp::blackhole::BH_LAST_EXC_VALUE
                             .with(|c| c.set(exc_obj as i64));

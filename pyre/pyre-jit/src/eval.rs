@@ -4774,7 +4774,7 @@ pub(crate) fn pyre_portal_runner(
     match portal_runner_result(frame) {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
         Err(err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
-            err.exc_object as usize,
+            err.to_exc_object() as usize,
         ))),
     }
 }
@@ -4877,7 +4877,7 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     match portal_runner_result(frame) {
         Ok(r) => r,
         Err(err) => {
-            crate::call_jit::store_jit_exception(err.exc_object as i64);
+            crate::call_jit::store_jit_exception(err.to_exc_object() as i64);
             pyre_object::PY_NULL
         }
     }
