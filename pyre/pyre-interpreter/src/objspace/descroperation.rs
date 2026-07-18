@@ -3319,28 +3319,46 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Gt => la > lb && b_subset_a()?,
             }));
         }
-        // List lexicographic comparison — same logic as tuple.
+        // List comparison. Unlike tuples, element comparison may mutate either
+        // operand, so every loop boundary and the final size comparison read
+        // the live lists (CPython 3.14 `list_richcompare_impl`; PyPy
+        // `list_eq` / `_compare_unwrappeditems`).
         if is_list(a) && is_list(b) {
-            let la = pyre_object::w_list_len(a);
-            let lb = pyre_object::w_list_len(b);
-            let min_len = la.min(lb);
-            for i in 0..min_len {
+            if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                && pyre_object::w_list_len(a) != pyre_object::w_list_len(b)
+            {
+                return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+            }
+
+            let mut i = 0usize;
+            while i < pyre_object::w_list_len(a) && i < pyre_object::w_list_len(b) {
                 let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
                 let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
-                // listobject.py:590 `if not space.eq_w(w_item1, w_item2):
-                //     return getattr(space, name)(w_item1, w_item2)`
                 if !crate::baseobjspace::eq_w(ea, eb)? {
-                    return compare(ea, eb, op);
+                    break;
                 }
+                i += 1;
             }
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => la < lb,
-                CompareOp::Le => la <= lb,
-                CompareOp::Gt => la > lb,
-                CompareOp::Ge => la >= lb,
-                CompareOp::Eq => la == lb,
-                CompareOp::Ne => la != lb,
-            }));
+            let la = pyre_object::w_list_len(a);
+            let lb = pyre_object::w_list_len(b);
+            if i >= la || i >= lb {
+                return Ok(w_bool_from(match op {
+                    CompareOp::Lt => la < lb,
+                    CompareOp::Le => la <= lb,
+                    CompareOp::Eq => la == lb,
+                    CompareOp::Ne => la != lb,
+                    CompareOp::Gt => la > lb,
+                    CompareOp::Ge => la >= lb,
+                }));
+            }
+            if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+                return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+            }
+            // CPython deliberately fetches the live items again: equality may
+            // have replaced either element before the ordering comparison.
+            let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
+            let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
+            return compare(ea, eb, op);
         }
         // range value comparison — functional.py W_Range.descr_eq:
         // two ranges are equal iff they generate the same sequence

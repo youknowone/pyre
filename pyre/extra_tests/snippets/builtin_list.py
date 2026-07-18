@@ -896,3 +896,31 @@ class poc:
 list1 = rewrite_list_eq([poc()])
 list1.remove(list1)
 assert list1 == []
+
+
+class ClearOther:
+    def __eq__(self, other):
+        list2.clear()
+        return NotImplemented
+
+
+class ClearFirst:
+    def __eq__(self, other):
+        list1.clear()
+        return NotImplemented
+
+
+list1 = [ClearOther()]
+list2 = [ClearFirst()]
+assert list1 == list2
+
+
+class ClearSelfList:
+    def __eq__(self, other):
+        list3.clear()
+        return NotImplemented
+
+
+list3 = [ClearSelfList()]
+list4 = [1]
+assert not list3 == list4
