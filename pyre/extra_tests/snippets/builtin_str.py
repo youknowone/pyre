@@ -32,6 +32,26 @@ assert_raises(TypeError, lambda: str("abc", "utf-8"))
 assert str(b"abc", "utf-8") == "abc"
 assert str(b"abc", encoding="ascii") == "abc"
 
+for bad_index in ("index", object()):
+    try:
+        "abc"[bad_index]
+    except TypeError as exc:
+        assert str(exc) == (
+            "string indices must be integers, not "
+            f"'{type(bad_index).__name__}'"
+        )
+    else:
+        raise AssertionError("string accepted a non-index subscript")
+
+
+class BadStringIndex:
+    def __index__(self):
+        return "index"
+
+
+with assert_raises(TypeError):
+    "abc"[BadStringIndex()]
+
 assert repr("a") == "'a'"
 assert repr("can't") == '"can\'t"'
 assert repr('"won\'t"') == "'\"won\\'t\"'"

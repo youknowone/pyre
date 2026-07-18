@@ -1242,6 +1242,18 @@ fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
     ))
 }
 
+/// Python 3.14 string-subscript wording.  Unlike this PyPy source's generic
+/// `getindex_w(..., "string")` remap, 3.14 omits "or slices" after the slice
+/// case has already been handled and preserves errors raised by `__index__`.
+fn string_index_type_error(index: PyObjectRef) -> PyError {
+    let tp = if index.is_null() {
+        "NULL".to_string()
+    } else {
+        object_functionstr_type_name(index)
+    };
+    PyError::type_error(format!("string indices must be integers, not '{tp}'"))
+}
+
 /// `getindex_w` remaps a `TypeError` raised while coercing a subscript key
 /// through `__index__` — a non-int `__index__` return, or a `TypeError` from
 /// `__index__` itself — to the sequence-specific "indices must be integers or
@@ -1421,7 +1433,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
         let indexed = match space_index(index) {
             Ok(w) => w,
-            Err(e) => return Err(remap_getindex_type_error(e, "string", index)),
+            Err(e) => return Err(e),
         };
         if is_int(indexed) {
             w_int_get_value(indexed)
@@ -1440,7 +1452,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             }
         }
     } else {
-        return Err(index_type_error("string", index));
+        return Err(string_index_type_error(index));
     };
     let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
     if actual_idx < cps.len() {
