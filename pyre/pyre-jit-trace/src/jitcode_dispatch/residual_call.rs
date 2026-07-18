@@ -407,6 +407,28 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg(
                 ctx.trace_ctx.box_value(b),
                 Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
             ) {
+                // Phase-1 diagnostic (gh#343 depth-2): pinpoint which Ref arg
+                // folded to concrete NULL and its provenance.  Gated on
+                // `PYRE_P2_DIAG` (the depth-2 framestack-walk diag flag) and
+                // computed only on the abort path, so the default trace path
+                // pays nothing.
+                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                    eprintln!(
+                        "[p2-mayforce] NULL Ref arg: pc={pc} call_opcode={call_opcode:?} \
+                         helper={:?} arg_index={i} nargs={} funcbox={:?}(={:?})",
+                        call_descr.get_extra_info().pyre_helper,
+                        call_descr.arg_types().len(),
+                        allboxes.first(),
+                        allboxes.first().and_then(|&f| ctx.trace_ctx.box_value(f)),
+                    );
+                    for (j, &aty) in call_descr.arg_types().iter().enumerate() {
+                        let ab = allboxes.get(1 + j).copied();
+                        eprintln!(
+                            "[p2-mayforce]   arg[{j}] ty={aty:?} opref={ab:?} val={:?}",
+                            ab.and_then(|b| ctx.trace_ctx.box_value(b)),
+                        );
+                    }
+                }
                 return Err(DispatchError::MayForceNullRefArgUnsupported { pc });
             }
         }
