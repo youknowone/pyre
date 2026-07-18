@@ -2352,6 +2352,40 @@ impl TraceCtx {
         self.set_last_guard_resume_position(snapshot_id);
     }
 
+    /// Like [`capture_snapshot_for_last_guard_multi_frame_with_vable_vref`] but
+    /// stamps the resume position on the most-recent *guard* op rather than the
+    /// last recorded op — the multi-frame analog of
+    /// [`capture_snapshot_for_last_guard_op_with_vable_vref`].  Used when a
+    /// guard emitted inside a helper (the `_nonstandard_virtualizable` PTR_EQ
+    /// promote) records further non-guard ops (`emit_force_virtualizable`'s
+    /// GETFIELD_GC / PTR_NE / COND_CALL) before the caller captures, yet the
+    /// paused caller chain is available for a full `Snapshot.frames`.
+    pub fn capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
+        &mut self,
+        frames: &[(u32, u32, &[OpRef])],
+        vable_boxes: &[crate::recorder::SnapshotTagged],
+        vref_boxes: &[crate::recorder::SnapshotTagged],
+    ) {
+        let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
+            .iter()
+            .map(|(jitcode_index, pc, boxes)| {
+                // The pc word is a raw JitCode offset.
+                let encoded = self.encode_snapshot_boxes(boxes);
+                crate::recorder::SnapshotFrame {
+                    jitcode_index: *jitcode_index,
+                    pc: *pc,
+                    boxes: encoded,
+                }
+            })
+            .collect();
+        let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            frames: recorder_frames,
+            vable_boxes: vable_boxes.to_vec(),
+            vref_boxes: vref_boxes.to_vec(),
+        });
+        self.set_last_guard_op_resume_position(snapshot_id);
+    }
+
     fn encode_snapshot_boxes(
         &self,
         active_boxes: &[OpRef],

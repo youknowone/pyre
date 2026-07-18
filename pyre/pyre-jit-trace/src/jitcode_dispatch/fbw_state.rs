@@ -82,6 +82,24 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_NSVABLE_MULTIFRAME` (#73): publish the `_nonstandard_virtualizable`
+/// promote guard through the full multi-frame resume chain (each paused caller
+/// plus the callee's own coordinate) instead of the single-frame sentinel
+/// collapse in [`walker_capture_inline_nonstandard_vable_guard`], which cannot
+/// resolve a JitCode resume word and unconditionally aborts every inline
+/// sub-walk emit of this guard.  Default-on; `PYRE_FBW_NSVABLE_MULTIFRAME=0`
+/// (or `false`) restores the sentinel decline as the rollback escape hatch.
+pub(crate) fn fbw_nsvable_multiframe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_NSVABLE_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_REC_MULTIFRAME` (default ON; `=0`/`false` opts out): route
 /// primary-trace self-recursive Python calls through the multiframe inline path
 /// while below `PYRE_FBW_MULTIFRAME_DEPTH`, instead of folding immediately to
