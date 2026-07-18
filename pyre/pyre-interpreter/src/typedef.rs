@@ -19403,6 +19403,12 @@ fn setlike_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.isdisjoint"
+    } else {
+        "set.isdisjoint"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     if unsafe { pyre_object::is_set_or_frozenset(args[1]) } {
         return Ok(pyre_object::w_bool_from(set_is_disjoint_from(
             args[0], args[1],
@@ -20155,12 +20161,12 @@ pub(crate) fn set_method_difference(
 pub(crate) fn set_method_symmetric_difference(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        if args.is_empty() {
-            return Ok(pyre_object::w_set_new());
-        }
-        return Ok(args[0]);
-    }
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.symmetric_difference"
+    } else {
+        "set.symmetric_difference"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     // `setobject.py symmetric_difference` wraps the computed storage
     // in a set of self's class.
     let w_other_as_set = set_operand_as_set(args[1])?;
@@ -20338,9 +20344,12 @@ pub(crate) fn set_is_subset_of(
 fn set_method_le(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        return Ok(pyre_object::w_bool_from(true));
-    }
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.issubset"
+    } else {
+        "set.issubset"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     let w_other_as_set = set_operand_as_set(args[1])?;
     Ok(pyre_object::w_bool_from(set_is_subset_of(
         args[0],
@@ -20351,9 +20360,12 @@ fn set_method_le(
 fn set_method_ge(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        return Ok(pyre_object::w_bool_from(true));
-    }
+    let name = if unsafe { pyre_object::is_frozenset(args[0]) } {
+        "frozenset.issuperset"
+    } else {
+        "set.issuperset"
+    };
+    crate::type_methods::arity_exact(args, name, 1)?;
     // `setobject.py descr_issuperset` — the operand becomes a set and
     // the subset test runs the other way round.
     let w_other_as_set = set_operand_as_set(args[1])?;
@@ -20432,9 +20444,7 @@ fn set_method_intersection_update(
 fn set_method_symmetric_difference_update(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    if args.is_empty() || args.len() < 2 {
-        return Ok(pyre_object::w_none());
-    }
+    crate::type_methods::arity_exact(args, "set.symmetric_difference_update", 1)?;
     let w_other_as_set = set_operand_as_set(args[1])?;
     let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
     // `setobject.py` — the computed storage replaces self's.
