@@ -1,5 +1,21 @@
 import time
 
+for clock_name in ("time", "monotonic", "perf_counter", "process_time"):
+    clock_info = time.get_clock_info(clock_name)
+    assert isinstance(clock_info.implementation, str)
+    assert clock_info.implementation
+    assert isinstance(clock_info.monotonic, bool)
+    assert isinstance(clock_info.adjustable, bool)
+    assert isinstance(clock_info.resolution, float)
+    assert 0.0 < clock_info.resolution <= 1.0
+
+try:
+    time.get_clock_info("unknown")
+except ValueError:
+    pass
+else:
+    raise AssertionError("time.get_clock_info accepted an unknown clock")
+
 x = time.gmtime(1000)
 
 assert x.tm_year == 1970
