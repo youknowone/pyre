@@ -688,6 +688,10 @@ struct SpamBlock {
     framestate: Option<FrameState>,
     /// `flowcontext.py:41` `block.dead`.
     dead: bool,
+    /// Exception edges feeding a shared catch landing. Each upstream
+    /// `EggBlock` has one incoming edge; pyre coalesces those eggs by handler
+    /// PC, so widening the shared FrameState must rewrite every earlier edge.
+    incoming_exception_links: Vec<super::flow::LinkRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +703,7 @@ impl SpamBlockRef {
             block,
             framestate,
             dead: false,
+            incoming_exception_links: Vec::new(),
         })))
     }
 
@@ -712,6 +717,14 @@ impl SpamBlockRef {
 
     fn set_framestate(&self, framestate: FrameState) {
         self.0.borrow_mut().framestate = Some(framestate);
+    }
+
+    fn add_incoming_exception_link(&self, link: super::flow::LinkRef) {
+        self.0.borrow_mut().incoming_exception_links.push(link);
+    }
+
+    fn incoming_exception_links(&self) -> Vec<super::flow::LinkRef> {
+        self.0.borrow().incoming_exception_links.clone()
     }
 
     fn mark_dead(&self) {
@@ -1469,7 +1482,8 @@ fn update_catch_landing_state(
     // the link's outgoing args.  `copy()` is the upstream-canonical
     // shape — `framestate.py:80 copy(rename)` re-renames every
     // FlowValue Variable through the closure.
-    let new_state = if let Some(existing) = target.framestate() {
+    let existing_state = target.framestate();
+    let new_state = if let Some(existing) = existing_state.as_ref() {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         existing.union(edge_state, &mut fresh)
     } else {
@@ -1488,9 +1502,56 @@ fn update_catch_landing_state(
     // states), framestate and inputargs both stay at the existing
     // values.
     if let Some(state) = new_state {
+        if let Some(existing) = existing_state.as_ref() {
+            for link in target.incoming_exception_links() {
+                let old_args = link.borrow().args.clone();
+                link.borrow_mut().args =
+                    remap_outputargs_for_merged_target(existing, &state, &old_args);
+            }
+        }
         target.block().borrow_mut().inputargs = state.getvariables();
         target.set_framestate(state);
     }
+}
+
+fn remap_outputargs_for_merged_target(
+    old_target_state: &FrameState,
+    new_target_state: &FrameState,
+    old_args: &[Option<super::flow::FlowValue>],
+) -> Vec<Option<super::flow::FlowValue>> {
+    let old_mergeable = old_target_state.mergeable();
+    let new_mergeable = new_target_state.mergeable();
+    assert_eq!(old_mergeable.len(), new_mergeable.len());
+
+    let mut old_arg_by_mergeable = vec![None; old_mergeable.len()];
+    let mut old_args_iter = old_args.iter();
+    for (index, value) in old_mergeable.iter().enumerate() {
+        if matches!(value, Some(super::flow::FlowValue::Variable(_))) {
+            old_arg_by_mergeable[index] = old_args_iter
+                .next()
+                .cloned()
+                .expect("existing catch link is missing a target input argument");
+        }
+    }
+    assert!(
+        old_args_iter.next().is_none(),
+        "existing catch link has more arguments than its target state"
+    );
+
+    new_mergeable
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target_value)| {
+            if !matches!(target_value, Some(super::flow::FlowValue::Variable(_))) {
+                return None;
+            }
+            Some(match &old_mergeable[index] {
+                Some(super::flow::FlowValue::Variable(_)) => old_arg_by_mergeable[index].clone(),
+                Some(super::flow::FlowValue::Constant(constant)) => Some(constant.clone().into()),
+                None => None,
+            })
+        })
+        .collect()
 }
 
 fn handler_entry_state_from_catch_site(
@@ -1578,23 +1639,6 @@ fn handler_entry_has_explicit_raise_source(
                 Some((Instruction::RaiseVarargs { .. }, _))
             )
     })
-}
-
-fn next_non_aux_instruction(code: &CodeObject, mut pc: usize) -> Option<(usize, Instruction)> {
-    while pc < code.instructions.len() {
-        let (instruction, _) = pyre_interpreter::decode_instruction_at(code, pc)?;
-        if !matches!(
-            instruction,
-            Instruction::Nop
-                | Instruction::Cache
-                | Instruction::NotTaken
-                | Instruction::ExtendedArg
-        ) {
-            return Some((pc, instruction));
-        }
-        pc += 1;
-    }
-    None
 }
 
 fn initialize_spam_block(
@@ -3163,6 +3207,7 @@ fn attach_catch_exception_edge(
     let link = link.into_ref();
     let _ = source_state;
     append_exit(block, link.clone());
+    target.add_incoming_exception_link(link.clone());
     link
 }
 
@@ -3187,14 +3232,6 @@ fn carry_explicit_raise_value_on_catch_stack(
         .position(|value| value.as_variable().is_some_and(|v| v.id == stack_value.id))
         .expect("catch stack value must appear in landing inputargs");
     link.borrow_mut().args[input_index] = Some(raised_value);
-    let mut link = link.borrow_mut();
-    // Replacing the handler-stack alias changes the exception pair's
-    // positional mapping to value/type order. Keep the Link metadata aligned
-    // so `generate_last_exc` writes `last_exception` to the Int destination
-    // and `last_exc_value` to the Ref destination.
-    let last_exception = link.last_exception;
-    link.last_exception = link.last_exc_value;
-    link.last_exc_value = last_exception;
 }
 
 fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
@@ -7730,6 +7767,7 @@ impl CodeWriter {
 
                     let code_unit = code.instructions[py_pc];
                     let (instruction, op_arg) = arg_state.get(code_unit);
+                    let mut exception_edge_handled = false;
 
                     // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
                     // RPython's push/pop each write `self.valuestackdepth = depth +/- 1`.
@@ -9249,8 +9287,36 @@ impl CodeWriter {
                             // has a proper terminator (mirrors
                             // `flatten.py:189 make_exception_link`
                             // exception-edge shape).
+                            let symbolic_exc = current_state.stack.last().cloned();
+                            let exc_value = if matches!(
+                                symbolic_exc,
+                                Some(super::flow::FlowValue::Constant(ref constant))
+                                    if constant.value == super::flow::ConstantValue::None
+                            ) {
+                                // Handler entry can carry a null symbolic
+                                // placeholder while exception dispatch has
+                                // already installed the value in the semantic
+                                // frame slot. Read it before popvalue clears it.
+                                let exc_depth = current_depth.saturating_sub(1);
+                                let exc_slot = stack_base_absolute + exc_depth as usize;
+                                let exc_slot_value: super::flow::FlowValue =
+                                    super::flow::Constant::signed(exc_slot as i64).into();
+                                super::flow::FlowValue::from(emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        exc_slot_value.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                ))
+                            } else {
+                                symbolic_exc.unwrap_or_else(|| fresh_ref_value(&mut graph))
+                            };
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _ = current_state.stack.pop();
                             // RERAISE: pyre-only deviation from RPython
                             // (which has no RERAISE bytecode — its
                             // `Reraise.nomoreblocks` calls reraise
@@ -11547,47 +11613,6 @@ impl CodeWriter {
                                     emit_abort_permanent!(py_pc);
                                     continue;
                                 }
-                                // The implicit cleanup of a named `except E as m:`
-                                // whose body bare-re-raises compiles to
-                                // `DELETE_FAST m; RERAISE` immediately followed by
-                                // a sibling clause's `LOAD_GLOBAL <T>; CHECK_EXC_MATCH`.
-                                // The covered RERAISE must route to the outer
-                                // re-raise landing, but the walker-native bound
-                                // continuation of this DELETE_FAST falls through
-                                // into that sibling type check with the current
-                                // exception not re-seeded, so CHECK_EXC_MATCH peeks
-                                // a null operand. Decline this shape — and any
-                                // catch-covered DELETE_FAST in a function that
-                                // contains it — so the interpreter runs it.
-                                let cleanup_reraise_to_sibling = |delete_pc: usize| {
-                                    let next = next_non_aux_instruction(code, delete_pc + 1);
-                                    let after_next = next
-                                        .and_then(|(pc, _)| next_non_aux_instruction(code, pc + 1));
-                                    let after_after_next = after_next
-                                        .and_then(|(pc, _)| next_non_aux_instruction(code, pc + 1));
-                                    next.is_some_and(|(pc, instruction)| {
-                                        catch_for_pc.get(pc).copied().flatten().is_some()
-                                            && matches!(instruction, Instruction::Reraise { .. })
-                                    }) && after_next.is_some_and(|(_, instruction)| {
-                                        matches!(instruction, Instruction::LoadGlobal { .. })
-                                    }) && after_after_next.is_some_and(|(_, instruction)| {
-                                        matches!(instruction, Instruction::CheckExcMatch)
-                                    })
-                                };
-                                let function_has_cleanup_reraise_to_sibling =
-                                    (0..num_instrs).any(|pc| {
-                                        matches!(
-                                            pyre_interpreter::decode_instruction_at(code, pc),
-                                            Some((Instruction::DeleteFast { .. }, _))
-                                        ) && cleanup_reraise_to_sibling(pc)
-                                    });
-                                if cleanup_reraise_to_sibling(py_pc)
-                                    || (catch_for_pc.get(py_pc).copied().flatten().is_some()
-                                        && function_has_cleanup_reraise_to_sibling)
-                                {
-                                    emit_abort_permanent!(py_pc);
-                                    continue;
-                                }
                                 let local_slot = local_to_vable_slot(idx) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -11633,6 +11658,11 @@ impl CodeWriter {
                                     emit_raise!(0u16, exc_flow, py_pc as i64, true);
                                     continue;
                                 }
+                                // The dynamic bound check below splits the
+                                // exception arm explicitly. Its successful
+                                // continuation cannot raise and must not
+                                // receive the generic per-op catch edge.
+                                exception_edge_handled = true;
                                 let idx_u16 = idx as u16;
                                 emit_load_fast_ref!(current_depth, idx_u16, py_pc);
                                 let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -11664,7 +11694,10 @@ impl CodeWriter {
                                     ),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), true);
-                                let bound_state = current_state.clone();
+                                let mut bound_state = current_state.clone();
+                                bound_state.next_offset = py_pc + 1;
+                                bound_state.blocklist =
+                                    frame_blocks_for_offset(code, bound_state.next_offset);
                                 let bound_block = SpamBlockRef::new(
                                     graph.new_block(Vec::new()),
                                     Some(bound_state.clone()),
@@ -11677,6 +11710,15 @@ impl CodeWriter {
                                     output_link(&current_state, &bound_state, bound_block.block()),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), false);
+                                // The successful check continues at the next
+                                // bytecode in this block. Register that block
+                                // as the next-PC candidate so a handler or
+                                // exception-table joinpoint at the same PC
+                                // cannot replace the DELETE_FAST continuation.
+                                joinpoints
+                                    .entry(py_pc + 1)
+                                    .or_insert_with(Vec::new)
+                                    .insert(0, bound_block.clone());
 
                                 // The unbound arm raises before any clear,
                                 // matching pyopcode.py:998 DELETE_FAST. Keep
@@ -11954,7 +11996,7 @@ impl CodeWriter {
                         }
                     }
 
-                    if let Some(catch_label) = catch_for_pc[py_pc] {
+                    if !exception_edge_handled && let Some(catch_label) = catch_for_pc[py_pc] {
                         // RPython `flowcontext.py:130-156 guessexception`
                         // attaches an exception edge only to **canraise**
                         // ops — control-flow opcodes (POP_JUMP_IF_*,
@@ -15533,6 +15575,48 @@ def run(iters):
     }
 
     #[test]
+    fn named_handler_cleanup_with_sibling_clause_emits_delete_fast_path() {
+        let source = "\
+def f(i):
+    try:
+        if i % 9 == 0:
+            raise ValueError
+        return 1
+    except ValueError as m:
+        if i % 2 == 0:
+            raise
+        raise KeyError
+    except KeyError:
+        return 100
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("make_jitcodes must populate the named-handler jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(opnames.contains(&"raise"));
+        assert!(
+            !opnames.contains(&"abort_permanent"),
+            "named-handler DELETE_FAST cleanup must remain executable in blackhole"
+        );
+    }
+
+    #[test]
     fn make_jitcodes_fills_mainjitcode_payload_in_place() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 5\n").expect("source must compile");
@@ -15692,6 +15776,47 @@ def run(iters):
             .framestate()
             .expect("catch landing should acquire a FrameState");
         assert!(catch_state.last_exception.is_some());
+    }
+
+    #[test]
+    fn explicit_raise_stack_value_preserves_exception_link_kinds() {
+        let code = first_nested_function_code("def f(a):\n    return a\n");
+        let mut graph = new_shadow_graph(&code);
+        let catch_block = graph.new_block(Vec::new());
+        let catch_ref = SpamBlockRef::new(catch_block, None);
+        let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
+        let startblock_ref = graph.startblock.clone();
+        let site = synthetic_catch_site(&catch_ref);
+        let link = attach_catch_exception_edge(
+            &code,
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &site,
+        );
+        let (last_exception, last_exc_value) = {
+            let link = link.borrow();
+            (link.last_exception, link.last_exc_value)
+        };
+
+        carry_explicit_raise_value_on_catch_stack(
+            &link,
+            &catch_ref,
+            Variable::new(VariableId(100), Kind::Ref).into(),
+        );
+
+        let link = link.borrow();
+        assert_eq!(link.last_exception, last_exception);
+        assert_eq!(link.last_exc_value, last_exc_value);
+        assert_eq!(
+            link.last_exception.and_then(|variable| variable.kind),
+            Some(Kind::Int)
+        );
+        assert_eq!(
+            link.last_exc_value.and_then(|variable| variable.kind),
+            Some(Kind::Ref)
+        );
     }
 
     #[test]
