@@ -1086,7 +1086,7 @@ fn resolve_buffer_offset(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), cra
 /// `interp_struct.py:177 W_UnpackIter` — an iterator yielding the
 /// successive fixed-size records of a buffer.  Kept in its own module
 /// because each `#[pyre_class]` emits a module-scoped `type_object()`.
-mod unpack_iter {
+pub mod unpack_iter {
     use super::{do_unpack, readbuf, struct_error};
     use pyre_object::*;
 

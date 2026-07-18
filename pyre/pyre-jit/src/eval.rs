@@ -1806,6 +1806,50 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,
         );
     }
+    // Immortal `#[pyre_class]` iterator / sequence wrappers whose managed
+    // children are held SOLELY through the immortal object.  The marker never
+    // scans a `malloc_typed`-immortal, so without a registered offset set the
+    // generic immortal-root walker (`walk_raw_immortal_roots`) cannot forward
+    // the child, and a collection reachable only through the wrapper frees it —
+    // e.g. `enumerate(list)` whose source list-iterator sits on a caller frame
+    // across a hot inner loop's collection, surfacing as
+    // `TypeError: not an iterator` on the next `__next__`.  These have no GC
+    // vtable site (immortal, keyed by `pytype_ptr`), so register the
+    // descriptor's `ptr_offsets` directly like the dict-view offsets above.
+    // The explicit `type_id`s never reach a GC arena, so no `register_type` /
+    // drift-check is involved.  This is the complete set of immortal
+    // `#[pyre_class]` wrappers with managed children that the
+    // `register_pyre_class` list above does not already cover; every other
+    // iterator family (map/filter/zip/cycle/chain/count/repeat, the four
+    // seq/list/tuple/set iterators, reversed, the SRE scanner) is registered
+    // there, and `W_Deque` is `allocate_stable` (GC-managed, not immortal).
+    for descr in [
+        <pyre_object::functional::W_Enumerate
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_Range
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_LongRangeIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_TakeWhile
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_DropWhile
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_FilterFalse
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_itertools::W_Pairwise
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::operation::_CallableIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::r#struct::W_Struct
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::r#struct::unpack_iter::W_UnpackIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    ] {
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+    }
     // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
     // — fget/fset/fdel/doc/reqcls/name are W_Root references.
     // Pyre's `GetSetProperty` ports them as inline fields; the
