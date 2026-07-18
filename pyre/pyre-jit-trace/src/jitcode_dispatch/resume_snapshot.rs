@@ -1330,6 +1330,93 @@ pub(crate) fn compute_nested_inline_caller_frame(
         Ok(b) => b,
         Err(_) => return Err(InlineCallerFrameDecline::Unavailable),
     };
+    // #343 depth-2 operand flush.  `emit_new_pyframe_inline_with_params` seeds
+    // this inlined-callee frame's `locals_cells_stack_w` virtual array with LOCALS
+    // only; its live operand-stack slots live in the register file and are never
+    // written back into the frame array.  When a guard fires inside a NESTED
+    // inline (this frame is the paused MIDDLE caller), the multi-frame snapshot
+    // captures this frame virtual and numbers its array — an unwritten operand
+    // slot numbers to `NULLREF`, which `reconstruct_inline_recipe`
+    // (state.rs:5954-5998, semantic-slot-ordered `arr[k]` read) decodes to a
+    // concrete-NULL Ref box, aborting the reconstructed middle at its next
+    // `CALL_MAY_FORCE` (`MayForceNullRefArgUnsupported`).  Materialize the live
+    // operand boxes into the frame array now — at the point we pause this frame to
+    // enter the nested inline — mirroring the locals seed at `helpers.rs:1418`
+    // (`virtualizable.py:101-113` write_boxes writes the frame's field boxes into
+    // its array when it is forced).  Only NON-pending operand slots are written;
+    // the top slot is the not-yet-produced nested-call result, delivered on resume
+    // (`pending_result_abs_slot`), so the decoder skips it and so do we.  Emitting
+    // here (before the nested callee's body walk) — not at capture — places the
+    // stores ahead of every in-callee guard, so `_number_virtuals` reads the
+    // populated array when it numbers those guards' resume data.
+    if let Some(marker) = resume_marker_jit_pc {
+        if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > 1 {
+            let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
+            let frame_red = (frame_reg != u16::MAX)
+                .then(|| ctx.registers_r.get(frame_reg as usize).copied())
+                .flatten()
+                .filter(|&r| r != OpRef::NONE);
+            let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
+            if let Some(locals_array) =
+                frame_red.and_then(|fr| ctx.trace_ctx.heapcache_getfield_cached(fr, locals_idx))
+            {
+                // nlocals from the paused caller's own code (varnames count), the
+                // same base the decoder uses (`code_ref.varnames.len()`).
+                let nlocals = unsafe { &*pjc.code_ptr }.varnames.len();
+                // `depth` is the operand-stack depth at the CALL return point,
+                // top slot = the pending nested-call result.
+                let pending_top_slot = nlocals + depth - 1;
+                let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                    jitcode_index as i32,
+                    marker as i32,
+                    caller_liveness_word,
+                );
+                let array_descr = crate::state::pyobject_gcarray_descr();
+                // Heapcache array-element key = the virtualizable info's array
+                // item descr, matching the seed store at `helpers.rs:1414-1417`.
+                let item_descr_index = ctx
+                    .trace_ctx
+                    .virtualizable_info()
+                    .map(|info| info.array_item_descr(0).index())
+                    .unwrap_or_else(|| array_descr.index());
+                // Live Ref colors at the CALL return coordinate, same enumeration
+                // as `collect_callee_active_boxes`.
+                let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+                    jitcode_index as i32,
+                    caller_liveness_word,
+                );
+                for &color in &banks.ref_ {
+                    let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
+                        nlocals,
+                        depth,
+                        &maps.pcdep_entries,
+                        color as usize,
+                    ) else {
+                        continue;
+                    };
+                    // Locals are already seeded; the pending result slot is
+                    // delivered on resume — only sibling operands need the flush.
+                    if slot < nlocals || slot == pending_top_slot {
+                        continue;
+                    }
+                    let Some(&operand) = ctx.registers_r.get(color as usize) else {
+                        continue;
+                    };
+                    if operand == OpRef::NONE {
+                        continue;
+                    }
+                    let idx = ctx.trace_ctx.const_int(slot as i64);
+                    ctx.trace_ctx.record_op_with_descr(
+                        OpCode::SetarrayitemGc,
+                        &[locals_array, idx, operand],
+                        array_descr.clone(),
+                    );
+                    ctx.trace_ctx
+                        .heapcache_setarrayitem(locals_array, idx, item_descr_index, operand);
+                }
+            }
+        }
+    }
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
