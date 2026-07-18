@@ -1511,155 +1511,6 @@ pub(crate) fn complex_hash(real: f64, imag: f64) -> i64 {
 
 // ── Public dispatch API ───────────────────────────────────────────────
 
-/// Try to call a dunder method on an instance for binary ops.
-///
-/// PyPy: descroperation.py `_binop_impl` →
-///   1. Try `a.__op__(b)` (forward)
-///   2. If not found or returns NotImplemented, try `b.__rop__(a)` (reverse)
-///
-/// descroperation.py:432-437 parity: `space.get_and_call_function` raises
-/// OperationError; the NotImplemented return value alone triggers the
-/// fallback. We mirror that by propagating PyError immediately — the
-/// pyre `call_function` shim stashes exceptions in PENDING_CALL_ERROR
-/// so we must consume them via `call_function_impl_result` to match.
-unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
-    let a_is_inst = is_instance(a);
-    let b_is_inst = is_instance(b);
-
-    // PyPy: descroperation.py _binop_impl
-    // If b's type is a proper subtype of a's type, try reverse first.
-    // This matches Python's "subclass reflected op takes priority" rule.
-    let try_reverse_first = if a_is_inst && b_is_inst {
-        if let Some(rdunder) = reverse_dunder(dunder) {
-            let a_type = w_instance_get_type(a);
-            let b_type = w_instance_get_type(b);
-            if std::ptr::eq(a_type, b_type) || !issubtype_cached(b_type, a_type) {
-                false
-            } else {
-                // PyPy `descroperation.py:_call_binop_impl` compares the
-                // classes that *define* the forward and reflected methods,
-                // not merely the operand types. An inherited `__rop__` from
-                // the same defining class must not pre-empt the lhs method.
-                // This distinction is observable for `ChainMap | Subclass`.
-                match (
-                    crate::baseobjspace::lookup_where_pair(a_type, dunder),
-                    crate::baseobjspace::lookup_where_pair(b_type, rdunder),
-                ) {
-                    (Some((left_src, _)), Some((right_src, _)))
-                        if !std::ptr::eq(left_src, right_src) =>
-                    {
-                        let left_src_below_right =
-                            match p_abstract_issubclass_w(left_src, right_src) {
-                                Ok(value) => value,
-                                Err(err) => return Some(Err(err)),
-                            };
-                        let left_type_below_right = match p_abstract_issubclass_w(a_type, right_src)
-                        {
-                            Ok(value) => value,
-                            Err(err) => return Some(Err(err)),
-                        };
-                        !left_src_below_right && !left_type_below_right
-                    }
-                    _ => false,
-                }
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if try_reverse_first {
-        let rdunder = reverse_dunder(dunder).unwrap();
-        let w_type = w_instance_get_type(b);
-        if let Some(method) = lookup_in_type_where(w_type, rdunder) {
-            match crate::call::call_function_impl_result(method, &[b, a]) {
-                Ok(result) => {
-                    if !is_not_implemented(result) {
-                        return Some(Ok(result));
-                    }
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-
-    // Forward: a.__op__(b)
-    if a_is_inst {
-        let w_type = w_instance_get_type(a);
-        if let Some(method) = lookup_in_type_where(w_type, dunder) {
-            match crate::call::call_function_impl_result(method, &[a, b]) {
-                Ok(result) => {
-                    if !is_not_implemented(result) {
-                        return Some(Ok(result));
-                    }
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-
-    // Reverse: b.__rop__(a) — only if not already tried above
-    if !try_reverse_first && b_is_inst {
-        if let Some(rdunder) = reverse_dunder(dunder) {
-            let w_type = w_instance_get_type(b);
-            if let Some(method) = lookup_in_type_where(w_type, rdunder) {
-                match crate::call::call_function_impl_result(method, &[b, a]) {
-                    Ok(result) => {
-                        if !is_not_implemented(result) {
-                            return Some(Ok(result));
-                        }
-                    }
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// `descroperation.py _binop_impl` typedef-driven fallback for
-/// non-instance LHS / RHS — pyre's `try_instance_binop` only fires
-/// when at least one operand is `is_instance`, but built-in W_Root
-/// types (dict_view, exception, generator, …) also expose dunder
-/// methods through their typedef.  This helper does the same
-/// forward + reverse MRO lookup but routes through
-/// `crate::typedef::r#type` instead of `w_instance_get_type`, so
-/// `dict_keys() | set()` etc. find the typedef-installed `__or__`
-/// and friends.  Returns `None` when neither side defines the
-/// method (caller falls through to the existing TypeError path).
-unsafe fn try_typedef_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
-    if let Some(a_type) = crate::typedef::r#type(a) {
-        if let Some(method) = lookup_in_type_where(a_type, dunder) {
-            match crate::call::call_function_impl_result(method, &[a, b]) {
-                Ok(result) => {
-                    if !is_not_implemented(result) {
-                        return Some(Ok(result));
-                    }
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-    if let Some(rdunder) = reverse_dunder(dunder) {
-        if let Some(b_type) = crate::typedef::r#type(b) {
-            if let Some(method) = lookup_in_type_where(b_type, rdunder) {
-                match crate::call::call_function_impl_result(method, &[b, a]) {
-                    Ok(result) => {
-                        if !is_not_implemented(result) {
-                            return Some(Ok(result));
-                        }
-                    }
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Check if w_type is a subtype of cls — delegates to the single MRO
 /// membership scan in `pyre_object::w_type_issubtype`.
 unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
@@ -2024,13 +1875,9 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
         // already implements the reflected-first reordering rule for
-        // subclass operands.  Fall back to the legacy instance-only
-        // `__add__` path when neither side is a typedef-bearing class.
+        // subclass operands.
         if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
             return Ok(result);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__add__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -2090,14 +1937,6 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
             return Ok(result);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__sub__") {
-            return result;
-        }
-        // Built-in W_Root types (dict_view, …) expose `__sub__` /
-        // `__rsub__` through their typedef.
-        if let Some(result) = try_typedef_binop(a, b, "__sub__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -2171,9 +2010,6 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
             return Ok(result);
         }
-        if let Some(result) = try_instance_binop(a, b, "__mul__") {
-            return result;
-        }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         // Sequence repetition slot (sq_repeat): a sequence on either side
@@ -2218,9 +2054,6 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")? {
             return Ok(result);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__floordiv__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -2275,9 +2108,6 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
             return Ok(result);
         }
-        if let Some(result) = try_instance_binop(a, b, "__mod__") {
-            return result;
-        }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         Err(PyError::type_error(format!(
@@ -2323,9 +2153,6 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
             return Ok(result);
         }
-        if let Some(result) = try_instance_binop(a, b, "__truediv__") {
-            return result;
-        }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         Err(PyError::type_error(format!(
@@ -2361,9 +2188,6 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
             return Ok(result);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__pow__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3039,9 +2863,6 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
             return Ok(result);
         }
-        if let Some(result) = try_instance_binop(a, b, "__lshift__") {
-            return result;
-        }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         Err(PyError::type_error(format!(
@@ -3067,9 +2888,6 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
             return Ok(result);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__rshift__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3118,15 +2936,6 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
             return Ok(result);
         }
-        if let Some(result) = try_instance_binop(a, b, "__and__") {
-            return result;
-        }
-        // Built-in W_Root types (dict_view, …) expose `__and__` /
-        // `__rand__` through their typedef but are not is_instance
-        // — fall back to typedef-driven MRO dispatch before TypeError.
-        if let Some(result) = try_typedef_binop(a, b, "__and__") {
-            return result;
-        }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         Err(PyError::type_error(format!(
@@ -3174,12 +2983,13 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     };
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
+        let numeric = needs_numeric_binop_dispatch(a, b, "__or__", "__ror__");
         if set_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
                 return Ok(result);
             }
         }
-        if needs_numeric_binop_dispatch(a, b, "__or__", "__ror__") {
+        if numeric {
             if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
                 return Ok(result);
             }
@@ -3217,22 +3027,19 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
             return Ok(new_dict);
         }
-        if let Some(result) = try_instance_binop(a, b, "__or__") {
-            return result;
+        // user-class + typedef (dict_view, …) dispatch: forward __or__ then reflected
+        // __ror__, exactly once.  Skipped when a gated special above already ran, so a
+        // set-/numeric-subclass override is never re-invoked.
+        if !set_override && !numeric {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
+                return Ok(result);
+            }
         }
         // type | type — PEP 604 union types (Python 3.10+)
         // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
         // which collapses identical operands (`int | int` is `int`).
         if unionable(a) && unionable(b) {
             return crate::_pypy_generic_alias::create_union(a, b);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__ror__") {
-            return result;
-        }
-        // Built-in W_Root types (dict_view, …) expose `__or__` /
-        // `__ror__` through their typedef.
-        if let Some(result) = try_typedef_binop(a, b, "__or__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3279,14 +3086,6 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
             return Ok(result);
-        }
-        if let Some(result) = try_instance_binop(a, b, "__xor__") {
-            return result;
-        }
-        // Built-in W_Root types (dict_view, …) expose `__xor__` /
-        // `__rxor__` through their typedef.
-        if let Some(result) = try_typedef_binop(a, b, "__xor__") {
-            return result;
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3559,7 +3358,6 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 _ => unreachable!(),
             }));
         }
-        // Instance dunder dispatch for comparison
         let dunder = match op {
             CompareOp::Lt => "__lt__",
             CompareOp::Le => "__le__",
@@ -3568,34 +3366,33 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             CompareOp::Eq => "__eq__",
             CompareOp::Ne => "__ne__",
         };
-        if let Some(result) = try_instance_binop(a, b, dunder) {
-            return result;
-        }
-        // `dictmultiobject.py:1628-1656 SetLikeDictView` — dict_keys
-        // / dict_items expose `__eq__` / `__ne__` / `__lt__` / etc.
-        // through the typedef.  `try_instance_binop` only fires for
-        // is_instance-shaped objects, so dict views (a separate
-        // W_Root type) need an explicit MRO-driven dispatch here.
+        // `SetLikeDictView` operands expose comparison dunders through the
+        // typedef. Instance-shaped operands were already handled by
+        // `try_compare_override`, so only non-instance operands dispatch here.
         // Reflected: if RHS is a dict view, try `b.dunder(a)` —
         // PyPy's `_is_set_like(other)` short-circuits the LHS-side
         // descr_eq when the other is set-like, so the reflected call
         // path is the one that succeeds for `set == d.keys()`.
-        if let Some(a_type) = crate::typedef::r#type(a) {
-            if let Some(method) = lookup_in_type_where(a_type, dunder) {
-                // A raised exception (not NotImplemented) propagates; only
-                // NotImplemented falls through to the reflected comparison.
-                let result = crate::call::call_function_impl_result(method, &[a, b])?;
-                if !is_not_implemented(result) {
-                    return Ok(result);
+        if !is_instance(a) {
+            if let Some(a_type) = crate::typedef::r#type(a) {
+                if let Some(method) = lookup_in_type_where(a_type, dunder) {
+                    // A raised exception (not NotImplemented) propagates; only
+                    // NotImplemented falls through to the reflected comparison.
+                    let result = crate::call::call_function_impl_result(method, &[a, b])?;
+                    if !is_not_implemented(result) {
+                        return Ok(result);
+                    }
                 }
             }
         }
-        if let Some(rdunder) = reverse_dunder(dunder) {
-            if let Some(b_type) = crate::typedef::r#type(b) {
-                if let Some(method) = lookup_in_type_where(b_type, rdunder) {
-                    let result = crate::call::call_function_impl_result(method, &[b, a])?;
-                    if !is_not_implemented(result) {
-                        return Ok(result);
+        if !is_instance(b) {
+            if let Some(rdunder) = reverse_dunder(dunder) {
+                if let Some(b_type) = crate::typedef::r#type(b) {
+                    if let Some(method) = lookup_in_type_where(b_type, rdunder) {
+                        let result = crate::call::call_function_impl_result(method, &[b, a])?;
+                        if !is_not_implemented(result) {
+                            return Ok(result);
+                        }
                     }
                 }
             }
