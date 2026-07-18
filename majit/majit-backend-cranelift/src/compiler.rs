@@ -952,6 +952,12 @@ pub fn jit_exc_value_addr() -> usize {
     &JIT_EXC_VALUE as *const _ as usize
 }
 
+/// Non-destructive read of `JIT_EXC_VALUE` for the GC root walker (unlike
+/// the swap-to-0 read `jit_exc_value_raw`).
+pub fn jit_exc_value_peek() -> i64 {
+    JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Return the address of JIT_EXC_TYPE for direct memory store in JIT code.
 fn jit_exc_type_addr() -> usize {
     &JIT_EXC_TYPE as *const _ as usize

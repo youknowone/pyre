@@ -191,6 +191,12 @@ pub fn jit_exc_take() -> i64 {
     value
 }
 
+/// Non-destructive read of `JIT_EXC_VALUE` for the GC root walker (unlike
+/// `jit_exc_take`, which swaps the cell to 0).
+pub fn jit_exc_value_peek() -> i64 {
+    JIT_EXC_VALUE.load(Ordering::Relaxed)
+}
+
 /// Clear both exception slots without reading the value.
 pub fn jit_exc_clear() {
     JIT_EXC_VALUE.store(0, Ordering::Relaxed);

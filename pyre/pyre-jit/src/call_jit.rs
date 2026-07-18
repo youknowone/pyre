@@ -572,6 +572,11 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 /// cells (`jit_exc_raise`).  Writing only `BH_LAST_EXC_VALUE` leaves
 /// `GUARD_NO_EXCEPTION` reading a stale 0, so the guard wrongly passes and the
 /// helper's NULL result flows to the consumer — keep both states in sync.
+///
+/// Both cells this writes — `BH_LAST_EXC_VALUE` and the backend `JIT_EXC_VALUE`
+/// (via `store_jit_exception`) — are GC-rooted by their respective extra-root
+/// walkers (`walk_bh_last_exception`, `walk_jit_exc_value`), so this writer
+/// needs no rooting of its own.
 fn publish_residual_call_exception(exc_obj: i64) {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
     store_jit_exception(exc_obj);

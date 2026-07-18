@@ -863,10 +863,45 @@ fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     });
 }
 
+/// Root the residual-call raise carried in the blackhole `BH_LAST_EXC_VALUE`
+/// cell. A residual `bh_call` that raised publishes the exception's raw pointer
+/// here (`publish_residual_call_exception`); between that write and the frame
+/// that catches it (`route_to_catch` / the eval-loop walker-skip path) the
+/// exception is held only in this raw `i64` cell, invisible to the precise
+/// collector — a safepoint major would sweep its oldgen traceback chain. Mark
+/// it (and its children) so the whole graph survives. Only `0` (no pending
+/// raise) is skipped; production never stores a non-pointer value here (the
+/// `0xDEAD` sentinel exists solely in a blackhole unit-test helper).
+fn walk_bh_last_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        if c.get() == 0 {
+            return;
+        }
+        // SAFETY: `slot` is the `Cell<i64>` interior, valid for this closure;
+        // the stored `i64` is a `PyObjectRef` bit-pattern, layout-compatible
+        // with `GcRef`. Forwarding through the slot relocates a (hypothetically)
+        // moving exception in place; the object is oldgen-stable today so only
+        // the mark takes effect.
+        let slot = c.as_ptr();
+        unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
+        let exc = c.get() as PyObjectRef;
+        unsafe { walk_raw_exception_roots(exc, visitor) };
+    });
+}
+
 fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // The in-flight exception is a live stack root, not a prebuilt object;
     // walk it on every collection, ahead of the prebuilt-dirty gate below.
     walk_in_flight_exception(visitor);
+    // These exception-carrier walkers resolve their thread-local on the
+    // collecting thread, matching `walk_in_flight_exception`. Under the
+    // single-threaded (GIL) execution model the collecting thread is the only
+    // mutator, so that covers every live carrier. A pending carrier on another
+    // stopped mutator would need the per-mutator root-area mechanism
+    // (`register_mutator_extra_area`); migrating all exception carriers to it is
+    // the free-threading root-area work, deferred with the rest of the EXC set.
+    walk_bh_last_exception(visitor);
+    crate::call::walk_pending_call_error(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor

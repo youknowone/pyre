@@ -70,6 +70,8 @@ pub fn majit_j2plan_log_enabled() -> bool {
 }
 
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
+// Holds the pending exception's `typeptr` (an immortal static `PyType`), never a
+// managed object, so it is deliberately not GC-rooted.
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 #[allow(dead_code)]
@@ -109,6 +111,12 @@ pub fn jit_exc_class_raw() -> i64 {
 /// cpu.grab_exc_value parity: read and clear exception value.
 pub fn jit_exc_value_raw() -> i64 {
     JIT_EXC_VALUE.swap(0, Ordering::Relaxed)
+}
+
+/// Non-destructive read of `JIT_EXC_VALUE` for the GC root walker (unlike
+/// `jit_exc_value_raw`, which swaps the cell to 0).
+pub fn jit_exc_value_peek() -> i64 {
+    JIT_EXC_VALUE.load(Ordering::Relaxed)
 }
 
 /// Clear exception state.
