@@ -40,7 +40,8 @@ pub(crate) unsafe fn try_call_dunder_obj(
         }
         // A raising `__repr__`/`__str__` propagates; a non-string return is a
         // TypeError (`object.c slot_tp_repr` / `slot_tp_str`).
-        let result = crate::builtins::call_and_check(method, &[obj])?;
+        let w_type = crate::typedef::r#type(obj).unwrap_or(pyre_object::PY_NULL);
+        let result = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }
@@ -65,7 +66,7 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
             return Ok(None);
         }
-        let result = crate::builtins::call_and_check(method, &[obj])?;
+        let result = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }

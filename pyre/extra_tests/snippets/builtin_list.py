@@ -960,3 +960,17 @@ subclass_with_new = ListSubclassWithNew([1, 2], newarg=3)
 assert type(subclass_with_new) is ListSubclassWithNew
 assert subclass_with_new == [1, 2]
 assert subclass_with_new.newarg == 3
+
+
+class StaticReprPoppingList:
+    @staticmethod
+    def __repr__():
+        try:
+            repr_mutating_list.pop()
+        except IndexError:
+            pass
+        return "obj"
+
+
+repr_mutating_list = [StaticReprPoppingList() for _ in range(5)]
+assert repr(repr_mutating_list) == "[obj, obj, obj]"
