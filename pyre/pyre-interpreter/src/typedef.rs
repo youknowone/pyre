@@ -5336,6 +5336,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         true,
                         "dict",
                         &pyre_object::DICT_TYPE,
+                        true,
                     )?;
                     let d = crate::type_methods::resolve_dict_backing(args[0]);
                     Ok(
@@ -5472,7 +5473,7 @@ fn dict_view_reversed(
     expected: &'static PyType,
     kind: pyre_object::dictmultiobject::DictViewKind,
 ) -> crate::PyResult {
-    let view = dict_iterator_receiver(args, "__reversed__", true, owner, expected)?;
+    let view = dict_iterator_receiver(args, "__reversed__", true, owner, expected, false)?;
     let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
     Ok(pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(dict, kind))
 }
@@ -7024,6 +7025,7 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     true,
                     "mappingproxy",
                     &pyre_object::MAPPING_PROXY_TYPE,
+                    false,
                 )?;
                 let dict = crate::type_methods::resolve_dict_backing(args[0]);
                 Ok(
@@ -20746,6 +20748,7 @@ fn dict_iterator_receiver(
     method_descriptor: bool,
     owner: &str,
     expected: &'static PyType,
+    allow_subclass: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let Some(&receiver) = args.first() else {
         let message = if method_descriptor {
@@ -20755,7 +20758,15 @@ fn dict_iterator_receiver(
         };
         return Err(crate::PyError::type_error(message));
     };
-    if !unsafe { pyre_object::py_type_check(receiver, expected) } {
+    // `dict` method descriptors bind to any dict subclass (an `OrderedDict`
+    // passed to `dict.__reversed__`); the concrete iterator typedefs are not
+    // subclassable, so they keep the exact-type check on the hot path.
+    let matches = if allow_subclass {
+        unsafe { crate::baseobjspace::isinstance_w(receiver, gettypeobject(expected)) }
+    } else {
+        unsafe { pyre_object::py_type_check(receiver, expected) }
+    };
+    if !matches {
         let received = crate::baseobjspace::object_functionstr_type_name(receiver);
         let message = if method_descriptor {
             format!(
@@ -20775,21 +20786,21 @@ fn dict_iterator_receiver(
 macro_rules! define_dict_iterator_type {
     ($init:ident, $self_fn:ident, $next_fn:ident, $len_fn:ident, $reduce_fn:ident, $owner:literal, $expected:path) => {
         fn $self_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__iter__", false, $owner, &$expected)
+            dict_iterator_receiver(args, "__iter__", false, $owner, &$expected, false)
         }
 
         fn $next_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__next__", false, $owner, &$expected)?;
+            dict_iterator_receiver(args, "__next__", false, $owner, &$expected, false)?;
             crate::baseobjspace::next(args[0])
         }
 
         fn $len_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__length_hint__", true, $owner, &$expected)?;
+            dict_iterator_receiver(args, "__length_hint__", true, $owner, &$expected, false)?;
             crate::baseobjspace::dict_view_iter_length_hint_method(args)
         }
 
         fn $reduce_fn(args: &[PyObjectRef]) -> crate::PyResult {
-            dict_iterator_receiver(args, "__reduce__", true, $owner, &$expected)?;
+            dict_iterator_receiver(args, "__reduce__", true, $owner, &$expected, false)?;
             crate::baseobjspace::dict_view_iter_reduce_method(args)
         }
 
