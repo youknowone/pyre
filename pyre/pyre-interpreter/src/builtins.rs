@@ -5247,7 +5247,27 @@ pub(crate) fn exception_group_match(
         return Ok((group, pyre_object::w_none()));
     }
     if crate::baseobjspace::isinstance(w_exc, base_group)? {
-        return exception_group_split_inner(w_exc, &ExceptionGroupCondition::Class(w_type));
+        // Partial match: call the (overridable) `split` method and validate it
+        // returns a 2-tuple of (match, rest).
+        let split = crate::baseobjspace::getattr_str(w_exc, "split")?;
+        let pair = crate::call::call_function_impl_result(split, &[w_type])?;
+        if !unsafe { pyre_object::is_tuple(pair) } {
+            let name = crate::baseobjspace::object_functionstr_type_name(pair);
+            return Err(crate::PyError::type_error(format!(
+                "split must return a tuple, not {name}"
+            )));
+        }
+        let n = unsafe { pyre_object::w_tuple_len(pair) };
+        if n < 2 {
+            return Err(crate::PyError::type_error(format!(
+                "split must return a 2-tuple, got tuple of size {n}"
+            )));
+        }
+        // Tuples longer than 2 are accepted for backwards compatibility; only
+        // the first two elements (match, rest) are used.
+        let matching = unsafe { pyre_object::w_tuple_getitem(pair, 0) }.unwrap();
+        let rest = unsafe { pyre_object::w_tuple_getitem(pair, 1) }.unwrap();
+        return Ok((matching, rest));
     }
     Ok((pyre_object::w_none(), w_exc))
 }
