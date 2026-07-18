@@ -3601,10 +3601,60 @@ fn set_init_from_iterable(
     // must still be marked live instead of being swept while Rust holds the
     // only reference.
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_set);
-    let items = crate::builtins::collect_iterable(w_iterable)?;
-    let w_set = pyre_object::gc_roots::shadow_stack_get(sp);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iterable);
+    // Python 3.14 `set_update_dict_lock_held`: an exact dict is walked
+    // through its key table and each cached hash is handed directly to the
+    // set.  This is observable when a key's `__hash__` has side effects, and
+    // it is the cached-hash shape of PyPy's
+    // `DictStrategy.getiteritems_with_hash`.  A dict subclass must still use
+    // normal iteration because it may override `__iter__`.
+    if unsafe {
+        pyre_object::is_exact_type(
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+            &pyre_object::DICT_TYPE,
+        )
+    } {
+        let mut index = 0usize;
+        let mut copied_hashed_key = false;
+        while let Some(key) = unsafe {
+            pyre_object::dictmultiobject::w_dict_nth_hashed_key(
+                pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+                index,
+            )
+        } {
+            unsafe {
+                pyre_object::setobject::w_set_insert_key_checked(
+                    pyre_object::gc_roots::shadow_stack_get(set_slot),
+                    key,
+                )
+            }
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            copied_hashed_key = true;
+            index += 1;
+        }
+        // Empty object-shaped dicts and non-empty ones both finish here.  For
+        // an empty dict the active Object/Unicode strategy is detected by a
+        // zero length; typed/Empty strategies deliberately fall through.
+        let strategy = unsafe {
+            pyre_object::w_dict_get_strategy(pyre_object::gc_roots::shadow_stack_get(iterable_slot))
+                .strategy_kind()
+        };
+        if copied_hashed_key
+            || matches!(
+                strategy,
+                pyre_object::dictmultiobject::StrategyKind::Object
+                    | pyre_object::dictmultiobject::StrategyKind::Unicode
+            )
+        {
+            return Ok(());
+        }
+    }
+    let items =
+        crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
     crate::builtins::builtin_set_add_items(w_set, &items)
 }
 
@@ -5492,7 +5542,6 @@ fn init_dict_type(ns: PyObjectRef) {
                         "fromkeys expected at least 1 argument, got 0",
                     ));
                 };
-                let items = crate::builtins::collect_iterable(iterable)?;
                 // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
                 // fill a fresh dict through the dict's own setitem, which hashes
                 // each key; for a dict subclass, construct an instance via `cls()`
@@ -5501,6 +5550,45 @@ fn init_dict_type(ns: PyObjectRef) {
                 let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
                 if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
                     let d = pyre_object::w_dict_new();
+                    // Python 3.14's exact-set/frozenset fast path carries each
+                    // entry's cached hash into the new exact dict.  This is the
+                    // reverse of `set_update_dict_lock_held` and avoids a
+                    // second observable `__hash__` call.  Subclasses still go
+                    // through their iterator below.
+                    if unsafe {
+                        pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
+                            || pyre_object::is_exact_type(
+                                iterable,
+                                &pyre_object::setobject::FROZENSET_TYPE,
+                            )
+                    } {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let sp = pyre_object::gc_roots::shadow_stack_len();
+                        pyre_object::gc_roots::pin_root(d);
+                        pyre_object::gc_roots::pin_root(value);
+                        pyre_object::gc_roots::pin_root(iterable);
+                        let mut index = 0usize;
+                        loop {
+                            let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+                            let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, index) })
+                            else {
+                                break;
+                            };
+                            let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                            unsafe {
+                                pyre_object::w_dict_store_hashed_checked(
+                                    d, key.obj, value, key.hash,
+                                )
+                            }
+                            .map_err(|_| {
+                                crate::baseobjspace::take_pending_dict_key_error(key.obj)
+                            })?;
+                            index += 1;
+                        }
+                        return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
+                    }
+                    let items = crate::builtins::collect_iterable(iterable)?;
                     // `try_hash_value` may run a user `__hash__` that allocates
                     // and triggers a moving minor collection; `d`, the shared
                     // `value` (reused across every key), and every not-yet-added
@@ -5532,6 +5620,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     };
                     Ok(d)
                 } else {
+                    let items = crate::builtins::collect_iterable(iterable)?;
                     let d = crate::call::call_function_impl_result(cls, &[])?;
                     for key in items {
                         crate::baseobjspace::setitem(d, key, value)?;

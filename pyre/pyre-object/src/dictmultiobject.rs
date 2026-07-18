@@ -1716,7 +1716,7 @@ pub unsafe fn w_dict_lookup_checked(
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
-        if crate::is_int(key) && !crate::is_bool(key) {
+        if crate::listobject::is_plain_int1(key) {
             return Ok(w_dict_lookup_int_strategy(obj, key));
         }
         if _never_equal_to_int(key) {
@@ -1914,7 +1914,7 @@ unsafe fn w_dict_store_checked_inner(
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
-        if crate::is_int(key) && !crate::is_bool(key) {
+        if crate::listobject::is_plain_int1(key) {
             w_dict_store_int_strategy(obj, key, value);
             return Ok(());
         }
@@ -2486,7 +2486,7 @@ pub unsafe fn w_dict_delitem_checked(
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
-        if crate::is_int(key) && !crate::is_bool(key) {
+        if crate::listobject::is_plain_int1(key) {
             return Ok(w_dict_delitem_int_strategy(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
@@ -2724,6 +2724,31 @@ pub unsafe fn w_dict_nth_item(
     w_dict_get_strategy(obj).nth_item(obj, index)
 }
 
+/// Return the `index`-th key together with the hash stored in an exact dict's
+/// object-shaped table.
+///
+/// CPython 3.14's set fast path consumes exact-dict keys with their cached
+/// hashes (`set_update_dict_lock_held`), which is observable for keys whose
+/// `__hash__` has side effects.  PyPy exposes the corresponding cached-hash
+/// iterator as `DictStrategy.getiteritems_with_hash`; pyre's Object and
+/// Unicode strategies share the `IndexMap<ObjectKey, _>` representation, so
+/// they can hand that same pair to the set implementation without hashing the
+/// application-level key again.  Other typed strategies return `None` and use
+/// their ordinary iterable path.
+///
+/// # Safety
+/// `obj` must be a valid regular `W_DictObject` (not a module dict).
+pub unsafe fn w_dict_nth_hashed_key(obj: PyObjectRef, index: usize) -> Option<ObjectKey> {
+    match w_dict_get_strategy(obj).strategy_kind() {
+        StrategyKind::Object | StrategyKind::Unicode => {
+            let dict = &*(obj as *const W_DictObject);
+            let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+            entries.get_index(index).map(|(key, _)| *key)
+        }
+        _ => None,
+    }
+}
+
 /// `dictmultiobject.py:585-587 W_DictMultiObject.descr_copy` —
 /// `w_dict.copy()` delegates to `strategy.copy(w_dict)` so typed
 /// strategies preserve their backing shape (`:1152
@@ -2752,7 +2777,7 @@ pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
-    let k = crate::w_int_get_value(key);
+    let k = crate::listobject::plain_int_w(key);
     if entries.insert(k, value).is_none() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
@@ -2776,7 +2801,7 @@ pub unsafe fn w_dict_lookup_int_strategy(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     let entries = w_dict_int_storage(obj);
-    let k = crate::w_int_get_value(key);
+    let k = crate::listobject::plain_int_w(key);
     entries.get(&k).copied()
 }
 
@@ -2789,7 +2814,7 @@ pub unsafe fn w_dict_lookup_int_strategy(
 pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
-    let k = crate::w_int_get_value(key);
+    let k = crate::listobject::plain_int_w(key);
     // shift_remove preserves insertion order, matching CPython 3.7+ /
     // PyPy3 dict semantics where deleting an entry leaves the
     // remaining entries in their original relative order.
@@ -3889,7 +3914,7 @@ impl EmptyDictStrategy {
         // `:700-701 is_w(w_type, self.space.w_int)` — plain int only;
         // bool inherits from int in Python 3 but PyPy's
         // `is_w(type(b), w_int)` is False because `type(True) is bool`.
-        if crate::is_int(w_key) && !crate::is_bool(w_key) {
+        if crate::listobject::is_plain_int1(w_key) {
             self.switch_to_int_strategy(w_dict);
             return;
         }
@@ -4054,7 +4079,7 @@ impl EmptyKwargsDictStrategy {
             self.switch_to_kwargs_strategy(w_dict);
             return;
         }
-        if crate::is_int(w_key) && !crate::is_bool(w_key) {
+        if crate::listobject::is_plain_int1(w_key) {
             EMPTY_DICT_STRATEGY.switch_to_int_strategy(w_dict);
             return;
         }
@@ -4916,7 +4941,7 @@ impl IntDictStrategy {
     /// per `listobject.py:is_plain_int1`.
     #[inline]
     fn is_correct_type(w_key: PyObjectRef) -> bool {
-        unsafe { crate::is_int(w_key) && !crate::is_bool(w_key) }
+        unsafe { crate::listobject::is_plain_int1(w_key) }
     }
 
     /// `dictmultiobject.py:1358-1364 _never_equal_to` for int — never
