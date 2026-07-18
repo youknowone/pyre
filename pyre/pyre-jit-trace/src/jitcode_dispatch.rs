@@ -8466,6 +8466,20 @@ pub(crate) fn fbw_inline_binop_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_INLINE_COMPAREOP` — gate the speculative inline of a
+/// plain-Python rich-compare dunder after the numeric COMPARE_OP
+/// specializations decline ([`try_walker_inline_user_compareop`]). When on, a
+/// user-class comparison folds to a class + version-tag guard plus the inlined
+/// dunder body instead of the opaque `jit_compare_value_from_tag` residual.
+/// Default OFF while the optimization is validated independently.
+pub(crate) fn fbw_inline_compareop_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_COMPAREOP") {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        None => false,
+    })
+}
+
 /// `PYRE_FBW_STOREATTR_FOLD` — gate the full-body-walker STORE_ATTR fast path
 /// ([`try_walker_specialize_store_attr`]).  When on, a plain same-type unboxed
 /// integer store folds to guards + a non-forcing raw longlong-list write
@@ -17127,6 +17141,133 @@ fn try_walker_inline_user_binop(
     Ok(Some(inlined))
 }
 
+/// Inline a plain Python rich-compare dunder after the numeric COMPARE_OP
+/// specializations decline. The receiver class and its version tag pin the
+/// descriptor lookup; a proper-subclass rhs declines so its reflected dunder
+/// retains priority.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_user_compareop(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    code: &[u8],
+    op_tag: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || !fbw_inline_compareop_enabled()
+        || dst_bank != 'r'
+        || r_args.len() != 2
+    {
+        return Ok(None);
+    }
+
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    // Forward rich-compare dunder only; a proper-subclass rhs declines below so
+    // its reflected dunder (__lt__/__gt__, __le__/__ge__, __eq__/__ne__ self)
+    // keeps priority, matching try_compare_override's forward-first dispatch.
+    let dunder = match cmp_op {
+        pyre_interpreter::bytecode::ComparisonOperator::Less => "__lt__",
+        pyre_interpreter::bytecode::ComparisonOperator::LessOrEqual => "__le__",
+        pyre_interpreter::bytecode::ComparisonOperator::Greater => "__gt__",
+        pyre_interpreter::bytecode::ComparisonOperator::GreaterOrEqual => "__ge__",
+        pyre_interpreter::bytecode::ComparisonOperator::Equal => "__eq__",
+        pyre_interpreter::bytecode::ComparisonOperator::NotEqual => "__ne__",
+    };
+
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
+        return Ok(None);
+    };
+    let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
+        return Ok(None);
+    };
+
+    let w_class = unsafe { (*concrete_lhs).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return Ok(None);
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+
+    let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(w_class, w_typ_r)
+        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r, w_class) }
+    {
+        return Ok(None);
+    }
+
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+    if nparams != 2 {
+        return Ok(None);
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_lhs),
+        ConcreteValue::Ref(concrete_rhs),
+    ];
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![lhs, rhs],
+        vec![
+            ConcreteValue::Ref(concrete_lhs),
+            ConcreteValue::Ref(concrete_rhs),
+        ],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((lhs, concrete_lhs, w_class, version_tag)),
+        false,
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        let result = ctx.registers_r[dst];
+        if matches!(
+            concrete_from_recorded_opref(ctx, result),
+            ConcreteValue::Ref(obj)
+                if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
+        ) {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
+    }
+    Ok(Some(inlined))
+}
+
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
     op: &DecodedOp,
@@ -24895,6 +25036,13 @@ fn dispatch_residual_call_iIRd_kind(
                 }
                 if ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp {
                     if let Some(inlined) = try_walker_inline_user_binop(
+                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                    )? {
+                        return Ok(inlined);
+                    }
+                }
+                if ei.pyre_helper == majit_ir::PyreHelperKind::CompareOp {
+                    if let Some(inlined) = try_walker_inline_user_compareop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
                         return Ok(inlined);
