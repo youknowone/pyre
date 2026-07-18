@@ -445,3 +445,33 @@ class FS(frozenset):
 
 assert repr(FS()) == "FS()"
 assert repr(FS([1, 2, 3])) == "FS({1, 2, 3})"
+
+
+class MutatingSetKey:
+    enabled = False
+    target = None
+
+    def __hash__(self):
+        return 0
+
+    def __eq__(self, other):
+        if self.enabled:
+            self.target.clear()
+        return False
+
+
+# CPython setobject.c restarts a table probe when equality replaces or clears
+# the table. These operations need not have a prescribed result under hostile
+# mutation, but they must never corrupt the backing table or abort.
+mutating_key = MutatingSetKey()
+mutating_operand = {mutating_key}
+mutating_target = {0}
+MutatingSetKey.target = mutating_target
+MutatingSetKey.enabled = True
+mutating_target |= mutating_operand
+
+MutatingSetKey.enabled = False
+mutating_target = {mutating_key}
+MutatingSetKey.target = mutating_target
+MutatingSetKey.enabled = True
+mutating_target -= {0}

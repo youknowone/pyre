@@ -288,26 +288,92 @@ pub unsafe fn w_set_add_hashed_checked(
 /// `space.hash_w` digest of `key.obj`.
 pub unsafe fn w_set_insert_key_checked(
     obj: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
+    mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), crate::dictmultiobject::DictKeyError> {
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
-    // Single insert probe, matching `r_dict.setitem`'s one bucket scan: an
-    // `eq_w` that raises mid-probe reads as "not equal", so `insert` appends a
-    // spurious entry at the end; drop it so the add leaves the set unchanged.
-    let appended = entries.insert(key, ()).is_none();
-    if crate::dictmultiobject::take_dict_key_error() {
-        if appended {
-            entries.pop();
+    loop {
+        let s = &mut *(obj as *mut W_SetObject);
+        let probed_items = s.items;
+        let original_len = (*probed_items).len();
+
+        // CPython `set_add_entry_takeref` snapshots `so->table` before a
+        // rich comparison and restarts when the callback replaced the table
+        // or its candidate entry.  `IndexMap::insert` holds a mutable table
+        // borrow while invoking `ObjectKey::eq`, so allowing a re-entrant
+        // `set.clear()` to mutate that same table corrupts IndexMap.  Detach
+        // the probed table and expose a byte-for-byte copy to callbacks; the
+        // detached table remains exclusively owned by this probe.
+        let visible_items = crate::lltype::malloc_raw((*probed_items).clone());
+        s.items = visible_items;
+
+        // The detached table is no longer reached by the set's custom GC
+        // trace.  Root every key (plus the incoming key) across `eq_w`, then
+        // write forwarded pointers back before either committing or dropping
+        // it.  This is the explicit shadow-stack equivalent of RPython's
+        // livevars around an r_dict comparison call.
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        for i in 0..original_len {
+            if let Some((stored, ())) = (*probed_items).get_index(i) {
+                crate::gc_roots::pin_root(stored.obj);
+            }
         }
-        return Err(crate::dictmultiobject::DictKeyError);
+        let incoming_root = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(key.obj);
+
+        let appended = (*probed_items).insert(key, ()).is_none();
+        let callback_error = crate::dictmultiobject::take_dict_key_error();
+
+        for i in 0..original_len {
+            if let Some((stored, ())) = (*probed_items).get_index(i) {
+                let stored_ptr = stored as *const crate::dictmultiobject::ObjectKey
+                    as *mut crate::dictmultiobject::ObjectKey;
+                (*stored_ptr).obj = crate::gc_roots::shadow_stack_get(root_base + i);
+            }
+        }
+        key.obj = crate::gc_roots::shadow_stack_get(incoming_root);
+        if appended {
+            if let Some((stored, ())) = (*probed_items).get_index(original_len) {
+                let stored_ptr = stored as *const crate::dictmultiobject::ObjectKey
+                    as *mut crate::dictmultiobject::ObjectKey;
+                (*stored_ptr).obj = key.obj;
+            }
+        }
+
+        if callback_error {
+            drop(Box::from_raw(probed_items));
+            return Err(crate::dictmultiobject::DictKeyError);
+        }
+
+        // `entry->key != startkey` parity: compare the callback-visible
+        // table with the pre-probe prefix by cached hash and object identity,
+        // without firing another Python comparison.  A mutation restarts
+        // against the now-live storage; a net-no-op mutation is equivalent
+        // to the unchanged-table path.
+        let current_items = s.items;
+        let unchanged = (*current_items).len() == original_len
+            && (0..original_len).all(|i| {
+                let Some((before, ())) = (*probed_items).get_index(i) else {
+                    return false;
+                };
+                let Some((after, ())) = (*current_items).get_index(i) else {
+                    return false;
+                };
+                before.hash == after.hash && std::ptr::eq(before.obj, after.obj)
+            });
+        if !unchanged {
+            drop(Box::from_raw(probed_items));
+            continue;
+        }
+
+        s.items = probed_items;
+        s.len = (*probed_items).len();
+        drop(Box::from_raw(current_items));
+        if appended {
+            s.hash = -1;
+            set_write_barrier(obj);
+        }
+        return Ok(());
     }
-    if appended {
-        s.len += 1;
-        s.hash = -1;
-        set_write_barrier(obj);
-    }
-    Ok(())
 }
 
 /// Membership test for a key that carries its own digest, propagating an
@@ -322,15 +388,47 @@ pub unsafe fn w_set_insert_key_checked(
 /// `space.hash_w` digest of `key.obj`.
 pub unsafe fn w_set_contains_key_checked(
     obj: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
+    mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let s = &*(obj as *const W_SetObject);
-    let entries = &*s.items;
-    let found = entries.contains_key(&key);
-    if crate::dictmultiobject::take_dict_key_error() {
-        return Err(crate::dictmultiobject::DictKeyError);
+    loop {
+        let s = &mut *(obj as *mut W_SetObject);
+        let probed_items = s.items;
+        let original_len = (*probed_items).len();
+        let visible_items = crate::lltype::malloc_raw((*probed_items).clone());
+        s.items = visible_items;
+
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        let mut hashes = Vec::with_capacity(original_len);
+        for i in 0..original_len {
+            if let Some((stored, ())) = (*probed_items).get_index(i) {
+                hashes.push(stored.hash);
+                crate::gc_roots::pin_root(stored.obj);
+            }
+        }
+        let incoming_root = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(key.obj);
+
+        let found = (*probed_items).contains_key(&key);
+        let callback_error = crate::dictmultiobject::take_dict_key_error();
+        key.obj = crate::gc_roots::shadow_stack_get(incoming_root);
+        let current_items = s.items;
+        let unchanged = (*current_items).len() == original_len
+            && (0..original_len).all(|i| {
+                let Some((after, ())) = (*current_items).get_index(i) else {
+                    return false;
+                };
+                hashes[i] == after.hash
+                    && std::ptr::eq(crate::gc_roots::shadow_stack_get(root_base + i), after.obj)
+            });
+        drop(Box::from_raw(probed_items));
+        if callback_error {
+            return Err(crate::dictmultiobject::DictKeyError);
+        }
+        if unchanged {
+            return Ok(found);
+        }
     }
-    Ok(found)
 }
 
 /// Remove a key that carries its own digest, propagating an `eq_w` raise from
@@ -341,19 +439,70 @@ pub unsafe fn w_set_contains_key_checked(
 /// `space.hash_w` digest of `key.obj`.
 pub unsafe fn w_set_discard_key_checked(
     obj: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
+    mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
-    let removed = entries.shift_remove(&key).is_some();
-    if crate::dictmultiobject::take_dict_key_error() {
-        return Err(crate::dictmultiobject::DictKeyError);
+    loop {
+        let s = &mut *(obj as *mut W_SetObject);
+        let probed_items = s.items;
+        let original_len = (*probed_items).len();
+        let visible_items = crate::lltype::malloc_raw((*probed_items).clone());
+        s.items = visible_items;
+
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        let mut hashes = Vec::with_capacity(original_len);
+        for i in 0..original_len {
+            if let Some((stored, ())) = (*probed_items).get_index(i) {
+                hashes.push(stored.hash);
+                crate::gc_roots::pin_root(stored.obj);
+            }
+        }
+        let incoming_root = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(key.obj);
+
+        let removed_index = (*probed_items)
+            .shift_remove_full(&key)
+            .map(|(index, _, ())| index);
+        let callback_error = crate::dictmultiobject::take_dict_key_error();
+        key.obj = crate::gc_roots::shadow_stack_get(incoming_root);
+        for i in 0..(*probed_items).len() {
+            if let Some((stored, ())) = (*probed_items).get_index(i) {
+                let old_index = match removed_index {
+                    Some(removed) if i >= removed => i + 1,
+                    _ => i,
+                };
+                let stored_ptr = stored as *const crate::dictmultiobject::ObjectKey
+                    as *mut crate::dictmultiobject::ObjectKey;
+                (*stored_ptr).obj = crate::gc_roots::shadow_stack_get(root_base + old_index);
+            }
+        }
+
+        let current_items = s.items;
+        let unchanged = (*current_items).len() == original_len
+            && (0..original_len).all(|i| {
+                let Some((after, ())) = (*current_items).get_index(i) else {
+                    return false;
+                };
+                hashes[i] == after.hash
+                    && std::ptr::eq(crate::gc_roots::shadow_stack_get(root_base + i), after.obj)
+            });
+        if callback_error {
+            drop(Box::from_raw(probed_items));
+            return Err(crate::dictmultiobject::DictKeyError);
+        }
+        if !unchanged {
+            drop(Box::from_raw(probed_items));
+            continue;
+        }
+
+        s.items = probed_items;
+        s.len = (*probed_items).len();
+        drop(Box::from_raw(current_items));
+        if removed_index.is_some() {
+            s.hash = -1;
+        }
+        return Ok(removed_index.is_some());
     }
-    if removed {
-        s.len -= 1;
-        s.hash = -1;
-    }
-    Ok(removed)
 }
 
 /// Membership test.
@@ -379,13 +528,7 @@ pub unsafe fn w_set_contains_checked(
     item: PyObjectRef,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
     let key = crate::dictmultiobject::object_key_for_checked(item)?;
-    let s = &*(obj as *const W_SetObject);
-    let entries = &*s.items;
-    let found = entries.contains_key(&key);
-    if crate::dictmultiobject::take_dict_key_error() {
-        return Err(crate::dictmultiobject::DictKeyError);
-    }
-    Ok(found)
+    w_set_contains_key_checked(obj, key)
 }
 
 /// Remove an element if present. Returns true when removed.
@@ -416,17 +559,7 @@ pub unsafe fn w_set_discard_checked(
     item: PyObjectRef,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
     let key = crate::dictmultiobject::object_key_for_checked(item)?;
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
-    let removed = entries.shift_remove(&key).is_some();
-    if crate::dictmultiobject::take_dict_key_error() {
-        return Err(crate::dictmultiobject::DictKeyError);
-    }
-    if removed {
-        s.len -= 1;
-        s.hash = -1;
-    }
-    Ok(removed)
+    w_set_discard_key_checked(obj, key)
 }
 
 /// Remove every element.
@@ -518,7 +651,13 @@ pub unsafe fn w_set_difference_update_from_set(
         let mut i = 0;
         while let Some(key) = w_set_key_at(dst, i) {
             if !w_set_contains_key_checked(src, key)? {
-                let key = w_set_key_at(dst, i).expect("probing the other set cannot shorten self");
+                // The comparison may clear or otherwise shorten `dst`.
+                // CPython's set probe restarts when `entry->key` changes;
+                // once this live index disappeared there is no surviving
+                // entry to copy into the difference result.
+                let Some(key) = w_set_key_at(dst, i) else {
+                    break;
+                };
                 w_set_insert_key_checked(result, key)?;
             }
             i += 1;

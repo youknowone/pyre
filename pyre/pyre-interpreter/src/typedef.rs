@@ -19872,8 +19872,9 @@ fn set_intersect_update(
             if pyre_object::w_set_contains_key_checked(probe, key)
                 .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
-                let key = pyre_object::w_set_key_at(keep, i)
-                    .expect("probing a set cannot shorten the set being walked");
+                let Some(key) = pyre_object::w_set_key_at(keep, i) else {
+                    break;
+                };
                 pyre_object::w_set_insert_key_checked(result, key)
                     .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
             }
@@ -20268,8 +20269,9 @@ fn set_symmetric_difference_storage(
                 {
                     // The probe's `eq_w` can move the element, so the key is
                     // re-read from the table the collector rewrites.
-                    let key = pyre_object::w_set_key_at(walk, i)
-                        .expect("probing a set cannot shorten the set being walked");
+                    let Some(key) = pyre_object::w_set_key_at(walk, i) else {
+                        break;
+                    };
                     pyre_object::w_set_insert_key_checked(w_new, key)
                         .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                 }
