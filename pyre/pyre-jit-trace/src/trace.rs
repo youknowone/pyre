@@ -1244,8 +1244,25 @@ fn drive_bridge_framestack_walk(
     }
 
     let Some(recipe) = carrier.recipes.last() else {
-        crate::jitcode_dispatch::census_record("P2Framestack::NoRecipes");
-        return TraceAction::Abort;
+        // A 0-recipe carrier is a guard failure with NO paused inline callee
+        // frames: the multi-frame snapshot held only the root frame, so
+        // `rebuild_from_resumedata` → `setup_bridge_sym` (jitdriver.rs:4891)
+        // already seeded the root sym and there is nothing to reconstruct.  This
+        // is semantically a plain ROOT bridge.  resume.py:1042-1057 has ONE
+        // resume path: a resume with no inline frames rebuilds just the root and
+        // continues forward — it never aborts.  Fall through to the full-body
+        // bridge walk from the root pc, mirroring the `carrier.is_none()`
+        // plain-bridge path (trace.rs:621-627), instead of deopting to the
+        // blackhole (which killed the depth-2 payoff — one such carrier per
+        // base-case guard failure).
+        if std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() == Some(std::ffi::OsStr::new("0"))
+            || fbw_declined(crate::driver::make_green_key(w_code, root_pc))
+        {
+            crate::jitcode_dispatch::census_record("P2Framestack::NoRecipes");
+            return TraceAction::Abort;
+        }
+        crate::jitcode_dispatch::census_record("P2Framestack::NoRecipesPlainBridge");
+        return full_body_walk_trace(ctx, sym, w_code, root_pc, cf_addr, WalkJournals::Reset);
     };
 
     let root_ec = sym.concrete_execution_context;
