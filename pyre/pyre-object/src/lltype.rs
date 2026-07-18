@@ -148,12 +148,34 @@ pub struct PyreClassDescriptor {
     pub object_size: usize,
     /// Byte offsets of inline `PyObjectRef` fields the GC must trace.
     pub ptr_offsets: &'static [usize],
+    /// Python-visible dotted name (`"collections.deque"`), carried for
+    /// diagnostics — the GC-root registration guard reports it by name
+    /// when a type with managed children was left unregistered.
+    pub pyname: &'static str,
 }
 
 // Safety: every field is either a static-`'static` reference (PyType,
-// gc_type_id, ptr_offsets), a primitive, or a raw pointer to read-only
-// static storage; sharing across threads is sound.
+// gc_type_id, ptr_offsets, pyname), a primitive, or a raw pointer to
+// read-only static storage; sharing across threads is sound.
 unsafe impl Sync for PyreClassDescriptor {}
+
+/// Link-time registry of every `#[pyre_class]` type's descriptor.
+///
+/// `#[pyre_class]` appends one element per type (via `linkme`'s
+/// `distributed_slice`), so this slice is the whole-program set of GC
+/// class descriptors — the Rust stand-in for RPython's translation-time
+/// walk over every `GcStruct` in the low-level type graph
+/// (`rpython/memory/gctransform/framework.py`), which pyre cannot do
+/// because Rust has no such pass.  Consumed only as a completeness
+/// *oracle*: the JIT driver's `build_gc` asserts, right before
+/// `freeze_types()`, that every descriptor with managed children was
+/// actually wired into the GC.  It is deliberately NOT used to *drive*
+/// registration — population is a link-section array whose completeness
+/// is not guaranteed on every backend (notably wasm), and an oracle
+/// degrades gracefully under under-population (it can only under-check,
+/// never false-alarm) whereas a driver could not.
+#[::linkme::distributed_slice]
+pub static PYRE_CLASS_DESCRIPTORS: [&'static PyreClassDescriptor] = [..];
 
 /// Compile-time bridge between a `#[pyre_class]` struct and its
 /// per-type static `PyType` / `PyreClassDescriptor`.  Implemented
@@ -249,6 +271,15 @@ pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
     } else {
         unsafe {
             std::ptr::write(raw as *mut T, value);
+            // The object is born old-gen with `TRACK_YOUNG_PTRS` set but is
+            // not yet in the remembered set, so a minor collection would not
+            // scan it — any inline `PyObjectRef` field still pointing into the
+            // nursery would be dropped.  Run the barrier once so the object
+            // joins the remembered set and the first minor GC forwards its
+            // young children, mirroring the hand-written barrier every other
+            // stable allocator runs after its raw write (`w_list_new`,
+            // `w_generator_new`, `tupleobject`).
+            crate::gc_hook::try_gc_write_barrier(raw);
             raw as *mut T
         }
     }

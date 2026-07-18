@@ -1038,6 +1038,7 @@ fn expand_pyre_class(
     let object_size_const = format_ident!("W_{}_OBJECT_SIZE", suffix);
     let ptr_offsets_const = format_ident!("W_{}_GC_PTR_OFFSETS", suffix);
     let descriptor_static = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR", suffix);
+    let descriptor_slice_elem = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR_SLICE", suffix);
 
     // When the user declared `type_id = N` we pre-initialize the cell
     // to `N` and additionally emit the legacy `pub const W_X_GC_TYPE_ID:
@@ -1143,7 +1144,16 @@ fn expand_pyre_class(
                 gc_type_id: &#gc_type_id_cell,
                 object_size: #object_size_const,
                 ptr_offsets: &#ptr_offsets_const,
+                pyname: #name_lit,
             };
+
+        /// Link-time registration of this class's descriptor into the
+        /// whole-program `PYRE_CLASS_DESCRIPTORS` slice, so the JIT
+        /// driver's GC-root completeness oracle can see every
+        /// `#[pyre_class]` type without a hand-maintained list.
+        #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_CLASS_DESCRIPTORS)]
+        static #descriptor_slice_elem: &'static ::pyre_object::lltype::PyreClassDescriptor =
+            &#descriptor_static;
 
         impl ::pyre_object::lltype::PyreClassPyTypeOf for #st_name {
             const PYTYPE: *const ::pyre_object::PyType =

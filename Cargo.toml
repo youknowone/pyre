@@ -115,6 +115,9 @@ proc-macro2 = "1"
 
 # data structures
 smallvec = "1"
+# link-section distributed slice: `#[pyre_class]` appends each type's GC
+# descriptor to a whole-program slice the JIT driver checks for completeness.
+linkme = "0.3"
 
 # cranelift backend
 cranelift-codegen = "0.132"

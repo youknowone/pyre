@@ -32,6 +32,10 @@ wasm_vfs = ["dep:lz4_flex", "host_env"]
 pyre-object = { workspace = true }
 pyre-macros = { workspace = true }
 pyre-native = { workspace = true }
+# `#[pyre_class]` emits a `linkme::distributed_slice` element per type into
+# `pyre_object::lltype::PYRE_CLASS_DESCRIPTORS`; the attribute path must resolve
+# in this crate too.
+linkme = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 rustpython-literal = { workspace = true }
 rustpython-common = { workspace = true }
