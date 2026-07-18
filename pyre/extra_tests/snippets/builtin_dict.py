@@ -447,3 +447,16 @@ callback_dict = {failing_dict_key: 1}
 failing_dict_key.fail = True
 assert_raises(DictKeyCallbackError, callback_dict.setdefault, failing_dict_key, 2)
 assert_raises(DictKeyCallbackError, callback_dict.pop, failing_dict_key)
+
+
+iterator_mutation_dict = {0: 0}
+iterator_mutation_iter = iter(iterator_mutation_dict)
+assert next(iterator_mutation_iter) == 0
+del iterator_mutation_dict[0]
+iterator_mutation_dict[0] = 1
+assert_raises(RuntimeError, next, iterator_mutation_iter)
+
+iterator_value_dict = {0: 0}
+iterator_value_iter = iter(iterator_value_dict)
+iterator_value_dict[0] = 1
+assert next(iterator_value_iter) == 0

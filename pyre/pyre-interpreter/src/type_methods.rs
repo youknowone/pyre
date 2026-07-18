@@ -5172,16 +5172,31 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     w_copy,
                 );
             } else {
-                let items = pyre_object::w_dict_items(resolve_dict_backing(data()));
-                let item_base = pyre_object::gc_roots::shadow_stack_len();
-                for &(k, v) in &items {
-                    pyre_object::gc_roots::pin_root(k);
-                    pyre_object::gc_roots::pin_root(v);
-                }
-                for i in 0..items.len() {
-                    let k = pyre_object::gc_roots::shadow_stack_get(item_base + i * 2);
-                    let v = pyre_object::gc_roots::shadow_stack_get(item_base + i * 2 + 1);
+                // `create_iterator_classes.rev_update1_dict_dict` keeps the
+                // source strategy's live `iteritems_with_hash` iterator while
+                // storing into the destination.  A key comparison may mutate
+                // the source; the following iterator step must then raise.
+                let iter = pyre_object::dictmultiobject::w_dict_view_iterator_new(
+                    resolve_dict_backing(data()),
+                    pyre_object::dictmultiobject::DictViewKind::Items,
+                );
+                let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(iter);
+                loop {
+                    let pair = match crate::baseobjspace::next(
+                        pyre_object::gc_roots::shadow_stack_get(iter_slot),
+                    ) {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                        Err(e) => return Err(e),
+                    };
+                    let iteration_roots = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(pyre_object::w_tuple_getitem(pair, 0).unwrap());
+                    pyre_object::gc_roots::pin_root(pyre_object::w_tuple_getitem(pair, 1).unwrap());
+                    let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
+                    let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     dict_store_checked(dict(), k, v)?;
+                    pyre_object::gc_roots::truncate_shadow_stack(iteration_roots);
                 }
             }
         } else {

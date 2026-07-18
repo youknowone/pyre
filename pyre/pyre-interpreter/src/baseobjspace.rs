@@ -11391,6 +11391,16 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     "dictionary changed size during iteration".to_string(),
                 ));
             }
+            // PyPy's strategy iterator retains its native mutation state even
+            // when a delete+insert restores the original length.  Pyre's
+            // compacting IndexMap needs the equivalent explicit stamp.
+            let start_keys_version = dv::w_dict_view_iterator_get_start_keys_version(obj);
+            if start_keys_version != dv::w_dict_keys_version(dict) {
+                return Err(PyError::new(
+                    PyErrorKind::RuntimeError,
+                    "dictionary keys changed during iteration".to_string(),
+                ));
+            }
             let index = dv::w_dict_view_iterator_get_index(obj);
             if index >= startlen {
                 return Err(PyError::stop_iteration());

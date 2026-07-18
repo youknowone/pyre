@@ -172,6 +172,7 @@ impl DictStrategy for KwargsDictStrategy {
             }
             storage.0.push(w_key);
             storage.1.push(w_value);
+            crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
             return;
         }
@@ -216,6 +217,7 @@ impl DictStrategy for KwargsDictStrategy {
         let storage = kwargs_storage_mut(w_dict);
         let w_key = storage.0.pop()?;
         let w_value = storage.1.pop()?;
+        crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
         Some((w_key, w_value))
     }
 
@@ -224,6 +226,10 @@ impl DictStrategy for KwargsDictStrategy {
     /// box and installs a fresh empty pair.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let storage = &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        if !storage.0.is_empty() {
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+        }
         drop(Box::from_raw(
             dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>),
         ));

@@ -173,7 +173,9 @@ impl DictStrategy for IdentityDictStrategy {
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
             let entries = identity_storage_mut(w_dict);
-            entries.insert(IdentityKey(w_key), w_value);
+            if entries.insert(IdentityKey(w_key), w_value).is_none() {
+                crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+            }
             crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
             return;
         }
@@ -194,7 +196,11 @@ impl DictStrategy for IdentityDictStrategy {
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if Self::is_correct_type(w_key) {
             let entries = identity_storage_mut(w_dict);
-            return entries.shift_remove(&IdentityKey(w_key)).is_some();
+            let removed = entries.shift_remove(&IdentityKey(w_key)).is_some();
+            if removed {
+                crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+            }
+            return removed;
         }
         self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
@@ -221,6 +227,9 @@ impl DictStrategy for IdentityDictStrategy {
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         let entries = identity_storage_mut(w_dict);
+        if !entries.is_empty() {
+            crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+        }
         entries.clear();
     }
 
