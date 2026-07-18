@@ -4165,7 +4165,10 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                     let (scan_instr, _) = scan_state.get(instructions[scan_pc]);
                     if matches!(
                         scan_instr,
-                        I::Call { .. } | I::CallKw { .. } | I::CallFunctionEx | I::CallIntrinsic1 { .. }
+                        I::Call { .. }
+                            | I::CallKw { .. }
+                            | I::CallFunctionEx
+                            | I::CallIntrinsic1 { .. }
                     ) {
                         found = true;
                         break;
@@ -4189,7 +4192,8 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::DeleteSubscr
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
-                    ) || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
+                    )
+                    || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
                     return false;
                 }

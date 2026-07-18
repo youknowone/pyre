@@ -10181,16 +10181,40 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            // PEEK(oparg): after popping the value, PEEK(1) is
-                            // the new TOS, so the list sits at `len - oparg`.
-                            // Clone its FlowValue without popping.
-                            let list_value = {
-                                let len = current_state.stack.len();
-                                if oparg >= 1 && oparg <= len {
-                                    current_state.stack[len - oparg].clone()
-                                } else {
-                                    fresh_ref_value(&mut graph)
-                                }
+                            // PEEK(oparg): after popping the value, the list sits
+                            // at operand-stack depth `current_depth - oparg`.
+                            // Reload it from its value-stack slot via
+                            // `getarrayitem_vable_r`, the same per-iteration
+                            // re-materialization the FOR_ITER iterator reload uses
+                            // (see above): the comprehension accumulator lives on
+                            // the operand stack, which is NOT loop-carried in
+                            // registers (`jit_merge_point` reds are `[frame, ec]`),
+                            // so the preamble `BUILD_LIST` FlowValue is not a live
+                            // register inside the resident loop. Reading it from
+                            // the vable image each iteration gives it a genuine
+                            // in-loop reader, so the full-body walk resolves the
+                            // list receiver (else the `jit_list_append` residual
+                            // reads an unbound register and aborts
+                            // `ResidualCallArgUnbound`, never reaching the #171
+                            // append fold).
+                            let list_value: super::flow::FlowValue = {
+                                let list_slot_depth = current_depth.saturating_sub(oparg as u16);
+                                let list_abs_slot =
+                                    (stack_base_absolute + list_slot_depth as usize) as i64;
+                                let v_list_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(list_abs_slot).into();
+                                let v_list = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_list_idx.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                v_list.into()
                             };
                             let _ = residual_call!(
                                 list_append_fn_idx,
