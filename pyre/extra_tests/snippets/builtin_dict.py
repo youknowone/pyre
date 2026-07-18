@@ -408,3 +408,15 @@ expected_keys = ["x", "y", "w", "z"]
 assert list(result.keys()) == expected_keys, (
     f"Expected {expected_keys}, got {list(result.keys())}"
 )
+
+
+class DictContainsError(Exception):
+    pass
+
+
+class RaisingDictKey:
+    def __hash__(self):
+        raise DictContainsError
+
+
+assert_raises(DictContainsError, {}.__contains__, RaisingDictKey())

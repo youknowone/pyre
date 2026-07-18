@@ -2670,6 +2670,7 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         unsafe {
             (*fresh).w_class = sub;
         }
+        pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
     Ok(value)
@@ -5115,7 +5116,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         };
                     }
                     Ok(pyre_object::w_bool_from(
-                        crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
+                        crate::baseobjspace::contains_slot(args[0], args[1])?,
                     ))
                 },
                 2,
@@ -7382,7 +7383,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     crate::type_methods::require_tuple_receiver(args, "__contains__", false)?;
                     crate::type_methods::arity_slot(args, 1)?;
                     Ok(pyre_object::w_bool_from(
-                        crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
+                        crate::baseobjspace::contains_slot(args[0], args[1])?,
                     ))
                 },
                 2,

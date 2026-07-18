@@ -105,3 +105,31 @@ class TupleSubclass(tuple):
 tuple_subclass = TupleSubclass((1, 2))
 assert tuple_subclass * 1 == (1, 2)
 assert type(tuple_subclass * 1) is tuple
+
+
+class TupleContainsError(Exception):
+    pass
+
+
+class RaisingTupleItem:
+    def __eq__(self, other):
+        raise TupleContainsError
+
+
+assert_raises(TupleContainsError, (RaisingTupleItem(), 1).__contains__, 1)
+
+
+import gc
+
+finalized_tuple_subclasses = []
+
+
+class FinalizedTupleSubclass(tuple):
+    def __del__(self):
+        finalized_tuple_subclasses.append(True)
+
+
+finalized_tuple = FinalizedTupleSubclass()
+del finalized_tuple
+gc.collect()
+assert finalized_tuple_subclasses == [True]
