@@ -2597,6 +2597,11 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         unsafe {
             (*value).w_class = sub;
         }
+        // objspace.py `allocate_instance`: a builtin-layout subclass still
+        // participates in the user-finalizer queue when its Python type has
+        // `__del__`. Registration must follow `w_class` tagging so the hook
+        // sees the subclass rather than the canonical list type.
+        pyre_object::gc_hook::maybe_register_finalizer(value);
     }
     Ok(value)
 }

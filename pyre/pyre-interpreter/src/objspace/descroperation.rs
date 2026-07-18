@@ -1228,6 +1228,11 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     let cap = len
         .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "list is too large"))?;
+    // CPython 3.14 `list_resize`: the element count may fit Py_ssize_t while
+    // `new_allocated * sizeof(PyObject*)` does not (gh-97616).
+    if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
     let mut items: Vec<PyObjectRef> = Vec::new();
     items
         .try_reserve_exact(cap)
@@ -1256,8 +1261,12 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     if count == 1 || len == 0 {
         return Ok(());
     }
-    len.checked_mul(count)
+    let cap = len
+        .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "list is too large"))?;
+    if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
     // Snapshot the original items so the growing list is not re-read while
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
@@ -1980,6 +1989,12 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // tupleobject.py descr_mul
         if is_tuple(a) && is_int_or_long(b) {
             let n = repeat_count(b)?;
+            // tupleobject.py: `if times == 1 and space.type(self) ==
+            // space.w_tuple: return self`. Subclasses must still be copied to
+            // a base tuple.
+            if n == 1 && is_exact_tuple(a) {
+                return Ok(a);
+            }
             let len = w_tuple_len(a);
             let cap = len
                 .checked_mul(n)

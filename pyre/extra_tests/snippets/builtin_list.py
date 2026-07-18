@@ -974,3 +974,35 @@ class StaticReprPoppingList:
 
 repr_mutating_list = [StaticReprPoppingList() for _ in range(5)]
 assert repr(repr_mutating_list) == "[obj, obj, obj]"
+
+
+import gc
+
+finalized_list_subclasses = []
+
+
+class FinalizedListSubclass(list):
+    def __del__(self):
+        finalized_list_subclasses.append(True)
+
+
+finalized = FinalizedListSubclass()
+del finalized
+gc.collect()
+assert finalized_list_subclasses == [True]
+
+
+import sys
+
+resize_overflow = [0] * 65
+del resize_overflow[1:]
+assert len(resize_overflow) == 1
+assert_raises((MemoryError, OverflowError), lambda: resize_overflow * sys.maxsize)
+
+
+def inplace_resize_overflow():
+    value = resize_overflow.copy()
+    value *= sys.maxsize
+
+
+assert_raises((MemoryError, OverflowError), inplace_resize_overflow)

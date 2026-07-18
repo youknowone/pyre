@@ -93,3 +93,15 @@ assert (float("inf"), float("inf")) <= (float("inf"), float("inf"))
 assert (float("inf"), float("inf")) >= (float("inf"), float("inf"))
 assert not (float("inf"), float("inf")) < (float("inf"), float("inf"))
 assert not (float("inf"), float("inf")) > (float("inf"), float("inf"))
+
+exact_tuple = tuple(range(3))
+assert exact_tuple * 1 is exact_tuple
+
+
+class TupleSubclass(tuple):
+    pass
+
+
+tuple_subclass = TupleSubclass((1, 2))
+assert tuple_subclass * 1 == (1, 2)
+assert type(tuple_subclass * 1) is tuple
