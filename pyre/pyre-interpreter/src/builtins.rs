@@ -5089,7 +5089,10 @@ enum ExceptionGroupCondition {
 impl ExceptionGroupCondition {
     fn matches(&self, exc: PyObjectRef) -> Result<bool, crate::PyError> {
         match *self {
-            Self::Class(classinfo) => crate::baseobjspace::isinstance(exc, classinfo),
+            // Match on the exception's type (`exception_match`), not
+            // `isinstance`, so a matcher class with a custom metaclass
+            // `__instancecheck__` cannot pull unrelated leaves into a subgroup.
+            Self::Class(classinfo) => Ok(crate::eval::check_exc_match_against(exc, classinfo)),
             Self::Callable(callable) => {
                 let result = crate::call::call_function_impl_result(callable, &[exc])?;
                 crate::baseobjspace::is_true(result)
@@ -5237,7 +5240,7 @@ pub(crate) fn exception_group_match(
     w_type: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if crate::baseobjspace::isinstance(w_exc, w_type)? {
+    if crate::eval::check_exc_match_against(w_exc, w_type) {
         if crate::baseobjspace::isinstance(w_exc, base_group)? {
             return Ok((w_exc, pyre_object::w_none()));
         }
@@ -5397,10 +5400,14 @@ pub(crate) fn exception_group_prep_reraise_star(
     if raised.len() == 1 {
         return Ok(raised[0]);
     }
-    let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
+    // Construct through BaseExceptionGroup so a merged result that carries a
+    // bare BaseException (e.g. a reraised KeyboardInterrupt alongside a freshly
+    // raised Exception) stays a BaseExceptionGroup; the constructor promotes to
+    // ExceptionGroup only when every leaf is an Exception.
+    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     let message = unsafe { pyre_object::w_str_new("") };
     let list = pyre_object::w_list_new(raised);
-    exception_group_new(&[exception_group, message, list])
+    exception_group_new(&[base_group, message, list])
 }
 
 fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

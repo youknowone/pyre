@@ -13725,7 +13725,9 @@ fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
             if same_inherited_slot(tp_init, obj_init) {
                 let name = unsafe { pyre_object::w_type_get_name(cls) };
-                return Err(crate::PyError::type_error(format!("{name}() takes no arguments")));
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() takes no arguments"
+                )));
             }
         }
         // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
