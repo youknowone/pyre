@@ -6,6 +6,11 @@
 //! shared `try` block; both must resolve for the optimized path to
 //! activate, so both are provided here as app-level classes.
 //!
+//! `collections.OrderedDict` (`_collections/app_odict.py`) imports
+//! `reversed_dict`, `move_to_end`, and `objects_in_repr` — the dict-order
+//! primitives PyPy keeps in `interp_dict.py` / `interp_magic.py`.  Pyre
+//! provides them app-level alongside `identity_dict`.
+//!
 //! `PickleBuffer` (`interp_buffer.py W_PickleBuffer`) is exposed here as
 //! an interp-level class; `pickle.py` re-exports it and the `_pickle`
 //! accelerator serializes it in-band or out-of-band under protocol 5.
@@ -23,7 +28,8 @@ crate::py_module! {
         "PickleBuffer" => interp_buffer::type_object(),
     },
     appleveldefs: {
-        "identity_dict_app.py" => ["identity_dict"],
+        "identity_dict_app.py" =>
+            ["identity_dict", "reversed_dict", "move_to_end", "objects_in_repr"],
     },
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`
