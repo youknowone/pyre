@@ -2622,6 +2622,21 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_iterator_tid);
     }
+    // `collections.deque` W_Deque — AUTO-ID typed payload allocated via
+    // `allocate_stable` (GC-managed old-gen).  Managed only means the marker
+    // *scans* it; tracing its `data` backing list still needs a registered tid
+    // + offsets.  Unregistered, its cell stays UNASSIGNED and
+    // `malloc_typed_stable` stamps tid 0 (= `object`: empty offsets, no custom
+    // trace), so the marker forwards none of its children and `data` is swept
+    // while the deque is live — use-after-free on the next `len`/index/iterate.
+    // Register at the absolute tail like the auto-id iterators above so no
+    // earlier fixed slot shifts.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_collections::W_Deque
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges
