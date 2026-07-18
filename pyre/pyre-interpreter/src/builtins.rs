@@ -9144,10 +9144,12 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             }
             pyre_object::gc_roots::pin_root(method);
             let method_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            return Ok(crate::call_function(
+            // Propagate a raised error from `__reversed__` instead of handing
+            // back a null result.
+            return call_and_check(
                 unsafe { pyre_object::gc_roots::shadow_stack_get(method_slot) },
                 &[unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) }],
-            ));
+            );
         }
     }
     // functional.py:351 — without `__reversed__`, require the sequence
