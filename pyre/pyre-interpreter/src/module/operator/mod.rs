@@ -89,6 +89,26 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_bool_from(result == 0))
 }
 
+/// `interp_operator.py:20 concat` — `a + b` for two subscriptable
+/// sequences.  Either operand missing `__getitem__` raises a bare
+/// `TypeError` with no message (`OperationError(space.w_TypeError,
+/// space.w_None)`); otherwise the result is `space.add(a, b)`.
+fn op_concat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "concat expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    if unsafe {
+        crate::baseobjspace::lookup(args[0], "__getitem__").is_none()
+            || crate::baseobjspace::lookup(args[1], "__getitem__").is_none()
+    } {
+        return Err(crate::PyError::type_error(String::new()));
+    }
+    add(args[0], args[1])
+}
+
 /// `interp_operator.py:204 iconcat` — `a += b` for two subscriptable
 /// sequences; either operand missing `__getitem__` is a TypeError that
 /// names the left operand.
@@ -127,14 +147,15 @@ crate::py_module! {
     "operator",
     // `countOf` + the `itemgetter`/`attrgetter`/`methodcaller` callable
     // classes are app-level (`pypy/module/operator/app_operator.py`,
-    // `moduledef.py` `app_names`), not interp-level.  `concat`/`indexOf`/
-    // `inv`/`is_none`/`is_not_none`/`call` follow the `operator.py` pure-
-    // Python definitions verbatim (`call`'s `**kwargs` forwarding and
-    // `concat`'s `__getitem__` guard are awkward to express interp-level).
+    // `moduledef.py` `app_names`), not interp-level.  `indexOf`/`inv`/
+    // `is_none`/`is_not_none`/`call` follow the `operator.py` pure-Python
+    // definitions verbatim (`call`'s `**kwargs` forwarding is awkward to
+    // express interp-level).  `concat` is interp-level (`op_concat`,
+    // `interp_operator.py:20`) so it guards both operands for `__getitem__`.
     appleveldefs: {
         "app_operator.py" => [
             "countOf", "itemgetter", "attrgetter", "methodcaller",
-            "concat", "indexOf", "inv", "is_none", "is_not_none", "call",
+            "indexOf", "inv", "is_none", "is_not_none", "call",
         ],
     },
     functions: {
@@ -170,6 +191,7 @@ crate::py_module! {
         "iand"      / 2 = |args| op_binary(args, "iand", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAnd)),
         "ior"       / 2 = |args| op_binary(args, "ior", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceOr)),
         "ixor"      / 2 = |args| op_binary(args, "ixor", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceXor)),
+        "concat"    / 2 = op_concat,
         "iconcat"   / 2 = op_iconcat,
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
         // interp_operator.py:138

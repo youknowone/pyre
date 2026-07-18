@@ -5627,10 +5627,25 @@ fn dict_view_descr_new(
     static_tp: &'static pyre_object::PyType,
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error(format!(
-            "{name}() missing required argument: the source dict"
-        )));
+    // `interp2app(new_dict_*)` binds exactly `(w_type, w_dict)`; the arity
+    // is enforced before the body runs.
+    match args.len() {
+        0 => {
+            return Err(crate::PyError::type_error(format!(
+                "{name}.__new__() missing 2 required positional arguments: 'type' and 'dict'"
+            )));
+        }
+        1 => {
+            return Err(crate::PyError::type_error(format!(
+                "{name}.__new__() missing 1 required positional argument: 'dict'"
+            )));
+        }
+        2 => {}
+        n => {
+            return Err(crate::PyError::type_error(format!(
+                "{name}.__new__() takes 2 positional arguments but {n} were given"
+            )));
+        }
     }
     let cls = args[0];
     // `interp_w(W_DictMultiObject, w_dict)` — accept a dict or any dict
@@ -5638,17 +5653,21 @@ fn dict_view_descr_new(
     let dict_type = gettypeobject(&pyre_object::pyobject::DICT_TYPE);
     if !unsafe { crate::baseobjspace::isinstance_w(args[1], dict_type) } {
         return Err(crate::PyError::type_error(format!(
-            "{name}() argument must be a dict"
+            "'dict' object expected, got '{}' instead",
+            crate::baseobjspace::object_functionstr_type_name(args[1])
         )));
     }
+    // `allocate_instance(W_DictView*Object, w_type)` validates the target:
+    // a non-type, a non-subtype, or a foreign-layout subtype is rejected
+    // before the view is allocated.
+    let static_obj = gettypeobject(static_tp);
+    check_user_subclass(static_obj, cls)?;
     // A dict subclass keeps its entries in a native backing dict; the view
     // binds to that, exactly as `dict.keys()`/`values()`/`items()` do.
     let w_dict = crate::type_methods::resolve_dict_backing(args[1]);
     let view = pyre_object::dictmultiobject::w_dict_view_new(w_dict, kind);
-    // Re-point the Python-visible class to a subtype when one was passed
-    // (mirrors the `__new__` subtype fix-up applied to native builtins).
-    let static_obj = gettypeobject(static_tp);
-    if cls != static_obj && unsafe { pyre_object::is_type(cls) } {
+    // Re-point the Python-visible class to the validated subtype.
+    if !std::ptr::eq(cls, static_obj) {
         unsafe { (*view).w_class = cls };
     }
     Ok(view)
