@@ -6755,7 +6755,12 @@ pub fn builtin_set_add_items(
         let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
         for i in 0..item_len {
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-            let hash = try_hash_value(item)?;
+            let hash = try_hash_value(item).map_err(|err| {
+                crate::baseobjspace::wrap_set_element_hash_error(
+                    pyre_object::gc_roots::shadow_stack_get(item_base + i),
+                    err,
+                )
+            })?;
             let set = pyre_object::gc_roots::shadow_stack_get(sp);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             pyre_object::w_set_add_hashed_checked(set, item, hash)
@@ -8019,6 +8024,18 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             None
         };
         if let Some(name) = kind {
+            // The concrete builtin advertises `__hash__ = None`, but a user
+            // subclass may replace that slot.  PyPy's normal special-method
+            // lookup reaches the subclass entry before the inherited typedef
+            // value (Bug #1257731 in CPython's set tests), so only reject the
+            // object after giving a non-None override the call.
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+                    if !pyre_object::is_none(method) {
+                        return hash_call_normalize(method, obj);
+                    }
+                }
+            }
             return Err(crate::PyError::type_error(&format!(
                 "unhashable type: '{}'",
                 name

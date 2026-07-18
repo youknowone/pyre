@@ -4982,7 +4982,13 @@ unsafe fn set_lookup_checked(
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(item);
-    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))?;
+    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
+        .map_err(|err| {
+            crate::baseobjspace::wrap_set_element_hash_error(
+                pyre_object::gc_roots::shadow_stack_get(sp),
+                err,
+            )
+        })?;
     let key = pyre_object::dictmultiobject::object_key_hashed(
         pyre_object::gc_roots::shadow_stack_get(sp),
         hash,

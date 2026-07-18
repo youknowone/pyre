@@ -121,6 +121,31 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
     ))
 }
 
+/// Python 3.14 `set_unhashable_type` parity. Set element operations replace
+/// an exact `TypeError` raised by hashing with their container-specific
+/// context, while a `TypeError` subclass and every other exception propagate
+/// unchanged.
+pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
+    if err.kind != PyErrorKind::TypeError {
+        return err;
+    }
+    let exact_type_error = err.exc_object.is_null()
+        || unsafe {
+            pyre_object::is_exact_type(
+                err.exc_object,
+                &pyre_object::interp_exceptions::EXC_TYPE_ERROR_TYPE,
+            )
+        };
+    if !exact_type_error {
+        return err;
+    }
+    PyError::type_error(format!(
+        "cannot use '{}' as a set element ({})",
+        object_functionstr_type_name(item),
+        err.message,
+    ))
+}
+
 /// Compatibility alias for PyPy's base-object type.
 /// PyPy frequently models interpreter values as subclasses of `W_Root`.
 pub type W_Root = PyObjectRef;
@@ -13128,10 +13153,10 @@ pub fn hash_w(obj: PyObjectRef) -> i64 {
 /// silently returning a sentinel hash.  Shares the single dispatch with
 /// the `hash()` entry point (`builtins::builtin_hash`): `try_hash_value`
 /// covers the unhashable ladder (dict / list / set / bytearray / dict
-/// view / slice per `dictmultiobject.py:1431` + `listobject.py` +
-/// `setobject.py`), memoryview, tuple / frozenset / GenericAlias /
-/// UnionType, and user-class + typed-payload `__hash__` overrides (e.g.
-/// `class D(deque): __hash__ = ...`) before the `hash_value` fallback.
+/// view), Python 3.14's hashable slice, memoryview, tuple / frozenset /
+/// GenericAlias / UnionType, and user-class + typed-payload `__hash__`
+/// overrides (e.g. `class D(deque): __hash__ = ...`) before the
+/// `hash_value` fallback.
 /// Callers that must surface the `TypeError` directly (EmptyDictStrategy
 /// `getitem` / ObjectDictStrategy lookups per `dictmultiobject.py:738-743`)
 /// reuse it here rather than duplicating a subset of the ladder that would
@@ -13140,37 +13165,11 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("hash() argument is null"));
     }
-    unsafe {
-        let kind = if pyre_object::is_dict(obj) {
-            Some("dict")
-        } else if pyre_object::is_list(obj) {
-            Some("list")
-        } else if pyre_object::is_set(obj) {
-            Some("set")
-        } else if pyre_object::is_bytearray(obj) {
-            Some("bytearray")
-        } else if pyre_object::dictmultiobject::is_dict_view_keys(obj) {
-            // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
-            // views are set-like: they define `__eq__` and so are unhashable.
-            // The values view keeps `object.__hash__`.
-            Some("dict_keys")
-        } else if pyre_object::dictmultiobject::is_dict_view_items(obj) {
-            Some("dict_items")
-        } else if pyre_object::sliceobject::is_slice(obj) {
-            Some("slice")
-        } else {
-            None
-        };
-        if let Some(name) = kind {
-            return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
-        }
-        // A released or writable memoryview is unhashable; route through the
-        // fallible hasher so it raises the proper ValueError instead of an
-        // infallible identity hash (`memoryobject.py descr_hash`).
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            return crate::builtins::try_hash_value(obj);
-        }
-    }
+    // Keep a single special-method dispatch.  `try_hash_value` distinguishes
+    // exact unhashable builtin containers from subclasses that override
+    // `__hash__`, and also carries Python 3.14's hashable-slice semantics plus
+    // memoryview's released/writable errors.  Pre-rejecting by payload layout
+    // here would bypass all three observable cases.
     crate::builtins::try_hash_value(obj)
 }
 

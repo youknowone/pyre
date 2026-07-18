@@ -20478,7 +20478,12 @@ fn init_set_type(ns: PyObjectRef) {
                         let sp = pyre_object::gc_roots::shadow_stack_len();
                         pyre_object::gc_roots::pin_root(args[0]);
                         pyre_object::gc_roots::pin_root(args[1]);
-                        let hash = crate::builtins::try_hash_value(args[1])?;
+                        let hash = crate::builtins::try_hash_value(args[1]).map_err(|err| {
+                            crate::baseobjspace::wrap_set_element_hash_error(
+                                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                                err,
+                            )
+                        })?;
                         let set = pyre_object::gc_roots::shadow_stack_get(sp);
                         let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                         pyre_object::w_set_add_hashed_checked(set, item, hash)
