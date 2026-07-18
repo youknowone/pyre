@@ -4443,6 +4443,14 @@ fn emit_resolve(
             .inline_const_bits()
             .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
         sink.i64_const(val);
+    } else if opref.is_none() {
+        // A `NONE` fail-arg is a dead deopt slot: the optimizer numbered no
+        // value for it, so the blackhole never reads it back (its resume data
+        // carries the live values). Spill a zero placeholder — matching the
+        // native backends, whose deadframe slot for an unmapped fail-arg is
+        // never consumed. Resolving it as a local would index `value_types`
+        // out of bounds (`raw() == u32::MAX`).
+        sink.i64_const(0);
     } else {
         sink.local_get(1 + opref.raw());
         if value_types[opref.raw() as usize] == ValType::F64 {

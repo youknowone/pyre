@@ -1044,6 +1044,36 @@ impl WasmBackend {
 
 unsafe impl Send for WasmBackend {}
 
+/// Stamp a position onto every non-Void-result op left unpositioned by the
+/// optimizer, so no operand resolves to `OpRef::NONE` during codegen.
+///
+/// The optimizer's force path emits materialized allocation/store ops (e.g. a
+/// virtualized list's `NewArray` backing block and its `SetfieldGc` /
+/// `SetarrayitemGc` stores) with `Op::new`, and only assigns a position to ops
+/// whose `result_type() != Void` — a Void-result store keeps `pos == NONE`.
+/// A later op that consumes such a producer's result reads its `pos` through
+/// `Operand::Op`, and an unpositioned producer yields `OpRef::NONE`
+/// (`raw() == u32::MAX`), which `emit_resolve` would use to index `value_types`
+/// out of bounds. The native backends normalize positions before codegen
+/// (dynasm `prepare_ops_for_compile`, cranelift `normalize_ops_for_codegen_simple`);
+/// the wasm backend does the same here.
+fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[OpRc]) -> Vec<Op> {
+    let num_inputs = inputargs.len() as u32;
+    ops.iter()
+        .enumerate()
+        .map(|(op_idx, op)| {
+            let normalized = (**op).clone();
+            let rt = normalized.result_type();
+            if rt != majit_ir::Type::Void && normalized.pos.get().is_none() {
+                normalized
+                    .pos
+                    .set(majit_ir::OpRef::op_typed(num_inputs + op_idx as u32, rt));
+            }
+            normalized
+        })
+        .collect()
+}
+
 /// Report why a trace cannot be compiled by the wasm backend, or `None` if it
 /// can. Declined traces fall back to the interpreter (correct, unaccelerated)
 /// instead of producing an invalid trace module. `is_loop` is true for
@@ -1493,7 +1523,7 @@ impl majit_backend::Backend for WasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
-        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         let ops: &[Op] = &ops_owned;
         // Freeze this token's generated frame layout before CA resolution.  A
         // self-recursive CALL_ASSEMBLER reaches this point while its token is
@@ -1871,7 +1901,7 @@ impl majit_backend::Backend for WasmBackend {
         // `build_function` reads its inputs (`inputargs[k].index == k`), so no
         // argument-recovery layout is needed — hence `caller_recovery_layout`
         // and `previous_tokens` are unused.
-        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         let ops: &[Op] = &ops_owned;
         diag_bump(0); // compile_bridge entered
 
