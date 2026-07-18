@@ -174,6 +174,12 @@ unsafe impl Sync for PyreClassDescriptor {}
 /// is not guaranteed on every backend (notably wasm), and an oracle
 /// degrades gracefully under under-population (it can only under-check,
 /// never false-alarm) whereas a driver could not.
+///
+/// Compiled native-only: `linkme::distributed_slice` rejects `wasm32`
+/// ("distributed_slice is not implemented for this platform"), and the
+/// sole consumer — `build_gc`'s oracle — is itself `wasm32`-gated, so the
+/// registry is dead weight there anyway.
+#[cfg(not(target_arch = "wasm32"))]
 #[::linkme::distributed_slice]
 pub static PYRE_CLASS_DESCRIPTORS: [&'static PyreClassDescriptor] = [..];
 

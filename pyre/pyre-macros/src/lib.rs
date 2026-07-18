@@ -1150,7 +1150,9 @@ fn expand_pyre_class(
         /// Link-time registration of this class's descriptor into the
         /// whole-program `PYRE_CLASS_DESCRIPTORS` slice, so the JIT
         /// driver's GC-root completeness oracle can see every
-        /// `#[pyre_class]` type without a hand-maintained list.
+        /// `#[pyre_class]` type without a hand-maintained list.  Native
+        /// only, matching the slice: `distributed_slice` rejects `wasm32`.
+        #[cfg(not(target_arch = "wasm32"))]
         #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_CLASS_DESCRIPTORS)]
         static #descriptor_slice_elem: &'static ::pyre_object::lltype::PyreClassDescriptor =
             &#descriptor_static;
