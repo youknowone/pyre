@@ -6015,12 +6015,26 @@ pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     };
     // baseobjspace.py:324 `w_result = space.get_and_call_function(w_impl, self)`
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
-    // baseobjspace.py:326-337 validate that w_result is a W_AbstractIntObject.
-    if unsafe { pyre_object::pyobject::is_int_or_long(w_result) } {
+    // baseobjspace.py:326-327 — an exact int returns directly.
+    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE);
+    if crate::typedef::r#type(w_result) == w_int {
+        return Ok(w_result);
+    }
+    // baseobjspace.py:328-336 — a strict int subclass is accepted for now,
+    // with the deprecation warning consumed by CPython's int tests.
+    if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
+    {
+        let tp = crate::type_methods::arg_type_name(w_result);
+        crate::warn::warn_deprecation(&format!(
+            "__int__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
+        ));
         return Ok(w_result);
     }
     // baseobjspace.py:338-339 non-int result → TypeError.
-    Err(PyError::type_error("__int__ returned non-int"))
+    Err(PyError::type_error(format!(
+        "__int__ returned non-int (type {})",
+        object_functionstr_type_name(w_result),
+    )))
 }
 
 /// baseobjspace.py:1811-1824 `ObjSpace.int_w(w_obj,
@@ -9407,8 +9421,33 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         )));
     };
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
-    if unsafe { pyre_object::pyobject::is_int_or_long(w_result) } {
+    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE);
+    if crate::typedef::r#type(w_result) == w_int {
         return Ok(w_result);
+    }
+    if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
+    {
+        let tp = crate::type_methods::arg_type_name(w_result);
+        crate::warn::warn_deprecation(&format!(
+            "__index__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
+        ));
+        // descroperation.py:622-627 `space.index` — return a base int,
+        // never the strict subclass supplied by `__index__`.
+        unsafe {
+            if pyre_object::is_bool(w_result) {
+                return Ok(pyre_object::w_int_new(
+                    pyre_object::w_bool_get_value(w_result) as i64,
+                ));
+            }
+            if pyre_object::is_int(w_result) {
+                return Ok(pyre_object::w_int_new(pyre_object::w_int_get_value(
+                    w_result,
+                )));
+            }
+            return Ok(pyre_object::w_long_new(
+                pyre_object::w_long_get_value(w_result).clone(),
+            ));
+        }
     }
     Err(PyError::type_error(format!(
         "__index__ returned non-int (type {})",

@@ -118,6 +118,9 @@ assert int("0o100", base=0) == 64
 assert int("0O100", base=0) == 64
 assert int("0xFF", base=0) == 255
 assert int("0XFF", base=0) == 255
+assert int("000", base=0) == 0
+with assert_raises(ValueError):
+    int("010", base=0)
 with assert_raises(ValueError):
     int("0xFF", base=10)
 with assert_raises(ValueError):
@@ -252,6 +255,31 @@ with assert_raises(TypeError):
 
 with assert_raises(TypeError):
     int(1, base=2)
+
+with assert_raises(TypeError):
+    int("10", 2, 1)
+
+with assert_raises(TypeError):
+    int(type("OnlyTrunc", (), {"__trunc__": lambda self: 42})())
+
+for method_name in ("__int__", "__index__"):
+    returned_subclass = type(
+        "ReturnedIntSubclass",
+        (),
+        {method_name: lambda self: True},
+    )()
+    with __import__("warnings").catch_warnings(record=True) as caught:
+        __import__("warnings").simplefilter("always")
+        result = int(returned_subclass)
+    assert result == 1 and type(result) is int
+    assert len(caught) == 1 and caught[0].category is DeprecationWarning
+
+try:
+    int("  123 456  ")
+except ValueError as exc:
+    assert str(exc) == "invalid literal for int() with base 10: '  123 456  '"
+else:
+    raise AssertionError("invalid integer literal was accepted")
 
 with assert_raises(TypeError):
     # check that first parameter is truly positional only

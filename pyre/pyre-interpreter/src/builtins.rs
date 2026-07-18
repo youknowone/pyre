@@ -5958,6 +5958,16 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // only one accepted), `base` is positional-or-keyword at position 2
     // (intobject.py descr_new).
     let (pos, kwargs) = split_builtin_kwargs(args);
+    // `descr_new(space, w_inttype, w_x, __posonly__, w_base=None)` has two
+    // user-visible slots.  PyPy's gateway rejects surplus positionals while
+    // binding that signature, before `_new_int` runs; pyre's flat builtin
+    // ABI must perform the same gateway check explicitly.
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "int expected at most 2 arguments, got {}",
+            pos.len()
+        )));
+    }
     kwarg_reject_unknown(kwargs, &["base"], "int")?;
     let w_base = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "base", "int", 2)?;
     let obj = match pos.first().copied() {
@@ -5979,63 +5989,32 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             return Ok(obj);
         }
         // intobject.py:994: space.lookup(w_value, '__int__')
-        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__int__") } {
+        if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
             // intobject.py:995: w_intvalue = space.int(w_value)
-            let w_intvalue = call_and_check(method, &[obj])?;
+            let w_intvalue = crate::baseobjspace::space_int(obj)?;
             return ensure_baseint_result(w_intvalue, obj);
         }
-        // intobject.py:997: space.lookup(w_value, '__trunc__')
-        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__trunc__") } {
-            // intobject.py:998-999: DeprecationWarning
-            crate::warn::warn_deprecation("The delegation of int() to __trunc__ is deprecated.");
-            // intobject.py:1001: w_obj = space.trunc(w_value)
-            let w_obj = call_and_check(method, &[obj])?;
-            // intobject.py:1002: if not space.isinstance_w(w_obj, space.w_int)
-            if !unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
-                // intobject.py:1003-1004: try: w_obj = space.index(w_obj)
-                if let Some(idx_method) = unsafe { crate::baseobjspace::lookup(w_obj, "__index__") }
-                {
-                    let w_indexed = call_and_check(idx_method, &[w_obj])?;
-                    return ensure_baseint_result(w_indexed, obj);
-                }
-                // intobject.py:1008-1011
-                return Err(crate::PyError::type_error(
-                    "__trunc__ returned non-Integral (type '%T')",
-                ));
-            }
-            return ensure_baseint_result(w_obj, obj);
-        }
+        // Python 3.14 difference: the deprecated `__trunc__` delegation in
+        // this PyPy source was removed from `int()` after Python 3.11.  Our
+        // language target is 3.14, so proceed directly to `__index__`.
         // intobject.py:1015: space.lookup(w_value, '__index__')
-        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__index__") } {
+        if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
             // intobject.py:1016: w_obj = space.index(w_value)
-            let w_obj = call_and_check(method, &[obj])?;
-            // intobject.py:1017: if not space.is_w(space.type(w_obj), space.w_int)
-            let w_obj_type = crate::typedef::r#type(w_obj);
-            if w_obj_type != w_int {
-                // intobject.py:1018: if space.isinstance_w(w_obj, space.w_int)
-                if unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
-                    // intobject.py:1019: w_obj = space.int(w_obj)
-                    return ensure_baseint_result(w_obj, obj);
-                }
-                // intobject.py:1020-1023
-                return Err(crate::PyError::type_error(format!(
-                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                    crate::type_methods::arg_type_name(obj)
-                )));
-            }
+            let w_obj = crate::baseobjspace::space_index(obj)?;
             return ensure_baseint_result(w_obj, obj);
         }
         // intobject.py:1047 — unicode is normalized through
         // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
         if unsafe { is_str(obj) } {
-            return parse_int_from_str(&unicode_to_decimal_w(obj)?, 10);
+            let normalized = unicode_to_decimal_w(obj).map_err(|_| invalid_int_literal(obj, 10))?;
+            return parse_int_from_str(obj, &normalized, 10);
         }
         // intobject.py:1056-1070 — bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
         if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
             let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
             let s = String::from_utf8_lossy(data);
-            return parse_int_from_str(&s, 10);
+            return parse_int_from_str(obj, &s, 10);
         }
         return Err(crate::PyError::type_error(format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
@@ -6048,13 +6027,15 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         // intobject.py:1079 — unicode normalized through `unicode_to_decimal_w`.
         if is_str(obj) {
-            return parse_int_from_str(&unicode_to_decimal_w(obj)?, base);
+            let normalized =
+                unicode_to_decimal_w(obj).map_err(|_| invalid_int_literal(obj, base))?;
+            return parse_int_from_str(obj, &normalized, base);
         }
         // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
             let s = String::from_utf8_lossy(data);
-            return parse_int_from_str(&s, base);
+            return parse_int_from_str(obj, &s, base);
         }
     }
     Err(crate::PyError::type_error(
@@ -6206,8 +6187,23 @@ fn unicode_to_decimal_w(
     Ok(std::borrow::Cow::Owned(out))
 }
 
+/// `wrap_parsestringerror(space, e, w_source)` — report the original Python
+/// source object, not the whitespace-trimmed or Unicode-normalized buffer the
+/// number parser consumes internally.
+fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
+    let source_repr = unsafe { crate::display::py_repr(w_source) }
+        .unwrap_or_else(|_| "<unprintable>".to_string());
+    crate::PyError::value_error(format!(
+        "invalid literal for int() with base {base}: {source_repr}"
+    ))
+}
+
 /// Parse an integer from a string with the given base.
-fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError> {
+fn parse_int_from_str(
+    w_source: PyObjectRef,
+    s: &str,
+    base: u32,
+) -> Result<PyObjectRef, crate::PyError> {
     let s = s.trim();
     let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
         (-1i64, r)
@@ -6216,15 +6212,21 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     } else {
         (1i64, s)
     };
-    let (radix, digits, had_base_prefix) = if base == 0 {
+    let (radix, digits, had_base_prefix, implicit_zero_only) = if base == 0 {
         if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-            (16u32, r, true)
+            (16u32, r, true, false)
         } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-            (2u32, r, true)
+            (2u32, r, true, false)
         } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-            (8u32, r, true)
+            (8u32, r, true, false)
+        } else if rest.starts_with('0') {
+            // `NumberStringParser(..., no_implicit_octal=True)`: base 0
+            // plus an unprefixed leading zero selects pseudo-base 1, which
+            // makes only digit zero valid. Keep radix 10 for BigInt parsing
+            // after enforcing that digit rule below.
+            (10u32, rest, false, true)
         } else {
-            (10u32, rest, false)
+            (10u32, rest, false, false)
         }
     } else {
         let (stripped, had_base_prefix) = match base {
@@ -6242,9 +6244,15 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
             },
             _ => (rest, false),
         };
-        (base, stripped, had_base_prefix)
+        (base, stripped, had_base_prefix, false)
     };
-    let is_digit = |c: char| c.to_digit(radix).is_some();
+    let is_digit = |c: char| {
+        if implicit_zero_only {
+            c == '0'
+        } else {
+            c.to_digit(radix).is_some()
+        }
+    };
     let digit_chars: Vec<char> = digits.chars().collect();
     let mut cleaned = String::with_capacity(digits.len());
     for (i, &c) in digit_chars.iter().enumerate() {
@@ -6255,10 +6263,10 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
             if next_is_digit && (prev_is_digit || after_prefix) {
                 continue;
             }
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!("invalid literal for int() with base {base}: '{s}'"),
-            ));
+            return Err(invalid_int_literal(w_source, base));
+        }
+        if implicit_zero_only && c != '0' {
+            return Err(invalid_int_literal(w_source, base));
         }
         cleaned.push(c);
     }
@@ -6285,10 +6293,7 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
         let signed = if sign < 0 { -big } else { big };
         return Ok(w_long_new(signed));
     }
-    Err(crate::PyError::new(
-        crate::PyErrorKind::ValueError,
-        format!("invalid literal for int() with base {base}: '{s}'"),
-    ))
+    Err(invalid_int_literal(w_source, base))
 }
 
 /// Remove PEP 515 underscore digit separators, rejecting any underscore
