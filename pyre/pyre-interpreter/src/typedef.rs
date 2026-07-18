@@ -2526,27 +2526,28 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         "object of this type has no bool()",
                     ));
                 }
-                let result = crate::call_function(method, &[w_obj]);
-                if !result.is_null() {
-                    if !pyre_object::is_bool(result) {
-                        // A tagged immediate is always an exact `int`; name it
-                        // without derefing its (non-pointer) tagged bits as
-                        // `ob_type`. Mirrors the tag short-circuit in
-                        // `builtin_str`. Gated on `CAN_BE_TAGGED`.
-                        let tp_name: &str = if pyre_object::tagged_int::CAN_BE_TAGGED
-                            && pyre_object::tagged_int::is_tagged_int(result)
-                        {
-                            "int"
-                        } else {
-                            (*(*result).ob_type).name
-                        };
-                        return Err(crate::PyError::type_error(format!(
-                            "__bool__ should return bool, returned {}",
-                            tp_name,
-                        )));
-                    }
-                    return Ok(result);
+                // Propagate a raised `__bool__` instead of dropping its
+                // stashed error and falling through to `is_true`, which would
+                // dispatch a second time and leave the first copy pending.
+                let result = crate::builtins::call_and_check(method, &[w_obj])?;
+                if !pyre_object::is_bool(result) {
+                    // A tagged immediate is always an exact `int`; name it
+                    // without derefing its (non-pointer) tagged bits as
+                    // `ob_type`. Mirrors the tag short-circuit in
+                    // `builtin_str`. Gated on `CAN_BE_TAGGED`.
+                    let tp_name: &str = if pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(result)
+                    {
+                        "int"
+                    } else {
+                        (*(*result).ob_type).name
+                    };
+                    return Err(crate::PyError::type_error(format!(
+                        "__bool__ should return bool, returned {}",
+                        tp_name,
+                    )));
                 }
+                return Ok(result);
             }
             if let Some(len_m) = crate::baseobjspace::lookup_in_type(w_type, "__len__") {
                 if pyre_object::is_none(len_m) {
@@ -2554,9 +2555,10 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         "object of this type has no len()",
                     ));
                 }
-                // __len__ returning negative → ValueError
-                let len_result = crate::call_function(len_m, &[w_obj]);
-                if !len_result.is_null() && pyre_object::is_int(len_result) {
+                // __len__ returning negative → ValueError. Propagate a raised
+                // `__len__` rather than dropping its stashed error.
+                let len_result = crate::builtins::call_and_check(len_m, &[w_obj])?;
+                if pyre_object::is_int(len_result) {
                     let v = pyre_object::w_int_get_value(len_result);
                     if v < 0 {
                         return Err(crate::PyError::new(
