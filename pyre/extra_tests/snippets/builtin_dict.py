@@ -460,3 +460,34 @@ iterator_value_dict = {0: 0}
 iterator_value_iter = iter(iterator_value_dict)
 iterator_value_dict[0] = 1
 assert next(iterator_value_iter) == 0
+
+
+# CPython 3.14 Objects/dictobject.c `dict_unhashable_type`: dict operations
+# add the key type to an exact TypeError raised by hashing.
+unhashable_key_message = "cannot use 'list' as a dict key (unhashable type: 'list')"
+unhashable_dict = {"present": 1}
+for operation in (
+    lambda: [] in unhashable_dict,
+    lambda: unhashable_dict[[]],
+    lambda: unhashable_dict.__setitem__([], 1),
+    lambda: unhashable_dict.setdefault([], 1),
+    lambda: unhashable_dict.pop([]),
+    lambda: unhashable_dict.get([]),
+):
+    with assert_raises(TypeError) as cm:
+        operation()
+    assert str(cm.exception) == unhashable_key_message
+
+
+class DictHashTypeErrorSubclass(TypeError):
+    pass
+
+
+class DictKeyWithTypeErrorSubclass:
+    def __hash__(self):
+        raise DictHashTypeErrorSubclass("keep me")
+
+
+with assert_raises(DictHashTypeErrorSubclass) as cm:
+    unhashable_dict.get(DictKeyWithTypeErrorSubclass())
+assert str(cm.exception) == "keep me"

@@ -3240,7 +3240,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             if equal {
                 for (k, v) in pyre_object::w_dict_items(a) {
                     match pyre_object::dictmultiobject::w_dict_lookup_checked(b, k)
-                        .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?
                     {
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,

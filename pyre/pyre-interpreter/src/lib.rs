@@ -111,7 +111,7 @@ pub mod test_hooks {
         match crate::builtins::try_hash_value(obj) {
             Ok(h) => h,
             Err(e) => {
-                crate::baseobjspace::set_pending_hash_error(e);
+                crate::baseobjspace::set_pending_dict_hash_error(e);
                 pyre_object::dict_eq_hook::signal_hash_error(obj);
                 0
             }

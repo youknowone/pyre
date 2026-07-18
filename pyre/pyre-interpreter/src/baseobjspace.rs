@@ -36,16 +36,28 @@ pub use crate::objspace::descroperation::*;
 // `DictKeyError` to recover whichever exception was raised.
 thread_local! {
     static PENDING_HASH_ERROR: Cell<Option<PyError>> = const { Cell::new(None) };
+    static PENDING_ERROR_FROM_HASH: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Store an error raised by the equality half of the dict `r_dict` callback
+/// pair.  The historical name is retained for existing callers; hash
+/// callbacks use [`set_pending_dict_hash_error`] so Python 3.14's hash-only
+/// dict-key error remapping does not rewrite equality errors.
 pub fn set_pending_hash_error(e: PyError) {
     PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
+}
+
+pub fn set_pending_dict_hash_error(e: PyError) {
+    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(true));
 }
 
 /// `dont_look_inside`: the `PENDING_HASH_ERROR` thread-local `.with`
 /// read has no extractable graph; the call stays a residual.
 #[majit_macros::dont_look_inside]
 pub fn take_pending_hash_error() -> PyError {
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
     PENDING_HASH_ERROR.with(|cell| {
         cell.take()
             .unwrap_or_else(|| PyError::type_error("unhashable type"))
@@ -67,6 +79,46 @@ pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             err.walk_gc_refs(visitor);
         }
     });
+}
+
+/// CPython 3.14 `dict_unhashable_type` (`Objects/dictobject.c`) parity.
+/// Only an exact `TypeError` raised while hashing is replaced; equality
+/// callback errors, non-TypeError exceptions, and TypeError subclasses pass
+/// through unchanged.
+#[majit_macros::dont_look_inside]
+pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
+    let from_hash = PENDING_ERROR_FROM_HASH.with(|cell| cell.replace(false));
+    let err = PENDING_HASH_ERROR.with(|cell| {
+        cell.take()
+            .unwrap_or_else(|| PyError::type_error("unhashable type"))
+    });
+    if !from_hash {
+        return err;
+    }
+    wrap_dict_key_hash_error(key, err)
+}
+
+/// The direct-hash counterpart of [`take_pending_dict_key_error`], used by
+/// bytecode paths which compute the key hash before entering `r_dict`.
+pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
+    if err.kind != PyErrorKind::TypeError {
+        return err;
+    }
+    let exact_type_error = err.exc_object.is_null()
+        || unsafe {
+            pyre_object::is_exact_type(
+                err.exc_object,
+                &pyre_object::interp_exceptions::EXC_TYPE_ERROR_TYPE,
+            )
+        };
+    if !exact_type_error {
+        return err;
+    }
+    PyError::type_error(format!(
+        "cannot use '{}' as a dict key ({})",
+        object_functionstr_type_name(key),
+        err.message,
+    ))
 }
 
 /// Compatibility alias for PyPy's base-object type.
@@ -1191,7 +1243,7 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                     // __missing__ dispatch before KeyError
                     dict_missing_or_key_error(obj, index)
                 }
-                Err(_) => Err(take_pending_hash_error()),
+                Err(_) => Err(take_pending_dict_key_error(index)),
             };
         }
         if is_str(obj) {
@@ -2834,7 +2886,7 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         if is_dict(obj) {
             return match pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) {
                 Ok(()) => Ok(w_none()),
-                Err(_) => Err(take_pending_hash_error()),
+                Err(_) => Err(take_pending_dict_key_error(index)),
             };
         }
         if pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -12867,7 +12919,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, needle)
                     } {
                         Ok(v) => Ok(v.is_some()),
-                        Err(_) => Err(take_pending_hash_error()),
+                        Err(_) => Err(take_pending_dict_key_error(needle)),
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Items => {
@@ -12887,7 +12939,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     } {
                         Ok(Some(have)) => eq_w(have, want),
                         Ok(None) => Ok(false),
-                        Err(_) => Err(take_pending_hash_error()),
+                        Err(_) => Err(take_pending_dict_key_error(k)),
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Values => {
@@ -13002,7 +13054,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         if is_dict(haystack) {
             return match pyre_object::dictmultiobject::w_dict_lookup_checked(haystack, needle) {
                 Ok(v) => Ok(v.is_some()),
-                Err(_) => Err(take_pending_hash_error()),
+                Err(_) => Err(take_pending_dict_key_error(needle)),
             };
         }
         // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
@@ -13375,7 +13427,7 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
             Ok(true) => Ok(()),
             Ok(false) => Err(PyError::key_error_with_key(key)),
-            Err(_) => Err(take_pending_hash_error()),
+            Err(_) => Err(take_pending_dict_key_error(key)),
         }
     }
 }

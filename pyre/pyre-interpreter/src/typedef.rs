@@ -5085,7 +5085,9 @@ fn init_dict_type(ns: PyObjectRef) {
                                             args[0], args[1],
                                         ),
                                         Err(_) => {
-                                            Err(crate::baseobjspace::take_pending_hash_error())
+                                            Err(crate::baseobjspace::take_pending_dict_key_error(
+                                                args[1],
+                                            ))
                                         }
                                     };
                                 }
@@ -5112,7 +5114,9 @@ fn init_dict_type(ns: PyObjectRef) {
                             pyre_object::dictmultiobject::w_dict_lookup_checked(dict, args[1])
                         } {
                             Ok(v) => Ok(pyre_object::w_bool_from(v.is_some())),
-                            Err(_) => Err(crate::baseobjspace::take_pending_hash_error()),
+                            Err(_) => {
+                                Err(crate::baseobjspace::take_pending_dict_key_error(args[1]))
+                            }
                         };
                     }
                     Ok(pyre_object::w_bool_from(
@@ -5514,12 +5518,15 @@ fn init_dict_type(ns: PyObjectRef) {
                         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
                         for i in 0..key_len {
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                            let hash = crate::builtins::try_hash_value(key)?;
+                            let hash = crate::builtins::try_hash_value(key).map_err(|err| {
+                                crate::baseobjspace::wrap_dict_key_hash_error(key, err)
+                            })?;
                             let d = pyre_object::gc_roots::shadow_stack_get(sp);
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
                             let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash)
-                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash).map_err(
+                                |_| crate::baseobjspace::take_pending_dict_key_error(key),
+                            )?;
                         }
                         pyre_object::gc_roots::shadow_stack_get(sp)
                     };

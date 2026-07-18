@@ -276,7 +276,7 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
     match pyre_interpreter::builtins::try_hash_value(obj) {
         Ok(h) => h,
         Err(e) => {
-            pyre_interpreter::baseobjspace::set_pending_hash_error(e);
+            pyre_interpreter::baseobjspace::set_pending_dict_hash_error(e);
             pyre_object::dict_eq_hook::signal_hash_error(obj);
             0
         }

@@ -554,7 +554,7 @@ pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         let value = pair[1];
         unsafe {
             w_dict_store_checked(dict, key, value)
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
         }
     }
     Ok(dict)

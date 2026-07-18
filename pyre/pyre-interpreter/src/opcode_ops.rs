@@ -359,12 +359,13 @@ pub fn map_add_value(
         pyre_object::gc_roots::pin_root(dict);
         pyre_object::gc_roots::pin_root(key);
         pyre_object::gc_roots::pin_root(value);
-        let hash = crate::builtins::try_hash_value(key)?;
+        let hash = crate::builtins::try_hash_value(key)
+            .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
         let dict = pyre_object::gc_roots::shadow_stack_get(sp);
         let key = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         let value = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         pyre_object::w_dict_store_hashed_checked(dict, key, value, hash)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
     }
     Ok(())
 }
@@ -420,12 +421,13 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
             let val_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(val);
             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-            let hash = crate::builtins::try_hash_value(key)?;
+            let hash = crate::builtins::try_hash_value(key)
+                .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
             let dict = pyre_object::gc_roots::shadow_stack_get(sp);
             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
             let val = pyre_object::gc_roots::shadow_stack_get(val_slot);
             pyre_object::w_dict_store_hashed_checked(dict, key, val, hash)
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
         }
     }
     Ok(())

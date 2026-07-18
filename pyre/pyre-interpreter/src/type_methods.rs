@@ -4948,7 +4948,7 @@ fn dict_lookup_checked(
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, key)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
     }
 }
 
@@ -4959,7 +4959,7 @@ pub(crate) fn dict_store_checked(
 ) -> Result<(), crate::PyError> {
     unsafe {
         pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
     }
 }
 
@@ -5374,7 +5374,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             match pyre_object::dictmultiobject::w_dict_pop_checked(dict, key) {
                 Ok(Some(val)) => return Ok(val),
                 Ok(None) => {}
-                Err(_) => return Err(crate::baseobjspace::take_pending_hash_error()),
+                Err(_) => return Err(crate::baseobjspace::take_pending_dict_key_error(key)),
             }
         }
     }
@@ -5428,7 +5428,7 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     if !dict.is_null() {
         unsafe {
             return pyre_object::dictmultiobject::w_dict_setdefault_checked(dict, key, default)
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error());
+                .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key));
         }
     }
     Ok(default)
@@ -5440,14 +5440,23 @@ mod dict_method_tests {
 
     use crate::test_hooks::install_hash_hook;
 
+    fn init_dict_test_runtime() {
+        crate::typedef::init_typeobjects();
+        install_hash_hook();
+    }
+
     fn assert_type_error<T: std::fmt::Debug>(result: Result<T, crate::PyError>) {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message,
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
+        );
     }
 
     #[test]
     fn dict_get_rejects_unhashable_key() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5457,7 +5466,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_setitem_rejects_unhashable_key_without_inserting() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5473,7 +5482,7 @@ mod dict_method_tests {
         // `w_dict.setitem` hashes the key via the object strategy's
         // `space.hash_w`, so an unhashable key raises TypeError before
         // anything is stored — the dict stays empty.
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5483,7 +5492,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_pop_empty_returns_default_without_hashing_key() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
         let default = w_int_new(42);
@@ -5495,7 +5504,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_pop_empty_without_default_raises_keyerror_not_typeerror() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
 
@@ -5506,7 +5515,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_update_pairs_rejects_unhashable_key() {
-        install_hash_hook();
+        init_dict_test_runtime();
         let dict = w_dict_new();
         let key = w_list_new(vec![]);
         let pair = w_tuple_new(vec![key, w_int_new(1)]);
