@@ -16473,11 +16473,10 @@ fn split_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
             break;
         }
         if maxsplit >= 0 && parts.len() as i64 >= maxsplit {
-            let mut end = n;
-            while end > i && is_ws(data[end - 1]) {
-                end -= 1;
-            }
-            parts.push(data[i..end].to_vec());
+            // `rstring.py split` (sep=None): once maxsplit is reached the rest
+            // of the string is the final field verbatim — trailing whitespace
+            // is kept, not stripped.
+            parts.push(data[i..n].to_vec());
             break;
         }
         let start = i;
@@ -16501,11 +16500,10 @@ fn rsplit_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
             break;
         }
         if maxsplit >= 0 && parts.len() as i64 >= maxsplit {
-            let mut start = 0;
-            while start < i && is_ws(data[start]) {
-                start += 1;
-            }
-            parts.push(data[start..i].to_vec());
+            // `rstring.py rsplit` (sep=None): once maxsplit is reached the
+            // leading remainder is the final field verbatim — leading
+            // whitespace is kept, not stripped.
+            parts.push(data[0..i].to_vec());
             break;
         }
         let end = i;
