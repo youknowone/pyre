@@ -164,7 +164,8 @@ impl SSAReprEmitter {
     /// Feed the walker-local `SSARepr` into `Assembler::assemble`
     /// against the pre-populated builder, translate the walker's
     /// per-PC insn-index map into byte offsets, and return the
-    /// finished `JitCode` alongside the translated positions.
+    /// finished `JitCode` alongside the translated positions. Returns `None`
+    /// when the single-byte register/constant namespace cannot encode it.
     ///
     /// `num_regs` is the post-regalloc per-kind ceiling computed by
     /// `super::regalloc::allocate_registers` from `max(color)+1`
@@ -178,11 +179,11 @@ impl SSAReprEmitter {
         mut ssarepr: SSARepr,
         insn_positions: &[usize],
         num_regs: NumRegs,
-    ) -> (JitCode, Vec<usize>) {
-        let jitcode = assembler.assemble(&mut ssarepr, self.builder, Some(num_regs));
+    ) -> Option<(JitCode, Vec<usize>)> {
+        let jitcode = assembler.try_assemble(&mut ssarepr, self.builder, Some(num_regs))?;
         let byte_positions =
             Self::insn_pos_to_byte_offset(&ssarepr, insn_positions.iter().copied());
-        (jitcode, byte_positions)
+        Some((jitcode, byte_positions))
     }
 
     /// Consume the emitter and yield its underlying [`JitCodeBuilder`].

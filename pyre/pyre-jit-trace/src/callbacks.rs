@@ -36,7 +36,8 @@ pub struct CallJitCallbacks {
     /// codewriter.py:make_jitcodes parity: build the majit JitCode for
     /// `code` through CallControl.get_jitcode + the pending-graph drain, then
     /// publish the same populated PyJitCode Arc into trace-side staticdata.
-    pub ensure_majit_jitcode: fn(*const CodeObject, *const ()),
+    /// Returns false when the graph cannot be represented as a JitCode.
+    pub ensure_majit_jitcode: fn(*const CodeObject, *const ()) -> bool,
     /// Drain the backend `_store_exception` cells (`jit_exc_clear`).  Called
     /// from the authoritative residual-call executor's raise arm so a raise
     /// recorded into `last_exc_value` during tracing does not also leave the

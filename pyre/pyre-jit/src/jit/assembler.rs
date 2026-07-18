@@ -192,7 +192,23 @@ impl Assembler {
         mut builder: JitCodeBuilder,
         num_regs: Option<NumRegs>,
     ) -> JitCode {
+        self.try_assemble(ssarepr, builder, num_regs)
+            .expect("Assembler::assemble called for an unencodable JitCode")
+    }
+
+    /// Checked assembly used by runtime graph construction.  The canonical
+    /// `assembler.py` format has one-byte register/constant operands; `None`
+    /// declines a graph whose per-kind namespace cannot be represented.
+    pub fn try_assemble(
+        &mut self,
+        ssarepr: &mut SSARepr,
+        mut builder: JitCodeBuilder,
+        num_regs: Option<NumRegs>,
+    ) -> Option<JitCode> {
         if let Some(nr) = num_regs {
+            if nr.int >= 256 || nr.ref_ >= 256 || nr.float >= 256 {
+                return None;
+            }
             builder.ensure_i_regs(nr.int);
             builder.ensure_r_regs(nr.ref_);
             builder.ensure_f_regs(nr.float);
@@ -225,14 +241,12 @@ impl Assembler {
 
         self.fix_labels(&mut state);
 
-        let jitcode = state.builder.finish();
-        // `assembler.py:54`: run `check_result()` unconditionally after
-        // `fix_labels()` and before `make_jitcode`. Strict RPython parity
-        // — an oversized jitcode is a translator-level programming error,
-        // so this asserts and aborts rather than degrading to a runtime
-        // fallback. Any pyre-only safety net belongs outside this unit.
+        let jitcode = state.builder.try_finish()?;
+        // `assembler.py` checks the completed register/constant namespace
+        // before making the JitCode. Runtime-generated graphs use the checked
+        // seam above; this assertion remains an invariant check on success.
         self.check_result(&jitcode);
-        jitcode
+        Some(jitcode)
     }
 
     /// `assembler.py:140-223` `write_insn(insn)`.
@@ -2116,6 +2130,21 @@ mod tests {
         assert_eq!(jitcode.name, "empty");
         assert!(jitcode.code.is_empty(), "empty SSARepr -> empty code");
         assert_eq!(ssarepr.insns_pos, Some(Vec::new()));
+    }
+
+    #[test]
+    fn try_assemble_declines_single_byte_register_overflow() {
+        let mut ssarepr = SSARepr::new("overflow");
+        let mut assembler = Assembler::new();
+        let jitcode = assembler.try_assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 256,
+                ..NumRegs::default()
+            }),
+        );
+        assert!(jitcode.is_none());
     }
 
     #[test]

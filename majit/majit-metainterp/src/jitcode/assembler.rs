@@ -116,6 +116,10 @@ pub struct JitCodeBuilder {
     /// next instruction starts or `finish()` seals the code.
     pending_resulttype: Option<char>,
     has_abort: bool,
+    /// Set while emitting when an operand cannot fit the canonical
+    /// single-byte register/constant namespace.  `try_finish()` declines
+    /// the JitCode before any such bytecode can be installed.
+    encoding_overflow: bool,
     /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte —
     /// captured by `jit_merge_point()` immediately before
     /// `write_insn` pushes the opcode.  Propagated to
@@ -4516,8 +4520,21 @@ impl JitCodeBuilder {
         idx
     }
 
-    pub fn finish(mut self) -> JitCode {
+    pub fn try_finish(mut self) -> Option<JitCode> {
         self.flush_pending_resulttype();
+        let total_i = self.num_regs_i as usize + self.constants_i.len();
+        let total_r = self.num_regs_r as usize + self.constants_r.len();
+        let total_f = self.num_regs_f as usize + self.constants_f.len();
+        if self.encoding_overflow
+            || self.num_regs_i >= 256
+            || self.num_regs_r >= 256
+            || self.num_regs_f >= 256
+            || total_i > 256
+            || total_r > 256
+            || total_f > 256
+        {
+            return None;
+        }
         self.patch_labels();
         self.patch_switch_descrs();
         self.patch_const_refs();
@@ -4546,23 +4563,16 @@ impl JitCodeBuilder {
         // off to `JitCodeBody::resulttypes` is therefore keyed by
         // every typed-result instruction's end-of-instruction PC.
         let resulttypes = Some(self.resulttypes);
-        // Stage 1 audit (bytecode encoding unification —
-        // .claude/plans/TODO-bytecode-encoding-unification.md):
         // RPython enforces two distinct ceilings:
-        //   * `jitcode.py:36 assert num_regs_i < 256 and ...` — the
+        //   * `jitcode.py` keeps `num_regs_*` in a single char — the
         //     stored `c_num_regs_*` is a single char.
-        //   * `assembler.py:132-133 val = count_regs[kind] +
-        //     len(constants) - 1; assert 0 <= val < 256` — the last
+        //   * `assembler.py` encodes `count_regs[kind] +
+        //     len(constants) - 1` — the last
         //     constant-slot index in the unified register-plus-const
         //     namespace must fit in one byte, so the total count
         //     `num_regs + len(constants) <= 256` (last index 255).
-        // pyre legacy assembler still emits u16 operands, so this hook
-        // gates the migration: if any production trace exceeds the
-        // canonical ceiling per kind, the migration plan must grow a
-        // spill mechanism before continuing.
-        let total_i = self.num_regs_i as usize + self.constants_i.len();
-        let total_r = self.num_regs_r as usize + self.constants_r.len();
-        let total_f = self.num_regs_f as usize + self.constants_f.len();
+        // `try_finish` checks both ceilings before patching operands so an
+        // unencodable source graph is declined instead of being installed.
         if crate::majit_log_enabled() {
             eprintln!(
                 "[bcenc-audit] {:?} regs i={} r={} f={} consts i={} r={} f={} total i={} r={} f={}",
@@ -4578,27 +4588,11 @@ impl JitCodeBuilder {
                 total_f,
             );
         }
-        // RPython `jitcode.py:36` ceiling: `num_regs_X < 256` per kind.
-        assert!(
-            (self.num_regs_i as usize) < 256
-                && (self.num_regs_r as usize) < 256
-                && (self.num_regs_f as usize) < 256,
-            "jitcode {:?} exceeds RPython jitcode.py:36 num_regs ceiling \
-             (num_regs i={} r={} f={})",
-            self.name,
-            self.num_regs_i,
-            self.num_regs_r,
-            self.num_regs_f,
-        );
-        // RPython `assembler.py:132-133` ceiling: last unified slot
+        // `jitcode.py` ceiling: `num_regs_X < 256` per kind.
+        debug_assert!(self.num_regs_i < 256 && self.num_regs_r < 256 && self.num_regs_f < 256);
+        // `assembler.py` ceiling: last unified slot
         // index `num_regs + len(consts) - 1 < 256`, i.e. `total <= 256`.
-        assert!(
-            total_i <= 256 && total_r <= 256 && total_f <= 256,
-            "jitcode {:?} exceeds canonical 1-byte register pool \
-             (i_total={total_i} r_total={total_r} f_total={total_f}); \
-             see TODO-bytecode-encoding-unification.md Stage 1.3",
-            self.name,
-        );
+        debug_assert!(total_i <= 256 && total_r <= 256 && total_f <= 256);
         let body = majit_translate::jitcode::JitCodeBody {
             // RPython `jitcode.py:17 self.calldescr = calldescr` — the
             // value was stored on the builder via `set_calldescr` (the
@@ -4651,19 +4645,27 @@ impl JitCodeBuilder {
         // previously expected `index = 0` from the flat-struct
         // Default consume `try_index()` instead, which correctly
         // returns `None` until the back-stamp lands.
-        jc
+        Some(jc)
+    }
+
+    pub fn finish(self) -> JitCode {
+        self.try_finish()
+            .expect("JitCodeBuilder::finish called for an unencodable JitCode")
     }
 
     fn push_u8(&mut self, value: u8) {
         self.code.push(value);
     }
 
-    fn push_reg_u8(&mut self, reg: u16, context: &'static str) {
-        assert!(
-            reg <= u8::MAX as u16,
-            "{context}: register {reg} does not fit canonical u8 operand"
-        );
-        self.push_u8(reg as u8);
+    fn push_reg_u8(&mut self, reg: u16, _context: &'static str) {
+        if reg > u8::MAX as u16 {
+            // The placeholder exists only in the transient builder;
+            // `try_finish` observes the latch and declines the JitCode.
+            self.encoding_overflow = true;
+            self.push_u8(0);
+        } else {
+            self.push_u8(reg as u8);
+        }
     }
 
     fn push_u16(&mut self, value: u16) {
@@ -4768,10 +4770,11 @@ impl JitCodeBuilder {
     fn touch_reg(&mut self, reg: u16) {
         if self.num_regs_frozen {
             assert!(
-                reg < self.num_regs_i && reg < 256,
+                reg < self.num_regs_i,
                 "int reg {reg} out of bounds {} (assembler.py:72-74 emit_reg parity)",
                 self.num_regs_i
             );
+            self.encoding_overflow |= reg >= 256;
             return;
         }
         assert!(
@@ -4784,10 +4787,11 @@ impl JitCodeBuilder {
     fn touch_ref_reg(&mut self, reg: u16) {
         if self.num_regs_frozen {
             assert!(
-                reg < self.num_regs_r && reg < 256,
+                reg < self.num_regs_r,
                 "ref reg {reg} out of bounds {} (assembler.py:72-74 emit_reg parity)",
                 self.num_regs_r
             );
+            self.encoding_overflow |= reg >= 256;
             return;
         }
         assert!(
@@ -4800,10 +4804,11 @@ impl JitCodeBuilder {
     fn touch_float_reg(&mut self, reg: u16) {
         if self.num_regs_frozen {
             assert!(
-                reg < self.num_regs_f && reg < 256,
+                reg < self.num_regs_f,
                 "float reg {reg} out of bounds {} (assembler.py:72-74 emit_reg parity)",
                 self.num_regs_f
             );
+            self.encoding_overflow |= reg >= 256;
             return;
         }
         assert!(
@@ -4828,10 +4833,11 @@ impl JitCodeBuilder {
             .saturating_add(self.constants_i.len() as u16);
         if self.num_regs_frozen {
             assert!(
-                reg < limit && reg < 256,
+                reg < limit,
                 "int reg-or-pool {reg} out of bounds {limit} \
                  (assembler.py:72-74 emit_reg / assembler.py:126 emit_const parity)"
             );
+            self.encoding_overflow |= reg >= 256;
             return;
         }
         assert!(
@@ -4847,10 +4853,11 @@ impl JitCodeBuilder {
             .saturating_add(self.constants_r.len() as u16);
         if self.num_regs_frozen {
             assert!(
-                reg < limit && reg < 256,
+                reg < limit,
                 "ref reg-or-pool {reg} out of bounds {limit} \
                  (assembler.py:72-74 emit_reg / assembler.py:126 emit_const parity)"
             );
+            self.encoding_overflow |= reg >= 256;
             return;
         }
         assert!(
@@ -4866,10 +4873,11 @@ impl JitCodeBuilder {
             .saturating_add(self.constants_f.len() as u16);
         if self.num_regs_frozen {
             assert!(
-                reg < limit && reg < 256,
+                reg < limit,
                 "float reg-or-pool {reg} out of bounds {limit} \
                  (assembler.py:72-74 emit_reg / assembler.py:126 emit_const parity)"
             );
+            self.encoding_overflow |= reg >= 256;
             return;
         }
         assert!(
@@ -6101,5 +6109,25 @@ mod tests {
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("raise/r");
         assert_eq!(jitcode.code, vec![opcode, 0]);
+    }
+
+    #[test]
+    fn try_finish_accepts_last_single_byte_constant_slot() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        for value in 0..255 {
+            builder.add_const_i(value);
+        }
+        assert!(builder.try_finish().is_some());
+    }
+
+    #[test]
+    fn try_finish_declines_register_constant_overflow() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        for value in 0..256 {
+            builder.add_const_i(value);
+        }
+        assert!(builder.try_finish().is_none());
     }
 }

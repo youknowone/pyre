@@ -5370,7 +5370,7 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> Option<PyJitCode> {
         // Recover the live globals-stamped PyCode wrapper for `code` from the
         // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
         // per-code wrapper that every compiled code has stamped (during the
@@ -13068,7 +13068,7 @@ impl CodeWriter {
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
-    ) -> PyJitCode {
+    ) -> Option<PyJitCode> {
         // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
         // before assembly so `JitCodeBuilder::finish()` can stamp them
@@ -13113,7 +13113,7 @@ impl CodeWriter {
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
-        };
+        }?;
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
@@ -13530,12 +13530,12 @@ impl CodeWriter {
             is_drained: true,
         };
 
-        PyJitCode::from_parts(
+        Some(PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),
             metadata,
             code as *const CodeObject,
             has_abort,
-        )
+        ))
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
@@ -13613,7 +13613,9 @@ impl CodeWriter {
             // replaces the cached skeleton's payload in place. That
             // matches RPython's "same JitCode object is filled later"
             // identity flow even after other stores cloned the Arc.
-            let pyjitcode = self.transform_graph_to_jitcode(unsafe { &*code_ptr });
+            let Some(pyjitcode) = self.transform_graph_to_jitcode(unsafe { &*code_ptr }) else {
+                continue;
+            };
             let key = code_ptr as usize;
             let pyjitcode = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
@@ -13741,8 +13743,9 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// `assign_portal_jitdriver_indices`. The resulting list is published
 /// whole to trace-side `MetaInterpStaticData`, matching
 /// `warmspot.py:281-282`. Runtime trace-side lookup must observe this
-/// installed result; it must not compile missing callees lazily.
-pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
+/// installed result. A false result declines the portal and leaves execution
+/// in the interpreter.
+pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
     let writer = CodeWriter::instance();
     // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
@@ -13768,7 +13771,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
     writer
         .callcontrol()
         .find_compiled_jitcode_arc(code as *const pyre_interpreter::CodeObject)
-        .expect("make_jitcodes must populate the registered portal jitcode");
+        .is_some()
 }
 
 /// Callee compile path: `CallControl.get_jitcode(graph)` followed by the

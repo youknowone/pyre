@@ -610,14 +610,13 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
                 code
             )
         });
-        (callbacks.ensure_majit_jitcode)(raw_code, code);
+        if !(callbacks.ensure_majit_jitcode)(raw_code, code) {
+            return std::ptr::null();
+        }
         if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
             return existing;
         }
-        panic!(
-            "ensure_majit_jitcode did not install a populated JitCode for PyCode {:p}",
-            code
-        );
+        return std::ptr::null();
     }
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None))
 }
@@ -682,6 +681,9 @@ pub fn ensure_jitcode_index(code: *const ()) -> Option<i32> {
         return None;
     }
     let jitcode = jitcode_for(code);
+    if jitcode.is_null() {
+        return None;
+    }
     Some(unsafe { (*jitcode).index })
 }
 
@@ -692,7 +694,8 @@ pub fn ensure_jitcode_ptr(code: *const ()) -> Option<*const ()> {
     if code.is_null() {
         return None;
     }
-    Some(jitcode_for(code) as *const ())
+    let jitcode = jitcode_for(code);
+    (!jitcode.is_null()).then_some(jitcode as *const ())
 }
 
 #[doc(hidden)]
@@ -10004,7 +10007,7 @@ mod tests {
                 jit_create_self_recursive_callee_frame_1: std::ptr::null(),
                 jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
                 driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
-                ensure_majit_jitcode: |_, _| {},
+                ensure_majit_jitcode: |_, _| false,
                 drain_backend_jit_exc: || {},
             }));
             crate::callbacks::init(cb);

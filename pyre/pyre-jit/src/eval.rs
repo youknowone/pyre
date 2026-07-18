@@ -3947,9 +3947,12 @@ fn init_callbacks() {
                 driver_pair: || driver_pair() as *mut JitDriverPair as *mut u8,
                 ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        let _ =
-                            crate::jit::codewriter::ensure_trace_jitcode_for_w_code(code, w_code);
+                        return crate::jit::codewriter::ensure_trace_jitcode_for_w_code(
+                            code, w_code,
+                        )
+                        .is_some();
                     }
+                    false
                 },
                 drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
             }));
@@ -6035,7 +6038,9 @@ fn compile_and_run_once(
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
     // when it constructs the root MIFrame.
-    crate::jit::codewriter::register_portal_jitdriver(code);
+    if !crate::jit::codewriter::register_portal_jitdriver(code) {
+        return None;
+    }
     let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
         .expect("registered portal must have a drained PyJitCode");
     pjc.merge_entry_for(target_pc)
