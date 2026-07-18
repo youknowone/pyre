@@ -453,10 +453,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     // ── Helper: convert std::io::Error → PyError (OSError) ──
     fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
-        crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("{}: '{}'", e, path),
-        )
+        let w_filename = if path.is_empty() {
+            pyre_object::PY_NULL
+        } else {
+            pyre_object::w_str_new(path)
+        };
+        crate::PyError::os_error_syscall(e.raw_os_error().unwrap_or(0), w_filename)
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──

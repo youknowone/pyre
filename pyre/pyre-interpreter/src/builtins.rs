@@ -4283,7 +4283,7 @@ mod wasm_errno {
 /// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
-fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
+pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (MSVC CRT lacks it);
     // the rest come from `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
     #[cfg(not(target_arch = "wasm32"))]
@@ -10505,9 +10505,9 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 Ok(bytes) => bytes,
                 Err(_e) if writing => Vec::new(),
                 Err(e) => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(crate::PyError::os_error_syscall(
                         e.raw_os_error().unwrap_or(2),
-                        format!("{e}: '{path}'"),
+                        pyre_object::w_str_new(&path),
                     ));
                 }
             }

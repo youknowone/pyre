@@ -1709,6 +1709,15 @@ def main():
             15,
             skip_backends=("wasm",),
         )
+        # Skipped on wasm: the guest has no os/filesystem — open() raises
+        # NotImplementedError and `import os` has no posix backend — so the
+        # errno-specific OSError subclass behaviour is native-JIT-backend only.
+        chk.run_selfcheck(
+            "oserror_errno_fields",
+            f"{B}/oserror_errno_fields_regression.py",
+            15,
+            skip_backends=("wasm",),
+        )
 
     if not args.no_synthetic:
         print()

@@ -623,15 +623,77 @@ impl PyError {
         Self::new(PyErrorKind::OSError, msg)
     }
 
-    /// Raise an OSError (or FileNotFoundError when errno is ENOENT) with
-    /// a platform-style error message.
-    pub fn os_error_with_errno(errno: i32, msg: impl Into<String>) -> Self {
-        let kind = if errno == 2 {
-            PyErrorKind::FileNotFoundError
+    /// Rust's OS-error `Display` is `"{strerror} (os error {errno})"`;
+    /// recover the bare strerror the way `rposix.strerror` reports it.
+    fn clean_strerror(errno: i32) -> String {
+        let full = std::io::Error::from_raw_os_error(errno).to_string();
+        match full.rfind(" (os error ") {
+            Some(idx) => full[..idx].to_string(),
+            None => full,
+        }
+    }
+
+    /// `error.py:_wrap_oserror2` — build the OSError a failed syscall raises:
+    /// `args = (errno, strerror)`, the errno-specific subclass (`ERRNO_MAP`),
+    /// the clean strerror, and the `.errno` / `.strerror` / `.filename` slots.
+    /// `w_filename` is the affected path, or `PY_NULL` for none.
+    pub fn os_error_syscall(errno: i32, w_filename: PyObjectRef) -> Self {
+        let strerror = Self::clean_strerror(errno);
+        let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
+        // The dedicated FileNotFoundError kind carries its own str/repr; the
+        // other errno subclasses share OSError's and differ only by class.
+        let (kind, exc_kind) = if matches!(subclass, Some("FileNotFoundError")) {
+            (PyErrorKind::FileNotFoundError, ExcKind::FileNotFoundError)
         } else {
-            PyErrorKind::OSError
+            (PyErrorKind::OSError, ExcKind::OSError)
         };
-        Self::new(kind, msg)
+        let message = format!("[Errno {errno}] {strerror}");
+        let exc = w_exception_new(exc_kind, &message);
+        // Retag to the errno subclass through `w_class`, like
+        // `os_error_family_new`: the subclasses share OSError's layout, so
+        // the ExcKind stays OSError and only the class differs.
+        if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
+            unsafe {
+                (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
+            }
+        }
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(errno as i64),
+            pyre_object::w_str_new(&strerror),
+        ]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+            pyre_object::interp_exceptions::w_exception_set_errno(
+                exc,
+                pyre_object::w_int_new(errno as i64),
+            );
+            pyre_object::interp_exceptions::w_exception_set_strerror(
+                exc,
+                pyre_object::w_str_new(&strerror),
+            );
+            if !w_filename.is_null() {
+                pyre_object::interp_exceptions::w_exception_set_filename(exc, w_filename);
+            }
+        }
+        PyError {
+            kind,
+            // Leave the display message empty so `message_text` derives it from
+            // `exc_object` via `W_OSError.descr_str`, which appends the
+            // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
+            // it and the uncaught-traceback header would drop the filename.
+            message: String::new(),
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
+    /// Raise the structured OSError for `errno` (no filename). The caller's
+    /// platform message is superseded by the errno-derived strerror.
+    pub fn os_error_with_errno(errno: i32, _msg: impl Into<String>) -> Self {
+        Self::os_error_syscall(errno, pyre_object::PY_NULL)
     }
 
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
