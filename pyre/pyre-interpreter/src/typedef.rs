@@ -910,6 +910,19 @@ pub fn init_typeobjects() {
             &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
             new_typeobject_with_base("zip", init_zip_type, object_type) as usize,
         );
+        // `iter(callable, sentinel)` produces a `_CallableIterator`; register
+        // its type so `type(it)` / `it.__class__` resolve like the other
+        // iterators. Not directly instantiable.
+        let callable_iterator_type =
+            new_typeobject_with_base("callable_iterator", init_callable_iterator_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(callable_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(callable_iterator_type, false);
+        }
+        reg.insert(
+            &pyre_object::operation::CALLABLE_ITERATOR_TYPE as *const PyType as usize,
+            callable_iterator_type as usize,
+        );
         for (pytype, name, init) in [
             (
                 &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType,
@@ -3300,6 +3313,20 @@ fn init_enumerate_type(ns: PyObjectRef) {
             "__class_getitem__",
             crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
+    );
+}
+
+/// `operation.py W_IterCallable.typedef` — `iter(callable, sentinel)`.
+fn init_callable_iterator_type(ns: PyObjectRef) {
+    install_functional_entry(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+    );
+    install_functional_entry(
+        ns,
+        "__next__",
+        make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
     );
 }
 
