@@ -13143,9 +13143,9 @@ fn init_int_type(ns: PyObjectRef) {
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
     // implementation delegates virtually to this repr slot.
     let int_to_text = |args: &[PyObjectRef]| {
-        Ok(pyre_object::w_str_new(
-            &unsafe { crate::builtins::obj_to_bigint(args[0]) }.to_string(),
-        ))
+        Ok(pyre_object::w_str_new(&unsafe {
+            crate::builtins::int_to_decimal_string(args[0])?
+        }))
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

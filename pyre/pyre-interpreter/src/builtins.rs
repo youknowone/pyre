@@ -6296,6 +6296,35 @@ fn parse_int_from_str(
     Err(invalid_int_literal(w_source, base))
 }
 
+/// PyPy `W_AbstractLongObject.descr_str` / Python 3.14 integer-to-decimal
+/// conversion guard. The bit-length lower bound rejects enormous values
+/// before the quadratic decimal conversion; the resulting string supplies
+/// the exact boundary check.
+pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let value = obj_to_bigint(obj);
+    let maxdigits = crate::module::sys::state::int_max_str_digits();
+    if maxdigits != 0 {
+        let bits = value.bits();
+        let decimal_digits_lower_bound = if bits == 0 {
+            1
+        } else {
+            ((bits - 1).saturating_mul(30_103) / 100_000) + 1
+        };
+        if decimal_digits_lower_bound > maxdigits as u64 {
+            return Err(crate::PyError::value_error(format!(
+                "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+            )));
+        }
+    }
+    let text = value.to_string();
+    if maxdigits != 0 && text.trim_start_matches('-').len() as i64 > maxdigits {
+        return Err(crate::PyError::value_error(format!(
+            "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+        )));
+    }
+    Ok(text)
+}
+
 /// Remove PEP 515 underscore digit separators, rejecting any underscore
 /// that is not flanked by two ASCII digits — `_Py_string_to_number_with_
 /// underscores`. Returns `None` for an invalid placement (leading,
