@@ -11516,25 +11516,14 @@ mod tests {
         };
 
         let recorder = ctx.into_recorder();
-        // w_int_new(7) is a tagged immediate under CAN_BE_TAGGED, so the
-        // constant unbox lowers to rtagged.py:147 ll_unboxed_to_int:
-        // IntRshift(CastPtrToInt(obj), 1) — pure arithmetic, no guard. The
-        // tag-discrimination guard (rtagged.py:155) is elided because `obj`
-        // is a Const (pyjitpl.py:2583 generate_guard const-skip), and the
-        // tagged branch returns before the boxed GUARD_CLASS.
+        // A boxed W_Int reads its immutable payload with GetfieldGcPureI. The
+        // lowbit tag-discrimination guard (rtagged.py:155) is elided because
+        // `obj` is a Const (pyjitpl.py:2583 generate_guard const-skip), so no
+        // guard is emitted at all.
         let payload_op = recorder
             .get_op_by_pos(payload)
             .expect("payload op should be present");
-        assert_eq!(payload_op.opcode, OpCode::IntRshift);
-        // The untag reads CastPtrToInt(obj): payload arg(0) is the cast op,
-        // whose arg(0) is the constant `obj` — the payload derives from the
-        // proven-constant operand, not an unrelated value.
-        let cast_ref = payload_op.arg(0).to_opref();
-        let cast_op = recorder
-            .get_op_by_pos(cast_ref)
-            .expect("cast op should be present");
-        assert_eq!(cast_op.opcode, OpCode::CastPtrToInt);
-        assert_eq!(cast_op.arg(0).to_opref(), int_obj);
+        assert_eq!(payload_op.opcode, OpCode::GetfieldGcPureI);
         for pos in 1..(1 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
