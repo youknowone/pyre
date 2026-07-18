@@ -4920,8 +4920,15 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
         // on `type.__dict__` without per-method proxy plumbing.
         if pyre_object::is_dict_proxy(obj) {
             let inner = pyre_object::w_dict_proxy_get_mapping(obj);
-            if !inner.is_null() && pyre_object::is_dict(inner) {
-                return inner;
+            // The wrapped mapping may itself be a dict subclass (e.g. a
+            // class whose namespace is an `OrderedDict`), which keeps its
+            // entries in a native backing dict — resolve through to that
+            // rather than requiring `inner` to be an exact dict.
+            if !inner.is_null() && inner != obj {
+                let backing = resolve_dict_backing(inner);
+                if !backing.is_null() {
+                    return backing;
+                }
             }
         }
         if is_instance(obj) {
