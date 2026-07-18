@@ -1359,6 +1359,34 @@ impl MiniMarkGC {
         }
     }
 
+    /// A non-moving major leaves nursery objects in place, so the normal
+    /// minor-only `invalidate_young_weakrefs` pass does not run.  A live
+    /// nursery weakref may nevertheless point at an old object that this
+    /// major is about to sweep.  Clear that edge while old-gen VISITED bits
+    /// still distinguish survivors, and leave the nursery bookkeeping list
+    /// intact for the next moving minor.
+    fn invalidate_young_weakrefs_for_nonmoving_major(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        for obj_addr in self.young_objects_with_weakrefs.iter().copied() {
+            let weakref_hdr = unsafe { header_of(obj_addr) };
+            if unsafe { !(*weakref_hdr).has_flag(flags::VISITED) } {
+                continue;
+            }
+            let weakptr_slot = (obj_addr + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef;
+            let pointing_to = unsafe { (*weakptr_slot).0 };
+            if pointing_to == 0 || !self.oldgen.contains(pointing_to) {
+                continue;
+            }
+            let target_hdr = unsafe { header_of(pointing_to) };
+            if unsafe {
+                !(*target_hdr).has_flag(flags::VISITED)
+                    || (*target_hdr).has_flag(flags::FINALIZATION_ORDERING)
+            } {
+                unsafe { (*weakptr_slot).0 = 0 };
+            }
+        }
+    }
+
     /// incminimark.py:2914-2926 `deal_with_young_objects_with_finalizers`.
     fn deal_with_young_objects_with_finalizers(&mut self) {
         while let Some((obj_addr, fq_index)) =
@@ -2207,6 +2235,9 @@ impl MiniMarkGC {
             self.deal_with_objects_with_finalizers();
         } else if !self.old_objects_with_weakrefs.is_empty() {
             self.invalidate_old_weakrefs();
+        }
+        if self.oldgen_nonmoving_active && !self.young_objects_with_weakrefs.is_empty() {
+            self.invalidate_young_weakrefs_for_nonmoving_major();
         }
         // A non-moving major (do_collect_oldgen_nonmoving) runs with a live
         // nursery and no preceding minor, so the write barrier's
@@ -6809,6 +6840,58 @@ mod tests {
         let n_hdr = unsafe { header_of(n_root.0) };
         assert!(unsafe { !(*n_hdr).has_flag(flags::VISITED) });
 
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn nonmoving_major_invalidates_live_nursery_weakref_to_dead_old_target() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_in_oldgen(target_tid, GcHeader::SIZE + 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+        let mut wref_root = wref;
+        unsafe { gc.roots.add(&mut wref_root) };
+
+        gc.do_collect_oldgen_nonmoving();
+
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert_eq!(after.0, 0);
+        assert_eq!(gc.young_objects_with_weakrefs, vec![wref.0]);
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn nonmoving_major_keeps_live_nursery_weakref_to_live_old_target() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_in_oldgen(target_tid, GcHeader::SIZE + 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+        let mut target_root = target;
+        let mut wref_root = wref;
+        unsafe {
+            gc.roots.add(&mut target_root);
+            gc.roots.add(&mut wref_root);
+        }
+
+        gc.do_collect_oldgen_nonmoving();
+
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert_eq!(after.0, target_root.0);
+        assert_eq!(gc.young_objects_with_weakrefs, vec![wref.0]);
         gc.roots.clear();
     }
 
