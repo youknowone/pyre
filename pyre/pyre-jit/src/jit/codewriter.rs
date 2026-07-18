@@ -12016,6 +12016,38 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
+                        // MatchMapping: peeks TOS (subject), pushes bool. Net: +1.
+                        Instruction::MatchMapping => {
+                            push_fresh_ref(&mut current_state, &mut graph);
+                            current_depth += 1;
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // MatchKeys: peeks subject + keys tuple (TOS), pushes a
+                        // values tuple or None. Net: +1.
+                        Instruction::MatchKeys => {
+                            push_fresh_ref(&mut current_state, &mut graph);
+                            current_depth += 1;
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // MatchClass: pops subject, type and the keyword-names
+                        // tuple (3), pushes the extracted-attrs tuple or None (1).
+                        // Net: -2. The stack effect MUST be modelled even though
+                        // the trace aborts: an unmodelled MATCH_CLASS (via the
+                        // catch-all below) left the operand-stack depth 2 too high,
+                        // so the enclosing block's return link carried stale pattern
+                        // temporaries and tripped `make_return`'s arity assert in
+                        // the flatten pass.
+                        Instruction::MatchClass { .. } => {
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            push_fresh_ref(&mut current_state, &mut graph);
+                            current_depth += 1;
+                            emit_abort_permanent!(py_pc);
+                        }
+
                         // Catch-all: unknown instruction.
                         _other => {
                             emit_abort_permanent!(py_pc);
