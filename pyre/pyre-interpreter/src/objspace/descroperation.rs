@@ -1095,8 +1095,12 @@ pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn repeat_count(n: PyObjectRef) -> Result<usize, PyError> {
     if is_long(n) {
         let big = as_bigint(n);
-        match big.to_usize() {
-            Some(v) => Ok(v),
+        // The count coerces to a signed machine word (an index-sized integer):
+        // a non-negative value exceeding `isize::MAX` overflows rather than
+        // wrapping to a huge `usize` count, matching `getindex_w`. Negative
+        // counts clamp to 0.
+        match big.to_isize() {
+            Some(v) => Ok(if v < 0 { 0 } else { v as usize }),
             None if bigint_lt(big, BigInt::from(0)) => Ok(0),
             None => Err(PyError::new(
                 PyErrorKind::OverflowError,
@@ -1167,6 +1171,11 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let data = pyre_object::bytesobject::bytes_like_data(s);
     let count = repeat_count(n)?;
+    // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
+    // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.
+    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE) {
+        return Ok(s);
+    }
     let cap = data
         .len()
         .checked_mul(count)
