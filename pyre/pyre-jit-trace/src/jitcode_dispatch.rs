@@ -27743,17 +27743,6 @@ fn handle(
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
                 if !has_partial && has_targets {
-                    // pyjitpl.py:2967-2969 `reached_loop_header`: the dummy
-                    // GUARD_FUTURE_CONDITION is recorded before compile_trace
-                    // so unroll can attach this exact merge-point snapshot to
-                    // artificial short-preamble guards.  The ordinary
-                    // CloseLoop outcome records the same guard later through
-                    // `close_loop_args_at`; this in-walk compile_trace path
-                    // returns before that post-processing step, so it must
-                    // record the guard here.
-                    ctx.trace_ctx
-                        .record_guard(OpCode::GuardFutureCondition, &[], 0);
-                    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
                     let outcome = match bridge_origin {
                         // Guard-origin: existing bridge path.
                         Some(_) => {
