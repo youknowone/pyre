@@ -45,6 +45,27 @@ assert type(subclass_value) is FloatSubclass
 nan = float("nan")
 assert float.from_number(nan) is nan
 
+
+class FloatString(str):
+    def __float__(self):
+        return float(str(self)) + 1
+
+
+assert float(FloatString("8")) == 9.0
+
+
+class HugeIndex:
+    def __index__(self):
+        return 2**2000
+
+
+try:
+    float(HugeIndex())
+except OverflowError:
+    pass
+else:
+    raise AssertionError("an oversized __index__ result must overflow float")
+
 for cls in (float, complex):
     try:
         cls.from_number("3")

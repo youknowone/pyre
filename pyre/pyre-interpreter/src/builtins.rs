@@ -6416,28 +6416,6 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }
             return Ok(floatobject::w_float_new(v));
         }
-        if is_str(obj) {
-            // floatobject.py:242 — unicode is normalized through
-            // `unicode_to_decimal_w` before `_string_to_float`, so non-ASCII
-            // decimal digits parse.
-            let s = unicode_to_decimal_w(obj)?;
-            // The strict conversion above rejected any surrogate, so the
-            // original object now has a valid UTF-8 view for the error text.
-            let raw = w_str_get_value(obj);
-            // `float_from_string` strips PEP 515 underscore separators
-            // (between digits only) before parsing; the numeric conversion
-            // uses the Python-literal float grammar.
-            if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
-                if let Some(v) = rustpython_literal::float::parse_str(&cleaned) {
-                    return Ok(floatobject::w_float_new(v));
-                }
-            }
-            // `floatobject.py:descr_new` — message uses single-quoted str:
-            // "could not convert string to float: '<s>'".
-            return Err(crate::PyError::value_error(format!(
-                "could not convert string to float: '{raw}'"
-            )));
-        }
     }
     // descroperation.py float — type-MRO __float__ then __index__
     if let Some(tp) = crate::typedef::r#type(obj) {
@@ -6470,10 +6448,13 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         }
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__index__") } {
             let r = crate::call::call_function_impl_result(method, &[obj])?;
-            // descroperation.py:609 — exact int or bool (int subclass)
+            // descroperation.py:609 `space.index` returns an arbitrary-size
+            // Python int.  Accept both the machine-word and W_LongObject
+            // layouts, then reuse the integer float conversion so an
+            // out-of-range bigint raises `OverflowError`.
             unsafe {
-                if is_int(r) || is_bool(r) {
-                    return Ok(floatobject::w_float_new(w_int_get_value(r) as f64));
+                if is_int(r) || is_bool(r) || pyre_object::is_long(r) {
+                    return builtin_float(&[r]);
                 }
             }
             let result_type = unsafe { (*(*r).ob_type).name };
@@ -6481,6 +6462,25 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 "__index__ returned non-int (type '{result_type}')",
             )));
         }
+    }
+    // floatobject.py:242 — only after the `__float__` / `__index__` lookup,
+    // unicode (including subclasses without a numeric override) is normalized
+    // through `unicode_to_decimal_w` before `_string_to_float`.
+    if unsafe { is_str(obj) } {
+        let s = unsafe { unicode_to_decimal_w(obj)? };
+        // The strict conversion above rejected any surrogate, so the original
+        // object now has a valid UTF-8 view for the error text.
+        let raw = unsafe { w_str_get_value(obj) };
+        // `float_from_string` strips PEP 515 underscore separators (between
+        // digits only) before parsing the Python-literal float grammar.
+        if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
+            if let Some(v) = rustpython_literal::float::parse_str(&cleaned) {
+                return Ok(floatobject::w_float_new(v));
+            }
+        }
+        return Err(crate::PyError::value_error(format!(
+            "could not convert string to float: '{raw}'"
+        )));
     }
     // floatobject.py:247-255 — a readable buffer (`charbuf_w`: bytes /
     // bytearray / array / memoryview) is decoded and parsed like a str; an
