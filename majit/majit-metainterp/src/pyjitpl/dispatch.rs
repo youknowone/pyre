@@ -1545,6 +1545,30 @@ where
         self.outer_program_pc = Some(pc);
     }
 
+    /// A root dispatch return finishes the source loop. Its ABI keeps the
+    /// interpreter program counter in i0, which has already been advanced by
+    /// the matched opcode arm. Preserve it before popping the frame so the
+    /// single-pass merge hook resumes native execution at the source loop exit.
+    /// The scalar state handoff rides `single_pass_scalar_values` (published by
+    /// the jitdriver Finish arm), so only the resume pc is captured here.
+    fn capture_single_pass_finish(&mut self, ctx: &mut TraceCtx) {
+        if self.outer_program_pc.is_none() || self.frames.len() != 1 {
+            return;
+        }
+        if let Some(pc) = self
+            .frames
+            .current_mut()
+            .int_values
+            .first()
+            .copied()
+            .flatten()
+        {
+            if let Ok(pc) = usize::try_from(pc) {
+                ctx.walk_final_pc = Some(pc);
+            }
+        }
+    }
+
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
         // model.py:199-201: ConstPtr wrap then cpu.cls_of_box(box).
         let const_box = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Ref(
@@ -2027,7 +2051,7 @@ where
                     );
                 }
                 match action {
-                    TraceAction::CloseLoop => sym.commit_portal_op(),
+                    TraceAction::CloseLoop | TraceAction::Finish { .. } => sym.commit_portal_op(),
                     _ => sym.abort_portal_op(),
                 }
                 return action;
@@ -4794,6 +4818,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let target = self.frames.current_mut().return_i;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4825,6 +4852,9 @@ where
                 let value = self.frames.current_mut().next_u8() as i8 as i64;
                 let opref = OpRef::ConstInt(value);
                 let target = self.frames.current_mut().return_i;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4852,6 +4882,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let target = self.frames.current_mut().return_r;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4879,6 +4912,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let target = self.frames.current_mut().return_f;
+                if target.is_none() {
+                    self.capture_single_pass_finish(ctx);
+                }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -4903,6 +4939,7 @@ where
             }
             jitcode::insns::BC_VOID_RETURN => {
                 self.clear_exception();
+                self.capture_single_pass_finish(ctx);
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }

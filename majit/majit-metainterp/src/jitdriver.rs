@@ -2450,6 +2450,25 @@ impl<S: JitState> JitDriver<S> {
                 finish_arg_types,
                 exit_with_exception,
             } => {
+                // A terminal dispatch return is also a valid single-pass
+                // handoff. The JitCode machine captured i0 after the matched
+                // arm advanced it, so native execution resumes at the source
+                // loop exit and performs the post-loop work exactly once.
+                let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                if let Some(p) = pc {
+                    self.meta.single_pass_outcome = Some((p, Vec::new()));
+                }
+                if let Some(sym) = self.sym.as_ref() {
+                    let scalars = S::collect_scalar_state_field_values(sym);
+                    self.meta.single_pass_scalar_values = Some(scalars);
+                }
+                let virt_elems = self
+                    .meta
+                    .trace_ctx()
+                    .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                if let Some(elems) = virt_elems {
+                    self.meta.single_pass_virt_array_values = Some(elems);
+                }
                 // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
                 // `compile_done_with_this_frame` and
                 // `compile_exit_frame_with_exception` both call

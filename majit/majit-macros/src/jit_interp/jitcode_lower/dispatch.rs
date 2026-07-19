@@ -2605,13 +2605,13 @@ pub(super) fn lower_dispatch_chain(
                         ),
                     }
                 }
-                // `break` arms (`Halt`) share the empty Nop body — RPython
-                // codewriter has no `abort_permanent/`, and emitting
-                // `BC_ABORT_PERMANENT` here was a pyre-only divergence that
-                // failed blackhole resume when a guard tail landed on the
-                // loop-exit arm of `while cond { ... }` patterns.
-                crate::jit_interp::classify::ArmPattern::Nop
-                | crate::jit_interp::classify::ArmPattern::Halt => (
+                // `break` arms (`Halt`) use the same empty body as Nop — no
+                // `BC_ABORT_PERMANENT` is emitted for this loop-exit path.
+                crate::jit_interp::classify::ArmPattern::Nop => (
+                    quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
+                    dispatch_arm_inline_call_tokens(&[]),
+                ),
+                crate::jit_interp::classify::ArmPattern::Halt => (
                     quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
                     dispatch_arm_inline_call_tokens(&[]),
                 ),
@@ -2672,7 +2672,14 @@ pub(super) fn lower_dispatch_chain(
         // the dispatch loop at the portal merge point.  The GOTO is
         // required for control-flow correctness regardless of whether
         // the arm body emitted any LH inside its sub-JitCode.
-        lowerer.emit_jump(loop_start_label);
+        // `break` exits the source dispatch `while`, so its empty arm must
+        // flow to the function's typed return. Re-entering the loop here
+        // would execute the loop header with the post-HALT pc instead.
+        if matches!(arm.pattern, crate::jit_interp::classify::ArmPattern::Halt) {
+            lowerer.emit_jump(&default_label);
+        } else {
+            lowerer.emit_jump(loop_start_label);
+        }
 
         // Bind the skip label at the end of this arm's guard sequence.
         // Jumping here means "this arm did not match; proceed to next arm".
