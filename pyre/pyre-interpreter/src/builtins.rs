@@ -3660,6 +3660,24 @@ fn type_descr_new_with_metaclass(
         if unsafe { pyre_object::is_str(name_obj) } {
             check_surrogate(name_obj)?;
         }
+        // typeobject.py `type.__new__` — `isinstance_w(w_bases, w_tuple)` and
+        // `isinstance_w(w_dict, w_dict)`: bases must be a tuple and the
+        // namespace a dict (subclasses of each are accepted, e.g. a dict
+        // subclass namespace); neither is silently coerced.
+        let w_tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
+        if !unsafe { crate::baseobjspace::isinstance_w(bases, w_tuple_type) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 2 must be tuple, not {}",
+                crate::baseobjspace::object_functionstr_type_name(bases)
+            )));
+        }
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 3 must be dict, not {}",
+                crate::baseobjspace::object_functionstr_type_name(w_namespace_dict)
+            )));
+        }
         let name = unsafe { pyre_object::w_str_get_value(name_obj) };
 
         // CPython: calculate_metaclass — if bases have a custom metaclass,
@@ -3783,8 +3801,10 @@ fn type_descr_new_with_metaclass(
         } else {
             w_metaclass
         };
-        let w_winner = crate::call::calculate_metaclass(default_meta, w_effective_bases)
-            .unwrap_or(default_meta);
+        // A metaclass conflict among the bases (or an explicit metaclass that
+        // is not a subclass of every base's metaclass) is a hard error, not a
+        // silent fall-back to `default_meta`.
+        let w_winner = crate::call::calculate_metaclass(default_meta, w_effective_bases)?;
         if !std::ptr::eq(w_winner, default_meta) {
             // Winner is a different metaclass — delegate to its __new__
             if let Some(w_metaclass_new) =

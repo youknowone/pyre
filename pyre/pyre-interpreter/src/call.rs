@@ -2546,7 +2546,10 @@ pub(crate) fn calculate_metaclass(
             w_winner = w_base_type;
             continue;
         }
-        return Err(PyError::type_error("metaclass conflict"));
+        return Err(PyError::type_error(
+            "metaclass conflict: the metaclass of a derived class must be a \
+             (non-strict) subclass of the metaclasses of all its bases",
+        ));
     }
     Ok(w_winner)
 }
@@ -4207,7 +4210,16 @@ pub unsafe fn create_all_slots(
                 match slot_name.as_str() {
                     // typeobject.py:1165-1169: __dict__ slot
                     "__dict__" => {
-                        if wantdict || pyre_object::w_type_get_hasdict(w_type) {
+                        // A base whose instances already carry a dict disallows
+                        // a second one. Regular classes are flagged `hasdict`;
+                        // BaseException subclasses expose their dict through the
+                        // native exception slot (`w_exception_getdict`) without
+                        // the flag, so check the layout base explicitly.
+                        let base_has_dict = pyre_object::w_type_get_hasdict(w_type)
+                            || (!w_bestbase.is_null()
+                                && crate::builtins::lookup_exc_class("BaseException")
+                                    .is_some_and(|base_exc| issubtype_ptr(w_bestbase, base_exc)));
+                        if wantdict || base_has_dict {
                             return Err(crate::PyError::type_error(
                                 "__dict__ slot disallowed: we already got one".to_string(),
                             ));

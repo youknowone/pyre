@@ -1120,6 +1120,70 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
         ) {
             return Ok(None);
         }
+        // `interp_exceptions.py:859 W_SyntaxError.descr_str` — format
+        // `msg (filename, line lineno)`, falling back through the
+        // filename-only, lineno-only, and bare-msg shapes. Shared by the
+        // IndentationError / TabError subclasses (same `ExcKind`).
+        if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
+            let w_msg = crate::baseobjspace::syntax_error_attr(obj, "msg");
+            // `type(self.msg) is not str` → `return str(self.msg)`.
+            if w_msg.is_null()
+                || !pyre_object::pyobject::is_exact_type(w_msg, &STR_TYPE)
+            {
+                return Ok(Some(Wtf8Buf::from_string(py_str(w_msg)?)));
+            }
+            let compose = |extra: Option<Wtf8Buf>| -> Wtf8Buf {
+                let mut out = pyre_object::w_str_get_wtf8(w_msg).to_wtf8_buf();
+                if let Some(inner) = extra {
+                    out.push_str(" (");
+                    out.push_wtf8(&inner);
+                    out.push_str(")");
+                }
+                out
+            };
+            // `line %d` / `lines %d-%d` when `end_lineno > lineno`.
+            let w_lineno = crate::baseobjspace::syntax_error_attr(obj, "lineno");
+            let lineno_str: Option<Wtf8Buf> =
+                if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
+                    let lineno = crate::baseobjspace::int_w(w_lineno).unwrap_or(0);
+                    let w_end = crate::baseobjspace::syntax_error_attr(obj, "end_lineno");
+                    let end = if pyre_object::pyobject::is_exact_type(w_end, &INT_TYPE) {
+                        crate::baseobjspace::int_w(w_end).ok()
+                    } else {
+                        None
+                    };
+                    Some(match end {
+                        Some(end) if end > lineno => {
+                            Wtf8Buf::from_string(format!("lines {lineno}-{end}"))
+                        }
+                        _ => Wtf8Buf::from_string(format!("line {lineno}")),
+                    })
+                } else {
+                    None
+                };
+            // `have_filename` → `os.path.basename(self.filename or "???")`.
+            let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
+            if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
+                let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
+                let fname = if fbuf.as_bytes().is_empty() {
+                    Wtf8Buf::from_string("???".to_string())
+                } else {
+                    let start = fbuf
+                        .as_bytes()
+                        .iter()
+                        .rposition(|&b| b == b'/')
+                        .map_or(0, |i| i + 1);
+                    fbuf[start..].to_wtf8_buf()
+                };
+                let mut inner = fname;
+                if let Some(l) = lineno_str {
+                    inner.push_str(", ");
+                    inner.push_wtf8(&l);
+                }
+                return Ok(Some(compose(Some(inner))));
+            }
+            return Ok(Some(compose(lineno_str)));
+        }
         let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
         if args.is_null() || !pyre_object::is_tuple(args) {
             return Ok(None);

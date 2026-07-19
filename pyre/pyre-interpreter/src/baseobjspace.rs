@@ -341,7 +341,7 @@ fn exc_blocking_written(obj: PyObjectRef) -> bool {
 /// write lands in the hasdict instance dict: read it first so the write
 /// wins, then derive the construct-time value from `args_w`, and finally
 /// fall back to the `None` class default.
-fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
+pub(crate) fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
         if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
@@ -12192,9 +12192,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
                     // `calliter_iternext`: when the callable itself raises
                     // `StopIteration`, latch `it_callable` to `PY_NULL` so
-                    // further `next()` stays stopped, then re-raise.
+                    // further `next()` stays stopped. The callable's
+                    // StopIteration is cleared and replaced with a bare one —
+                    // its value/message does not leak to the consumer.
+                    let _ = e;
                     ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
-                    return Err(e);
+                    return Err(PyError::stop_iteration());
                 }
                 Err(e) => return Err(e),
             };
