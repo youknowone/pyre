@@ -14787,28 +14787,15 @@ fn init_bool_type(ns: PyObjectRef) {
 // ── Object TypeDef ───────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/objectobject.py TypeDef("object", ...)
 
-/// True when a class's `__new__` / `__init__` slot still resolves to the
-/// one `object` owns — i.e. the class does not override it.  A
-/// `staticmethod`-wrapped `__new__` is unwrapped to its function first
-/// (`_same_static_method`, objectobject.py:113-116) before the identity
-/// compare, so a slot carrying `object`'s own `__new__` staticmethod
-/// matches.
-fn object_slot_inherited(
-    class_slot: Option<PyObjectRef>,
-    object_slot: Option<PyObjectRef>,
-) -> bool {
-    let unwrap = |s: Option<PyObjectRef>| -> PyObjectRef {
-        match s {
-            Some(f) if unsafe { pyre_object::function::is_staticmethod(f) } => unsafe {
-                pyre_object::function::w_staticmethod_get_func(f)
-            },
-            Some(f) => f,
-            None => PY_NULL,
-        }
-    };
-    let a = unwrap(class_slot);
-    !a.is_null() && crate::baseobjspace::is_w(a, unwrap(object_slot))
-}
+// The `__new__` override check below uses raw slot identity
+// (`same_inherited_slot`), not a `staticmethod`-unwrapping compare.  PyPy's
+// `_same_static_method` (objectobject.py:113-116) unwraps a
+// `staticmethod`-wrapped `__new__` to its function before the identity
+// compare, so `__new__ = staticmethod(object.__new__)` counts as inherited;
+// CPython 3.14 keeps the wrapper as a distinct `tp_new` slot, so the same
+// assignment counts as an OVERRIDE and `Cls(1, 2)` raises
+// "object.__new__() takes exactly one argument (the type to instantiate)".
+// pyre targets CPython, so raw identity is the correct comparison here.
 
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
