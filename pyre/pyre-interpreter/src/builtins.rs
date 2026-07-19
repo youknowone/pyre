@@ -11115,7 +11115,6 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
-    let mut real_is_complex = false;
     let (mut real, mut imag) = match w_real {
         Some(a) => {
             let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
@@ -11142,31 +11141,31 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                     crate::type_methods::arg_type_name(a)
                 ));
             }
-            real_is_complex = has_complex_protocol;
             value
         }
         None => (0.0, 0.0),
     };
     if let Some(b) = w_imag {
-        let (br, bi, imag_is_complex) = if unsafe { is_complex(b) } {
+        let (br, bi) = if unsafe { is_complex(b) } {
             crate::warn::warn_deprecation(&format!(
                 "complex() argument 'imag' must be a real number, not {}",
                 crate::type_methods::arg_type_name(b)
             ));
-            unsafe { (w_complex_get_real(b), w_complex_get_imag(b), true) }
+            unsafe { (w_complex_get_real(b), w_complex_get_imag(b)) }
         } else {
             if !unsafe { complex_constructor_has_real_protocol(b) } {
                 return Err(complex_constructor_argument_error("imag", b));
             }
             let converted = builtin_float(&[b])?;
-            (unsafe { w_float_get_value(converted) }, 0.0, false)
+            (unsafe { w_float_get_value(converted) }, 0.0)
         };
-        // CPython 3.14 complex_new_impl: only genuinely complex arguments
-        // contribute the cross lanes; real inputs leave those lanes absent.
-        if imag_is_complex {
+        // complex(x, y) == x + y*j even if y is already complex; preserve the
+        // signs of zero lanes by subtracting/adding only when the source lane
+        // is nonzero, otherwise taking the operand's real part directly.
+        if bi != 0.0 {
             real -= bi;
         }
-        if real_is_complex {
+        if imag != 0.0 {
             imag += br;
         } else {
             imag = br;
@@ -11429,7 +11428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_uses_python314_signed_zero_with_complex_real() {
+    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
@@ -11437,7 +11436,7 @@ mod tests {
         );
         assert_eq!(
             unsafe { w_complex_get_imag(result).to_bits() },
-            0.0f64.to_bits()
+            (-0.0f64).to_bits()
         );
     }
 
