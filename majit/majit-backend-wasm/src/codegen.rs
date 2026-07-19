@@ -640,20 +640,19 @@ impl HomeLiveness {
 }
 
 /// Static collecting-call positions whose gcmap-visible homes may be forwarded.
-/// Alongside `New*`, conservatively include residual calls: an eligible direct
-/// residual target may allocate or force, so it needs the same post-call home
-/// reload as the allocation helpers.
+/// Every `is_malloc` op (the whole `New..=Newunicode` range, string allocations
+/// included) routes through a collecting allocator; conservatively include
+/// residual calls too, since an eligible direct residual target may allocate or
+/// force, so it needs the same post-call home reload as the allocation helpers.
 fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize> {
     ops.iter()
         .enumerate()
         .filter_map(|(i, op)| {
-            (op.opcode.is_call()
-                || matches!(
-                    op.opcode,
-                    OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear
-                ))
-            .then_some(i)
-            .or_else(|| (include_ca_collects && op.opcode == OpCode::CallAssemblerR).then_some(i))
+            (op.opcode.is_call() || op.opcode.is_malloc())
+                .then_some(i)
+                .or_else(|| {
+                    (include_ca_collects && op.opcode == OpCode::CallAssemblerR).then_some(i)
+                })
         })
         .collect()
 }
@@ -3014,6 +3013,24 @@ fn build_function(
                     sink.i64_store(mem64(frame.call_nargs_ofs));
                     sink.local_get(0);
                     emit_jit_call(&mut sink, jit_call, frame);
+                    // The trampoline routes to a collecting allocator, so the
+                    // call may have moved every other live Ref (and forwarded
+                    // the JitFrame). Reload them from their homes, skipping the
+                    // fresh result (`vi`), exactly as the `New` collecting path.
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
                     if !OpRef::raw_is_constant(vi) {
                         sink.local_get(0);
                         sink.i64_load(mem64(frame.call_result_ofs));
