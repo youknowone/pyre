@@ -376,6 +376,21 @@ pub struct ModuleDictStorage {
     pub entries: indexmap::IndexMap<String, PyObjectRef>,
 }
 
+/// Runtime-assigned GC type id for the [`ModuleDictStorage`] box.
+static MODULE_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the [`ModuleDictStorage`] box.
+pub fn set_module_dict_storage_gc_type_id(id: u32) {
+    MODULE_DICT_STORAGE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the [`ModuleDictStorage`] box.
+#[majit_macros::dont_look_inside]
+pub fn module_dict_storage_gc_type_id() -> u32 {
+    MODULE_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl ModuleDictStorage {
     pub fn new() -> Self {
         Self {
@@ -558,6 +573,21 @@ pub struct ModuleDictStrategy {
     /// invalidate every such loop, so it flips all live flags.  Weak refs
     /// so a dead loop token drops out without keeping the flag alive.
     version_watchers: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+}
+
+/// Runtime-assigned GC type id for the [`ModuleDictStrategy`] box.
+static MODULE_DICT_STRATEGY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the [`ModuleDictStrategy`] box.
+pub fn set_module_dict_strategy_gc_type_id(id: u32) {
+    MODULE_DICT_STRATEGY_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the [`ModuleDictStrategy`] box.
+#[majit_macros::dont_look_inside]
+pub fn module_dict_strategy_gc_type_id() -> u32 {
+    MODULE_DICT_STRATEGY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for ModuleDictStrategy {

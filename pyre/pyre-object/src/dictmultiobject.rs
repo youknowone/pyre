@@ -1029,12 +1029,13 @@ pub static MODULE_DICT_TYPE: PyType = new_pytype("dict");
 pub struct W_ModuleDictObject {
     pub ob_header: PyObject,
     /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py:47`).
-    /// Owned via `malloc_raw` (`Box::into_raw`).  Authoritative while
+    /// A GC-managed non-moving storage box (off-GC storage epic S3);
+    /// reassignment is a `setfield_gc`.  Authoritative while
     /// `object_storage` is null (ModuleDictStrategy mode); after
     /// `switch_to_object_strategy` it is cleared and not consulted.
     pub dstorage: *mut crate::celldict::ModuleDictStorage,
     /// `mstrategy` from `W_ModuleDictObject.__slots__` (`:331`).
-    /// Owned via `malloc_raw`.
+    /// A GC-managed non-moving storage box (off-GC storage epic S3).
     pub mstrategy: *mut crate::celldict::ModuleDictStrategy,
     /// `dstorage` after a `switch_to_object_strategy`
     /// (`celldict.py:173-186`).  Null while the dict is in
@@ -1051,36 +1052,6 @@ pub struct W_ModuleDictObject {
     /// Key-set mutation state corresponding to the live iterator held by
     /// PyPy's ModuleDictStrategy iterator implementation.
     pub keys_version: usize,
-}
-
-/// Free the three off-GC `malloc_raw` storages owned by a
-/// `W_ModuleDictObject`.  Called from the GC-sweep destructor
-/// (`pyre-jit::eval::module_dict_object_destructor`).  A regular
-/// `W_DictObject`'s `dstorage` is a GC-managed storage box reclaimed by its
-/// own tid drop glue (off-GC storage epic S2), but a module dict's
-/// `dstorage`/`mstrategy`/`object_storage` are still plain `Box::into_raw`
-/// allocations the GC never sees, so they must be reclaimed here (S3 scope).
-/// Null-checked and nulled after free so a second call is a no-op.  The
-/// `PyObjectRef` values inside the dropped containers are `Copy` (no `Drop`),
-/// so dropping frees only the container heap, never a GC object.
-///
-/// # Safety
-/// `obj` must point at a valid `W_ModuleDictObject` whose Boxes are not
-/// aliased by any other owner (they are not — nothing else frees them).
-pub unsafe fn w_module_dict_dealloc_storage(obj: PyObjectRef) {
-    let raw = &mut *(obj as *mut W_ModuleDictObject);
-    if !raw.dstorage.is_null() {
-        drop(Box::from_raw(raw.dstorage));
-        raw.dstorage = std::ptr::null_mut();
-    }
-    if !raw.mstrategy.is_null() {
-        drop(Box::from_raw(raw.mstrategy));
-        raw.mstrategy = std::ptr::null_mut();
-    }
-    if !raw.object_storage.is_null() {
-        drop(Box::from_raw(raw.object_storage));
-        raw.object_storage = std::ptr::null_mut();
-    }
 }
 
 /// GC type id assigned to `W_ModuleDictObject`.  Lands at slot 48,
@@ -1166,8 +1137,16 @@ impl W_DictMultiObject for W_ModuleDictObject {
 /// plain GCREF with no discriminant to erase.
 #[majit_macros::dont_look_inside]
 pub fn w_module_dict_new() -> PyObjectRef {
-    let strategy = crate::lltype::malloc_raw(crate::celldict::ModuleDictStrategy::new());
-    let storage = unsafe { crate::lltype::malloc_raw((*strategy).get_empty_storage()) };
+    let strategy = crate::gc_storage::gc_alloc_storage_box(
+        crate::celldict::ModuleDictStrategy::new(),
+        crate::celldict::module_dict_strategy_gc_type_id(),
+    );
+    let storage = unsafe {
+        crate::gc_storage::gc_alloc_storage_box(
+            (*strategy).get_empty_storage(),
+            crate::celldict::module_dict_storage_gc_type_id(),
+        )
+    };
     crate::lltype::malloc_typed_stable(W_ModuleDictObject {
         ob_header: PyObject {
             // `dictmultiobject.py:67 space.allocate_instance(...,
@@ -1325,7 +1304,10 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
         let key_obj = crate::celldict::_wrapkey(k);
         new_storage.insert(object_key_for(key_obj), v);
     }
-    raw.object_storage = crate::lltype::malloc_raw(new_storage);
+    raw.object_storage = crate::gc_storage::gc_alloc_storage_box(
+        new_storage,
+        object_dict_storage_gc_type_id(),
+    );
     storage.clear();
     // `celldict.py:180-184`: every live GlobalCache becomes invalid
     // because the strategy is being swapped out; the JIT must
