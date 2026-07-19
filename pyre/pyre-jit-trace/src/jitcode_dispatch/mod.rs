@@ -172,6 +172,10 @@ use crate::state::{ConcreteValue, MIFrame};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceCtx, default_effect_info};
 
+// jitcode_dispatch submodules (extracted from this file). Their `pub`
+// items are re-exported so `crate::jitcode_dispatch::` paths stay stable.
+// __SUBMODULES__
+
 /// Body of a callee jitcode that the walker needs to recurse into.
 /// RPython parity: when `inline_call_r_r/dR>r` fires, the metainterp
 /// reads the descr's `JitCode` body (`pyjitpl.py:1266-1324
