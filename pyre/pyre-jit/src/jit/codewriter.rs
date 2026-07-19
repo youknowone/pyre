@@ -11524,6 +11524,22 @@ impl CodeWriter {
                                 )
                             {
                                 emit_abort_permanent!(py_pc);
+                                // The bailout is a graph terminator even though
+                                // the runtime transfers control back to the
+                                // interpreter before reaching its successor.
+                                // Close it explicitly so `flatten.py make_link`
+                                // enters this block and emits the
+                                // bailout instead of treating its FrameState-
+                                // wide input arguments as a direct return.
+                                append_exit(
+                                    &current_block.block(),
+                                    super::flow::Link::new(
+                                        vec![super::flow::Constant::none().into()],
+                                        Some(graph.returnblock.clone()),
+                                        None,
+                                    )
+                                    .into_ref(),
+                                );
                                 continue;
                             }
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
@@ -16039,6 +16055,49 @@ def f(n):
                 .find_compiled_jitcode_arc(code_ptr)
                 .is_some(),
             "walker must close catch landings discovered while draining a handler"
+        );
+    }
+
+    #[test]
+    fn walker_delete_before_break_closes_unbound_load_bailout() {
+        let source = "\
+def f(n):
+    acc = 0
+    for i in range(n):
+        x = i
+        for j in range(10):
+            if j == 5:
+                del x
+                break
+        try:
+            acc += x
+        except UnboundLocalError:
+            acc += 7
+    return acc
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("DELETE_FAST break continuation must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            opnames.contains(&"abort_permanent"),
+            "the undefined LOAD_FAST_CHECK must bail to the interpreter"
         );
     }
 
