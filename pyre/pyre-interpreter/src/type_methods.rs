@@ -1743,8 +1743,9 @@ fn format_parse_err(
     crate::PyError::value_error(msg)
 }
 
-/// Geometry of a format spec: `[fill][align][sign][#][0][width][grouping]
-/// [.precision][type]`.  Only the presentation types the shared engine
+/// Geometry of a Python 3.14 format spec:
+/// `[fill][align][sign][#][0][width][grouping][.precision[grouping]][type]`.
+/// Only the presentation types the shared engine
 /// cannot format correctly — integer `c` and non-finite floats — read
 /// this back; every other case parses through `FormatSpec` directly.
 struct ParsedSpec {
@@ -1754,8 +1755,15 @@ struct ParsedSpec {
     alt_form: bool,
     width: usize,
     grouping: Option<char>,
+    fractional_grouping: Option<char>,
     precision: Option<usize>,
     ty: char,
+    /// The equivalent pre-3.14 spec accepted by rustpython-common's format
+    /// engine (the fractional grouping marker, and its otherwise-empty dot,
+    /// are removed).
+    engine_spec: String,
+    width_start: usize,
+    width_end: usize,
 }
 
 fn parse_spec(spec: &str) -> ParsedSpec {
@@ -1792,27 +1800,59 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         }
         i += 1;
     }
+    let width_start = i;
     let mut width = 0usize;
     while i < n && chars[i].is_ascii_digit() {
         width = width * 10 + (chars[i] as u8 - b'0') as usize;
         i += 1;
     }
+    let width_end = i;
     let mut grouping: Option<char> = None;
     if i < n && matches!(chars[i], ',' | '_') {
         grouping = Some(chars[i]);
         i += 1;
     }
     let mut precision: Option<usize> = None;
+    let mut fractional_grouping: Option<char> = None;
+    let mut empty_precision_dot: Option<usize> = None;
+    let mut fractional_grouping_index: Option<usize> = None;
     if i < n && chars[i] == '.' {
+        let dot = i;
         i += 1;
         let mut p = 0usize;
+        let precision_start = i;
         while i < n && chars[i].is_ascii_digit() {
             p = p * 10 + (chars[i] as u8 - b'0') as usize;
             i += 1;
         }
-        precision = Some(p);
+        if i < n && matches!(chars[i], ',' | '_') {
+            fractional_grouping = Some(chars[i]);
+            fractional_grouping_index = Some(i);
+            if i == precision_start {
+                // Python 3.14's `._f` means default precision plus
+                // fractional grouping, not precision zero.
+                empty_precision_dot = Some(dot);
+                precision = None;
+            } else {
+                precision = Some(p);
+            }
+            i += 1;
+        } else {
+            precision = Some(p);
+        }
     }
     let ty = if i < n { chars[i] } else { '\0' };
+    let engine_spec = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| {
+            if Some(index) == fractional_grouping_index || Some(index) == empty_precision_dot {
+                None
+            } else {
+                Some(*ch)
+            }
+        })
+        .collect();
     ParsedSpec {
         fill,
         align,
@@ -1820,9 +1860,68 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         alt_form,
         width,
         grouping,
+        fractional_grouping,
         precision,
         ty,
+        engine_spec,
+        width_start,
+        width_end,
     }
+}
+
+/// Return the normalized engine spec with its width replaced.  Fractional
+/// grouping is applied after rustpython-common has rounded the number; reducing
+/// the engine width by the number of inserted separators keeps Python's width
+/// measured against the final grouped result.
+fn float_engine_spec_with_width(p: &ParsedSpec, width: Option<usize>) -> String {
+    let chars: Vec<char> = p.engine_spec.chars().collect();
+    let mut out = String::new();
+    for ch in &chars[..p.width_start] {
+        out.push(*ch);
+    }
+    if let Some(width) = width
+        && width != 0
+    {
+        out.push_str(&width.to_string());
+    }
+    for ch in &chars[p.width_end..] {
+        out.push(*ch);
+    }
+    out
+}
+
+fn fractional_digit_count(s: &str) -> usize {
+    let Some(dot) = s.find('.') else {
+        return 0;
+    };
+    s[dot + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count()
+}
+
+fn group_fractional_digits(s: String, separator: char, digits: usize) -> String {
+    if digits < 4 {
+        return s;
+    }
+    let Some(dot) = s.find('.') else {
+        return s;
+    };
+    let fraction_start = dot + 1;
+    let fraction_end = fraction_start + digits;
+    let mut out = String::with_capacity(s.len() + (digits - 1) / 3);
+    out.push_str(&s[..fraction_start]);
+    for (index, byte) in s.as_bytes()[fraction_start..fraction_end]
+        .iter()
+        .enumerate()
+    {
+        if index != 0 && index % 3 == 0 {
+            out.push(separator);
+        }
+        out.push(*byte as char);
+    }
+    out.push_str(&s[fraction_end..]);
+    out
 }
 
 /// Pad `body` to `width` characters with `fill`, honouring the numeric
@@ -2425,7 +2524,7 @@ fn format_nonfinite(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
 /// for their exact messages; the type and grouping-with-`n` checks are
 /// applied on top.
 fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError> {
-    rustpython_common::format::FormatSpec::parse(spec)
+    rustpython_common::format::FormatSpec::parse(p.engine_spec.as_str())
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     if !matches!(p.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
         return Err(crate::PyError::value_error(format!(
@@ -2434,6 +2533,13 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
         )));
     }
     if let Some(sep) = p.grouping
+        && p.ty == 'n'
+    {
+        return Err(crate::PyError::value_error(format!(
+            "Cannot specify '{sep}' with 'n'."
+        )));
+    }
+    if let Some(sep) = p.fractional_grouping
         && p.ty == 'n'
     {
         return Err(crate::PyError::value_error(format!(
@@ -2450,7 +2556,25 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
 fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     validate_float_spec(spec, &p)?;
-    let parsed = rustpython_common::format::FormatSpec::parse(spec)
+    if let Some(separator) = p.fractional_grouping {
+        let unpadded_spec = float_engine_spec_with_width(&p, None);
+        let unpadded = rustpython_common::format::FormatSpec::parse(unpadded_spec.as_str())
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        let digits = fractional_digit_count(&unpadded);
+        let separators = digits.saturating_sub(1) / 3;
+        let adjusted_width = p.width.saturating_sub(separators);
+        let adjusted_spec = float_engine_spec_with_width(&p, Some(adjusted_width));
+        let rendered = rustpython_common::format::FormatSpec::parse(adjusted_spec.as_str())
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        return Ok(Wtf8Buf::from_string(group_fractional_digits(
+            rendered, separator, digits,
+        )));
+    }
+    let parsed = rustpython_common::format::FormatSpec::parse(p.engine_spec.as_str())
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     let s = parsed
         .format_float(v)

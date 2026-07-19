@@ -37,4 +37,18 @@ for cls in (float, complex):
 
 assert float.__doc__.startswith("Convert a string or number")
 assert complex.__doc__.startswith("Create a complex number")
+
+# Python 3.14 permits a second grouping option after the precision.  It
+# groups digits to the right of the decimal point independently of the
+# traditional integer-part grouping option.
+x = 123_456.123_456
+assert format(x, "._f") == "123456.123_456"
+assert format(x, ".,f") == "123456.123,456"
+assert format(x, "_._f") == "123_456.123_456"
+assert format(x, ".10_f") == "123456.123_456_000_0"
+assert format(x, "+.11_e") == "+1.234_561_234_56e+05"
+assert format(x, ">21._f") == "       123456.123_456"
+assert format(x, "021_._f") == "0_000_123_456.123_456"
+assert format(x, "023_.10_f") == "0_123_456.123_456_000_0"
+
 print("float/complex 3.14 surface: ok")
