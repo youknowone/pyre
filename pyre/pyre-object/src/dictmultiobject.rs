@@ -1706,7 +1706,7 @@ pub unsafe fn w_dict_lookup_checked(
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
-        if crate::is_str(key) {
+        if crate::is_exact_type(key, &crate::STR_TYPE) {
             return w_dict_lookup_object_strategy_checked(obj, key);
         }
         if _never_equal_to_string(key) {
@@ -1733,7 +1733,7 @@ pub unsafe fn w_dict_lookup_checked(
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
-        if crate::is_str(key) {
+        if crate::is_exact_type(key, &crate::STR_TYPE) {
             return Ok(strategy.getitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
@@ -1908,7 +1908,7 @@ unsafe fn w_dict_store_checked_inner(
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
-        if !crate::is_str(key) {
+        if !crate::is_exact_type(key, &crate::STR_TYPE) {
             w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
         }
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
@@ -1930,7 +1930,7 @@ unsafe fn w_dict_store_checked_inner(
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
-        if crate::is_str(key) {
+        if crate::is_exact_type(key, &crate::STR_TYPE) {
             strategy.setitem(obj, key, value);
             return Ok(());
         }
@@ -2479,7 +2479,7 @@ pub unsafe fn w_dict_delitem_checked(
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
-        if crate::is_str(key) {
+        if crate::is_exact_type(key, &crate::STR_TYPE) {
             return w_dict_delitem_object_strategy_checked(obj, key);
         }
         w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
@@ -3882,7 +3882,7 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// ```
 ///
 /// `switch_to_correct_strategy` discriminates the key type:
-/// `is_bytes` → Bytes, `is_str` → Unicode, plain `is_int`
+/// `is_bytes` → Bytes, exact str → Unicode, plain `is_int`
 /// (excluding bool) → Int.  IdentityDictStrategy is selected by
 /// the `compares_by_identity` MRO walker (Slice D5) routed through
 /// `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`; everything else falls
@@ -3907,7 +3907,7 @@ impl EmptyDictStrategy {
         }
         // `:696-698 type(w_key) is self.space.UnicodeObjectCls`
         // (Python 2 unicode / Python 3 str).
-        if crate::is_str(w_key) {
+        if crate::is_exact_type(w_key, &crate::STR_TYPE) {
             crate::dictmultiobject::w_dict_set_strategy(w_dict, &UNICODE_DICT_STRATEGY);
             return;
         }
@@ -4075,7 +4075,7 @@ impl EmptyKwargsDictStrategy {
             EMPTY_DICT_STRATEGY.switch_to_bytes_strategy(w_dict);
             return;
         }
-        if crate::is_str(w_key) {
+        if crate::is_exact_type(w_key, &crate::STR_TYPE) {
             self.switch_to_kwargs_strategy(w_dict);
             return;
         }
@@ -4774,7 +4774,7 @@ impl DictStrategy for UnicodeDictStrategy {
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        if crate::is_str(w_key) {
+        if crate::is_exact_type(w_key, &crate::STR_TYPE) {
             return crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key);
         }
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
@@ -4811,7 +4811,7 @@ impl DictStrategy for UnicodeDictStrategy {
 
     /// `dictmultiobject.py:1061-1067 AbstractTypedStrategy.setitem`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
-        if crate::is_str(w_key) {
+        if crate::is_exact_type(w_key, &crate::STR_TYPE) {
             crate::dictmultiobject::w_dict_store_object_strategy(w_dict, w_key, w_value);
             return;
         }
@@ -4821,7 +4821,7 @@ impl DictStrategy for UnicodeDictStrategy {
 
     /// `dictmultiobject.py:1081-1087 AbstractTypedStrategy.delitem`.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
-        if crate::is_str(w_key) {
+        if crate::is_exact_type(w_key, &crate::STR_TYPE) {
             return crate::dictmultiobject::w_dict_delitem_object_strategy(w_dict, w_key);
         }
         crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);

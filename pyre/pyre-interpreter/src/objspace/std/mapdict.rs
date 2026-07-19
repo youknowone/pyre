@@ -3017,8 +3017,9 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
 
     /// mapdict.py:1157-1166 `getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        if pyre_object::is_str(w_key) {
-            // mapdict.py:1161 `space.text_w(w_key)` — a str key (including a
+        if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
+            // mapdict.py:1161 `space.text_w(w_key)` — an exact str key
+            // (including a
             // lone surrogate) is looked up by its full WTF-8 name, so a
             // surrogate-named attribute is a mapdict node like any other.
             return instance_node_getdictvalue(
@@ -3042,7 +3043,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
 
     /// mapdict.py:1177-1183 `setitem`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
-        if pyre_object::is_str(w_key) {
+        if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             // mapdict.py:1180 — store under the full WTF-8 name so a
             // surrogate-named attribute becomes a mapdict node rather than
             // forcing a strategy switch.
@@ -3068,7 +3069,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     /// mapdict.py:1198-1211 `delitem`. pyre's trait returns `bool` (true =
     /// removed) where PyPy raises KeyError on a miss; the caller raises.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
-        if pyre_object::is_str(w_key) {
+        if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             // mapdict.py:1203 — delete by the full WTF-8 name (a surrogate
             // name addresses a real node, no strategy switch).
             return instance_node_deldictvalue(

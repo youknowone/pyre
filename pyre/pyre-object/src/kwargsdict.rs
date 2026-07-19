@@ -81,7 +81,7 @@ impl KwargsDictStrategy {
     /// (space.type(w_obj), space.w_text)`.  Plain str (Py3 unicode).
     #[inline]
     unsafe fn is_correct_type(w_key: PyObjectRef) -> bool {
-        crate::is_str(w_key)
+        crate::is_exact_type(w_key, &crate::STR_TYPE)
     }
 
     /// `kwargsdict.py:143-152 switch_to_unicode_strategy` —
