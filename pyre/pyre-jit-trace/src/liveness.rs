@@ -843,7 +843,7 @@ fn is_unconditional_jump(instr: &pyre_interpreter::bytecode::Instruction) -> boo
 /// Branch target PC for branching instructions.
 /// Uses skip_caches to account for cache slots after the instruction,
 /// matching the codewriter's target calculation.
-fn target_pc(
+pub(crate) fn target_pc(
     code: &CodeObject,
     instr: &pyre_interpreter::bytecode::Instruction,
     pc: usize,
