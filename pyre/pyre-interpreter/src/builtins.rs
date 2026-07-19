@@ -2996,10 +2996,10 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // no single-dict value, so route it through the gateway for the faithful
     // `_match_signature` arity error.
     if let [obj] = args {
-        return crate::baseobjspace::len(*obj);
+        return Ok(w_int_new(crate::baseobjspace::len_w(*obj)?));
     }
     let obj = parse_single_required(args, "obj", "len")?;
-    crate::baseobjspace::len(obj)
+    Ok(w_int_new(crate::baseobjspace::len_w(obj)?))
 }
 
 /// `abs(x)` — return the absolute value of a number.

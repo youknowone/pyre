@@ -9317,7 +9317,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let n = pyre_object::w_tuple_len(w_value);
         if n == 0 {
             return Err(crate::PyError::type_error(format!(
-                "can only assign non-empty tuple to {type_name}.__bases__"
+                "can only assign non-empty tuple to {type_name}.__bases__, not ()"
             )));
         }
         // find_best_base: pick the base with the most-derived instance layout.
@@ -9353,9 +9353,12 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // as Generic is fine; switching to an incompatible solid base is not.
         let cur_layout = pyre_object::w_type_get_layout_ptr(w_type);
         if best_layout != cur_layout {
+            // The clash names the new best base and the type's *current* best
+            // base (`__base__`), not the type being reassigned.
             return Err(crate::PyError::type_error(format!(
-                "__bases__ assignment: '{}' object layout differs from '{type_name}'",
-                pyre_object::w_type_get_name(w_bestbase)
+                "__bases__ assignment: '{}' object layout differs from '{}'",
+                pyre_object::w_type_get_name(w_bestbase),
+                pyre_object::w_type_get_name(pyre_object::typeobject::w_type_get_best_base(w_type))
             )));
         }
         pyre_object::typeobject::w_type_set_bases(w_type, w_value);

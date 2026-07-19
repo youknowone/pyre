@@ -2320,6 +2320,15 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                     "'=' alignment flag is not allowed in complex format specifier",
                 ));
             }
+            // Only the float presentation types e/E/f/F/g/G/n are valid for
+            // complex; reject any other code with a `complex`-typed message
+            // rather than letting the per-part float formatter report `float`.
+            if p.ty != '\0' && !matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n') {
+                return Err(crate::PyError::value_error(format!(
+                    "Unknown format code '{}' for object of type 'complex'",
+                    p.ty
+                )));
+            }
             let align = p.align.unwrap_or('>');
             // With no component-affecting flags, the default presentation is
             // exactly str(self), padded as a single complex value.

@@ -8482,7 +8482,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // objectobject.py:139-142 — w_newcls must be a W_TypeObject
         if !is_type(w_newcls) {
             return Err(crate::PyError::type_error(format!(
-                "__class__ must be set to new-style class, not '{}' object",
+                "__class__ must be set to a class, not '{}' object",
                 pyre_object::type_name_of(w_newcls),
             )));
         }
@@ -10055,11 +10055,32 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
 /// raise `OverflowError` ("int too large to convert to int") via
 /// `intobject.py:558` / `longobject.py` `_int_w`.
 fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
-    let n = int_w(w_int)?;
-    if n < 0 {
+    // `lt(w_int, 0)` — a negative length (including a negative bignum) raises
+    // ValueError, checked before the machine-word fit so it wins over the
+    // OverflowError. `w_int` is already the `space.index` result, so this is a
+    // plain int comparison.
+    let negative = is_true(crate::objspace::descroperation::compare(
+        w_int,
+        pyre_object::w_int_new(0),
+        crate::objspace::descroperation::CompareOp::Lt,
+    )?)?;
+    if negative {
         return Err(crate::PyError::value_error("__len__() should return >= 0"));
     }
-    Ok(n)
+    // `getindex_w(w_int, w_OverflowError)` — a length that does not fit a
+    // machine word reports the source type, `oefmt("cannot fit '%T' into an
+    // index-sized integer", w_obj)`, not the coerced int.
+    match int_w(w_int) {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
+            PyErrorKind::OverflowError,
+            format!(
+                "cannot fit '{}' into an index-sized integer",
+                object_functionstr_type_name(w_int)
+            ),
+        )),
+        Err(e) => Err(e),
+    }
 }
 
 /// pypy/objspace/descroperation.py:300-302 `len_w`.
