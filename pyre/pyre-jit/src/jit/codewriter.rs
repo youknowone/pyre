@@ -4562,6 +4562,61 @@ fn filter_liveness_in_place(
             union_r.extend(pc_live_r);
             union_f.extend(pc_live_f);
         }
+        // `liveness.py:67-75` keeps Ref values read by the instructions after
+        // this marker. Pyre's frame-slot filter normally removes scratch Ref
+        // colors, but LOAD_ATTR's in-place residual receiver/result is a live
+        // operand populated by the tracer and must be seeded before blackhole
+        // executes the call.
+        for next in ssarepr.insns.iter().skip(insn_idx + 1) {
+            if next.is_live() {
+                break;
+            }
+            let super::flatten::Insn::Op {
+                opname: _,
+                args,
+                result,
+            } = next
+            else {
+                continue;
+            };
+            // A sparse opcode-start marker can also precede the residual op
+            // that consumes the prior opcode's result (for example
+            // LOAD_NAME(r) followed by LOAD_ATTR). Those Ref arguments are
+            // real SSA-live values populated by the tracer, not disposable
+            // scratch, and must be seeded before blackhole executes the call.
+            let is_load_attr_call = args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    SsaOperand::Descr(descr)
+                        if matches!(
+                            &**descr,
+                            super::flatten::DescrOperand::CallDescrStub(stub)
+                                if stub.effect_info.pyre_helper
+                                    == majit_ir::PyreHelperKind::LoadAttr
+                        )
+                )
+            });
+            if is_load_attr_call && let Some(result) = result.filter(|reg| reg.kind == SsaKind::Ref)
+            {
+                for arg in args {
+                    match arg {
+                        SsaOperand::Register(reg) if *reg == result => {
+                            union_r.insert(reg.index);
+                        }
+                        SsaOperand::ListOfKind(list) if list.kind == SsaKind::Ref => {
+                            for item in &list.content {
+                                if let SsaOperand::Register(reg) = item
+                                    && *reg == result
+                                {
+                                    union_r.insert(reg.index);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // #348 Part (2): the marker's Ref colors are now final in `union_r`.
         // Collect the group's `(color, slot)` entries (union of member PCs'

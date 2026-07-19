@@ -5095,6 +5095,15 @@ fn walker_int_specialization_operands(
         if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
             return None;
         }
+        // A numeric subclass keeps the builtin `ob_type` layout while its
+        // Python-visible class lives in `w_class`.  The raw int specialization
+        // bypasses special-method dispatch, so only exact builtin ints/bools
+        // may enter it; subclasses continue through the residual BINARY_OP.
+        if !pyre_object::is_exact_builtin_instance(lhs_obj)
+            || !pyre_object::is_exact_builtin_instance(rhs_obj)
+        {
+            return None;
+        }
         (
             pyre_object::w_int_get_value(lhs_obj),
             pyre_object::w_int_get_value(rhs_obj),

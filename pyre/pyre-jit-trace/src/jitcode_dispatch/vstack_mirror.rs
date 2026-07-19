@@ -45,6 +45,7 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::UnaryNegative
         | Instruction::UnaryNot
         | Instruction::UnaryInvert
+        | Instruction::ToBool
         | Instruction::GetIter
         | Instruction::GetLen
         | Instruction::LoadAttr { .. }
