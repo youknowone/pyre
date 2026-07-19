@@ -3724,6 +3724,21 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// with the exact, depth-independent edge resolution. Empty outside the
     /// gated kept-stack path.
     pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
+
+    /// Extra virtual roots to seed into the guard snapshot beyond the outer
+    /// Python frame's jitcode-liveness boxes — walker-minted virtual op-results
+    /// that carry no liveness color yet must survive a deopt as fail-arg roots.
+    /// The motivating case is the `w_list_append` commit sub-walk over a
+    /// non-empty nested list element (`[[i] for i in range(n)]`): the appended
+    /// inner-list wrapper is passed to the sub-walk as a register arg but is not
+    /// named by any live outer color, so without an explicit root the resume
+    /// recursion never descends into it and its backing block resolves to a null
+    /// `OpRef`. Each entry is the `(OpRef, Type)` of a root the snapshot builder
+    /// must append to the top frame's boxes so the ported
+    /// `_visitor_walk_recursive` registers the nested virtual (wrapper + backing
+    /// block) in resume data. Empty on every path today: only populated behind
+    /// the DEFAULT-OFF `PYRE_NESTED_LIST_FOLD_VIRT` gate, so this is dormant.
+    pub sub_walk_extra_virtual_roots: &'a [(OpRef, majit_ir::Type)],
 }
 
 /// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
@@ -5983,6 +5998,26 @@ fn newlist_virt_enabled() -> bool {
 fn empty_append_virt_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("PYRE_EMPTY_APPEND_VIRT").map_or(true, |v| v != "0")
+    });
+    *ENABLED
+}
+
+/// `PYRE_NESTED_LIST_FOLD_VIRT` gate (read once) — admits a non-empty nested
+/// `BUILD_LIST` element (`[[i] for i in range(n)]`) into the orthodox
+/// `w_list_append` fold. The appended value is an already-virtualized inner
+/// list whose separately allocated backing block (`NewArray` / `NewArrayClear`)
+/// has no jitcode-liveness slot, so `collect_outer_active_boxes` cannot root it
+/// and it resolves to a null `OpRef` at a guard-exit deopt. Closing the gap
+/// needs the inner wrapper threaded into the append commit sub-walk's guard
+/// snapshot as an extra virtual root, so the resume-data recursion (the ported
+/// `_visitor_walk_recursive` / `VArrayInfo`) registers the backing block. That
+/// rooting machinery is being built incrementally; this gate keeps it opt-in
+/// and DEFAULT-OFF until the whole path is proven bit-exact on all backends.
+/// While off, `for_iter_bodies_all_jit_safe` still declines the shape, so the
+/// gate is a strict no-op.
+pub fn nested_list_fold_virt_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PYRE_NESTED_LIST_FOLD_VIRT").map_or(false, |v| v == "1")
     });
     *ENABLED
 }

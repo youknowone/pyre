@@ -4999,9 +4999,14 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
             // OpRef and crashes. The orthodox recovery is recursive virtual-list
             // forcing at the guard, threading each inner element box + length
             // into resume data (mirroring `_visitor_walk_recursive` /
-            // `VArrayInfo`); until that lands the shape declines. An empty `[]`
-            // element is Empty-strategy (no backing block) and unaffected;
-            // tuple / set / dict elements take non-list allocation paths.
+            // `VArrayInfo`); that rooting machinery is being built behind the
+            // DEFAULT-OFF `PYRE_NESTED_LIST_FOLD_VIRT` gate, so until it is
+            // proven bit-exact the gate stays off and the shape still declines.
+            // An empty `[]` element is Empty-strategy (no backing block) and
+            // unaffected; tuple / set / dict elements take non-list allocation
+            // paths.
+            let nested_list_fold_ok =
+                pyre_jit_trace::jitcode_dispatch::nested_list_fold_virt_enabled();
             let (body_has_call, body_has_nonempty_list_build) = {
                 let mut scan_state = pyre_interpreter::OpArgState::default();
                 let mut scan_pc = pc + 1;
@@ -5043,7 +5048,7 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::LoadName { .. }
                     )
                     || (!body_has_call
-                        && !body_has_nonempty_list_build
+                        && (!body_has_nonempty_list_build || nested_list_fold_ok)
                         && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
                     return false;
