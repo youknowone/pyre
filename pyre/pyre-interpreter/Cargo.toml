@@ -43,6 +43,7 @@ majit-metainterp = { workspace = true }
 stacker = { workspace = true }
 rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
+ruff-text-size = { workspace = true }
 num-complex = { workspace = true }
 malachite-bigint = { workspace = true }
 num-traits = { workspace = true }
