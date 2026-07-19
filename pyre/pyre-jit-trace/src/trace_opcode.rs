@@ -9761,6 +9761,14 @@ impl OpcodeStepExecutor for MIFrame {
             // each iteration instead of folding the trace-time heap
             // address into a `const_ref`.
             if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+                // Root the normalized `cause` across the class instantiation: it
+                // is a fresh oldgen exception held only in this Rust local,
+                // invisible to the precise collector until `attach_raise_cause`
+                // reads it, and the `call_function` below can drive a collection.
+                let _roots = pyre_object::gc_roots::push_roots();
+                if let Some(c) = cause {
+                    pyre_object::gc_roots::pin_root(c);
+                }
                 // Mirror `normalize_raise_value` (pyopcode.py:707/:713): the
                 // trace-time constructor call must stay on the plain
                 // interpreter path so it does not re-enter the tracer.

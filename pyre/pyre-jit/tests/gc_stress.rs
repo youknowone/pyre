@@ -505,3 +505,80 @@ assert result == 21, result
         "weak_subclasses gc stress program failed",
     );
 }
+
+/// A trace-built exception raised with a bare-class `from` cause survives a
+/// collection that fires while the fresh exception lives only in the tracer's
+/// `sym.trace_built_exc` (window A). `raise ValueError(n) from KeyError` builds
+/// the `ValueError(n)` instance at trace time and parks it in `trace_built_exc`;
+/// the `KeyError` cause normalization then allocates (a GC safepoint) before the
+/// instance is lifted back out at the raise. The `walk_active_sym_exc_roots`
+/// root walker keeps the parked instance alive across that collection — without
+/// it the caught exception's `args` are read from a swept block (wrong value or
+/// fault). Under `MAJIT_GC_STRESS` every allocation forces a full collection, so
+/// the cause normalization deterministically hits the window.
+#[test]
+fn trace_built_exc_from_class_cause_survives_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def run():
+    total = 0
+    n = 0
+    while n < 300:
+        junk = [0] * 16
+        try:
+            raise ValueError(n) from KeyError
+        except ValueError as e:
+            total = total + e.args[0]
+        gc.collect()
+        n = n + 1
+    return total
+
+result = run()
+assert result == 44850, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<trace_built_exc_from_class_cause_gc_stress>",
+        "trace-built exception window-A survival check",
+        "trace-built exc from-class-cause gc stress program failed",
+    );
+}
+
+/// A bare-class exception raised with a bare-class `from` cause exercises window
+/// B: the normalized cause (`RuntimeError`) lives only in a Rust local across the
+/// class-exception instantiation (`call_function(ValueError, &[])`), a GC
+/// safepoint, before `attach_raise_cause` reads it. The `push_roots` /
+/// `pin_root(cause)` bracket keeps the cause alive so `__cause__` is a live
+/// `RuntimeError`; without it that read is against a swept block. Under
+/// `MAJIT_GC_STRESS` the instantiation deterministically collects inside the
+/// window.
+#[test]
+fn class_exc_from_class_cause_keeps_cause_across_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def run():
+    ok = 0
+    n = 0
+    while n < 300:
+        junk = [0] * 16
+        try:
+            raise ValueError from RuntimeError
+        except ValueError as e:
+            if type(e.__cause__) is RuntimeError:
+                ok = ok + 1
+        gc.collect()
+        n = n + 1
+    return ok
+
+result = run()
+assert result == 300, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<class_exc_from_class_cause_gc_stress>",
+        "trace-built exception window-B cause survival check",
+        "class-exc from-class-cause gc stress program failed",
+    );
+}

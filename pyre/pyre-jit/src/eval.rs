@@ -2623,6 +2623,13 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_extra_root_walker(
         pyre_jit_trace::trace::walk_walk_end_propagated_exception,
     );
+    // Trace-time exception carriers held only in the active `PyreSym`
+    // (`trace_built_exc` / `last_exc_value` / `current_exc_value`): a
+    // trace-built exception is unreachable to the precise collector between its
+    // construction and the RAISE_VARARGS lift-out.
+    majit_gc::shadow_stack::register_extra_root_walker(
+        pyre_jit_trace::trace::walk_active_sym_exc_roots,
+    );
 }
 
 fn register_thread_root_areas() {

@@ -2922,6 +2922,15 @@ impl OpcodeStepExecutor for PyFrame {
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
+                        // Root the normalized `cause` across the class
+                        // instantiation: it is a fresh oldgen exception held only
+                        // in this Rust local, invisible to the precise collector
+                        // until `attach_raise_cause` reads it, and `call_function`
+                        // below can drive a collection.
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        if let Some(c) = cause {
+                            pyre_object::gc_roots::pin_root(c);
+                        }
                         // pyopcode.py:711-713 — class raise: call the type.
                         let result = crate::call_function(w_value, &[]);
                         if pyre_object::is_exception(result) {

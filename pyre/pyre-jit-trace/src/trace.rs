@@ -85,6 +85,73 @@ pub fn walk_walk_end_propagated_exception(visitor: &mut dyn FnMut(&mut majit_ir:
     });
 }
 
+thread_local! {
+    /// Raw pointer to the `PyreSym` being traced on this thread, or null when no
+    /// trace is in flight. Lets [`walk_active_sym_exc_roots`] reach the
+    /// trace-time exception carriers (`trace_built_exc` / `last_exc_value` /
+    /// `current_exc_value`) during a collection triggered mid-trace. Set at
+    /// [`trace_bytecode`] entry, restored on return.
+    static ACTIVE_SYM_EXC: std::cell::Cell<*mut PyreSym> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// RAII guard restoring the previous [`ACTIVE_SYM_EXC`] on drop, so nested /
+/// re-entrant `trace_bytecode` (recursive portal) unwinds to the outer trace's
+/// sym rather than leaving a stale or null anchor.
+pub(crate) struct ActiveSymExcGuard {
+    prev: *mut PyreSym,
+}
+
+impl Drop for ActiveSymExcGuard {
+    fn drop(&mut self) {
+        ACTIVE_SYM_EXC.with(|c| c.set(self.prev));
+    }
+}
+
+/// Publish `sym` as the active trace's exception-carrier anchor for the lifetime
+/// of the returned guard. Called once at [`trace_bytecode`] entry.
+pub(crate) fn set_active_sym_exc(sym: *mut PyreSym) -> ActiveSymExcGuard {
+    let prev = ACTIVE_SYM_EXC.with(|c| c.replace(sym));
+    ActiveSymExcGuard { prev }
+}
+
+/// Root the trace-time exception carriers held in the active `PyreSym`.
+///
+/// Between construction (`trace_built_exc.insert`, `trace_opcode.rs`) and
+/// lift-out (`swap_remove` at the raise), a trace-built exception is reachable
+/// only through `sym.trace_built_exc`, invisible to the precise collector; an
+/// allocating safepoint in that window would otherwise sweep it. `last_exc_value`
+/// / `current_exc_value` cover the seeded-raise and reraise paths.
+///
+/// Mirrors `walk_jit_exc_value`: the carriers are oldgen-stable exceptions
+/// (`try_gc_alloc_stable_raw`), so a bare mark-by-value suffices — no forwarded
+/// write-back — which means only a shared read of the sym is taken, never a
+/// second `&mut` aliasing the tracer's live borrow.
+pub fn walk_active_sym_exc_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let sym_ptr = ACTIVE_SYM_EXC.with(|c| c.get());
+    if sym_ptr.is_null() {
+        return;
+    }
+    // SAFETY: a collection triggered mid-trace runs on the SAME thread (the
+    // allocating thread becomes the collector), so the tracer's `&mut PyreSym`
+    // up the stack is a suspended frame. Only a shared `&PyreSym` is formed and
+    // oldgen-stable (non-moving) exceptions are marked by value, never writing a
+    // forwarded pointer back — matching the accepted `jit_driver_pair_from_root_area`
+    // convention in `pyre-jit`.
+    let sym = unsafe { &*sym_ptr };
+    let mut mark = |p: pyre_object::PyObjectRef| {
+        if !p.is_null() {
+            let mut gcref = majit_ir::GcRef(p as usize);
+            visitor(&mut gcref);
+        }
+    };
+    mark(sym.last_exc_value);
+    mark(sym.current_exc_value);
+    for exc in sym.trace_built_exc.values() {
+        mark(*exc);
+    }
+}
+
 pub fn take_walk_end_restart_pc() -> Option<usize> {
     WALK_END_RESTART_PC.with(|c| c.replace(None))
 }
@@ -524,6 +591,13 @@ pub fn trace_bytecode(
     // Likewise drop any cross-frame-resume abort request a prior aborted
     // trace left unconsumed.
     let _ = crate::state::take_trace_abort_requested();
+
+    // Publish this trace's `sym` as the exception-carrier root anchor: a
+    // collection triggered by an allocating traced opcode marks the trace-built
+    // exception held only in `sym.trace_built_exc` (and the seeded/caught
+    // `last_exc_value` / `current_exc_value`). The guard restores the prior
+    // anchor on every return path, including panics and nested tracing.
+    let _active_sym_guard = set_active_sym_exc(&mut *sym as *mut PyreSym);
 
     let ctx = meta
         .trace_ctx()
