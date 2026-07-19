@@ -412,11 +412,28 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // a loop-carried local read after a may-force op in the loop body has no
     // heapcache entry this pass, yet its recording-time concrete is known.
     let shadow_value = if matches!(shadow_value, Value::Void) {
-        ctx.callee_shadow
+        let entry = ctx
+            .callee_shadow
             .as_ref()
             .and_then(|shadow| shadow.concrete.get(&index_value).copied())
-            .filter(|entry| entry.frame_reg == code[op.pc + 1] as u16)
-            .map(|entry| entry.value)
+            .filter(|entry| entry.frame_reg == code[op.pc + 1] as u16);
+        let slot_opref = ctx
+            .callee_shadow
+            .as_ref()
+            .and_then(|shadow| shadow.opref.get(&index_value).copied());
+        // Prefer re-resolving the slot's SSA OpRef through the op-table (a
+        // GC-forwarded, rooted value channel) over the raw concrete copy the
+        // shadow holds: `CalleeLocalsShadow.concrete` is not visited by the
+        // trace-ref walker, so a Ref copy dangles if a minor collection moved a
+        // nursery object across the may-force residual. The op-table concrete IS
+        // forwarded. Fall back to the stored copy when the OpRef carries no live
+        // concrete (ints/floats are value copies of immutable payloads and are
+        // always safe). Only consult the OpRef when a frame-matched `concrete`
+        // entry exists, so the per-frame isolation the `frame_reg` filter gives
+        // `concrete` also bounds the OpRef re-resolution.
+        entry
+            .and_then(|_| slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref)))
+            .or_else(|| entry.map(|entry| entry.value))
             .unwrap_or(Value::Void)
     } else {
         shadow_value
@@ -574,7 +591,12 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     );
     // Keep the inline concrete-locals shadow current so a later read of this
     // slot (after a may-force op clears the heapcache) recovers the concrete.
+    // Seed BOTH maps: the read fallback prefers re-resolving the slot's OpRef
+    // through the (GC-forwarded) op-table over the raw `concrete` copy, so the
+    // OpRef must track the stored value on every write — otherwise a re-stored
+    // slot would re-resolve a stale OpRef while `concrete` held the fresh value.
     if let Some(shadow) = ctx.callee_shadow.as_mut() {
+        shadow.set_opref(index_value, value);
         shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
     }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;

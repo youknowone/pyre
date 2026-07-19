@@ -2080,8 +2080,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         //    shadow for `try_multiframe` too gives that re-read a fallback — the
         //    analog of the callee MIFrame register box RPython reads
         //    `box.getint()` off (registers survive a residual call; the heapcache
-        //    does not).  STORE_FAST keeps it current (the `setarrayitem_vable`
-        //    handler re-seeds `set_concrete` on every store).
+        //    does not).  STORE_FAST keeps both maps current (the
+        //    `setarrayitem_vable` handler re-seeds `set_opref` + `set_concrete`
+        //    on every store).
+        //
+        //    `set_opref` is seeded on BOTH paths (not just the fold): the read
+        //    fallback re-resolves the slot's concrete through `concrete_of_opref`
+        //    on this OpRef — a GC-forwarded, rooted channel — in preference to
+        //    the raw `Value` copy in `concrete`, which the trace-ref walker does
+        //    not visit and so dangles if a minor collection moves a nursery Ref
+        //    across the may-force residual.  The fold consumer stays gated by
+        //    `fold_frame_reg` (kept `!try_multiframe`), so seeding `opref` here is
+        //    inert for folding on the multiframe path.
         //
         // Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF / frame reg
         // unresolved).
@@ -2097,9 +2107,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     .concrete_of_opref(callee_args[i])
                     .unwrap_or(majit_ir::Value::Void);
                 let shadow = sub_wc.callee_shadow.as_mut().unwrap();
-                if !try_multiframe {
-                    shadow.set_opref(slot, value);
-                }
+                shadow.set_opref(slot, value);
                 shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
             }
         }
