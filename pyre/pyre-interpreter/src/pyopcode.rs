@@ -187,15 +187,17 @@ pub fn decode_instruction_for_dispatch(
 ///
 /// `OpArgState` resets its accumulator after every real opcode, so the fully
 /// accumulated oparg at a real opcode depends only on the contiguous
-/// `ExtendedArg` run immediately preceding it. The dispatch loop reaches a
-/// real opcode both by fall-through from its prefix (interpreter) and by a
-/// jump/loop-header/resume coordinate that points at the real opcode past the
-/// prefix (`jump_target_backward` targets the opcode, not its `ExtendedArg`).
-/// To reconstruct the same triple in either case, back up to the logical
-/// start over any immediately-preceding `ExtendedArg` units, then accumulate
-/// forward with a fresh state. The back-up loop body runs zero times in the
-/// common no-prefix case (the unit before a real opcode is not `ExtendedArg`),
-/// so the hot path stays a single forward pass.
+/// `ExtendedArg` run immediately preceding it. The interpreter reaches a real
+/// opcode by fall-through from its `ExtendedArg` prefix (the logical start),
+/// but the JIT dispatch loop enters at a coordinate normalized through
+/// `skip_python_trivia_forward`, which advances past `ExtendedArg` units (they
+/// are trivia in pyre's pc-indexed metadata keying) and so names the real
+/// opcode *past* its prefix. This preserves the backward-scanning
+/// `decode_instruction_at` contract for both: back up to the logical start
+/// over any immediately-preceding `ExtendedArg` units, then accumulate forward
+/// with a fresh state. The back-up loop body runs zero times in the common
+/// no-prefix case (the unit before a real opcode is not `ExtendedArg`), so the
+/// hot path stays a single forward pass.
 ///
 /// Shares `decode_instruction_for_dispatch`'s `u8 < 44` malformed-chain guard
 /// and returns `BytecodeCorruption` on out of bounds.
