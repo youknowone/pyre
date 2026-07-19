@@ -6,7 +6,7 @@ use std::rc::Rc;
 use lexopt::Arg::*;
 use lexopt::ValueExt;
 
-use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx, set_last_exec_ctx};
+use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
@@ -649,14 +649,13 @@ fn maybe_print_jit_stats() {
 
 /// Shared top-level launcher bootstrap for `run_source` and `run_module`:
 /// register `__build_class__`, create the process `ExecutionContext`, seed
-/// the build-class and `LAST_EXEC_CTX` TLS slots so
+/// the `LAST_EXEC_CTX` TLS slot so
 /// `space.getexecutioncontext()` (sys.settrace/getframe) resolves from the
 /// first user statement, and install SIGINT handling (app_main.py:926).
 fn setup_exec_context() -> Rc<PyExecutionContext> {
     // Register __build_class__ callback (PyPy: setup_builtin_modules)
     register_build_class();
     let execution_context = Rc::new(PyExecutionContext::default());
-    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
     unsafe {
         let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;

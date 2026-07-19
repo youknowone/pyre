@@ -1293,18 +1293,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::clear_call_error",
         clear_call_error as *const (),
     );
-    // `#[dont_look_inside]` execution-context thread-local reads
-    // (`BUILD_CLASS_EXEC_CTX` / `LAST_EXEC_CTX`), twins of the call-error
-    // slot accessors above; front::mir const-folds the `ThreadLocal` global
-    // to None, so their bodies have no extractable graph and the call stays
-    // a residual read via the registered fnaddr.
-    let build_class_exec_ctx: fn() -> *const crate::PyExecutionContext =
-        crate::call::build_class_exec_ctx;
-    push_fnaddr(
-        &mut entries,
-        "pyre_interpreter::call::build_class_exec_ctx",
-        build_class_exec_ctx as *const (),
-    );
+    // `#[dont_look_inside]` execution-context thread-local read, a twin of
+    // the call-error slot accessors above. front::mir const-folds the
+    // `ThreadLocal` global to None, so its body has no extractable graph and
+    // the call stays a residual read via the registered fnaddr.
     let take_last_exec_ctx: fn() -> *const crate::PyExecutionContext =
         crate::call::take_last_exec_ctx;
     push_fnaddr(

@@ -994,23 +994,17 @@ impl ExecutionContext {
     }
 
     /// Celldict globals for a fresh module (`__main__`, imported source
-    /// modules). Seeds the builtins + `__builtins__` directly into
-    /// the `W_ModuleDictObject`'s authoritative cell storage so the JIT sees a
-    /// stable globals shape up front (same seed-vs-fallback rationale as
-    /// module dict. The `IntMutableCell` in-place write stands alone, matching
-    /// PyPy's `ModuleDictStrategy`.
+    /// modules). PyPy `imp.importing.exec_code_module` adds only the
+    /// `__builtins__` module to this namespace; builtin names remain a
+    /// LOAD_GLOBAL fallback and are not observable module globals.
     pub fn fresh_module_globals(&self) -> PyObjectRef {
         let dict = pyre_object::dictmultiobject::w_module_dict_new();
-        // Root the fresh dict across the seeding loop: each
-        // `w_dict_setitem_str_no_proxy` allocates a cell and may trigger a
-        // minor collection that would otherwise reclaim the not-yet-referenced
-        // dict.
+        // Root the fresh dict while installing `__builtins__`: allocating its
+        // module-dict cell may trigger a minor collection before the caller
+        // has stored the new namespace anywhere else.
         let _root = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(dict);
         unsafe {
-            for (k, v) in pyre_object::w_dict_str_entries(self.builtins_module) {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, &k, v);
-            }
             let w_builtin = self.get_builtin();
             if !w_builtin.is_null() {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

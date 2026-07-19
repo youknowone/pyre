@@ -26,7 +26,7 @@
 
 use std::rc::Rc;
 
-use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx, set_last_exec_ctx};
+use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
@@ -59,7 +59,6 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     register_build_class();
 
     let execution_context = Rc::new(PyExecutionContext::default());
-    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
 
     let mut frame = PyFrame::new_with_context(code, execution_context)

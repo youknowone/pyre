@@ -79,9 +79,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // callable (the classmethod is read straight off the function object, so
     // it is called with just the outer iterable).
     let from_iterable_fn = crate::make_builtin_function("from_iterable", |args| {
-        let outer = args.first().copied().ok_or_else(|| {
-            crate::PyError::type_error("from_iterable() missing 1 required positional argument")
-        })?;
+        if args.len() != 1 {
+            return Err(crate::PyError::type_error(format!(
+                "chain.from_iterable() takes exactly one argument ({} given)",
+                args.len()
+            )));
+        }
+        let outer = args[0];
         let iterables = crate::baseobjspace::iter(outer)?;
         Ok(pyre_object::interp_itertools::w_chain_new(iterables))
     });

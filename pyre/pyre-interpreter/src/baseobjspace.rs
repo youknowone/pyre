@@ -1891,12 +1891,11 @@ pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
         if pyre_object::w_list_iter_seq(args[0]).is_null() {
             return Ok(w_none());
         }
-        // CPython 3.14's listiter_setstate parses the state through an
-        // unsigned size; a negative value therefore becomes an exhausted
-        // cursor. This is a deliberate 3.14 oracle difference from PyPy's
-        // abstract sequence iterator, which clamps negative state to zero.
+        // PyPy `W_AbstractSeqIterObject.descr_setstate` clamps a negative
+        // cursor to zero for every live sequence iterator, including the
+        // specialised list iterator.
         if index < 0 {
-            index = i64::MAX;
+            index = 0;
         }
         pyre_object::w_list_iter_set_index(args[0], index);
     }
