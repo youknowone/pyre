@@ -13986,7 +13986,32 @@ fn init_float_type(ns: PyObjectRef) {
             "from_number",
             pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
                 "from_number",
-                |args| Ok(w_float_new(crate::baseobjspace::float_w(args[1])?)),
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "float.from_number() missing required argument 'number' (pos 1)",
+                        ));
+                    }
+                    let value = args[1];
+                    // Python 3.14 float.from_number uses the numeric
+                    // conversion protocol (__float__, then __index__) but,
+                    // unlike float(), never accepts textual inputs.
+                    if unsafe {
+                        pyre_object::is_str(value)
+                            || pyre_object::is_bytes(value)
+                            || pyre_object::is_bytearray(value)
+                            || pyre_object::is_complex(value)
+                    } {
+                        return Err(crate::PyError::type_error(format!(
+                            "must be real number, not {}",
+                            crate::type_methods::arg_type_name(value)
+                        )));
+                    }
+                    // Reuse float.__new__'s exact base/subclass allocation:
+                    // exact base floats retain identity, while a classmethod
+                    // invoked on a float subclass returns that subclass.
+                    float_descr_new(&[args[0], value])
+                },
                 2,
             )),
         )

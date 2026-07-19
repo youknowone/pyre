@@ -27,6 +27,24 @@ class Number:
 assert float.from_number(Number()) == 2.5
 assert complex.from_number(Number()) == 2 + 3j
 
+
+class IndexOnly:
+    def __index__(self):
+        return 314
+
+
+class FloatSubclass(float):
+    pass
+
+
+assert float.from_number(IndexOnly()) == 314.0
+subclass_value = FloatSubclass.from_number(IndexOnly())
+assert subclass_value == 314.0
+assert type(subclass_value) is FloatSubclass
+
+nan = float("nan")
+assert float.from_number(nan) is nan
+
 for cls in (float, complex):
     try:
         cls.from_number("3")
