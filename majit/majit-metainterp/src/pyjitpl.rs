@@ -4100,8 +4100,16 @@ impl<M: Clone> MetaInterp<M> {
                 return InlineDecision::ResidualCall;
             };
             let green_key = crate::green_key_hash_typed(green_values, &jd.green_args_spec());
-            let callee_compiled =
-                compiled_loops.contains_key(&green_key) || pending_green_key == Some(green_key);
+            // `callee_compiled` must recognise every token the sibling
+            // `recursive_target` resolver can produce — `warm_state.get_compiled`
+            // returns the cell's procedure token, including the tmp-callback
+            // tokens `get_assembler_token` installs (warmstate.py:714-723).
+            // Without the `get_compiled` disjunct the decision reports "no
+            // token" and aborts while `recursive_target` would have resolved
+            // one, the exact drift `decide_recursive_inline` is meant to prevent.
+            let callee_compiled = compiled_loops.contains_key(&green_key)
+                || pending_green_key == Some(green_key)
+                || warm_state.get_compiled(green_key).is_some();
             let can_inline = warm_state.can_inline_callable(green_key);
             let (decision, _should_disable) = decide_recursive_inline(
                 callee_compiled,
@@ -11583,11 +11591,16 @@ impl<M: Clone> MetaInterp<M> {
         // token on demand (warmstate.py:714). Pyre uses the pending-token
         // entry for inlining-decision purposes only; emitted CALL_ASSEMBLER
         // descrs resolve to either a compiled token or a tmp-callback token.
+        // The `warm_state.get_compiled` disjunct mirrors the production
+        // `recursive_decision` closure so a callee whose only token lives on a
+        // warm cell (a tmp-callback install `get_assembler_token` performed for
+        // a sibling entry) is still recognised as compiled here.
         let callee_compiled = self.compiled_loops.contains_key(&callee_key)
             || self
                 .pending_token
                 .as_ref()
-                .is_some_and(|(k, _)| *k == callee_key);
+                .is_some_and(|(k, _)| *k == callee_key)
+            || self.warm_state.get_compiled(callee_key).is_some();
 
         // Not tracing: pyjitpl.py:1381 `warmrunnerstate.inlining`
         // is only meaningful inside a trace. Route compiled
@@ -14559,9 +14572,11 @@ pub enum InlineDecision {
 /// pyjitpl.py:1404 `dont_trace_here` performs — this returns
 /// `should_disable = true` exactly in that gate.
 ///
-/// `callee_compiled` folds `compiled_loops.contains_key || pending_token`
-/// (the pyre `get_assembler_token` stand-in).  `can_inline` is
-/// `warm_state.can_inline_callable` (pyjitpl.py:1382).
+/// `callee_compiled` folds `compiled_loops.contains_key || pending_token ||
+/// warm_state.get_compiled` (the pyre `get_assembler_token` stand-in — the
+/// `get_compiled` disjunct keeps it aligned with the `recursive_target` token
+/// resolver).  `can_inline` is `warm_state.can_inline_callable`
+/// (pyjitpl.py:1382).
 pub(crate) fn decide_recursive_inline(
     callee_compiled: bool,
     can_inline: bool,
