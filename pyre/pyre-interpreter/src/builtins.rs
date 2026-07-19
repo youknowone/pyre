@@ -11406,6 +11406,7 @@ mod tests {
 
     #[test]
     fn test_hash_rejects_tuple_containing_unhashable_key() {
+        crate::typedef::init_typeobjects();
         let value = w_tuple_new(vec![w_list_new(vec![])]);
         let err = builtin_hash(&[value]).expect_err("tuple hash should reject list element");
 
