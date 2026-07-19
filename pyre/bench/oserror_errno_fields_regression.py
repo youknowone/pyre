@@ -4,7 +4,9 @@
 # FileExistsError(17).  Native-only: the wasm guest has no os/filesystem
 # (open() raises NotImplementedError, `import os` has no posix backend), so
 # this guard is registered with skip_backends=("wasm",).  Behaviour verified
-# against CPython/PyPy.
+# against CPython/PyPy.  The mkdir target is os.getcwd() rather than "/" so
+# the EEXIST path is exercised identically on POSIX and Windows (where "/"
+# is a drive root that raises access-denied, not EEXIST).
 import os
 
 PATH = "/no/such/file/xyz_pyre_probe"
@@ -23,14 +25,14 @@ def check():
         raise AssertionError("open() of a missing path did not raise")
 
     try:
-        os.mkdir("/")
+        os.mkdir(os.getcwd())
     except FileExistsError as e:
         assert type(e).__name__ == "FileExistsError", type(e).__name__
         assert e.errno == 17, e.errno
         assert isinstance(e.strerror, str), e.strerror
         assert e.args == (17, e.strerror), e.args
     else:
-        raise AssertionError("os.mkdir('/') did not raise")
+        raise AssertionError("os.mkdir of the cwd did not raise")
 
 
 for _ in range(200):
