@@ -404,9 +404,6 @@ fn real_main() {
 
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
-    // The `OpcodeHandler` trait impls for `MIFrame` are hand-maintained Rust
-    // in `src/opcode_handler_impls.rs` (the `pyjitpl.py` analog), not codegen.
-
     // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();

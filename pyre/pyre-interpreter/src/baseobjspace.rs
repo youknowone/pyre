@@ -6986,7 +6986,7 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
 
 /// `callmethod.py:25-85 LOAD_METHOD` fast-path decision, shared by the
 /// interpreter (`eval::load_method`) and the JIT tracer
-/// (`trace_opcode::try_load_method_fast_path`) so both produce the
+/// (`jitcode_dispatch::try_walker_specialize_load_method_attr`) so both produce the
 /// identical `[w_descr, w_obj]` stack shape — the tracer otherwise records
 /// a `[descr, self]` shape while the concrete frame keeps the `getattr`
 /// `[bound_method, null]` shape, and the two desync at the following

@@ -91,11 +91,6 @@ mod generated_root {
 }
 pub use generated_root::*;
 
-// `OpcodeHandler` trait impls for `MIFrame` — the trace-time twin of
-// `PyFrame`'s impls in `pyre-interpreter`. Hand-maintained (the `pyjitpl.py`
-// analog), so this is a plain module rather than generated code.
-mod opcode_handler_impls;
-
 // Fixed trace helpers (operator dispatch tables, concrete computation,
 // unbox/box/binop trace primitives, typed `generated_*` operations). These
 // are hand-maintained Rust — the `pyjitpl.py`/`executor.py` analogs — not
