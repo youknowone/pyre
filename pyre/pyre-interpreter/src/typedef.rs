@@ -9343,6 +9343,19 @@ fn init_type_type(ns: PyObjectRef) {
     };
 }
 
+/// `typeobject.py:1090 mro_subclasses` — recompute the MRO of `w_type` and,
+/// recursively, of every subclass, after a base change alters the
+/// linearization.  The subclasses stay reachable through the (rooted) type
+/// hierarchy across each `compute_mro` allocation, so the walk needs no
+/// extra rooting (mirrors `baseobjspace::mutated`).
+unsafe fn mro_subclasses(w_type: PyObjectRef) {
+    let mro = crate::baseobjspace::compute_mro(w_type);
+    pyre_object::w_type_set_mro(w_type, mro);
+    for w_sc in pyre_object::typeobject::w_type_get_subclasses(w_type) {
+        mro_subclasses(w_sc);
+    }
+}
+
 /// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
 /// Heap types only; the new bases must be a non-empty tuple of classes whose
 /// best base shares the current instance layout (so instances stay valid).
@@ -9410,10 +9423,29 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 pyre_object::w_type_get_name(pyre_object::typeobject::w_type_get_best_base(w_type))
             )));
         }
+        // Invalidate the method cache of w_type and every subclass before the
+        // hierarchy changes (typeobject.py:1130 `w_type.mutated(None)`).
+        crate::baseobjspace::mutated(w_type, None);
+        // Unlink w_type from its old bases' subclass lists before switching to
+        // the new bases (typeobject.py:1136-1138 `remove_subclass`); the new
+        // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
+        // `add_subclass`).
+        let saved_bases = pyre_object::typeobject::w_type_get_bases(w_type);
+        if !saved_bases.is_null() {
+            let old_n = pyre_object::w_tuple_len(saved_bases);
+            for i in 0..old_n as i64 {
+                if let Some(w_oldbase) = pyre_object::w_tuple_getitem(saved_bases, i) {
+                    if pyre_object::is_type(w_oldbase) {
+                        pyre_object::typeobject::w_type_remove_subclass(w_oldbase, w_type);
+                    }
+                }
+            }
+        }
         pyre_object::typeobject::w_type_set_bases(w_type, w_value);
-        let mro = crate::baseobjspace::compute_mro(w_type);
-        pyre_object::w_type_set_mro(w_type, mro);
         pyre_object::typeobject::w_type_ready(w_type);
+        // Recompute the MRO of w_type and, recursively, of every subclass
+        // (typeobject.py:1144 `mro_subclasses`).
+        mro_subclasses(w_type);
         Ok(pyre_object::w_none())
     }
 }
