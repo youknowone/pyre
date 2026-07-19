@@ -7669,35 +7669,119 @@ fn slice_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate
 }
 
 /// sliceobject.py:148 `W_SliceObject.descr_indices`.
+fn slice_eval_index_big(value: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyError> {
+    match crate::baseobjspace::space_index(value) {
+        Ok(indexed) => Ok(unsafe { pyre_object::range_obj_to_bigint(indexed) }),
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+            Err(crate::PyError::type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "indices")?;
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "slice.indices() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(self_);
-    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_object::gc_roots::pin_root(args[1]);
-    let length_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let length = crate::builtins::getindex_w(unsafe {
-        pyre_object::gc_roots::shadow_stack_get(length_slot)
+    // sliceobject.py app-level `indices`: unlike the machine-word
+    // `indices3()` used by concrete sequence operations, this rarely-used
+    // public method deliberately keeps start/stop/step/length unbounded.
+    let indexed_length = crate::baseobjspace::space_index(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(roots + 1)
     })?;
-    if length < 0 {
+    let length = unsafe { pyre_object::range_obj_to_bigint(indexed_length) };
+    let zero = malachite_bigint::BigInt::from(0);
+    let one = malachite_bigint::BigInt::from(1);
+    if length < zero {
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
             "length should not be negative".to_string(),
         ));
     }
-    let self_ = unsafe { pyre_object::gc_roots::shadow_stack_get(self_slot) };
-    let (start, stop, step) = unsafe {
-        crate::sliceobject::indices3(
-            pyre_object::sliceobject::w_slice_get_start(self_),
-            pyre_object::sliceobject::w_slice_get_stop(self_),
-            pyre_object::sliceobject::w_slice_get_step(self_),
-            length,
-        )?
+    let w_step = unsafe {
+        pyre_object::sliceobject::w_slice_get_step(pyre_object::gc_roots::shadow_stack_get(roots))
     };
+    let step = if unsafe { pyre_object::is_none(w_step) } {
+        one.clone()
+    } else {
+        let step = slice_eval_index_big(w_step)?;
+        if step == zero {
+            return Err(crate::PyError::value_error("slice step cannot be zero"));
+        }
+        step
+    };
+    let negative_step = step < zero;
+    let lower = if negative_step {
+        -one.clone()
+    } else {
+        zero.clone()
+    };
+    let upper = if negative_step {
+        &length - &one
+    } else {
+        length.clone()
+    };
+
+    let w_start = unsafe {
+        pyre_object::sliceobject::w_slice_get_start(pyre_object::gc_roots::shadow_stack_get(roots))
+    };
+    let start = if unsafe { pyre_object::is_none(w_start) } {
+        if negative_step {
+            upper.clone()
+        } else {
+            lower.clone()
+        }
+    } else {
+        let mut start = slice_eval_index_big(w_start)?;
+        if start < zero {
+            start += &length;
+            if start < lower {
+                start = lower.clone();
+            }
+        } else if start > upper {
+            start = upper.clone();
+        }
+        start
+    };
+
+    let w_stop = unsafe {
+        pyre_object::sliceobject::w_slice_get_stop(pyre_object::gc_roots::shadow_stack_get(roots))
+    };
+    let stop = if unsafe { pyre_object::is_none(w_stop) } {
+        if negative_step { lower } else { upper }
+    } else {
+        let mut stop = slice_eval_index_big(w_stop)?;
+        if stop < zero {
+            stop += &length;
+            if stop < lower {
+                stop = lower;
+            }
+        } else if stop > upper {
+            stop = upper;
+        }
+        stop
+    };
+
+    let w_start = pyre_object::range_bigint_to_obj(start);
+    pyre_object::gc_roots::pin_root(w_start);
+    let w_stop = pyre_object::range_bigint_to_obj(stop);
+    pyre_object::gc_roots::pin_root(w_stop);
+    let w_step = pyre_object::range_bigint_to_obj(step);
+    pyre_object::gc_roots::pin_root(w_step);
     Ok(w_tuple_new(vec![
-        pyre_object::w_int_new(start),
-        pyre_object::w_int_new(stop),
-        pyre_object::w_int_new(step),
+        unsafe { pyre_object::gc_roots::shadow_stack_get(roots + 2) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(roots + 3) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(roots + 4) },
     ]))
 }
 

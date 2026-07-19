@@ -21,6 +21,29 @@ check(slice.__lt__(a, 1) is NotImplemented, "slice foreign comparison")
 check(hash(a) == slice.__hash__(a), "slice hash descriptor")
 check(hash(slice(1, 2)) == hash(slice(1, 2)), "equal slices hash equally")
 
+huge = 2**100
+check(slice(None).indices(huge) == (0, huge, 1), "unbounded slice length")
+check(
+    slice(-huge, huge, 2).indices(huge) == (0, huge, 2),
+    "unbounded slice endpoints",
+)
+check(
+    slice(None, None, -huge).indices(huge) == (huge - 1, -1, -huge),
+    "unbounded negative slice step",
+)
+
+for args in ((), (1, 2)):
+    try:
+        slice(None).indices(*args)
+    except TypeError as error:
+        check(
+            str(error)
+            == f"slice.indices() takes exactly one argument ({len(args)} given)",
+            "slice.indices arity",
+        )
+    else:
+        raise AssertionError("slice.indices accepted the wrong arity")
+
 
 class Unhashable:
     __hash__ = None
