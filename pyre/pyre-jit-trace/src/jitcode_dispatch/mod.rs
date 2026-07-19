@@ -20287,61 +20287,9 @@ fn handle(
         "residual_call_r_v/iRd" => dispatch_residual_call_iRd_kind(code, op, ctx, 'v'),
         "residual_call_ir_v/iIRd" => dispatch_residual_call_iIRd_kind(code, op, ctx, 'v'),
         "residual_call_irf_v/iIRFd" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'v'),
-        // RPython parity: `pyjitpl.py:279-292` exec-generated
-        // `opimpl_int_*` for binary arithmetic ops — each handler reads
-        // two `i`-coded register operands and dispatches
-        // `self.execute(rop.<OPNUM>, b1, b2)`. Walker mirror: read regs
-        // from `registers_i`, record `OpCode::<Variant>` with the
-        // operand OpRefs as args, write the recorder result OpRef into
-        // the dst slot. No MIFrame state involved (these are pure
-        // arithmetic — `EffectInfo`-free, `heapcache`-free).
-        //
-        // Operand layout `ii>i`: 1B src1 + 1B src2 + 1B dst (=3 operand
-        // bytes after the opcode).
-        // RPython `pyjitpl.py:281` enumerates `int_lshift` alongside
-        // `int_rshift` in the exec-generated `(box, box)` opimpl loop;
-        // the canonical operand shape is therefore `ii>i`
-        // (`blackhole.py:516-519 bhimpl_int_lshift(a, b): return
-        // intmask(a << b)`). Mixed shapes such as `int_lshift/ri>i`
-        // stay unwired: those are kind-flow kind-flow bugs, and adding
-        // a handler for them would mask a Ref register flowing into
-        // an Int op.
-        // RPython `pyjitpl.py:326-336` — comparison opimpls have a `b1
-        // is b2` fast path returning a constant. Walker omits the fast
-        // path: with two distinct OpRefs on the trace, recording the
-        // op is parity-correct, and the optimizer collapses
-        // tautological compares downstream. (RPython needs the fast
-        // path because `ConstInt(1)` allocation is expensive in Python;
-        // pyre's recorder shares constants by value.)
-        // Float arithmetic — same shape as int binops but on the
-        // `f` bank. RPython `pyjitpl.py:284-292` includes
-        // float_add/float_sub/float_mul/float_truediv in the same
-        // exec-generated opimpl loop. Codewriter today emits only
-        // float_add/float_sub/float_truediv (float_mul absent —
-        // generated only when an explicit `*` operand reaches the
-        // codewriter; pyre's bench set has no float_mul yet)
-        // plus the unary float_neg.
-        // Float-to-int comparisons — `bhimpl_float_{lt,le,eq,ne,gt,ge}`
-        // (`blackhole.py:721-746`).  Read two `f` regs, record
-        // `OpCode::Float<Cmp>`, write the recorder result into the int
-        // bank.
-        "float_lt/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatLt),
-        "float_le/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatLe),
-        "float_eq/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatEq),
-        "float_ne/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatNe),
-        "float_gt/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatGt),
-        "float_ge/ff>i" => binop_float_to_int_record(code, op, ctx, OpCode::FloatGe),
-        // Int-bank unary ops. RPython parity:
-        // `pyjitpl.py:356-368` (int_neg / int_invert) + 371-375
-        // (int_same_as which calls `_record_helper(rop.SAME_AS_I, ...)`
-        // explicitly — same shape, walker treats it as a regular
-        // record-and-writeback).
-        // `int_is_true/i>i` mirrors `int_neg`/`int_invert`: a single
-        // i-coded source, a recorded IR op, an i-coded destination.
-        // RPython `pyjitpl.py:319-330 opimpl_int_is_true` records
-        // `rop.INT_IS_TRUE` via `_record_helper`. The result is
-        // semantically a bool but Int-typed on the bank (matches the
-        // codewriter's `>i` destination shape).
+        // The `int_*` / `float_*` / `ptr_*` record families are routed
+        // through `dispatch_regular_record` (see `arith.rs`) before this
+        // match, so their arms no longer appear here.
         // `int_between/iii>i` decomposes a 3-arg range check at record
         // time per `pyjitpl.py:588-595 opimpl_int_between` into
         // `INT_SUB + (INT_EQ on ConstInt(1) fast path | INT_SUB +

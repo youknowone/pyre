@@ -507,6 +507,18 @@ macro_rules! regular_record_table {
 }
 
 regular_record_table! {
+    // Binary arithmetic `int_*`, from the `pyjitpl.py:279-292`
+    // exec-generated `(box, box)` opimpl loop: read two `i`-coded reg
+    // operands, `self.execute(rop.<OPNUM>, b1, b2)`. Operand layout
+    // `ii>i` (1B src1 + 1B src2 + 1B dst). No MIFrame state — pure
+    // arithmetic, EffectInfo-free / heapcache-free. `int_lshift/ii>i` is
+    // the canonical shape (`bhimpl_int_lshift`); a mixed `int_lshift/ri>i`
+    // stays unwired because a Ref register flowing into an Int op is a
+    // kind-flow bug, not a shape to handle. The `int_eq..int_ge`
+    // comparisons carry a `b1 is b2` fast path in `pyjitpl.py:326-336`;
+    // the walker omits it (two distinct OpRefs record correctly and the
+    // optimizer collapses tautological compares) since the recorder
+    // shares constants by value rather than allocating a `ConstInt`.
     binop_int_record {
         "int_add/ii>i" => IntAdd,
         "int_sub/ii>i" => IntSub,
@@ -523,12 +535,34 @@ regular_record_table! {
         "int_gt/ii>i" => IntGt,
         "int_ge/ii>i" => IntGe,
     }
+    // Float arithmetic — same `pyjitpl.py:284-292` loop on the `f` bank.
+    // Codewriter today emits only float_add/float_sub/float_truediv
+    // (float_mul appears only when an explicit `*` operand reaches the
+    // codewriter; the bench set has none yet).
     binop_float_record {
         "float_add/ff>f" => FloatAdd,
         "float_sub/ff>f" => FloatSub,
         "float_mul/ff>f" => FloatMul,
         "float_truediv/ff>f" => FloatTrueDiv,
     }
+    // Float comparisons `bhimpl_float_{lt,le,eq,ne,gt,ge}`
+    // (`blackhole.py:721-746`) — part of the same `pyjitpl.py:284-292`
+    // generated loop, but the recorder result lands in the int bank
+    // (`ff>i`).
+    binop_float_to_int_record {
+        "float_lt/ff>i" => FloatLt,
+        "float_le/ff>i" => FloatLe,
+        "float_eq/ff>i" => FloatEq,
+        "float_ne/ff>i" => FloatNe,
+        "float_gt/ff>i" => FloatGt,
+        "float_ge/ff>i" => FloatGe,
+    }
+    // Int-bank unary ops: `pyjitpl.py:356-368` (int_neg / int_invert) +
+    // 371-375 (int_same_as, which records `rop.SAME_AS_I` via
+    // `_record_helper` — same shape, treated as a regular
+    // record-and-writeback). `int_is_true` (`pyjitpl.py:319-330`) is
+    // Int-typed on the bank though semantically bool (matches the `>i`
+    // destination shape).
     unop_int_record {
         "int_neg/i>i" => IntNeg,
         "int_invert/i>i" => IntInvert,
@@ -538,6 +572,7 @@ regular_record_table! {
     unop_float_record {
         "float_neg/f>f" => FloatNeg,
     }
+    // `ptr_eq` / `ptr_ne` (`pyjitpl.py:326-336`): Ref operands, int result.
     binop_ref_to_int_record {
         "ptr_eq/rr>i" => PtrEq,
         "ptr_ne/rr>i" => PtrNe,
