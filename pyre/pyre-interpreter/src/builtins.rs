@@ -6963,7 +6963,9 @@ pub(crate) fn super_check(
     // typeobject.c super_init: a type obj names its own class ("type str"),
     // otherwise the message names the instance's class ("instance of str").
     let obj_desc = if unsafe { pyre_object::is_type(obj_or_type) } {
-        format!("type {}", unsafe { pyre_object::w_type_get_name(obj_or_type) })
+        format!("type {}", unsafe {
+            pyre_object::w_type_get_name(obj_or_type)
+        })
     } else {
         let obj_type_name = crate::typedef::r#type(obj_or_type)
             .map(|t| unsafe { pyre_object::w_type_get_name(t) })

@@ -1411,8 +1411,12 @@ pub(crate) fn compute_nested_inline_caller_frame(
                         &[locals_array, idx, operand],
                         array_descr.clone(),
                     );
-                    ctx.trace_ctx
-                        .heapcache_setarrayitem(locals_array, idx, item_descr_index, operand);
+                    ctx.trace_ctx.heapcache_setarrayitem(
+                        locals_array,
+                        idx,
+                        item_descr_index,
+                        operand,
+                    );
                 }
             }
         }

@@ -3177,6 +3177,73 @@ fn emit_call_footer_shadowstack(
         .store(MemFlags::trusted(), new_rst, rst_addr_val, 0);
 }
 
+/// x86/assembler.py:1630-1641 `genop_discard_check_memory_error` /
+/// aarch64/assembler.rs `emit_propagate_memory_error_if_null`: branch to the
+/// `propagate_exception_descr` exit when `ptr_val` is NULL.  The metainterp
+/// emits an explicit `OpCode::CheckMemoryError` only for non-inline mallocs; an
+/// inline nursery/varsize bump has its check emitted by the backend right after
+/// the allocation (RPython `malloc_cond`), so the NULL a bounded `PYPY_GC_MAX`
+/// major collection returns is caught before the following header/field stores
+/// dereference it.  Leaves the builder positioned in the (sealed) continuation
+/// block so subsequent stores run only on the non-NULL path.
+fn emit_memory_error_check(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    ptr_val: cranelift_codegen::ir::Value,
+    propagate_exception_descr_ptr: usize,
+    preamble_phase: bool,
+) {
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
+    let propagate_block = builder.create_block();
+    let cont_block = builder.create_block();
+    if preamble_phase {
+        builder.set_cold_block(cont_block);
+    }
+    builder
+        .ins()
+        .brif(is_null, propagate_block, &[], cont_block, &[]);
+
+    builder.switch_to_block(propagate_block);
+    builder.seal_block(propagate_block);
+    if propagate_exception_descr_ptr == 0 {
+        // Unattached descr (unit tests bypassing `MetaInterp::finish_setup`).
+        builder
+            .ins()
+            .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+    } else {
+        // _store_and_reset_exception (assembler.py:1826-1843): read
+        // JIT_EXC_VALUE → tmp, clear both globals.
+        let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+        let exc_val = builder
+            .ins()
+            .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, exc_val_addr, 0);
+        let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+        // assembler.py:336-340 — MOV [jf_guard_exc], tmp; MOV [jf_descr], descr.
+        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), exc_val, cur_jf, JF_GUARD_EXC_OFS);
+        let descr_val = builder
+            .ins()
+            .iconst(ptr_type, propagate_exception_descr_ptr as i64);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), descr_val, cur_jf, JF_DESCR_OFS);
+        emit_call_footer_shadowstack(builder, ptr_type);
+        builder.ins().return_(&[cur_jf]);
+    }
+
+    builder.switch_to_block(cont_block);
+    builder.seal_block(cont_block);
+}
+
 /// direct call_assembler path. Ultra-lightweight: just increments
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
@@ -10784,68 +10851,13 @@ impl CraneliftBackend {
                     // that mirrors `_build_propagate_exception_path`,
                     // x86/assembler.py:328-345 / aarch64/assembler.py:559-577).
                     let ptr_val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
-                    let propagate_block = builder.create_block();
-                    let cont_block = builder.create_block();
-                    if preamble_phase {
-                        builder.set_cold_block(cont_block);
-                    }
-                    builder
-                        .ins()
-                        .brif(is_null, propagate_block, &[], cont_block, &[]);
-
-                    builder.switch_to_block(propagate_block);
-                    builder.seal_block(propagate_block);
-                    if propagate_exception_descr_ptr == 0 {
-                        // Unattached `propagate_exception_descr` — typical for
-                        // unit tests that bypass `MetaInterp::finish_setup`.
-                        // In production (`pyjitpl.py:2283
-                        // self.cpu.propagate_exception_descr = exc_descr`) the
-                        // descr is always set before `compile_loop` runs.
-                        builder
-                            .ins()
-                            .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-                    } else {
-                        // _store_and_reset_exception (assembler.py:1826-1843):
-                        // read JIT_EXC_VALUE → tmp, clear both globals.
-                        let exc_val_addr =
-                            builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
-                        let exc_val =
-                            builder
-                                .ins()
-                                .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), zero, exc_val_addr, 0);
-                        let exc_type_addr =
-                            builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
-                        // assembler.py:336-337 — MOV [jf_guard_exc], tmp
-                        // so `cpu.grab_exc_value(deadframe)` in
-                        // `PropagateExceptionDescr.handle_fail`
-                        // (compile.py:1095) can read it back.
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), exc_val, cur_jf, JF_GUARD_EXC_OFS);
-                        // assembler.py:339-340 — MOV [jf_descr], descr.
-                        let descr_val = builder
-                            .ins()
-                            .iconst(ptr_type, propagate_exception_descr_ptr as i64);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), descr_val, cur_jf, JF_DESCR_OFS);
-                        // assembler.py:1101 _call_footer_shadowstack
-                        // + assembler.py:1097 _call_footer.
-                        emit_call_footer_shadowstack(&mut builder, ptr_type);
-                        builder.ins().return_(&[cur_jf]);
-                    }
-
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
+                    emit_memory_error_check(
+                        &mut builder,
+                        ptr_type,
+                        ptr_val,
+                        propagate_exception_descr_ptr,
+                        preamble_phase,
+                    );
                 }
 
                 // ── Call operations ──
@@ -11863,6 +11875,17 @@ impl CraneliftBackend {
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(vi), result);
+                    // malloc_cond parity: the headerless slow path
+                    // (gc_alloc_nursery_headerless_shim) returns NULL on
+                    // host/bounded out-of-memory; propagate before the
+                    // following stores dereference it.
+                    emit_memory_error_check(
+                        &mut builder,
+                        ptr_type,
+                        result,
+                        propagate_exception_descr_ptr,
+                        preamble_phase,
+                    );
                 }
                 OpCode::CallMallocNursery => {
                     // x86/assembler.py:2556-2565 malloc_cond parity.
@@ -12012,6 +12035,17 @@ impl CraneliftBackend {
                             builder.def_var(var(var_idx), params[2 + i]);
                         }
                         builder.def_var(var(vi), result);
+                        // malloc_cond parity: the slow path returns NULL on
+                        // `PYPY_GC_MAX` out-of-memory (gc_alloc_nursery_shim →
+                        // alloc_nursery → GcRef(0)); propagate the MemoryError
+                        // before the following header/field stores dereference it.
+                        emit_memory_error_check(
+                            &mut builder,
+                            ptr_type,
+                            result,
+                            propagate_exception_descr_ptr,
+                            preamble_phase,
+                        );
                     } else {
                         // No active GC — refuse compile, matching the
                         // pre-existing contract that CallMallocNursery
@@ -12057,6 +12091,17 @@ impl CraneliftBackend {
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(vi), result);
+                    // malloc_cond_varsize parity: the varsize slow path
+                    // (gc_alloc_varsize_shim) returns NULL on `PYPY_GC_MAX`
+                    // out-of-memory; propagate before the following
+                    // header/item stores dereference it.
+                    emit_memory_error_check(
+                        &mut builder,
+                        ptr_type,
+                        result,
+                        propagate_exception_descr_ptr,
+                        preamble_phase,
+                    );
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
                     // x86/assembler.py:2567-2582 malloc_cond_varsize_frame:
@@ -12170,6 +12215,18 @@ impl CraneliftBackend {
                     for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
                         builder.def_var(var(var_idx), params[2 + i]);
                     }
+                    // malloc_cond_varsize_frame parity: the slow path
+                    // (gc_alloc_nursery_shim) returns NULL on `PYPY_GC_MAX`
+                    // out-of-memory.  Propagate the MemoryError before the
+                    // jf_gcmap initialization store below dereferences the
+                    // (null) frame pointer.
+                    emit_memory_error_check(
+                        &mut builder,
+                        ptr_type,
+                        result,
+                        propagate_exception_descr_ptr,
+                        preamble_phase,
+                    );
                     // jitframe.py:105-116: the custom tracer reads jf_gcmap
                     // even though it is a raw Ptr(GCMAP), not one of the five
                     // GCREF/forward fields explicitly cleared by
