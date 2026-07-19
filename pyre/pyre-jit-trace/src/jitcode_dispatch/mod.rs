@@ -19682,6 +19682,13 @@ fn handle(
     code: &[u8],
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // The `int_*` / `float_*` / `ptr_*` families whose arm is a uniform
+    // `HELPER(code, op, ctx, OpCode::VARIANT)` call are dispatched from the
+    // `regular_record_table!`-generated table (see `arith.rs`); a `Some`
+    // there stands in for the arm that used to live in this `match`.
+    if let Some(res) = dispatch_regular_record(op, code, ctx) {
+        return res;
+    }
     match op.key {
         "live/" => Ok((DispatchOutcome::Continue, op.next_pc)),
         "loop_header/i" => {
@@ -20292,12 +20299,6 @@ fn handle(
         //
         // Operand layout `ii>i`: 1B src1 + 1B src2 + 1B dst (=3 operand
         // bytes after the opcode).
-        "int_add/ii>i" => binop_int_record(code, op, ctx, OpCode::IntAdd),
-        "int_sub/ii>i" => binop_int_record(code, op, ctx, OpCode::IntSub),
-        "int_mul/ii>i" => binop_int_record(code, op, ctx, OpCode::IntMul),
-        "int_and/ii>i" => binop_int_record(code, op, ctx, OpCode::IntAnd),
-        "int_or/ii>i" => binop_int_record(code, op, ctx, OpCode::IntOr),
-        "int_xor/ii>i" => binop_int_record(code, op, ctx, OpCode::IntXor),
         // RPython `pyjitpl.py:281` enumerates `int_lshift` alongside
         // `int_rshift` in the exec-generated `(box, box)` opimpl loop;
         // the canonical operand shape is therefore `ii>i`
@@ -20306,8 +20307,6 @@ fn handle(
         // stay unwired: those are kind-flow kind-flow bugs, and adding
         // a handler for them would mask a Ref register flowing into
         // an Int op.
-        "int_lshift/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLshift),
-        "int_rshift/ii>i" => binop_int_record(code, op, ctx, OpCode::IntRshift),
         // RPython `pyjitpl.py:326-336` — comparison opimpls have a `b1
         // is b2` fast path returning a constant. Walker omits the fast
         // path: with two distinct OpRefs on the trace, recording the
@@ -20315,12 +20314,6 @@ fn handle(
         // tautological compares downstream. (RPython needs the fast
         // path because `ConstInt(1)` allocation is expensive in Python;
         // pyre's recorder shares constants by value.)
-        "int_eq/ii>i" => binop_int_record(code, op, ctx, OpCode::IntEq),
-        "int_ne/ii>i" => binop_int_record(code, op, ctx, OpCode::IntNe),
-        "int_lt/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLt),
-        "int_le/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLe),
-        "int_gt/ii>i" => binop_int_record(code, op, ctx, OpCode::IntGt),
-        "int_ge/ii>i" => binop_int_record(code, op, ctx, OpCode::IntGe),
         // Float arithmetic — same shape as int binops but on the
         // `f` bank. RPython `pyjitpl.py:284-292` includes
         // float_add/float_sub/float_mul/float_truediv in the same
@@ -20329,11 +20322,6 @@ fn handle(
         // generated only when an explicit `*` operand reaches the
         // codewriter; pyre's bench set has no float_mul yet)
         // plus the unary float_neg.
-        "float_add/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatAdd),
-        "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
-        "float_mul/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatMul),
-        "float_truediv/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatTrueDiv),
-        "float_neg/f>f" => unop_float_record(code, op, ctx, OpCode::FloatNeg),
         // Float-to-int comparisons — `bhimpl_float_{lt,le,eq,ne,gt,ge}`
         // (`blackhole.py:721-746`).  Read two `f` regs, record
         // `OpCode::Float<Cmp>`, write the recorder result into the int
@@ -20349,16 +20337,12 @@ fn handle(
         // (int_same_as which calls `_record_helper(rop.SAME_AS_I, ...)`
         // explicitly — same shape, walker treats it as a regular
         // record-and-writeback).
-        "int_neg/i>i" => unop_int_record(code, op, ctx, OpCode::IntNeg),
-        "int_invert/i>i" => unop_int_record(code, op, ctx, OpCode::IntInvert),
-        "int_same_as/i>i" => unop_int_record(code, op, ctx, OpCode::SameAsI),
         // `int_is_true/i>i` mirrors `int_neg`/`int_invert`: a single
         // i-coded source, a recorded IR op, an i-coded destination.
         // RPython `pyjitpl.py:319-330 opimpl_int_is_true` records
         // `rop.INT_IS_TRUE` via `_record_helper`. The result is
         // semantically a bool but Int-typed on the bank (matches the
         // codewriter's `>i` destination shape).
-        "int_is_true/i>i" => unop_int_record(code, op, ctx, OpCode::IntIsTrue),
         // `int_between/iii>i` decomposes a 3-arg range check at record
         // time per `pyjitpl.py:588-595 opimpl_int_between` into
         // `INT_SUB + (INT_EQ on ConstInt(1) fast path | INT_SUB +
@@ -20408,8 +20392,6 @@ fn handle(
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
-        "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
         "ptr_nonzero/r>i" => ptr_nullity_record(code, op, ctx, true),
         "ptr_iszero/r>i" => ptr_nullity_record(code, op, ctx, false),
         "ref_guard_value/r" => ref_guard_value_record(code, op, ctx),

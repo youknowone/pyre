@@ -665,4 +665,3 @@ pub(crate) fn arraylen_vable_via_metainterp(
     write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
-

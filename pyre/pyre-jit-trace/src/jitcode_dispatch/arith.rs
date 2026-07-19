@@ -478,3 +478,68 @@ pub(crate) fn unop_float_record(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Opname → recorder table for the "regular" record helpers whose
+/// dispatch arm is a uniform `HELPER(code, op, ctx, OpCode::VARIANT)` call.
+/// `handle` consults `dispatch_regular_record` before its per-opname
+/// `match`; a `Some` short-circuits it. The Rust analogue of the
+/// `@arguments`-decorated exec-generated `opimpl_*` families in
+/// `pyjitpl.py:279-368`, which collapse the opcode × register-bank cross
+/// product into one metaprogrammed table rather than spelling out each arm.
+macro_rules! regular_record_table {
+    ( $( $helper:ident { $( $key:literal => $variant:ident, )+ } )* ) => {
+        pub(crate) fn dispatch_regular_record(
+            op: &DecodedOp,
+            code: &[u8],
+            ctx: &mut WalkContext<'_, '_>,
+        ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+            match op.key {
+                $( $( $key => Some($helper(code, op, ctx, OpCode::$variant)), )+ )*
+                _ => None,
+            }
+        }
+
+        /// Every opname routed through `dispatch_regular_record`; the `tests`
+        /// module asserts none of these still appear as an arm in `handle`'s
+        /// `match`, so the table stays the sole dispatcher for them.
+        #[cfg(test)]
+        pub(crate) const REGULAR_RECORD_KEYS: &[&str] = &[ $( $( $key, )+ )* ];
+    };
+}
+
+regular_record_table! {
+    binop_int_record {
+        "int_add/ii>i" => IntAdd,
+        "int_sub/ii>i" => IntSub,
+        "int_mul/ii>i" => IntMul,
+        "int_and/ii>i" => IntAnd,
+        "int_or/ii>i" => IntOr,
+        "int_xor/ii>i" => IntXor,
+        "int_lshift/ii>i" => IntLshift,
+        "int_rshift/ii>i" => IntRshift,
+        "int_eq/ii>i" => IntEq,
+        "int_ne/ii>i" => IntNe,
+        "int_lt/ii>i" => IntLt,
+        "int_le/ii>i" => IntLe,
+        "int_gt/ii>i" => IntGt,
+        "int_ge/ii>i" => IntGe,
+    }
+    binop_float_record {
+        "float_add/ff>f" => FloatAdd,
+        "float_sub/ff>f" => FloatSub,
+        "float_mul/ff>f" => FloatMul,
+        "float_truediv/ff>f" => FloatTrueDiv,
+    }
+    unop_int_record {
+        "int_neg/i>i" => IntNeg,
+        "int_invert/i>i" => IntInvert,
+        "int_same_as/i>i" => SameAsI,
+        "int_is_true/i>i" => IntIsTrue,
+    }
+    unop_float_record {
+        "float_neg/f>f" => FloatNeg,
+    }
+    binop_ref_to_int_record {
+        "ptr_eq/rr>i" => PtrEq,
+        "ptr_ne/rr>i" => PtrNe,
+    }
+}

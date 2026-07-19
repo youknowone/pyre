@@ -559,4 +559,3 @@ pub(crate) fn getfield_gc_via_heapcache(
 /// `[last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals]`.
 pub(crate) const VABLE_CODE_FIELD_IDX: usize = 1;
 pub(crate) const VABLE_NAMESPACE_FIELD_IDX: usize = 5;
-

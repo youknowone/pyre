@@ -153,7 +153,10 @@ pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) ->
 /// the caller keeps the conservative kept-stack decline.  Each `ref_copy`
 /// is `[opcode, src, dst]` (`ref_copy/r>r`: `registers_r[dst] =
 /// registers_r[src]`).
-pub(crate) fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option<Vec<(u16, u16)>> {
+pub(crate) fn decode_branch_trampoline_ref_moves(
+    code: &[u8],
+    tramp_start: usize,
+) -> Option<Vec<(u16, u16)>> {
     let mut pc = tramp_start;
     let mut moves: Vec<(u16, u16)> = Vec::new();
     for _ in 0..64 {
@@ -206,7 +209,10 @@ pub(crate) fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize
 /// kept temp).  Callers treat `None` as "no kept temp".  `frame` is the
 /// frame whose jitcode the `target` offset indexes (see
 /// [`ActiveResumeFrame`]).
-pub(crate) fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) -> Option<u16> {
+pub(crate) fn branch_resume_target_stack_depth(
+    frame: &ActiveResumeFrame,
+    target: usize,
+) -> Option<u16> {
     let pjc = &frame.0;
     if pjc.code_ptr.is_null() {
         return None;
@@ -526,7 +532,10 @@ pub(crate) fn branch_arm_reads_unrestorable_ref(
 /// so the unrestorable-kept-stack decline needs a depth probe that works in
 /// either leg.  A depth `> 0` marks the short-circuit / conditional-
 /// expression / chained-comparison kept-stack shape.
-pub(crate) fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -> Option<u16> {
+pub(crate) fn branch_resume_target_stack_depth_any_leg(
+    target: usize,
+    jitcode_index: u32,
+) -> Option<u16> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
     if pjc.code_ptr.is_null() {
         return None;
@@ -541,4 +550,3 @@ pub(crate) fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_in
     );
     pjc.depth_trivia_for_jitcode_pc(target)
 }
-

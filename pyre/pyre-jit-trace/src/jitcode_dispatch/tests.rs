@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
@@ -447,9 +446,11 @@ fn t3_audit_opname_gap_inventory() {
 
     // 2) Walker-handled opnames — parsed from the embedded `handle`
     // function's string literals.  Source-of-truth scan against
-    // the file itself so this probe stays accurate as handlers
-    // land/leave.
-    let source = include_str!("mod.rs");
+    // the files themselves so this probe stays accurate as handlers
+    // land/leave.  `arith.rs` carries the `regular_record_table!` arms
+    // (the `int_*` / `float_*` / `ptr_*` families) as opname literals, so
+    // it is scanned alongside `mod.rs`.
+    let source = concat!(include_str!("mod.rs"), "\n", include_str!("arith.rs"));
     let mut handled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Heuristic: scan the literal patterns that appear ONLY in
     // dispatch arms of `handle()` — they look like
@@ -540,6 +541,54 @@ fn t3_audit_opname_gap_inventory() {
 
     // Sanity: byte_to_opname must invert opname_to_byte.
     assert_eq!(byte_to_opname.len(), opname_to_byte.len());
+}
+
+#[test]
+fn regular_record_table_is_the_sole_dispatcher() {
+    // The `regular_record_table!` macro (arith.rs) owns dispatch for the
+    // uniform `int_*` / `float_*` / `ptr_*` record families. Guard the
+    // invariant that those opnames route ONLY through the table:
+    // (a) it is non-empty with unique keys, (b) every key is a real
+    // runtime opname, (c) none still appears as a `"opname" =>` arm in
+    // `handle` (which the pre-match table lookup would shadow into dead
+    // code).
+    let keys = REGULAR_RECORD_KEYS;
+    assert!(!keys.is_empty(), "table must route at least one opname");
+
+    // (a) unique keys.
+    let unique: std::collections::BTreeSet<&str> = keys.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        keys.len(),
+        "REGULAR_RECORD_KEYS has duplicates"
+    );
+
+    // (b) every key is a real codewriter-emitted opname, except the
+    // documented dormant `int_same_as/i>i` forward-prep arm: RPython
+    // `jtransform.py:246 rewrite_op_same_as` strips `same_as` before
+    // assembly, so it is intentionally absent from the runtime table while
+    // its dispatch entry is kept for the walker's forward-prep path.
+    let runtime = insns_opname_to_byte();
+    for key in keys {
+        if *key == "int_same_as/i>i" {
+            continue;
+        }
+        assert!(
+            runtime.contains_key(*key),
+            "table key {key:?} is not a runtime opname",
+        );
+    }
+
+    // (c) no key survives as a dispatch arm in `handle`.
+    let handle_src = include_str!("mod.rs");
+    for key in keys {
+        let arm = format!("\"{key}\" =>");
+        assert!(
+            !handle_src.contains(&arm),
+            "opname {key:?} still has a dead dispatch arm in mod.rs; \
+             it is dispatched by regular_record_table!",
+        );
+    }
 }
 
 #[test]

@@ -1580,4 +1580,3 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot(
         );
     Ok(())
 }
-

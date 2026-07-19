@@ -150,4 +150,3 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
         }
     }
 }
-

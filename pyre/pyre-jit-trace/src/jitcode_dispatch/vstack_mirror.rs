@@ -533,7 +533,10 @@ pub(crate) fn vstack_initial_py_pc(
         .unwrap_or_else(|| vstack_containing_py_pc(metadata, jit_pc))
 }
 
-pub(crate) fn metadata_block_head_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> Option<u32> {
+pub(crate) fn metadata_block_head_py_pc(
+    metadata: &crate::PyJitCodeMetadata,
+    jit_pc: usize,
+) -> Option<u32> {
     metadata
         .block_head_py_by_jit_pc
         .binary_search_by_key(&jit_pc, |&(off, _)| off)
@@ -647,7 +650,11 @@ pub(crate) fn seed_callee_vstack_mirror(ctx: &mut WalkContext<'_, '_>, frame: &A
 /// `collect_outer_active_boxes` / `stack_sync` read.  Any unsourceable
 /// slot leaves `vstack_valid = false`; the overlay then omits operand
 /// slots, which resume re-materializes (zero regression).
-pub(crate) fn seed_vstack_mirror(ctx: &mut WalkContext<'_, '_>, sym: &crate::state::PyreSym, start_pc: usize) {
+pub(crate) fn seed_vstack_mirror(
+    ctx: &mut WalkContext<'_, '_>,
+    sym: &crate::state::PyreSym,
+    start_pc: usize,
+) {
     if sym.jitcode.is_null() || !sym.owns_virtualizable_shadow() {
         return;
     }
@@ -794,4 +801,3 @@ pub(crate) fn vstack_enter_exception_handler(
     // NONE (per-slot decline) rather than latching the whole mirror invalid.
     let _ = reseed_vstack_from_shadow(ctx, handler_depth);
 }
-
