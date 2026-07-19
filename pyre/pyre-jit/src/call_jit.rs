@@ -2692,28 +2692,37 @@ pub fn trace_and_compile_from_bridge(
         driver.last_bridge_is_exception_guard
     };
     if last_bridge_is_exception_guard {
-        #[cfg(feature = "cranelift")]
-        let exc_class = majit_backend_cranelift::jit_exc_class_raw();
-        #[cfg(not(feature = "cranelift"))]
-        let exc_class: i64 = 0;
-        #[cfg(feature = "cranelift")]
-        let exc_value = majit_backend_cranelift::jit_exc_value_raw();
-        #[cfg(not(feature = "cranelift"))]
-        let exc_value: i64 = 0;
-        if exc_class != 0 {
-            // RPython pyjitpl.py:3125-3126 + 3138:
-            // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION
-            {
-                let (driver, _) = crate::eval::driver_pair();
-                driver
-                    .meta_interp_mut()
-                    .emit_exception_bridge_prologue(exc_class, exc_value);
-            }
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][bridge-exc] exception guard bridge: class={:#x} value={:#x}",
-                    exc_class, exc_value
-                );
+        // With `PYRE_EXC_EDGE_BRIDGE` the walker emits the whole exception
+        // resumption sequence (SAVE_EXC_CLASS/SAVE_EXCEPTION/RESTORE_EXCEPTION +
+        // a snapshotted GUARD_EXCEPTION) at the bridge-entry frame state, where
+        // the guard can capture resume data.  The legacy call-site prologue
+        // below emits a snapshot-less GUARD_EXCEPTION and is only reached on the
+        // declined path (which discards the trace), so skip it when routing is
+        // enabled and let the walker own the sequence.
+        if !pyre_jit_trace::jitcode_dispatch::exc_edge_bridge_enabled() {
+            #[cfg(feature = "cranelift")]
+            let exc_class = majit_backend_cranelift::jit_exc_class_raw();
+            #[cfg(not(feature = "cranelift"))]
+            let exc_class: i64 = 0;
+            #[cfg(feature = "cranelift")]
+            let exc_value = majit_backend_cranelift::jit_exc_value_raw();
+            #[cfg(not(feature = "cranelift"))]
+            let exc_value: i64 = 0;
+            if exc_class != 0 {
+                // RPython pyjitpl.py:3125-3126 + 3138:
+                // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION
+                {
+                    let (driver, _) = crate::eval::driver_pair();
+                    driver
+                        .meta_interp_mut()
+                        .emit_exception_bridge_prologue(exc_class, exc_value);
+                }
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][bridge-exc] exception guard bridge: class={:#x} value={:#x}",
+                        exc_class, exc_value
+                    );
+                }
             }
         }
         let (driver, _) = crate::eval::driver_pair();
@@ -2807,7 +2816,33 @@ pub fn trace_and_compile_from_bridge(
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
         }
     };
-    if pending_exc {
+    // Exception-edge bridge (`PYRE_EXC_EDGE_BRIDGE`): route the caught-in-frame
+    // single-frame resume to the in-frame `except` handler (walker
+    // `find_catch_before_resume_live`) instead of declining.  The escaping case
+    // (uncaught) and the multi-frame resume still decline here — those are
+    // separate slices (raising-bridge Finish(exc) / carrier subwalk).
+    let route_exc_edge = caught_in_frame
+        && !is_multiframe_resume
+        && pyre_jit_trace::jitcode_dispatch::exc_edge_bridge_enabled();
+    if route_exc_edge && guard_exc != 0 {
+        // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
+        // walker's `seed_standing_exception_for_walk` threads it into
+        // `sym.last_exc_box`, which the handler's `last_exc_value/>r` reads.
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(guard_exc));
+    } else if !pending_exc {
+        // No standing exception at this bridge's source guard (e.g. a
+        // GUARD_NOT_FORCED that fails every iteration because the may-force
+        // residual forced the frame).  A prior residual-call raise may have
+        // left a stale non-null value in `BH_LAST_EXC_VALUE`; the walker's
+        // exc-edge routing seeds `sym.last_exc_value` from it and would route
+        // this exception-free bridge into the `except` handler (recording the
+        // `v = -1` handler body as the bridge body → the handler path runs
+        // every iteration).  Clear it so the walk resumes on the real
+        // no-exception continuation.  The decline path below (`pending_exc &&
+        // !route_exc_edge`) keeps the value for the blackhole.
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    }
+    if pending_exc && !route_exc_edge {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] decline (pending exc, caught_in_frame={caught_in_frame}) key={} trace={} fail={} resume_pc={}",

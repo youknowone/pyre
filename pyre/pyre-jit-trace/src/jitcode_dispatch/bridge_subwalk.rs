@@ -186,6 +186,50 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         ConcreteValue::Ref(sym.last_exc_value())
     };
 
+    // Exception-edge bridge routing (`PYRE_EXC_EDGE_BRIDGE`): an exception-guard
+    // bridge with a standing exception resumes at the no-exception fallthrough
+    // `-live-`, NOT the `except` handler.  Mirror the blackhole
+    // `handle_exception_in_frame` backward case: route the walk entry to the
+    // in-frame catch target so the handler body (`except KeyError: return -1`)
+    // is recorded as the bridge instead of the NULL raised-call fallthrough.
+    // `call_jit.rs trace_and_compile_from_bridge` only lets a bridge walk begin
+    // with this precondition holding when it has already ROUTED the exc-edge
+    // (published the standing exception into `BH_LAST_EXC_VALUE` and declined to
+    // hand the guard to the blackhole).  So whenever the precondition holds the
+    // walk MUST resume at an `except` handler — falling through to the
+    // no-exception continuation would record the return of the NULL raised-call
+    // result (`Finish(NULL)` → "call failed").
+    let exc_edge_precondition = exc_edge_bridge_enabled()
+        && trace_ctx.is_bridge_trace
+        && trace_ctx.bridge_source_is_exception_guard()
+        && !sym.last_exc_box.is_none()
+        && !sym.last_exc_value.is_null();
+    let exc_edge_catch_target = if exc_edge_precondition {
+        find_catch_before_resume_live(jitcode_code, position)
+            // Only route when the handler rejoins this frame's loop; a handler
+            // that returns out of the frame (called function's `try/except:
+            // return`, compiled as its own function trace) needs cross-frame
+            // resume pyre does not yet reconstruct — decline it to the blackhole.
+            .filter(|&catch_target| exc_handler_rejoins_loop(jitcode_code, catch_target))
+    } else {
+        None
+    };
+    if exc_edge_precondition && exc_edge_catch_target.is_none() {
+        // Routed by `call_jit` but the handler is unroutable here (returns out of
+        // the frame).  Abort BEFORE any recording so the guard failure resumes
+        // via the blackhole (correct caught-exception + callee-return handling),
+        // exactly as when the flag is off.
+        return Err(DispatchError::ExcEdgeCrossFrameReturnUnsupported { pc: position });
+    }
+    let exc_edge_concrete = sym.last_exc_value;
+    // typeptr at offset 0 (`_store_exception` invariant): the expected class the
+    // bridge-entry GUARD_EXCEPTION checks the restored pending exception against.
+    let exc_edge_class = if exc_edge_catch_target.is_some() && !exc_edge_concrete.is_null() {
+        unsafe { *(exc_edge_concrete as *const i64) }
+    } else {
+        0
+    };
+
     let result = {
         let mut wc = WalkContext {
             callee_shadow: None,
@@ -264,8 +308,66 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // entry-boundary reconcile of the not-yet-executed first opcode).
         // Pure side-data: the snapshot read stays LEGACY until a later slice
         // makes it authoritative.
-        seed_vstack_mirror(&mut wc, sym, position);
-        let outcome = walk(jitcode_code, position, &mut wc);
+        // Exception-edge bridge: enter at the in-frame `except` handler target
+        // instead of the no-exception fallthrough.  `vstack_enter_exception_
+        // handler` re-seeds the operand-stack mirror at handler-entry depth and
+        // places the caught exception box on the new TOS (the same reconstruction
+        // the mid-walk SubRaise catch routing uses at handler entry); `wc.
+        // last_exc_value` is already the standing exception box, so the handler's
+        // `last_exc_value/>r` reads it.  On the normal path, seed the mirror at
+        // the first-walked pc as before.
+        let walk_position = if let Some(catch_target) = exc_edge_catch_target {
+            // RPython `pyjitpl.py:3125-3173` exception-guard resumption, emitted
+            // at the bridge-entry frame state so the GUARD_EXCEPTION captures a
+            // fresh resume snapshot (the call-site prologue cannot — no frame is
+            // reconstructed there):
+            //   SAVE_EXC_CLASS / SAVE_EXCEPTION (no-arg record0 — read the
+            //   pending exc cell at runtime) → RESTORE_EXCEPTION → GUARD_EXCEPTION
+            //   (`handle_possible_exception`; deopts on a class mismatch, and
+            //   consumes/clears the pending exception cell on match).
+            let class_op = wc.trace_ctx.save_exc_class();
+            let value_op = wc.trace_ctx.save_exception();
+            wc.trace_ctx.restore_exception(class_op, value_op);
+            // `RefFrontendOp(pos, gcref)` parity (`history.py:803`): SAVE_EXCEPTION
+            // returns `exc_value_box`, whose `getref()` is the concrete restored
+            // exception pointer at trace-recording time (`pyjitpl.py:3163
+            // execute_ll_raised`).  Stamp that concrete onto `value_op` so the box
+            // stays symbolic (emits at runtime, class protected by the
+            // GUARD_EXCEPTION below) yet carries a trace-time value: the handler's
+            // `CHECK_EXC_MATCH` residual (`ll_issubclass(exc, KeyError)`) is then
+            // concrete-executable and folds, instead of declining to a symbolic
+            // result whose downstream `POP_JUMP_IF_FALSE` has no branch direction
+            // (the residual-call executor keys concreteness on `box_value`, which
+            // reads the frontend value slot — not the register `reg_shadow`).
+            wc.trace_ctx.set_opref_concrete(
+                value_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(exc_edge_concrete as usize)),
+            );
+            let exc_class_const = wc.trace_ctx.const_int(exc_edge_class);
+            wc.trace_ctx
+                .record_guard(OpCode::GuardException, &[exc_class_const], 0);
+            walker_capture_snapshot_for_last_guard(&mut wc, position)?;
+            // `execute_ll_raised` parity: the standing exception the handler
+            // reads (`last_exc_value/>r`) is the SAVE_EXCEPTION box — the
+            // runtime-restored value, NOT a baked constant — so a value-using
+            // handler (`except E as e`) sees the actual exception.
+            wc.last_exc_value = Some(value_op);
+            wc.last_exc_value_concrete = ConcreteValue::Ref(exc_edge_concrete);
+            wc.fbw_mode.class_of_last_exc_is_const = true;
+            // Reconstruct the handler-entry operand stack + push the exc box on
+            // the new TOS (mirrors the mid-walk SubRaise catch routing).
+            vstack_enter_exception_handler(&mut wc, catch_target, value_op);
+            // The exception is now caught by this frame's handler; drain the
+            // standing residual-call exception flag so a later trace attempt's
+            // `seed_standing_exception_for_walk` does not re-pick this
+            // already-caught exception (mirrors `blackhole.rs route_to_catch`).
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+            catch_target
+        } else {
+            seed_vstack_mirror(&mut wc, sym, position);
+            position
+        };
+        let outcome = walk(jitcode_code, walk_position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
         let final_last_exc = wc.last_exc_value;

@@ -1550,6 +1550,17 @@ pub enum DispatchError {
     /// rewind it and a deliver re-run would double it, so the walk declines BEFORE
     /// the commit and the location interprets permanently (`AbortPermanent`).
     InplaceContainerMutationUnsupported { pc: usize },
+    /// Exception-edge bridge (`PYRE_EXC_EDGE_BRIDGE`): the failing exception
+    /// guard is caught in-frame, but the `except` handler RETURNS out of the
+    /// frame (a called function's `try/except: return`, compiled as its own
+    /// function trace) rather than rejoining this frame's loop.  Routing the
+    /// walk to such a handler records a `Finish`/`DoneWithThisFrame` whose
+    /// cross-frame return pyre cannot yet reconstruct (the caller frame is not
+    /// rebuilt at the bridge → NULL-frame deref on return).  Abort so the guard
+    /// failure resumes via the blackhole, which handles the caught exception and
+    /// the callee return correctly.  The loop-rejoin case (same-frame handler)
+    /// still routes.
+    ExcEdgeCrossFrameReturnUnsupported { pc: usize },
 }
 
 impl DispatchError {
@@ -1615,6 +1626,9 @@ impl DispatchError {
             }
             Self::InplaceContainerMutationUnsupported { .. } => {
                 "InplaceContainerMutationUnsupported"
+            }
+            Self::ExcEdgeCrossFrameReturnUnsupported { .. } => {
+                "ExcEdgeCrossFrameReturnUnsupported"
             }
         }
     }
@@ -2020,6 +2034,110 @@ fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
         FinishframeLookahead::CatchTarget(target) => Some(target),
         FinishframeLookahead::RvmprofCode { .. } | FinishframeLookahead::NoMatch => None,
     }
+}
+
+/// `PYRE_EXC_EDGE_BRIDGE=1` enables the exception-edge bridge: route an
+/// exception-guard bridge (GUARD_NO_EXCEPTION / GUARD_EXCEPTION) resume to the
+/// in-frame `except` handler instead of declining to the blackhole
+/// (`call_jit.rs` pending-exc decline).  Default-off for A/B while the routing
+/// is validated bit-exact.
+pub fn exc_edge_bridge_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_EXC_EDGE_BRIDGE").is_some())
+}
+
+/// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`
+/// for the walker.  An after-residual-call exception guard resumes at the
+/// no-exception fallthrough `-live-` (the next opcode after the call); the
+/// `catch_exception/L` that belongs to the just-executed raising op sits BEHIND
+/// that resume `-live-` (between the call's own post-call `-live-` and the next
+/// op), so there is no forward catch to route to.  Scan op boundaries backward
+/// from `resume_live_pos`, newest first, bounded by the first `live/` (the
+/// call's own post-call `-live-`), so only THIS opcode's catch can match.
+/// Returns the handler target (2-byte LE label after `catch_exception/L`), or
+/// `None` when the raising op sits outside any in-frame try (propagate).
+pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
+    let mut pcs: Vec<usize> = crate::jitcode_runtime::decoded_ops(code)
+        .map(|op| op.pc)
+        .filter(|&pc| pc < resume_live_pos)
+        .collect();
+    pcs.sort_unstable_by(|a, b| b.cmp(a));
+    for pc in pcs {
+        let op = decode_op_at(code, pc)?;
+        if op.key == "catch_exception/L" {
+            let lo = code[pc + 1] as usize;
+            let hi = code[pc + 2] as usize;
+            return Some(lo | (hi << 8));
+        }
+        if op.key == "live/" {
+            // The call's own post-call `-live-`: bound the scan so a preceding
+            // opcode's catch can never be mis-selected.
+            return None;
+        }
+    }
+    None
+}
+
+/// Does the `except` handler at `catch_target` flow back into this frame's loop
+/// (reaching a `jit_merge_point` back-edge), rather than returning out of the
+/// frame (`*_return`)?
+///
+/// The exception-edge bridge is only sound when the handler REJOINS the loop in
+/// the SAME frame: the bridge records the handler body and closes with a `Jump`
+/// to the loop header, exactly like the no-exception path.  When the handler
+/// instead RETURNS out of the frame (a called function's `try/except: return`,
+/// compiled as its own function trace, not inlined into the caller's loop), the
+/// walk records a `Finish`/`DoneWithThisFrame` and the bridge must hand the
+/// return value back across the frame boundary to the caller — a cross-frame
+/// exception resume pyre does not yet reconstruct (the caller frame is not
+/// rebuilt at the bridge, so the return path derefs a NULL frame).  Route only
+/// the loop-rejoin case; the caller-return case declines to the blackhole.
+///
+/// Bounded forward reachability from `catch_target`, following `goto`/
+/// `goto_if_not` successors: `true` as soon as any path reaches a
+/// `jit_merge_point`; `false` if every reachable path terminates at a `*_return`
+/// (or the scan hits an un-followed control op / the bound, which conservatively
+/// declines).
+pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut work = vec![catch_target];
+    let mut budget = 4096usize;
+    while let Some(pc) = work.pop() {
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+        if !visited.insert(pc) {
+            continue;
+        }
+        let Some(op) = decode_op_at(code, pc) else {
+            continue;
+        };
+        if op.key.starts_with("jit_merge_point") {
+            return true;
+        }
+        if matches!(
+            op.key,
+            "ref_return/r" | "int_return/i" | "float_return/f" | "void_return/"
+        ) {
+            // Frame-return terminal on this path; do not enqueue successors.
+            continue;
+        }
+        match op.key {
+            "goto/L" => work.push(read_label(code, &op, 0)),
+            "goto_if_not/iL" => {
+                // `iL`: 1B int register + 2B LE label.
+                work.push(read_label(code, &op, 1));
+                work.push(op.next_pc);
+            }
+            key if key.starts_with("switch") => {
+                // Multi-target dispatch not followed; leave this path un-proven
+                // (routing declines unless another path rejoins the loop).
+            }
+            _ => work.push(op.next_pc),
+        }
+    }
+    false
 }
 
 fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
