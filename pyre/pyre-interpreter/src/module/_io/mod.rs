@@ -7,6 +7,145 @@
 
 use pyre_object::*;
 
+fn type_method(ns: PyObjectRef, name: &str, function: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, function);
+    }
+}
+
+fn io_closed(obj: PyObjectRef) -> bool {
+    crate::baseobjspace::getattr_str(obj, "closed")
+        .ok()
+        .and_then(|value| unsafe {
+            pyre_object::is_bool(value).then(|| pyre_object::w_bool_get_value(value))
+        })
+        .unwrap_or(false)
+}
+
+fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
+    if let Some(&self_obj) = args.first() {
+        crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(true))?;
+    }
+    Ok(w_none())
+}
+
+fn iobase_isatty(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("isatty() requires self"))?;
+    if io_closed(self_obj) {
+        return Err(crate::PyError::value_error("I/O operation on closed file"));
+    }
+    Ok(w_bool_from(false))
+}
+
+fn init_iobase_type(ns: PyObjectRef) {
+    type_method(ns, "closed", w_bool_from(false));
+    type_method(
+        ns,
+        "close",
+        crate::make_builtin_function_with_arity("close", iobase_close, 1),
+    );
+    type_method(
+        ns,
+        "isatty",
+        crate::make_builtin_function_with_arity("isatty", iobase_isatty, 1),
+    );
+    type_method(
+        ns,
+        "__enter__",
+        crate::make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
+    );
+    type_method(
+        ns,
+        "__exit__",
+        crate::make_builtin_function("__exit__", |args| {
+            iobase_close(&args[..1])?;
+            Ok(w_none())
+        }),
+    );
+}
+
+fn call_method_result(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> crate::PyResult {
+    let result = crate::baseobjspace::call_method(obj, name, args);
+    if result.is_null() {
+        Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error(format!("{name} failed"))))
+    } else {
+        Ok(result)
+    }
+}
+
+fn buffered_reader_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("BufferedReader.__init__() missing self"))?;
+    let raw = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("BufferedReader() missing raw argument"))?;
+    crate::baseobjspace::setattr_str(self_obj, "raw", raw)?;
+    crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false))?;
+    Ok(w_none())
+}
+
+fn buffered_reader_call(args: &[PyObjectRef], method: &str) -> crate::PyResult {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error(format!("{method}() requires self")))?;
+    let raw = crate::baseobjspace::getattr_str(self_obj, "raw")?;
+    call_method_result(raw, method, &args[1..])
+}
+
+fn buffered_reader_close(args: &[PyObjectRef]) -> crate::PyResult {
+    let result = buffered_reader_call(args, "close")?;
+    crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true))?;
+    Ok(result)
+}
+
+fn init_buffered_reader_type(ns: PyObjectRef) {
+    type_method(
+        ns,
+        "__init__",
+        crate::make_builtin_function("__init__", buffered_reader_init),
+    );
+    type_method(
+        ns,
+        "read",
+        crate::make_builtin_function("read", |args| buffered_reader_call(args, "read")),
+    );
+    type_method(
+        ns,
+        "seekable",
+        crate::make_builtin_function_with_arity(
+            "seekable",
+            |args| buffered_reader_call(args, "seekable"),
+            1,
+        ),
+    );
+    type_method(
+        ns,
+        "close",
+        crate::make_builtin_function_with_arity("close", buffered_reader_close, 1),
+    );
+    type_method(
+        ns,
+        "__enter__",
+        crate::make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
+    );
+    type_method(
+        ns,
+        "__exit__",
+        crate::make_builtin_function("__exit__", |args| {
+            buffered_reader_close(&args[..1])?;
+            Ok(w_none())
+        }),
+    );
+}
+
 crate::py_module! {
     "_io",
     interpleveldefs: {
@@ -54,19 +193,29 @@ crate::py_module! {
         }
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
+        // PyPy hierarchy: RawIOBase/BufferedIOBase/TextIOBase all derive IOBase.
         let obj_type = crate::typedef::w_object();
-        let mut io_base_types: std::collections::HashMap<&str, pyre_object::PyObjectRef> =
-            std::collections::HashMap::new();
-        for name in &["_IOBase", "_RawIOBase", "_BufferedIOBase", "_TextIOBase"] {
-            let t = pyre_object::w_type_new(
-                name,
-                pyre_object::w_tuple_new(vec![obj_type]),
-                pyre_object::w_dict_new() as *mut u8,
-            );
-            unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
-            unsafe { pyre_object::typeobject::w_type_ready(t) };
-            io_base_types.insert(name, t);
-            crate::module_ns_store(ns, name, t);
+        let io_base = crate::typedef::make_builtin_type_with_base(
+            "_IOBase",
+            init_iobase_type,
+            obj_type,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(io_base, true) };
+        let raw_base = crate::typedef::make_builtin_type_with_base("_RawIOBase", |_| {}, io_base);
+        let buffered_base = crate::typedef::make_builtin_type_with_base(
+            "_BufferedIOBase",
+            |_| {},
+            io_base,
+        );
+        let text_base = crate::typedef::make_builtin_type_with_base("_TextIOBase", |_| {}, io_base);
+        for (name, typ) in [
+            ("_IOBase", io_base),
+            ("_RawIOBase", raw_base),
+            ("_BufferedIOBase", buffered_base),
+            ("_TextIOBase", text_base),
+        ] {
+            unsafe { pyre_object::w_type_set_acceptable_as_base_class(typ, true) };
+            crate::module_ns_store(ns, name, typ);
         }
 
         // Concrete stream classes as subclassable W_TypeObjects.  stdlib
@@ -75,15 +224,51 @@ crate::py_module! {
         // test_io), so they must be real types, not function stubs.
         // `FileIO` derives from `_RawIOBase`; the buffered classes from
         // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
-        for (name, base_name) in &[
-            ("FileIO", "_RawIOBase"),
-            ("BufferedReader", "_BufferedIOBase"),
-            ("BufferedWriter", "_BufferedIOBase"),
-            ("BufferedRWPair", "_BufferedIOBase"),
-            ("BufferedRandom", "_BufferedIOBase"),
+        let file_io = crate::typedef::make_builtin_type_with_base(
+            "FileIO",
+            |type_ns| {
+                crate::builtins::init_file_wrapper_type(type_ns);
+                type_method(
+                    type_ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
+                );
+            },
+            raw_base,
+        );
+        let buffered_reader = crate::typedef::make_builtin_type_with_base(
+            "BufferedReader",
+            init_buffered_reader_type,
+            buffered_base,
+        );
+        for (name, t) in [
+            ("FileIO", file_io),
+            ("BufferedReader", buffered_reader),
+            (
+                "BufferedWriter",
+                crate::typedef::make_builtin_type_with_base(
+                    "BufferedWriter",
+                    |_| {},
+                    buffered_base,
+                ),
+            ),
+            (
+                "BufferedRWPair",
+                crate::typedef::make_builtin_type_with_base(
+                    "BufferedRWPair",
+                    |_| {},
+                    buffered_base,
+                ),
+            ),
+            (
+                "BufferedRandom",
+                crate::typedef::make_builtin_type_with_base(
+                    "BufferedRandom",
+                    |_| {},
+                    buffered_base,
+                ),
+            ),
         ] {
-            let base = io_base_types[base_name];
-            let t = crate::typedef::make_builtin_type_with_base(name, |_ns| {}, base);
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);
                 pyre_object::typeobject::w_type_set_hasdict(t, true);
