@@ -2469,11 +2469,6 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     boxed
 }
 
-/// pyjitpl.py:3514 find_biggest_function
-pub(crate) fn biggest_inline_trace_key(state: &mut MIFrame) -> Option<u64> {
-    state.with_ctx(|_, ctx| ctx.find_biggest_function())
-}
-
 pub(crate) fn note_root_trace_too_long(green_key: u64) {
     let (driver, _) = crate::driver::driver_pair();
     let warm_state = driver.meta_interp_mut().warm_state_mut();
@@ -2489,14 +2484,6 @@ pub(crate) fn note_root_trace_too_long(green_key: u64) {
 
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
-}
-
-pub(crate) fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &MIFrame, value: OpRef) -> OpRef {
-    match state.value_type(value) {
-        Type::Int => wrapint(ctx, value),
-        Type::Float => wrapfloat(ctx, value),
-        Type::Ref | Type::Void => value,
-    }
 }
 
 pub(crate) fn box_value_for_python_helper(
@@ -12671,7 +12658,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
 
         assert_eq!(jump_args.len(), 11);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -12785,7 +12772,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
 
         assert_eq!(
             jump_args.len(),
