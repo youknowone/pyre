@@ -11002,6 +11002,36 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
 fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
+        if is_exact_type(obj, &COMPLEX_TYPE) {
+            return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
+        }
+    }
+    // CPython 3.14 try_complex_special_method runs before the complex-subclass
+    // fallback, so a subclass override is honored instead of reading its raw
+    // lanes.  The inherited complex.__complex__ returns an exact base value.
+    if unsafe { crate::baseobjspace::lookup(obj, "__complex__") }.is_some() {
+        let res = crate::baseobjspace::call_method(obj, "__complex__", &[]);
+        if res.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::type_error("__complex__ call failed")));
+        }
+        unsafe {
+            if is_complex(res) {
+                if !is_exact_type(res, &COMPLEX_TYPE) {
+                    crate::warn::warn_deprecation(&format!(
+                        "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
+                        crate::type_methods::arg_type_name(res)
+                    ));
+                }
+                return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
+            }
+        }
+        return Err(crate::PyError::type_error(format!(
+            "__complex__ returned non-complex (type {})",
+            crate::type_methods::arg_type_name(res)
+        )));
+    }
+    unsafe {
         if is_complex(obj) {
             return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
         }
@@ -11018,25 +11048,6 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             return Ok((w_float_get_value(obj), 0.0));
         }
     }
-    // `__complex__` then `__float__` (complexobject.c try_complex_special_method).
-    unsafe {
-        if is_instance(obj) {
-            let t = w_instance_get_type(obj);
-            if crate::baseobjspace::lookup_in_type(t, "__complex__").is_some() {
-                let res = crate::baseobjspace::call_method(obj, "__complex__", &[]);
-                if res.is_null() {
-                    return Err(crate::call::take_call_error()
-                        .unwrap_or_else(|| crate::PyError::type_error("__complex__ call failed")));
-                }
-                if is_complex(res) {
-                    return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
-                }
-                return Err(crate::PyError::type_error(
-                    "__complex__ should return a complex object",
-                ));
-            }
-        }
-    }
     // `complexobject.py unpackcomplex`: after `__complex__`, conversion uses
     // the real-number protocol.  Reuse float's `__float__` then `__index__`
     // ladder so an index-only object is accepted without admitting strings.
@@ -11051,6 +11062,22 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
+unsafe fn complex_constructor_has_real_protocol(obj: PyObjectRef) -> bool {
+    is_bool(obj)
+        || is_int(obj)
+        || is_long(obj)
+        || is_float(obj)
+        || crate::baseobjspace::lookup(obj, "__float__").is_some()
+        || crate::baseobjspace::lookup(obj, "__index__").is_some()
+}
+
+fn complex_constructor_argument_error(name: &str, obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "complex() argument '{name}' must be a real number, not {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
 pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::*;
     // `complex(real=0, imag=0)` — both arguments are positional-or-keyword
@@ -11059,11 +11086,12 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
     let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+    let simple_single_positional = pos.len() == 1 && !has_real_kwargs(kwargs);
 
     // `complex.__new__`: an exact complex passed as the sole argument is
     // returned unchanged.  A strict subclass continues through coercion and
     // is copied into a base complex.
-    if w_imag.is_none() {
+    if simple_single_positional && w_imag.is_none() {
         if let Some(a) = w_real {
             if unsafe { is_exact_type(a, &COMPLEX_TYPE) } {
                 return Ok(a);
@@ -11073,12 +11101,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
     // String form accepts only the real argument.
     if let Some(a) = w_real {
-        if unsafe { is_str(a) } {
-            if w_imag.is_some() {
-                return Err(crate::PyError::type_error(
-                    "complex() can't take second arg if first is a string",
-                ));
-            }
+        if unsafe { is_str(a) } && simple_single_positional {
             // complexobject.py:342 applies `unicode_to_decimal_w` before
             // underscore removal and parsing, including strict surrogate
             // rejection.
@@ -11092,23 +11115,58 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
+    let mut real_is_complex = false;
     let (mut real, mut imag) = match w_real {
-        Some(a) => complex_coerce(a)?,
+        Some(a) => {
+            let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
+            let has_complex_protocol =
+                unsafe { is_complex(a) || crate::baseobjspace::lookup(a, "__complex__").is_some() };
+            if !has_real_protocol && !has_complex_protocol {
+                if simple_single_positional {
+                    return Err(crate::PyError::type_error(format!(
+                        "complex() argument must be a string or a number, not {}",
+                        crate::type_methods::arg_type_name(a)
+                    )));
+                }
+                return Err(complex_constructor_argument_error("real", a));
+            }
+            let value = complex_coerce(a)?;
+            // CPython 3.14 complex_new_impl: using a complex-valued real
+            // argument in the general (keyword/two-argument) constructor is
+            // deprecated unless the original object also has a real-number
+            // conversion protocol.  The single-positional conversion path is
+            // intentionally exempt.
+            if !simple_single_positional && has_complex_protocol && !has_real_protocol {
+                crate::warn::warn_deprecation(&format!(
+                    "complex() argument 'real' must be a real number, not {}",
+                    crate::type_methods::arg_type_name(a)
+                ));
+            }
+            real_is_complex = has_complex_protocol;
+            value
+        }
         None => (0.0, 0.0),
     };
     if let Some(b) = w_imag {
-        if unsafe { is_str(b) } {
-            return Err(crate::PyError::type_error(
-                "complex() second arg can't be a string",
+        let (br, bi, imag_is_complex) = if unsafe { is_complex(b) } {
+            crate::warn::warn_deprecation(&format!(
+                "complex() argument 'imag' must be a real number, not {}",
+                crate::type_methods::arg_type_name(b)
             ));
-        }
-        // complexobject.py:370-377 preserves signed zeroes by checking the
-        // numeric components, not whether either operand is a complex object.
-        let (br, bi) = complex_coerce(b)?;
-        if bi != 0.0 {
+            unsafe { (w_complex_get_real(b), w_complex_get_imag(b), true) }
+        } else {
+            if !unsafe { complex_constructor_has_real_protocol(b) } {
+                return Err(complex_constructor_argument_error("imag", b));
+            }
+            let converted = builtin_float(&[b])?;
+            (unsafe { w_float_get_value(converted) }, 0.0, false)
+        };
+        // CPython 3.14 complex_new_impl: only genuinely complex arguments
+        // contribute the cross lanes; real inputs leave those lanes absent.
+        if imag_is_complex {
             real -= bi;
         }
-        if imag != 0.0 {
+        if real_is_complex {
             imag += br;
         } else {
             imag = br;

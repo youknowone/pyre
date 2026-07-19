@@ -2,6 +2,7 @@
 
 import math
 import operator
+import warnings
 
 
 assert {"__doc__", "__hash__", "__repr__", "from_number"} <= set(float.__dict__)
@@ -59,6 +60,41 @@ else:
 
 assert complex.__lt__(1 + 1j, 2 + 2j) is NotImplemented
 assert complex(2**60, 0) != 2**60 + 1
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    assert complex(real=4.25 + 1.5j) == 4.25 + 1.5j
+assert len(caught) == 1
+assert caught[0].category is DeprecationWarning
+assert str(caught[0].message) == (
+    "complex() argument 'real' must be a real number, not complex"
+)
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    assert complex(1 + 2j, 3 + 4j) == -3 + 5j
+assert len(caught) == 2
+
+
+class ComplexOnly:
+    def __complex__(self):
+        return 3 + 4j
+
+
+try:
+    complex(1, ComplexOnly())
+except TypeError as error:
+    assert str(error) == (
+        "complex() argument 'imag' must be a real number, not ComplexOnly"
+    )
+else:
+    raise AssertionError("the imaginary argument must use the real protocol")
+
+assert format(1 + 2j, "+g") == "+1+2j"
+assert format(1 + 2j, " g") == " 1+2j"
+assert format(1 + 2j, "#g") == "1.00000+2.00000j"
+assert format(complex(float("inf"), float("nan")), "+g") == "+inf+nanj"
+assert format(1234.5 + 6789j, ",.2f") == "1,234.50+6,789.00j"
 
 def assert_float_identical(value, expected):
     if math.isnan(expected):

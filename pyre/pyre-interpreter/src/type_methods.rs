@@ -1869,6 +1869,60 @@ fn parse_spec(spec: &str) -> ParsedSpec {
     }
 }
 
+/// Component spec used by CPython's complex advanced formatter.  Width and
+/// alignment belong to the joined complex value; every remaining numeric flag
+/// is repeated for the real and imaginary float components.
+fn complex_component_spec(p: &ParsedSpec, sign: char) -> String {
+    let mut spec = String::new();
+    if sign != '-' {
+        spec.push(sign);
+    }
+    if p.alt_form {
+        spec.push('#');
+    }
+    if let Some(grouping) = p.grouping {
+        spec.push(grouping);
+    }
+    if let Some(precision) = p.precision {
+        spec.push('.');
+        spec.push_str(&precision.to_string());
+        if let Some(grouping) = p.fractional_grouping {
+            spec.push(grouping);
+        }
+    } else if let Some(grouping) = p.fractional_grouping {
+        spec.push('.');
+        spec.push(grouping);
+    }
+    if p.ty != '\0' {
+        spec.push(p.ty);
+    }
+    spec
+}
+
+/// Format one real/imaginary lane.  Complex's omitted presentation type is
+/// repr-like (integral doubles lose float's trailing `.0`); an alternate form
+/// deliberately retains it.
+fn format_complex_component(
+    value: f64,
+    spec: &str,
+    default_type: bool,
+    alternate: bool,
+) -> Result<String, crate::PyError> {
+    let rendered = if value.is_nan() || value.is_infinite() {
+        format_nonfinite(value, spec)?
+    } else {
+        format_finite_float(value, spec)?
+    };
+    let mut text = rendered
+        .as_str()
+        .expect("numeric formatting always produces UTF-8")
+        .to_string();
+    if default_type && !alternate && text.ends_with(".0") {
+        text.truncate(text.len() - 2);
+    }
+    Ok(text)
+}
+
 /// Return the normalized engine spec with its width replaced.  Fractional
 /// grouping is applied after rustpython-common has rounded the number; reducing
 /// the engine width by the number of inserted separators keeps Python's width
@@ -2254,26 +2308,40 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 ));
             }
             let align = p.align.unwrap_or('>');
-            // No presentation type and no precision: pad str(self), which
-            // already carries the parentheses / bare-imaginary form.
-            if p.ty == '\0' && p.precision.is_none() {
+            // With no component-affecting flags, the default presentation is
+            // exactly str(self), padded as a single complex value.
+            if p.ty == '\0'
+                && p.precision.is_none()
+                && p.fractional_grouping.is_none()
+                && p.grouping.is_none()
+                && !p.alt_form
+                && !matches!(p.sign, Some('+') | Some(' '))
+            {
                 let body = Wtf8Buf::from_string(crate::py_str(val)?);
                 return Ok(pad_wtf8(&body, p.fill, align, p.width));
             }
-            // A presentation type or precision formats the real and imaginary
-            // parts as floats and joins them; the imaginary part always
-            // carries an explicit sign and the whole ends in `j`.
-            let prec = p
-                .precision
-                .map(|precision| format!(".{precision}"))
-                .unwrap_or_default();
-            let ty = if p.ty == '\0' { 'f' } else { p.ty };
-            let re_spec = format!("{prec}{ty}");
-            let im_spec = format!("+{prec}{ty}");
-            let mut body = format_finite_float(re, &re_spec)?;
-            let im_str = format_finite_float(im, &im_spec)?;
-            body.push_wtf8(&im_str);
-            body.push_char('j');
+            // CPython _PyComplex_FormatAdvancedWriter: component flags
+            // (sign / alternate / grouping / precision / type) are applied
+            // to each float, while alignment and width pad the joined value.
+            let default_type = p.ty == '\0';
+            let real_sign = p.sign.unwrap_or('-');
+            let real_spec = complex_component_spec(&p, real_sign);
+            let imag_sign = if default_type && re == 0.0 && re.is_sign_positive() {
+                p.sign.unwrap_or('-')
+            } else {
+                '+'
+            };
+            let imag_spec = complex_component_spec(&p, imag_sign);
+            let real_text = format_complex_component(re, &real_spec, default_type, p.alt_form)?;
+            let imag_text = format_complex_component(im, &imag_spec, default_type, p.alt_form)?;
+            let text = if default_type && re == 0.0 && re.is_sign_positive() {
+                format!("{imag_text}j")
+            } else if default_type {
+                format!("({real_text}{imag_text}j)")
+            } else {
+                format!("{real_text}{imag_text}j")
+            };
+            let body = Wtf8Buf::from_string(text);
             return Ok(pad_wtf8(&body, p.fill, align, p.width));
         }
         if pyre_object::is_str(val) {
