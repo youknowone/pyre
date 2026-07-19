@@ -4,7 +4,16 @@ from io import BufferedReader, BytesIO, FileIO, RawIOBase, StringIO, TextIOWrapp
 from testutils import assert_raises
 
 fi = FileIO("README.md")
+assert isinstance(fi, RawIOBase)
+assert issubclass(FileIO, RawIOBase)
+assert fi.mode == "rb"
+assert fi.readable()
+assert not fi.writable()
 assert fi.seekable()
+assert fi.tell() == 0
+assert fi.seek(2) == 2
+assert fi.tell() == 2
+assert fi.seek(0) == 0
 bb = BufferedReader(fi)
 assert bb.seekable()
 
@@ -40,6 +49,23 @@ with FileIO("README.md") as fio:
     assert len(nres) == 1
     nres = fio.read(2)
     assert len(nres) == 2
+
+
+# closefd=False leaves an externally owned descriptor usable after close.
+read_fd, write_fd = os.pipe()
+os.write(write_fd, b"pipe")
+os.close(write_fd)
+with FileIO(read_fd, closefd=False) as fio:
+    assert fio.closefd is False
+    assert fio.read() == b"pipe"
+os.close(read_fd)
+
+with assert_raises(ValueError):
+    FileIO("README.md", closefd=False)
+
+for bad_mode in ("", "rr", "rt", "rw", "rbb"):
+    with assert_raises(ValueError):
+        FileIO("README.md", bad_mode)
 
 
 # Test that IOBase.isatty() raises ValueError when called on a closed file.
