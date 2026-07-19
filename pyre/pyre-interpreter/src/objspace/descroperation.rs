@@ -1429,28 +1429,173 @@ unsafe fn complex_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn complex_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
     let (br, bi) = complex_val(b).unwrap();
-    Ok(w_complex_new(ar * br - ai * bi, ar * bi + ai * br))
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    if is_complex(a) && is_complex(b) {
+        Ok(complex_prod(ar, ai, br, bi))
+    } else if is_complex(a) {
+        // CPython 3.14 _Py_cr_prod: multiply each existing complex lane by
+        // the real operand, without manufacturing a zero imaginary lane.
+        Ok(w_complex_new(ar * br, ai * br))
+    } else {
+        // _Py_rc_prod(a, b) delegates to _Py_cr_prod(b, a).
+        Ok(w_complex_new(br * ar, bi * ar))
+    }
 }
 
-/// `complexobject.c _Py_c_quot` — Smith's algorithm for numerical stability.
-unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let (ar, ai) = complex_val(a).unwrap();
-    let (br, bi) = complex_val(b).unwrap();
+/// CPython 3.14 `complexobject.c _Py_c_prod`, including the C11 Annex G.5.1
+/// recovery for infinities that first produce `nan+nanj`.
+unsafe fn complex_prod(mut a: f64, mut b: f64, mut c: f64, mut d: f64) -> PyObjectRef {
+    let ac = a * c;
+    let bd = b * d;
+    let ad = a * d;
+    let bc = b * c;
+    let mut real = ac - bd;
+    let mut imag = ad + bc;
+    if real.is_nan() && imag.is_nan() {
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = float_copysign(if a.is_infinite() { 1.0 } else { 0.0 }, a);
+            b = float_copysign(if b.is_infinite() { 1.0 } else { 0.0 }, b);
+            if c.is_nan() {
+                c = float_copysign(0.0, c);
+            }
+            if d.is_nan() {
+                d = float_copysign(0.0, d);
+            }
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            c = float_copysign(if c.is_infinite() { 1.0 } else { 0.0 }, c);
+            d = float_copysign(if d.is_infinite() { 1.0 } else { 0.0 }, d);
+            if a.is_nan() {
+                a = float_copysign(0.0, a);
+            }
+            if b.is_nan() {
+                b = float_copysign(0.0, b);
+            }
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite())
+        {
+            if a.is_nan() {
+                a = float_copysign(0.0, a);
+            }
+            if b.is_nan() {
+                b = float_copysign(0.0, b);
+            }
+            if c.is_nan() {
+                c = float_copysign(0.0, c);
+            }
+            if d.is_nan() {
+                d = float_copysign(0.0, d);
+            }
+            recalc = true;
+        }
+        if recalc {
+            real = f64::INFINITY * (a * c - b * d);
+            imag = f64::INFINITY * (a * d + b * c);
+        }
+    }
+    w_complex_new(real, imag)
+}
+
+/// CPython 3.14 `complexobject.c _Py_c_quot`: Smith's stable division plus
+/// the C11 Annex G.5.2 recovery for infinite numerators and denominators.
+unsafe fn complex_quot(ar: f64, ai: f64, br: f64, bi: f64) -> PyObjectRef {
     let abs_br = br.abs();
     let abs_bi = bi.abs();
-    let (real, imag) = if abs_br >= abs_bi {
+    let mut real: f64;
+    let mut imag: f64;
+    if abs_br >= abs_bi {
         if abs_br == 0.0 {
-            return Err(PyError::zero_division("complex division by zero"));
+            // `_Py_c_quot` writes 0+0j and signals EDOM through errno.  The
+            // caller performs that side-channel check before using the pair.
+            return w_complex_new(0.0, 0.0);
         }
         let ratio = bi / br;
         let denom = br + bi * ratio;
-        ((ar + ai * ratio) / denom, (ai - ar * ratio) / denom)
-    } else {
+        real = (ar + ai * ratio) / denom;
+        imag = (ai - ar * ratio) / denom;
+    } else if abs_bi >= abs_br {
         let ratio = br / bi;
         let denom = br * ratio + bi;
-        ((ar * ratio + ai) / denom, (ai * ratio - ar) / denom)
-    };
-    Ok(w_complex_new(real, imag))
+        real = (ar * ratio + ai) / denom;
+        imag = (ai * ratio - ar) / denom;
+    } else {
+        real = f64::NAN;
+        imag = f64::NAN;
+    }
+    if real.is_nan() && imag.is_nan() {
+        if (ar.is_infinite() || ai.is_infinite()) && br.is_finite() && bi.is_finite() {
+            let x = float_copysign(if ar.is_infinite() { 1.0 } else { 0.0 }, ar);
+            let y = float_copysign(if ai.is_infinite() { 1.0 } else { 0.0 }, ai);
+            real = f64::INFINITY * (x * br + y * bi);
+            imag = f64::INFINITY * (y * br - x * bi);
+        } else if (abs_br.is_infinite() || abs_bi.is_infinite()) && ar.is_finite() && ai.is_finite()
+        {
+            let x = float_copysign(if br.is_infinite() { 1.0 } else { 0.0 }, br);
+            let y = float_copysign(if bi.is_infinite() { 1.0 } else { 0.0 }, bi);
+            real = 0.0 * (ar * x + ai * y);
+            imag = 0.0 * (ai * x - ar * y);
+        }
+    }
+    w_complex_new(real, imag)
+}
+
+/// CPython 3.14 `_Py_rc_quot`: real divided by complex, with its distinct
+/// signed-zero recovery when the denominator contains an infinity.
+unsafe fn real_complex_quot(a: f64, br: f64, bi: f64) -> PyObjectRef {
+    let abs_br = br.abs();
+    let abs_bi = bi.abs();
+    let mut real: f64;
+    let mut imag: f64;
+    if abs_br >= abs_bi {
+        if abs_br == 0.0 {
+            return w_complex_new(0.0, 0.0);
+        }
+        let ratio = bi / br;
+        let denom = br + bi * ratio;
+        real = a / denom;
+        imag = (-a * ratio) / denom;
+    } else if abs_bi >= abs_br {
+        let ratio = br / bi;
+        let denom = br * ratio + bi;
+        real = (a * ratio) / denom;
+        imag = (-a) / denom;
+    } else {
+        real = f64::NAN;
+        imag = f64::NAN;
+    }
+    if real.is_nan()
+        && imag.is_nan()
+        && a.is_finite()
+        && (abs_br.is_infinite() || abs_bi.is_infinite())
+    {
+        let x = float_copysign(if br.is_infinite() { 1.0 } else { 0.0 }, br);
+        let y = float_copysign(if bi.is_infinite() { 1.0 } else { 0.0 }, bi);
+        real = 0.0 * (a * x);
+        imag = 0.0 * (-a * y);
+    }
+    w_complex_new(real, imag)
+}
+
+unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let (ar, ai) = complex_val(a).unwrap();
+    let (br, bi) = complex_val(b).unwrap();
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    if br == 0.0 && bi == 0.0 {
+        return Err(PyError::zero_division("complex division by zero"));
+    }
+    if is_complex(a) && is_complex(b) {
+        Ok(complex_quot(ar, ai, br, bi))
+    } else if is_complex(a) {
+        // CPython 3.14 _Py_cr_quot.
+        Ok(w_complex_new(ar / br, ai / br))
+    } else {
+        Ok(real_complex_quot(ar, br, bi))
+    }
 }
 
 unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {

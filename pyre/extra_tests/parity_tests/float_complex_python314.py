@@ -60,15 +60,25 @@ else:
 assert complex.__lt__(1 + 1j, 2 + 2j) is NotImplemented
 assert complex(2**60, 0) != 2**60 + 1
 
-def assert_negative_zero_complex(value):
-    assert math.copysign(1.0, value.real) == -1.0
-    assert math.copysign(1.0, value.imag) == -1.0
+def assert_float_identical(value, expected):
+    if math.isnan(expected):
+        assert math.isnan(value)
+    elif expected == 0.0:
+        assert value == 0.0
+        assert math.copysign(1.0, value) == math.copysign(1.0, expected)
+    else:
+        assert value == expected
 
 
-assert_negative_zero_complex(complex(-0.0, -0.0) + -0.0)
-assert_negative_zero_complex(-0.0 + complex(-0.0, -0.0))
-assert_negative_zero_complex(complex(-0.0, -0.0) - 0.0)
-assert_negative_zero_complex(-0.0 - complex(0.0, 0.0))
+def assert_complex_identical(value, expected):
+    assert_float_identical(value.real, expected.real)
+    assert_float_identical(value.imag, expected.imag)
+
+
+assert_complex_identical(complex(-0.0, -0.0) + -0.0, complex(-0.0, -0.0))
+assert_complex_identical(-0.0 + complex(-0.0, -0.0), complex(-0.0, -0.0))
+assert_complex_identical(complex(-0.0, -0.0) - 0.0, complex(-0.0, -0.0))
+assert_complex_identical(-0.0 - complex(0.0, 0.0), complex(-0.0, -0.0))
 for operation in (operator.add, operator.sub):
     try:
         operation(1j, 10**1000)
@@ -76,6 +86,17 @@ for operation in (operator.add, operator.sub):
         assert str(error) == "int too large to convert to float"
     else:
         raise AssertionError("over-range int must fail complex arithmetic")
+
+inf = float("inf")
+nan = float("nan")
+assert_complex_identical(complex(inf, 1.0) * 0.0, complex(nan, 0.0))
+assert_complex_identical(
+    complex(1e300, 1.0) * complex(nan, inf), complex(-inf, inf)
+)
+assert_complex_identical(
+    (1.0 + 1.0j) / complex(-inf, inf), complex(0.0, -0.0)
+)
+assert_complex_identical(1.0 / complex(-inf, -inf), complex(-0.0, 0.0))
 
 
 class IndexOnly:
