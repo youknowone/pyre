@@ -1065,22 +1065,6 @@ pub(crate) fn collect_call_stack_overrides(
             }
         }
     }
-    let base = ctx
-        .trace_ctx
-        .virtualizable_info()
-        .map(|info| info.num_static_extra_boxes)
-        .unwrap_or(0);
-    for slot in nlocals..stack_end {
-        if overrides.iter().any(|&(present, _)| present == slot) {
-            continue;
-        }
-        if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
-        {
-            if !value.is_null() {
-                overrides.push((slot, value.as_usize() as pyre_object::PyObjectRef));
-            }
-        }
-    }
     if pcdep_entries.is_empty() {
         for slot in nlocals..stack_end {
             if overrides.iter().any(|&(present, _)| present == slot) {
@@ -1101,6 +1085,25 @@ pub(crate) fn collect_call_stack_overrides(
                     overrides.push((slot, value));
                 }
             }
+        }
+    }
+    // Use the virtualizable shadow only after the live register/vstack
+    // sources.  A mid-opcode shadow stack slot can be NULL because it was not
+    // mirrored, while the corresponding live color still has the value.  The
+    // remaining NULL is the CALL's real null-or-self sentinel and must be
+    // preserved as an explicit slot override.
+    let base = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .map(|info| info.num_static_extra_boxes)
+        .unwrap_or(0);
+    for slot in nlocals..stack_end {
+        if overrides.iter().any(|&(present, _)| present == slot) {
+            continue;
+        }
+        if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
+        {
+            overrides.push((slot, value.as_usize() as pyre_object::PyObjectRef));
         }
     }
     overrides

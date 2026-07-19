@@ -3672,15 +3672,15 @@ fn flush_walk_end_state_to_frame_inner(
             .find_map(|&(slot, value)| (slot == abs).then_some(value))
     };
     for abs in 0..live {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
-        };
         if abs >= nlocals && !stack_overrides.is_empty() {
             if stack_override_at(abs).is_none() {
                 return false;
             }
             continue;
         }
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
         // An operand-STACK slot (`abs >= nlocals`) that resolves to a NULL Ref
         // is an UNPOPULATED shadow slot, not a live value: the virtualizable
         // shadow tracks locals/cells faithfully but its stack region is only
@@ -3716,12 +3716,14 @@ fn flush_walk_end_state_to_frame_inner(
     // slot is reachable from the (rooted) frame, so neither side goes
     // stale across the loop.
     for abs in 0..live {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
-        };
-        let boxed = if abs >= nlocals {
-            stack_override_at(abs).unwrap_or_else(|| boxed_slot_value_for_type(Type::Ref, &value))
+        let boxed = if abs >= nlocals && !stack_overrides.is_empty() {
+            // The override is the authoritative caller CALL stack.  Its
+            // mid-opcode slots need not exist in the virtualizable shadow.
+            stack_override_at(abs).expect("validated stack override")
         } else {
+            let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+                return false;
+            };
             boxed_slot_value_for_type(Type::Ref, &value)
         };
         unsafe {

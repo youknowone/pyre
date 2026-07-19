@@ -1502,3 +1502,27 @@ pub(crate) fn fbw_callee_body_side_effect_free(
     }
     true
 }
+
+pub(crate) fn fbw_callee_body_has_binary_op_residual(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if op.opname.starts_with("residual_call")
+            && residual_call_descr_index_in_body(body_code, &op)
+                .and_then(|index| callee_descr_refs.get(index))
+                .and_then(|descr| descr.as_call_descr())
+                .is_some_and(|descr| {
+                    descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::BinaryOp
+                })
+        {
+            return true;
+        }
+        pc = op.next_pc;
+    }
+    false
+}

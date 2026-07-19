@@ -2133,7 +2133,7 @@ fn run_perfn_walk(
                 ) => Some((*pc, false)),
                 _ => None,
             };
-            let mut entry_carrier_call_py_pc = None;
+            let mut committed_entry_carrier_call_py_pc = None;
             if let Some((abort_jit_pc, is_marker_abort)) = call_forward_abort {
                 // gh#467: a supported abort fired inside a TOP-level inline
                 // sub-walk whose callee executed no concrete effect
@@ -2159,10 +2159,10 @@ fn run_perfn_walk(
                         if let Some(call_py_pc) =
                             resolve_entry_carrier_call_py_pc(*outer_jitcode_index, *call_jitcode_pc)
                         {
-                            entry_carrier_call_py_pc = Some(call_py_pc);
                             if crate::state::flush_walk_end_state_at_outer_call(
                                 ctx, cf_addr, call_py_pc, call_stack,
                             ) {
+                                committed_entry_carrier_call_py_pc = Some(call_py_pc);
                                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                     eprintln!(
                                         "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
@@ -2295,7 +2295,7 @@ fn run_perfn_walk(
                             &pjc.metadata,
                             call_jitcode_pc,
                         ) as usize;
-                        if entry_carrier_call_py_pc == Some(resume_py_pc) {
+                        if committed_entry_carrier_call_py_pc == Some(resume_py_pc) {
                             crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                 eprintln!(

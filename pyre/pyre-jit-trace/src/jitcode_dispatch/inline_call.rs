@@ -1288,6 +1288,23 @@ pub(crate) fn try_walker_inline_resolved_user_call(
         },
         ConcreteValue::Ref(_) | ConcreteValue::Null => false,
     });
+    let args_all_builtin_integer = callee_arg_concretes.iter().all(|concrete| match concrete {
+        ConcreteValue::Int(_) | ConcreteValue::Bool(_) => true,
+        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { pyre_object::is_int_or_long(*obj) },
+        ConcreteValue::Float(_) | ConcreteValue::Ref(_) | ConcreteValue::Null => false,
+    });
+    // Keep exact-integer arithmetic callees as one residual call when tracing
+    // a guard-origin bridge.  Re-inlining their BinaryOp body would create a
+    // second virtual frame whose operand stack is not a red bridge input; an
+    // overflow path can then compile NULL vable stack slots into the bridge.
+    // The primary loop still inlines the callee, and non-integer/user-
+    // overridable calls continue through the ordinary inline/abort policy.
+    if ctx.trace_ctx.is_bridge_trace
+        && args_all_builtin_integer
+        && fbw_callee_body_has_binary_op_residual(body.code, callee_descr_refs)
+    {
+        return Ok(None);
+    }
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
     // a live-heap mutation would double it; the nested-residual decline catches
