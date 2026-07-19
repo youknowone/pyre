@@ -404,12 +404,9 @@ fn run_python_impl(source: &str) -> String {
     // JIT-compiled loop — can resolve its parent frame instead of tripping the
     // fail-fast topframe assert.
     pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
-    // Register the __build_class__ callback and seed its exec-context slot
-    // (pyrex setup_exec_context does the same). Without this, a `class Sub(...,
-    // kw=...)` body cannot resolve the live frame in call_init_subclass_on_bases
-    // and __init_subclass__ keyword arguments are rejected.
+    // Register the __build_class__ callback. Class construction resolves the
+    // live frame from the execution-context slot seeded above.
     pyre_interpreter::call::register_build_class();
-    pyre_interpreter::call::set_build_class_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
     let mut frame =
         match pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context) {
             Ok(frame) => frame,

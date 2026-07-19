@@ -6,7 +6,7 @@ use rustpython_compiler::{
     parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErrorType},
 };
 
-use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx};
+use pyre_interpreter::call::register_build_class;
 use pyre_interpreter::importing;
 use pyre_interpreter::{PyDisplay, PyError, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
@@ -48,7 +48,6 @@ pub fn run_repl(quiet: bool, no_site: bool) {
 
     let execution_context = Rc::new(PyExecutionContext::default());
     register_build_class();
-    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
     // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
     // at the REPL raises KeyboardInterrupt rather than killing the
     // process, and register the periodic signal-check action.
