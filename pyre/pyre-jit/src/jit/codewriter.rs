@@ -2788,7 +2788,8 @@ fn binary_opname(op: pyre_interpreter::bytecode::BinaryOperator) -> &'static str
         B::InplaceAnd => "inplace_and",
         B::InplaceOr => "inplace_or",
         B::InplaceXor => "inplace_xor",
-        other => panic!("unsupported BinaryOperator in frontend graph: {other:?}"),
+        B::MatrixMultiply => "matmul",
+        B::InplaceMatrixMultiply => "inplace_matmul",
     }
 }
 

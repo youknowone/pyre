@@ -3607,6 +3607,8 @@ fn binary_op_tag_for_opname(opname: &str) -> Option<i64> {
         "inplace_and" => 22,
         "inplace_or" => 23,
         "inplace_xor" => 24,
+        "matmul" => 25,
+        "inplace_matmul" => 26,
         _ => return None,
     })
 }
@@ -8733,6 +8735,8 @@ mod tests {
             ("inplace_and", 22),
             ("inplace_or", 23),
             ("inplace_xor", 24),
+            ("matmul", 25),
+            ("inplace_matmul", 26),
         ] {
             assert_eq!(
                 binary_op_tag_for_opname(opname),
