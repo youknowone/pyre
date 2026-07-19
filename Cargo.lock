@@ -2175,6 +2175,7 @@ dependencies = [
  "rustpython-compiler-core",
  "rustpython-host_env",
  "rustpython-literal",
+ "rustpython-ruff_text_size",
  "rustpython-sre_engine",
  "rustpython-unicode",
  "rustpython-wtf8",

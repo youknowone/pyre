@@ -44,3 +44,28 @@ def _check_flags_error(flags):
 
 _check_flags_error(99999)
 _check_flags_error(0x10000)
+
+
+# PyPy's compile_to_ast path returns public, mutable `_ast` heap objects.
+import ast
+
+tree = compile("x = f'{value!r:>10}'", "<ast>", "exec", ast.PyCF_ONLY_AST)
+assert isinstance(tree, ast.Module)
+assign = tree.body[0]
+assert assign.targets[0].id == "x"
+formatted = assign.value.values[0]
+assert formatted.value.id == "value"
+assert formatted.conversion == ord("r")
+assert formatted.format_spec.values[0].value == ">10"
+assert compile(tree, "<ast>", "exec", ast.PyCF_ONLY_AST) is tree
+
+tree = ast.parse(
+    'match value:\n'
+    '    case {"x": [first, *rest]} if rest:\n'
+    '        pass\n'
+)
+case = tree.body[0].cases[0]
+assert case.pattern.keys[0].value == "x"
+assert case.pattern.patterns[0].patterns[0].name == "first"
+assert case.pattern.patterns[0].patterns[1].name == "rest"
+assert case.guard.id == "rest"
