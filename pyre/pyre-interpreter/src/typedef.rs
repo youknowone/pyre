@@ -13787,15 +13787,7 @@ fn init_complex_type(ns: PyObjectRef) {
             "__abs__",
             make_builtin_function_with_arity(
                 "__abs__",
-                |args| {
-                    let (re, im) = unsafe {
-                        (
-                            pyre_object::w_complex_get_real(args[0]),
-                            pyre_object::w_complex_get_imag(args[0]),
-                        )
-                    };
-                    Ok(pyre_object::w_float_new(re.hypot(im)))
-                },
+                |args| crate::objspace::descroperation::complex_abs(args[0]),
                 1,
             ),
         )

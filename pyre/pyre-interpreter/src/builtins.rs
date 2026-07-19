@@ -2869,10 +2869,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             return Ok(w_float_new(w_float_get_value(obj).abs()));
         }
         if pyre_object::is_complex(obj) {
-            // abs(complex) → the float magnitude.
-            let re = pyre_object::w_complex_get_real(obj);
-            let im = pyre_object::w_complex_get_imag(obj);
-            return Ok(w_float_new(re.hypot(im)));
+            return crate::objspace::descroperation::complex_abs(obj);
         }
     }
     // Instance __abs__ — PyPy: baseobjspace.py abs

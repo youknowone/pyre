@@ -9,7 +9,7 @@
 
 use malachite_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 
 use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
@@ -1491,23 +1491,47 @@ unsafe fn complex_neg(a: PyObjectRef) -> PyResult {
 }
 
 /// `abs(complex)` → the float magnitude `hypot(real, imag)`.
-unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
-    Ok(w_float_new(ar.hypot(ai)))
+    let result = ar.hypot(ai);
+    if result.is_infinite() && ar.is_finite() && ai.is_finite() {
+        return Err(PyError::overflow_error("absolute value too large"));
+    }
+    Ok(w_float_new(result))
 }
 
 /// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
 /// operands compare equal when the imaginary part is zero.
 unsafe fn complex_richcompare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    let (ar, ai) = complex_val(a).unwrap();
-    let (br, bi) = complex_val(b).unwrap();
-    match op {
-        CompareOp::Eq => Ok(w_bool_from(ar == br && ai == bi)),
-        CompareOp::Ne => Ok(w_bool_from(ar != br || ai != bi)),
-        _ => Err(PyError::type_error(
-            "'<' not supported between instances of 'complex' and 'complex'",
-        )),
+    if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        return Ok(w_not_implemented());
     }
+    let equal = if is_complex(a) && is_complex(b) {
+        w_complex_get_real(a) == w_complex_get_real(b)
+            && w_complex_get_imag(a) == w_complex_get_imag(b)
+    } else {
+        // `complexobject.py descr_eq`: compare a real-only complex through
+        // float/int equality.  Do not round an arbitrary-size integer to f64;
+        // convert the integral float lane to BigInt and compare exactly.
+        let (z, other) = if is_complex(a) { (a, b) } else { (b, a) };
+        let real = w_complex_get_real(z);
+        if w_complex_get_imag(z) != 0.0 {
+            false
+        } else if is_float(other) {
+            real == w_float_get_value(other)
+        } else if is_int(other) || is_long(other) || is_bool(other) {
+            real.is_finite()
+                && real.fract() == 0.0
+                && BigInt::from_f64(real).is_some_and(|value| value == as_bigint(other))
+        } else {
+            return Ok(w_not_implemented());
+        }
+    };
+    Ok(w_bool_from(if matches!(op, CompareOp::Eq) {
+        equal
+    } else {
+        !equal
+    }))
 }
 
 /// `complexobject.c complex_hash` — `hash(real) + _PyHASH_IMAG * hash(imag)`.
@@ -3176,7 +3200,10 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => float_ne(a, b),
             };
         }
-        if is_complex_pair(a, b) {
+        // complexobject.py only implements equality here.  Its ordering
+        // dunders return NotImplemented, which must continue through the
+        // reflected comparison and the generic TypeError fallback below.
+        if is_complex_pair(a, b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             return complex_richcompare(a, b, op);
         }
         if is_str(a) && is_str(b) {

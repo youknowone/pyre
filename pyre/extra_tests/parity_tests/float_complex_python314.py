@@ -46,6 +46,17 @@ complex_nan = complex(float("nan"), float("nan"))
 assert complex.from_number(complex_nan) is complex_nan
 assert (1 - 2j).__getnewargs__() == (1.0, -2.0)
 
+try:
+    abs(complex(float.fromhex("0x1.fffffffffffffp+1023"),
+                float.fromhex("0x1.fffffffffffffp+1023")))
+except OverflowError as error:
+    assert str(error) == "absolute value too large"
+else:
+    raise AssertionError("an overflowing complex magnitude must raise")
+
+assert complex.__lt__(1 + 1j, 2 + 2j) is NotImplemented
+assert complex(2**60, 0) != 2**60 + 1
+
 
 class IndexOnly:
     def __index__(self):
