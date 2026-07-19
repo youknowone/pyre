@@ -12572,6 +12572,21 @@ impl CodeWriter {
                     &splice_pairs,
                     &splice_interference,
                 );
+            // `interp_jit.py:67 reds = ['frame', 'ec']`: both portal inputs
+            // are live in every MIFrame at every guard. Give them dedicated
+            // Ref colors above the ordinary allocator range so neither can be
+            // coalesced with a local/stack value at an interior resume point.
+            // This is the post-color equivalent of adding interference edges
+            // from the always-live reds to every Ref, without perturbing the
+            // coloring of the body itself.
+            {
+                let ref_alloc = &mut splice_regallocs[Kind::Ref.index()];
+                let frame_color = ref_alloc.num_colors;
+                let ec_color = frame_color + 1;
+                ref_alloc.coloring.insert(frame_var.id, frame_color);
+                ref_alloc.coloring.insert(ec_var.id, ec_color);
+                ref_alloc.num_colors = ec_color + 1;
+            }
             let ssarepr = super::flatten::flatten_graph(
                 &graph,
                 &mut splice_regallocs,

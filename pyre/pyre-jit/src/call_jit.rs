@@ -1982,12 +1982,35 @@ pub fn blackhole_resume_via_rd_numb(
     // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
     // reds = ['frame', 'ec']`) are filled per-frame by
     // `consume_one_section` from each section's `-live-` op (resume.py
-    // :1381 / `_prepare_next_section` resume.py:1017). With the
-    // codewriter now seeding `portal_frame_reg` / `portal_ec_reg` into
-    // every -live- op's R-bank (jit/codewriter.rs:2364), each chained
-    // `BlackholeInterpreter` gets its frame_ptr + ec values via the
-    // regular `setarg_r` callback path. No pyre-side fixup is needed;
-    // RPython has no chain fill-up step either.
+    // :1381 / `_prepare_next_section` resume.py:1017). RPython's vable
+    // bytecodes use that live frame red directly. Pyre's blackhole vable
+    // handlers instead address `BlackholeInterpreter::virtualizable_ptr`,
+    // so bind that Pyre-only cache from EACH frame's own red register.
+    {
+        let multi_frame = bh.nextblackholeinterp.is_some();
+        let mut current = Some(&mut bh);
+        while let Some(frame) = current {
+            // The outer/root frame's standard virtualizable identity comes
+            // from `consume_vable_info` above. Preserve it for a single-frame
+            // resume. In a multi-frame snapshot that one vable section names
+            // only the outer portal frame, so even the innermost blackhole
+            // must instead bind its own frame red.
+            if (multi_frame || frame.virtualizable_ptr == 0)
+                && let Some(jitcode_index) = frame.jitcode.try_index()
+            {
+                let (frame_reg, _) =
+                    pyre_jit_trace::state::portal_red_regs_at(jitcode_index as i32);
+                if frame_reg != u16::MAX {
+                    if let Some(&frame_ptr) = frame.registers_r.get(frame_reg as usize) {
+                        if frame_ptr != 0 {
+                            frame.virtualizable_ptr = frame_ptr;
+                        }
+                    }
+                }
+            }
+            current = frame.nextblackholeinterp.as_deref_mut();
+        }
+    }
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
@@ -2093,7 +2116,15 @@ pub fn blackhole_resume_via_rd_numb(
 
     // blackhole.py:1752 _run_forever parity.
     loop {
-        if let Some(args) = bh.run() {
+        // `_resume_mainloop` can hand an unhandled exception to a suspended
+        // caller by setting `got_exception` below. Propagate that state before
+        // dispatching the caller: its current position is the normal post-call
+        // continuation and the call result is deliberately garbage on raise.
+        // Running even one opcode first consumes that garbage as a successful
+        // return and replaces the real exception with a secondary TypeError.
+        if !bh.got_exception
+            && let Some(args) = bh.run()
+        {
             // blackhole.py:1068: raise ContinueRunningNormally(*args)
             //
             // The blackhole reached a merge point with no pending exception
@@ -2135,7 +2166,7 @@ pub fn blackhole_resume_via_rd_numb(
                     .collect(),
             };
         }
-        if bh.aborted {
+        if !bh.got_exception && bh.aborted {
             // #326: roll the virtualizable heap frame back to the guard
             // snapshot captured before `bh.run()`, discarding this aborted
             // run's partial forward mutations.  The interpreter resumes

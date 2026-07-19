@@ -3249,6 +3249,21 @@ fn call_assembler_guard_failure_inner(
         return handle as i64;
     }
 
+    // compile.py:658-662 ExitFrameWithExceptionDescrRef.handle_fail:
+    // FINISH descriptors are the attached singleton Arc<dyn Descr> data
+    // pointers, not the concrete FailDescrCell pointers used by guards.
+    // The normal DoneWithThisFrame descriptor was handled by the emitted
+    // fast-path comparison before entering this helper; classify the other
+    // FINISH singleton here before `recover_fail_descr_cell` below.  Its
+    // exception ref is the returned jitframe's slot 0, as staged by
+    // `run_compiled_code`'s propagate-exception handling.
+    let attached_ptrs = attachments.descr_ptrs();
+    if attached_ptrs.is_exit_frame_with_exception_descr(fail_descr_ptr as usize) {
+        let exc_value = unsafe { *outputs_ptr };
+        jit_exc_raise(exc_value);
+        return 0;
+    }
+
     let _target = unsafe { &*fast_lookup_ca_target(token_number) };
 
     // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref)`
