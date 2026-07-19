@@ -1402,7 +1402,17 @@ pub unsafe fn w_list_find_or_count_fast(
             let mut result: i64 = 0;
             let mut i = start.max(0);
             while i < stop {
-                if items[i as usize] == target {
+                // `FloatListStrategy._safe_find_or_count`: ordinary floats
+                // compare by value, while NaNs compare by their unwrapped
+                // bit pattern.  The latter preserves the identity shortcut
+                // that `space.eq_w` would observe before the strategy erased
+                // the original W_FloatObject.
+                let matches = if target.is_nan() {
+                    items[i as usize].to_bits() == target.to_bits()
+                } else {
+                    items[i as usize] == target
+                };
+                if matches {
                     if count {
                         result += 1;
                     } else {

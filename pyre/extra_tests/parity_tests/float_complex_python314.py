@@ -66,6 +66,33 @@ except OverflowError:
 else:
     raise AssertionError("an oversized __index__ result must overflow float")
 
+
+class FromHexSubclass(float):
+    def __new__(cls, value):
+        return float.__new__(cls, value + 1)
+
+
+class FromHexInitSubclass(float):
+    def __init__(self, value):
+        self.initialized = value
+
+
+fromhex_value = FromHexSubclass.fromhex((1.5).hex())
+assert type(fromhex_value) is FromHexSubclass
+assert fromhex_value == 2.5
+
+fromhex_init_value = FromHexInitSubclass.fromhex((1.5).hex())
+assert type(fromhex_init_value) is FromHexInitSubclass
+assert fromhex_init_value == 1.5
+assert fromhex_init_value.initialized == 1.5
+
+try:
+    float("\t \n")
+except ValueError as error:
+    assert str(error) == "could not convert string to float: '\\t \\n'"
+else:
+    raise AssertionError("invalid float text must raise ValueError")
+
 for cls in (float, complex):
     try:
         cls.from_number("3")

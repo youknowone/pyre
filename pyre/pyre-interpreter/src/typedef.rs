@@ -14073,43 +14073,54 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromhex",
-            make_builtin_function("fromhex", |args| {
-                // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
-                // Parse hexadecimal floating-point literals like '0x1.8p3'.
-                let s_arg = args
-                    .iter()
-                    .find_map(|&a| unsafe {
-                        if pyre_object::is_str(a) {
-                            Some(pyre_object::w_str_get_value(a).to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| {
-                        crate::PyError::type_error("fromhex() requires a string argument")
-                    })?;
-                // Delegate parsing to the shared hex-float reader, which rounds
-                // round-half-even over the full exponent range (subnormals down to
-                // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
-                // ASCII whitespace itself, and flags overflow distinctly.
-                match rustpython_common::float_ops::from_hex(&s_arg) {
-                    Ok(v) => Ok(pyre_object::w_float_new(v)),
-                    Err(e) => {
-                        use rustpython_common::float_ops::HexFloatError;
-                        Err(match e {
-                            HexFloatError::Overflow => crate::PyError::overflow_error(
-                                "hexadecimal value too large to represent as a float",
-                            ),
-                            HexFloatError::TooLong => crate::PyError::value_error(
-                                "hexadecimal string too long to convert",
-                            ),
-                            HexFloatError::Invalid => crate::PyError::value_error(
-                                "invalid hexadecimal floating-point string",
-                            ),
-                        })
+            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
+                "fromhex",
+                |args| {
+                    // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
+                    // Parse hexadecimal floating-point literals like '0x1.8p3'.
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "fromhex() requires a string argument",
+                        ));
                     }
-                }
-            }),
+                    let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
+                        unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "fromhex() requires a string argument",
+                        ));
+                    };
+                    // Delegate parsing to the shared hex-float reader, which rounds
+                    // round-half-even over the full exponent range (subnormals down to
+                    // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
+                    // ASCII whitespace itself, and flags overflow distinctly.
+                    match rustpython_common::float_ops::from_hex(&s_arg) {
+                        Ok(v) => {
+                            let w_float = pyre_object::w_float_new(v);
+                            // floatobject.py:419: return
+                            // space.call_function(w_cls, w_float).  This runs a
+                            // subclass's __new__ and __init__ rather than merely
+                            // retagging the parsed base float.
+                            crate::call::call_function_impl_result(args[0], &[w_float])
+                        }
+                        Err(e) => {
+                            use rustpython_common::float_ops::HexFloatError;
+                            Err(match e {
+                                HexFloatError::Overflow => crate::PyError::overflow_error(
+                                    "hexadecimal value too large to represent as a float",
+                                ),
+                                HexFloatError::TooLong => crate::PyError::value_error(
+                                    "hexadecimal string too long to convert",
+                                ),
+                                HexFloatError::Invalid => crate::PyError::value_error(
+                                    "invalid hexadecimal floating-point string",
+                                ),
+                            })
+                        }
+                    }
+                },
+                2,
+            )),
         )
     };
     unsafe {

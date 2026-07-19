@@ -6468,9 +6468,6 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // through `unicode_to_decimal_w` before `_string_to_float`.
     if unsafe { is_str(obj) } {
         let s = unsafe { unicode_to_decimal_w(obj)? };
-        // The strict conversion above rejected any surrogate, so the original
-        // object now has a valid UTF-8 view for the error text.
-        let raw = unsafe { w_str_get_value(obj) };
         // `float_from_string` strips PEP 515 underscore separators (between
         // digits only) before parsing the Python-literal float grammar.
         if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
@@ -6478,8 +6475,11 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 return Ok(floatobject::w_float_new(v));
             }
         }
+        // floatobject.py `_string_to_float`: `%R` uses the original source's
+        // repr, preserving quotes and escaping controls/NUL/non-ASCII text.
+        let source_repr = unsafe { crate::py_repr(obj)? };
         return Err(crate::PyError::value_error(format!(
-            "could not convert string to float: '{raw}'"
+            "could not convert string to float: {source_repr}"
         )));
     }
     // floatobject.py:247-255 — a readable buffer (`charbuf_w`: bytes /
