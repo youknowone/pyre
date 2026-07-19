@@ -1244,7 +1244,7 @@ impl UnrollOptimizer {
         }
 
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
-        let imported_short_aliases = opt_p2.imported_short_aliases.clone();
+        let mut imported_short_aliases = opt_p2.imported_short_aliases.clone();
         // finalize_short_preamble: create TargetToken for this loop version
         // RPython parity: short preamble ops reference constant OpRefs from
         // the loop's constant pool. Pass consts_p1 so the ShortPreamble
@@ -1402,6 +1402,29 @@ impl UnrollOptimizer {
                                 .potential_extra_ops
                                 .iter()
                                 .any(|(k, _)| *k == arg || *k == resolved);
+                            if !needs_force {
+                                // RPython keeps the exported result and its
+                                // body use as one Box. A forwarded Phase-2
+                                // placeholder needs the preserved exported
+                                // Box to recover the same ownership path.
+                                if let Some((_, produced)) =
+                                    exported_short_boxes_produced.iter().find(|(_, produced)| {
+                                        let source = produced.res.to_opref();
+                                        source != arg
+                                            && final_ctx.get_replacement_opref(source) == arg
+                                    })
+                                {
+                                    let preamble_op = crate::optimizeopt::info::PreambleOp {
+                                        op: produced.res.clone(),
+                                        invented_name: produced.invented_name,
+                                        preamble_op: produced.preamble_op.clone(),
+                                        same_as_source: produced.same_as_source.clone(),
+                                    };
+                                    let source = final_ctx.force_op_from_preamble_op(&preamble_op);
+                                    let _ = opt_p2.force_box(source, &mut final_ctx);
+                                    continue;
+                                }
+                            }
                             if needs_force {
                                 let _ = opt_p2.force_box(arg, &mut final_ctx);
                             }
@@ -1410,6 +1433,7 @@ impl UnrollOptimizer {
                 }
                 let rebuilt = final_ctx.build_imported_short_preamble();
                 let builder = final_ctx.imported_short_preamble_builder.clone();
+                imported_short_aliases = final_ctx.used_imported_short_aliases();
                 opt_p2.final_ctx = Some(final_ctx);
                 (builder, rebuilt)
             } else {
