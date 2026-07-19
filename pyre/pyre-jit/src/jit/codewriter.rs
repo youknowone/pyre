@@ -13485,14 +13485,6 @@ impl CodeWriter {
             is_drained: true,
         };
 
-        if pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-            assert_eq!(
-                n_py_instrs as usize,
-                first_jit_pc_by_py_pc.len(),
-                "PCMAP_PIVOT Python instruction count diverges from first-jit map",
-            );
-        }
-
         PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),
             metadata,

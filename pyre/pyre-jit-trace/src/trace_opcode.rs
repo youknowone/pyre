@@ -4068,12 +4068,6 @@ impl MIFrame {
                             parent_word,
                             crate::state::op_live(),
                         );
-                        if resolved.is_none() {
-                            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                                "resolve_none_caller",
-                                "parent_word",
-                            );
-                        }
                         resolved
                     })
                     .map(|offset| offset as u32)
@@ -4128,12 +4122,6 @@ impl MIFrame {
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
         let payload = unsafe { &(&*self.sym().jitcode).payload };
         let resolved = payload.resolve_resume_pc_with_jitcode_pc(top_word, crate::state::op_live());
-        if resolved.is_none() {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_none_caller",
-                "top_word",
-            );
-        }
         let top_pc_word = resolved.map(|offset| offset as u32).unwrap_or_else(|| {
             // A missing carried marker declines this trace before the
             // provisional snapshot can be installed.

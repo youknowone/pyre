@@ -359,23 +359,11 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 ///
 /// `None` when the tables are empty or
 /// no at-or-after py emitted a real op.
-#[track_caller]
 pub fn derive_resume_marker(
     first_op_by_py_pc: &[usize],
     block_head_py_by_jit_pc: &[(usize, u32)],
     py_pc: usize,
 ) -> Option<usize> {
-    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-        let caller = std::panic::Location::caller().file();
-        let arm = if caller.ends_with("/codewriter.rs") {
-            "codewriter_build_time"
-        } else if block_head_py_by_jit_pc.is_empty() {
-            "empty_pivot_fallback"
-        } else {
-            "production"
-        };
-        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("derive_resume_marker", arm);
-    }
     if block_head_py_by_jit_pc.is_empty() {
         return None;
     }
@@ -768,24 +756,8 @@ impl PyJitCode {
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);
         if used_carried {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_resume_pc",
-                "carried_used",
-            );
             Some(carried as usize)
         } else {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_resume_pc",
-                "carried_none",
-            );
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_resume_pc",
-                if carried == majit_ir::resumedata::NO_JITCODE_PC || carried < 0 {
-                    "none_sentinel"
-                } else {
-                    "none_not_live_anchored"
-                },
-            );
             None
         }
     }
@@ -805,24 +777,8 @@ impl PyJitCode {
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);
         if used_carried {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_bridge_walk_entry",
-                "carried_used",
-            );
             Some(carried as usize)
         } else {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_bridge_walk_entry",
-                "carried_none",
-            );
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_bridge_walk_entry",
-                if carried == majit_ir::resumedata::NO_JITCODE_PC || carried < 0 {
-                    "none_sentinel"
-                } else {
-                    "none_not_live_anchored"
-                },
-            );
             None
         }
     }

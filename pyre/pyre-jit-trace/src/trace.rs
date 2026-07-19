@@ -215,32 +215,11 @@ fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> boo
     })
 }
 
-/// `PYRE_PCMAP_MIDBODY_AUDIT` now certifies only identity resolution: after
-/// the Python-PC carrier fields were deleted, the flush words are derived once
-/// here from the carried native coordinates.
-fn audit_midbody_carrier_resolution(site: &'static str, resolved: bool) {
-    if !crate::jitcode_dispatch::pcmap_midbody_audit_enabled() {
-        return;
-    }
-    crate::jitcode_dispatch::pcmap_midbody_audit_probe(
-        site,
-        if resolved { "resolve" } else { "unresolved" },
-    );
-    assert!(
-        resolved,
-        "PCMAP_MIDBODY carried jitcode identity must resolve: {site}"
-    );
-}
-
 fn resolve_entry_carrier_call_py_pc(
     outer_jitcode_index: u32,
     call_jitcode_pc: usize,
 ) -> Option<usize> {
     let outer = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32);
-    let resolved = outer
-        .as_ref()
-        .is_some_and(|payload| !payload.code_ptr.is_null());
-    audit_midbody_carrier_resolution("entry_flush_call_py_pc", resolved);
     let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
     let call_py_pc =
         crate::jitcode_dispatch::python_pc_for_jitcode_pc(&outer.metadata, call_jitcode_pc)
@@ -262,16 +241,7 @@ fn resolve_midbody_flush_words(
     payload: &crate::jitcode_dispatch::MidBodyPayload,
 ) -> Option<MidBodyFlushWords> {
     let outer = crate::state::pyjitcode_for_jitcode_index(payload.outer_jitcode_index as i32);
-    let outer_resolved = outer
-        .as_ref()
-        .is_some_and(|payload| !payload.code_ptr.is_null());
-    audit_midbody_carrier_resolution("flush_outer_call_py_pc", outer_resolved);
-    audit_midbody_carrier_resolution("flush_outer_post_call_py_pc", outer_resolved);
     let callee = crate::state::pyjitcode_for_jitcode_index(payload.callee_jitcode_index as i32);
-    let callee_resolved = callee
-        .as_ref()
-        .is_some_and(|payload| !payload.code_ptr.is_null());
-    audit_midbody_carrier_resolution("flush_callee_py_pc", callee_resolved);
     let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
     let callee = callee.filter(|payload| !payload.code_ptr.is_null())?;
     let call_py_pc =
@@ -2246,23 +2216,6 @@ fn run_perfn_walk(
                     crate::jitcode_dispatch::fbw_abort_outer_resume_take()
                 {
                     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32);
-                    if crate::jitcode_dispatch::pcmap_callpc_audit_enabled() {
-                        if let Some(path) = std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT_PROBE") {
-                            use std::io::Write;
-
-                            if let Ok(mut probe) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(path)
-                            {
-                                let _ = writeln!(probe, "fbw_abort_outer_resume\tresolve");
-                            }
-                        }
-                        assert!(
-                            pjc.is_some(),
-                            "PCMAP_CALLPC carried jitcode index must resolve: jitcode_index={jitcode_index} call_jitcode_pc={call_jitcode_pc}",
-                        );
-                    }
                     if let Some(pjc) = pjc {
                         let resume_py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
                             &pjc.metadata,

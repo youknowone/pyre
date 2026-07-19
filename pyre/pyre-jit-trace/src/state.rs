@@ -798,20 +798,8 @@ pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)
     {
-        Some(py_pc) => {
-            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "backxlat_py_pc",
-                "pivot_hit",
-            );
-            py_pc
-        }
-        None => {
-            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "backxlat_py_pc",
-                "py_word_fallback",
-            );
-            fallback
-        }
+        Some(py_pc) => py_pc,
+        None => fallback,
     }
 }
 
@@ -930,19 +918,6 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
     }
     let pjc = pyjitcode_for_code(code)?;
     let legacy = pjc.pcdep_for_jitcode_pc(0);
-    if crate::jitcode_dispatch::pcmap_pivot_audit_enabled() {
-        crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "fire");
-        let twin = pjc.pcdep_for_jitcode_pc(0);
-        if legacy == twin {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "eq");
-        } else {
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_fire("entry_param_colors", "di");
-            crate::jitcode_dispatch::pcmap_pivot_audit_record_data(
-                "entry_param_colors",
-                &format!("legacy={legacy:?} twin={twin:?}"),
-            );
-        }
-    }
     legacy
 }
 
@@ -1097,12 +1072,6 @@ pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32)
         let resolved = jc
             .payload
             .resolve_bridge_walk_entry_pc(carried_jitcode_pc, sd.op_live);
-        if resolved.is_none() {
-            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_none_caller",
-                "bridge_walk_entry",
-            );
-        }
         resolved
     })
 }
@@ -1247,10 +1216,6 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let resolved_jit_pc: Option<usize> =
             payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, sd.op_live);
         let Some(jit_pc) = resolved_jit_pc else {
-            pyre_jit_trace::jitcode_dispatch::pcmap_pivot_audit_record_fire(
-                "resolve_none_caller",
-                "frame_liveness",
-            );
             return FrameLivenessRegIndices::default();
         };
         let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);

@@ -6862,11 +6862,8 @@ fn try_execute_residual_call_via_executor(
     // exhaustion arm) still records the completion; a successful attempt
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::PyreHelperKind::ForIterNext {
-        let body =
-            fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc).unwrap_or_else(|| {
-                pcmap_entrypc_audit_ctx_read(ctx, "foriter_attempt_fallback");
-                InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1)
-            });
+        let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+            .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
         fbw_foriter_inflight_mark_attempt(body);
     }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
@@ -7037,10 +7034,7 @@ fn try_execute_residual_call_via_executor(
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
                 let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
-                    .unwrap_or_else(|| {
-                        pcmap_entrypc_audit_ctx_read(ctx, "foriter_capture_fallback");
-                        InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1)
-                    });
+                    .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
                 fbw_foriter_inflight_capture(result_i64 as usize as pyre_object::PyObjectRef, body);
                 // #73/#267: the item lands on the operand-stack TOS through the
                 // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
@@ -7055,7 +7049,6 @@ fn try_execute_residual_call_via_executor(
                 // FOR_ITER `ResultToTos` boundary.
                 ctx.vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
-                    pcmap_entrypc_audit_ctx_read(ctx, "foriter_debug");
                     let item = result_i64 as usize as pyre_object::PyObjectRef;
                     let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
                         Some(unsafe { pyre_object::w_int_get_value(item) })
@@ -9098,7 +9091,7 @@ pub(crate) fn fbw_foriter_inflight_capture(
             body_effect_since_consume: false,
             body_completed: false,
         };
-        let Some(body_pc) = inflight_foriter_body_pc("capture", body) else {
+        let Some(body_pc) = inflight_foriter_body_pc(body) else {
             // An unresolvable native coordinate cannot identify an existing
             // loop. Keep this item as a distinct entry; later consumers also
             // refuse it conservatively instead of guessing a Python pc.
@@ -9107,7 +9100,7 @@ pub(crate) fn fbw_foriter_inflight_capture(
         };
         match stack
             .iter()
-            .position(|e| inflight_foriter_body_pc("capture", e.body) == Some(body_pc))
+            .position(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))
         {
             Some(at) => {
                 stack.truncate(at + 1);
@@ -9135,13 +9128,13 @@ pub(crate) fn fbw_foriter_inflight_active() -> bool {
 /// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
 pub(crate) fn fbw_foriter_inflight_mark_attempt(body: InflightForiterBody) {
     FBW_FORITER_INFLIGHT.with(|c| {
-        let Some(body_pc) = inflight_foriter_body_pc("mark_attempt", body) else {
+        let Some(body_pc) = inflight_foriter_body_pc(body) else {
             return;
         };
         if let Some(entry) = c
             .borrow_mut()
             .iter_mut()
-            .find(|e| inflight_foriter_body_pc("mark_attempt", e.body) == Some(body_pc))
+            .find(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))
         {
             entry.body_completed = true;
         }
@@ -9191,7 +9184,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
         let stack = c.borrow();
         let at = stack
             .iter()
-            .position(|e| inflight_foriter_body_pc("take_for_resume", e.body) == Some(body_pc))?;
+            .position(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
         // would double it — refuse delivery.  A body-COMPLETED entry (the walk
@@ -9251,7 +9244,7 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
         let stack = c.borrow();
         let Some(at) = stack
             .iter()
-            .position(|e| inflight_foriter_body_pc("completed_at_resume", e.body) == Some(body_pc))
+            .position(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))
         else {
             return false;
         };
@@ -9328,7 +9321,7 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
     });
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
-    let Some(body_pc) = inflight_foriter_body_pc("take", stash.body) else {
+    let Some(body_pc) = inflight_foriter_body_pc(stash.body) else {
         return None;
     };
     let store_len = fbw_store_journal_len();
@@ -10604,7 +10597,6 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
         .expect("drained JitCode PC floor pivot must begin at byte offset zero")
         .1;
     }
-    pcmap_pivot_audit_record_fire("vstack_containing_py_pc", "empty_pivot_fallback");
     0
 }
 
@@ -10928,193 +10920,28 @@ fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static st
     }
 }
 
-/// `PYRE_PCMAP_PFRESUME_AUDIT` records paused-parent-frame coordinate
-/// resolution variants and retains the nested builder's twin assertions.
-/// Diagnostic only; phase 2 makes `ParentResumeCoord` authoritative.
-fn pcmap_pfresume_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PFRESUME_AUDIT").is_some())
-}
-
-/// Append one paused-parent-frame resume audit result. `check.py` discards
-/// diagnostic stderr, so the optional probe receives one row per resolution
-/// or nested-twin assertion.
-fn pcmap_pfresume_audit_probe(site: &'static str, verdict: &'static str) {
-    if let Some(path) = std::env::var_os("PYRE_PCMAP_PFRESUME_AUDIT_PROBE") {
-        use std::io::Write;
-
-        if let Ok(mut probe) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(probe, "pfresume\t{site}\t{verdict}");
-        }
-    }
-}
-
 /// Resolve the authoritative paused-parent coordinate at a Python-native
 /// consumer. A missing JitCode/code object is reported to the caller as the
 /// same multi-frame snapshot decline used by nearby unavailable-coordinate
 /// paths; it is never a panic.
-fn resolve_parent_resume_py_pc(parent: &InlineParentFrame, site: &'static str) -> Option<u32> {
+fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<u32> {
     match parent.resume_coord {
-        ParentResumeCoord::Backxlat(jitcode_pc) => {
-            if pcmap_pfresume_audit_enabled() {
-                pcmap_pfresume_audit_probe(site, "backxlat");
-            }
-            Some(
-                crate::state::backxlat_py_pc(parent.jitcode_index as i32, jitcode_pc as i32) as u32,
-            )
-        }
+        ParentResumeCoord::Backxlat(jitcode_pc) => Some(crate::state::backxlat_py_pc(
+            parent.jitcode_index as i32,
+            jitcode_pc as i32,
+        ) as u32),
         ParentResumeCoord::CallFallthrough(call_jit_pc) => {
             let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
             else {
-                if pcmap_pfresume_audit_enabled() {
-                    pcmap_pfresume_audit_probe(site, "unavailable");
-                }
                 return None;
             };
             if pjc.code_ptr.is_null() {
-                if pcmap_pfresume_audit_enabled() {
-                    pcmap_pfresume_audit_probe(site, "unavailable");
-                }
                 return None;
-            }
-            if pcmap_pfresume_audit_enabled() {
-                pcmap_pfresume_audit_probe(site, "call_fallthrough");
             }
             let call_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
             let code = unsafe { &*pjc.code_ptr };
             Some(crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32)
         }
-    }
-}
-
-/// Retained only for the unobserved nested builder: its marker construction is
-/// line-identical to the certified top-level M73_PFMARKER identity, and this
-/// assertion self-checks any future execution.
-fn audit_pfresume_twin<T: PartialEq>(site: &'static str, twin: T, table: T) {
-    if !pcmap_pfresume_audit_enabled() {
-        return;
-    }
-    let verdict = if twin == table { "eq" } else { "di" };
-    pcmap_pfresume_audit_probe(site, verdict);
-    assert!(twin == table, "PFRESUME {site} JitCode-PC twin diverges");
-}
-
-/// `PYRE_PCMAP_CALLPC_AUDIT` certifies that a nested-inline abort's carried
-/// caller CALL JitCode coordinate resolves at the interpreter-flush boundary.
-/// Diagnostic only; off in production.
-pub(crate) fn pcmap_callpc_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT").is_some())
-}
-
-/// `PYRE_PCMAP_MIDBODY_AUDIT` certifies carried inline-abort identities at
-/// the interpreter-flush boundary and retains the deferred plain JitCode-PC
-/// producer-twin census.
-pub(crate) fn pcmap_midbody_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT").is_some())
-}
-
-/// Record one mid-body pc-map audit result. `check.py` discards diagnostic
-/// stderr, so the optional probe receives one row per attempted comparison.
-pub(crate) fn pcmap_midbody_audit_probe(site: &'static str, verdict: &'static str) {
-    if let Some(path) = std::env::var_os("PYRE_PCMAP_MIDBODY_AUDIT_PROBE") {
-        use std::io::Write;
-
-        if let Ok(mut probe) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(probe, "{site}\t{verdict}");
-        }
-    }
-}
-
-/// Audit the mid-body producer's legacy Python-PC metadata reads against the
-/// plain (no trivia skip) JitCode-PC twins at the callee abort opcode.
-/// `PYRE_PCMAP_ENTRYPC_AUDIT` records every remaining consumer of
-/// `WalkContext::entry_py_pc` against its marker twin. Diagnostic only; off
-/// in production.
-pub(crate) fn pcmap_entrypc_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_ENTRYPC_AUDIT").is_some())
-}
-
-/// Append one report-only `entry_py_pc` consumer census row. `check.py`
-/// discards diagnostic stderr, so the audit writes to an explicitly supplied
-/// probe file instead.
-fn pcmap_entrypc_audit_probe(site: &'static str, relation: &str, extra: &str) {
-    if let Some(path) = std::env::var_os("PYRE_PCMAP_ENTRYPC_AUDIT_PROBE") {
-        use std::io::Write;
-
-        if let Ok(mut probe) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(probe, "entrypc\t{site}\t{relation}\t{extra}");
-        }
-    }
-}
-
-/// Audit a genuine `WalkContext::entry_py_pc` read. The channel variant is
-/// diagnostic-only; consumers retain their existing Python-PC behavior.
-fn pcmap_entrypc_audit_ctx_read(ctx: &WalkContext<'_, '_>, site: &'static str) {
-    if !pcmap_entrypc_audit_enabled() {
-        return;
-    }
-    pcmap_entrypc_audit_probe(site, ctx.entry_py_pc.audit_variant(), "-");
-}
-
-/// `PYRE_PCMAP_PIVOT_AUDIT` records PC-pivot census counters. Off by default.
-pub fn pcmap_pivot_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT").is_some())
-}
-
-/// Append a report-only runtime/build-time PC-map census fire.  The probe is
-/// intentionally shared by the trace crate and codewriter so a corpus run can
-/// distinguish derivation work done while building metadata from runtime
-/// fallback use.
-pub fn pcmap_pivot_audit_record_fire(site: &'static str, arm: &'static str) {
-    if !pcmap_pivot_audit_enabled() {
-        return;
-    }
-    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
-        return;
-    };
-    use std::io::Write;
-
-    if let Ok(mut probe) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(probe, "pcmap_fire\t{site}\t{arm}");
-    }
-}
-
-/// Append report-only PC-map census data for a divergent or missing candidate.
-pub fn pcmap_pivot_audit_record_data(site: &'static str, data: &str) {
-    if !pcmap_pivot_audit_enabled() {
-        return;
-    }
-    let Some(path) = std::env::var_os("PYRE_PCMAP_PIVOT_AUDIT_PROBE") else {
-        return;
-    };
-    use std::io::Write;
-
-    if let Ok(mut probe) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(probe, "pcmap_data\t{site}\t{data}");
     }
 }
 
@@ -11152,65 +10979,20 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
             .expect("drained JitCode PC floor pivot must begin at byte offset zero");
         return pivot;
     }
-    pcmap_pivot_audit_record_fire("python_pc_for_jitcode_pc", "empty_pivot_production");
     0
-}
-
-/// `PYRE_PCMAP_INFLIGHT_AUDIT` records the final in-flight FOR_ITER body
-/// channel's variant and resolution outcome at each match point. Diagnostic
-/// only; a native-coordinate resolution failure is a conservative no-match.
-fn pcmap_inflight_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_INFLIGHT_AUDIT").is_some())
-}
-
-/// Append one report-only in-flight FOR_ITER pc-map census row. `check.py`
-/// discards diagnostic stderr, so the audit writes to an explicitly supplied
-/// probe file instead.
-fn pcmap_inflight_audit_probe(site: &'static str, variant: &'static str, outcome: &'static str) {
-    if let Some(path) = std::env::var_os("PYRE_PCMAP_INFLIGHT_AUDIT_PROBE") {
-        use std::io::Write;
-
-        if let Ok(mut probe) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(probe, "inflight\t{site}\t{variant}\t{outcome}");
-        }
-    }
 }
 
 /// Resolve an in-flight body channel exactly where a stash match needs its
 /// Python body pc. A missing JitCode entry is deliberately `None`: callers
 /// treat it as no match and retain the legacy replay/delivery fallback.
-fn inflight_foriter_body_pc(site: &'static str, body: InflightForiterBody) -> Option<usize> {
+fn inflight_foriter_body_pc(body: InflightForiterBody) -> Option<usize> {
     match body {
-        InflightForiterBody::Py(body_pc) => {
-            if pcmap_inflight_audit_enabled() {
-                pcmap_inflight_audit_probe(site, "py", "native");
-            }
-            Some(body_pc)
-        }
+        InflightForiterBody::Py(body_pc) => Some(body_pc),
         InflightForiterBody::Jit {
             outer_jitcode_index,
             op_pc,
-        } => {
-            let body_pc = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
-                .map(|jc| python_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1);
-            if pcmap_inflight_audit_enabled() {
-                pcmap_inflight_audit_probe(
-                    site,
-                    "jit",
-                    if body_pc.is_some() {
-                        "resolved"
-                    } else {
-                        "unresolved"
-                    },
-                );
-            }
-            body_pc
-        }
+        } => crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
+            .map(|jc| python_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1),
     }
 }
 
@@ -11375,21 +11157,12 @@ fn decode_side_other_target(
 /// never reaches that leg.
 pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
     match majit_ir::resumedata::decode_branch_orgpc(carried) {
-        None => {
-            pcmap_pivot_audit_record_fire("expand_branch_carried", "passthrough");
-            carried
-        }
+        None => carried,
         Some((orgpc, flavor)) => {
             let code = payload.jitcode.code.as_slice();
             match decode_side_other_target(code, orgpc, flavor) {
-                Err(_) => {
-                    pcmap_pivot_audit_record_fire("expand_branch_carried", "expanded_fail");
-                    majit_ir::resumedata::NO_JITCODE_PC
-                }
-                Ok(derived) => {
-                    pcmap_pivot_audit_record_fire("expand_branch_carried", "expanded_ok");
-                    derived as i32
-                }
+                Err(_) => majit_ir::resumedata::NO_JITCODE_PC,
+                Ok(derived) => derived as i32,
             }
         }
     }
@@ -11985,9 +11758,6 @@ fn walker_capture_inline_nonstandard_vable_guard(
             .and_then(|payload| {
                 let resolved = payload
                     .resolve_resume_pc_with_jitcode_pc(nsvable_word, crate::state::op_live());
-                if resolved.is_none() {
-                    pcmap_pivot_audit_record_fire("resolve_none_caller", "nsvable_word");
-                }
                 resolved
             })
             .map(|offset| offset as u32)
@@ -12217,7 +11987,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // Python opcode → resume at the trace's entry py (loop header).
             let loop_close_overshoot = py_pc as usize >= num_instrs;
             let py_pc = if loop_close_overshoot {
-                pcmap_entrypc_audit_ctx_read(ctx, "loop_close_overshoot");
                 ctx.entry_py_pc()
             } else {
                 py_pc
@@ -12258,17 +12027,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 if !code_ptr.is_null() {
                     let resume_depth = match resume_depth_twin {
                         Some(depth) => depth as usize,
-                        None => {
-                            pcmap_pivot_audit_record_fire(
-                                "guard_capture_depth",
-                                "vstack_reconcile_twin_none",
-                            );
-                            crate::liveness::liveness_for(code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .unwrap_or(0) as usize
-                        }
+                        None => crate::liveness::liveness_for(code_ptr)
+                            .depth_at_py_pc()
+                            .get(py_pc as usize)
+                            .copied()
+                            .unwrap_or(0) as usize,
                     };
                     let code = unsafe { &*code_ptr };
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth);
@@ -12322,18 +12085,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     } else {
                         match resume_depth_twin {
                             Some(d) => (sym.nlocals + d as usize) as i64,
-                            None => {
-                                pcmap_pivot_audit_record_fire(
-                                    "guard_capture_depth",
-                                    "valuestackdepth_twin_none",
-                                );
-                                crate::liveness::liveness_for(jc.payload.code_ptr)
-                                    .depth_at_py_pc()
-                                    .get(py_pc as usize)
-                                    .copied()
-                                    .map(|d| (sym.nlocals + d as usize) as i64)
-                                    .unwrap_or(sym.valuestackdepth as i64)
-                            }
+                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .map(|d| (sym.nlocals + d as usize) as i64)
+                                .unwrap_or(sym.valuestackdepth as i64),
                         }
                     }
                 };
@@ -12375,17 +12132,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     } else {
                         match resume_depth_twin {
                             Some(depth) => depth as usize,
-                            None => {
-                                pcmap_pivot_audit_record_fire(
-                                    "guard_capture_depth",
-                                    "stack_sync_twin_none",
-                                );
-                                crate::liveness::liveness_for(jc.payload.code_ptr)
-                                    .depth_at_py_pc()
-                                    .get(py_pc as usize)
-                                    .copied()
-                                    .unwrap_or(0) as usize
-                            }
+                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .unwrap_or(0) as usize,
                         }
                     }
                 };
@@ -12707,9 +12458,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
             let payload = unsafe { &(&*sym.jitcode).payload };
             let resolved = payload
                 .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live());
-            if resolved.is_none() {
-                pcmap_pivot_audit_record_fire("resolve_none_caller", "guard_snapshot");
-            }
             let Some(resolved_offset) = resolved else {
                 return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
             };
@@ -12849,9 +12597,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
             .and_then(|payload| {
                 let resolved =
                     payload.resolve_resume_pc_with_jitcode_pc(arm_word, crate::state::op_live());
-                if resolved.is_none() {
-                    pcmap_pivot_audit_record_fire("resolve_none_caller", "arm_word");
-                }
                 resolved
             })
             .map(|offset| offset as u32)
@@ -13186,22 +12931,6 @@ fn compute_nested_inline_caller_frame(
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    if pcmap_pfresume_audit_enabled() {
-        if let Some(marker) = resume_marker_jit_pc {
-            let fallthrough_py_pc = legacy_fallthrough_py_pc();
-            let table_depth = unsafe {
-                crate::liveness::liveness_for(pjc.code_ptr)
-                    .depth_at_py_pc()
-                    .get(fallthrough_py_pc as usize)
-                    .copied()
-            };
-            audit_pfresume_twin(
-                "inline_nested_depth_trivia",
-                pjc.depth_trivia_for_jitcode_pc(marker),
-                table_depth,
-            );
-        }
-    }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
     let result_color = match resume_marker_jit_pc {
@@ -13425,7 +13154,7 @@ fn walker_capture_multi_frame_inline_snapshot(
     if !caller_sym_ptr.is_null() {
         let caller_sym = unsafe { &*caller_sym_ptr };
         if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode.is_null() {
-            let resume_py_pc = resolve_parent_resume_py_pc(outer, "vable_last_instr")
+            let resume_py_pc = resolve_parent_resume_py_pc(outer)
                 .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
             let last_instr_value = resume_py_pc as i64 - 1;
             let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
@@ -13435,7 +13164,7 @@ fn walker_capture_multi_frame_inline_snapshot(
                 last_instr_op,
                 Value::Int(last_instr_value),
             );
-            let resume_py_pc = resolve_parent_resume_py_pc(outer, "vable_stack_depth")
+            let resume_py_pc = resolve_parent_resume_py_pc(outer)
                 .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
             let vsd_value = unsafe {
                 let jc = &*caller_sym.jitcode;
@@ -13473,9 +13202,6 @@ fn walker_capture_multi_frame_inline_snapshot(
             .and_then(|payload| {
                 let resolved =
                     payload.resolve_resume_pc_with_jitcode_pc(pf_word, crate::state::op_live());
-                if resolved.is_none() {
-                    pcmap_pivot_audit_record_fire("resolve_none_caller", "pf_word");
-                }
                 resolved
             })
             .map(|offset| offset as u32)
@@ -16251,12 +15977,6 @@ fn try_walker_inline_resolved_user_call(
                     let depth = depth as usize;
                     let nlocals = callee_code.varnames.len();
                     let pcdep_twin = callee_pjc.pcdep_for_jitcode_pc(abort_pc);
-                    if pcdep_twin.is_none() {
-                        pcmap_pivot_audit_record_fire(
-                            "midbody_producer_pcdep",
-                            "py_pc_legacy_or_else",
-                        );
-                    }
                     let Some(entries) = pcdep_twin else {
                         return None;
                     };
@@ -23098,10 +22818,8 @@ fn try_walker_specialize_for_iter_next(
 
     // A new consume attempt completes the prior in-flight iteration before
     // this irreversible concrete advance, matching the residual executor.
-    let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc).unwrap_or_else(|| {
-        pcmap_entrypc_audit_ctx_read(ctx, "range_foriter_attempt_fallback");
-        InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1)
-    });
+    let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(body);
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
