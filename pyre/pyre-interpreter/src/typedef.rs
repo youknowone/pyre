@@ -5954,6 +5954,17 @@ fn init_dict_view_set_like_type(
             ),
         )
     };
+    // The keys and items views are set-like and therefore unhashable
+    // (`dictmultiobject.py:1626 _is_set_like`); the values view is not and
+    // keeps `object.__hash__`.  Declare the slot `None` so a `hash()` finds it
+    // and rejects the view instead of falling back to the identity hash.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            pyre_object::w_none(),
+        )
+    };
     register_dict_view_set_operators(ns);
 }
 

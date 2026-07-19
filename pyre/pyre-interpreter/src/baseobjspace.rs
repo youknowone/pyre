@@ -100,50 +100,18 @@ pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
 
 /// The direct-hash counterpart of [`take_pending_dict_key_error`], used by
 /// bytecode paths which compute the key hash before entering `r_dict`.
-pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
-    if err.kind != PyErrorKind::TypeError {
-        return err;
-    }
-    let exact_type_error = err.exc_object.is_null()
-        || unsafe {
-            pyre_object::is_exact_type(
-                err.exc_object,
-                &pyre_object::interp_exceptions::EXC_TYPE_ERROR_TYPE,
-            )
-        };
-    if !exact_type_error {
-        return err;
-    }
-    PyError::type_error(format!(
-        "cannot use '{}' as a dict key ({})",
-        object_functionstr_type_name(key),
-        err.message,
-    ))
+///
+/// A bad dict key raises the bare `unhashable type: '<type>'` TypeError from
+/// hashing, with no container-specific prefix, so the error passes through.
+pub fn wrap_dict_key_hash_error(_key: PyObjectRef, err: PyError) -> PyError {
+    err
 }
 
-/// Python 3.14 `set_unhashable_type` parity. Set element operations replace
-/// an exact `TypeError` raised by hashing with their container-specific
-/// context, while a `TypeError` subclass and every other exception propagate
-/// unchanged.
-pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
-    if err.kind != PyErrorKind::TypeError {
-        return err;
-    }
-    let exact_type_error = err.exc_object.is_null()
-        || unsafe {
-            pyre_object::is_exact_type(
-                err.exc_object,
-                &pyre_object::interp_exceptions::EXC_TYPE_ERROR_TYPE,
-            )
-        };
-    if !exact_type_error {
-        return err;
-    }
-    PyError::type_error(format!(
-        "cannot use '{}' as a set element ({})",
-        object_functionstr_type_name(item),
-        err.message,
-    ))
+/// The set-element counterpart of [`wrap_dict_key_hash_error`]: a bad element
+/// raises the bare `unhashable type: '<type>'` TypeError from hashing, so the
+/// error passes through unchanged.
+pub fn wrap_set_element_hash_error(_item: PyObjectRef, err: PyError) -> PyError {
+    err
 }
 
 /// Compatibility alias for PyPy's base-object type.
