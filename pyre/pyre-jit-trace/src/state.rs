@@ -8621,13 +8621,17 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
-            // The Int bank is color-indexed (no slot overlay to defer to), and
-            // for a kept-stack branch guard the walk resumes at the guard's own
-            // coordinate where `reg_indices.int` colors are authoritative — so
-            // stamp the concrete directly here (the `seed_deferred_to_overlay`
-            // deferral only applies to the Ref slot-mirror). The guard's
-            // GUARD_TRUE/GUARD_FALSE needs this concrete to fold its direction.
-            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+            // The Int bank is color-indexed and can be seeded directly only
+            // when the frame position names its exact liveness marker.  A
+            // resolved body coordinate can share a marker whose Int color is
+            // an earlier scratch value; treating that value as the current
+            // branch condition lets a nested FOR_ITER bridge take the wrong
+            // arm.  Leave such scratches symbolic, as RPython does when an
+            // unboxed temporary is absent from the exact resume position.
+            if seed_bridge_locals
+                && !seed_deferred_to_overlay
+                && !matches!(concrete_val, majit_ir::Value::Void)
+            {
                 ctx.try_set_opref_concrete(resolved, concrete_val);
             }
             let reg_idx = reg_idx as usize;
