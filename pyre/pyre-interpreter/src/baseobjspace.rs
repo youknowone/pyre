@@ -5588,14 +5588,24 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             if name == "__name__" {
-                // `type.__name__` is the bare type name; a dotted tp_name
-                // (e.g. "types.UnionType") carries its module prefix only
-                // in repr, so strip to the final component here.
+                // typeobject.py:626 getname — a heap type keeps its stored
+                // name verbatim (it may legitimately contain a dot when built
+                // via `type('a.b', (), {})`); a static type's dotted tp_name
+                // (e.g. "types.UnionType") carries its module prefix only in
+                // repr, so strip to the final component.
                 let full = w_type_get_name(obj);
-                let bare = full.rsplit('.').next().unwrap_or(full);
+                let bare = if pyre_object::w_type_is_heaptype(obj) {
+                    full
+                } else {
+                    full.rsplit('.').next().unwrap_or(full)
+                };
                 return Ok(w_str_new(bare));
             }
             if name == "__qualname__" {
+                // typeobject.py:637 getqualname returns the stored qualname;
+                // `type_new_take_qualname` popped an explicit class-body
+                // `__qualname__` into it at creation, and the heap/static name
+                // split is already baked into the field.
                 return Ok(w_str_new(pyre_object::w_type_get_qualname(obj)));
             }
             if name == "__mro__" {
