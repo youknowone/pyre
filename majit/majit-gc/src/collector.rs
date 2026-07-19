@@ -473,6 +473,28 @@ pub struct MiniMarkGC {
     /// `0.125 * get_total_memory()`). Caps the absolute next-major threshold
     /// growth per cycle.
     max_delta: f64,
+    /// incminimark.py:309 `self.max_heap_size_already_raised`. Set true the
+    /// first time a bounded major collection finds the heap already over
+    /// `max_heap_size`; a second such event aborts the process
+    /// (`out_of_memory`, minimarkpage.py:611 -> fatalerror) instead of raising
+    /// another MemoryError. Only reachable when `max_heap_size > 0`
+    /// (`PYPY_GC_MAX` set), so it stays false in the default unbounded config.
+    max_heap_size_already_raised: bool,
+    /// Set by `finish_incremental_cycle` when a bounded major collection leaves
+    /// the heap over `max_heap_size`. The allocation that triggered the
+    /// collection (`alloc_with_type`) reads and clears this and returns NULL,
+    /// so the JIT `CHECK_MEMORY_ERROR` path / interpreter allocation chokepoint
+    /// raises `MemoryError` (incminimark.py:2603-2615 `raise MemoryError`,
+    /// lowered to the NULL-return the backend already understands).
+    oom_pending: bool,
+    /// Byte size of the allocation that triggered the current nursery-full
+    /// collection, carried across `do_collect_nursery` so
+    /// `finish_incremental_cycle` can pass it to `threshold_reached`
+    /// (incminimark's `major_collection_step(reserving_size)` argument). Carried
+    /// on the collector rather than threaded through the public
+    /// `do_collect_nursery` signature and its many call sites; reset to 0 by the
+    /// triggering allocation once the collection returns.
+    pending_reserving_size: usize,
     /// incminimark.py:568 `self.next_major_collection_initial`. The
     /// pre-reservation threshold; `set_major_threshold_from` grows the next
     /// threshold relative to this value, bounded by `growth_rate_max`.
@@ -622,6 +644,9 @@ impl MiniMarkGC {
             min_heap_size,
             max_heap_size,
             max_delta,
+            max_heap_size_already_raised: false,
+            oom_pending: false,
+            pending_reserving_size: 0,
             // incminimark.py:568-569 — both initialized to min_heap_size,
             // then refined by set_major_threshold_from(0.0) below.
             next_major_collection_initial: min_heap_size,
@@ -846,8 +871,21 @@ impl MiniMarkGC {
         let ptr = self.nursery.alloc(total_size);
         if ptr.is_null() {
             // Nursery full: trigger minor collection and retry.
-            // minimark.py:1282 collect_and_reserve parity.
+            // minimark.py:1282 collect_and_reserve parity. Carry the triggering
+            // allocation size so a bounded major collection applies the
+            // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
+            self.pending_reserving_size = total_size;
             self.do_collect_nursery();
+            self.pending_reserving_size = 0;
+            // incminimark.py:2603-2615 — a bounded major collection that leaves
+            // the heap over `max_heap_size` asks this allocation to fail so the
+            // caller raises MemoryError: NULL propagates to the compiled-code
+            // `CHECK_MEMORY_ERROR` path and to the interpreter allocation
+            // chokepoint. Never taken in the unbounded default (`PYPY_GC_MAX`
+            // unset), so the fallback below is unchanged there.
+            if std::mem::take(&mut self.oom_pending) {
+                return GcRef(0);
+            }
             let ptr = self.nursery.alloc(total_size);
             if ptr.is_null() {
                 // Still no space after collection. Allocate in old gen as fallback.
@@ -2328,18 +2366,37 @@ impl MiniMarkGC {
         // `kept_alive_by_finalizer` accounting, so `total_memory_used` is the
         // post-sweep old-gen size directly.)
         let total_memory_used = self.get_total_memory_used() as f64;
-        // The `bounded` result is intentionally dropped: incminimark.py:2603-2615
-        // raises MemoryError when `bounded and threshold_reached(reserving_size)`,
-        // but pyre has no GC out-of-memory path, so only the threshold-capping
-        // side effect of `set_major_threshold_from` is used (the PYPY_GC_MAX OOM
-        // policy is unported).
-        let _bounded = self.set_major_threshold_from(
+        // incminimark.py:2574-2577 — capped next-major threshold. `reserving_size`
+        // is the byte size of the allocation that triggered this collection,
+        // carried on the collector across `do_collect_nursery` (see
+        // `pending_reserving_size`), matching the argument
+        // `major_collection_step(reserving_size)` threads to both
+        // `set_major_threshold_from` and `threshold_reached`.
+        let reserving_size = self.pending_reserving_size;
+        let bounded = self.set_major_threshold_from(
             (total_memory_used * self.major_collection_threshold)
                 .min(total_memory_used + self.max_delta),
-            0.0,
+            reserving_size as f64,
         );
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
+
+        // incminimark.py:2601-2615 — max heap size (PYPY_GC_MAX). If the capped
+        // threshold was bounded by `max_heap_size` and the heap has already
+        // reached it, signal out-of-memory. The first time, ask the triggering
+        // allocation to return NULL so `CHECK_MEMORY_ERROR` (compiled code) or
+        // the interpreter allocation chokepoint raises `MemoryError`, giving the
+        // program a chance to quit cleanly; a second occurrence aborts the
+        // process (`out_of_memory` -> fatalerror). `max_heap_size == 0`
+        // (unbounded default) never sets `bounded`, so this is inert unless
+        // `PYPY_GC_MAX` is set.
+        if bounded && self.threshold_reached(reserving_size) {
+            if self.max_heap_size_already_raised {
+                panic!("using too much memory, aborting");
+            }
+            self.max_heap_size_already_raised = true;
+            self.oom_pending = true;
+        }
 
         // incminimark.py:2617-2631: pyre has explicit death deques but no
         // collector-run execute_finalizers phase. Make recursive collections
@@ -3800,6 +3857,55 @@ mod tests {
         let obj = gc.alloc_with_type(0, 16);
         assert!(!obj.is_null());
         assert!(gc.is_in_nursery(obj.0));
+    }
+
+    /// incminimark.py:2601-2615 `PYPY_GC_MAX` out-of-memory policy: a bounded
+    /// major collection over `max_heap_size` signals OOM the first time
+    /// (`oom_pending` so the triggering allocation returns NULL) and aborts on
+    /// the second occurrence. `max_heap_size` below `min_heap_size` makes any
+    /// threshold bounded, so the decision fires on an otherwise empty heap.
+    #[test]
+    fn bounded_max_heap_size_signals_oom_then_aborts() {
+        let mut gc = test_gc(4096);
+        // PYPY_GC_MAX = 1 byte (below min_heap_size), so set_major_threshold_from
+        // caps at 1 and reports `bounded`.
+        gc.max_heap_size = 1.0;
+        // The allocation that triggered the collection is larger than the
+        // remaining headroom (1 - total_memory_used), so threshold_reached holds.
+        gc.pending_reserving_size = 4096;
+
+        // First bounded breach: flag + signal, no abort.
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert!(
+            gc.max_heap_size_already_raised,
+            "first bounded breach records max_heap_size_already_raised"
+        );
+        assert!(
+            gc.oom_pending,
+            "first bounded breach asks the allocation to fail (NULL)"
+        );
+
+        // Second bounded breach aborts (out_of_memory -> fatalerror == panic).
+        gc.pending_reserving_size = 4096;
+        gc.gc_state = GcState::Sweeping;
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.finish_incremental_cycle();
+        }));
+        assert!(second.is_err(), "second bounded breach aborts the process");
+    }
+
+    /// The default (unbounded, `max_heap_size == 0`) config never sets `bounded`,
+    /// so a completed major collection leaves the OOM signals untouched.
+    #[test]
+    fn unbounded_heap_never_signals_oom() {
+        let mut gc = test_gc(4096);
+        assert_eq!(gc.max_heap_size, 0.0);
+        gc.pending_reserving_size = 4096;
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert!(!gc.max_heap_size_already_raised);
+        assert!(!gc.oom_pending);
     }
 
     #[test]
