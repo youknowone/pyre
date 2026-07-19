@@ -8318,7 +8318,12 @@ impl CodeWriter {
                                     // the target's `jit_merge_point` treats
                                     // this arrival as a loop crossing
                                     // (pyjitpl.py:1527-1562).
-                                    if let Some(jdindex) = portal_jd_index {
+                                    if !backward_jump_is_handler_only_target(
+                                        code,
+                                        py_pc,
+                                        target_py_pc,
+                                    ) && let Some(jdindex) = portal_jd_index
+                                    {
                                         emit_loop_header(
                                             &graph,
                                             &current_block,
@@ -8744,7 +8749,12 @@ impl CodeWriter {
                                     // Same `can_enter_jit` → `loop_header`
                                     // lowering as the JumpBackward arm above
                                     // (jtransform.py:1714-1723).
-                                    if let Some(jdindex) = portal_jd_index {
+                                    if !backward_jump_is_handler_only_target(
+                                        code,
+                                        py_pc,
+                                        target_py_pc,
+                                    ) && let Some(jdindex) = portal_jd_index
+                                    {
                                         emit_loop_header(
                                             &graph,
                                             &current_block,
@@ -13724,6 +13734,36 @@ fn backward_jump_target(
     }
 }
 
+/// True when a backward bytecode jump is only a control-flow return from an
+/// out-of-line exception handler to earlier mainline code, rather than a loop
+/// backedge.  Python 3.14 lays handler cleanup blocks after the protected
+/// body, so a `break` in a handler can be encoded as `JUMP_BACKWARD` even
+/// though its landing is after the source loop.  `interp_jit.py:103-114`
+/// attaches `loop_header` / `can_enter_jit` to semantic loop backedges; do not
+/// manufacture a JIT loop header for this layout-only backward coordinate.
+fn backward_jump_is_handler_only_target(
+    code: &CodeObject,
+    source_pc: usize,
+    target_pc: usize,
+) -> bool {
+    let handler_boundary = pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+        .map(|entry| entry.target as usize / 2)
+        .filter(|&handler_pc| target_pc < handler_pc && handler_pc <= source_pc)
+        .min();
+    let Some(handler_boundary) = handler_boundary else {
+        return false;
+    };
+
+    let mut arg_state = OpArgState::default();
+    for pc in 0..handler_boundary.min(code.instructions.len()) {
+        let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
+        if backward_jump_target(code, pc, instruction, op_arg) == Some(target_pc) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Match pyre-interpreter/pyopcode.rs:skip_caches.
 fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
     let mut state = OpArgState::default();
@@ -14002,7 +14042,7 @@ pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize
     for scan_pc in 0..num_instrs {
         let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
         if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
-            if target < num_instrs {
+            if target < num_instrs && !backward_jump_is_handler_only_target(code, scan_pc, target) {
                 loop_header_pcs.insert(target);
             }
         }
@@ -15439,6 +15479,37 @@ mod tests {
         assert_eq!(blocks[0].handler_offset, first.target as usize / 2);
         assert_eq!(blocks[0].stack_depth, first.depth as u16);
         assert_eq!(blocks[0].push_lasti, first.lasti);
+    }
+
+    #[test]
+    fn handler_break_backward_jump_is_not_a_loop_header() {
+        let code = first_nested_function_code(
+            "def f():\n    total = 0\n    for _ in range(3):\n        value = 0\n        while True:\n            try:\n                value = may_raise()\n            except Exception as exc:\n                value = exc.value\n                break\n        total += value\n    return total\n",
+        );
+        let mut arg_state = OpArgState::default();
+        let mut handler_only_targets = Vec::new();
+        let mut ordinary_targets = Vec::new();
+        for pc in 0..code.instructions.len() {
+            let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
+            let Some(target) = backward_jump_target(&code, pc, instruction, op_arg) else {
+                continue;
+            };
+            if backward_jump_is_handler_only_target(&code, pc, target) {
+                handler_only_targets.push(target);
+            } else {
+                ordinary_targets.push(target);
+            }
+        }
+
+        assert_eq!(handler_only_targets.len(), 1);
+        assert!(!ordinary_targets.is_empty());
+        let loop_headers = find_loop_header_pcs(&code);
+        assert!(!loop_headers.contains(&handler_only_targets[0]));
+        assert!(
+            ordinary_targets
+                .iter()
+                .all(|target| loop_headers.contains(target))
+        );
     }
 
     #[test]

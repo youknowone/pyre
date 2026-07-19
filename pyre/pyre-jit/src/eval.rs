@@ -4980,6 +4980,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    let semantic_loop_headers = crate::jit::codewriter::find_loop_header_pcs(code);
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
@@ -5153,6 +5154,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 driver.blackhole_if_trace_too_long();
             }
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
+                if !semantic_loop_headers.contains(&loop_header_pc) {
+                    driver.blackhole_if_trace_too_long();
+                    continue;
+                }
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
                 let marker_ec = frame_root.frame().execution_context as *const PyExecutionContext;
