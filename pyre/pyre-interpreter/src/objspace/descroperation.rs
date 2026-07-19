@@ -1394,13 +1394,36 @@ unsafe fn is_complex_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
 unsafe fn complex_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
     let (br, bi) = complex_val(b).unwrap();
-    Ok(w_complex_new(ar + br, ai + bi))
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    // CPython 3.14 complexobject.c COMPLEX_BINOP(add, sum): mixed real /
+    // complex addition uses _Py_cr_sum / _Py_rc_sum and leaves the complex
+    // imaginary lane untouched.  Besides matching C11 Annex G mixed-mode
+    // arithmetic, this preserves the sign of an imaginary zero.
+    if is_complex(a) && is_complex(b) {
+        Ok(w_complex_new(ar + br, ai + bi))
+    } else if is_complex(a) {
+        Ok(w_complex_new(ar + br, ai))
+    } else {
+        Ok(w_complex_new(ar + br, bi))
+    }
 }
 
 unsafe fn complex_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let (ar, ai) = complex_val(a).unwrap();
     let (br, bi) = complex_val(b).unwrap();
-    Ok(w_complex_new(ar - br, ai - bi))
+    reject_float_coercion_overflow(a, ar)?;
+    reject_float_coercion_overflow(b, br)?;
+    // CPython 3.14 _Py_c_diff / _Py_cr_diff / _Py_rc_diff.  In the mixed
+    // cases only the real lane is combined; real-complex negates the complex
+    // imaginary lane directly instead of subtracting it from +0.0.
+    if is_complex(a) && is_complex(b) {
+        Ok(w_complex_new(ar - br, ai - bi))
+    } else if is_complex(a) {
+        Ok(w_complex_new(ar - br, ai))
+    } else {
+        Ok(w_complex_new(ar - br, -bi))
+    }
 }
 
 unsafe fn complex_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {

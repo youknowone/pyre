@@ -1,5 +1,8 @@
 """float/complex TypeDef parity with Python 3.14's from_number API."""
 
+import math
+import operator
+
 
 assert {"__doc__", "__hash__", "__repr__", "from_number"} <= set(float.__dict__)
 assert {"__doc__", "from_number"} <= set(complex.__dict__)
@@ -56,6 +59,23 @@ else:
 
 assert complex.__lt__(1 + 1j, 2 + 2j) is NotImplemented
 assert complex(2**60, 0) != 2**60 + 1
+
+def assert_negative_zero_complex(value):
+    assert math.copysign(1.0, value.real) == -1.0
+    assert math.copysign(1.0, value.imag) == -1.0
+
+
+assert_negative_zero_complex(complex(-0.0, -0.0) + -0.0)
+assert_negative_zero_complex(-0.0 + complex(-0.0, -0.0))
+assert_negative_zero_complex(complex(-0.0, -0.0) - 0.0)
+assert_negative_zero_complex(-0.0 - complex(0.0, 0.0))
+for operation in (operator.add, operator.sub):
+    try:
+        operation(1j, 10**1000)
+    except OverflowError as error:
+        assert str(error) == "int too large to convert to float"
+    else:
+        raise AssertionError("over-range int must fail complex arithmetic")
 
 
 class IndexOnly:
