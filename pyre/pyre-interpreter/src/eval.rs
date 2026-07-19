@@ -159,6 +159,41 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
     push_current_frame_previous_root(previous, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
+/// Re-anchor a caller frame across a callee call that may run a moving minor
+/// collection.
+///
+/// The interpreter holds the running frame as a raw `&mut PyFrame`, which the
+/// GC does not treat as a managed reference.  When the callee allocates enough
+/// to trigger a minor collection, the caller frame is relocated and that raw
+/// pointer is left aimed at the abandoned nursery copy.  A field write through
+/// it afterwards — the `CALL` result push and its `valuestackdepth` bump —
+/// then lands on dead memory, so the live frame keeps a stack depth one slot
+/// short and the next opcode reads the wrong operands.
+///
+/// Pushing the frame onto the shadow stack lets the root walker forward it in
+/// place during the collection; `live()` reads the forwarded pointer back.
+/// This mirrors the JIT eval layer's `FrameRoot`.
+pub(crate) struct FrameAnchor {
+    depth: usize,
+}
+
+impl FrameAnchor {
+    pub(crate) fn new(frame: &mut PyFrame) -> Self {
+        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize));
+        Self { depth }
+    }
+
+    pub(crate) fn live(&self) -> *mut PyFrame {
+        majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame
+    }
+}
+
+impl Drop for FrameAnchor {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::try_pop_to(self.depth);
+    }
+}
+
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
 /// expose every live slot of `PyFrame.locals_cells_stack_w` on the active
 /// f_backref chain as a GC root.
@@ -4012,6 +4047,7 @@ impl OpcodeStepExecutor for PyFrame {
                 && !callable.is_null()
                 && unsafe { crate::is_function(callable) }
             {
+                let anchor = FrameAnchor::new(self);
                 let result =
                     crate::function::funccall_valuestack(callable, nargs, self, nargs + 2, false);
                 if result.is_null() {
@@ -4019,7 +4055,10 @@ impl OpcodeStepExecutor for PyFrame {
                         .unwrap_or_else(|| crate::PyError::type_error("call failed"))
                         .into());
                 }
-                self.push(result);
+                // baseobjspace.py:1256 self.pushvalue(w_result). The callee may
+                // have relocated this frame via a minor collection, so push
+                // onto the forwarded live frame, not the pre-call pointer.
+                unsafe { &mut *anchor.live() }.push(result);
                 return Ok(());
             }
         }
@@ -4034,6 +4073,7 @@ impl OpcodeStepExecutor for PyFrame {
         let null_or_self = self.pop();
         let callable = self.pop();
 
+        let anchor = FrameAnchor::new(self);
         let result = if null_or_self.is_null() {
             call_callable(self, callable, &args)?
         } else {
@@ -4042,7 +4082,9 @@ impl OpcodeStepExecutor for PyFrame {
             full_args.extend_from_slice(&args);
             call_callable(self, callable, &full_args)?
         };
-        self.push(result);
+        // The callee may have relocated this frame via a minor collection;
+        // push onto the forwarded live frame, not the pre-call pointer.
+        unsafe { &mut *anchor.live() }.push(result);
         Ok(())
     }
 
@@ -4066,9 +4108,12 @@ impl OpcodeStepExecutor for PyFrame {
         let args_obj = self.pop();
         let self_or_null = self.pop();
         let callable = self.pop();
+        let anchor = FrameAnchor::new(self);
         let result =
             crate::call::call_function_ex(self, callable, self_or_null, args_obj, kwargs_or_null)?;
-        self.push(result);
+        // The callee may have relocated this frame via a minor collection;
+        // push onto the forwarded live frame, not the pre-call pointer.
+        unsafe { &mut *anchor.live() }.push(result);
         Ok(())
     }
 
@@ -4094,8 +4139,11 @@ impl OpcodeStepExecutor for PyFrame {
         let self_or_null = self.pop();
         let callable = self.pop();
 
+        let anchor = FrameAnchor::new(self);
         let result = crate::call::call_kw(self, callable, self_or_null, &args, kwarg_names)?;
-        self.push(result);
+        // The callee may have relocated this frame via a minor collection;
+        // push onto the forwarded live frame, not the pre-call pointer.
+        unsafe { &mut *anchor.live() }.push(result);
         Ok(())
     }
 
