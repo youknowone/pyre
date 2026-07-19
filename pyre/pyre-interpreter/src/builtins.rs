@@ -11040,8 +11040,17 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             }
         }
     }
-    let f = crate::baseobjspace::float_w(obj)?;
-    Ok((f, 0.0))
+    // `complexobject.py unpackcomplex`: after `__complex__`, conversion uses
+    // the real-number protocol.  Reuse float's `__float__` then `__index__`
+    // ladder so an index-only object is accepted without admitting strings.
+    if unsafe { is_str(obj) || pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be real number, not {}",
+            crate::type_methods::arg_type_name(obj)
+        )));
+    }
+    let w_float = builtin_float(&[obj])?;
+    Ok((unsafe { w_float_get_value(w_float) }, 0.0))
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
@@ -11053,6 +11062,17 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
     let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+
+    // `complex.__new__`: an exact complex passed as the sole argument is
+    // returned unchanged.  A strict subclass continues through coercion and
+    // is copied into a base complex.
+    if w_imag.is_none() {
+        if let Some(a) = w_real {
+            if unsafe { is_exact_type(a, &COMPLEX_TYPE) } {
+                return Ok(a);
+            }
+        }
+    }
 
     // String form accepts only the real argument.
     if let Some(a) = w_real {

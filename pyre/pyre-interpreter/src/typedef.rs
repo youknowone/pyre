@@ -13704,6 +13704,11 @@ fn init_complex_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
                 "from_number",
                 |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "complex.from_number() missing required argument 'number' (pos 1)",
+                        ));
+                    }
                     let value = args[1];
                     if unsafe {
                         pyre_object::is_str(value)
@@ -13715,7 +13720,11 @@ fn init_complex_type(ns: PyObjectRef) {
                             crate::type_methods::arg_type_name(value)
                         )));
                     }
-                    crate::builtins::builtin_complex(&[value])
+                    // Reuse complex.__new__'s exact-base identity and subclass
+                    // allocation.  The constructor's numeric-only path runs
+                    // __complex__, __float__, then __index__ without parsing
+                    // text because those inputs were rejected above.
+                    complex_descr_new(&[args[0], value])
                 },
                 2,
             )),
@@ -13865,9 +13874,12 @@ fn init_complex_type(ns: PyObjectRef) {
                             pyre_object::w_complex_get_imag(args[0]),
                         )
                     };
-                    Ok(pyre_object::w_tuple_new(vec![pyre_object::w_complex_new(
-                        re, im,
-                    )]))
+                    // complexobject.py descr___getnewargs__: two base floats,
+                    // preserving the sign bits of zero components.
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_float_new(re),
+                        pyre_object::w_float_new(im),
+                    ]))
                 },
                 1,
             ),

@@ -28,6 +28,25 @@ assert float.from_number(Number()) == 2.5
 assert complex.from_number(Number()) == 2 + 3j
 
 
+class ComplexIndexOnly:
+    def __index__(self):
+        return 271
+
+
+class ComplexSubclass(complex):
+    pass
+
+
+assert complex.from_number(ComplexIndexOnly()) == 271 + 0j
+complex_subclass_value = ComplexSubclass.from_number(ComplexIndexOnly())
+assert complex_subclass_value == 271 + 0j
+assert type(complex_subclass_value) is ComplexSubclass
+
+complex_nan = complex(float("nan"), float("nan"))
+assert complex.from_number(complex_nan) is complex_nan
+assert (1 - 2j).__getnewargs__() == (1.0, -2.0)
+
+
 class IndexOnly:
     def __index__(self):
         return 314
