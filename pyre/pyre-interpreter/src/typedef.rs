@@ -1156,6 +1156,7 @@ pub fn init_typeobjects() {
     static PATCH_TYPEOBJECTS: std::sync::Once = std::sync::Once::new();
     PATCH_TYPEOBJECTS.call_once(|| {
         patch_object_class_descriptor();
+        patch_complex_realimag_descriptors();
         patch_builtin_function_descriptors();
         patch_function_member_descriptors();
         patch_module_descriptors();
@@ -1203,6 +1204,54 @@ fn patch_object_class_descriptor() {
             Some("__class__"),
         ),
     );
+}
+
+/// Install `complex.real` / `complex.imag` after the complex type exists.
+///
+/// complexobject.py:556-561 `complexwprop` builds each as
+/// `GetSetProperty(fget, doc=doc, cls=W_ComplexObject)`; the `cls` gives the
+/// descriptor its `__objclass__` and rejects a non-complex receiver. The
+/// complex type object is not available while `init_complex_type` fills the
+/// namespace (it is created by the same call that runs the initializer), so
+/// the two descriptors are stored here, once the type is registered.
+fn patch_complex_realimag_descriptors() {
+    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).unwrap_or(pyre_object::PY_NULL);
+    if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
+        return;
+    }
+    for (name, doc, getter) in [
+        (
+            "real",
+            "the real part of a complex number",
+            make_builtin_function_with_arity(
+                "real",
+                |args| Ok(pyre_object::w_float_new(unsafe { pyre_object::w_complex_get_real(args[1]) })),
+                2,
+            ),
+        ),
+        (
+            "imag",
+            "the imaginary part of a complex number",
+            make_builtin_function_with_arity(
+                "imag",
+                |args| Ok(pyre_object::w_float_new(unsafe { pyre_object::w_complex_get_imag(args[1]) })),
+                2,
+            ),
+        ),
+    ] {
+        crate::type_dict_store(
+            complex_type,
+            name,
+            make_getset_property_full(
+                getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                pyre_object::w_str_new(doc),
+                complex_type,
+                Some(name),
+            ),
+        );
+    }
 }
 
 /// `typedef.py:58 add_entries` parity — walk every registered
@@ -13868,45 +13917,10 @@ fn init_complex_type(ns: PyObjectRef) {
             ),
         )
     };
-    // complex.real / complex.imag — read-only float components.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "real",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity(
-                    "real",
-                    |args| {
-                        Ok(pyre_object::w_float_new(unsafe {
-                            pyre_object::w_complex_get_real(args[0])
-                        }))
-                    },
-                    1,
-                ),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "imag",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity(
-                    "imag",
-                    |args| {
-                        Ok(pyre_object::w_float_new(unsafe {
-                            pyre_object::w_complex_get_imag(args[0])
-                        }))
-                    },
-                    1,
-                ),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
+    // complex.real / complex.imag — read-only float getset descriptors.
+    // Installed post-registration by `patch_complex_realimag_descriptors`
+    // because the required-class check needs the complex type object, which
+    // does not exist yet while this namespace is being filled.
     for (name, func) in [
         ("__add__", complex_dunder_add as DunderFn),
         ("__radd__", complex_dunder_radd),
