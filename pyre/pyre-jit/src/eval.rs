@@ -919,6 +919,17 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
 pub(crate) enum LoopResult {
     Done(PyResult),
     ContinueRunningNormally,
+    /// warmspot.py:998-1005 `ExitFrameWithExceptionRef`: a direct compiled-code
+    /// exit (e.g. `CHECK_MEMORY_ERROR`'s `propagate_exception_path`) carrying a
+    /// pending exception that has NOT yet been offered to this frame's own
+    /// handler.  Unlike the blackhole-resume path — which re-runs bytecode and
+    /// unwinds the exception table during resume — a `PropagateExceptionDescr`
+    /// exit skips the frame's exception machinery entirely.  RPython's
+    /// `handle_jitexception` re-`raise`s the stored Ref so it re-enters the
+    /// interpreter loop and an enclosing same-frame `try`/`except` can catch it;
+    /// pyre delivers it to `handle_exception` at the eval loop for the same
+    /// effect.
+    ExitFrameWithException(pyre_interpreter::PyError),
 }
 
 /// Action from handle_jit_outcome for eval_loop_jit dispatch.
@@ -4868,6 +4879,11 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
         }
         match loop_outcome {
             LoopResult::Done(result) => return result,
+            // `eval_loop_jit` consumes `ExitFrameWithException` at its
+            // `maybe_compile_and_run` site (offers it to the frame's exception
+            // table, then re-loops or returns `Done`), so it never surfaces
+            // here; propagate defensively should that invariant change.
+            LoopResult::ExitFrameWithException(err) => return Err(err),
             LoopResult::ContinueRunningNormally => {
                 // RPython warmspot.py:976-978: result = portal_ptr(*args).
                 // The blackhole has already written back the merge point
@@ -4877,6 +4893,27 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
                 continue;
             }
         }
+    }
+}
+
+/// warmspot.py:998-1005 `ExitFrameWithExceptionRef` delivery for a compiled-run
+/// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
+/// compile-once path).  Offer the pending exception to `frame`'s exception
+/// table; on a match resume interpretation at the handler and return its
+/// result (a same-frame `try`/`except` catches it, matching PyPy's re-raise
+/// into the interpreter loop), otherwise return it for propagation out of the
+/// frame.  The eval loop's own `maybe_compile_and_run` site handles the warm
+/// path inline via `continue` instead of recursing here.
+fn deliver_exit_frame_exception(
+    frame: &mut PyFrame,
+    mut err: pyre_interpreter::PyError,
+) -> PyResult {
+    let mut handler_instr = frame.next_instr();
+    if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
+        frame.set_last_instr_from_next_instr(handler_instr);
+        handle_jitexception(frame)
+    } else {
+        Err(err)
     }
 }
 
@@ -5171,6 +5208,25 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     info,
                     &env,
                 ) {
+                    // warmspot.py:998-1005 handle_jitexception: an
+                    // `ExitFrameWithExceptionRef` from a direct compiled-code
+                    // exit is re-raised into the interpreter loop.  Offer it to
+                    // this frame's exception table first (mirroring the
+                    // per-opcode `Err` arm below); resume at the handler pc when
+                    // caught, otherwise propagate it out as a plain `Done(Err)`.
+                    if let LoopResult::ExitFrameWithException(mut err) = loop_result {
+                        if pyre_interpreter::eval::handle_exception(
+                            frame_root.frame(),
+                            &mut err,
+                            &mut next_instr,
+                        ) {
+                            frame_root
+                                .frame()
+                                .set_last_instr_from_next_instr(next_instr);
+                            continue;
+                        }
+                        return LoopResult::Done(Err(err));
+                    }
                     return loop_result;
                 }
             }
@@ -5888,7 +5944,12 @@ fn execute_assembler(
                     }
                 };
                 let err = unsafe { pyre_interpreter::PyError::from_exc_object(exc_ref) };
-                return Some(LoopResult::Done(Err(err)));
+                // warmspot.py:998-1005 — hand the compiled-code exception to
+                // this frame's exception table before propagating it out, so a
+                // same-frame `try`/`except` (e.g. around an allocating loop that
+                // tripped `PYPY_GC_MAX`) catches it, matching PyPy's re-raise
+                // into the interpreter loop.
+                return Some(LoopResult::ExitFrameWithException(err));
             }
             let [value] = typed_values.as_slice() else {
                 return Some(LoopResult::Done(Err(
@@ -6584,6 +6645,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &env,
     ) {
         Some(LoopResult::Done(result)) => Some(result),
+        // `compile_and_run_once` resolves a compiled-code exception exit inside
+        // `handle_jit_outcome` (offering it to the frame's exception table), so
+        // it never surfaces `ExitFrameWithException` here; propagate defensively.
+        Some(LoopResult::ExitFrameWithException(err)) => Some(Err(err)),
         Some(LoopResult::ContinueRunningNormally) => {
             // warmspot.py:976-978 portal re-entry.  Marker mode completed the
             // synchronous walk; continue from the adopted/restart state.
@@ -6628,7 +6693,12 @@ fn handle_jit_outcome(
                     }
                 };
                 let err = unsafe { pyre_interpreter::PyError::from_exc_object(exc_ref) };
-                return JitAction::Return(Err(err));
+                // warmspot.py:998-1005 — deliver to this frame's exception table
+                // (resume at the handler on a match) rather than propagating
+                // straight out, so a same-frame try/except catches a
+                // compiled-code exception such as CHECK_MEMORY_ERROR's
+                // MemoryError.
+                return JitAction::Return(deliver_exit_frame_exception(frame, err));
             }
             let [value] = typed_values.as_slice() else {
                 return JitAction::Return(Err(pyre_interpreter::PyError::type_error(
