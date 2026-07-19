@@ -12086,6 +12086,14 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
 unsafe fn leak_stopiteration(mut e: PyError) -> PyError {
     use pyre_object::interp_exceptions::*;
     let w_stopiter = e.to_exc_object();
+    // Root the leaked StopIteration across the RuntimeError allocation below:
+    // it lives only in this Rust local, which the precise collector does not
+    // scan, so a collection inside `w_exception_new` could sweep it before it
+    // is stamped onto `rt` as `__context__` / `__cause__`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    if !w_stopiter.is_null() {
+        pyre_object::gc_roots::pin_root(w_stopiter);
+    }
     let rt = w_exception_new(ExcKind::RuntimeError, "generator raised StopIteration");
     if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
         w_exception_set_context(rt, w_stopiter);

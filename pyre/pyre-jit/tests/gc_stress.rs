@@ -581,3 +581,46 @@ assert result == 300, result
         "class-exc from-class-cause gc stress program failed",
     );
 }
+
+/// A `StopIteration` leaking out of a generator body (PEP 479) is converted to
+/// `RuntimeError("generator raised StopIteration")` by `leak_stopiteration`. The
+/// leaked instance lives only in a Rust local (`w_stopiter`) across the
+/// `RuntimeError` allocation, a GC safepoint, before it is stamped onto the
+/// `RuntimeError` as `__cause__` / `__context__`. The `push_roots` /
+/// `pin_root(w_stopiter)` bracket keeps it alive so `__cause__` is a live
+/// `StopIteration`; without it that read is against a swept block. Under
+/// `MAJIT_GC_STRESS` the `RuntimeError` instantiation deterministically collects
+/// inside the window.
+#[test]
+fn generator_leaked_stopiteration_cause_survives_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def gen():
+    raise StopIteration
+    yield
+
+def run():
+    ok = 0
+    n = 0
+    while n < 300:
+        junk = [0] * 16
+        try:
+            next(gen())
+        except RuntimeError as e:
+            if type(e.__cause__) is StopIteration:
+                ok = ok + 1
+        gc.collect()
+        n = n + 1
+    return ok
+
+result = run()
+assert result == 300, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<generator_leaked_stopiteration_gc_stress>",
+        "leaked-StopIteration cause survival check",
+        "generator leaked-StopIteration gc stress program failed",
+    );
+}
