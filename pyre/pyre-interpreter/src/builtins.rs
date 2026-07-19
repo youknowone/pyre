@@ -6314,7 +6314,7 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
         }
     }
     let text = value.to_string();
-    if maxdigits != 0 && text.trim_start_matches('-').len() as i64 > maxdigits {
+    if maxdigits != 0 && text.trim_start_matches('-').len() > maxdigits as usize {
         return Err(crate::PyError::value_error(format!(
             "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
         )));
