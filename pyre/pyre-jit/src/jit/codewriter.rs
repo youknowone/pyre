@@ -2344,7 +2344,12 @@ fn emit_frontend_buildslice_shadow_graph(
     let step = match argc {
         BuildSliceArgCount::Two => {
             debug_assert!(step.is_none(), "BUILD_SLICE argc=2 must synthesize None");
-            super::flow::Constant::none().into()
+            // `space.w_None`, not the null Ref sentinel used by `Constant::none()`.
+            super::flow::Constant::new(
+                super::flow::ConstantValue::Signed(pyre_object::w_none() as i64),
+                Some(Kind::Ref),
+            )
+            .into()
         }
         BuildSliceArgCount::Three => step.expect("BUILD_SLICE argc=3 must preserve explicit step"),
     };
@@ -14155,8 +14160,8 @@ mod tests {
     use crate::jit::assembler::ArcByPtr;
     use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
     use crate::jit::flow::{
-        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, SpaceOperationArg, Variable,
-        VariableId, c_last_exception,
+        Block, Constant, ConstantValue, ExitSwitch, FlowValue, FunctionGraph, Link,
+        SpaceOperationArg, Variable, VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
@@ -14569,9 +14574,15 @@ mod tests {
             .expect("BUILD_SLICE argc=2 should record newslice");
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 47);
+        assert_eq!(op.args[0], w_start.into());
+        assert_eq!(op.args[1], w_stop.into());
         assert_eq!(
-            op.args,
-            vec![w_start.into(), w_stop.into(), Constant::none().into()],
+            op.args[2],
+            Constant::new(
+                ConstantValue::Signed(pyre_object::w_none() as i64),
+                Some(Kind::Ref),
+            )
+            .into(),
         );
         assert_eq!(op.result, Some(result.into()));
         assert_eq!(result.kind, Some(Kind::Ref));
