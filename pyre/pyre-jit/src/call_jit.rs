@@ -1809,6 +1809,40 @@ impl Drop for ResumeDeadframeRoots {
     }
 }
 
+/// RAII guard rooting a single bare `Ref`-carrying `i64` slot across an
+/// allocating region. Mirrors the dynasm CA helper's `gc_add_root` over the
+/// grabbed guard exception (majit-backend-dynasm `ca_helper`): once the slot is
+/// registered the collector forwards `*slot` in place if it moves the object,
+/// so the bare carrier stays valid across a hook that may allocate. `register`
+/// is a no-op for a null slot (non-exception guards leave `grab_exc_value` 0).
+#[cfg(target_arch = "wasm32")]
+struct BareRefRoot {
+    slot: Option<*mut *mut u8>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BareRefRoot {
+    fn register(value: &mut i64) -> Self {
+        if *value == 0 {
+            return Self { slot: None };
+        }
+        let slot = value as *mut i64 as *mut *mut u8;
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self {
+            slot: registered.then_some(slot),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for BareRefRoot {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            pyre_object::gc_hook::try_gc_remove_root(slot);
+        }
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -3356,8 +3390,15 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             green_key,
             exit_layout,
             raw_values,
-            guard_exc,
+            mut guard_exc,
         } => {
+            // `grab_exc_value` cleared the only root for the pending exception
+            // (dynasm `ca_helper`, llmodel.py:240); root the bare carrier while
+            // the bridge-compile hook and the blackhole run — both may allocate,
+            // and a moving collection would otherwise leave `guard_exc` stale.
+            // Inert today (wasm host allocations never collect) but keeps the
+            // carrier rooted at parity with dynasm if that invariant changes.
+            let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
             let attempt = try_compile_ca_bridge(&descr_arc, &raw_values);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
