@@ -1352,6 +1352,33 @@ impl BhDescr {
         }
     }
 
+    /// Resolve the dense GC `tid` for a blackhole/resume header write from
+    /// the identity this descr carries in [`get_type_id`].  Producers are
+    /// mixed: `allocate_with_vtable` and the walker struct path widen the
+    /// real `descr.tid` into the slot, while `bh_new`, `from_array_descr`,
+    /// and every array path serialize the `cache_key` (`descr.py:108-118` /
+    /// `:348-378` structural identity).  A `_cache_size`/`_cache_array` hit
+    /// maps a `cache_key` back to the allocated tid (`gc.py:536-542`); a
+    /// miss means the value was already the dense tid (a real tid never keys
+    /// a struct/array cache slot).  Backends call this instead of
+    /// `get_type_id() as u32` so a materialized object carries a header the
+    /// collector can trace.
+    pub fn resolve_gc_tid(&self) -> u32 {
+        let raw = self.get_type_id();
+        let resolved = match self {
+            BhDescr::Size { .. } => majit_ir::descr::gc_cache()
+                .lock()
+                .expect("gc_cache poisoned")
+                .resolve_struct_tid(raw),
+            BhDescr::Array { .. } => majit_ir::descr::gc_cache()
+                .lock()
+                .expect("gc_cache poisoned")
+                .resolve_array_tid(raw),
+            _ => None,
+        };
+        resolved.unwrap_or(raw as u32)
+    }
+
     pub fn as_itemsize(&self) -> usize {
         match self {
             BhDescr::Array { itemsize, .. } => *itemsize,

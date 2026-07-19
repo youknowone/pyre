@@ -1018,6 +1018,31 @@ impl GcCache {
         descr
     }
 
+    /// Read-only resolution of `LLType::Struct(cache_key)` to the dense GC
+    /// `tid` stamped on the cached `SizeDescr` (`gc.py:536-542` descr.tid),
+    /// or `None` when the key was never minted.  The blackhole/resume
+    /// allocation path holds only the `cache_key` (path_hash) that the
+    /// `BhDescr` serialized (`descr.py:108-118` structural identity) and must
+    /// recover the real GC tid the header write needs, without minting a
+    /// fresh descr the way `get_size_descr` would.  A real dense tid never
+    /// keys a `_cache_size` slot, so a miss reports the value was already a
+    /// tid and the caller keeps it verbatim.
+    pub fn resolve_struct_tid(&self, cache_key: u64) -> Option<u32> {
+        self._cache_size
+            .get(&LLType::Struct(cache_key))
+            .and_then(|d| d.as_size_descr())
+            .map(|sd| sd.type_id())
+    }
+
+    /// Array counterpart of [`resolve_struct_tid`] keyed on
+    /// `LLType::Array(cache_key)` (`descr.py:350`).
+    pub fn resolve_array_tid(&self, cache_key: u64) -> Option<u32> {
+        self._cache_array
+            .get(&LLType::Array(cache_key))
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| ad.type_id())
+    }
+
     /// `descr.py:423-438 get_interiorfield_descr(gc_ll_descr, ARRAY, name, arrayfieldname=None)`
     /// cache-or-mint.  Keys `_cache_interiorfield[(ARRAY, name, arrayfieldname)]`
     /// so the analyzer's `cc.interiorfielddescrof` and the struct-array

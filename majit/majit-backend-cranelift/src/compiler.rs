@@ -16539,15 +16539,11 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
-        // TODO: `BhDescr.get_type_id()` returns the
-        // u64 `path_hash` cache key, but `gc.alloc_nursery_typed`
-        // expects a u32 GC tid (allocated by `gc_cache.next_struct_tid`).
-        // Truncating loses gc identity; the structural fix is to route
-        // through `gc_cache.get_size_descr` here and use the resolved
-        // descr's allocated tid.
+        // `resolve_gc_tid` routes the serialized `path_hash` cache key back
+        // through `gc_cache` to the allocated dense GC tid; the raw key read
+        // as a tid loses gc identity and indexes past the type table.
         match with_cranelift_gc(|gc| {
-            gc.alloc_nursery_typed(sizedescr.get_type_id() as u32, size)
-                .0 as i64
+            gc.alloc_nursery_typed(sizedescr.resolve_gc_tid(), size).0 as i64
         }) {
             Some(ptr) => ptr,
             None => {
@@ -16563,7 +16559,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        let type_id = sizedescr.get_type_id() as u32;
+        let type_id = sizedescr.resolve_gc_tid();
         // resume.py direct-reader materialization retains raw pointers across
         // the forward blackhole run.  Match Dynasm's bh_new_with_vtable:
         // typed virtuals are born zero-filled in non-moving oldgen.  The old
@@ -16601,11 +16597,10 @@ impl majit_backend::Backend for CraneliftBackend {
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
-        // TODO: `BhDescr.get_type_id()` returns the
-        // u64 `path_hash` cache key, but `active_runtime_alloc_*`
-        // expects the u32 GC tid.  Truncate `as u32` until gc_cache
-        // routing resolves the proper allocated tid here.
-        let type_id = arraydescr.get_type_id() as u32;
+        // `resolve_gc_tid` maps the serialized `path_hash` cache key back to
+        // the allocated GC tid (`gc.py:544-549`) the tracer's per-item visit
+        // shape keys on.
+        let type_id = arraydescr.resolve_gc_tid();
         assert!(
             type_id != 0,
             "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"

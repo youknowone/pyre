@@ -1422,9 +1422,11 @@ impl majit_backend::Backend for WasmBackend {
     /// llmodel.py:775 bh_new(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
-        // TODO: get_type_id() returns the u64 path_hash cache key; the GC tid
-        // is its low 32 bits until gc_cache routing resolves the real tid.
-        let type_id = sizedescr.get_type_id() as u32;
+        // Resolve the serialized `path_hash` cache key back to the dense GC
+        // tid so the nursery object carries a header the collector can trace
+        // (`gc.py:536-542`); a raw cache key read as a tid indexes past the
+        // type table on the first minor collection.
+        let type_id = sizedescr.resolve_gc_tid();
         with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
             .unwrap_or(0)
     }
@@ -1434,7 +1436,7 @@ impl majit_backend::Backend for WasmBackend {
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        let type_id = sizedescr.get_type_id() as u32;
+        let type_id = sizedescr.resolve_gc_tid();
         let ptr =
             with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
                 .unwrap_or(0);
@@ -1455,7 +1457,7 @@ impl majit_backend::Backend for WasmBackend {
         let len_offset = arraydescr
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
-        let type_id = arraydescr.get_type_id() as u32;
+        let type_id = arraydescr.resolve_gc_tid();
         with_wasm_active_gc_mut(|gc| {
             let obj = gc.alloc_varsize_typed(type_id, base_size, itemsize, length);
             if obj.is_null() {

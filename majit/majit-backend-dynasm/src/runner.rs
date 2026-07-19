@@ -2907,7 +2907,7 @@ impl Backend for DynasmBackend {
         // object would leave those captures stale.  Old-gen keeps every
         // materialized pointer stable for the lifetime of the resume.  Non-GC
         // descrs (`type_id == 0`, raw buffers) keep the plain malloc.
-        let type_id = sizedescr.get_type_id() as u32;
+        let type_id = sizedescr.resolve_gc_tid();
         let ptr = if type_id != 0 {
             dynasm_alloc_oldgen_typed(type_id, size).0 as *mut libc::c_void
         } else {
@@ -2942,10 +2942,10 @@ impl Backend for DynasmBackend {
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
-        // TODO: `BhDescr.get_type_id()` returns the
-        // u64 `path_hash` cache key, but `dynasm_alloc_*` expects the
-        // u32 GC tid.  Truncate `as u32` until gc_cache routing.
-        let type_id = arraydescr.get_type_id() as u32;
+        // `BhDescr::resolve_gc_tid` maps the serialized `path_hash` cache key
+        // back to the allocated GC tid (`gc.py:544-549`) so the header carries
+        // the per-item visit shape the tracer reads.
+        let type_id = arraydescr.resolve_gc_tid();
         assert!(
             type_id != 0,
             "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
