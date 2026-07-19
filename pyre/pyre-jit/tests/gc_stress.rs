@@ -690,3 +690,57 @@ assert result == 2325, result
         "bytes/bytearray gc stress program failed",
     );
 }
+
+/// A `str` SUBCLASS instance's WTF-8 `value` buffer is a GC-managed leaf storage
+/// box (off-GC storage epic S5): the mortal subclass holder is GC-swept and its
+/// `value` gc-pointer edge greys the box, whose tid drop glue reclaims the
+/// buffer on sweep. Regression for the migration off the per-type
+/// `unicode_object_destructor`: a subclass string reachable only through a list
+/// must keep its value buffer across collections (UAF on read-back if the box is
+/// swept early), and per-round dead subclass strings must be reclaimed without a
+/// double-free (the box drop glue is the sole reclaimer). Exact strings keep an
+/// immortal `malloc_raw` value and are unaffected — the test mixes both.
+///
+/// `subs` holds `S` (a str subclass) instances reachable only through a list;
+/// each carries its own boxed value. The returned checksum reads them back after
+/// 100 collections, so it is reachable only if every subclass value survived.
+#[test]
+fn str_subclass_value_survives_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+class S(str):
+    pass
+
+def run():
+    subs = []
+    i = 0
+    while i < 12:
+        subs.append(S("payload"))
+        i = i + 1
+
+    n = 0
+    while n < 100:
+        junk = S("throwaway garbage")
+        plain = "exact" * 3
+        gc.collect()
+        n = n + 1
+
+    total = 0
+    i = 0
+    while i < 12:
+        s = subs[i]
+        total = total + len(s) + ord(s[0])
+        i = i + 1
+    return total
+
+result = run()
+assert result == 1428, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<str_subclass_value_gc_stress>",
+        "str subclass value survival checks",
+        "str subclass value gc stress program failed",
+    );
+}

@@ -1762,17 +1762,24 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_type_tid,
     );
     pytype_to_tid.insert(&pyre_object::TYPE_TYPE as *const _ as usize, w_type_tid);
-    // W_UnicodeObject carries an off-heap WTF-8 buffer. Managed subclass
-    // instances additionally need the header's `w_class` traced, matching
-    // W_ObjectObject's instance-class edge; exact strings remain immortal.
-    let w_str_tid = gc.register_type(
-        TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
-            object_tid,
-            vec![pyre_object::pyobject::W_CLASS_OFFSET],
-        )
-        .with_destructor_fn(pyre_object::unicodeobject::unicode_object_destructor),
-    );
+    // W_UnicodeObject carries an off-heap WTF-8 `value` buffer. A mortal
+    // subclass instance's `value` is a GC-managed storage box (off-GC storage
+    // epic S5), traced through the `value` gc-pointer edge; the box tid's drop
+    // glue reclaims it on sweep. An exact string keeps a `malloc_raw` immortal
+    // value (an immortal holder cannot grey an old-gen box), which the
+    // `is_managed_heap_object` guard on the edge skips. Managed subclass
+    // instances also need the header's `w_class` traced, matching
+    // W_ObjectObject's instance-class edge. No `.with_destructor_fn`: the box
+    // tid's drop glue is the sole reclaimer (a holder destructor would
+    // double-free a box swept before its owner).
+    let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
+        object_tid,
+        vec![
+            pyre_object::pyobject::W_CLASS_OFFSET,
+            pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
+        ],
+    ));
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2886,6 +2893,18 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
         pyre_object::bytesobject::set_bytes_data_gc_type_id,
+    );
+    // Mortal (subclass) `str` `value` WTF-8 buffer storage box (off-GC storage
+    // epic S5). A leaf `Wtf8Buf` (no inner refs); the W_UnicodeObject `value`
+    // gc-pointer edge greys it and the box tid's drop glue reclaims the buffer
+    // on sweep. Only subclass strings box their value; exact strings keep a
+    // `malloc_raw` immortal value. Keep this id at the absolute registration tail.
+    register_leaf_storage_box::<pyre_object::unicodeobject::UnicodeValueStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::unicodeobject::UnicodeValueStorage,
+        >,
+        pyre_object::unicodeobject::set_unicode_value_gc_type_id,
     );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids

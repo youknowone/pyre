@@ -45,6 +45,32 @@ pub const UNICODE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, len)
 /// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
 pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
 
+/// GC-managed WTF-8 value buffer of a *mortal* (subclass) `str` instance.
+///
+/// A leaf (`Wtf8Buf { bytes: Vec<u8> }`, no inner `PyObjectRef`); its GC box
+/// carries only drop glue that reclaims the buffer on sweep. Exact strings keep
+/// their `malloc_raw` immortal value (an immortal holder cannot grey an old-gen
+/// box, so its value must not be one), matching the `longobject` bigint box that
+/// only mortal longs use.
+pub type UnicodeValueStorage = Wtf8Buf;
+
+/// Runtime-assigned GC type id for [`UnicodeValueStorage`]. Published by
+/// `pyre-jit::eval` after the fixed-constant type registrations; never embedded
+/// in a JIT allocation descriptor.
+static UNICODE_VALUE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for [`UnicodeValueStorage`].
+pub fn set_unicode_value_gc_type_id(id: u32) {
+    UNICODE_VALUE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for [`UnicodeValueStorage`].
+#[majit_macros::dont_look_inside]
+pub fn unicode_value_gc_type_id() -> u32 {
+    UNICODE_VALUE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Fixed payload size (`framework.py:811`).
 pub const W_UNICODE_OBJECT_SIZE: usize = std::mem::size_of::<W_UnicodeObject>();
 
@@ -110,7 +136,11 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
 pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjectRef {
     let byte_len = value.len();
     let char_len = value.code_points().count();
-    let value = crate::lltype::malloc_raw(value);
+    // Mortal (subclass) holder: the value buffer lives in a GC-managed box so
+    // the sweep reclaims it through the box tid's drop glue, and the holder's
+    // `value` gc-pointer edge greys it. Falls back to `malloc_raw` when no GC
+    // hook is installed (pre-init / unit tests).
+    let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
     let unicode = W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
@@ -131,16 +161,6 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     };
     crate::gc_hook::maybe_register_finalizer(obj);
     obj
-}
-
-/// Lightweight GC destructor for the off-heap WTF-8 buffer owned by a
-/// managed `W_UnicodeObject`.
-pub unsafe fn unicode_object_destructor(obj_addr: usize) {
-    let obj = unsafe { &mut *(obj_addr as *mut W_UnicodeObject) };
-    if !obj.value.is_null() {
-        unsafe { drop(Box::from_raw(obj.value)) };
-        obj.value = std::ptr::null_mut();
-    }
 }
 
 thread_local! {
