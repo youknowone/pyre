@@ -11429,7 +11429,7 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
+    fn test_builtin_complex_uses_python314_signed_zero_with_complex_real() {
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
@@ -11437,7 +11437,7 @@ mod tests {
         );
         assert_eq!(
             unsafe { w_complex_get_imag(result).to_bits() },
-            (-0.0f64).to_bits()
+            0.0f64.to_bits()
         );
     }
 
