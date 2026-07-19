@@ -999,6 +999,24 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.accumulate",
+                init_accumulate_type,
+                object_type,
+                &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
+            &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.zip_longest",
+                init_zip_longest_type,
+                object_type,
+                &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
         );
@@ -21843,6 +21861,88 @@ fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::next(obj)
 }
 
+fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_Accumulate__new__(space, w_subtype, w_iterable, w_func=None,
+    //                     __kwonly__=None, w_initial=None).
+    let exact = gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE).unwrap_or(PY_NULL);
+    let w_none = pyre_object::w_none();
+    let (cls, scope_w) = itertools_constructor_scope(
+        args,
+        "accumulate",
+        vec!["iterable", "func", "initial"],
+        &[w_none, w_none],
+    )?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(scope_w[0]);
+    let iterable_arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(scope_w[1]);
+    let func_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(scope_w[2]);
+    let initial_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_iterable = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(iterable_arg_slot)
+    })?;
+    let w_func = unsafe { pyre_object::gc_roots::shadow_stack_get(func_slot) };
+    let w_func = if unsafe { pyre_object::is_none(w_func) } {
+        PY_NULL
+    } else {
+        w_func
+    };
+    let obj = pyre_object::interp_itertools::w_accumulate_new(w_iterable, w_func, unsafe {
+        pyre_object::gc_roots::shadow_stack_get(initial_slot)
+    });
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn zip_longest_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_ZipLongest___new__: keep all positional sources as live iterators and
+    // accept only the fillvalue keyword.
+    let exact = gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE).unwrap_or(PY_NULL);
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let sources = positional.get(1..).unwrap_or(&[]);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["fillvalue"], "zip_longest")?;
+    let w_fillvalue =
+        crate::builtins::kwarg_get(kwargs, "fillvalue").unwrap_or_else(pyre_object::w_none);
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_fillvalue);
+    let fill_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let sources_base = pyre_object::gc_roots::shadow_stack_len();
+    for &source in sources {
+        pyre_object::gc_roots::pin_root(source);
+    }
+    let iterators_base = pyre_object::gc_roots::shadow_stack_len();
+    for index in 0..sources.len() {
+        let w_iterable = crate::baseobjspace::iter(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(sources_base + index)
+        })?;
+        pyre_object::gc_roots::pin_root(w_iterable);
+    }
+    let iterators = (0..sources.len())
+        .map(|index| unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_base + index) })
+        .collect();
+    let w_iterators = pyre_object::w_list_new(iterators);
+    let obj = pyre_object::interp_itertools::w_zip_longest_new(
+        w_iterators,
+        unsafe { pyre_object::gc_roots::shadow_stack_get(fill_slot) },
+        sources.len() as i64,
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
 fn init_takewhile_type(ns: PyObjectRef) {
     // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
     // entries between __next__ and __doc__).
@@ -21957,6 +22057,53 @@ fn init_starmap_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return an iterator whose values are returned from the function evaluated with an argument tuple taken from the given sequence.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_accumulate_type(ns: PyObjectRef) {
+    // interp_itertools.py W_Accumulate.typedef.  Pickle state methods remain
+    // to be ported; the iterator and constructor slots preserve the live
+    // PyPy state machine instead of materializing the input.
+    let entries = [
+        ("__new__", make_new_descr(accumulate_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new("Return series of accumulated sums (or other binary function results)."),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_zip_longest_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(zip_longest_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return a zip_longest object whose next method returns a tuple from each iterable.",
             ),
         ),
     ];

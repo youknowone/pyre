@@ -2070,6 +2070,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             interp_itertools::STARMAP_TYPE
         ),
         pytype_addr!(
+            "interp_itertools::ACCUMULATE_TYPE",
+            interp_itertools::ACCUMULATE_TYPE
+        ),
+        pytype_addr!(
+            "interp_itertools::ZIP_LONGEST_TYPE",
+            interp_itertools::ZIP_LONGEST_TYPE
+        ),
+        pytype_addr!(
             "interp_itertools::PAIRWISE_TYPE",
             interp_itertools::PAIRWISE_TYPE
         ),

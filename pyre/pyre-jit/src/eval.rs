@@ -2508,6 +2508,23 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::interp_itertools::W_StarMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_Accumulate (`itertools.accumulate`) — AUTO-ID; all four live state
+    // fields are traced edges.  Append after existing registrations so no
+    // earlier automatic GC type id moves.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Accumulate
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // W_ZipLongest (`itertools.zip_longest`) — AUTO-ID; the iterator list and
+    // fill value are traced edges.  Append at the registration tail.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_ZipLongest
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // PyPy GeneratorOrCoroutine gives GeneratorIterator and Coroutine the
     // same payload shape, but rclass requires distinct vtable hierarchy ids.
     // Host allocation stamps coroutine payloads with W_GENERATOR_GC_TYPE_ID

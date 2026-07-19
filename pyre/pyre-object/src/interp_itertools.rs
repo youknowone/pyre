@@ -409,6 +409,99 @@ pub unsafe fn is_starmap(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &STARMAP_TYPE) }
 }
 
+// ── W_Accumulate — pypy/module/itertools/interp_itertools.py:W_Accumulate ──
+//
+// PyPy keeps the live iterator, optional binary function, running total, and
+// pending initial value on the iterator object.  PY_NULL represents PyPy's
+// internal `None` sentinel for `w_func` and `w_total`; `w_initial` is the
+// Python-level value and is reset to Python None after it is yielded.
+
+#[pyre_class("itertools.accumulate", static_name = "ACCUMULATE")]
+pub struct W_Accumulate {
+    pub w_iterable: PyObjectRef,
+    pub w_func: PyObjectRef,
+    pub w_total: PyObjectRef,
+    pub w_initial: PyObjectRef,
+}
+
+pub fn w_accumulate_new(
+    w_iterable: PyObjectRef,
+    w_func: PyObjectRef,
+    w_initial: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterable);
+    if !w_func.is_null() {
+        crate::gc_roots::pin_root(w_func);
+    }
+    crate::gc_roots::pin_root(w_initial);
+    W_Accumulate::allocate(W_Accumulate {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterable,
+        w_func,
+        w_total: std::ptr::null_mut(),
+        w_initial,
+    })
+}
+
+#[inline]
+pub unsafe fn is_accumulate(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ACCUMULATE_TYPE) }
+}
+
+#[inline]
+pub unsafe fn w_accumulate_set_total(obj: PyObjectRef, w_value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_Accumulate)).w_total = w_value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
+#[inline]
+pub unsafe fn w_accumulate_set_initial(obj: PyObjectRef, w_value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_Accumulate)).w_initial = w_value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
+// ── W_ZipLongest — pypy/module/itertools/interp_itertools.py:W_ZipLongest ──
+
+#[pyre_class("itertools.zip_longest", static_name = "ZIP_LONGEST")]
+pub struct W_ZipLongest {
+    /// A Python list of live iterators; exhausted entries become Python None.
+    pub w_iterators: PyObjectRef,
+    pub w_fillvalue: PyObjectRef,
+    pub active: i64,
+}
+
+pub fn w_zip_longest_new(
+    w_iterators: PyObjectRef,
+    w_fillvalue: PyObjectRef,
+    active: i64,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterators);
+    crate::gc_roots::pin_root(w_fillvalue);
+    W_ZipLongest::allocate(W_ZipLongest {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterators,
+        w_fillvalue,
+        active,
+    })
+}
+
+#[inline]
+pub unsafe fn is_zip_longest(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ZIP_LONGEST_TYPE) }
+}
+
 // ── W_Pairwise — pypy/module/itertools/interp_itertools.py:class W_Pairwise ──
 //
 // ```python
@@ -713,6 +806,40 @@ mod tests {
         assert_eq!(
             <W_StarMap as crate::lltype::GcType>::SIZE,
             W_STARMAP_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_accumulate_gc_descriptor_traces_live_state() {
+        assert_eq!(W_ACCUMULATE_GC_PTR_OFFSETS.len(), 4);
+        assert_eq!(
+            W_ACCUMULATE_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Accumulate, w_iterable),
+                std::mem::offset_of!(W_Accumulate, w_func),
+                std::mem::offset_of!(W_Accumulate, w_total),
+                std::mem::offset_of!(W_Accumulate, w_initial),
+            ]
+        );
+        assert_eq!(
+            <W_Accumulate as crate::lltype::GcType>::SIZE,
+            W_ACCUMULATE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_zip_longest_gc_descriptor_traces_iterators_and_fillvalue() {
+        assert_eq!(W_ZIP_LONGEST_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(
+            W_ZIP_LONGEST_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_ZipLongest, w_iterators),
+                std::mem::offset_of!(W_ZipLongest, w_fillvalue),
+            ]
+        );
+        assert_eq!(
+            <W_ZipLongest as crate::lltype::GcType>::SIZE,
+            W_ZIP_LONGEST_OBJECT_SIZE
         );
     }
 

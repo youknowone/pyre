@@ -48,6 +48,12 @@ class _tee:
         self._mydeque = mydeque
     def __iter__(self):
         return self
+    def __copy__(self):
+        # W_TeeIterable.copy_w: the clone starts at this iterator's current
+        # node while sharing the same source and future buffer fan-out.
+        mydeque = collections.deque(self._mydeque)
+        self._deques.append(mydeque)
+        return _tee(self._it, self._deques, mydeque)
     def __next__(self):
         if not self._mydeque:
             newval = next(self._it)
@@ -60,6 +66,8 @@ def tee(iterable, n=2):
     if n < 0:
         raise ValueError("n must be >= 0")
     it = iter(iterable)
+    if hasattr(it, '__copy__'):
+        return tuple(it if i == 0 else it.__copy__() for i in range(n))
     deques = [collections.deque() for _ in range(n)]
     return tuple(_tee(it, deques, d) for d in deques)
 "#;
@@ -237,18 +245,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             let pool = crate::builtins::collect_iterable(args[0])?;
             let n = pool.len();
             let r = if args.len() >= 2 {
-                unsafe {
-                    if pyre_object::is_int(args[1]) {
-                        pyre_object::w_int_get_value(args[1]) as usize
-                    } else {
-                        n
+                if unsafe { pyre_object::is_none(args[1]) } {
+                    n
+                } else {
+                    let r = crate::builtins::space_index_w(args[1])?;
+                    if r < 0 {
+                        return Err(crate::PyError::value_error("r must be non-negative"));
                     }
+                    r as usize
                 }
             } else {
                 n
             };
             if r > n {
-                return Ok(pyre_object::w_list_new(vec![]));
+                let list = pyre_object::w_list_new(vec![]);
+                return Ok(pyre_object::w_seq_iter_new(list, 0));
             }
             // Heap/Lehmer would be clearer; use a recursive closure-free helper.
             fn perms(
@@ -284,13 +295,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "combinations",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_list_new(vec![]));
+                let r = crate::builtins::space_index_w(args[1])?;
+                if r < 0 {
+                    return Err(crate::PyError::value_error("r must be non-negative"));
                 }
+                let r = r as usize;
                 let pool = crate::builtins::collect_iterable(args[0])?;
-                let r = unsafe { pyre_object::w_int_get_value(args[1]) as usize };
                 if r > pool.len() {
-                    return Ok(pyre_object::w_list_new(vec![]));
+                    let list = pyre_object::w_list_new(vec![]);
+                    return Ok(pyre_object::w_seq_iter_new(list, 0));
                 }
                 fn combs(
                     pool: &[pyre_object::PyObjectRef],
@@ -429,64 +442,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(pyre_object::w_seq_iter_new(list, n))
         }),
     );
-    // zip_longest(*iterables, fillvalue=None) — interp_itertools.py
-    // W_ZipLongest. CALL_KW packs `fillvalue` into the trailing
-    // `__pyre_kw__` dict (`call.rs:727-744`); strip it before
-    // collecting the iterable pools so the kwarg doesn't surface as
-    // an extra positional pool.
+    // PyPy exports W_ZipLongest.typedef.  Construction keeps each source as a
+    // live iterator, so unbounded inputs remain lazy.
     crate::module_ns_store(
         ns,
         "zip_longest",
-        crate::make_builtin_function("zip_longest", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            // `pypy/module/itertools/interp_itertools.py:685` —
-            // W_ZipLongest's `unwrap_spec` only knows about
-            // `fillvalue`; any other keyword raises TypeError at the
-            // gateway.  Pyre's flat builtin ABI has to enforce this
-            // by hand.
-            crate::builtins::kwarg_reject_unknown(kwargs, &["fillvalue"], "zip_longest")?;
-            let fill =
-                crate::builtins::kwarg_get(kwargs, "fillvalue").unwrap_or_else(pyre_object::w_none);
-            let pools: Vec<Vec<_>> = positional
-                .iter()
-                .map(|&a| crate::builtins::collect_iterable(a))
-                .collect::<Result<_, _>>()?;
-            let max_len = pools.iter().map(|p| p.len()).max().unwrap_or(0);
-            let mut tuples = Vec::with_capacity(max_len);
-            for i in 0..max_len {
-                let row: Vec<_> = pools
-                    .iter()
-                    .map(|p| if i < p.len() { p[i] } else { fill })
-                    .collect();
-                tuples.push(pyre_object::w_tuple_new(row));
-            }
-            let n = tuples.len();
-            let list = pyre_object::w_list_new(tuples);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE)
+            .expect("itertools.zip_longest TypeDef initialized"),
     );
-    // accumulate(iterable) — sums only, PyPy interp_itertools W_Accumulate.
+    // PyPy exports the live W_Accumulate iterator TypeDef.  Its running total,
+    // optional function, and initial value stay on the object and next_w
+    // advances the source lazily.
     crate::module_ns_store(
         ns,
         "accumulate",
-        crate::make_builtin_function("accumulate", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_list_new(vec![]));
-            }
-            let items = crate::builtins::collect_iterable(args[0])?;
-            let mut out = Vec::with_capacity(items.len());
-            let mut acc: Option<pyre_object::PyObjectRef> = None;
-            for item in items {
-                acc = Some(match acc {
-                    None => item,
-                    Some(prev) => crate::baseobjspace::add(prev, item)?,
-                });
-                out.push(acc.unwrap());
-            }
-            let n = out.len();
-            let list = pyre_object::w_list_new(out);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE)
+            .expect("itertools.accumulate TypeDef initialized"),
     );
     // W_Compress.typedef is exported directly, matching PyPy's dedicated
     // live iterator rather than materializing both inputs into a list.

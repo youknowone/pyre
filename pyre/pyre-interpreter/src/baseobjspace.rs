@@ -10891,6 +10891,118 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 &rooted_args,
             );
         }
+        // itertools.accumulate — interp_itertools.py W_Accumulate.next_w.
+        // Keep the running state on the live iterator and perform the binary
+        // operation only when the next result is requested.
+        if pyre_object::interp_itertools::is_accumulate(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_initial =
+                (*(w_self as *const pyre_object::interp_itertools::W_Accumulate)).w_initial;
+            if !pyre_object::is_none(w_initial) {
+                pyre_object::interp_itertools::w_accumulate_set_total(w_self, w_initial);
+                pyre_object::interp_itertools::w_accumulate_set_initial(
+                    w_self,
+                    pyre_object::w_none(),
+                );
+                return Ok(w_initial);
+            }
+
+            let w_iterable =
+                (*(w_self as *const pyre_object::interp_itertools::W_Accumulate)).w_iterable;
+            let w_value = next(w_iterable)?;
+            pyre_object::gc_roots::pin_root(w_value);
+            let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_total = (*(w_self as *const pyre_object::interp_itertools::W_Accumulate)).w_total;
+            if w_total.is_null() {
+                let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+                pyre_object::interp_itertools::w_accumulate_set_total(w_self, w_value);
+                return Ok(w_value);
+            }
+
+            pyre_object::gc_roots::pin_root(w_total);
+            let total_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_func = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                as *const pyre_object::interp_itertools::W_Accumulate))
+                .w_func;
+            let w_total = if w_func.is_null() {
+                add(
+                    pyre_object::gc_roots::shadow_stack_get(total_slot),
+                    pyre_object::gc_roots::shadow_stack_get(value_slot),
+                )?
+            } else {
+                pyre_object::gc_roots::pin_root(w_func);
+                let func_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                crate::call::call_function_impl_result(
+                    pyre_object::gc_roots::shadow_stack_get(func_slot),
+                    &[
+                        pyre_object::gc_roots::shadow_stack_get(total_slot),
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    ],
+                )?
+            };
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            pyre_object::interp_itertools::w_accumulate_set_total(w_self, w_total);
+            return Ok(w_total);
+        }
+        // itertools.zip_longest — interp_itertools.py W_ZipLongest.next_w.
+        // Each source remains live and is advanced once per output tuple;
+        // exhausted entries are replaced by None and subsequently yield the
+        // shared fill value until the last iterator stops.
+        if pyre_object::interp_itertools::is_zip_longest(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_iterators =
+                (*(w_self as *const pyre_object::interp_itertools::W_ZipLongest)).w_iterators;
+            let count = pyre_object::w_list_len(w_iterators);
+            if count == 0 {
+                return Err(PyError::stop_iteration());
+            }
+            let mut objects = Vec::with_capacity(count);
+            for index in 0..count {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_ZipLongest);
+                let w_iter = pyre_object::w_list_getitem(state.w_iterators, index as i64)
+                    .expect("zip_longest iterator index in range");
+                let w_obj = if pyre_object::is_none(w_iter) {
+                    state.w_fillvalue
+                } else {
+                    match next(w_iter) {
+                        Ok(w_obj) => w_obj,
+                        Err(e) if e.kind == PyErrorKind::StopIteration => {
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            let state =
+                                &mut *(w_self as *mut pyre_object::interp_itertools::W_ZipLongest);
+                            state.active -= 1;
+                            if state.active <= 0 {
+                                return Err(e);
+                            }
+                            pyre_object::w_list_setitem(
+                                state.w_iterators,
+                                index as i64,
+                                pyre_object::w_none(),
+                            );
+                            state.w_fillvalue
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+                pyre_object::gc_roots::pin_root(w_obj);
+                objects.push(w_obj);
+            }
+            // Rebuild from roots because any preceding `next` may have moved
+            // the yielded objects after their raw addresses entered `objects`.
+            let objects_base = pyre_object::gc_roots::shadow_stack_len() - objects.len();
+            let rooted_objects = (0..objects.len())
+                .map(|index| pyre_object::gc_roots::shadow_stack_get(objects_base + index))
+                .collect();
+            return Ok(pyre_object::w_tuple_new(rooted_objects));
+        }
         // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
         // (reverse=False): pull from the iterator until the predicate (or
         // truthiness, when None) passes.
@@ -11114,34 +11226,71 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                 else:
         //                     raise
         if pyre_object::interp_itertools::is_chain(obj) {
-            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Chain);
+            // Keep the chain rooted and re-read it after calls into Python.
+            // Both `next` and `iter` can allocate and relocate GC objects.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             loop {
-                if it.w_it.is_null() {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let w_it = pyre_object::interp_itertools::w_chain_get_it(w_self);
+                if w_it.is_null() {
                     // `_advance`: `if self.w_iterables is None: raise
                     // StopIteration` — once the outer iterator is spent it is
                     // cleared to None and the chain stays exhausted.
-                    if it.w_iterables.is_null() {
+                    let w_iterables = pyre_object::interp_itertools::w_chain_get_iterables(w_self);
+                    if w_iterables.is_null() {
                         return Err(PyError::stop_iteration());
                     }
                     // Fetch the next source iterable and take its iterator.
                     // StopIteration from `w_iterables` means the outer
                     // iterator is exhausted — `_handle_error` sets
                     // `w_iterables = None` before re-raising.
-                    let w_iterable = match next(it.w_iterables) {
+                    let w_iterable = match next(w_iterables) {
                         Ok(w) => w,
                         Err(e) if e.kind == PyErrorKind::StopIteration => {
-                            it.w_iterables = std::ptr::null_mut();
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            pyre_object::interp_itertools::w_chain_set_iterables(
+                                w_self,
+                                std::ptr::null_mut(),
+                            );
                             return Err(e);
                         }
                         Err(e) => return Err(e),
                     };
-                    it.w_it = iter(w_iterable)?;
+                    let w_it_result = {
+                        let _iter_roots = pyre_object::gc_roots::push_roots();
+                        pyre_object::gc_roots::pin_root(w_iterable);
+                        let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))
+                    };
+                    let w_it = match w_it_result {
+                        Ok(w_it) => w_it,
+                        Err(e) => {
+                            // CPython 3.14 clears `source` when GetIter fails,
+                            // so a bad input leaves chain permanently exhausted.
+                            // PyPy currently advances to the following input;
+                            // pyre intentionally follows its target-version
+                            // public behavior here (stdlib_itertools.py).
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            pyre_object::interp_itertools::w_chain_set_iterables(
+                                w_self,
+                                std::ptr::null_mut(),
+                            );
+                            return Err(e);
+                        }
+                    };
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    pyre_object::interp_itertools::w_chain_set_it(w_self, w_it);
                 }
-                match next(it.w_it) {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let w_it = pyre_object::interp_itertools::w_chain_get_it(w_self);
+                match next(w_it) {
                     Ok(w_obj) => return Ok(w_obj),
                     Err(e) if e.kind == PyErrorKind::StopIteration => {
                         // Sub-iterator exhausted — advance to the next iterable.
-                        it.w_it = std::ptr::null_mut();
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        pyre_object::interp_itertools::w_chain_set_it(w_self, std::ptr::null_mut());
                         continue;
                     }
                     Err(e) => return Err(e),
