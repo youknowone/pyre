@@ -6960,9 +6960,21 @@ pub(crate) fn super_check(
             Err(e) => return Err(e),
         }
     }
-    Err(crate::PyError::type_error(
-        "super(type, obj): obj must be an instance or subtype of type",
-    ))
+    // typeobject.c super_init: a type obj names its own class ("type str"),
+    // otherwise the message names the instance's class ("instance of str").
+    let obj_desc = if unsafe { pyre_object::is_type(obj_or_type) } {
+        format!("type {}", unsafe { pyre_object::w_type_get_name(obj_or_type) })
+    } else {
+        let obj_type_name = crate::typedef::r#type(obj_or_type)
+            .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+            .unwrap_or("object");
+        format!("instance of {obj_type_name}")
+    };
+    let start_type_name = unsafe { pyre_object::w_type_get_name(start_type) };
+    Err(crate::PyError::type_error(format!(
+        "super(type, obj): obj ({obj_desc}) is not an instance \
+         or subtype of type ({start_type_name})."
+    )))
 }
 
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:

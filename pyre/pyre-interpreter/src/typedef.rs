@@ -15168,7 +15168,22 @@ fn init_object_type(ns: PyObjectRef) {
             "__dir__",
             make_builtin_function_with_arity(
                 "__dir__",
-                |args| crate::builtins::object_dir_default(args[0]),
+                |args| {
+                    // `object.__dir__` is a no-extra-arg method: reject a
+                    // missing receiver and any surplus positional.
+                    let Some(&receiver) = args.first() else {
+                        return Err(crate::PyError::type_error(
+                            "unbound method object.__dir__() needs an argument".to_string(),
+                        ));
+                    };
+                    if args.len() > 1 {
+                        return Err(crate::PyError::type_error(format!(
+                            "object.__dir__() takes no arguments ({} given)",
+                            args.len() - 1
+                        )));
+                    }
+                    crate::builtins::object_dir_default(receiver)
+                },
                 1,
             ),
         )
