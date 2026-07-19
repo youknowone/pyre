@@ -1651,7 +1651,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // the two-phase rtyper for `PyError.to_exc_object()` call sites.  This uses
     // the same impl-method CallPath shape as `type_error`, resolving to
     // `["PyError", "to_exc_object"]` after the crate segment is stripped.
-    let pyerror_to_exc_object: fn(&crate::PyError) -> pyre_object::PyObjectRef =
+    let pyerror_to_exc_object: fn(&mut crate::PyError) -> pyre_object::PyObjectRef =
         crate::PyError::to_exc_object;
     push_fnaddr(
         &mut entries,

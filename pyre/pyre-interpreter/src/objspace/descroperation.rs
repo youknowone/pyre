@@ -723,7 +723,7 @@ pub extern "C" fn jit_w_long_truediv_raw(a: i64, b: i64) -> f64 {
     unsafe {
         match bigint_truediv(w_long_get_value(a).clone(), w_long_get_value(b).clone()) {
             Ok(f) => f,
-            Err(e) => {
+            Err(mut e) => {
                 crate::runtime_ops::jit_publish_exception(e.to_exc_object());
                 0.0
             }

@@ -4840,7 +4840,7 @@ pub(crate) fn pyre_portal_runner(
     frame.set_last_instr_from_next_instr(next_instr);
     match portal_runner_result(frame) {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
-        Err(err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
+        Err(mut err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
             err.to_exc_object() as usize,
         ))),
     }
@@ -4943,7 +4943,7 @@ fn portal_runner_dispatch(frame: &mut PyFrame) -> PyResult {
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     match portal_runner_result(frame) {
         Ok(r) => r,
-        Err(err) => {
+        Err(mut err) => {
             crate::call_jit::store_jit_exception(err.to_exc_object() as i64);
             pyre_object::PY_NULL
         }

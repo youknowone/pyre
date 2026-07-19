@@ -89,7 +89,7 @@ pub(crate) extern "C" fn ccall_pow(x: f64, y: f64) -> f64 {
 pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
     match pyre_interpreter::float_pow_raw(x, y) {
         Ok(z) => z,
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception parity: set JIT exception
             // state so the following GuardNoException sees it and fails,
             // propagating the raise into the meta-interpreter.
@@ -169,7 +169,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
         };
         match result {
             Ok(cause) => Some(cause),
-            Err(err) => {
+            Err(mut err) => {
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
                 let exc = err.to_exc_object();
                 raise_exception_jit(exc as i64);
@@ -198,7 +198,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
                 Ok(_) => {
                     PyError::type_error("exceptions must derive from BaseException").to_exc_object()
                 }
-                Err(err) => err.to_exc_object(),
+                Err(mut err) => err.to_exc_object(),
             }
         } else {
             PyError::type_error("exceptions must derive from BaseException").to_exc_object()
@@ -207,7 +207,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
 
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
 
-    if let Err(err) = attach_raise_cause(final_exc, cause) {
+    if let Err(mut err) = attach_raise_cause(final_exc, cause) {
         final_exc = err.to_exc_object();
     }
     raise_exception_jit(final_exc as i64);

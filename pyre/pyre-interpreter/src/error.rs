@@ -692,7 +692,9 @@ impl PyError {
     }
 
     /// Convert to a W_BaseException for pushing onto the value stack.
-    /// Reuses the cached object from from_exc_object() if available.
+    /// Reuses the cached object from from_exc_object() if available, otherwise
+    /// materialises it once and memoises it into `self.exc_object` so repeat
+    /// calls return the same instance (`get_w_value` write-once, error.py:349).
     ///
     /// Mirrors `pypy/interpreter/error.py:OperationError.get_w_value`'s
     /// upgrade-to-exception-instance path: when the OperationError
@@ -703,7 +705,7 @@ impl PyError {
     /// stores `args_w` as a `W_ListObject`, so we stamp a one-element
     /// list `[msg_str]` here so `str(e)` and `repr(e)` and
     /// `e.args == (msg,)` all line up with PyPy.
-    pub fn to_exc_object(&self) -> PyObjectRef {
+    pub fn to_exc_object(&mut self) -> PyObjectRef {
         if !self.exc_object.is_null() {
             return self.exc_object;
         }
@@ -754,6 +756,10 @@ impl PyError {
                 pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, self.w_obj_context)
             };
         }
+        // Write-once memo (`get_w_value` self.w_value): cache the materialised
+        // instance so a second call returns the same object (identity `e1 is e2`)
+        // instead of a fresh allocation.
+        self.exc_object = exc;
         exc
     }
 

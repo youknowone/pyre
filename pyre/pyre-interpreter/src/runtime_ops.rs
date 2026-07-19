@@ -228,7 +228,7 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
         let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
         match func(arg_slice) {
             Ok(result) => result as i64,
-            Err(e) => {
+            Err(mut e) => {
                 jit_publish_exception(e.to_exc_object());
                 0 // garbage — GuardNoException will fire
             }
@@ -252,7 +252,7 @@ fn call_callable_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
         unsafe { std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len()) };
     match crate::call::call_function_impl_result(callable_ref, arg_slice) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             jit_publish_exception(err.to_exc_object());
             0 // garbage — GuardNoException will fire
         }
@@ -773,7 +773,7 @@ fn build_map_from_args(args: &[i64]) -> i64 {
     // residuals.
     match build_map_from_refs(&items) {
         Ok(dict) => dict as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             PY_NULL as i64
@@ -1579,7 +1579,7 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
         // StopIteration is not a frame-level exception for FOR_ITER; return
         // null so the GuardNonnull (not GuardNoException) fires.
         Err(err) if err.kind == PyErrorKind::StopIteration => 0,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
@@ -1597,7 +1597,7 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
 pub extern "C" fn jit_get_iter(iterable: i64) -> i64 {
     match crate::baseobjspace::iter(iterable as PyObjectRef) {
         Ok(iterator) => iterator as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));

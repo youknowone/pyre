@@ -539,7 +539,7 @@ extern "C" fn jit_call_user_function_from_frame(
     // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
     match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             // llmodel.py:194-199 _store_exception: write the exception
             // to the backend's `_exception_emulator` tp/val cells. The
             // matching GUARD_NO_EXCEPTION in the trace then reads
@@ -859,7 +859,7 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     frame.set_last_instr_from_next_instr(next_instr);
     match crate::eval::portal_runner_result(frame) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE
                 .with(|c| c.set(err.to_exc_object() as i64));
             pyre_object::PY_NULL as i64
@@ -1253,7 +1253,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 extern "C" fn dynasm_stack_check_slowpath_for_backend(current: usize) -> u8 {
     let result = pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend(current);
     if result != 0 {
-        if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        if let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
             majit_backend_dynasm::jit_exc_raise(exc.to_exc_object() as i64);
         }
     }
@@ -1550,7 +1550,7 @@ fn jit_blackhole_resume_from_guard(
         let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
         return match crate::eval::portal_runner_result(frame) {
             Ok(result) => Some(result as i64),
-            Err(err) => {
+            Err(mut err) => {
                 let exc_obj = err.to_exc_object();
                 if exc_obj != pyre_object::PY_NULL {
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
@@ -2342,7 +2342,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             Some(f.to_bits() as i64)
         }
         // warmspot.py:998-1005: ExitFrameWithExceptionRef → raise value.
-        BlackholeResult::ExitFrameWithExceptionRef(err) => {
+        BlackholeResult::ExitFrameWithExceptionRef(mut err) => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → raise");
             }
@@ -2407,7 +2407,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             crate::eval::correct_resume_vsd(frame, next_instr);
             match crate::eval::portal_runner_result(frame) {
                 Ok(result) => Some(result as i64),
-                Err(err) => {
+                Err(mut err) => {
                     let exc_obj = err.to_exc_object();
                     if exc_obj != pyre_object::PY_NULL {
                         majit_metainterp::blackhole::BH_LAST_EXC_VALUE
@@ -4009,7 +4009,7 @@ fn bh_call_self_recursive_portal(
     jit_drop_callee_frame(frame_ptr);
     Some(match result {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -4248,7 +4248,7 @@ fn bh_call_kw_impl(
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -4351,7 +4351,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
          execution context before any residual call"
     );
     if pyre_object::gc_roots::shadow_stack_get(root_base).is_null() {
-        let err = pyre_interpreter::PyError::new(
+        let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
             "call on null callable".to_string(),
         );
@@ -4375,7 +4375,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             return match func(&call_args) {
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
-                Err(err) => {
+                Err(mut err) => {
                     publish_residual_call_exception(err.to_exc_object() as i64);
                     0
                 }
@@ -4406,7 +4406,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
         return match result {
             Ok(result) => result as i64,
-            Err(err) => {
+            Err(mut err) => {
                 publish_residual_call_exception(err.to_exc_object() as i64);
                 0
             }
@@ -4432,7 +4432,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -4484,7 +4484,7 @@ pub extern "C" fn bh_call_function_ex_fn(
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -4555,7 +4555,7 @@ pub extern "C" fn bh_load_global_fn(
         match pyre_interpreter::baseobjspace::finditem_str(w_globals, varname) {
             Ok(Some(w_value)) => return w_value as i64,
             Ok(None) => {}
-            Err(err) => {
+            Err(mut err) => {
                 let exc_obj = err.to_exc_object();
                 publish_residual_call_exception(exc_obj as i64);
                 return 0;
@@ -4574,7 +4574,7 @@ pub extern "C" fn bh_load_global_fn(
                 match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
                     Ok(Some(w_value)) => return w_value as i64,
                     Ok(None) => {}
-                    Err(err) => {
+                    Err(mut err) => {
                         let exc_obj = err.to_exc_object();
                         publish_residual_call_exception(exc_obj as i64);
                         return 0;
@@ -4585,7 +4585,7 @@ pub extern "C" fn bh_load_global_fn(
     }
 
     // pyopcode.py:970 `_load_global_failed`: raise NameError.
-    let err = pyre_interpreter::PyError::new(
+    let mut err = pyre_interpreter::PyError::new(
         pyre_interpreter::PyErrorKind::NameError,
         format!("name '{}' is not defined", varname),
     );
@@ -4647,7 +4647,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
         }
     }
 
-    let err = pyre_interpreter::PyError::name_error_with_name(
+    let mut err = pyre_interpreter::PyError::name_error_with_name(
         format!("name '{varname}' is not defined"),
         varname,
     );
@@ -4682,7 +4682,7 @@ pub extern "C" fn bh_getattr_fn(obj: i64, w_name: i64) -> i64 {
     let res = pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name);
     match res {
         Ok(w_value) => w_value as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             0
@@ -4721,7 +4721,7 @@ pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i
     let name = code.names[idx].as_ref();
     match pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name) {
         Ok(attr) => attr as i64,
-        Err(err) => {
+        Err(mut err) => {
             // Publish the raise into BOTH the blackhole `BH_LAST_EXC_VALUE` and
             // the backend `_store_exception` cells (`publish_residual_call_exception`).
             // The LOAD_ATTR residual runs under the blackhole interpreter AND
@@ -4758,7 +4758,7 @@ pub extern "C" fn bh_store_attr_fn(obj: i64, value: i64, w_code_ptr: i64, name_i
         return 0;
     }
     let name = code.names[idx].as_ref();
-    if let Err(err) = pyre_interpreter::baseobjspace::setattr_str(
+    if let Err(mut err) = pyre_interpreter::baseobjspace::setattr_str(
         obj as pyre_object::PyObjectRef,
         name,
         value as pyre_object::PyObjectRef,
@@ -4791,7 +4791,7 @@ pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) ->
         return 0;
     }
     let name = code.names[idx].as_ref();
-    if let Err(err) =
+    if let Err(mut err) =
         pyre_interpreter::baseobjspace::delattr_str(obj as pyre_object::PyObjectRef, name)
     {
         let exc_obj = err.to_exc_object();
@@ -4837,7 +4837,7 @@ pub extern "C" fn bh_import_name_fn(
         // result.  A null frame cannot honour that, so fail closed by
         // publishing an exception for the trailing `GuardNoException`
         // instead of returning a bare 0 the guard would accept.
-        let err = pyre_interpreter::PyError::new(
+        let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::SystemError,
             "IMPORT_NAME residual received a null frame",
         );
@@ -4851,7 +4851,7 @@ pub extern "C" fn bh_import_name_fn(
         level as pyre_object::PyObjectRef,
     ) {
         Ok(module) => module as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -4887,7 +4887,7 @@ pub extern "C" fn bh_import_from_fn(module: i64, w_code_ptr: i64, name_idx: i64)
     let ec = pyre_interpreter::call::getexecutioncontext();
     match pyre_interpreter::importing::import_from(module as pyre_object::PyObjectRef, name, ec) {
         Ok(attr) => attr as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -4929,7 +4929,7 @@ pub extern "C" fn bh_load_super_attr_fn(
     );
     match pyre_interpreter::baseobjspace::getattr_str(proxy, name) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -4973,7 +4973,7 @@ pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
         stop as pyre_object::PyObjectRef,
     ) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -4991,7 +4991,7 @@ pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
 /// `bh_delete_subscr_fn`.
 pub extern "C" fn bh_store_slice_fn(obj: i64, start: i64, stop: i64, value: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::runtime_ops::store_slice_values(
+    if let Err(mut err) = pyre_interpreter::runtime_ops::store_slice_values(
         obj as pyre_object::PyObjectRef,
         start as pyre_object::PyObjectRef,
         stop as pyre_object::PyObjectRef,
@@ -5011,7 +5011,7 @@ pub extern "C" fn bh_store_slice_fn(obj: i64, start: i64, stop: i64, value: i64)
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
 /// `bh_store_subscr_fn`.
 pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::baseobjspace::delitem(
+    if let Err(mut err) = pyre_interpreter::baseobjspace::delitem(
         obj as pyre_object::PyObjectRef,
         index as pyre_object::PyObjectRef,
     ) {
@@ -5030,7 +5030,7 @@ pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
 /// exception is published through `BH_LAST_EXC_VALUE` for the trailing
 /// `GuardNoException`, matching `bh_delete_subscr_fn`.
 pub extern "C" fn bh_list_extend_fn(list: i64, iterable: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::opcode_ops::list_extend_value(
+    if let Err(mut err) = pyre_interpreter::opcode_ops::list_extend_value(
         list as pyre_object::PyObjectRef,
         iterable as pyre_object::PyObjectRef,
     ) {
@@ -5045,7 +5045,7 @@ pub extern "C" fn bh_list_extend_fn(list: i64, iterable: i64) -> i64 {
 /// `opcode_ops::set_add_value`; `set` is peeked and mutated in place.
 /// A user `__hash__`/`__eq__` can run Python (`MayForce`).  Void result.
 pub extern "C" fn bh_set_add_fn(set: i64, value: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::opcode_ops::set_add_value(
+    if let Err(mut err) = pyre_interpreter::opcode_ops::set_add_value(
         set as pyre_object::PyObjectRef,
         value as pyre_object::PyObjectRef,
     ) {
@@ -5059,7 +5059,7 @@ pub extern "C" fn bh_set_add_fn(set: i64, value: i64) -> i64 {
 /// `opcode_ops::set_update_value`; `set` is peeked and mutated in place.
 /// A user iterator / `__hash__` can run Python (`MayForce`).  Void result.
 pub extern "C" fn bh_set_update_fn(set: i64, iterable: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::opcode_ops::set_update_value(
+    if let Err(mut err) = pyre_interpreter::opcode_ops::set_update_value(
         set as pyre_object::PyObjectRef,
         iterable as pyre_object::PyObjectRef,
     ) {
@@ -5074,7 +5074,7 @@ pub extern "C" fn bh_set_update_fn(set: i64, iterable: i64) -> i64 {
 /// place.  A `keys()`/`__getitem__`/`__hash__` can run Python
 /// (`MayForce`).  Void result.
 pub extern "C" fn bh_dict_update_fn(dict: i64, source: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::opcode_ops::dict_update_value(
+    if let Err(mut err) = pyre_interpreter::opcode_ops::dict_update_value(
         dict as pyre_object::PyObjectRef,
         source as pyre_object::PyObjectRef,
     ) {
@@ -5088,7 +5088,7 @@ pub extern "C" fn bh_dict_update_fn(dict: i64, source: i64) -> i64 {
 /// `dict` is peeked and mutated in place.  A user key `__hash__`/`__eq__`
 /// can run Python (`MayForce`).  Void result.
 pub extern "C" fn bh_map_add_fn(dict: i64, key: i64, value: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::opcode_ops::map_add_value(
+    if let Err(mut err) = pyre_interpreter::opcode_ops::map_add_value(
         dict as pyre_object::PyObjectRef,
         key as pyre_object::PyObjectRef,
         value as pyre_object::PyObjectRef,
@@ -5105,7 +5105,7 @@ pub extern "C" fn bh_map_add_fn(dict: i64, key: i64, value: i64) -> i64 {
 /// prefixes.  A `keys()`/`__getitem__`/`__hash__` can run Python
 /// (`MayForce`).  Void result.
 pub extern "C" fn bh_dict_merge_fn(dict: i64, source: i64, w_callable: i64) -> i64 {
-    if let Err(err) = pyre_interpreter::opcode_ops::dict_merge_value(
+    if let Err(mut err) = pyre_interpreter::opcode_ops::dict_merge_value(
         dict as pyre_object::PyObjectRef,
         source as pyre_object::PyObjectRef,
         w_callable as pyre_object::PyObjectRef,
@@ -5173,7 +5173,7 @@ pub extern "C" fn bh_load_special_fn(obj: i64, method_kind: i64) -> i64 {
     }
     match pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name) {
         Ok(attr) => attr as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -5219,7 +5219,7 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
         unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.load_name_checked_value(name, namei as usize) {
         Ok(w_value) => w_value as i64,
-        Err(err) => {
+        Err(mut err) => {
             // Publish into BOTH the blackhole `BH_LAST_EXC_VALUE` and the
             // backend `_store_exception` cells: LOAD_NAME lowers into the
             // full-body-walk compiled trace (a handler-bearing body skips the
@@ -5255,7 +5255,7 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
         unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
-        Err(err) => {
+        Err(mut err) => {
             // Publish into both exception cells: STORE_NAME lowers into the
             // full-body-walk compiled trace, whose `GUARD_NO_EXCEPTION` reads
             // the backend `_store_exception` cells; writing only
@@ -5289,7 +5289,7 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
         unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.store_global_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
-        Err(err) => {
+        Err(mut err) => {
             // Publish into both exception cells, matching the STORE_NAME arm.
             // `store_global_value` is infallible today (this arm is dead), but
             // STORE_GLOBAL lowers into the compiled trace with a following
@@ -5380,7 +5380,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
         };
         match result {
             Ok(cause) => Some(cause),
-            Err(err) => {
+            Err(mut err) => {
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
                 return err.to_exc_object() as i64;
             }
@@ -5404,7 +5404,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
                     "exceptions must derive from BaseException",
                 )
                 .to_exc_object(),
-                Err(err) => err.to_exc_object(),
+                Err(mut err) => err.to_exc_object(),
             }
         } else {
             pyre_interpreter::PyError::type_error("exceptions must derive from BaseException")
@@ -5414,7 +5414,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
 
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
 
-    if let Err(err) = pyre_interpreter::eval::attach_raise_cause(final_exc, cause) {
+    if let Err(mut err) = pyre_interpreter::eval::attach_raise_cause(final_exc, cause) {
         final_exc = err.to_exc_object();
     }
     final_exc as i64
@@ -5428,7 +5428,7 @@ pub extern "C" fn bh_truth_fn(value: i64) -> i64 {
     }
     match pyre_interpreter::opcode_ops::truth_value(obj) {
         Ok(truth) => truth as i64,
-        Err(err) => {
+        Err(mut err) => {
             // A raising `__bool__` / `__len__` publishes for the trailing
             // GuardNoException, then returns 0.
             publish_residual_call_exception(err.to_exc_object() as i64);
@@ -5445,7 +5445,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     let lhs = lhs as PyObjectRef;
     let rhs = rhs as PyObjectRef;
     if lhs.is_null() || rhs.is_null() {
-        let err = pyre_interpreter::PyError::new(
+        let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
             "comparison on null operand".to_string(),
         );
@@ -5470,7 +5470,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         // `check_exc_match_against`, so the residual path must too — `except 5:`
         // (or a tuple with a non-exception member) raises instead of silently
         // producing a bool.
-        if let Err(err) = pyre_interpreter::eval::validate_check_exc_match_class(rhs) {
+        if let Err(mut err) = pyre_interpreter::eval::validate_check_exc_match_class(rhs) {
             publish_residual_call_exception(err.to_exc_object() as i64);
             return 0;
         }
@@ -5487,7 +5487,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
                 let result = if op_code == 7 { !found } else { found };
                 return pyre_object::w_bool_from(result) as i64;
             }
-            Err(err) => {
+            Err(mut err) => {
                 let exc_obj = err.to_exc_object();
                 publish_residual_call_exception(exc_obj as i64);
                 return 0;
@@ -5506,7 +5506,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
     // ComparisonOperator discriminant. Reverse the mapping to get the enum.
     let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {
-        let err = pyre_interpreter::PyError::new(
+        let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
             format!("unknown compare op tag {op_code}"),
         );
@@ -5515,7 +5515,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     };
     match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5534,7 +5534,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // op_code is the compact tag from binary_op_tag (0-12), NOT the raw
     // BinaryOperator discriminant. Reverse the mapping to get the enum.
     let Some(op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_code) else {
-        let err = pyre_interpreter::PyError::new(
+        let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
             format!("unknown binary op tag {op_code}"),
         );
@@ -5543,7 +5543,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     };
     match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5600,7 +5600,7 @@ pub extern "C" fn bh_build_map_from_array(array: i64) -> i64 {
     }
     match pyre_interpreter::runtime_ops::build_map_from_refs(&items) {
         Ok(dict) => dict as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5623,7 +5623,7 @@ pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
     }
     match pyre_interpreter::runtime_ops::build_set_from_refs(&items) {
         Ok(set) => set as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5659,7 +5659,7 @@ pub extern "C" fn bh_format_simple_fn(value: i64) -> i64 {
         pyre_object::PY_NULL,
     ) {
         Ok(s) => s as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5676,7 +5676,7 @@ pub extern "C" fn bh_format_simple_fn(value: i64) -> i64 {
 pub extern "C" fn bh_convert_value_fn(value: i64, conv: i64) -> i64 {
     match pyre_interpreter::runtime_ops::convert_value(value as pyre_object::PyObjectRef, conv) {
         Ok(s) => s as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5696,7 +5696,7 @@ pub extern "C" fn bh_format_with_spec_fn(value: i64, spec: i64) -> i64 {
         spec as pyre_object::PyObjectRef,
     ) {
         Ok(s) => s as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5779,7 +5779,7 @@ pub extern "C" fn bh_make_cell_fn(current: i64) -> i64 {
 pub extern "C" fn bh_unary_negative_fn(value: i64) -> i64 {
     match pyre_interpreter::opcode_ops::unary_negative_value(value as pyre_object::PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5794,7 +5794,7 @@ pub extern "C" fn bh_unary_negative_fn(value: i64) -> i64 {
 pub extern "C" fn bh_get_iter_fn(obj: i64) -> i64 {
     match pyre_interpreter::baseobjspace::iter(obj as pyre_object::PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -5809,7 +5809,7 @@ pub extern "C" fn bh_get_iter_fn(obj: i64) -> i64 {
 pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
     match pyre_interpreter::opcode_ops::unary_invert_value(value as pyre_object::PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5825,7 +5825,7 @@ pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
 pub extern "C" fn bh_unary_positive_fn(value: i64) -> i64 {
     match pyre_interpreter::opcode_ops::unary_positive_value(value as pyre_object::PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             let exc_obj = err.to_exc_object();
             publish_residual_call_exception(exc_obj as i64);
             0
@@ -5842,7 +5842,7 @@ pub extern "C" fn bh_unary_positive_fn(value: i64) -> i64 {
 pub extern "C" fn bh_list_to_tuple_fn(value: i64) -> i64 {
     match pyre_interpreter::opcode_ops::list_to_tuple_value(value as pyre_object::PyObjectRef) {
         Ok(result) => result as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -5872,7 +5872,7 @@ pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> i64 {
 pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
     match pyre_interpreter::opcode_ops::truth_value(value as pyre_object::PyObjectRef) {
         Ok(truth) => pyre_object::w_bool_from(!truth) as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -5977,7 +5977,7 @@ pub extern "C" fn bh_unpack_sequence_fn(count: i64, seq: i64) -> i64 {
     let seq = seq as pyre_object::PyObjectRef;
     match pyre_interpreter::runtime_ops::unpack_sequence_exact(seq, count as usize) {
         Ok(items) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
@@ -5990,7 +5990,7 @@ pub extern "C" fn bh_unpack_item_fn(index: i64, seq: i64) -> i64 {
     let seq = seq as pyre_object::PyObjectRef;
     match pyre_interpreter::runtime_ops::sequence_getitem(seq, index as usize) {
         Ok(item) => item as i64,
-        Err(err) => {
+        Err(mut err) => {
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE
                 .with(|c| c.set(err.to_exc_object() as i64));
             0
@@ -6008,7 +6008,7 @@ pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: i64) -> i64 {
     let seq = seq as pyre_object::PyObjectRef;
     match pyre_interpreter::runtime_ops::unpack_ex_slots(before as usize, after as usize, seq) {
         Ok(slots) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&slots) as i64,
-        Err(err) => {
+        Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }

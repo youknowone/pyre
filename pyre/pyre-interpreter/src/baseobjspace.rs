@@ -11975,7 +11975,7 @@ fn resume_yield_from(
 /// iterator has no `throw` method.
 fn throw_yield_from(
     w_yf: PyObjectRef,
-    err: PyError,
+    mut err: PyError,
     throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> PyResult {
     unsafe {
@@ -12083,7 +12083,7 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
 /// cause suppresses the context in display, mirroring
 /// `chain_exceptions_from_cause`).  This is distinct from a normal generator
 /// return, which surfaces through the `Ok`/`frame_finished_execution` path.
-unsafe fn leak_stopiteration(e: PyError) -> PyError {
+unsafe fn leak_stopiteration(mut e: PyError) -> PyError {
     use pyre_object::interp_exceptions::*;
     let w_stopiter = e.to_exc_object();
     let rt = w_exception_new(ExcKind::RuntimeError, "generator raised StopIteration");

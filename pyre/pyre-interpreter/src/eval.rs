@@ -4367,7 +4367,7 @@ mod tests {
             );
         }
 
-        let err = raise_frame
+        let mut err = raise_frame
             .execute_frame(None, None)
             .expect_err("raise from should fail");
         assert_eq!(err.to_exc_object(), exc);
@@ -4375,6 +4375,24 @@ mod tests {
             crate::getattr_str(exc, "__cause__").expect("read cause"),
             cause
         );
+    }
+
+    #[test]
+    fn test_to_exc_object_memoizes_lazy_exception() {
+        // Bring up the managed heap / builtin exception types by running a
+        // real frame first; `to_exc_object()` allocates the instance.
+        let _ = run_exec_frame("pass");
+        // A raw-message NameError is lazy: `exc_object` stays null until the
+        // first `to_exc_object()` materialises it. The write-once memo
+        // (`get_w_value`, error.py:349) must then return that same instance on
+        // every later call instead of allocating a fresh one.
+        let mut err = PyError::name_error_with_name("name 'x' is not defined", "x");
+        assert!(err.exc_object.is_null(), "raw-message error starts lazy");
+        let first = err.to_exc_object();
+        assert!(!first.is_null());
+        assert_eq!(err.exc_object, first, "materialised instance is memoised");
+        let second = err.to_exc_object();
+        assert_eq!(first, second, "second call returns the memoised instance");
     }
 
     #[test]
