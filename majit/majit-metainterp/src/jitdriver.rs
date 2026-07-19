@@ -3076,9 +3076,17 @@ impl<S: JitState> JitDriver<S> {
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
             // guard failure resumes via blackhole — isolates bridge-record
             // resume defects from the blackhole path.
+            let bridge_needs_materialization =
+                exit_layout.storage.as_deref().is_some_and(|storage| {
+                    !storage.rd_virtuals.is_empty() || !storage.rd_pendingfields.is_empty()
+                });
+            if bridge_needs_materialization {
+                self.meta.record_declined_bridge_guard(&descr_arc);
+            }
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled();
+                && !no_bridge_enabled()
+                && !bridge_needs_materialization;
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -4823,6 +4831,18 @@ impl<S: JitState> JitDriver<S> {
             majit_metainterp::mc_diag_bump(15); // sbt early: no compiled_meta
             return false;
         };
+
+        if self
+            .meta
+            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+            .and_then(|layout| layout.storage)
+            .is_some_and(|storage| {
+                !storage.rd_virtuals.is_empty() || !storage.rd_pendingfields.is_empty()
+            })
+        {
+            // resume.py:983-1006: bridge materialization prologue is required before attaching this guard.
+            return false;
+        }
 
         if !state.can_trace() {
             majit_metainterp::mc_diag_bump(16); // sbt early: !can_trace
