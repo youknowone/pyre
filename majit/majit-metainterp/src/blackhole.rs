@@ -7060,13 +7060,34 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // a ref base); intbase (`id`/`iid`/`ird`) forms have no canonical byte
     // and are not emitted here.  Additive: every byte is currently unwired.
     for (key, byte) in [
-        ("getfield_gc_i/rd>i", majit_translate::insns::BC_GETFIELD_GC_I),
-        ("getfield_gc_r/rd>r", majit_translate::insns::BC_GETFIELD_GC_R),
-        ("getfield_gc_f/rd>f", majit_translate::insns::BC_GETFIELD_GC_F),
-        ("setfield_gc_i/rid", majit_translate::insns::BC_SETFIELD_GC_I),
-        ("setfield_gc_i/rcd", majit_translate::insns::BC_SETFIELD_GC_I_C),
-        ("setfield_gc_r/rrd", majit_translate::insns::BC_SETFIELD_GC_R),
-        ("setfield_gc_f/rfd", majit_translate::insns::BC_SETFIELD_GC_F),
+        (
+            "getfield_gc_i/rd>i",
+            majit_translate::insns::BC_GETFIELD_GC_I,
+        ),
+        (
+            "getfield_gc_r/rd>r",
+            majit_translate::insns::BC_GETFIELD_GC_R,
+        ),
+        (
+            "getfield_gc_f/rd>f",
+            majit_translate::insns::BC_GETFIELD_GC_F,
+        ),
+        (
+            "setfield_gc_i/rid",
+            majit_translate::insns::BC_SETFIELD_GC_I,
+        ),
+        (
+            "setfield_gc_i/rcd",
+            majit_translate::insns::BC_SETFIELD_GC_I_C,
+        ),
+        (
+            "setfield_gc_r/rrd",
+            majit_translate::insns::BC_SETFIELD_GC_R,
+        ),
+        (
+            "setfield_gc_f/rfd",
+            majit_translate::insns::BC_SETFIELD_GC_F,
+        ),
         (
             "getfield_gc_i_pure/rd>i",
             majit_translate::insns::BC_GETFIELD_GC_I_PURE,

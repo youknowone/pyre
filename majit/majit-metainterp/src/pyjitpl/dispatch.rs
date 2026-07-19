@@ -1809,7 +1809,11 @@ where
         sym: &mut S,
     ) -> TraceAction {
         let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-        let resume_pc = self.frames.current_mut().pc;
+        // `code_cursor` is post-call and points at this CALL_ASSEMBLER's
+        // trailing `-live-` marker. `MIFrame::pc` is only the saved resume
+        // position and stays 0 in an inline sub-frame, so do not use it for
+        // this after-residual-call snapshot.
+        let resume_pc = self.frames.current_mut().code_cursor;
 
         if exc == 0 {
             self.record_state_guard(
