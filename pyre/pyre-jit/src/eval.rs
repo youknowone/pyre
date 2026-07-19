@@ -332,6 +332,15 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
+    // epic S5) for a mortal heap type; forward the field slot so a major GC greys
+    // the box, and the box tid's drop glue reclaims the buffer on sweep. An
+    // immortal type's `malloc_raw` name is not collector-owned, so the guard
+    // skips it.
+    if !t.name.is_null() && pyre_object::gc_hook::try_gc_owns_object(t.name as *mut u8) {
+        let name_slot = std::ptr::addr_of_mut!(t.name);
+        f(name_slot as *mut majit_ir::GcRef);
+    }
     if !t.mro_w.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8) {
             // GC-owned type-9 block: forward the `mro_w` field slot; the
@@ -359,17 +368,15 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
-/// Reclaim the two Rust-owned, out-of-line containers of a swept heap type.
-/// `mro_w` is a GC-managed `FixedObjectArray` reclaimed by the collector and
-/// must not be freed here. The managed namespace object is also reclaimed by
-/// the collector, while the shared/uncertain `terminator` ownership remains
-/// deferred by #528.
+/// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
+/// heap type. `name` is a GC-managed leaf storage box (`NameStorage`, off-GC
+/// storage epic S5) reclaimed by its own box tid's drop glue — freeing it here
+/// too would double-free a box swept before its owner. `mro_w` is a GC-managed
+/// `FixedObjectArray` reclaimed by the collector and must not be freed here. The
+/// managed namespace object is also reclaimed by the collector, while the
+/// shared/uncertain `terminator` ownership remains deferred by #528.
 unsafe fn type_object_destructor(obj_addr: usize) {
     let t = obj_addr as *const pyre_object::typeobject::W_TypeObject;
-    let name = unsafe { (*t).name };
-    if !name.is_null() {
-        drop(unsafe { Box::from_raw(name) });
-    }
     let weak_subclasses = unsafe { (*t).weak_subclasses };
     if !weak_subclasses.is_null() {
         drop(unsafe { Box::from_raw(weak_subclasses) });
@@ -498,12 +505,6 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
-}
-
-/// Reclaim the off-GC name string of a swept function object.
-unsafe fn function_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_interpreter::function::function_dealloc_name(obj) };
 }
 
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
@@ -1430,21 +1431,22 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         builtin_code_tid,
     );
     // Function carries inline `PyObjectRef` fields (code / closure /
-    // defs_w / w_kw_defs / w_module / cached metadata) that the
-    // collector must walk — `object_subclass_with_gc_ptrs` records
-    // the offsets so mark traversal reaches them. `BUILTIN_FUNCTION_TYPE`
-    // is a separate static `PyType` for module-level builtins
-    // (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
+    // defs_w / w_kw_defs / w_module / cached metadata) plus its `name`
+    // GC-managed storage box that the collector must walk —
+    // `object_subclass_with_gc_ptrs` records the offsets (including
+    // `FUNCTION_NAME_OFFSET`) so mark traversal reaches them.
+    // `BUILTIN_FUNCTION_TYPE` is a separate static `PyType` for module-level
+    // builtins (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
-    // both PyTypes to `function_tid`.
-    let function_tid = gc.register_type(
-        TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_interpreter::function::Function>(),
-            object_tid,
-            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-        )
-        .with_destructor_fn(function_object_destructor),
-    );
+    // both PyTypes to `function_tid`. No `.with_destructor_fn`: a mortal
+    // function's `name` box is reclaimed by its own tid's drop glue (off-GC
+    // storage epic S5); a holder destructor would double-free a box swept before
+    // its owner.
+    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        std::mem::size_of::<pyre_interpreter::function::Function>(),
+        object_tid,
+        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+    ));
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2905,6 +2907,18 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             pyre_object::unicodeobject::UnicodeValueStorage,
         >,
         pyre_object::unicodeobject::set_unicode_value_gc_type_id,
+    );
+    // Mortal `name` string storage box shared by heap `W_TypeObject` and user
+    // `Function` (off-GC storage epic S5). A leaf `String` (no inner refs); the
+    // type's `type_object_custom_trace` name-slot greying and the function's
+    // `FUNCTION_NAME_OFFSET` gc-pointer edge grey it, and the box tid's drop glue
+    // reclaims the buffer on sweep. Only mortal holders box their name; immortal
+    // builtin types/functions keep a `malloc_raw` name. Keep this id at the
+    // absolute registration tail.
+    register_leaf_storage_box::<pyre_object::typeobject::NameStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::typeobject::NameStorage>,
+        pyre_object::typeobject::set_name_storage_gc_type_id,
     );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids

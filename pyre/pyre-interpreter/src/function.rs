@@ -253,15 +253,22 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// Function.code? — an immutable GC reference traced as part of the
 /// closure / defs_w / w_kw_defs / w_module set.
 ///
-/// The remaining fields are non-GC: `can_change_code` is a `bool` and
-/// `name` is a manually-managed `*const String`.
+/// `can_change_code` is a `bool` and thus non-GC. `name` points at a
+/// GC-managed leaf storage box (`NameStorage`, off-GC storage epic S5) for a
+/// mortal (user, `PyCode`) function, so its slot is forwarded here; the box tid's
+/// drop glue reclaims it on sweep. An immortal builtin function's `malloc_raw`
+/// name is not collector-owned, so the walker's `is_managed_heap_object` guard
+/// skips that edge (the same immortal-holder skip as W_UnicodeObject's `value`).
 ///
 /// `ob.w_class` is intentionally absent, mirroring how W_IntObject /
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 16] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 17] = [
     FUNCTION_CODE_OFFSET,
+    // `name` — GC-managed `NameStorage` box for a mortal function (skipped by the
+    // walker's managed-object guard for an immortal builtin's `malloc_raw` name).
+    FUNCTION_NAME_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
     FUNCTION_W_KW_DEFS_OFFSET,
@@ -306,19 +313,6 @@ impl pyre_object::lltype::GcType for Function {
         FUNCTION_GC_TYPE_ID
     }
     const SIZE: usize = FUNCTION_OBJECT_SIZE;
-}
-
-/// Free the off-GC name string owned by a `Function`.
-///
-/// # Safety
-/// `obj` must point at a valid `Function` whose `name` Box is not aliased by
-/// another owner.
-pub unsafe fn function_dealloc_name(obj: PyObjectRef) {
-    let raw = unsafe { &mut *(obj as *mut Function) };
-    if !raw.name.is_null() {
-        unsafe { drop(Box::from_raw(raw.name as *mut String)) };
-        raw.name = std::ptr::null();
-    }
 }
 
 /// Allocate a new `Function`.
@@ -418,7 +412,24 @@ pub(crate) fn function_new_impl(
     let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(globals_slot);
     let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
 
-    let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
+    // A `BuiltinCode`-backed function is a permanent, immortal slot (see the
+    // `malloc_typed` rationale below); its name must stay a `malloc_raw` string
+    // because an immortal holder is never greyed and so could never keep an
+    // old-gen box alive. A user (`PyCode`) function is GC-managed and boxes its
+    // name in a GC-managed storage box (`NameStorage`) greyed through the
+    // `FUNCTION_NAME_OFFSET` gc-pointer edge; the box tid's drop glue reclaims it
+    // on sweep. The non-collecting old-gen alloc cannot sweep this box before it
+    // is stored into the Function below.
+    let is_builtin =
+        !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
+    let name_ptr = if is_builtin {
+        pyre_object::lltype::malloc_raw(name) as *const String
+    } else {
+        pyre_object::gc_storage::gc_alloc_storage_box(
+            name,
+            pyre_object::typeobject::name_storage_gc_type_id(),
+        ) as *const String
+    };
     let function = Function {
         ob: PyObject {
             ob_type: ob_type as *const PyType,
@@ -455,9 +466,8 @@ pub(crate) fn function_new_impl(
     // method functions of a builtin type built lazily at runtime (weakref, …)
     // after the GC hook is wired. Startup builtin functions are already immortal
     // (no hook installed yet); this extends that to runtime-created ones. User
-    // functions (`PyCode`) stay GC-managed.
-    let is_builtin =
-        !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
+    // functions (`PyCode`) stay GC-managed. `is_builtin` was computed above to
+    // gate the name allocation on the same mortality split.
     if !is_builtin {
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             FUNCTION_GC_TYPE_ID,
@@ -1408,18 +1418,29 @@ pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
 }
 
 /// PyPy-compatible `__name__` setter.
+///
+/// A GC-managed (user) function boxes the new name in a GC-managed storage box
+/// (`NameStorage`), reclaimed by the box tid's drop glue and greyed through the
+/// `FUNCTION_NAME_OFFSET` edge; an immortal function keeps a `malloc_raw` name
+/// (an immortal holder can never grey an old-gen box). The old name slot is not
+/// freed here — a GC box is reclaimed on sweep once it becomes unreachable, and
+/// an immortal `malloc_raw` name was never collector-freed — so the box tid's
+/// drop glue stays the sole reclaimer.
 #[inline]
 pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
     unsafe {
         if !pyre_object::is_str(name) {
             return;
         }
-        let name = pyre_object::w_str_get_value(name);
-        let name = pyre_object::lltype::malloc_raw(name.to_string()) as *const String;
-        let old = (*(obj as *mut Function)).name;
-        if !old.is_null() {
-            drop(Box::from_raw(old as *mut String));
-        }
+        let name = pyre_object::w_str_get_value(name).to_string();
+        let name = if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+            pyre_object::gc_storage::gc_alloc_storage_box(
+                name,
+                pyre_object::typeobject::name_storage_gc_type_id(),
+            ) as *const String
+        } else {
+            pyre_object::lltype::malloc_raw(name) as *const String
+        };
         (*(obj as *mut Function)).name = name;
     }
 }
@@ -2811,6 +2832,7 @@ mod tests {
             FUNCTION_GC_PTR_OFFSETS,
             [
                 std::mem::offset_of!(Function, code),
+                std::mem::offset_of!(Function, name),
                 std::mem::offset_of!(Function, closure),
                 std::mem::offset_of!(Function, defs_w),
                 std::mem::offset_of!(Function, w_kw_defs),

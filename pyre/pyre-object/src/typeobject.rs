@@ -233,6 +233,37 @@ impl crate::lltype::GcType for W_TypeObject {
     const SIZE: usize = W_TYPE_OBJECT_SIZE;
 }
 
+/// Byte offset of the `name: *mut String` slot within `W_TypeObject`.
+pub const W_TYPE_NAME_OFFSET: usize = std::mem::offset_of!(W_TypeObject, name);
+
+/// GC-managed name-string box shared by `W_TypeObject` and `Function`, whose
+/// `name` fields are both `String` behind a raw pointer.
+///
+/// A leaf (`String` = heap `Vec<u8>`, no inner `PyObjectRef`); its GC box
+/// carries only drop glue that reclaims the buffer on sweep. Only *mortal*
+/// holders box their name — a heap type (`w_type_new`) and a user function
+/// (`PyCode`-backed `function_new_impl`). Immortal holders (builtin types and
+/// builtin functions) keep a `malloc_raw` name, because an immortal holder is
+/// never greyed and so could never keep an old-gen box alive. Mirrors
+/// [`crate::unicodeobject::UnicodeValueStorage`] and the `longobject` bigint box.
+pub type NameStorage = String;
+
+/// Runtime-assigned GC type id for [`NameStorage`]. Published by
+/// `pyre-jit::eval` after the fixed-constant type registrations; never embedded
+/// in a JIT allocation descriptor.
+static NAME_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for [`NameStorage`].
+pub fn set_name_storage_gc_type_id(id: u32) {
+    NAME_STORAGE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for [`NameStorage`].
+#[majit_macros::dont_look_inside]
+pub fn name_storage_gc_type_id() -> u32 {
+    NAME_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Leak a Layout to get a 'static pointer for sharing.
 pub fn leak_layout(layout: Layout) -> *const Layout {
     crate::lltype::malloc_raw(layout)
@@ -272,16 +303,25 @@ pub fn snapshot_builtin_type_roots() -> Vec<usize> {
 /// Layout is set to null initially; caller must set it via set_layout
 /// after running create_all_slots / setup_builtin_type.
 pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObjectRef {
-    let name = crate::lltype::malloc_raw(name.to_string());
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(bases);
     crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
-    // The stable allocation may collect the nursery, so install the forwarded
-    // bases and managed namespace addresses rather than the pre-collection
-    // arguments.
+    // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
+    // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
+    // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
+    // snapshot tools) keeps a `malloc_raw` name that an immortal holder can never
+    // grey — the non-collecting old-gen alloc above cannot sweep this box before
+    // it is stored into the type below.
+    let name = if raw.is_null() {
+        crate::lltype::malloc_raw(name.to_string())
+    } else {
+        crate::gc_storage::gc_alloc_storage_box(name.to_string(), name_storage_gc_type_id())
+    };
+    // Install the forwarded bases and managed namespace addresses rather than the
+    // pre-collection arguments (the pins survive any collection the alloc forces).
     let bases = crate::gc_roots::shadow_stack_get(save_point);
     let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
     let value = W_TypeObject {

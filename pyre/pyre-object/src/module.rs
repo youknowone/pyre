@@ -145,13 +145,19 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
 
 /// Replace the module name (`module.py:24` re-seeding).  Used by
 /// `module.__init__(name, doc)` after `module.__new__` allocates an
-/// anonymous module.  The previous (immortal) name string is leaked.
+/// anonymous module.  A Module holder is immortal (`malloc_typed`, never
+/// swept), so its `name` stays a `malloc_raw` box that no collector reclaims;
+/// free the previous box before installing the new one to avoid leaking it.
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &str) {
     let module = &mut *(obj as *mut Module);
+    let old = module.name;
     module.name = crate::lltype::malloc_raw(name.to_string());
+    if !old.is_null() {
+        drop(Box::from_raw(old));
+    }
 }
 
 /// Get the aliased `W_DictObject` (`PY_NULL` when storage-only).

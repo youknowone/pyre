@@ -744,3 +744,75 @@ assert result == 1428, result
         "str subclass value gc stress program failed",
     );
 }
+
+/// A mortal (user) `Function`'s `name` string and a heap `W_TypeObject`'s `name`
+/// string are GC-managed leaf storage boxes shared under one `NameStorage` tid
+/// (off-GC storage epic S5): the function's `FUNCTION_NAME_OFFSET` gc-pointer
+/// edge and the type's `type_object_custom_trace` name-slot greying keep the box
+/// live, and the box tid's drop glue is the sole reclaimer. Regression for the
+/// migration off `function_object_destructor` / the type destructor's name-free:
+/// a function/type reachable only through a list must keep its name across
+/// collections (UAF on `__name__` read-back if swept early), the `__name__`
+/// setter must rebox on a mortal holder, and per-round dead functions/types must
+/// be reclaimed without a double-free.
+///
+/// `fns` and `types` are reachable only through lists; each function's name is
+/// reassigned via the setter. The checksum reads every `__name__` back after
+/// 100 collections, so it is reachable only if every name box survived.
+#[test]
+fn function_type_name_survives_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def make_funcs():
+    fns = []
+    i = 0
+    while i < 10:
+        def f():
+            return 1
+        f.__name__ = "renamed"
+        fns.append(f)
+        i = i + 1
+    return fns
+
+def make_types():
+    types = []
+    i = 0
+    while i < 10:
+        class C:
+            pass
+        types.append(C)
+        i = i + 1
+    return types
+
+def run():
+    fns = make_funcs()
+    types = make_types()
+
+    n = 0
+    while n < 100:
+        def junk():
+            return 0
+        class Junk:
+            pass
+        gc.collect()
+        n = n + 1
+
+    total = 0
+    i = 0
+    while i < 10:
+        total = total + len(fns[i].__name__)
+        total = total + len(types[i].__name__)
+        i = i + 1
+    return total
+
+result = run()
+assert result == 80, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<function_type_name_gc_stress>",
+        "function/type name survival checks",
+        "function/type name gc stress program failed",
+    );
+}
