@@ -975,7 +975,15 @@ impl BlackholeResult {
             BlackholeResult::DoneWithThisFrameFloat(f) => {
                 Some(Ok(pyre_object::floatobject::w_float_new(*f) as PyObjectRef))
             }
-            // warmspot.py:998-1005: raise the exception
+            // warmspot.py:998-1005: raise the exception. The clone is forced by
+            // the `&self` borrow; the source `err` stays in the caller's
+            // `bh_result`, which is dropped without ever being propagated or
+            // traceback-recorded (PyError has no Drop), so this returned clone is
+            // the only copy that unwinds. That single-propagating-copy invariant
+            // is load-bearing: `record_application_traceback` prepends a frame
+            // node unconditionally (no per-(frame,lasti) dedup), so driving a
+            // second copy that shares this `exc_object` onward would double-append
+            // the same node. Keep the source copy dead — do not propagate both.
             BlackholeResult::ExitFrameWithExceptionRef(err) => Some(Err(err.clone())),
             _ => None,
         }
