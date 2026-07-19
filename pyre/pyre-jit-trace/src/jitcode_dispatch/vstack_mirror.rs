@@ -261,26 +261,36 @@ pub(crate) fn reconcile_vstack_at_boundary(
         return;
     };
     let class = classify_vstack_opcode(&instr, op_arg);
-    // #389(b): the py3.14 inlined comprehension emits a
-    // `SWAP`/`BUILD_LIST`/`SWAP` preamble before its `FOR_ITER`, which the
-    // codewriter lowers NON-MONOTONICALLY in jitcode — the JitCode-PC floor
-    // pivot maps a later jit_pc back to an EARLIER py_pc, so the walk re-visits
-    // those preamble py_pcs OUT OF ORDER (a backward py transition, then a
-    // forward re-walk of the just-visited py_pcs).  A `SWAP`/`COPY` never
-    // branches, so a backward py transition whose PREDECESSOR is a permutation
-    // op is unambiguously this lowering artifact, not real re-execution (a
-    // genuine loop back-edge leaves a `JUMP`/branch as the predecessor, class
-    // `PopOnlyOrSideStore`).  In the region the per-op replay is WRONG: it
-    // re-applies the `SWAP` effect and reuses a stale `vstack_last_ref`,
-    // dropping the just-built list from the mirror.  Reseed the whole mirror
-    // from the authoritative virtualizable shadow (kept current by the portal
-    // `setarrayitem_vable_r` pushes) instead, until the walk advances PAST the
-    // py_pc it backed off from (py order monotonic again).
-    if matches!(class, VstackOpClass::Swap(_) | VstackOpClass::Copy(_))
-        && (new_pypc as usize) < prev_pypc
-        && ctx.vstack_reorder_ceiling == u32::MAX
-    {
-        ctx.vstack_reorder_ceiling = prev_pypc as u32;
+    // RPython's MIFrame follows one flow-graph link at a time; the target
+    // block receives its register state from that link's inputargs
+    // (pyjitpl.py:2371-2387 `interpret` / `run_one_step`).  The full-body
+    // walk instead traverses flattened JitCode whose layout can switch to a
+    // different source block without the Python PCs forming a CFG edge.  Do
+    // not replay the previous Python opcode across such a layout switch: its
+    // `vstack_last_ref` belongs to the other block.  Doing so at the two arms
+    // of a conditional expression overwrote the loop-carried FOR_ITER slot
+    // with the selected local, and a later branch guard serialized that
+    // foreign box into the virtualizable resume image.
+    //
+    // Enter a shadow-reseed region until the walk passes both endpoints of
+    // the out-of-order transition.  This subsumes the former SWAP/COPY-only
+    // detection for non-monotonic comprehension lowering and applies the
+    // same block-input rule to ordinary conditional-expression arms.
+    let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, prev_pypc);
+    use pyre_interpreter::Instruction;
+    let has_fallthrough = !matches!(
+        instr,
+        Instruction::JumpForward { .. }
+            | Instruction::JumpBackward { .. }
+            | Instruction::JumpBackwardNoInterrupt { .. }
+            | Instruction::ReturnValue
+            | Instruction::Reraise { .. }
+            | Instruction::RaiseVarargs { .. }
+    );
+    let cfg_successor = (has_fallthrough && new_pypc as usize == fallthrough)
+        || crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) == Some(new_pypc as usize);
+    if !cfg_successor && ctx.vstack_reorder_ceiling == u32::MAX {
+        ctx.vstack_reorder_ceiling = (new_pypc as usize).max(prev_pypc) as u32;
     }
     let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
     let (fallthrough_depth, branch_depth) =
