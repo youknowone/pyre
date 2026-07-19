@@ -477,16 +477,27 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
-/// Reclaim the off-GC byte buffer of a swept bytes object.
-unsafe fn bytes_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::bytesobject::w_bytes_dealloc(obj) };
+/// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
+/// box (`Vec<u8>`, no inner refs, off-GC storage epic S4). Forward the field
+/// slot so a major GC greys the box; the box tid's own drop glue reclaims the
+/// buffer on sweep. A no-GC-hook fallback allocation is not collector-owned, so
+/// the guard skips it.
+unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let bytes = unsafe { &mut *(obj_addr as *mut pyre_object::bytesobject::W_BytesObject) };
+    if !bytes.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(bytes.data as *mut u8) {
+        let data_slot = std::ptr::addr_of_mut!(bytes.data);
+        f(data_slot as *mut majit_ir::GcRef);
+    }
 }
 
-/// Reclaim the off-GC byte buffer of a swept bytearray object.
-unsafe fn bytearray_object_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_object::bytearrayobject::w_bytearray_dealloc(obj) };
+/// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
+/// `W_BytesObject` (off-GC storage epic S4).
+unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
+    if !ba.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(ba.data as *mut u8) {
+        let data_slot = std::ptr::addr_of_mut!(ba.data);
+        f(data_slot as *mut majit_ir::GcRef);
+    }
 }
 
 /// Reclaim the off-GC name string of a swept function object.
@@ -1548,18 +1559,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut pytype_to_tid,
         <pyre_object::typedef::W_MemberDescr as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // W_BytesObject (immutable byte sequence) carries a raw
-    // `*const Vec<u8>` (`data`) and a `usize` length, neither a
-    // `PyObjectRef`. Pre-registered with `object_subclass(size, ...)`
-    // so the foreign-pytype loop's `sizeof(PyObject)` approximation
-    // does not under-count the payload.
-    let w_bytes_tid = gc.register_type(
-        TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
-            object_tid,
-        )
-        .with_destructor_fn(bytes_object_destructor),
-    );
+    // W_BytesObject (immutable byte sequence) carries `data`, a `*const Vec<u8>`
+    // GC-managed storage box (off-GC storage epic S4). The custom trace forwards
+    // that field slot so the box stays live; no `.with_destructor_fn` — the box
+    // tid's drop glue is the sole reclaimer, exactly as the set-items box owns
+    // its reclamation. A sweep-time bytes destructor would put two reclaimers on
+    // the destructor list and double-free a box swept before its owner.
+    let w_bytes_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
+        object_tid,
+        bytes_object_custom_trace,
+    ));
     debug_assert_eq!(w_bytes_tid, W_BYTES_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1570,16 +1580,13 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_object::bytesobject::BYTES_TYPE as *const _ as usize,
         w_bytes_tid,
     );
-    // W_BytearrayObject (mutable byte sequence) carries a raw
-    // `*mut Vec<u8>` (`data`). Same registration shape as
-    // W_BytesObject.
-    let w_bytearray_tid = gc.register_type(
-        TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
-            object_tid,
-        )
-        .with_destructor_fn(bytearray_object_destructor),
-    );
+    // W_BytearrayObject (mutable byte sequence) carries `data`, a `*mut Vec<u8>`
+    // GC-managed storage box. Same registration shape as W_BytesObject.
+    let w_bytearray_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
+        object_tid,
+        bytearray_object_custom_trace,
+    ));
     debug_assert_eq!(w_bytearray_tid, W_BYTEARRAY_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2869,6 +2876,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
+    );
+    // bytes / bytearray `data` storage box (off-GC storage epic S4). A leaf
+    // `Vec<u8>` (no inner refs) shared by both types; `bytes_object_custom_trace`
+    // / `bytearray_object_custom_trace` grey it through the `data` field slot and
+    // the box tid's drop glue reclaims the buffer on sweep. Keep this id at the
+    // absolute registration tail.
+    register_leaf_storage_box::<pyre_object::bytesobject::BytesDataStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
+        pyre_object::bytesobject::set_bytes_data_gc_type_id,
     );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids

@@ -31,43 +31,64 @@ impl crate::lltype::GcType for W_BytearrayObject {
     const SIZE: usize = W_BYTEARRAY_OBJECT_SIZE;
 }
 
-/// Free the off-GC byte buffer owned by a `W_BytearrayObject`.
+/// Allocate a new bytearray from an owned byte buffer.
 ///
-/// # Safety
-/// `obj` must point at a valid `W_BytearrayObject` whose `data` Box is not
-/// aliased by another owner.
-pub unsafe fn w_bytearray_dealloc(obj: PyObjectRef) {
-    let raw = unsafe { &mut *(obj as *mut W_BytearrayObject) };
-    if !raw.data.is_null() {
-        unsafe { drop(Box::from_raw(raw.data)) };
-        raw.data = std::ptr::null_mut();
+/// The `data` buffer lives in a GC-managed non-moving storage box (reusing the
+/// shared `bytes` data box tid — identical `Vec<u8>` type); the sweep reclaims
+/// it through the box tid's drop glue. The `W_BytearrayObject` body is allocated
+/// in GC old-gen (`try_gc_alloc_stable_raw`) so the collector traces through it
+/// and greys the box, mirroring `w_list_new`/`w_set_new`. Falls back to
+/// `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
+///
+/// Not a residual boundary itself: its only callers are the two
+/// `dont_look_inside` public constructors below, so the tracer never reaches it
+/// (the `Vec<u8>`-by-value argument never crosses a residual call ABI).
+fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
+    let data =
+        crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
+    let header = PyObject {
+        ob_type: &BYTEARRAY_TYPE as *const PyType,
+        w_class: get_instantiate(&BYTEARRAY_TYPE),
+    };
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
+    if !raw.is_null() {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_BytearrayObject,
+                W_BytearrayObject {
+                    ob_header: header,
+                    data,
+                    exports: 0,
+                },
+            );
+        }
+        raw as PyObjectRef
+    } else {
+        crate::lltype::malloc_typed(W_BytearrayObject {
+            ob_header: header,
+            data,
+            exports: 0,
+        }) as PyObjectRef
     }
 }
 
 /// Allocate a new bytearray filled with zeros.
+///
+/// `dont_look_inside` (`rlib/jit.py:139`): the GC-managed box allocation is not
+/// phaseA-liftable, so the JIT residualises the call, matching the
+/// `w_bytes_from_bytes` residual boundary.
+#[majit_macros::dont_look_inside]
 pub fn w_bytearray_new(size: usize) -> PyObjectRef {
-    let data = crate::lltype::malloc_raw(vec![0u8; size]);
-    crate::lltype::malloc_typed(W_BytearrayObject {
-        ob_header: PyObject {
-            ob_type: &BYTEARRAY_TYPE as *const PyType,
-            w_class: get_instantiate(&BYTEARRAY_TYPE),
-        },
-        data,
-        exports: 0,
-    }) as PyObjectRef
+    w_bytearray_alloc(vec![0u8; size])
 }
 
 /// Allocate a new bytearray from a byte slice.
+///
+/// `dont_look_inside` (`rlib/jit.py:139`): see [`w_bytearray_new`].
+#[majit_macros::dont_look_inside]
 pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
-    let data = crate::lltype::malloc_raw(bytes.to_vec());
-    crate::lltype::malloc_typed(W_BytearrayObject {
-        ob_header: PyObject {
-            ob_type: &BYTEARRAY_TYPE as *const PyType,
-            w_class: get_instantiate(&BYTEARRAY_TYPE),
-        },
-        data,
-        exports: 0,
-    }) as PyObjectRef
+    w_bytearray_alloc(bytes.to_vec())
 }
 
 pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {

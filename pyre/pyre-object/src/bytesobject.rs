@@ -9,11 +9,34 @@ use crate::pyobject::*;
 
 pub static BYTES_TYPE: PyType = crate::pyobject::new_pytype("bytes");
 
+/// GC-managed byte buffer shared by `bytes` and `bytearray` bodies.
+///
+/// The `Vec<u8>` is a leaf (no inner `PyObjectRef`s); its GC box carries only
+/// drop glue that reclaims the buffer on sweep.
+pub type BytesDataStorage = Vec<u8>;
+
+/// Runtime-assigned GC type id for [`BytesDataStorage`]. Like the set-items
+/// box, this is published by `pyre-jit::eval` after the fixed-constant type
+/// registrations and is never embedded in a JIT allocation descriptor.
+static BYTES_DATA_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for [`BytesDataStorage`].
+pub fn set_bytes_data_gc_type_id(id: u32) {
+    BYTES_DATA_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for [`BytesDataStorage`].
+#[majit_macros::dont_look_inside]
+pub fn bytes_data_gc_type_id() -> u32 {
+    BYTES_DATA_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Python bytes object — immutable byte sequence.
 ///
 /// PyPy: W_BytesObject stores `_value` (RPython string).
-/// pyre: stores a heap-allocated `Vec<u8>` behind a raw pointer,
-/// same layout as W_BytearrayObject but without setitem/extend.
+/// pyre: stores a heap-allocated `Vec<u8>` in a GC-managed non-moving storage
+/// box (off-GC storage epic S4), same layout as W_BytearrayObject but without
+/// setitem/extend.
 #[repr(C)]
 pub struct W_BytesObject {
     pub ob_header: PyObject,
@@ -40,40 +63,46 @@ impl crate::lltype::GcType for W_BytesObject {
     const SIZE: usize = W_BYTES_OBJECT_SIZE;
 }
 
-/// Free the off-GC byte buffer owned by a `W_BytesObject`.
-///
-/// # Safety
-/// `obj` must point at a valid `W_BytesObject` whose `data` Box is not
-/// aliased by another owner.
-pub unsafe fn w_bytes_dealloc(obj: PyObjectRef) {
-    let raw = unsafe { &mut *(obj as *mut W_BytesObject) };
-    if !raw.data.is_null() {
-        unsafe { drop(Box::from_raw(raw.data as *mut Vec<u8>)) };
-        raw.data = std::ptr::null();
-    }
-}
-
 /// Allocate a new bytes object from a byte slice.
 ///
-/// Allocates the `W_BytesObject` via `malloc_typed` (`NewWithVtable`) which
-/// the tracer cannot model; the JIT residualises the call instead of tracing
-/// into it (`@dont_look_inside`, `rlib/jit.py:139`).
+/// The `data` buffer lives in a GC-managed non-moving storage box; the sweep
+/// reclaims it through the box tid's drop glue. The `W_BytesObject` body is
+/// allocated in GC old-gen (`try_gc_alloc_stable_raw`) so the collector traces
+/// through it and greys the box, mirroring `w_list_new`/`w_set_new`. Falls back
+/// to `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
+///
+/// `dont_look_inside` (`rlib/jit.py:139`): the tracer cannot model the box
+/// allocation, so the JIT residualises the call.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let len = bytes.len();
-    // The `data` Vec lives on the raw heap (manually freed elsewhere),
-    // so it is allocated through `malloc_raw`. The W_BytesObject itself
-    // is GC-managed via `malloc_typed`.
-    let data = crate::lltype::malloc_raw(bytes.to_vec());
-    crate::lltype::malloc_typed(W_BytesObject {
-        ob_header: PyObject {
-            ob_type: &BYTES_TYPE as *const PyType,
-            w_class: get_instantiate(&BYTES_TYPE),
-        },
-        data,
-        len,
-        ctypes_keepalive_refs: 0,
-    }) as PyObjectRef
+    let data = crate::gc_storage::gc_alloc_storage_box(bytes.to_vec(), bytes_data_gc_type_id());
+    let header = PyObject {
+        ob_type: &BYTES_TYPE as *const PyType,
+        w_class: get_instantiate(&BYTES_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
+    if !raw.is_null() {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_BytesObject,
+                W_BytesObject {
+                    ob_header: header,
+                    data,
+                    len,
+                    ctypes_keepalive_refs: 0,
+                },
+            );
+        }
+        raw as PyObjectRef
+    } else {
+        crate::lltype::malloc_typed(W_BytesObject {
+            ob_header: header,
+            data,
+            len,
+            ctypes_keepalive_refs: 0,
+        }) as PyObjectRef
+    }
 }
 
 /// Allocate an empty bytes object.

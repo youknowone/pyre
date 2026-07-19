@@ -553,15 +553,29 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_remove_root",
         pyre_object::gc_hook::try_gc_remove_root as *const (),
     );
-    // #346: four direct `malloc_typed` (`NewWithVtable`) roots residualised
-    // via `#[dont_look_inside]`; each binds both the qualified module path and
-    // the glob-re-exported root alias. `function_new_impl` lives in this crate
-    // so it binds through `crate::`.
+    // #346: direct allocation roots residualised via `#[dont_look_inside]`;
+    // each binds both the qualified module path and the glob-re-exported root
+    // alias. `function_new_impl` lives in this crate so it binds through
+    // `crate::`. The bytes/bytearray constructors allocate a GC-managed storage
+    // box (off-GC storage epic S4) that is not phaseA-liftable, so they
+    // residualise like the `malloc_typed` (`NewWithVtable`) roots below.
     push_alias_pair(
         &mut entries,
         "pyre_object::bytesobject::w_bytes_from_bytes",
         "pyre_object::w_bytes_from_bytes",
         pyre_object::bytesobject::w_bytes_from_bytes as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::bytearrayobject::w_bytearray_new",
+        "pyre_object::w_bytearray_new",
+        pyre_object::bytearrayobject::w_bytearray_new as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::bytearrayobject::w_bytearray_from_bytes",
+        "pyre_object::w_bytearray_from_bytes",
+        pyre_object::bytearrayobject::w_bytearray_from_bytes as *const (),
     );
     push_alias_pair(
         &mut entries,

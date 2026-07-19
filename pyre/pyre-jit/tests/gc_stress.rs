@@ -624,3 +624,69 @@ assert result == 300, result
         "generator leaked-StopIteration gc stress program failed",
     );
 }
+
+/// A `bytes` / `bytearray` object's `data` buffer is a GC-managed leaf storage
+/// box (off-GC storage epic S4): `bytes_object_custom_trace` /
+/// `bytearray_object_custom_trace` grey it through the `data` field slot, and
+/// the box tid's drop glue reclaims it on sweep. Regression for two failure
+/// modes the migration off `malloc_typed`-immortal holders could introduce: a
+/// buffer swept while its still-live object is reachable only through a list
+/// (UAF on read-back), and a per-round dead throwaway whose buffer leaks or is
+/// double-freed. `bytearray` extension after the collections re-derives the box
+/// pointer, proving the box survived and stayed writable.
+///
+/// `blobs` (bytes reachable only through a list), `ba` (a live bytearray grown
+/// after the collections), and `pieces` (bytearray fragments held only through a
+/// list) must all survive the 100 collections; each round allocates fresh dead
+/// bytes/bytearray garbage. The returned checksum is reachable only if every
+/// live buffer survived intact.
+#[test]
+fn bytes_bytearray_buffers_survive_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def run():
+    blobs = []
+    i = 0
+    while i < 12:
+        blobs.append(b"abcde")
+        i = i + 1
+
+    ba = bytearray(b"seed")
+    pieces = []
+    i = 0
+    while i < 8:
+        pieces.append(bytearray(b"xy"))
+        i = i + 1
+
+    n = 0
+    while n < 100:
+        junk = b"garbage" * 4
+        tmp = bytearray(b"throwaway") * 3
+        gc.collect()
+        n = n + 1
+
+    ba.extend(b"-grown")
+
+    total = 0
+    i = 0
+    while i < 12:
+        total = total + len(blobs[i]) + blobs[i][0]
+        i = i + 1
+    i = 0
+    while i < 8:
+        total = total + len(pieces[i]) + pieces[i][0]
+        i = i + 1
+    total = total + len(ba) + ba[0]
+    return total
+
+result = run()
+assert result == 2325, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<bytes_bytearray_gc_stress>",
+        "bytes/bytearray buffer survival checks",
+        "bytes/bytearray gc stress program failed",
+    );
+}
