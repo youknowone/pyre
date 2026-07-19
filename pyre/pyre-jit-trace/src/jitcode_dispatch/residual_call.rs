@@ -3047,7 +3047,22 @@ pub(crate) fn dispatch_residual_call_iIRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                // The mixed int/ref residual-call shape must use the same
+                // exception-region resume as the one-ref shape above.  In
+                // particular, UNPACK_SEQUENCE and UNPACK_EX pass their arity
+                // as Int arguments and the sequence as a Ref argument.  If
+                // their validation raises after a guard failure, resume at the
+                // call's own catch so the enclosing handler sees the error;
+                // the generic fallthrough may already be outside the covered
+                // exception-table range.
+                walker_capture_snapshot_for_last_guard_scoped(
+                    ctx,
+                    op.pc,
+                    GuardCaptureScope {
+                        residual_call_catch_resume: true,
+                        ..GuardCaptureScope::default()
+                    },
+                )?;
             }
         }
 

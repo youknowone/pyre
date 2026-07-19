@@ -9784,6 +9784,43 @@ impl CodeWriter {
                             let tuple_value = tuple_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // This opcode lowers to more than one residual call,
+                            // but only the validator can raise for a validated
+                            // built-in sequence.  Its trailing `-live-` must be
+                            // immediately followed by `catch_exception`: a
+                            // specialization guard can resume at this call and
+                            // discover a different runtime arity.  Split the
+                            // successful continuation before emitting the item
+                            // reads so blackhole exception dispatch sees the
+                            // validator's own exception edge.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception!(catch_label);
+                                exception_edge_handled = true;
+
+                                // Carry the normalized tuple across the graph
+                                // edge as a temporary FrameState value.  It is
+                                // not part of the Python operand stack, so remove
+                                // it again as soon as the continuation starts.
+                                current_state.stack.push(tuple_value.clone());
+                                let mut next_state = current_state.clone();
+                                next_state.next_offset = py_pc;
+                                next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                let next_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(next_state.clone()),
+                                );
+                                all_walker_blocks.push(next_block.clone());
+                                next_block.block().borrow_mut().inputargs =
+                                    next_state.getvariables();
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &next_state, next_block.block()),
+                                );
+                                restore_canraise_exit_order(&current_block.block());
+                                current_block = next_block;
+                                current_state = next_state;
+                                current_state.stack.pop();
+                            }
                             // Push the items in reverse so the stack top is item[0]
                             // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
                             for k in (0..n).rev() {
@@ -11140,6 +11177,35 @@ impl CodeWriter {
                             let tuple_value = tuple_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // Keep the raising validator's exception edge
+                            // adjacent to its trailing `-live-`; the item-reader
+                            // residuals belong to the successful continuation.
+                            // This is the starred-unpack sibling of the
+                            // UNPACK_SEQUENCE split above.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception!(catch_label);
+                                exception_edge_handled = true;
+
+                                current_state.stack.push(tuple_value.clone());
+                                let mut next_state = current_state.clone();
+                                next_state.next_offset = py_pc;
+                                next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                let next_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(next_state.clone()),
+                                );
+                                all_walker_blocks.push(next_block.clone());
+                                next_block.block().borrow_mut().inputargs =
+                                    next_state.getvariables();
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &next_state, next_block.block()),
+                                );
+                                restore_canraise_exit_order(&current_block.block());
+                                current_block = next_block;
+                                current_state = next_state;
+                                current_state.stack.pop();
+                            }
                             // Push the slots in reverse so the stack top is
                             // slot[0] (unpack_ex pushes head items last).
                             for k in (0..total).rev() {
