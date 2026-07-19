@@ -1091,6 +1091,13 @@ where
             // marker that `get_list_of_active_boxes` (frame.rs:628) reads.
             // The snapshot's liveness decode REQUIRES this to be a JitCode
             // PC; using an interpreter PC underflows `pc - SIZE_LIVE_OP`.
+            // For an `after_residual_call` guard
+            // (`finish_residual_call_exception_path`) `resume_pc` is instead
+            // the post-call `code_cursor` itself: it already points AT that
+            // residual call's trailing LIVE marker, so the snapshot reads it
+            // directly (frame.rs:846-849) WITHOUT the `- SIZE_LIVE_OP`
+            // step-back. `MIFrame::pc` (the saved resume position) stays 0 in
+            // an inline sub-frame, so it must not be used here.
             self.frames.frames[top_idx].pc = resume_pc;
             // RPython only swaps the top frame pc before
             // `capture_resumedata`; it never writes portal state into an
@@ -1748,10 +1755,11 @@ where
         // GUARD_ALWAYS_FAILS) `after_residual_call=True` so the snapshot
         // walks `frame.pc` directly instead of stepping back to the
         // preceding LIVE marker (frame.rs:626-630 / pyjitpl.py:194-198).
-        // `resumepc=-1` (the default for these guards) keeps `frame.pc`
-        // unchanged — pyre's current `frame.pc` is already past the
-        // residual_call's bytecode operands.
-        let resume_pc = self.frames.current_mut().pc;
+        // `next_u*()` advances `code_cursor`; unlike RPython's single `pc`,
+        // `MIFrame::pc` is only the saved resume position.  Capture the
+        // post-call bytecode cursor so the snapshot reads the trailing
+        // `-live-` marker for this residual call.
+        let resume_pc = self.frames.current_mut().code_cursor;
 
         if exc == 0 {
             self.record_state_guard(
