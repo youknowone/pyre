@@ -42,33 +42,15 @@ pub const TAGINT: u8 = 1;
 pub const TAGBOX: u8 = 2;
 pub const TAGVIRTUAL: u8 = 3;
 
-/// After-residual-call marker folded into a snapshot frame's pc word.
+/// Snapshot frame pc words now carry the published resume coordinate directly.
 ///
-/// The same Python PC serves two resume semantics: a normal guard at a
-/// `residual_call` opcode re-executes from the call start
-/// (`pc_map[pc]`), while an after-residual-call guard (`GUARD_EXCEPTION`
-/// / `GUARD_NO_EXCEPTION` / `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS`)
-/// must resume at the call's own post-call `-live-`/`catch_exception`
-/// (`PyJitCode.after_residual_call_resume_pc`).  RPython keeps
-/// `frame.pc` at the post-call jitcode position
-/// (`pyjitpl.py:2610-2624 capture_resumedata(resumepc=-1)`); pyre stores
-/// the Python PC and translates at decode time, so this high bit on the
-/// rd_numb pc word carries the distinction without a format change.
-///
-/// Stealing bit 14 narrows the storable Python PC from `append_int`'s
-/// full `i16` range down to `[0, 1 << 14)`: a pc `>= 1 << 14` sets bit 14
-/// on its own and `decode_resume_pc` would mis-read it as marked.
-/// RPython has no such cap at this layer — it stores the JitCode pc
-/// directly (`pyjitpl.py:2610-2624`), needing no marker bit.  This is a
-/// PRE-EXISTING-ADAPTATION of pyre's pc_map indirection (resume.rs:259-263
-/// stores the Python PC, not the jitcode offset); the convergence path is
-/// to store the jitcode pc directly and drop both pc_map and this marker.
-/// Until then every resume pc is bounds-checked against this constant at
-/// capture — marked pcs through `encode_after_residual_call_pc`, unmarked
-/// pcs at their `build_framestack_snapshot` / `capture_resumedata` sites —
-/// so an out-of-range pc fails loudly at trace time instead of corrupting
-/// decode at resume time.
-pub const AFTER_RESIDUAL_CALL_PC_FLAG: i32 = 1 << 14;
+/// RPython stores the JitCode pc in `frame.pc`
+/// (`pyjitpl.py:2610-2624 capture_resumedata(resumepc=-1)`).  Pyre now matches
+/// that shape for published resume data: the pc word is a genuine JitCode byte
+/// offset, and after-residual-call guards carry their post-call
+/// `-live-`/`catch_exception` coordinate through the companion `jitcode_pc`
+/// field where needed.  No high-bit marker is reserved in the pc word; offsets
+/// whose natural value has bit 14 set must remain unchanged.
 
 /// Sentinel for a snapshot frame's `jitcode_pc` word: no direct JitCode
 /// resume coordinate. Such a frame is unrepresentable and must decline before
@@ -108,29 +90,6 @@ pub const fn decode_branch_orgpc(word: i32) -> Option<(usize, bool)> {
         Some((v >> 1, (v & 1) == 1))
     } else {
         None
-    }
-}
-
-/// Fold the after-residual-call marker into a snapshot frame pc word.
-/// `pc` must be a non-negative Python PC `< AFTER_RESIDUAL_CALL_PC_FLAG`.
-/// The bound is enforced in release builds, not only under `debug_assert`,
-/// because a stored pc `>= 1 << 14` is silently mis-decoded as marked.
-pub fn encode_after_residual_call_pc(pc: i32) -> i32 {
-    assert!(
-        pc >= 0 && pc < AFTER_RESIDUAL_CALL_PC_FLAG,
-        "after-residual-call pc {pc} out of range for marker bit"
-    );
-    pc | AFTER_RESIDUAL_CALL_PC_FLAG
-}
-
-/// Split a snapshot frame pc word into `(python_pc, after_residual_call)`.
-/// A negative word (sentinel / invalid pc) passes through unflagged so the
-/// existing `pc < 0` guards keep rejecting it.
-pub fn decode_resume_pc(raw_pc: i32) -> (i32, bool) {
-    if raw_pc >= 0 && raw_pc & AFTER_RESIDUAL_CALL_PC_FLAG != 0 {
-        (raw_pc & !AFTER_RESIDUAL_CALL_PC_FLAG, true)
-    } else {
-        (raw_pc, false)
     }
 }
 
@@ -569,53 +528,6 @@ pub fn rebuild_from_numbering(
         });
     }
     (num_failargs, vable_values, vref_values, frames)
-}
-
-#[cfg(test)]
-mod after_residual_call_pc_tests {
-    use super::{AFTER_RESIDUAL_CALL_PC_FLAG, decode_resume_pc, encode_after_residual_call_pc};
-
-    #[test]
-    fn marker_roundtrips_in_range() {
-        // Every Python PC below the marker bit round-trips intact as a
-        // marked resume pc.
-        for pc in [0, 1, 100, AFTER_RESIDUAL_CALL_PC_FLAG - 1] {
-            let encoded = encode_after_residual_call_pc(pc);
-            assert_eq!(decode_resume_pc(encoded), (pc, true));
-        }
-    }
-
-    #[test]
-    fn unmarked_pc_below_flag_decodes_unmarked() {
-        // An unmarked resume pc that leaves bit 14 free decodes as itself.
-        for pc in [0, 1, 100, AFTER_RESIDUAL_CALL_PC_FLAG - 1] {
-            assert_eq!(decode_resume_pc(pc), (pc, false));
-        }
-    }
-
-    #[test]
-    fn negative_sentinel_passes_through_unmarked() {
-        // resume.rs uses negative pcs as sentinels; they must not read as
-        // marked (decode_resume_pc:74-83).
-        assert_eq!(decode_resume_pc(-1), (-1, false));
-    }
-
-    #[test]
-    #[should_panic(expected = "out of range for marker bit")]
-    fn encode_rejects_pc_at_flag_boundary() {
-        // A pc >= 1 << 14 cannot carry the marker; encoding must reject it
-        // in release builds too (the bound is `assert!`, not debug-only)
-        // rather than silently aliasing a smaller pc on decode.
-        let _ = encode_after_residual_call_pc(AFTER_RESIDUAL_CALL_PC_FLAG);
-    }
-
-    #[test]
-    fn raw_pc_at_flag_aliases_a_marked_pc() {
-        // Documents WHY the capture-site asserts bound every *unmarked* pc:
-        // a raw pc with bit 14 set is indistinguishable from a marked pc at
-        // decode, so an unmarked stored pc >= the flag would be mis-read.
-        assert_eq!(decode_resume_pc(AFTER_RESIDUAL_CALL_PC_FLAG), (0, true));
-    }
 }
 
 #[cfg(test)]

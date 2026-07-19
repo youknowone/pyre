@@ -5156,10 +5156,10 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// through the call's OWN post-call `catch_exception` instead of the
     /// generic post-call fallthrough. The snapshot helper only acts on this
     /// when the call's CALL pc is directly covered by an enclosing
-    /// exception-table handler: it then folds the bit-14 after-residual-call
-    /// marker onto the CALL pc so a deopt resumes at the call's own catch —
-    /// the blackhole's `handle_exception_in_frame` routes the raise to the
-    /// enclosing handler instead of escaping the frame. Without this, a
+    /// exception-table handler: it then carries the CALL jitcode offset so a
+    /// deopt resumes at the call's own catch. The blackhole's
+    /// `handle_exception_in_frame` routes the raise to the enclosing handler
+    /// instead of escaping the frame. Without this, a
     /// residual resumes at the NEXT opcode, whose own catch receives only a
     /// raise from that opcode, not from the call itself; a residual whose CALL
     /// pc sits directly under a try (its fallthrough may leave the covered
@@ -11551,11 +11551,11 @@ fn dispatch_residual_call_iRd_kind(
                 // Request that this residual call's no-exception-guard resume
                 // route through the call's OWN post-call catch
                 // (`GuardCaptureScope::residual_call_catch_resume`).  The
-                // snapshot helper folds the marker only when the call's CALL pc
-                // is actually covered by the code's exception table (checked in
-                // `walker_capture_snapshot_for_last_guard_impl`); an uncovered
-                // residual keeps the generic fallthrough resume.  See the scope
-                // field's doc.
+                // snapshot helper carries the call's jitcode offset only when
+                // the CALL pc is actually covered by the code's exception table
+                // (checked in `walker_capture_snapshot_for_last_guard_impl`);
+                // an uncovered residual keeps the generic fallthrough resume.
+                // See the scope field's doc.
                 walker_capture_snapshot_for_last_guard_scoped(
                     ctx,
                     op.pc,

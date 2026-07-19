@@ -291,10 +291,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl(
                     py = skip_python_trivia_forward(code, py as usize) as u32;
                     // after_residual_call=True (`pyjitpl.py:2599-2603`): the
                     // may-force call already executed in compiled code and
-                    // consumed its Python stack operands.  Resume at the NEXT
+                    // consumed its Python stack operands. Resume at the NEXT
                     // executable opcode so the blackhole continues past the call
                     // (re-executing from the call's coordinate would drop/dup the
-                    // side effect, e.g. an in-place list swap store).  The
+                    // side effect, e.g. an in-place list swap store). The
                     // fallthrough resume routes a raise through the next opcode's
                     // own `catch_exception` (still inside the same try-block) and
                     // the bridge-decline path, which handles every sequential
@@ -305,17 +305,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl(
                     // receive the raise: its fallthrough may leave the covered
                     // region (e.g. FOR_ITER-next's fallthrough is the continue-arm
                     // body, reached only on a NON-null item, which carries no
-                    // catch for the call's OWN raise).  When the guard capture
+                    // catch for the call's OWN raise). When the guard capture
                     // requested catch-resume
                     // (`GuardCaptureScope::residual_call_catch_resume`) and the
                     // call's CALL pc is covered by the code's exception table,
-                    // fold the bit-14 marker onto the CALL pc so the blackhole
-                    // resumes at the call's OWN catch and routes the raise to the
-                    // enclosing handler instead of escaping the frame.
+                    // carry the CALL jitcode offset so the blackhole resumes at
+                    // the call's OWN catch and routes the raise to the enclosing
+                    // handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
-                        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
                         let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
                             &code.exceptiontable,
                             call_py_pc * 2,
@@ -323,7 +322,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl(
                         .is_some();
                         if scope.residual_call_catch_resume
                             && call_pc_has_catch
-                            && call_py_pc < flag
                             && jc
                                 .payload
                                 .after_residual_call_resume_for_jitcode_pc(op_pc)
@@ -673,8 +671,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl(
                 // encoder reg-bank window and decoder liveness symmetric.  It is
                 // a valid startpoint (`can_decode_live_vars` holds).
                 // The `after_residual_call` family is excluded — it routes
-                // through the separate post-call catch-marker twin + the
-                // bit-14 marker, so the ordinary marker would name a different
+                // through the separate post-call catch-marker twin, so the
+                // ordinary marker would name a different resume point.
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
                 let marker = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) };
@@ -747,15 +745,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl(
                 // `after_residual_call` bool tracks, `walker_capture_snapshot_for_last_guard`).
                 // These resume AFTER the residual call at the marker the
                 // decoder already resolves for this guard, so carrying it
-                // directly makes decode consult the carried word instead of
-                // the bit-14-marked / plain `py_pc → jitcode` resume-translation.
+                // directly makes decode consult the carried word instead of a
+                // fallback `py_pc → jitcode` resume translation.
                 //
                 // Which marker the decoder resolves depends on the sub-case
                 // captured at the CALL pc:
                 //   * `Some(call_jit_pc)` — the residual call is in a try-block
-                //     (FOR_ITER-next catch resume): decode routes the bit-14
-                //     word through the post-call catch marker, so carry
-                //     that same post-call catch `-live-` offset.
+                //     (FOR_ITER-next catch resume): carry that same post-call
+                //     catch `-live-` offset.
                 //   * `None` — plain sequential residual call resuming at the
                 //     next opcode's start marker: decode routes the plain word
                 //     through the resume-translation, so carry
@@ -975,9 +972,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl(
 /// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
 /// jitcode pc in the caller.  Returns a named decline reason
 /// when the caller frame is not snapshot-able for this first slice: missing
-/// liveness / resume tables, a CALL inside a try-block (catch marker resume pc
-/// is not
-/// representable in the multi-frame capture's bit-14-free py_pc slot), or no
+/// liveness / resume tables, a CALL inside a try-block whose catch-marker
+/// resume is not representable in this py_pc-only multi-frame capture, or no
 /// result on the operand stack at the return point.
 ///
 /// The caller resumes at the CALL's return point (fallthrough) with the
@@ -1145,9 +1141,8 @@ pub(crate) fn compute_inline_caller_frame(
             return Err(InlineCallerFrameDecline::Unavailable);
         }
         let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
-        // A CALL inside a try-block resumes at its own catch via a bit-14
-        // marker pc, which the multi-frame capture's `py_pc < FLAG` assert
-        // rejects — decline this slice.
+        // A CALL inside a try-block resumes at its own catch marker, which this
+        // py_pc-only multi-frame capture cannot represent — decline this slice.
         decline_inline_caller_frame_for_catch_marker(
             jc.payload
                 .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
@@ -1262,8 +1257,8 @@ pub(crate) fn compute_nested_inline_caller_frame(
     }
     let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
-    // A CALL inside a try-block resumes at its own catch via a bit-14 marker
-    // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
+    // A CALL inside a try-block resumes at its own catch marker, which this
+    // py_pc-only multi-frame capture cannot represent.
     decline_inline_caller_frame_for_catch_marker(after_residual_call_resume)?;
     let legacy_fallthrough_py_pc = || unsafe {
         let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;

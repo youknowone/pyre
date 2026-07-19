@@ -14705,13 +14705,10 @@ fn collect_guards(
                     fvc_ref,
                     num_virtuals,
                 );
-                // Strip the after-residual-call marker: this pre-computed
-                // pc is exit-layout metadata, not the resume target (the
-                // orthodox path always re-decodes rd_numb), so record the
-                // plain Python PC.
-                frames
-                    .last()
-                    .map(|f| majit_ir::resumedata::decode_resume_pc(f.pc).0 as u64)
+                // This pre-computed pc is exit-layout metadata, not the resume
+                // target (the orthodox path re-decodes rd_numb), so carry the
+                // published resume word unchanged.
+                frames.last().map(|f| f.pc as u64)
             } else {
                 None
             }

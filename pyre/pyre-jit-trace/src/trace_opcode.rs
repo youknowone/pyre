@@ -1453,10 +1453,9 @@ impl MIFrame {
         // clear and the liveness decode.  Resolve the resume jitcode pc once
         // here so the lazy-load preamble fills exactly the registers the
         // snapshot below reads, routed through the SAME `-live-` the snapshot
-        // pc resolves to (`marker_aware_resume_pc` /
-        // `marker_aware_parent_resume_pc`). A py_pc-only observer cannot
-        // represent a post-call catch marker after the JitCode-keyed migration;
-        // it declines below rather than publishing an ambiguous snapshot.
+        // pc resolves to. A py_pc-only observer cannot represent a post-call
+        // catch marker after the JitCode-keyed migration; it declines below
+        // rather than publishing an ambiguous snapshot.
         let resume_jit_pc: Option<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
             if !jc.payload.is_populated() {
@@ -1468,11 +1467,9 @@ impl MIFrame {
                     top_frame_marker_call_pc
                 } else {
                     // Pre-call top-frame guard: resume at the plain `live_pc`
-                    // `-live-`, matching `marker_aware_resume_pc`'s
-                    // `wants_marker = after_residual_call && ...`.  Routing
-                    // through the post-call marker here would make the box list
-                    // shorter than the box count the decoder reads at the
-                    // recorded (pre-call) snapshot position.
+                    // `-live-`. Routing through the post-call marker here would
+                    // make the box list shorter than the box count the decoder
+                    // reads at the recorded (pre-call) snapshot position.
                     None
                 };
                 if marker_call_pc.is_some() {
@@ -1856,14 +1853,13 @@ impl MIFrame {
         // Mirror RPython `pyjitpl.py:194-195 pc=self.pc`: an `in_a_call`
         // parent whose CALL sits in a try-block reads liveness at that call's
         // post-residual-call `-live-`/catch, so the encoded box count and
-        // bank layout match the blackhole's marker-routed resume position
-        // (`build_framestack_snapshot` folds the same marker into this
-        // frame's snapshot pc).  The pyre split between a narrowed
+        // bank layout match the blackhole's carried jitcode resume position.
+        // The pyre split between a narrowed
         // fallthrough `-live-` and the un-narrowed post-call `-live-`
         // otherwise crosses the two markers — the post-call `-live-` keeps
         // the CALL result ref the next opcode pops, so the decoder reads one
-        // more ref than the encoder wrote.  Without a catch marker, use the
-        // plain fallthrough `-live-` via `pc_map`.
+        // more ref than the encoder wrote. Without a catch marker, use the
+        // plain fallthrough `-live-`.
         let jit_pc =
             resume_jit_pc.expect("get_list_of_active_boxes: no carried JitCode resume marker");
         let op_live = crate::state::op_live();
@@ -3782,13 +3778,15 @@ impl MIFrame {
             let callee_snapshot_types_full =
                 self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
 
-            // snapshot.pc must match the liveness PC used for active boxes
-            // (get_list_of_active_boxes uses fallthrough_pc when
-            // after_residual_call), and folds in the after-residual-call
-            // marker so an inlined frame's try-block residual call resumes
-            // at its OWN catch_exception — the single-frame path
-            // (capture_resumedata) applies the same fold.
-            let callee_live_pc = self.marker_aware_resume_pc(self.orgpc, after_residual_call);
+            // snapshot.pc must match the liveness PC used for active boxes.
+            // This retired MIFrame trait-interpret leg has no production
+            // driver; production guard capture carries a genuine jitcode
+            // post-call coordinate instead. Preserve the trait-leg decline
+            // without rewriting the resume word.
+            if after_residual_call {
+                crate::state::request_trace_abort();
+            }
+            let callee_live_pc = self.orgpc;
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
             let snapshot = self.build_framestack_snapshot(
                 ctx,
@@ -3894,60 +3892,6 @@ impl MIFrame {
     /// `capture_resumedata(framestack, virtualizable_boxes,
     /// virtualref_boxes, after_residual_call=False)` which walks the full
     /// `self.framestack` to build one SnapshotFrame per live frame.
-    /// Resolve a top-frame snapshot pc, folding in the after-residual-call
-    /// marker when the residual call at `call_pc` sits inside a try-block.
-    ///
-    /// `call_pc` is the CALL opcode pc (the frame's pc before it was
-    /// advanced to the resume target).  Used by BOTH the single-frame
-    /// `capture_resumedata` and the multi-frame guard path so a residual
-    /// call resumes at its OWN catch_exception even when the calling frame
-    /// was inlined (`pyjitpl.py:2582 capture_resumedata` applies the
-    /// `after_residual_call` resume consistently to the top frame).
-    ///
-    /// The marker bit (1 << 14) steals the top bit of the i16 pc word
-    /// `resumecode::append_int` allows.  A *marked* pc ORs the bit onto a
-    /// value gated `< 1 << 14`; an *unmarked* pc (no try-block catch, or
-    /// the non-after_residual_call path) must independently leave bit 14
-    /// free, or `decode_resume_pc` mis-reads it as marked.  A function with
-    /// >= 16384 trace-bytecode units exceeds this and cannot be encoded
-    /// under the bit-14 scheme — request a trace abort rather than corrupt
-    /// decode silently at resume time (resumedata.rs:48-62).
-    /// `abort_unencodable_resume_pc` sets the flag `metainterp::interpret`
-    /// polls each step, so an unencodable pc (an oversized function, or a
-    /// corrupted cross-frame coordinate, #124/#130) falls back to the
-    /// interpreter rather than crashing.
-    fn marker_aware_resume_pc(&self, call_pc: usize, after_residual_call: bool) -> usize {
-        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-        if after_residual_call {
-            // This retired MIFrame trait-interpret leg has no production driver.
-            // Production guard capture (`walker_capture_snapshot_for_last_guard`)
-            // captures rather than aborts residual-call guards as pyjitpl.py:2599 does; only trait-leg
-            // unit tests reach this abort before Phase-6 deletion.
-            return crate::state::abort_unencodable_resume_pc(call_pc);
-        }
-        if call_pc >= flag {
-            return crate::state::abort_unencodable_resume_pc(call_pc);
-        }
-        call_pc
-    }
-
-    /// Parent frames with a py_pc-only CALL observer decline rather than
-    /// reconstructing a post-call catch coordinate.
-    fn marker_aware_parent_resume_pc(call_pc: Option<usize>, return_point_pc: usize) -> usize {
-        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-        if call_pc.is_some() {
-            // This retired MIFrame trait-interpret leg has no production driver.
-            // Production guard capture (`collect_outer_active_boxes`) captures rather
-            // than aborts inline guards as opencoder.py:819 does; only trait-leg tests reach this
-            // abort before Phase-6 deletion.
-            return crate::state::abort_unencodable_resume_pc(return_point_pc);
-        }
-        if return_point_pc >= flag {
-            return crate::state::abort_unencodable_resume_pc(return_point_pc);
-        }
-        return_point_pc
-    }
-
     fn capture_resumedata(
         &mut self,
         ctx: &mut TraceCtx,
@@ -3962,26 +3906,14 @@ impl MIFrame {
         let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
 
-        // The snapshot's frame.pc must match the liveness PC used by
-        // get_list_of_active_boxes.  For after-residual-call guards the
-        // resume target depends on whether the residual call sits inside
-        // a try-block: only then did the jitcode emit a post-call
-        // `-live-`/`catch_exception` marker.
-        //
-        //   * try-block call: resume at the call's OWN catch.  Store the
-        //     CALL pc (`saved_orgpc`) with the marker bit folded in so the
-        //     decoder routes it through the post-call catch marker rather
-        //     than `pc_map` (which would re-execute the call).
-        //   * non-try call: no catch to land on, so keep the next-opcode
-        //     resume (`fallthrough_pc`) — the exception then propagates
-        //     out of the frame via `handle_exception_in_frame`, exactly
-        //     as before this fix.
-        //
-        // RPython always keeps `frame.pc` at the post-call `-live-`
-        // (`pyjitpl.py:2610-2624`) and lets `handle_exception_in_frame`
-        // decide catch-vs-propagate; pyre only emits that marker for
-        // try-block calls, so the non-try case falls back here.
-        let snapshot_live_pc = self.marker_aware_resume_pc(saved_orgpc, after_residual_call);
+        // This retired MIFrame trait-interpret leg has no production driver.
+        // Production guard capture carries the genuine post-call jitcode
+        // coordinate; preserve the trait-leg after-residual decline without
+        // rewriting the resume word.
+        if after_residual_call {
+            crate::state::request_trace_abort();
+        }
+        let snapshot_live_pc = saved_orgpc;
 
         // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
         //     self.framestack, virtualizable_boxes, self.virtualref_boxes,
@@ -4056,7 +3988,10 @@ impl MIFrame {
             } else {
                 &[]
             };
-            let parent_pc = Self::marker_aware_parent_resume_pc(parent.call_pc, parent.resume_pc);
+            if parent.call_pc.is_some() {
+                crate::state::request_trace_abort();
+            }
+            let parent_pc = parent.resume_pc;
             let parent_word = parent
                 .resume_marker_jit_pc
                 .map(|m| m as i32)
@@ -4234,8 +4169,7 @@ impl MIFrame {
         // When the parent's CALL sits in a try-block, read this frame's
         // liveness at the call's post-residual-call `-live-`/catch (mirroring
         // `pyjitpl.py:194-195 pc=self.pc`) so the encoded box count matches
-        // the blackhole's marker-routed resume position (`build_framestack_
-        // snapshot` folds the same marker into this parent's snapshot pc).
+        // the blackhole's carried jitcode resume position.
         parent_frame.residual_call_pc = parent.call_pc;
         let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false, None);
         let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
@@ -4762,33 +4696,6 @@ impl MIFrame {
         // use the same other_target adaptation — the callee frame's resume
         // pc points past POP_JUMP_IF_* (not at it), while parent frames
         // keep their original return_point pc.
-        //
-        // A branch guard never carries the after-residual-call marker, so its
-        // plain top-frame resume pc must leave bit 14 free or `decode_resume_pc`
-        // mis-reads it as marked (resumedata.rs:48-62).  A function whose body
-        // is large enough to push a branch resume pc past the bit-14 ceiling is
-        // un-encodable; this is the same "trace got too big for the machinery"
-        // condition `is_too_long`/ABORT_TOO_LONG handles, but reached mid-walk
-        // (a single full-body-walk step records the whole oversized body before
-        // the post-step `is_too_long` poll runs).  `abort_unencodable_resume_pc`
-        // requests a graceful trace abort (polled on both the FBW
-        // `trace.rs:1006` and trait `pyjitpl.rs:208` legs, discarding the trace
-        // and routing the location to re-interpret/blackhole) and clamps the pc
-        // so the recorded-but-discarded guard never decodes a marked pc — the
-        // same fallback the other marker-aware resume-pc sites use, instead of
-        // the bare assert panicking the whole process.
-        let resume_pc = if resume_pc >= majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize {
-            crate::jitcode_dispatch::census_record("BranchGuardResumePcTooLarge");
-            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[fbw-abort] branch-guard resume pc {resume_pc} >= bit-14 ceiling; \
-                     function too large for resume encoding"
-                );
-            }
-            crate::state::abort_unencodable_resume_pc(resume_pc)
-        } else {
-            resume_pc
-        };
         let snapshot = self.build_framestack_snapshot(
             ctx,
             resume_pc,
@@ -8036,113 +7943,6 @@ impl MIFrame {
         }
 
         Ok(None)
-    }
-
-    /// RPython pyjitpl.py:3380 handle_possible_exception.
-    ///
-    /// Called after every may-raise opcode. Checks last_exc_value to decide:
-    /// - exception raised → GUARD_EXCEPTION + finishframe_exception
-    /// - no exception → GUARD_NO_EXCEPTION
-    pub(crate) fn handle_possible_exception(
-        &mut self,
-        code: &CodeObject,
-        pc: usize,
-    ) -> TraceAction {
-        if !self.sym().last_exc_value.is_null() {
-            let exc_obj = self.sym().last_exc_value;
-
-            // pyjitpl.py:3382-3384: ALWAYS emit GUARD_EXCEPTION first,
-            // regardless of class_of_last_exc_is_const.
-            let exc_type_ptr = unsafe {
-                (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
-                    .ob_header
-                    .ob_type as i64
-            };
-
-            let guard_op = self.with_ctx(|this, ctx| {
-                // pyjitpl.py:2575-2578: after_residual_call=true for
-                // GuardException — all boxes in top frame are live.
-                let after_residual_call = true;
-                let resume_pc = this.fallthrough_pc;
-                let saved_orgpc = this.orgpc;
-                this.orgpc = resume_pc;
-                this.clear_pre_opcode_state();
-
-                this.flush_to_frame_for_guard(ctx);
-                // GUARD_EXCEPTION resumes via the `jf_guard_exc` channel at a
-                // plain fallthrough pc (no bit-14 marker), so read the boxes at
-                // the fallthrough `-live-` to match the snapshot pc below.
-                let active_boxes =
-                    this.get_list_of_active_boxes(ctx, false, after_residual_call, None);
-                let fail_arg_types = this.build_fail_arg_types_for_active_boxes(&active_boxes);
-
-                // capture_resumedata parity: full framestack snapshot.
-                // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
-                //
-                // The post-call exception is carried to blackhole resume via
-                // `jf_guard_exc` (the guard_exc channel), not the bit-14 resume
-                // marker, so the top-frame resume pc stays a plain `fallthrough_pc`
-                // and must leave bit 14 free or `decode_resume_pc` mis-reads it
-                // as marked (resumedata.rs:48-62) — fail loudly otherwise.
-                assert!(
-                    resume_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
-                    "exception-guard resume pc {resume_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-                     function too large for bit-14 resume encoding"
-                );
-                let snapshot =
-                    this.build_framestack_snapshot(ctx, resume_pc, &active_boxes, &fail_arg_types);
-                // Snapshot is the source of truth —
-                // the optimizer's `store_final_boxes_in_guard`
-                // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args`
-                // from the snapshot via
-                // `op.store_final_boxes(liveboxes)` (mod.rs:3392), so
-                // the inline `record_guard_typed_with_fail_args` copy
-                // was redundant.  Mirrors RPython
-                // `pyjitpl.MetaInterp.generate_guard`
-                // (pyjitpl.py:2558-2602) which records the guard with
-                // no inline fail_args and lets `capture_resumedata` +
-                // `_number_boxes` populate them from the snapshot
-                // chain.
-                let all_types = this.extend_types_with_parents(ctx, fail_arg_types);
-                let snapshot_id = ctx.capture_resumedata(snapshot);
-
-                let exc_type_const = ctx.const_int(exc_type_ptr);
-                let op = ctx.record_guard_typed(
-                    majit_ir::OpCode::GuardException,
-                    &[exc_type_const],
-                    all_types,
-                );
-                ctx.set_last_guard_resume_position(snapshot_id);
-
-                this.orgpc = saved_orgpc;
-                op
-            });
-
-            // pyjitpl.py:3385-3392:
-            //   val = cast_opaque_ptr(GCREF, self.last_exc_value)
-            //   if self.class_of_last_exc_is_const:
-            //       self.last_exc_box = ConstPtr(val)
-            //   else:
-            //       self.last_exc_box = op
-            //       op.setref_base(val)
-            //   self.class_of_last_exc_is_const = True
-            if self.sym().class_of_last_exc_is_const {
-                let exc_box = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
-                self.sym_mut().last_exc_box = exc_box;
-            } else {
-                self.sym_mut().last_exc_box = guard_op;
-            }
-            self.sym_mut().class_of_last_exc_is_const = true;
-
-            // pyopcode.py: generic raise paths carry no saved lasti; the
-            // RERAISE-issuing site is the only producer of reraise_lasti.
-            self.finishframe_exception(code, pc, -1)
-        } else {
-            // Per-caller GUARD_NO_EXCEPTION is emitted inline at each
-            // can-raise CALL_* site (pyjitpl.py:2082 do_residual_call), so
-            // no fallback emit is needed when no exception was observed.
-            TraceAction::Continue
-        }
     }
 
     /// RPython pyjitpl.py:1701 opimpl_reraise parity.

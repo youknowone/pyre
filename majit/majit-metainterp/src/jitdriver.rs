@@ -955,10 +955,7 @@ fn state_field_frame_value_count(jitcode_index: i32, pc: i32) -> usize {
         let Some(jc) = data.jitcodes.get(jitcode_index as usize) else {
             return 0;
         };
-        // The rd_numb pc word may carry the after-residual-call marker; strip
-        // it to the plain JitCode position before the liveness lookup.
-        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
-        let off = jc.get_live_vars_info(real_pc as usize, data.op_live);
+        let off = jc.get_live_vars_info(pc as usize, data.op_live);
         let all_liveness = &data.all_liveness;
         if off + 2 < all_liveness.len() {
             all_liveness[off] as usize

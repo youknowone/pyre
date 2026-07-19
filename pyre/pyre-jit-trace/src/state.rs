@@ -567,23 +567,6 @@ pub fn take_trace_abort_requested() -> bool {
     TRACE_ABORT_REQUESTED.with(|c| c.replace(false))
 }
 
-/// Request a trace abort and return a bit-14-encodable stand-in for a resume
-/// pc that does not fit the marker scheme (`>= AFTER_RESIDUAL_CALL_PC_FLAG`).
-///
-/// The bit-14 resume asserts (`trace_opcode.rs marker_aware_*_resume_pc`)
-/// document that an unencodable pc is meant to fall back to the interpreter
-/// via the recording loop's `catch_unwind` — but the pyre tracer runs its own
-/// `metainterp::interpret`, which has no such catch, so the bare assert
-/// crashed the process instead.  The cross-frame snapshot coordinate gap
-/// (#124/#130) can hand such a pc (e.g. one already carrying the marker bit
-/// from a corrupted cross-frame coordinate).  Requesting an abort discards the
-/// guard with the (pre-install) trace, so the clamped value is never decoded.
-pub fn abort_unencodable_resume_pc(pc: usize) -> usize {
-    let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-    request_trace_abort();
-    pc & (flag - 1)
-}
-
 /// pyjitpl.py:2255 `MetaInterpStaticData.finish_setup` parity entry point.
 ///
 /// RPython runs `finish_setup` once per `MetaInterpStaticData` object. Pyre's
@@ -788,12 +771,12 @@ pub fn skip_python_trivia_forward_public(
 
 /// Translate a resume-frame pc word to a Python instruction coordinate.
 ///
-/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; per
-/// the `decode_resume_pc` contract it passes through so the caller's `pc < 0`
-/// screen rejects it (the internal metadata lookups below are bounds-checked and
-/// never index with the word, so no wrap results).
+/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; it
+/// passes through so the caller's `pc < 0` screen rejects it (the internal
+/// metadata lookups below are bounds-checked and never index with the word, so
+/// no wrap results).
 pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
-    let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
+    let fallback = pc_word;
     match python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)
@@ -1468,28 +1451,8 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // usize would otherwise be a huge OOB index. No-op for offsets /
         // NO_JITCODE_PC (flip-off), so byte-identical when off.
         let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(payload, jitcode_pc);
-        // The rd_numb pc word may carry an after-residual-call marker;
-        // recover the plain Python PC for the py_pc-keyed liveness/depth
-        // tables (same decode as
-        // `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`).
-        //
-        // Coordinate note (#423): the Ref bank is decoded marker-aware (at the
-        // post-call jitcode pc via the carried `jitcode_pc`), but `pcdep_entries`
-        // / `stack_depth_at_pc` / `live_locals` here key by the marker-STRIPPED
-        // `real_pc` (= the CALL `orgpc` for an after-residual-call guard). The
-        // encode side (`get_list_of_active_boxes`) keys its pcdep by
-        // `live_pc = fallthrough_pc` (the post-call pc). For a kept operand-stack
-        // Ref below the call window the slot index and the (flat-base) color are
-        // identical at `orgpc` and `fallthrough_pc`, and the entries that DO
-        // differ (the call-window arg slots present only at the pre-call depth)
-        // sit above the post-call `valuestackdepth` and are clamped out by the
-        // `s >= semantic_prefix_len` bound in `setup_bridge_sym`, so the
-        // inversion agrees in practice (residual-call-in-try kept-Ref corpus is
-        // byte-exact gate-on vs gate-off on both backends). A confirmed trigger
-        // would be fixed by keying these three tables off the same post-call
-        // coordinate the Ref bank uses when the marker is set; that change is
-        // deferred to the symbolic-stack work (#423) since an unvalidated
-        // resume-coordinate flip can itself miscompile.
+        // The rd_numb pc word is already the published resume coordinate. Use
+        // it directly for the py_pc-keyed liveness/depth table fallback.
         //
         // When the carried `jitcode_pc` is set (kept-stack branch
         // guard), resolve the guard's Python PC from the jitcode coordinate
@@ -1527,18 +1490,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 payload.pcdep_for_jitcode_pc(jp),
             ) {
                 (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                _ => (
-                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
-                    Vec::new(),
-                ),
+                _ => (via_py_pc(pc as usize), Vec::new()),
             }
         } else {
             // A non-decodable carried coordinate falls back to the merge-target
             // PC so liveness and pcdep key the same point.
-            (
-                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
-                Vec::new(),
-            )
+            (via_py_pc(pc as usize), Vec::new())
         };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
