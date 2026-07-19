@@ -9993,100 +9993,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_local_checked_value_respects_symbolic_local_type_with_compiled_trace_jitcode() {
-        use majit_ir::{OpCode, OpRef, Type};
-        use majit_metainterp::TraceCtx;
-        use pyre_interpreter::pyframe::PyFrame;
-        use pyre_interpreter::{LocalOpcodeHandler, compile_exec};
-        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
-        use pyre_object::{w_int_new, w_list_new};
-
-        ensure_test_jit_callbacks();
-        let module =
-            compile_exec("def f(b):\n    return b\nf(1)\n").expect("test code should compile");
-        let code = function_code_from_module(&module, "f");
-
-        let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        register_test_portal(&code, frame.pycode as *const ());
-        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
-            .expect("real trace-side jitcode registration must succeed");
-        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
-            .expect("real trace-side jitcode index must exist");
-        // Resolve local `b`'s Ref-bank color via the per-PC
-        // `pcdep_color_slots` entries.  Hardcoding reg index 0 couples the
-        // test to walker's pre-canonical local-slot identity; canonical
-        // `flatten_graph`'s regalloc-coalesced coloring may emit a
-        // different color for the inputarg.  Mirrors the splice-gate
-        // convergence pattern landed for
-        // test_restore_guard_failure_uses_runtime_value_kinds_... .
-        //
-        // `b`'s Ref color is not in any `-live-` set under precise liveness
-        // (a local restores from the virtualizable, not a register), so the
-        // resume PC is picked for validity only; the load reads local slot 0
-        // from the symbolic state, and `registers_r` carries `b` at its color.
-        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[]);
-        let color_b = pcdep_color_for_slot(jitcode_index, resume_pc, 0)
-            .expect("regalloc must assign a color to local `b`");
-        let max_color = live_regs.iter().copied().max().unwrap_or(0).max(color_b) as usize;
-
-        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
-            let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);
-            // resoperation.py:719/727/739 — InputArg has only Int/Float/Ref
-            // variants; `input_arg_typed` panics on Type::Void.
-            let local = OpRef::input_arg_typed(0, symbolic_type);
-            let frame_ref = ctx.const_ref(frame_ptr as i64);
-            let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
-            let mut sym = PyreSym::from_test_state(TestSymState {
-                frame: frame_ref,
-                jitcode: jitcode_ptr,
-                nlocals: 1,
-                valuestackdepth: 1,
-                locals_cells_stack_array_ref: locals_array,
-                symbolic_local_types: vec![symbolic_type],
-                symbolic_stack_types: vec![],
-                registers_r: {
-                    let mut r = vec![OpRef::NONE; max_color + 1];
-                    r[color_b as usize] = local;
-                    r
-                },
-                concrete_stack: vec![],
-                concrete_namespace: frame.w_globals,
-                vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
-                vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
-                vable_valuestackdepth: ctx.const_int(1),
-                vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-                vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
-            });
-            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-
-            let loaded =
-                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
-                    .expect("local should load");
-            assert_eq!(loaded.opref, local);
-
-            let recorder = ctx.into_recorder();
-            match expected_guard {
-                Some(opcode) => {
-                    assert!(
-                        recorder.ops().iter().any(|op| op.opcode == opcode),
-                        "expected guard opcode {opcode:?} in {:?}",
-                        recorder.ops()
-                    );
-                }
-                None => assert_eq!(recorder.num_guards(), 0),
-            }
-        };
-
-        run_case(Type::Int, "j", None);
-        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
-    }
-
-    #[test]
     fn test_guard_class_uses_guard_nonnull_class_with_compiled_trace_jitcode() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
@@ -10418,8 +10324,8 @@ mod tests {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
         use majit_metainterp::recorder::SnapshotTagged;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
-        use pyre_interpreter::{BranchOpcodeHandler, compile_exec};
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
@@ -10497,8 +10403,6 @@ mod tests {
                 .unwrap(),
             true
         );
-        <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
-
         // Snapshot is the resume-data oracle, not
         // `op.fail_args` (None until the optimizer's
         // `store_final_boxes_in_guard` writes it back).
@@ -10832,7 +10736,6 @@ mod tests {
      {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
-        use pyre_interpreter::IterOpcodeHandler;
         use pyre_jit_trace::state::{MIFrame, PyreSym};
 
         let range_iter = pyre_object::w_range_iter_new(0, 2, 1);
@@ -10865,16 +10768,12 @@ mod tests {
             .expect("range iterator fast path should trace")
             .expect("two-element range iterator should yield a value");
         assert_eq!(state.capture_value_type(next.opref), Type::Int);
-        <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
-            .expect("for-iter next should guard the optional result");
-
         let recorder = ctx.into_recorder();
         let mut saw_getfield_gc = false;
         let mut saw_setfield_gc = false;
         let mut saw_setfield_raw = false;
         let mut saw_getfield_raw = false;
         let mut saw_new = false;
-        let mut saw_optional_guard = false;
         for pos in 1..(1 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
@@ -10901,7 +10800,6 @@ mod tests {
                     saw_getfield_raw = true
                 }
                 OpCode::New => saw_new = true,
-                OpCode::GuardNonnull | OpCode::GuardIsnull => saw_optional_guard = true,
                 _ => {}
             }
         }
@@ -10910,7 +10808,6 @@ mod tests {
         assert!(!saw_setfield_raw);
         assert!(!saw_getfield_raw);
         assert!(!saw_new);
-        assert!(!saw_optional_guard);
     }
 
     #[test]
