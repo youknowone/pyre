@@ -98,6 +98,18 @@ assert_complex_identical(
 )
 assert_complex_identical(1.0 / complex(-inf, -inf), complex(-0.0, 0.0))
 
+for base, exponent in (
+    (1e200 + 1.0j, 1e200 + 1.0j),
+    (1e200 + 1.0j, 5),
+    (9.0j, 33.0j**3),
+):
+    try:
+        pow(base, exponent)
+    except OverflowError as error:
+        assert str(error) == "complex exponentiation"
+    else:
+        raise AssertionError("overflowing complex power must raise")
+
 
 class IndexOnly:
     def __index__(self):

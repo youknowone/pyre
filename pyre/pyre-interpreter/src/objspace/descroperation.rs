@@ -1605,24 +1605,34 @@ unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {
     let mut n = exponent.unsigned_abs();
     while n != 0 {
         if n & 1 != 0 {
-            let real = result_real * base_real - result_imag * base_imag;
-            result_imag = result_real * base_imag + result_imag * base_real;
-            result_real = real;
+            // CPython 3.14 c_powu calls _Py_c_prod for every multiply, so
+            // the Annex G infinity recovery is shared with ordinary `*`.
+            let product = complex_prod(result_real, result_imag, base_real, base_imag);
+            result_real = w_complex_get_real(product);
+            result_imag = w_complex_get_imag(product);
         }
         n >>= 1;
         if n != 0 {
-            let real = base_real * base_real - base_imag * base_imag;
-            base_imag = base_real * base_imag + base_imag * base_real;
-            base_real = real;
+            let square = complex_prod(base_real, base_imag, base_real, base_imag);
+            base_real = w_complex_get_real(square);
+            base_imag = w_complex_get_imag(square);
         }
     }
-    if exponent < 0 {
+    let result = if exponent < 0 {
         complex_truediv(
             w_complex_new(1.0, 0.0),
             w_complex_new(result_real, result_imag),
-        )
+        )?
     } else {
-        Ok(w_complex_new(result_real, result_imag))
+        w_complex_new(result_real, result_imag)
+    };
+    // complexobject.c complex_pow: `_Py_ADJUST_ERANGE2` forces ERANGE when
+    // either component is infinite; the numeric slot reports that as
+    // `OverflowError("complex exponentiation")`.
+    if w_complex_get_real(result).is_infinite() || w_complex_get_imag(result).is_infinite() {
+        Err(PyError::overflow_error("complex exponentiation"))
+    } else {
+        Ok(result)
     }
 }
 
@@ -1650,7 +1660,11 @@ unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         (len * phase.cos(), len * phase.sin())
     };
-    Ok(w_complex_new(real, imag))
+    if real.is_infinite() || imag.is_infinite() {
+        Err(PyError::overflow_error("complex exponentiation"))
+    } else {
+        Ok(w_complex_new(real, imag))
+    }
 }
 
 unsafe fn complex_neg(a: PyObjectRef) -> PyResult {
