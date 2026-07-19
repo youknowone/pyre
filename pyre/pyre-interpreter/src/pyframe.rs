@@ -102,8 +102,13 @@ pub struct PyFrame {
     /// runtime never observes a divergence — so this remains a structural
     /// adaptation, not a parity bug.
     pub last_instr: isize,
-    /// pyframe.py:80 escaped — see mark_as_escaped()
-    pub escaped: bool,
+    /// Packed frame status bits, one byte in place of two RPython
+    /// class-level bools: `FLAG_ESCAPED` (pyframe.py:80 escaped — see
+    /// mark_as_escaped()) and `FLAG_FRAME_FINISHED`
+    /// (frame_finished_execution).  Access through the
+    /// `escaped()`/`set_escaped()`/`frame_finished_execution()`/
+    /// `set_frame_finished_execution()` methods.
+    pub flags: u8,
     /// pyframe.py:82 debugdata — lazily allocated tracing/debug payload.
     /// Virtualizable static field (interp_jit.py:28).
     pub debugdata: *mut FrameDebugData,
@@ -113,8 +118,6 @@ pub struct PyFrame {
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
-    /// PyPy: `frame_finished_execution = False`.
-    pub frame_finished_execution: bool,
     /// PyPy: `f_generator_nowref = None`.
     pub f_generator_nowref: PyObjectRef,
     /// PyPy: `w_yielding_from = None`.
@@ -1633,8 +1636,7 @@ impl PyFrame {
         };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(&*raw) };
         self.last_instr = -1;
-        self.escaped = false;
-        self.frame_finished_execution = false;
+        self.flags = 0;
         self.f_generator_nowref = PY_NULL;
         self.w_yielding_from = PY_NULL;
         self.f_backref = std::ptr::null_mut();
@@ -1843,11 +1845,10 @@ impl PyFrame {
             },
             valuestackdepth: nlocals + ncells,
             last_instr: -1,
-            escaped: false,
+            flags: 0,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
             vable_token: 0,
-            frame_finished_execution: false,
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
@@ -1956,11 +1957,10 @@ impl PyFrame {
             },
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
-            escaped: false,
+            flags: 0,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
             vable_token: 0,
-            frame_finished_execution: false,
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
@@ -2020,11 +2020,10 @@ impl PyFrame {
             },
             valuestackdepth: self.valuestackdepth,
             last_instr: self.last_instr,
-            escaped: self.escaped,
+            flags: self.flags,
             debugdata: unsafe { clone_debugdata_ptr(self.debugdata, allocation) },
             lastblock: unsafe { clone_block_chain(self.lastblock, allocation) },
             vable_token: self.vable_token,
-            frame_finished_execution: self.frame_finished_execution,
             f_generator_nowref: self.f_generator_nowref,
             w_yielding_from: self.w_yielding_from,
             f_backref: self.f_backref,
@@ -2517,10 +2516,45 @@ impl PyFrame {
         unsafe { crate::w_code_hidden_applevel(self.pycode as PyObjectRef) }
     }
 
+    /// `escaped` status bit (pyframe.py:80).
+    pub const FLAG_ESCAPED: u8 = 0b01;
+    /// `frame_finished_execution` status bit.
+    pub const FLAG_FRAME_FINISHED: u8 = 0b10;
+
+    /// pyframe.py:80 `escaped`.
+    #[inline]
+    pub fn escaped(&self) -> bool {
+        self.flags & Self::FLAG_ESCAPED != 0
+    }
+
+    #[inline]
+    pub fn set_escaped(&mut self, value: bool) {
+        if value {
+            self.flags |= Self::FLAG_ESCAPED;
+        } else {
+            self.flags &= !Self::FLAG_ESCAPED;
+        }
+    }
+
+    /// `frame_finished_execution`.
+    #[inline]
+    pub fn frame_finished_execution(&self) -> bool {
+        self.flags & Self::FLAG_FRAME_FINISHED != 0
+    }
+
+    #[inline]
+    pub fn set_frame_finished_execution(&mut self, value: bool) {
+        if value {
+            self.flags |= Self::FLAG_FRAME_FINISHED;
+        } else {
+            self.flags &= !Self::FLAG_FRAME_FINISHED;
+        }
+    }
+
     /// pyframe.py:183 mark_as_escaped
     #[inline]
     pub fn mark_as_escaped(&mut self) {
-        self.escaped = true;
+        self.set_escaped(true);
     }
 
     /// pyframe.py:216-220 `get_builtin` — returns `self.builtin` (the
@@ -2604,7 +2638,7 @@ impl PyFrame {
     /// var / stack slot (cells are rebound to fresh empty cells so a
     /// shared inner/outer cell is not mutated).
     pub fn descr_clear(&mut self) -> Result<(), crate::PyError> {
-        if !self.frame_finished_execution {
+        if !self.frame_finished_execution() {
             if !self._is_generator_or_coroutine() {
                 return Err(crate::PyError::runtime_error(
                     "cannot clear an executing frame",
@@ -3365,11 +3399,10 @@ impl PyFrame {
             locals_cells_stack_w,
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
-            escaped: false,
+            flags: 0,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
             vable_token: 0,
-            frame_finished_execution: false,
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
@@ -3672,11 +3705,10 @@ pub fn createframe_obj(
         },
         valuestackdepth: num_locals + num_cells,
         last_instr: -1,
-        escaped: false,
+        flags: 0,
         debugdata: std::ptr::null_mut(),
         lastblock: std::ptr::null_mut(),
         vable_token: 0,
-        frame_finished_execution: false,
         f_generator_nowref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),

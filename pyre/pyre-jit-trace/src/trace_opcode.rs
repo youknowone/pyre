@@ -7241,7 +7241,7 @@ impl MIFrame {
                 if reraise_lasti >= 0 {
                     frame.last_instr = reraise_lasti as isize;
                 }
-                frame.frame_finished_execution = true;
+                frame.set_frame_finished_execution(true);
             }
             // No handler in this frame — return Abort so metainterp's
             // multi-frame finishframe_exception can pop this frame and

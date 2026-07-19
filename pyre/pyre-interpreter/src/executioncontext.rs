@@ -316,7 +316,7 @@ impl ExecutionContext {
         let _frame_vref = self.topframeref;
         unsafe {
             self.topframeref = (*frame).f_backref;
-            if (*frame).escaped || got_exception {
+            if (*frame).escaped() || got_exception {
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
                     (*f_back).mark_as_escaped();

@@ -9314,7 +9314,7 @@ fn generator_unpack_into(
                 Ok(w_result) => {
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
-                    if frame.frame_finished_execution {
+                    if frame.frame_finished_execution() {
                         w_generator_set_exhausted(gen_obj);
                         break;
                     }
@@ -12054,7 +12054,7 @@ fn generator_send_ex(
             Ok(value) => {
                 // generator.py:109-114 — if the frame marked itself finished,
                 // it was RETURNed from; otherwise it YIELDed.
-                if frame.frame_finished_execution {
+                if frame.frame_finished_execution() {
                     w_generator_set_exhausted(gen_obj);
                     // generator.py:117-119 / pyopcode.py RETURN_VALUE in
                     // generator frames — `raise StopIteration(returnvalue)`

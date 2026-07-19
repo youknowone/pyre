@@ -3454,7 +3454,7 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.valuestackdepth = frame.stack_base();
     frame.set_last_instr_from_next_instr(0);
     frame.vable_token = 0;
-    frame.frame_finished_execution = false;
+    frame.set_frame_finished_execution(false);
     frame.f_generator_nowref = PY_NULL;
     frame.w_yielding_from = PY_NULL;
     frame.f_backref = std::ptr::null_mut();
@@ -3462,7 +3462,7 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     // debugdata and lastblock are GC-managed refs — release references only,
     // never manually free (JIT snapshots may still hold these pointers).
     frame.debugdata = std::ptr::null_mut();
-    frame.escaped = false;
+    frame.set_escaped(false);
     frame.set_blocklist(&[]);
 }
 
