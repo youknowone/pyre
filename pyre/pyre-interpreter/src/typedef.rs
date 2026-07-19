@@ -39,10 +39,21 @@ pub struct Member;
 #[derive(Debug, Default)]
 pub struct ClassAttr;
 
-pub fn default_identity_hash(_space: PyObjectRef, _w_obj: PyObjectRef) -> PyObjectRef {
-    let _ = _space;
-    let _ = _w_obj;
-    0 as *mut pyre_object::PyObject
+/// `pypy/interpreter/typedef.py:138-143 default_identity_hash`.
+///
+/// Exact immutable builtin values use their value-derived unique id; ordinary
+/// objects use RPython's `compute_identity_hash`, whose translated minimark
+/// implementation is `mangle_hash(id_or_identityhash(obj))`.
+pub fn default_identity_hash_value(w_obj: PyObjectRef) -> i64 {
+    if let Some(w_unique_id) = crate::function::immutable_unique_id(w_obj) {
+        return crate::builtins::hash_value(w_unique_id);
+    }
+    let identity = pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64;
+    identity ^ (identity >> 4)
+}
+
+pub fn default_identity_hash(_space: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
+    pyre_object::w_int_new(default_identity_hash_value(w_obj))
 }
 
 pub fn get_unique_interplevel_subclass(_space: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
@@ -13735,7 +13746,7 @@ fn init_complex_type(ns: PyObjectRef) {
                         )
                     };
                     Ok(pyre_object::w_int_new(
-                        crate::objspace::descroperation::complex_hash(re, im),
+                        crate::objspace::descroperation::complex_hash(args[0], re, im),
                     ))
                 },
                 1,
@@ -14944,13 +14955,7 @@ fn init_object_type(ns: PyObjectRef) {
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
-                |args| {
-                    Ok(pyre_object::w_int_new(if args.is_empty() {
-                        0
-                    } else {
-                        args[0] as i64
-                    }))
-                },
+                |args| Ok(default_identity_hash(pyre_object::PY_NULL, args[0])),
                 1,
             ),
         )

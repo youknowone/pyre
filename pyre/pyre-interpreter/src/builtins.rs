@@ -8248,8 +8248,9 @@ pub(crate) fn _hash_long(v: &BigInt) -> i64 {
 /// reduces the mantissa/exponent modulo the Mersenne prime
 /// `HASH_MODULUS = 2**61 - 1` (keeping the sign), so `hash(2.0) == hash(2)`
 /// and the `±inf` sentinels are `±314159`; subnormals decompose exactly.
-/// It returns `None` for NaN, and the sole caller (`hash_value`) reaches
-/// here without a prior NaN check, so map that to `HASH_NAN`.
+/// It returns `None` for NaN.  Object-aware callers replace that case with
+/// `default_identity_hash`; `_hash_float` retains PyPy's internal sentinel
+/// for call sites that have no wrapped object.
 #[inline]
 pub(crate) fn _hash_float(v: f64) -> i64 {
     rustpython_common::hash::hash_float(v).unwrap_or(HASH_NAN)
@@ -8398,10 +8399,16 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return _hash_long(pyre_object::w_long_get_value(obj));
         }
         if is_float(obj) {
-            return _hash_float(pyre_object::w_float_get_value(obj));
+            let value = pyre_object::w_float_get_value(obj);
+            return if value.is_nan() {
+                crate::typedef::default_identity_hash_value(obj)
+            } else {
+                _hash_float(value)
+            };
         }
         if pyre_object::is_complex(obj) {
             return crate::objspace::descroperation::complex_hash(
+                obj,
                 pyre_object::w_complex_get_real(obj),
                 pyre_object::w_complex_get_imag(obj),
             );
@@ -8492,7 +8499,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
                 }
             }
         }
-        obj as i64
+        crate::typedef::default_identity_hash_value(obj)
     }
 }
 
@@ -10772,7 +10779,17 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                     if !v.is_finite() {
                         Ok(floatobject::w_float_new(v))
                     } else {
-                        Ok(floatobject::w_float_new(float_round_ndigits(v, n)))
+                        let rounded = float_round_ndigits(v, n);
+                        if rounded.is_infinite() {
+                            // CPython 3.14 `double_round`: PyPy performs the
+                            // same post-rounding infinity check, but retains
+                            // its older error text.
+                            Err(crate::PyError::overflow_error(
+                                "rounded value too large to represent",
+                            ))
+                        } else {
+                            Ok(floatobject::w_float_new(rounded))
+                        }
                     }
                 }
                 // `floatobject.py:954-960 _round_float`: single-argument

@@ -13005,15 +13005,14 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     }
     unsafe {
         if is_list(haystack) {
-            let len = w_list_len(haystack);
-            for i in 0..len {
-                if let Some(item) = w_list_getitem(haystack, i as i64) {
-                    if eq_w(item, needle)? {
-                        return Ok(true);
-                    }
-                }
-            }
-            return Ok(false);
+            // `W_ListObject.descr_contains`: membership is the same
+            // strategy-aware `find_or_count` operation used by count/index.
+            // In particular FloatListStrategy preserves an erased NaN's
+            // identity shortcut with its bit-pattern comparison.
+            return Ok(matches!(
+                crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false,)?,
+                crate::listobject::FindOrCountResult::Index(_)
+            ));
         }
         if is_tuple(haystack) {
             let len = w_tuple_len(haystack);
@@ -13178,34 +13177,8 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
 ///   `self.is_w(w_obj1, w_obj2) or self.is_true(self.eq(w_obj1, w_obj2))`.
 /// A raising `__eq__` or a raising `__bool__` on its result propagates.
 pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
-    if a == b {
+    if is_w(a, b) {
         return Ok(true);
-    }
-    unsafe {
-        use pyre_object::*;
-        // The by-value fast paths assume exact builtin operands; a subclass
-        // overriding `__eq__` must dispatch through `compare` instead.
-        if is_exact_builtin_instance(a) && is_exact_builtin_instance(b) {
-            if (is_int(a) || is_bool(a)) && (is_int(b) || is_bool(b)) {
-                let av = if is_bool(a) {
-                    w_bool_get_value(a) as i64
-                } else {
-                    w_int_get_value(a)
-                };
-                let bv = if is_bool(b) {
-                    w_bool_get_value(b) as i64
-                } else {
-                    w_int_get_value(b)
-                };
-                return Ok(av == bv);
-            }
-            if is_str(a) && is_str(b) {
-                // Compare WTF-8 bytes so lone-surrogate strings compare by
-                // content instead of panicking in `w_str_get_value`.
-                return Ok(pyre_object::w_str_get_wtf8(a).as_bytes()
-                    == pyre_object::w_str_get_wtf8(b).as_bytes());
-            }
-        }
     }
     Ok(is_true(compare(a, b, CompareOp::Eq)?)?)
 }

@@ -44,6 +44,23 @@ assert type(subclass_value) is FloatSubclass
 
 nan = float("nan")
 assert float.from_number(nan) is nan
+assert hash(nan) == object.__hash__(nan)
+
+
+class NanSubclass(float):
+    pass
+
+
+nan_subclass = NanSubclass("nan")
+assert hash(nan_subclass) == object.__hash__(nan_subclass)
+
+for value in (1.6e308, -1.7e308):
+    try:
+        round(value, -308)
+    except OverflowError as error:
+        assert str(error) == "rounded value too large to represent"
+    else:
+        raise AssertionError("an infinite rounded result must overflow")
 
 
 class FloatString(str):

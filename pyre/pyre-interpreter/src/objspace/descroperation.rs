@@ -1511,9 +1511,20 @@ unsafe fn complex_richcompare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> 
 }
 
 /// `complexobject.c complex_hash` — `hash(real) + _PyHASH_IMAG * hash(imag)`.
-pub(crate) fn complex_hash(real: f64, imag: f64) -> i64 {
-    let hr = crate::builtins::_hash_float(real);
-    let hi = crate::builtins::_hash_float(imag);
+pub(crate) fn complex_hash(obj: PyObjectRef, real: f64, imag: f64) -> i64 {
+    // `complexobject.py descr_hash`: each NaN lane uses the containing
+    // complex object's identity hash, not the float HASH_NAN sentinel.
+    let identity = || crate::typedef::default_identity_hash_value(obj);
+    let hr = if real.is_nan() {
+        identity()
+    } else {
+        crate::builtins::_hash_float(real)
+    };
+    let hi = if imag.is_nan() {
+        identity()
+    } else {
+        crate::builtins::_hash_float(imag)
+    };
     let combined = hr.wrapping_add(hi.wrapping_mul(HASH_IMAG));
     if combined == -1 { -2 } else { combined }
 }
