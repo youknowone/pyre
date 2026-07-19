@@ -448,9 +448,16 @@ fn t3_audit_opname_gap_inventory() {
     // function's string literals.  Source-of-truth scan against
     // the files themselves so this probe stays accurate as handlers
     // land/leave.  `arith.rs` carries the `regular_record_table!` arms
-    // (the `int_*` / `float_*` / `ptr_*` families) as opname literals, so
-    // it is scanned alongside `mod.rs`.
-    let source = concat!(include_str!("mod.rs"), "\n", include_str!("arith.rs"));
+    // (the `int_*` / `float_*` / `ptr_*` families) as opname literals, and
+    // `residual_call.rs` carries the residual-call body match arms, so both
+    // are scanned alongside `mod.rs`.
+    let source = concat!(
+        include_str!("mod.rs"),
+        "\n",
+        include_str!("arith.rs"),
+        "\n",
+        include_str!("residual_call.rs"),
+    );
     let mut handled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Heuristic: scan the literal patterns that appear ONLY in
     // dispatch arms of `handle()` — they look like
