@@ -4565,7 +4565,18 @@ pub fn build_residual_call_r_r_insn_from_operands(
     dst_reg: Register,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
-    let mut effect_info = effect_info_for_call_flavor(flavor);
+    // `bh_call_fn_N` dispatches the callable supplied at runtime.  Its target
+    // is therefore the indirect-call top set, not the empty effect set of the
+    // helper wrapper itself: user code can mutate any escaped heap location.
+    // `effectinfo_from_writeanalyze` promotes that shape to RANDOM_EFFECTS,
+    // which makes both the tracing heapcache and OptHeap forget values across
+    // the residual call.  In particular, a callee can rewrite an
+    // `IntMutableCell.intvalue` without changing the module-dict version.
+    let mut effect_info = if pyre_helper == majit_ir::PyreHelperKind::CallFn {
+        majit_ir::EffectInfo::MOST_GENERAL
+    } else {
+        effect_info_for_call_flavor(flavor)
+    };
     effect_info.pyre_helper = pyre_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
@@ -10180,7 +10191,7 @@ mod tests {
                                 stub.arg_kinds,
                                 vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref]
                             );
-                            let mut expected_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
+                            let mut expected_ei = majit_ir::EffectInfo::MOST_GENERAL;
                             expected_ei.pyre_helper = majit_ir::PyreHelperKind::CallFn;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
@@ -10264,7 +10275,7 @@ mod tests {
         let arg1 = Variable::new(VariableId(7), Kind::Ref);
         let arg2 = Variable::new(VariableId(8), Kind::Ref);
         let dst = Variable::new(VariableId(9), Kind::Ref);
-        let mut call_fn_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
+        let mut call_fn_ei = majit_ir::EffectInfo::MOST_GENERAL;
         call_fn_ei.pyre_helper = majit_ir::PyreHelperKind::CallFn;
         let descr = intern_call_descr_stub(
             call_fn_ei,
