@@ -175,11 +175,9 @@ fn rewire_one_range_contains_site(
     //    definition.  The single-consumer gate below is what makes this
     //    sound; here we only need to pick the producing site.
     let c_block = graph.blocks[c_idx].id;
-    let (new_site, range_trace) = new_sites
+    let new_site = new_sites
         .iter()
-        .find_map(|s| {
-            range_matches_new_site(graph, c_block, &range_v, &s.result_var).map(|trace| (s, trace))
-        })
+        .find(|s| range_matches_new_site(graph, c_block, &range_v, &s.result_var))
         .ok_or_else(|| {
             format!("{name}: range contains receiver traces to no RangeInclusive::new site")
         })?;
@@ -187,11 +185,10 @@ fn rewire_one_range_contains_site(
     // 4. Consumer-shape gate (excludes iteration-form ranges, whose
     //    range carries a stateful `exhausted` field read a second time by
     //    an iterator's `into_iter` / `next`).  The range value must be
-    //    read as an OP operand by exactly the `contains` op being folded.
-    //    Only the positional producer-to-consumer Links recorded by the
-    //    trace are permitted; any other Link carrying any traced alias means
-    //    the range survives past (or branches away from) `contains`.
-    if !range_value_single_op_consumer(graph, &range_trace, &site.result_var) {
+    //    read as an OP operand by exactly the `contains` op being folded;
+    //    dead framestate `Link.args` forwarding past the `contains` block
+    //    is reclaimed by `prune_dead_phis` and does not count.
+    if !range_value_single_op_consumer(graph, &new_site.result_var, &site.result_var) {
         return Err(format!(
             "{name}: range value has a second consumer — declining (iteration form?)"
         ));
@@ -249,39 +246,22 @@ fn rewire_one_range_contains_site(
 /// value at the matching link-arg index, recursing on that supplied
 /// Variable until it either reaches `new_result` (match) or a block that
 /// defines it via an op (must then equal `new_result`).
-struct RangeAliasTrace {
-    aliases: Vec<Variable>,
-    /// `(predecessor block, exit index, link-argument index)` for each
-    /// positional forwarding edge on the producer-to-`contains` trace;
-    /// RPython's `Link.args` carries these Variables positionally
-    /// (`rpython/flowspace/model.py:140-149`).
-    threaded_links: Vec<(BlockId, usize, usize)>,
-}
-
 fn range_matches_new_site(
     graph: &FunctionGraph,
     c_block: BlockId,
     range_v: &Variable,
     new_result: &Variable,
-) -> Option<RangeAliasTrace> {
+) -> bool {
     let mut cur_block = c_block;
     let mut cur_var = range_v.clone();
-    let mut aliases = vec![cur_var.clone()];
-    let mut threaded_links = Vec::new();
     let mut hops = 0usize;
     loop {
         if &cur_var == new_result {
-            if !aliases.contains(new_result) {
-                aliases.push(new_result.clone());
-            }
-            return Some(RangeAliasTrace {
-                aliases,
-                threaded_links,
-            });
+            return true;
         }
         hops += 1;
         if hops > graph.blocks.len() {
-            return None;
+            return false;
         }
         // `cur_var` must be a block inputarg to trace across the edge;
         // if it is defined by an op in `cur_block` and is not
@@ -292,7 +272,7 @@ fn range_matches_new_site(
             .iter()
             .position(|v| v == &cur_var)
         else {
-            return None;
+            return false;
         };
         // Exactly one predecessor edge, carrying the source at `arg_idx`.
         let pred_edges: Vec<(BlockId, usize)> = graph
@@ -308,18 +288,14 @@ fn range_matches_new_site(
             })
             .collect();
         if pred_edges.len() != 1 {
-            return None;
+            return false;
         }
         let (pred_block, exit_idx) = pred_edges[0];
         let Some(LinkArg::Value(src)) = graph.block(pred_block).exits[exit_idx].args.get(arg_idx)
         else {
-            return None;
+            return false;
         };
-        threaded_links.push((pred_block, exit_idx, arg_idx));
         cur_var = src.clone();
-        if !aliases.contains(&cur_var) {
-            aliases.push(cur_var.clone());
-        }
         cur_block = pred_block;
     }
 }
@@ -361,18 +337,66 @@ fn can_thread_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable) ->
 /// iteration-form ranges (whose range carries a stateful `exhausted`
 /// field an iterator's `into_iter` / `next` reads a second time).
 ///
-/// Framestate SSA can mint a fresh inputarg at every forwarding block, so the
-/// gate checks every Variable in the positional producer trace rather than
-/// only its endpoints.  The trace's own Link slots are the only permitted
-/// forwarding reads.  Any other op, exitswitch, Link arg, exception Link
-/// payload, return, iterator, second `contains`, or clone carrying an alias is
-/// a second consumer and declines before either residual call is removed.
+/// The genuine soundness requirement is that no operation other than the
+/// `contains` being folded READS the range value.  A range that merely
+/// rides framestate `Link.args` past the `contains` block without being
+/// read is dead once `new`/`contains` are removed — `prune_dead_phis`
+/// (run by the caller after any rewrite) reclaims the dead inputarg /
+/// link-arg forwards.  So link-arg forwarding is NOT a second consumer;
+/// only an op operand, an `exitswitch` discriminator, or an exception
+/// payload read is.
+///
+/// Framestate SSA can rename the range value into a fresh inputarg at
+/// every forwarding block, so a purely backward positional trace cannot
+/// see a read that happens under a renamed alias.  This computes the
+/// FORWARD alias closure from the `new` result — the fixpoint set of
+/// every Variable the range value flows into through `Link.args` — and
+/// then rejects if any op/exitswitch/exception payload (other than the
+/// folded `contains`) reads a Variable in that closure.  An iteration-form
+/// range's `into_iter`/`next` reads the range as an op operand, so it is
+/// caught even after a rename; a dead forward is not.
 fn range_value_single_op_consumer(
     graph: &FunctionGraph,
-    trace: &RangeAliasTrace,
+    new_result: &Variable,
     contains_result: &Variable,
 ) -> bool {
-    let is_range_value = |v: &Variable| trace.aliases.contains(v);
+    use std::collections::HashSet;
+    // Forward alias closure: every Variable the `new` result reaches
+    // through positional `Link.args` forwarding.  Seed with the producer
+    // result, then iterate to a fixpoint — a link arg in the closure adds
+    // the target block's inputarg at the matching position (the renamed
+    // alias in the successor).
+    let mut closure: HashSet<Variable> = HashSet::new();
+    closure.insert(new_result.clone());
+    loop {
+        let mut grew = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target_idx) = graph
+                    .blocks
+                    .iter()
+                    .position(|b| b.id == link.target)
+                else {
+                    continue;
+                };
+                let target_inputargs = &graph.blocks[target_idx].inputargs;
+                for (arg_idx, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(var) = arg else { continue };
+                    if closure.contains(var)
+                        && let Some(iarg) = target_inputargs.get(arg_idx)
+                        && closure.insert(iarg.clone())
+                    {
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let is_range_value = |v: &Variable| closure.contains(v);
     for block in &graph.blocks {
         for op in &block.operations {
             let reads_range = crate::inline::op_variable_refs(&op.kind)
@@ -393,17 +417,7 @@ fn range_value_single_op_consumer(
             }
             _ => {}
         }
-        for (exit_idx, link) in block.exits.iter().enumerate() {
-            for (arg_idx, arg) in link.args.iter().enumerate() {
-                let LinkArg::Value(var) = arg else { continue };
-                if is_range_value(var)
-                    && !trace
-                        .threaded_links
-                        .contains(&(block.id, exit_idx, arg_idx))
-                {
-                    return false;
-                }
-            }
+        for link in &block.exits {
             if link
                 .last_exception
                 .as_ref()
@@ -814,5 +828,102 @@ mod tests {
             1,
             "residual new survives",
         );
+    }
+
+    /// The range value rides framestate `Link.args` past the `contains`
+    /// block into a successor that only forwards it onward (never reads it
+    /// as an op operand) — the shape the real `setitem_bytearray`
+    /// `(0..=255).contains(&v)` lowers to, where the loop-carried `v`
+    /// framestate slot threads the dead range temporary through the whole
+    /// tail CFG.  This is a DEAD forward, not a second consumer: after the
+    /// fold removes `new`/`contains`, `prune_dead_phis` reclaims the dead
+    /// inputarg / link args.  It must FOLD (contrast
+    /// `rewrite_declines_when_successor_carries_fresh_range_alias`, where the
+    /// successor READS the alias via an op).
+    #[test]
+    fn rewrite_folds_when_dead_range_alias_forwarded_past_contains() {
+        let mut g = FunctionGraph::new("test_range_contains_dead_forward");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(255), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target(),
+                    args: vec![a.clone(), b.clone()],
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+
+        // Block C: identity-preserved delivery of the range to `contains`.
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let range_in_c = c_args[0].clone();
+        let x = g.push_op_var(c, OpKind::ConstInt(42), true).unwrap();
+        let contains = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: contains_target(),
+                    args: vec![range_in_c.clone(), x],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        // Successor S receives the range on a framestate link-arg but never
+        // reads it — a dead forward.  Its only live op reads an unrelated
+        // value (the `contains` result), and it returns that, not the range.
+        let (s, s_args) = g.create_block_with_arg_vars(2);
+        let range_in_s = s_args[0].clone();
+        let other_in_s = s_args[1].clone();
+        let ret = g
+            .push_op_var(
+                s,
+                OpKind::UnaryOp {
+                    op: "invert".to_string(),
+                    operand: other_in_s,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(s, Some(ret));
+        // C forwards the dead range plus the `contains` result onward.
+        let _ = range_in_s;
+        g.set_goto(c, s, vec![range_in_c.clone(), contains.clone()]);
+        g.set_goto(n, c, vec![range.clone()]);
+
+        let rewritten = rewire_range_contains_call_sites(
+            &mut g,
+            &[RangeInclusiveNewSite {
+                result_var: range,
+                lo: a,
+                hi: b,
+            }],
+            &[RangeContainsSite {
+                result_var: contains.clone(),
+            }],
+        );
+        assert_eq!(
+            rewritten, 1,
+            "a dead range forward past contains must still fold"
+        );
+        assert_eq!(
+            functionpath_calls_ending(&g, &["range", "RangeInclusive", "new"]),
+            0,
+            "residual new removed",
+        );
+        assert_eq!(
+            functionpath_calls_ending(&g, &["range", "RangeInclusive", "contains"]),
+            0,
+            "residual contains removed",
+        );
+        assert_eq!(binop_results(&g, "le").len(), 1, "one `le` compare emitted");
+        assert_eq!(binop_results(&g, "ge").len(), 1, "one `ge` compare emitted");
+        assert_eq!(binop_results(&g, "bitand").len(), 1, "one `bitand` emitted");
     }
 }
