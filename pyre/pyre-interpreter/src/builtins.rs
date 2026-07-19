@@ -2152,6 +2152,16 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "next", || {
         make_module_builtin_function("next", builtin_next)
     });
+    // aiter/anext resolve their app-level implementations lazily; the
+    // builtins dict is filled before an execution context exists.  Arity is
+    // enforced by the app-level `def aiter(obj)` / `def anext(iterator,
+    // default=...)` signatures, so no interp-level arity is imposed here.
+    crate::module_ns_get_or_insert_with(ns, "aiter", || {
+        make_module_builtin_function("aiter", crate::async_operation::builtin_aiter)
+    });
+    crate::module_ns_get_or_insert_with(ns, "anext", || {
+        make_module_builtin_function("anext", crate::async_operation::builtin_anext)
+    });
     crate::module_ns_get_or_insert_with(ns, "callable", || {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });

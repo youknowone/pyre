@@ -69,6 +69,7 @@ pub mod host_seam {
 pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;
+pub mod async_operation;
 pub mod pycode;
 pub mod pyopcode;
 pub mod pytraceback;
