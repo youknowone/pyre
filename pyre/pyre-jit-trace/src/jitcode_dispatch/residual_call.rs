@@ -1,6 +1,12 @@
 //! Residual-call dispatch: the tracer path for a callee that cannot be
 //! folded or inlined and must be recorded as a residual `CALL_*` operation.
 //!
+//! **Parity:** trace-side counterpart of `pyjitpl.py`'s
+//! `opimpl_residual_call_*`; the executor fast paths call into
+//! `majit-metainterp/executor.rs` (`executor.py`). PyPy keeps these opimpls
+//! inside `pyjitpl.py`'s `MIFrame`; the split into this file is pyre-local
+//! navigability, not a PyPy file boundary.
+//!
 //! Relocated verbatim from `jitcode_dispatch/mod.rs`. Covers the per-shape
 //! dispatchers (`dispatch_residual_call_{iRd,iIRd,iIRFd}_kind`), the
 //! executor fast paths (`try_fold_pure_call_via_executor`,

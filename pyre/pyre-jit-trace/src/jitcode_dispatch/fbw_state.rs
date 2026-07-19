@@ -2,6 +2,12 @@
 //! the tracer consults while deciding whether an opcode can be folded,
 //! inlined, or must fall back to a residual call.
 //!
+//! **Parity:** pyre-specific — the FBW (full-body-walk) live tracer has no
+//! `rpython/jit/metainterp/` file counterpart. PyPy's parity-faithful
+//! `MIFrame` interpret loop lives in `majit-metainterp/pyjitpl.rs` and is
+//! retired as the production path; this is walker-local state with no
+//! upstream analogue.
+//!
 //! Relocated verbatim from `jitcode_dispatch/mod.rs`. Groups the
 //! `PYRE_FBW_*` feature gates, the store / append / for-iter journals and
 //! their rollback machinery, the executed-effect and residual counters,

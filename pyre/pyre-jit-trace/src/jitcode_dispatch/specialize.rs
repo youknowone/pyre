@@ -5,6 +5,11 @@
 //! module/name cell folds) and either fold or record a specialized trace,
 //! returning `None` to fall through to the generic path.
 //!
+//! **Parity:** pyre-local trace-time folding. PyPy defers most
+//! specialization to `optimizeopt/` (a separate later pass); pyre folds
+//! during the walk instead. The fast-path shapes still mirror the
+//! `opimpl_*` fast paths and `blackhole.py`'s `bhimpl_*` folds.
+//!
 //! Relocated verbatim from `jitcode_dispatch/mod.rs`. The shared walker
 //! primitives these build on (unbox/box, guard emission, operand reads)
 //! stay in `mod.rs`; the specialization opname arms stay in `handle` and

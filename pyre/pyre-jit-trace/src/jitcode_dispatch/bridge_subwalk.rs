@@ -1,5 +1,8 @@
 //! Bridge / sub-walk driving.
 //!
+//! **Parity:** trace-side counterpart of `MetaInterp`'s bridge / sub-trace
+//! handling (`pyjitpl.py` + `compile.py`).
+//!
 //! `dispatch_via_miframe` entry plus the bridge-root / recipe-parent /
 //! middle-frame / outer-frame continuation drivers that recurse the
 //! walker into inlined and bridged frames.

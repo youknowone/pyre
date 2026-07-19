@@ -1,6 +1,10 @@
 //! Value-stack mirror: classify / reconcile / reseed / seed / step /
 //! enter-handler.
 //!
+//! **Parity:** pyre-specific — mirrors the interpreter value-stack shape
+//! for the FBW walker; PyPy's `MIFrame` uses register banks with no stack
+//! mirror.
+//!
 //! Tracks the interpreter value-stack shape alongside the walker so a
 //! guard resume coordinate and the catch-landing depth can be
 //! reconstructed. Includes the pc-map block-head helpers the mirror

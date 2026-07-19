@@ -1,5 +1,9 @@
 //! pc-map inversion helpers and `PYRE_PCMAP_*` audit probes.
 //!
+//! **Parity:** pyre-specific — the jitcode-pc <-> python-pc inversion and
+//! the `PYRE_PCMAP_*` audit probes have no `rpython/jit/metainterp/`
+//! counterpart (PyPy's pc handling is codewriter-side).
+//!
 //! Extracted verbatim from `jitcode_dispatch/mod.rs`: the jitcode-pc ->
 //! python-pc inversion (`python_pc_for_jitcode_pc` + floor-boundary
 //! helpers), the `skip_python_trivia_forward` boundary walker, and the

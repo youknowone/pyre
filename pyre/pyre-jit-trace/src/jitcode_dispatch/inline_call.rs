@@ -1,6 +1,11 @@
 //! Inline-call tracing: resolving a user-defined callee and walking its
 //! body inline instead of recording a residual call.
 //!
+//! **Parity:** trace-side counterpart of `pyjitpl.py`'s
+//! `opimpl_inline_call_*` / `opimpl_recursive_call` and the `MetaInterp`
+//! inline-callee machinery. PyPy keeps these inside `pyjitpl.py`; the split
+//! into this file is pyre-local navigability, not a PyPy file boundary.
+//!
 //! Relocated verbatim from `jitcode_dispatch/mod.rs`. Covers callee
 //! recognition and inlinability checks, active-box / call-stack
 //! reconstruction, callee register-bank allocation, the sub-jitcode walk

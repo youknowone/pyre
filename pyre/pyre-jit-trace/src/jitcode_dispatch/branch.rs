@@ -1,6 +1,12 @@
 //! Branch-target resolution, trampoline decoding, and branch-arm
 //! resume liveness / kept-stack hazard analysis.
 //!
+//! **Parity:** trace-side counterpart of `pyjitpl.py:497-536`'s
+//! `opimpl_goto*`. NOTE pyre's codewriter emits an UNFUSED `goto_if_not/iL`
+//! plus a separate `compare_op`, so PyPy's fused `goto_if_not_int_lt`
+//! family (`pyjitpl.py:541`) has no pyre opname — a codewriter-level
+//! divergence, not a tracer one.
+//!
 //! Helpers for the `goto_if_*` guard arms: follow register-renaming
 //! trampolines to the real py-boundary target, decode the side-exit
 //! other-target, and decide whether a branch arm resume can restore the

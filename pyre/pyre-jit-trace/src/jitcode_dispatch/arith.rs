@@ -1,5 +1,9 @@
 //! Arithmetic / comparison / cast / ptr-and-ref record helpers.
 //!
+//! **Parity:** trace-side recorders for the `pyjitpl.py:279-368`
+//! exec-generated `opimpl_*` families; the `regular_record_table!` macro
+//! below mirrors that generation rather than hand-spelling each arm.
+//!
 //! The `handle` dispatch arms for the `int_*` / `float_*` / `ptr_*`
 //! opcode families funnel into these kind-parameterized recorders --
 //! the Rust analogue of the exec-generated `opimpl_*` loops in

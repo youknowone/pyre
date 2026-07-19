@@ -1,5 +1,9 @@
 //! Heapcache-aware field and array-item recording.
 //!
+//! **Parity:** trace-side counterpart of `pyjitpl.py`'s field / array
+//! `_opimpl_*` consulting `heapcache.py` (implementation mirror
+//! `majit-metainterp/heapcache.rs`).
+//!
 //! getfield / setfield / getarrayitem / setarrayitem recorded through
 //! the heapcache (`pyjitpl.py` `_opimpl_*field*` / `_do_*arrayitem_gc`):
 //! a cache hit returns the cached OpRef without emitting IR; a miss

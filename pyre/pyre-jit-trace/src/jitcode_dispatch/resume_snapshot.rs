@@ -1,5 +1,8 @@
 //! Guard resume-data snapshot capture.
 //!
+//! **Parity:** trace-side counterpart of `resume.py`'s `capture_resumedata`
+//! (implementation mirror `majit-metainterp/resume.rs`).
+//!
 //! Builds the resume-data snapshot attached to the last recorded guard
 //! (the `capture_resumedata` analogue): the single-frame path
 //! (`walker_capture_snapshot_for_last_guard*`) and the multi-frame inline

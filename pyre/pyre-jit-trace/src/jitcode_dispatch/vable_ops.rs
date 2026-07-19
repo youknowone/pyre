@@ -1,5 +1,10 @@
 //! Virtualizable field / array access via the metainterp.
 //!
+//! **Parity:** trace-side counterpart of `pyjitpl.py`'s virtualizable
+//! `opimpl_*`, backed by `virtualizable.py` / `virtualref.py`
+//! (implementation mirrors `majit-metainterp/virtualizable.rs` /
+//! `virtualref.rs`).
+//!
 //! getfield / setfield / getarrayitem / setarrayitem / arraylen against
 //! a virtualizable, routed through the metainterp vable bookkeeping.
 

@@ -11,6 +11,15 @@
 //! `MIFrame::execute_opcode_step` interpret loop is retired
 //! (#203 gap 10 / #73 Phase 6).
 //!
+//! Module layout vs. RPython: because this FBW walker has no single
+//! `rpython/jit/metainterp/` file counterpart (the file-for-file parity
+//! mirror is the `majit-metainterp` crate — `pyjitpl.rs`, `executor.rs`,
+//! `heapcache.rs`, `resume.rs`, `virtualizable.rs`, `blackhole.rs`, ...),
+//! the submodules here are a pyre-local navigability split. Each submodule
+//! header names the PyPy concept it is the trace-side counterpart of, or
+//! declares itself pyre-specific where there is no upstream analogue.
+//! Behavioural parity is enforced per opcode arm, not per file.
+//!
 //! Opcode coverage:
 //!
 //! | opname              | parity status | behaviour |
