@@ -41,6 +41,33 @@ assert list(reversed(r)) == [11, 8, 5, 2]
 assert 8 in r and 9 not in r
 assert r.count(8) == 1 and r.count(8.0) == 1
 assert r.index(8) == 2 and r.index(8.0) == 2
+
+
+class AlwaysEqual:
+    def __eq__(self, other):
+        return True
+
+
+class EqualIntSubclass(int):
+    def __eq__(self, other):
+        return True
+
+
+assert range(10).count(AlwaysEqual()) == 10
+assert EqualIntSubclass(11) in range(10)
+assert list(range(1, 9, 3)[-1:-3:-1]) == [7, 4]
+assert list(range(8, 0, -3)[-1:-3:-1]) == [2, 5]
+for method_name in ("count", "index"):
+    method = getattr(range(3), method_name)
+    try:
+        method()
+    except TypeError as error:
+        assert str(error) == (
+            f"range.{method_name}() takes exactly one argument (0 given)"
+        )
+    else:
+        raise AssertionError(f"range.{method_name}() must require one argument")
+
 assert range(0, 3, 2) == range(0, 4, 2)
 assert hash(range(0, 3, 2)) == hash(range(0, 4, 2))
 assert range.__eq__(r, object()) is NotImplemented

@@ -1771,13 +1771,11 @@ unsafe fn compute_slice_indices3_big(
 /// `functional.py W_Range._compute_slice` — build the NEW `range`
 /// a slice of `obj` denotes.
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
-    use num_traits::Zero;
     let len_b = pyre_object::range_obj_to_bigint(pyre_object::w_range_length(obj));
     let (sl_start, sl_stop, sl_step) = compute_slice_indices3_big(slice, &len_b)?;
     let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
     let rstart_b = pyre_object::range_obj_to_bigint(rstart);
     let rstep_b = pyre_object::range_obj_to_bigint(rstep);
-    let stop_is_zero = sl_stop.is_zero();
     let substart = &rstart_b + &sl_start * &rstep_b;
     let substep = &rstep_b * &sl_step;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1785,31 +1783,74 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     pyre_object::gc_roots::pin_root(w_substart);
     let w_substep = pyre_object::range_bigint_to_obj(substep);
     pyre_object::gc_roots::pin_root(w_substep);
-    let w_substop = if stop_is_zero {
-        w_substart
-    } else {
-        let substop = &rstart_b + &sl_stop * &rstep_b;
-        let o = pyre_object::range_bigint_to_obj(substop);
-        pyre_object::gc_roots::pin_root(o);
-        o
-    };
+    // functional.py:523-526 tests `if w_stop`, i.e. whether the wrapped
+    // pointer exists, not whether its integer payload is zero.  The wrapped
+    // result of compute_slice_indices3 is always present, so compute the stop
+    // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
+    let substop = &rstart_b + &sl_stop * &rstep_b;
+    let w_substop = pyre_object::range_bigint_to_obj(substop);
+    pyre_object::gc_roots::pin_root(w_substop);
     Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
+}
+
+/// `space.type(w_item) is space.w_int or space.w_bool` used by
+/// `W_Range.descr_contains/count/index`.  BigInt-backed exact ints share the
+/// canonical `int` class through `is_exact_type`; an int subclass must take
+/// the elementwise comparison path so its `__eq__` override is honored.
+unsafe fn range_integer_fast_path(item: PyObjectRef) -> bool {
+    is_bool(item) || pyre_object::is_exact_type(item, &pyre_object::INT_TYPE)
 }
 
 /// `range.count(value)` — `functional.py W_Range.descr_count`.
 pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "range.count() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let obj = args[0];
-    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
-    Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
+    let needle = args[1];
+    unsafe {
+        if range_integer_fast_path(needle) {
+            let item = pyre_object::range_obj_to_bigint(needle);
+            return Ok(w_int_new(
+                pyre_object::w_range_contains_bigint(obj, &item) as i64
+            ));
+        }
+    }
+    // `space.sequence_count(self, w_item)` — scan the whole sequence, not
+    // merely until the first match.  Keep the counter unbounded like PyPy's
+    // wrapped integer accumulator.
+    let it = iter(obj)?;
+    let mut count = malachite_bigint::BigInt::from(0);
+    loop {
+        match next(it) {
+            Ok(item) => {
+                if is_true(compare(item, needle, CompareOp::Eq)?)? {
+                    count += malachite_bigint::BigInt::from(1);
+                }
+            }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pyre_object::range_bigint_to_obj(count))
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
 pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "range.index() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let obj = args[0];
-    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
+    let needle = args[1];
     unsafe {
         // int / bool / long needle → O(1) `(value - start) // step`.
-        if is_int(needle) || is_long(needle) {
+        if range_integer_fast_path(needle) {
             let item = pyre_object::range_obj_to_bigint(needle);
             if pyre_object::w_range_contains_bigint(obj, &item) {
                 return Ok(pyre_object::w_range_index_of(obj, &item));
@@ -12983,7 +13024,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     // an int/long needle; any other type falls back to an elementwise scan.
     unsafe {
         if pyre_object::is_w_range(haystack) {
-            if is_int(needle) || is_long(needle) {
+            if range_integer_fast_path(needle) {
                 let item = pyre_object::range_obj_to_bigint(needle);
                 return Ok(pyre_object::w_range_contains_bigint(haystack, &item));
             }
