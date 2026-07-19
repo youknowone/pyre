@@ -5805,13 +5805,27 @@ fn reconstruct_inline_recipe(
     // with the RPython frame shape and creating NO new vable. The color==
     // semantic identity check below only accepts a register-section callee
     // (locals at colors 0..nlocals), which this shape never satisfies.
+    //
+    // An `in_a_call` callee suspended at one of its own CALL sites carries a
+    // pending result whose register was already dropped from the ref bank above
+    // (`pending_value_index`). When that pending-result color coincides with the
+    // `ec` portal red, the removal leaves only `[frame]` live — a one-ref
+    // reduced form of the SAME portal-callee shape. `pec_reg` is consumed only
+    // by this classifier gate; the reconstruction body threads
+    // `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w` array and never
+    // reads `ec`, so `[frame]` alone is still faithfully reconstructable (the
+    // pending operand slot is delivered by `make_result_of_lastop`, not from
+    // resumedata, and is skipped by `pending_result_abs_slot` below).
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
+    let has_frame = reg_indices.ref_.contains(&pframe_reg);
+    let full_portal =
+        reg_indices.ref_.len() == 2 && has_frame && reg_indices.ref_.contains(&pec_reg);
+    let in_call_portal =
+        in_a_call && pending_value_index.is_some() && reg_indices.ref_.len() == 1 && has_frame;
     if pframe_reg != u32::from(u16::MAX)
         && pec_reg != u32::from(u16::MAX)
-        && reg_indices.ref_.len() == 2
-        && reg_indices.ref_.contains(&pframe_reg)
-        && reg_indices.ref_.contains(&pec_reg)
+        && (full_portal || in_call_portal)
     {
         use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
         let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
