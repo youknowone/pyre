@@ -66,6 +66,28 @@ class MarshalTests(unittest.TestCase):
             bytearray(b"\x01\x02"),
         )
 
+    def test_marshal_additional_atoms(self):
+        self._test_marshal(None)
+        self._test_marshal(Ellipsis)
+        self._test_marshal(StopIteration)
+        self._test_marshal(2**100)
+        self._test_marshal(-(2**100))
+        self._test_marshal(1 + 2j)
+        self._test_marshal(b"marshal")
+
+    def test_shared_reference(self):
+        shared = [1, 2]
+        loaded = self.dump_then_load([shared, shared])
+        self.assertIs(loaded[0], loaded[1])
+
+    def test_file_api(self):
+        from io import BytesIO
+
+        stream = BytesIO()
+        self.assertIsNone(marshal.dump({"answer": 42}, stream))
+        stream.seek(0)
+        self.assertEqual(marshal.load(stream), {"answer": 42})
+
     def test_roundtrip(self):
         orig = compile("1 + 1", "", "eval")
 
@@ -73,6 +95,9 @@ class MarshalTests(unittest.TestCase):
         loaded = marshal.loads(dumped)
 
         assert eval(loaded) == eval(orig)
+
+        with self.assertRaises(ValueError):
+            marshal.dumps([orig], allow_code=False)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ pub mod grp;
 pub mod imp;
 pub mod importlib;
 pub mod itertools;
+pub mod marshal;
 pub mod math;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod mmap;

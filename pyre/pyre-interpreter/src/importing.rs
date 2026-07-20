@@ -572,6 +572,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_pickle);
     pyre_install_module!("_struct"(r#struct));
     pyre_install_module!(binascii);
+    pyre_install_module!(marshal);
     pyre_install_module!(zlib);
     pyre_install_module!(_typing);
     pyre_install_module!(_template);
@@ -610,7 +611,6 @@ pub fn install_builtin_modules() {
         "_heapq",
         "_tokenize",
         "_bisect",
-        "marshal",
         "_stat",
         "_queue",
         "_zoneinfo",

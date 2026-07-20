@@ -1239,7 +1239,7 @@ unsafe fn read_code_consts(
 /// `co_consts`) and any object that is not a valid code constant raise
 /// `ValueError` (pyre's constant table cannot hold an arbitrary object the
 /// way a CPython `co_consts` tuple can).
-unsafe fn obj_to_constant_data(
+pub(crate) unsafe fn obj_to_constant_data(
     obj: PyObjectRef,
 ) -> Result<crate::bytecode::ConstantData, crate::PyError> {
     use crate::bytecode::ConstantData;
