@@ -65,3 +65,60 @@ class MyContainingClass:
 
 assert 2 in MyContainingClass(2)
 assert 1 not in MyContainingClass(2)
+
+
+# PyPy descroperation.py sequence_contains obtains iter(container) before
+# scanning.  An explicit __iter__ therefore wins over any __getitem__ path.
+class IterOnly:
+    def __iter__(self):
+        return iter((1, 2, 3))
+
+    def __getitem__(self, index):
+        raise AssertionError("membership bypassed __iter__")
+
+
+assert 2 in IterOnly()
+assert 4 not in IterOnly()
+
+
+# Special methods are resolved on the type, never from the instance dict.
+instance_only = MyNotContainingClass()
+instance_only.__contains__ = lambda value: True
+assert_raises(TypeError, lambda: 1 in instance_only)
+
+
+# Python 3.14 membership diagnostics and exception propagation while
+# acquiring the fallback iterator.
+class RaisingIterTypeError:
+    def __iter__(self):
+        raise TypeError("custom iterator error")
+
+
+try:
+    1 in RaisingIterTypeError()
+except TypeError as exc:
+    assert str(exc) == (
+        "argument of type 'RaisingIterTypeError' is not a container or iterable"
+    )
+else:
+    raise AssertionError("membership accepted a raising iterator")
+
+
+class RaisingIterValueError:
+    def __iter__(self):
+        raise ValueError("custom iterator error")
+
+
+assert_raises(ValueError, lambda: 1 in RaisingIterValueError())
+
+
+class BlockContains(IterOnly):
+    __contains__ = None
+
+
+try:
+    1 in BlockContains()
+except TypeError as exc:
+    assert str(exc) == "'BlockContains' object is not a container"
+else:
+    raise AssertionError("__contains__ = None did not block iteration fallback")

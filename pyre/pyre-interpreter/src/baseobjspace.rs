@@ -1920,24 +1920,69 @@ pub(crate) fn builtin_callable(name: &str) -> PyObjectRef {
     unsafe { (*ctx).lookup_builtin(name).unwrap_or(PY_NULL) }
 }
 
+/// Build the common iterator pickle tuple after the reconstructor lookup and
+/// the subsequent state read.  Keep every component rooted while tuple
+/// allocation runs: these methods are deliberately exercised with a hostile
+/// builtins dict whose equality hook can exhaust the receiver and allocate.
+fn iterator_reduce_tuple(
+    callable: PyObjectRef,
+    seq: PyObjectRef,
+    index: i64,
+    empty_kind: u8,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    if seq.is_null() {
+        // CPython 3.14 retains the concrete producer shape for the
+        // specialized string/list iterators; generic sequence, bytes and
+        // tuple iterators use the canonical empty tuple.
+        let empty = match empty_kind {
+            1 => w_str_new(""),
+            2 => w_list_new(vec![]),
+            _ => w_tuple_new(vec![]),
+        };
+        pyre_object::gc_roots::pin_root(empty);
+        let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(sp + 1)]);
+        pyre_object::gc_roots::pin_root(state);
+        return Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(sp),
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        ]));
+    }
+    pyre_object::gc_roots::pin_root(seq);
+    let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(sp + 1)]);
+    pyre_object::gc_roots::pin_root(state);
+    let w_index = w_int_new(index);
+    pyre_object::gc_roots::pin_root(w_index);
+    Ok(w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        pyre_object::gc_roots::shadow_stack_get(sp + 3),
+    ]))
+}
+
 /// `sequenceiterator.__reduce__()` — `iterobject.py
 /// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)` for a live
 /// sequence; an exhausted iterator (`w_seq is None`) pickles to `_empty_iterable`
 /// (`iterobject.py:251-253`) = `(iter, ((),))` so it restores empty.
 pub(crate) fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    // CPython 3.14 issue #101765: resolving `builtins.iter` can run an
+    // equality hook which exhausts this iterator.  Root the receiver, perform
+    // that lookup first, and only then read its live sequence and cursor.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let callable = builtin_callable("iter");
+    pyre_object::gc_roots::pin_root(callable);
     unsafe {
-        let seq = pyre_object::w_seq_iter_seq(args[0]);
-        if seq.is_null() {
-            let empty_state = w_tuple_new(vec![w_tuple_new(vec![])]);
-            return Ok(w_tuple_new(vec![builtin_callable("iter"), empty_state]));
-        }
-        let index = pyre_object::w_seq_iter_index(args[0]);
-        let state = w_tuple_new(vec![seq]);
-        Ok(w_tuple_new(vec![
-            builtin_callable("iter"),
-            state,
-            w_int_new(index),
-        ]))
+        let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
+        iterator_reduce_tuple(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            pyre_object::w_seq_iter_seq(receiver),
+            pyre_object::w_seq_iter_index(receiver),
+            pyre_object::w_seq_iter_empty_kind(receiver),
+        )
     }
 }
 
@@ -2020,19 +2065,19 @@ pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 /// `iterobject.py W_AbstractSeqIterObject.descr_reduce`, for the specialized
 /// `W_FastListIterObject` payload used by Python 3.14's `list_iterator`.
 pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let callable = builtin_callable("iter");
+    pyre_object::gc_roots::pin_root(callable);
     unsafe {
-        let seq = pyre_object::w_list_iter_seq(args[0]);
-        if seq.is_null() {
-            return Ok(w_tuple_new(vec![
-                builtin_callable("iter"),
-                w_tuple_new(vec![w_tuple_new(vec![])]),
-            ]));
-        }
-        Ok(w_tuple_new(vec![
-            builtin_callable("iter"),
-            w_tuple_new(vec![seq]),
-            w_int_new(pyre_object::w_list_iter_index(args[0])),
-        ]))
+        let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
+        iterator_reduce_tuple(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            pyre_object::w_list_iter_seq(receiver),
+            pyre_object::w_list_iter_index(receiver),
+            2,
+        )
     }
 }
 
@@ -2066,19 +2111,19 @@ pub(crate) fn list_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub(crate) fn tuple_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let callable = builtin_callable("iter");
+    pyre_object::gc_roots::pin_root(callable);
     unsafe {
-        let seq = pyre_object::w_tuple_iter_seq(args[0]);
-        if seq.is_null() {
-            return Ok(w_tuple_new(vec![
-                builtin_callable("iter"),
-                w_tuple_new(vec![w_tuple_new(vec![])]),
-            ]));
-        }
-        Ok(w_tuple_new(vec![
-            builtin_callable("iter"),
-            w_tuple_new(vec![seq]),
-            w_int_new(pyre_object::w_tuple_iter_index(args[0])),
-        ]))
+        let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
+        iterator_reduce_tuple(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            pyre_object::w_tuple_iter_seq(receiver),
+            pyre_object::w_tuple_iter_index(receiver),
+            0,
+        )
     }
 }
 
@@ -2113,19 +2158,19 @@ pub(crate) fn tuple_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `iterobject.py W_ReverseSeqIterObject` pickle/state/length protocol.
 pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let callable = builtin_callable("reversed");
+    pyre_object::gc_roots::pin_root(callable);
     unsafe {
-        let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
-        if seq.is_null() {
-            return Ok(w_tuple_new(vec![
-                builtin_callable("iter"),
-                w_tuple_new(vec![w_tuple_new(vec![])]),
-            ]));
-        }
-        Ok(w_tuple_new(vec![
-            builtin_callable("reversed"),
-            w_tuple_new(vec![seq]),
-            w_int_new(pyre_object::w_list_reverse_iter_index(args[0])),
-        ]))
+        let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
+        iterator_reduce_tuple(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            pyre_object::w_list_reverse_iter_seq(receiver),
+            pyre_object::w_list_reverse_iter_index(receiver),
+            2,
+        )
     }
 }
 
@@ -13159,6 +13204,12 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             || pyre_object::is_set_or_frozenset(haystack)
         {
             if let Some((method, w_type)) = subclass_special_override(haystack, "__contains__") {
+                // CPython 3.14 `slot_sq_contains`: assigning the special
+                // method to None blocks both the inherited slot and the
+                // iterator fallback.
+                if is_none(method) {
+                    return Err(not_container_error(haystack));
+                }
                 let result = get_and_call_function(method, haystack, w_type, &[needle])?;
                 return Ok(is_true(result)?);
             }
@@ -13353,11 +13404,9 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         if is_instance(haystack) {
             let w_type = w_instance_get_type(haystack);
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
-                let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
-                return Ok(is_true(result)?);
-            }
-            // Also check per-instance attributes
-            if let Ok(method) = getattr_str(haystack, "__contains__") {
+                if is_none(method) {
+                    return Err(not_container_error(haystack));
+                }
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result)?);
             }
@@ -13373,28 +13422,52 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     unsafe {
         if let Some(w_type) = crate::typedef::r#type(haystack) {
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
+                if is_none(method) {
+                    return Err(not_container_error(haystack));
+                }
                 let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
                 return Ok(is_true(result)?);
             }
         }
     }
-    // Fallback: `space.sequence_contains` — scan via getitem(obj, i) for
-    // i = 0, 1, ….  An `IndexError` ends the scan (not found); any other
-    // error (e.g. a released/non-contiguous memoryview) propagates, matching
-    // `PySequence_Contains`.
-    let mut i = 0i64;
+    // PyPy `descroperation.py:514-520 sequence_contains`: obtain the
+    // iterator first, then repeatedly call `space.next`.  The iterator may
+    // itself be the sequence iterator produced by `iter()`'s `__getitem__`
+    // fallback, but an explicit `__iter__` must take precedence.
+    let iterator = match iter(haystack) {
+        Ok(iterator) => iterator,
+        // CPython 3.14 `PySequence_Contains` replaces an iterator-acquisition
+        // TypeError (including one raised by user `__iter__`) with its
+        // membership-specific diagnostic.  Other exceptions propagate.
+        Err(err) if err.kind == PyErrorKind::TypeError => {
+            return Err(not_container_or_iterable_error(haystack));
+        }
+        Err(err) => return Err(err),
+    };
     loop {
-        match getitem(haystack, pyre_object::w_int_new(i)) {
+        match next(iterator) {
             Ok(item) => {
                 if eq_w(item, needle)? {
                     return Ok(true);
                 }
-                i += 1;
             }
-            Err(e) if e.kind == PyErrorKind::IndexError => return Ok(false),
+            Err(e) if e.kind == PyErrorKind::StopIteration => return Ok(false),
             Err(e) => return Err(e),
         }
     }
+}
+
+fn not_container_error(obj: PyObjectRef) -> PyError {
+    PyError::type_error(format!("'{}' object is not a container", unsafe {
+        obj_type_name(obj)
+    }))
+}
+
+fn not_container_or_iterable_error(obj: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
+        "argument of type '{}' is not a container or iterable",
+        unsafe { obj_type_name(obj) }
+    ))
 }
 
 /// `pypy/interpreter/baseobjspace.py:840-845 W_ObjectSpace.hash_w` —

@@ -163,8 +163,14 @@ impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // above allocates nothing.
                 dict_keys_equal(crate::w_str_new(self.key), k.obj)
             } else {
-                // A non-str stored key never equals a str query.
-                false
+                // ObjectDictStrategy uses the ordinary object equality hook
+                // for every hash collision.  A non-str key is allowed to
+                // compare equal to an exact str (and its `__eq__` may have
+                // observable side effects), so the borrowed-str fast path
+                // must not reject it by layout.  Materialise the query only
+                // on this rare collision path, matching
+                // `object_key_for(w_str_new(key))`.
+                dict_keys_equal(crate::w_str_new(self.key), k.obj)
             }
         }
     }

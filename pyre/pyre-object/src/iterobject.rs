@@ -12,6 +12,11 @@ pub struct W_SeqIterObject {
     pub seq: PyObjectRef,
     pub index: i64,
     pub length: i64,
+    /// Python 3.14 has producer-specific iterator types whose exhausted
+    /// reduce form retains the producer's empty shape.  Pyre shares this
+    /// payload for those iterators, so retain that type tag on the iterator
+    /// itself: 0 = tuple, 1 = str.
+    pub empty_kind: u8,
 }
 
 /// `iterobject.py W_FastListIterObject`.  PyPy shares the abstract
@@ -52,6 +57,7 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
         seq,
         index: 0,
         length: length as i64,
+        empty_kind: unsafe { if crate::is_str(seq) { 1 } else { 0 } },
     })
 }
 
@@ -216,6 +222,12 @@ pub unsafe fn w_seq_iter_index(obj: PyObjectRef) -> i64 {
 #[inline]
 pub unsafe fn w_seq_iter_length(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_SeqIterObject)).length }
+}
+
+/// Empty producer shape used by Python 3.14's exhausted reduce form.
+#[inline]
+pub unsafe fn w_seq_iter_empty_kind(obj: PyObjectRef) -> u8 {
+    unsafe { (*(obj as *const W_SeqIterObject)).empty_kind }
 }
 
 /// Set the cursor position.
