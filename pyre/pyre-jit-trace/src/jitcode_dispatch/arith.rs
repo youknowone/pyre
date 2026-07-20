@@ -52,6 +52,23 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+pub(crate) fn record_int_cmp<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+) -> OpRef {
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
 /// RPython `pyjitpl.py:588-595 opimpl_int_between`:
 ///
 /// ```python
@@ -221,6 +238,27 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+) -> OpRef {
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded = match opcode {
+            OpCode::PtrEq => (la == rb) as i64,
+            OpCode::PtrNe => (la != rb) as i64,
+            _ => panic!("record_ptr_cmp: unsupported opcode {opcode:?}"),
+        };
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
 /// `ptr_nonzero/r>i` (`nonzero = true`) and `ptr_iszero/r>i`
 /// (`nonzero = false`) handler (operand layout `r>i`: 1B r-src + 1B i-dst).
 ///
@@ -373,6 +411,24 @@ pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+pub(crate) fn record_float_cmp<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+    b: OpRef,
+) -> OpRef {
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
+        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
+    {
+        let folded =
+            majit_metainterp::eval_float_cmp(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
 }
 
 /// Bank-crossing unary cast family from the `pyjitpl.py`
