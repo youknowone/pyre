@@ -7286,7 +7286,10 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// / `e.end_lineno` / `e.end_offset` / `e.filename`, and `e.text` is the
 /// offending line sliced from `source`; a location-less codegen error
 /// (line 0) falls back to a bare, message-only SyntaxError.
-pub fn compile_err_to_syntax_error(e: crate::compile::CompileError, source: &str) -> crate::PyError {
+pub fn compile_err_to_syntax_error(
+    e: crate::compile::CompileError,
+    source: &str,
+) -> crate::PyError {
     let msg = e.to_string();
     let (lineno, offset) = e.python_location();
     if lineno == 0 {

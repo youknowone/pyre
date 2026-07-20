@@ -1378,8 +1378,8 @@ pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::R
             writeln!(writer, "{caret}")?;
         }
     }
-    let name = exc_object_class_name(exc)
-        .unwrap_or_else(|| exc_kind_name(err.to_exc_kind()).to_string());
+    let name =
+        exc_object_class_name(exc).unwrap_or_else(|| exc_kind_name(err.to_exc_kind()).to_string());
     match str_of(attr("msg")) {
         Some(msg) if !msg.is_empty() => writeln!(writer, "{name}: {msg}"),
         _ => writeln!(writer, "{name}"),
