@@ -4,37 +4,54 @@
 # FileExistsError(17).  Native-only: the wasm guest has no os/filesystem
 # (open() raises NotImplementedError, `import os` has no posix backend), so
 # this guard is registered with skip_backends=("wasm",).  Behaviour verified
-# against CPython/PyPy.  The mkdir target is os.getcwd() rather than "/" so
-# the EEXIST path is exercised identically on POSIX and Windows (where "/"
-# is a drive root that raises access-denied, not EEXIST).
+# against CPython/PyPy.
+#
+# The mkdir target is a freshly created temp directory rather than "/" or the
+# cwd: "/" is a Windows drive root (access-denied, not EEXIST) and the cwd is
+# in-use on Windows (also access-denied), whereas a temp dir gives EEXIST on
+# both POSIX and Windows.  The errno/strerror/args *values* are asserted only
+# on POSIX; Windows maps different errno numbers and strerror text, so there
+# the guard checks the exception type and that the fields are populated.
 import os
+import tempfile
 
-PATH = "/no/such/file/xyz_pyre_probe"
+POSIX = os.name == "posix"
+MISSING = os.path.join(tempfile.gettempdir(), "no_such_file_xyz_pyre_probe")
+EXISTING = tempfile.mkdtemp(prefix="pyre_eexist_")
 
 
 def check():
     try:
-        open(PATH, "r")
+        open(MISSING, "r")
     except FileNotFoundError as e:
         assert type(e).__name__ == "FileNotFoundError", type(e).__name__
-        assert e.errno == 2, e.errno
         assert isinstance(e.strerror, str), e.strerror
-        assert e.args == (2, e.strerror), e.args
-        assert e.filename == PATH, e.filename
+        assert e.filename == MISSING, e.filename
+        if POSIX:
+            assert e.errno == 2, e.errno
+            assert e.args == (2, e.strerror), e.args
+        else:
+            assert e.errno is not None, e.errno
     else:
         raise AssertionError("open() of a missing path did not raise")
 
     try:
-        os.mkdir(os.getcwd())
+        os.mkdir(EXISTING)
     except FileExistsError as e:
         assert type(e).__name__ == "FileExistsError", type(e).__name__
-        assert e.errno == 17, e.errno
         assert isinstance(e.strerror, str), e.strerror
-        assert e.args == (17, e.strerror), e.args
+        if POSIX:
+            assert e.errno == 17, e.errno
+            assert e.args == (17, e.strerror), e.args
+        else:
+            assert e.errno is not None, e.errno
     else:
-        raise AssertionError("os.mkdir of the cwd did not raise")
+        raise AssertionError("os.mkdir of an existing path did not raise")
 
 
-for _ in range(200):
-    check()
+try:
+    for _ in range(200):
+        check()
+finally:
+    os.rmdir(EXISTING)
 print("PASS")
