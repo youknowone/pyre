@@ -21,6 +21,15 @@ crate::py_module! {
             pyre_object::w_str_new("UTC"),
         ]),
     },
+    // PyPy: pypy/module/time/app_time.py:26-34.  Keep strptime at app
+    // level and delegate to the shared CPython `_strptime` module.
+    inline_app: {
+        r#"
+def strptime(string, format="%a %b %d %H:%M:%S %Y"):
+    import _strptime
+    return _strptime._strptime_time(string, format)
+"# => ["strptime"],
+    },
     functions: {
         "time"         / 0 = t::time,
         "time_ns"      / 0 = t::time_ns,
