@@ -215,10 +215,10 @@ pub struct Cpu {
     /// submodule-import fallback that may run module top-level Python →
     /// fallible) through the TLS-pinned execution context.
     pub import_from_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// `bh_load_super_attr_fn(self, cls, code, name_idx)` — LOAD_SUPER_ATTR
-    /// `getattr(super(cls, self), name)` residual (descriptor `__get__` may
-    /// run Python → fallible).
-    pub load_super_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_load_super_attr_fn(global_super, self, cls, code, name_idx,
+    /// is_two_arg)` — LOAD_SUPER_ATTR residual. Calls the actual global
+    /// callable with zero or two args, then resolves the attribute.
+    pub load_super_attr_fn: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
     /// `bh_super_attr_unwrap_fn(raw, which)` — LOAD_SUPER_ATTR method-form
     /// unwrap (`which` 0 = func slot, 1 = self slot); pure / infallible.
     pub super_attr_unwrap_fn: extern "C" fn(i64, i64) -> i64,

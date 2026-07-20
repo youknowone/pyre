@@ -4287,7 +4287,12 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                             // descriptor.py:76-82 — class-mode
                             // `super(C, C)` calls `__get__(None, C)`.
                             let descr_obj = if std::ptr::eq(bound_obj, w_obj_type) {
-                                w_none()
+                                // `get` represents class access with PY_NULL
+                                // and exposes `space.w_None` only when it
+                                // invokes a user `__get__`. Passing the None
+                                // singleton here would bind plain functions to
+                                // None instead of returning them unbound.
+                                PY_NULL
                             } else {
                                 bound_obj
                             };

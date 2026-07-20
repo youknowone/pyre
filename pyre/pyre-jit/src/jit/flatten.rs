@@ -3405,10 +3405,11 @@ pub struct LoweringContext {
     /// Python → `MayForce`).
     pub import_from_fn_idx: u16,
     /// `load_super_attr_fn` descrs-pool index.  LOAD_SUPER_ATTR records the
-    /// `load_super_attr(self, cls, code, name_idx)` HLOp lowered to
-    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx]), ListR([self,
-    /// cls, code]), Descr) → reg` via [`lower_load_super_attr_hlop_to_insn`];
-    /// `bh_load_super_attr_fn` resolves `getattr(super(cls, self), name)`
+    /// `load_super_attr(global_super, self, cls, code, name_idx, is_two_arg)`
+    /// HLOp lowered to `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx,
+    /// is_two_arg]), ListR([global_super, self, cls, code]), Descr) → reg` via
+    /// [`lower_load_super_attr_hlop_to_insn`]; `bh_load_super_attr_fn` calls
+    /// the actual global `super` value, then resolves the attribute
     /// (descriptor `__get__` may run → `MayForce`).
     pub load_super_attr_fn_idx: u16,
     /// `super_attr_unwrap_fn` descrs-pool index.  The LOAD_SUPER_ATTR
@@ -6327,12 +6328,13 @@ where
     ))
 }
 
-/// Lower the LOAD_SUPER_ATTR pyre HLOp `load_super_attr(self, cls, code,
-/// name_idx)` → `result: Ref` to `residual_call_ir_r(ConstInt(
-/// load_super_attr_fn_idx), ListI([name_idx]), ListR([self, cls, code]),
-/// Descr) → reg` — the same three-Ref shape as IMPORT_NAME.
-/// `bh_load_super_attr_fn` resolves `getattr(super(cls, self), name)`
-/// (descriptor `__get__` may run → `MayForce`).
+/// Lower the LOAD_SUPER_ATTR pyre HLOp `load_super_attr(global_super, self,
+/// cls, code, name_idx, is_two_arg)` → `result: Ref` to
+/// `residual_call_ir_r(ConstInt(load_super_attr_fn_idx),
+/// ListI([name_idx, is_two_arg]), ListR([global_super, self, cls, code]),
+/// Descr) → reg`. `bh_load_super_attr_fn` calls the actual global `super`
+/// value with zero or two arguments, then resolves the attribute (descriptor
+/// `__get__` may run → `MayForce`).
 ///
 /// Returns `None` for non-`load_super_attr` opnames so the caller can fall
 /// through to other lowering arms.
@@ -6346,13 +6348,15 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "load_super_attr" || op.args.len() != 4 {
+    if op.opname != "load_super_attr" || op.args.len() != 6 {
         return None;
     }
-    let self_obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-    let cls = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
-    let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
-    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let global_super = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let self_obj = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let cls = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[3], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[4])?;
+    let is_two_arg = const_int_for_value_arg(&op.args[5])?;
     let dst_reg = match &op.result {
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
@@ -6360,7 +6364,14 @@ where
     let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
-        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        arg_kinds: vec![
+            Kind::Ref,
+            Kind::Ref,
+            Kind::Ref,
+            Kind::Ref,
+            Kind::Int,
+            Kind::Int,
+        ],
         result_kind: Some(Kind::Ref),
     }));
     Some(Insn::op_with_result(
@@ -6369,9 +6380,12 @@ where
             Operand::ConstInt(ctx.load_super_attr_fn_idx as i64),
             Operand::ListOfKind(ListOfKind::new(
                 Kind::Int,
-                vec![Operand::ConstInt(name_idx)],
+                vec![Operand::ConstInt(name_idx), Operand::ConstInt(is_two_arg)],
             )),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![self_obj, cls, code])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Ref,
+                vec![global_super, self_obj, cls, code],
+            )),
             descr_operand,
         ],
         dst_reg,
@@ -13161,11 +13175,13 @@ mod tests {
 
     #[test]
     fn lower_load_super_attr_hlop_emits_load_super_attr_fn_residual() {
-        // `load_super_attr(self, cls, code, name_idx)` →
+        // `load_super_attr(global_super, self, cls, code, name_idx,
+        // is_two_arg)` →
         // `residual_call_ir_r(ConstInt(load_super_attr_fn_idx),
-        // ListI([name_idx]), ListR([self, cls, code]), Descr) → reg`
-        // (MayForce — descriptor `__get__` may run).  Same three-Ref shape
-        // as IMPORT_NAME.
+        // ListI([name_idx, is_two_arg]), ListR([global_super, self, cls,
+        // code]), Descr) → reg` (MayForce — calling the global and descriptor
+        // `__get__` may run).
+        let global_super_var = Variable::new(VariableId(7), Kind::Ref);
         let self_var = Variable::new(VariableId(8), Kind::Ref);
         let cls_var = Variable::new(VariableId(10), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
@@ -13173,15 +13189,21 @@ mod tests {
         let op = super::super::flow::SpaceOperation::new(
             "load_super_attr",
             vec![
+                global_super_var.into(),
                 self_var.into(),
                 cls_var.into(),
                 code_const.into(),
                 name_idx_const.into(),
+                Constant::signed(1).into(),
             ],
             Some(result_var.into()),
             0,
         );
         let mut get_register = |var: Variable| match var.id {
+            VariableId(7) => Register {
+                kind: Kind::Ref,
+                index: 100,
+            },
             VariableId(8) => Register {
                 kind: Kind::Ref,
                 index: 101,
@@ -13203,7 +13225,7 @@ mod tests {
             &mut get_register,
             &mut lower_constant,
         )
-        .expect("4-arg load_super_attr lowering must succeed");
+        .expect("6-arg load_super_attr lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
@@ -13220,8 +13242,11 @@ mod tests {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Int);
                         assert!(
-                            matches!(&list.content[..], [Operand::ConstInt(5)]),
-                            "ListI = [name_idx], got {:?}",
+                            matches!(
+                                &list.content[..],
+                                [Operand::ConstInt(5), Operand::ConstInt(1)]
+                            ),
+                            "ListI = [name_idx, is_two_arg], got {:?}",
                             list.content
                         );
                     }
@@ -13232,15 +13257,22 @@ mod tests {
                         assert_eq!(list.kind, Kind::Ref);
                         match &list.content[..] {
                             [
+                                Operand::Register(g),
                                 Operand::Register(s),
                                 Operand::Register(c),
                                 Operand::ConstRef(0x2000),
                             ] => {
-                                assert_eq!(s.index, 101, "leading Ref operand must be self");
-                                assert_eq!(c.index, 103, "second Ref operand must be cls");
+                                assert_eq!(
+                                    g.index, 100,
+                                    "leading Ref operand must be global_super"
+                                );
+                                assert_eq!(s.index, 101, "second Ref operand must be self");
+                                assert_eq!(c.index, 103, "third Ref operand must be cls");
                             }
                             other => {
-                                panic!("ListR must be [self, cls, code], got {other:?}")
+                                panic!(
+                                    "ListR must be [global_super, self, cls, code], got {other:?}"
+                                )
                             }
                         }
                     }

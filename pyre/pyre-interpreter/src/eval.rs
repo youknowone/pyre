@@ -3911,12 +3911,26 @@ impl OpcodeStepExecutor for PyFrame {
     // ── load_super_attr ──
     // CPython 3.12 LOAD_SUPER_ATTR: stack = [global_super, class, self]
     // → super(class, self).attr
-    fn load_super_attr_with(&mut self, name: &str, is_method: bool) -> Result<(), PyError> {
+    fn load_super_attr_with(
+        &mut self,
+        name: &str,
+        is_method: bool,
+        is_two_arg: bool,
+    ) -> Result<(), PyError> {
         let self_obj = self.pop();
         let cls = self.pop();
-        let _global_super = self.pop();
+        let global_super = self.pop();
 
-        let proxy = pyre_object::descriptor::w_super_new(cls, self_obj);
+        // CPython 3.14 `LOAD_SUPER_ATTR`: the callable loaded from globals is
+        // authoritative (it may shadow builtins.super).  Bit 1 distinguishes
+        // `super(type, obj)` from zero-argument `super()`; `cls` / `self_obj`
+        // are stack operands for the fast builtin case but are not arguments
+        // to a shadowing zero-arg callable.
+        let proxy = if is_two_arg {
+            crate::call::call_function_impl_result(global_super, &[cls, self_obj])?
+        } else {
+            crate::call::call_function_impl_result(global_super, &[])?
+        };
         let result = crate::baseobjspace::getattr_str(proxy, name)?;
 
         // CPython _PySuper_Lookup: determines whether the resolved attr

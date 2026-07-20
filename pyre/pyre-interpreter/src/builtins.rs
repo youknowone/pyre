@@ -7005,12 +7005,10 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         super_check(cls, obj)?;
         return Ok(pyre_object::descriptor::w_super_new(cls, obj));
     }
-    // Zero-arg super(): find __class__ cell and first arg from calling frame
-    //
-    // IMPORTANT: CURRENT_FRAME points to the frame that is currently
-    // executing the `super()` CALL.  For zero-arg super the __class__
-    // cell lives in the *caller* of super(), which IS the current frame
-    // (super is a builtin, not a user function that gets its own frame).
+    // descriptor.py `_super_from_frame`: zero-arg super() finds the first
+    // argument and the `__class__` free variable in the live caller frame.
+    // CURRENT_FRAME is that caller because a builtin call creates no Python
+    // frame of its own.
     crate::eval::CURRENT_FRAME.with(|current| {
         let frame_ptr = current.get();
         if frame_ptr.is_null() {
@@ -7018,75 +7016,54 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         }
         let frame = unsafe { &*frame_ptr };
         let code = frame.code();
-
-        // Find __class__ in freevars (it's a cell variable from the enclosing class scope)
-        let num_locals = code.varnames.len();
-        let ncellvars = code.cellvars.len();
-        let locals = frame.locals_w().as_slice();
-
-        let mut w_class = pyre_object::PY_NULL;
-
-        // Check freevars for __class__
-        for (slot, name) in code.freevars.iter().enumerate() {
-            if name == "__class__" {
-                let idx = num_locals + ncellvars + slot;
-                if idx < locals.len() {
-                    let cell = locals[idx];
-                    if !cell.is_null() {
-                        if unsafe { pyre_object::is_cell(cell) } {
-                            w_class = unsafe { pyre_object::w_cell_get(cell) };
-                        } else {
-                            w_class = cell;
-                        }
-                    }
-                }
-                break;
-            }
+        if code.arg_count == 0 {
+            return Err(crate::PyError::runtime_error("super(): no arguments"));
         }
 
-        // Also check cellvars for __class__
-        if w_class.is_null() {
-            for (slot, name) in code.cellvars.iter().enumerate() {
-                if name == "__class__" {
-                    let idx = if code.varnames.iter().any(|v| v == name) {
-                        code.varnames.iter().position(|v| v == name).unwrap()
-                    } else {
-                        num_locals + slot
-                    };
-                    if idx < locals.len() {
-                        let cell = locals[idx];
-                        if !cell.is_null() {
-                            if unsafe { pyre_object::is_cell(cell) } {
-                                w_class = unsafe { pyre_object::w_cell_get(cell) };
-                            } else {
-                                w_class = cell;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if w_class.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "super(): __class__ cell not found",
-            ));
-        }
-
-        // First argument is self/cls/mcs (locals[0])
-        let w_self = if locals.is_empty() {
-            pyre_object::PY_NULL
+        // CPython 3.11+ localsplus lets an argument cellvar share slot zero;
+        // this is PyPy's `_get_self_location` / `_getcell(self_cell)` branch
+        // expressed in the unified slot layout.
+        let self_slot = frame.locals_w()[0];
+        let first_arg_is_cellvar = code
+            .varnames
+            .first()
+            .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first));
+        let w_self = if first_arg_is_cellvar
+            && !self_slot.is_null()
+            && unsafe { pyre_object::is_cell(self_slot) }
+        {
+            unsafe { pyre_object::w_cell_get(self_slot) }
         } else {
-            locals[0]
+            self_slot
         };
-
         if w_self.is_null() {
+            return Err(crate::PyError::runtime_error("super(): arg[0] deleted"));
+        }
+
+        let class_freevar = code
+            .freevars
+            .iter()
+            .position(|name| name == "__class__")
+            .ok_or_else(|| crate::PyError::runtime_error("super(): __class__ cell not found"))?;
+        let class_slot = code.varnames.len() + crate::pyframe::npure_cellvars(code) + class_freevar;
+        let class_cell = frame
+            .locals_w()
+            .as_slice()
+            .get(class_slot)
+            .copied()
+            .unwrap_or(PY_NULL);
+        let w_class = if !class_cell.is_null() && unsafe { pyre_object::is_cell(class_cell) } {
+            unsafe { pyre_object::w_cell_get(class_cell) }
+        } else {
+            class_cell
+        };
+        if w_class.is_null() {
             return Err(crate::PyError::runtime_error(
-                "super(): no first argument found",
+                "super(): empty __class__ cell",
             ));
         }
 
+        super_check(w_class, w_self)?;
         Ok(pyre_object::descriptor::w_super_new(w_class, w_self))
     })
 }

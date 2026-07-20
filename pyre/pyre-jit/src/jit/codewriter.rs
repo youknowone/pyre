@@ -2963,10 +2963,12 @@ fn emit_frontend_import_from(
 fn emit_frontend_load_super_attr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
+    global_super: super::flow::FlowValue,
     self_value: super::flow::FlowValue,
     cls_value: super::flow::FlowValue,
     code: super::flow::FlowValue,
     name_idx: super::flow::FlowValue,
+    is_two_arg: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
     emit_graph_op_with_result(
@@ -2974,10 +2976,12 @@ fn emit_frontend_load_super_attr(
         block,
         "load_super_attr",
         vec![
+            global_super.into(),
             self_value.into(),
             cls_value.into(),
             code.into(),
             name_idx.into(),
+            is_two_arg.into(),
         ],
         Kind::Ref,
         offset,
@@ -11126,12 +11130,14 @@ impl CodeWriter {
                         // global_super=TOS2). is_method=false → pushes 1
                         // (result). Net: -2.  is_method=true → pushes 2 (func,
                         // self_or_null). Net: -1.  `oparg >> 2` is the co_names
-                        // index, `oparg & 1` the is_method flag (both
-                        // compile-time constants).  `load_super_attr(self, cls,
-                        // code, name_idx)` HLOp →
-                        // `residual_call_ir_r(load_super_attr_fn, ListI[name_idx],
-                        // ListR[self, cls, code])` resolves `getattr(super(cls,
-                        // self), name)` (MayForce).  The is_method form runs the
+                        // index, `oparg & 1` the is_method flag, and `oparg & 2`
+                        // the two-argument-super flag (all compile-time
+                        // constants). `load_super_attr(global_super, self, cls,
+                        // code, name_idx, is_two_arg)` HLOp →
+                        // `residual_call_ir_r(load_super_attr_fn,
+                        // ListI[name_idx, is_two_arg], ListR[global_super,
+                        // self, cls, code])` calls the actual global value and
+                        // resolves the attribute (MayForce). The is_method form runs the
                         // runtime bound-method unwrap through two pure
                         // `super_attr_unwrap(raw, which)` residuals (which 0 =
                         // func slot, 1 = self slot), mirroring the LOAD_ATTR
@@ -11139,6 +11145,7 @@ impl CodeWriter {
                         Instruction::LoadSuperAttr { .. } => {
                             let name_idx = (u32::from(op_arg) >> 2) as usize;
                             let is_method = (u32::from(op_arg) & 1) != 0;
+                            let is_two_arg = (u32::from(op_arg) & 2) != 0;
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
                                 super::flow::ConstantValue::Signed(w_code as i64),
                                 Some(Kind::Ref),
@@ -11146,19 +11153,23 @@ impl CodeWriter {
                             .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
+                            let is_two_arg_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(is_two_arg as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let _global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let raw_value = emit_frontend_load_super_attr(
                                 &mut graph,
                                 &current_block.block(),
+                                global_super,
                                 self_value,
                                 cls_value,
                                 code_const,
                                 name_idx_const,
+                                is_two_arg_const,
                                 py_pc as i64,
                             );
                             if is_method {

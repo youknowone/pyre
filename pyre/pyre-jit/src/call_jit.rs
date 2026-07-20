@@ -4959,17 +4959,20 @@ pub extern "C" fn bh_import_from_fn(module: i64, w_code_ptr: i64, name_idx: i64)
 
 /// LOAD_SUPER_ATTR residual (`load_super_attr` HLOp → `residual_call_ir_r`).
 /// Resolves the attribute name from the jitcode's code object via `name_idx`
-/// (same `co_names` invariant as `bh_load_attr_fn`), builds the `super(cls,
-/// self)` proxy, and runs `getattr` (a descriptor `__get__` may run Python →
-/// `MayForce`).  Returns the raw resolved attribute; the `is_method` form
+/// (same `co_names` invariant as `bh_load_attr_fn`), calls the actual global
+/// `super` value with zero or two arguments, and runs `getattr` (both calls may
+/// run Python → `MayForce`). Returns the raw resolved attribute; the
+/// `is_method` form
 /// post-processes it through [`bh_super_attr_unwrap_fn`].  On error the
 /// exception is published through `BH_LAST_EXC_VALUE` for the trailing
 /// `GuardNoException` and the call returns 0.
 pub extern "C" fn bh_load_super_attr_fn(
+    global_super: i64,
     self_obj: i64,
     cls: i64,
     w_code_ptr: i64,
     name_idx: i64,
+    is_two_arg: i64,
 ) -> i64 {
     let w_code = w_code_ptr as pyre_object::PyObjectRef;
     let code = unsafe {
@@ -4985,11 +4988,16 @@ pub extern "C" fn bh_load_super_attr_fn(
         return 0;
     }
     let name = code.names[idx].as_ref();
-    let proxy = pyre_object::descriptor::w_super_new(
-        cls as pyre_object::PyObjectRef,
-        self_obj as pyre_object::PyObjectRef,
-    );
-    match pyre_interpreter::baseobjspace::getattr_str(proxy, name) {
+    let global_super = global_super as pyre_object::PyObjectRef;
+    let self_obj = self_obj as pyre_object::PyObjectRef;
+    let cls = cls as pyre_object::PyObjectRef;
+    let proxy = if is_two_arg != 0 {
+        pyre_interpreter::call::call_function_impl_result(global_super, &[cls, self_obj])
+    } else {
+        pyre_interpreter::call::call_function_impl_result(global_super, &[])
+    };
+    let result = proxy.and_then(|proxy| pyre_interpreter::baseobjspace::getattr_str(proxy, name));
+    match result {
         Ok(result) => result as i64,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
