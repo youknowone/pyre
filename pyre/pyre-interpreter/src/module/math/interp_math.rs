@@ -60,7 +60,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
                              The ability to return an instance of a strict subclass of \
                              float is deprecated, and may be removed in a future version \
                              of Python."
-                        ));
+                        ))?;
                     }
                     return Ok(floatobject::w_float_get_value(result));
                 }

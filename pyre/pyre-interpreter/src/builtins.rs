@@ -6433,7 +6433,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                          The ability to return an instance of a strict subclass of \
                          float is deprecated, and may be removed in a future version \
                          of Python."
-                    ));
+                    ))?;
                     return Ok(floatobject::w_float_new(w_float_get_value(result)));
                 }
             }
@@ -11049,7 +11049,7 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
                     crate::warn::warn_deprecation(&format!(
                         "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
                         crate::type_methods::arg_type_name(res)
-                    ));
+                    ))?;
                 }
                 return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
             }
@@ -11168,7 +11168,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                 crate::warn::warn_deprecation(&format!(
                     "complex() argument 'real' must be a real number, not {}",
                     crate::type_methods::arg_type_name(a)
-                ));
+                ))?;
             }
             real_is_complex = has_complex_protocol;
             value
@@ -11180,7 +11180,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             crate::warn::warn_deprecation(&format!(
                 "complex() argument 'imag' must be a real number, not {}",
                 crate::type_methods::arg_type_name(b)
-            ));
+            ))?;
             unsafe { (w_complex_get_real(b), w_complex_get_imag(b), true) }
         } else {
             if !unsafe { complex_constructor_has_real_protocol(b) } {

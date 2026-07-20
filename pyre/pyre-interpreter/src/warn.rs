@@ -8,13 +8,13 @@
 /// _warnings C-extension module (not yet ported).
 
 /// baseobjspace.py:2087: space.warn(space.newtext(msg), space.w_DeprecationWarning)
-pub fn warn_deprecation(msg: &str) {
+pub fn warn_deprecation(msg: &str) -> Result<(), crate::PyError> {
     if let (Some(warnings), Some(category)) = (
         crate::importing::get_sys_module("warnings"),
         crate::builtins::lookup_exc_class("DeprecationWarning"),
     ) {
         if let Ok(warn_fn) = crate::baseobjspace::getattr_str(warnings, "warn") {
-            if crate::call::call_function_impl_result(
+            crate::call::call_function_impl_result(
                 warn_fn,
                 &[
                     pyre_object::w_str_new(msg),
@@ -22,13 +22,12 @@ pub fn warn_deprecation(msg: &str) {
                     pyre_object::w_int_new(2),
                 ],
             )
-            .is_ok()
-            {
-                return;
-            }
+            .map(|_| ())?;
+            return Ok(());
         }
     }
     warn(msg, "DeprecationWarning");
+    Ok(())
 }
 
 /// baseobjspace.py:2087-2093

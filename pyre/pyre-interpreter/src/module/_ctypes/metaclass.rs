@@ -778,7 +778,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     {
         crate::warn::warn_deprecation(
             "_pack_ without explicit _layout_ uses deprecated MSVC layout",
-        );
+        )?;
     }
 
     // Reject before mutating the class: a type already frozen (used as a field

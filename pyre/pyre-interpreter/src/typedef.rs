@@ -14715,6 +14715,27 @@ fn bool_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(if truthy { "True" } else { "False" }))
 }
 
+/// CPython 3.14 `Objects/boolobject.c:bool_invert`.
+///
+/// The bundled PyPy source inherits `int.__invert__`; Python 3.14 instead
+/// installs a bool-specific number slot solely to issue this deprecation
+/// warning before delegating to the underlying integer inversion.
+fn bool_descr_invert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&w_self) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "descriptor '__invert__' of 'bool' object needs an argument",
+        ));
+    };
+    if !unsafe { pyre_object::is_bool(w_self) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__invert__' requires a 'bool' object but received a '{}'",
+            crate::baseobjspace::object_functionstr_type_name(w_self),
+        )));
+    }
+    crate::type_methods::arity_slot(args, 0)?;
+    crate::objspace::descroperation::invert(w_self)
+}
+
 fn init_bool_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -14741,25 +14762,13 @@ fn init_bool_type(ns: PyObjectRef) {
             make_builtin_function("__repr__", bool_repr),
         )
     };
-    // CPython 3.14 gives bool an explicit deprecated `__invert__` wrapper.
-    // It still returns the inversion of the underlying integer (`~True ==
-    // -2`, `~False == -1`); the removal is scheduled for Python 3.16.
+    // CPython 3.14 gives bool an explicit deprecated `__invert__` wrapper;
+    // the bundled PyPy source inherits the int descriptor instead.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__invert__",
-            make_builtin_function_with_arity(
-                "__invert__",
-                |args| {
-                    let value = if crate::baseobjspace::is_true(args[0])? {
-                        1i64
-                    } else {
-                        0i64
-                    };
-                    Ok(w_int_new(!value))
-                },
-                1,
-            ),
+            make_builtin_function("__invert__", bool_descr_invert),
         )
     };
     // boolobject.py:97-106 — bool defines its own bitwise dunders so that

@@ -3775,7 +3775,20 @@ pub fn invert(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_numeric_unaryop_override(a, "__invert__") {
             return result;
         }
-        if is_int(a) || is_bool(a) {
+        if is_bool(a) {
+            // CPython 3.14 `Objects/boolobject.c:bool_invert`.  The bundled
+            // PyPy source inherits `W_IntObject.descr_invert`; 3.14 inserts
+            // this warning-bearing bool slot before the integer inversion.
+            crate::warn::warn_deprecation(
+                "Bitwise inversion '~' on bool is deprecated and will be removed in \
+Python 3.16. This returns the bitwise inversion of the underlying int \
+object and is usually not what you expect from negating a bool. \
+Use the 'not' operator for boolean negation or ~int(x) if you really want \
+the bitwise inversion of the underlying int.",
+            )?;
+            return Ok(w_int_new(!int_value(a)));
+        }
+        if is_int(a) {
             return Ok(w_int_new(!int_value(a)));
         }
         if is_long(a) {

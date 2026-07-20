@@ -6139,7 +6139,7 @@ pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let tp = crate::type_methods::arg_type_name(w_result);
         crate::warn::warn_deprecation(&format!(
             "__int__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
-        ));
+        ))?;
         return Ok(w_result);
     }
     // baseobjspace.py:338-339 non-int result → TypeError.
@@ -9560,7 +9560,7 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let tp = crate::type_methods::arg_type_name(w_result);
         crate::warn::warn_deprecation(&format!(
             "__index__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
-        ));
+        ))?;
         // descroperation.py:622-627 `space.index` — return a base int,
         // never the strict subclass supplied by `__index__`.
         unsafe {
