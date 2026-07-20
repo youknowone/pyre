@@ -2018,7 +2018,22 @@ pub fn blackhole_resume_via_rd_numb(
     bh.jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
         result_type: majit_metainterp::blackhole::BhReturnType::Ref,
         portal_runner_ptr: Some(bh_portal_runner),
-        mainjitcode_calldescr: bh.jitcode.calldescr.clone(),
+        mainjitcode_calldescr: {
+            // `get_portal_runner` returns this descr paired with
+            // `bh_portal_runner`, and the blackhole recursive-portal resume
+            // (`bhimpl_recursive_call_r` -> `bh_call_r`) verifies the merged
+            // green+red argument banks against it — so it must describe the
+            // portal runner, not the traced function.  `bh_portal_runner`
+            // consumes the warmspot `portalfunc_ARGS` (`warmspot.py:972-975`):
+            // greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
+            // `[frame:r, ec:r]` (`interp_jit.py:67-68`) = 2 int + 3 ref.
+            // `bh.jitcode.calldescr` is the traced function's own frame-based
+            // residual-call descr and does not describe the runner.
+            let mut d = bh.jitcode.calldescr.clone();
+            d.arg_classes = "iirrr".to_string();
+            d.result_type = 'r';
+            d
+        },
     }];
 
     // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
