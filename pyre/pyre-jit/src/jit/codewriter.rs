@@ -6984,6 +6984,18 @@ impl CodeWriter {
                         restore_canraise_exit_order(&current_block.block());
                     }
                     merged
+                } else if current_block
+                    .framestate()
+                    .is_some_and(|state| state.next_offset == py_pc)
+                {
+                    // `flowcontext.py:399-416 build_flow` pops a concrete
+                    // SpamBlock and records that exact block.  A PC may have
+                    // several union-incompatible joinpoint candidates; a
+                    // later candidate is then at the head of `joinpoints`,
+                    // but it must not replace the block just popped from
+                    // `pendingblocks`.  Preserve the pending block identity
+                    // at its entry PC, matching `record_block(block)`.
+                    current_block.clone()
                 } else if let Some(target) = joinpoints
                     .get(&py_pc)
                     .and_then(|blocks| blocks.iter().find(|b| !b.dead()))
