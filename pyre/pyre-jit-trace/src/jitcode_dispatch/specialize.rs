@@ -27,24 +27,24 @@ use super::*;
 /// writes the recorded result OpRef into the dst register chosen by
 /// `dst_bank`.
 ///
-/// RPython parity: `pyjitpl.py:1334-1336 _opimpl_residual_call1` →
+/// RPython parity: `pyjitpl.py _opimpl_residual_call1` →
 /// `do_residual_or_indirect_call` → `do_residual_call`
-/// (pyjitpl.py:1995-2127). `pyjitpl.py:1346 opimpl_residual_call_r_i =
+/// (pyjitpl.py). `pyjitpl.py opimpl_residual_call_r_i =
 /// _opimpl_residual_call1` and `:1347 opimpl_residual_call_r_r =
 /// _opimpl_residual_call1` confirm both kind variants share the
 /// `_call1` body. The `_X` suffix is the *call's return kind* — mapping
 /// comes from `do_residual_call`'s `descr.get_normalized_result_type()`
-/// dispatch (pyjitpl.py:2022-2044) and `select_residual_call_opcode`'s
+/// dispatch (pyjitpl.py) and `select_residual_call_opcode`'s
 /// kind-keyed opcode tables.
 ///
 /// `dst_bank` selects where the call's result lands:
 /// * `'r'`: caller's `registers_r[dst]` — Ref-typed `Call*` family
-///   (`_r_r/iRd>r`, `pyjitpl.py:1347 opimpl_residual_call_r_r`).
+///   (`_r_r/iRd>r`, `pyjitpl.py opimpl_residual_call_r_r`).
 /// * `'i'`: caller's `registers_i[dst]` — Int-typed `Call*` family
-///   (`_r_i/iRd>i`, `pyjitpl.py:1346 opimpl_residual_call_r_i`).
+///   (`_r_i/iRd>i`, `pyjitpl.py opimpl_residual_call_r_i`).
 /// * `'v'`: void return — operand layout drops the trailing `>X` byte and
-///   the writeback no-ops (`_r_v/iRd`, `pyjitpl.py:1348
-///   opimpl_residual_call_r_v`, `blackhole.py:1245 bhimpl_residual_call_r_v`).
+///   the writeback no-ops (`_r_v/iRd`, `pyjitpl.py
+///   opimpl_residual_call_r_v`, `blackhole.py bhimpl_residual_call_r_v`).
 /// (`'f'` is intentionally absent: RPython does not exec-generate
 /// `opimpl_residual_call_r_f`. The only float-result residual_call
 /// shape is `_irf_f/iIRFd>f`, dispatched by
@@ -55,30 +55,30 @@ use super::*;
 /// loop-invariant, `CallPure*` for elidable, otherwise `Call*`) via
 /// [`select_residual_call_opcode`]. Two sub-cases route through
 /// dedicated helpers before the selector:
-///   - **release-gil** ([`direct_call_release_gil`], `pyjitpl.py:3671-
+///   - **release-gil** ([`direct_call_release_gil`], `pyjitpl.py-
 ///     3681`) — early-return when `ei.is_call_release_gil()`,
 ///     reshapes the arglist to `[savebox, funcbox] + argboxes[1:]`
 ///     and records `CALL_RELEASE_GIL_*` instead of `CALL_MAY_FORCE_*`.
 ///   - **loop-invariant heapcache** ([`loopinvariant_lookup`] /
-///     [`loopinvariant_now_known`], `pyjitpl.py:2088 + 2109`) —
+///     [`loopinvariant_now_known`], `pyjitpl.py`) —
 ///     short-circuits the record on a heapcache hit and populates
 ///     the cache after a fresh record.
 ///
 /// Emits `GUARD_NOT_FORCED` on the forces path plus
 /// `GUARD_NO_EXCEPTION` whenever `check_can_raise(False)` is true,
-/// matching `pyjitpl.py:2078-2082`. After every recorded call op,
+/// matching `pyjitpl.py`. After every recorded call op,
 /// invalidates the heapcache via
 /// `heap_cache.invalidate_caches_varargs(call_opcode, ei, allboxes)`
-/// matching `pyjitpl.py:2659 _record_helper_varargs` parity (forces
-/// branch's `pyjitpl.py:2072` redundantly invalidates with
+/// matching `pyjitpl.py _record_helper_varargs` parity (forces
+/// branch's `pyjitpl.py` redundantly invalidates with
 /// `CALL_MAY_FORCE_*`, equivalent because `select_residual_call_opcode`
 /// returns `CallMayForce*` for the forces classification).  Release-gil
 /// helper invalidates with `CALL_MAY_FORCE_*` matching
-/// `pyjitpl.py:2072`'s `opnum1`. The pre-call vable IR bookkeeping
-/// (`pyjitpl.py:2017 vable_and_vrefs_before_residual_call`, IR-only
+/// `pyjitpl.py`'s `opnum1`. The pre-call vable IR bookkeeping
+/// (`pyjitpl.py vable_and_vrefs_before_residual_call`, IR-only
 /// portion: FORCE_TOKEN + SETFIELD_GC) is wired via
 /// [`maybe_walker_vable_and_vrefs_before_residual_call`].  The
-/// after-call helpers (`pyjitpl.py:3337-3366
+/// after-call helpers (`pyjitpl.py
 /// vrefs_after_residual_call` / `vable_after_residual_call`) and the
 /// runtime heap mutations on `tracing_before_residual_call` run in the
 /// residual-call execution path — see
@@ -91,7 +91,7 @@ use super::*;
 /// Still missing relative to upstream `do_residual_call`, all blocked
 /// on infrastructure absent from pyre-jit-trace today:
 ///   - `OS_JIT_FORCE_VIRTUAL` PTR_EQ + GUARD_VALUE prelude
-///     (`pyjitpl.py:2011-2014 → 2153-2172 _do_jit_force_virtual`) —
+///     (`pyjitpl.py _do_jit_force_virtual`) —
 ///     walker is fail-loud here via [`do_jit_force_virtual_guard`]
 ///     (called from each `dispatch_residual_call_*` arm); a producer
 ///     that emits an `OopSpecIndex::JitForceVirtual` calldescr surfaces
@@ -99,27 +99,27 @@ use super::*;
 ///     of silently recording `CALL_MAY_FORCE_*` (this was the prior
 ///     behaviour and is documented as STRICTER-THAN-PYPY in
 ///     [`do_jit_force_virtual_guard`]'s docstring). Optimizer pass
-///     `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs:1226`)
+///     `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs`)
 ///     already handles the constant-token / non-null-forced short-circuit
 ///     post-trace. Adding the PTR_EQ + GUARD_VALUE prelude (the only
 ///     way to retire the fail-loud guard) is not yet implemented and
 ///     would land with the walker; metainterp has a tests-only
 ///     orthodox port at
-///     `majit-metainterp/src/pyjitpl.rs:11828 _do_jit_force_virtual`
+///     `majit-metainterp/src/pyjitpl.rs _do_jit_force_virtual`
 ///     that the converged walker would route through. Production reach
-///     today is zero — `jtransform.rs:1903 jit.force_virtual` is the only
+///     today is zero — `jtransform.rs jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
 ///   - `vrefs_after_residual_call` is unported; no `jit.virtual_ref`
 ///     producers exist today, so the upstream loops are empty. Vable forces
 ///     are detected by the residual-call execution path's heap-token bracket.
-///   - `direct_libffi_call` (`pyjitpl.py:3622-3667`) — pyre's live
+///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
-///     (`majit-metainterp/src/pyjitpl.rs:11487-11491` defers to
+///     (`majit-metainterp/src/pyjitpl.rs` defers to
 ///     direct_call_release_gil/may_force, which is the same fall-through
 ///     the walker already takes).
-///   - `direct_assembler_call` (`pyjitpl.py:3589-3609`) + KEEPALIVE
-///     (`pyjitpl.py:2080-2081`) — only fire when `assembler_call=True`
+///   - `direct_assembler_call` (`pyjitpl.py`) + KEEPALIVE
+///     (`pyjitpl.py`) — only fire when `assembler_call=True`
 ///     in `do_residual_call`. Walker's residual_call dispatchers are
 ///     never called with `assembler_call=True`; the parallel
 ///     `inline_call_*/dR>X` family routes through
@@ -128,7 +128,7 @@ use super::*;
 ///     a walker-side change.
 ///   - Per-PC liveness narrowing for the snapshot that
 ///     `walker_capture_snapshot_for_last_guard` attaches
-///     (`pyjitpl.py:218-225 _get_list_of_active_boxes`). Walker's
+///     (`pyjitpl.py _get_list_of_active_boxes`). Walker's
 ///     helper today snapshots every non-`OpRef::NONE` register across
 ///     all three banks; RPython narrows the box list via
 ///     `jitcode.get_live_vars_info(pc, op_live)` so dead registers are
@@ -154,7 +154,7 @@ use super::*;
 ///    are `ConcreteValue::Ref(_)`.
 /// 5. `generated_store_subscr_value` returns `true` (object is a list
 ///    with int key, strategy-detectable value, in-bounds index — see
-///    `codegen.rs:3146-3168 generated_store_subscr_value` for the
+///    `codegen.rs generated_store_subscr_value` for the
 ///    detail criteria mirroring `jtransform do_resizable_list_setitem`).
 ///
 /// Decline (any gate `false`) → `None` → dispatcher falls through to
@@ -264,7 +264,7 @@ pub(crate) fn try_walker_store_subscr_specialization<Sym: WalkSym>(
         )
     };
     if success == 0 {
-        // `pyjitpl.py:2156-2168 handle_possible_exception` parity: drain
+        // `pyjitpl.py handle_possible_exception` parity: drain
         // the helper's stashed exception into `ctx.last_exc_value*`,
         // record `GuardException` against the specialized IR, and
         // surface `SubRaise` so the caller doesn't fall through to the
@@ -292,7 +292,7 @@ pub(crate) fn try_walker_store_subscr_specialization<Sym: WalkSym>(
         // `execute_residual_call` decides the dispatch.
         return None;
     }
-    // pyjitpl.py:2659 `_record_helper_varargs`: STORE_SUBSCR mutates the
+    // pyjitpl.py `_record_helper_varargs`: STORE_SUBSCR mutates the
     // heap; the specialized IR shape's setarrayitem_gc ops already
     // invalidate per-descr via the recorder, so no further explicit
     // heap-cache invalidation is needed here.
@@ -396,7 +396,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         _ => return Ok(None),
     };
 
-    // boolobject.py:74-76 descr_and/or/xor: when both operands are bool the
+    // boolobject.py descr_and/or/xor: when both operands are bool the
     // And/Or/Xor result is a bool (`space.newbool`), not an int.  The op runs
     // on the shared `intval` as for ints; only the boxing differs (picked
     // below).  `walker_concrete_ref_object` reads the same source as
@@ -445,7 +445,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
             }
             OpCode::IntRshift => {
                 // A count >= LONG_BIT (or negative) folds to 0/-1 in
-                // intobject.py:229-231, but that fold would be baked into the
+                // intobject.py, but that fold would be baked into the
                 // reused trace and be wrong for an in-range count; route it to
                 // the generic leg instead. An in-range recorded count is
                 // specialized below behind a runtime range guard.
@@ -469,7 +469,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
-            // rint.py:429/520 _ovf_zer guards: int_eq(rhs,0)→guard_false +
+            // rint.py _ovf_zer guards: int_eq(rhs,0)→guard_false +
             // (lhs==INT_MIN)&(rhs==-1)→guard_false ahead of the elidable
             // helper call (so a re-used trace bails before the helper's
             // wrapping_div / wrapping_rem returns a wrap value).
@@ -485,7 +485,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
                 majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
             );
             walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])?;
-            // jtransform.py:576-577 OS_INT_PY_DIV / OS_INT_PY_MOD elidable
+            // jtransform.py OS_INT_PY_DIV / OS_INT_PY_MOD elidable
             // residual call (call_typed_with_effect_pure → CallI patched via
             // record_result_of_call_pure).
             let (func_ptr, effect_info, concrete_result) = if op_code == OpCode::IntFloorDiv {
@@ -645,7 +645,7 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     // `*mut BigInt`, Ref-typed so the JIT gcmap roots it across the collecting
     // boxing NEW. Every op allocates (`EF_ELIDABLE_OR_MEMORYERROR`) or divides
     // (`EF_ELIDABLE_CAN_RAISE`), so a trailing `GuardNoException` follows
-    // (`pyjitpl.py:2110-2112`).
+    // (`pyjitpl.py`).
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let lhs_payload = unsafe { *((lhs_obj as *const u8).add(off) as *const i64) };
     let rhs_payload = unsafe { *((rhs_obj as *const u8).add(off) as *const i64) };
@@ -795,7 +795,7 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(f_concrete));
-    // pyjitpl.py:1946: no GuardNoException when the pure call folded to a Const.
+    // pyjitpl.py: no GuardNoException when the pure call folded to a Const.
     if raw.inline_const_to_value().is_none() {
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
     }
@@ -901,25 +901,25 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     }
 }
 
-/// `mapdict.py:1479-1537 LOAD_ATTR_caching` full-body-walker fast path for a
+/// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
 /// or an unboxed integer/float slot, emit the guarded read PyPy compiles
 /// LOAD_ATTR to under the JIT —
 ///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
-///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
+///     (so the `map`/`storage` field reads below are valid; `mapdict.py`
 ///     `if map is not None:` also filters non-instances at trace time).
 ///   * `guard_value(getfield_gc_i(w_type, version_tag), C_version_tag)` — pins
 ///     the class lookup result so a later descriptor or `__getattribute__`
 ///     mutation deopts on trace re-entry.
 ///   * `guard_value(getfield_gc_i(obj, map), C_map)` — `jit.promote(self.map)`
-///     (`mapdict.py:905`); pins the exact instance shape so `find_map_attr`
+///     (`mapdict.py`); pins the exact instance shape so `find_map_attr`
 ///     const-folds `storageindex` to a green constant.
 ///   * boxed: `getfield_gc_r(obj, storage)` +
 ///     `getarrayitem_gc_r(block, C_index)` for
-///     `mapdict.py:914-916 _mapdict_read_storage`;
+///     `mapdict.py _mapdict_read_storage`;
 ///   * unboxed int/float: a non-forcing typed read plus `wrapint`/`wrapfloat`,
-///     matching `_prim_direct_read` (mapdict.py:577-584, 600-601).
+///     matching `_prim_direct_read` (mapdict.py).
 /// — instead of the opaque `getattr_fn` `CALL_MAY_FORCE` MRO-walk residual.
 ///
 /// Returns `Some(())` after writing the dst; `None` (fall through to the
@@ -953,7 +953,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
+    // `mapdict.py` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
     if let Some((w_type, version_tag, map, storageindex)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
@@ -961,7 +961,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
 
         // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
-        // the inline value read (`mapdict.py:914-916`).  `storageindex` is a green
+        // the inline value read (`mapdict.py`).  `storageindex` is a green
         // constant (the map guard pinned it); `trace_items_block_getitem_value`
         // stamps the dst's concrete shadow from the live block slot.
         let block = crate::state::opimpl_getfield_gc_r(
@@ -1086,7 +1086,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     };
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
 
-    // `_prim_direct_read` (mapdict.py:600-601): read the raw longlong from the
+    // `_prim_direct_read` (mapdict.py): read the raw longlong from the
     // shared list through a non-forcing, non-elidable residual.  Both indices
     // are green constants pinned by the map guard; keeping boxing in the trace
     // lets an immediate integer consumer virtualize it away.
@@ -1116,7 +1116,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             let boxed = walker_box_int(ctx, op_pc, raw, live)?;
             // The `wrapint` op is a heap box, so its concrete must be a heap ptr too:
             // box the raw longlong through the same `w_int_new` the unboxed read uses
-            // (mapdict.py:579-584 `_box`); `box_int_concrete` re-homes a tagged small
+            // (mapdict.py `_box`); `box_int_concrete` re-homes a tagged small
             // int to a fresh heap `W_IntObject` so op(NewWithVtable) == concrete(heap).
             // Without this stamp the boxed result carries no concrete, so a downstream
             // eager void residual (e.g. the STORE_ATTR that writes `self.value`) cannot
@@ -1152,7 +1152,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `callmethod.py:25-85 LOAD_METHOD` method-cache fold for the
+/// `callmethod.py LOAD_METHOD` method-cache fold for the
 /// codewriter's method-form `LOAD_ATTR` residual.  The safety oracle is the
 /// interpreter's `load_method_fast_path`: it declines custom
 /// `__getattribute__`, uncacheable types, non-function descriptors,
@@ -1224,7 +1224,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(w_class_op, w_type_const);
 
-    // typeobject.py:506 `promote(self.version_tag())`: class mutation or method
+    // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
     let vt_op = walker_record_getfield_gc_i_uncached(
         ctx,
@@ -1255,7 +1255,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 /// already guards class, type version, and instance map; this second residual
 /// is only the pure `compute_load_method_bound` binding decision.  A plain
 /// instance-method bind writes the original red receiver box, not a baked
-/// `ConstRef`, matching `callmethod.py:68 f.pushvalue(w_obj)`.
+/// `ConstRef`, matching `callmethod.py f.pushvalue(w_obj)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -1330,7 +1330,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     } {
         match unbox_type {
             pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-                // `type(w_value) is space.IntObjectCls` (mapdict.py:615): reject bool
+                // `type(w_value) is space.IntObjectCls` (mapdict.py): reject bool
                 // and every type-changing value before emitting any guards.
                 if unsafe {
                     pyre_object::pyobject::is_bool(concrete_value)
@@ -1341,7 +1341,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             }
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
                 // A non-float changes the slot to boxed storage and freezes further
-                // unboxing (mapdict.py:615-619), so retain setattr.
+                // unboxing (mapdict.py), so retain setattr.
                 if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
                     return Ok(None);
                 }
@@ -1579,7 +1579,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
 /// + per-index `setarrayitem_gc` + a `newlist_from_array` residual
 /// (oopspec [`majit_ir::PyreHelperKind::NewlistFromArray`]) whose single
 /// r-arg is the already-built backing array.  Decompose that residual into
-/// the virtualizable `opimpl_newlist` shape (`pyjitpl.py:779`) —
+/// the virtualizable `opimpl_newlist` shape (`pyjitpl.py`) —
 /// `new_with_vtable` + `new_array` + `setarrayitem_gc` + `setfield_gc` —
 /// so the optimizer folds the whole list (wrapper + block) when it never
 /// escapes and the array build + residual DCE.
@@ -2002,7 +2002,7 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     // immediately-following `is_true` (POP_JUMP_IF_*), which folds to the
     // raw truth.  In that shape the W_Bool is never read as a Ref, so the
     // box is dead the moment it is recorded — yet it is a non-pure `CallR`
-    // the optimizer cannot DCE (pure.py:222 demotes CALL_PURE→CALL and
+    // the optimizer cannot DCE (pure.py demotes CALL_PURE→CALL and
     // emits it; the retired MIFrame path never created the box because it
     // fused COMPARE_OP+POP_JUMP at the bytecode level). Mirroring that
     // fusion walker-side: write the raw truth into the Ref dst as a marker
@@ -2034,7 +2034,7 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
 
 /// B3 (`PYRE_FBW_RAISE`): walker-native fold of the CHECK_EXC_MATCH
 /// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
-/// `call_jit.rs:4299`). Computes the match concretely from
+/// `call_jit.rs`). Computes the match concretely from
 /// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
 /// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and,
 /// via [`bool_box_truth_record`], the immediately-following `is_true`
@@ -2259,7 +2259,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     };
     use pyre_interpreter::bytecode::BinaryOperator;
     // Power has no FLOAT_* opcode — it lowers to the raw-float
-    // `float_pow_jit` call (floatobject.py:561 descr_pow → _pow), same
+    // `float_pow_jit` call (floatobject.py descr_pow → _pow), same
     // as the trait's `is_power` arm.
     let op_code = match bin_op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(OpCode::FloatAdd),
@@ -2297,7 +2297,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
         }
     }
 
-    // floatobject.py:519 `_floatdiv` raises "float division by zero" — a
+    // floatobject.py `_floatdiv` raises "float division by zero" — a
     // concrete zero divisor at trace time means the generic helper already
     // raised, so a non-raising specialized `FloatTrueDiv` (raw IEEE → inf)
     // would be a miscompile.  Decline so the generic CALL_MAY_FORCE leg
@@ -2309,7 +2309,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     // --- emit the specialized IR (walker-native) ---
     let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64)?;
     let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64)?;
-    // rint.py:429 `_ovf_zer` analogue for float true-division: emit a
+    // rint.py `_ovf_zer` analogue for float true-division: emit a
     // `float_eq(rhs, 0.0) → guard_false` precondition ahead of the bare
     // `FloatTrueDiv` llop so a future zero divisor deopts to the checked
     // descr_truediv path (which raises ZeroDivisionError) rather than
@@ -2333,7 +2333,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
         }
         None => {
             let result_val = unsafe { pyre_object::w_float_get_value(boxed_result_i64 as _) };
-            // _pow (floatobject.py:865) traced inline for its fast paths:
+            // _pow (floatobject.py) traced inline for its fast paths:
             // every special-case `if` becomes a comparison guard and only
             // the raw libm pow stays residual.
             if let Some(r) = walker_emit_float_pow_inline(
@@ -2343,10 +2343,10 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
             } else {
                 // Cold-path fallback (nan/inf operands, negative base):
                 // the opaque `_pow` helper.  It is EF_CAN_RAISE, NOT
-                // force_virtual: pyjitpl.py:2084-2121 execute_varargs(
+                // force_virtual: pyjitpl.py execute_varargs(
                 // rop.CALL_F, ..., exc=True, pure=False) records CALL_F
                 // and handle_possible_exception → GUARD_NO_EXCEPTION
-                // (pyjitpl.py:3395).  The raising case never reaches
+                // (pyjitpl.py).  The raising case never reaches
                 // here: `walker_float_specialization_operands` already
                 // executed the helper concretely and returns `None` on a
                 // raise, falling back to the generic residual leg.
@@ -2410,7 +2410,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
 
     // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  Two
     // gates, both required:
-    //   * `ob_type == &TUPLE_TYPE` (tupleobject.py / tupleobject.rs:222) —
+    //   * `ob_type == &TUPLE_TYPE` (tupleobject.py / tupleobject.rs) —
     //     NOT `is_tuple()` (which also accepts the three
     //     SPECIALISED_TUPLE_{II,FF,OO} variants).  Specialised tuples store
     //     `value0`/`value1` inline with no `wrappeditems` block, so a
@@ -2521,7 +2521,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
     // Two-sided bounds guard `0 <= raw_index < len`.  Object storage keeps the
-    // inline `length` field (rlist.py:116); int/float storage read the typed
+    // inline `length` field (rlist.py); int/float storage read the typed
     // items-array length field.  The trace is recorded from a non-negative
     // observed index, but a later NEGATIVE index would still satisfy
     // `raw_index < len` and reach the element load out of range; `space.getitem`
@@ -2709,7 +2709,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     // from a non-negative observed index, but a later NEGATIVE index would
     // still satisfy `raw_index < len` and reach the PURE element load out of
     // range.  `space.getitem` treats a negative index as `index + len`
-    // (tupleobject.py:468); the lower-bound guard deopts so that remap
+    // (tupleobject.py); the lower-bound guard deopts so that remap
     // re-executes generically instead of reading before the array.
     let zero = ctx.trace_ctx.const_int(0);
     let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
@@ -2739,7 +2739,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
 /// `W_TupleObject`:
 /// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
-/// (descroperation.py:294 `_len`): `guard_value(callable)` +
+/// (descroperation.py `_len`): `guard_value(callable)` +
 /// `guard_class` + exact `w_class` guard + length `getfield_gc_i` +
 /// `wrapint`.  For a list this reads `W_ListObject.length()` →
 /// `strategy.length`, so it additionally emits `guard_value(strategy)`
@@ -2887,7 +2887,7 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
         .class_now_known(list_op, arg_type_addr);
     walker_guard_exact_w_class(ctx, op.pc, list_op, exact_w_class)?;
     // Length read.  list: guard the storage strategy, then read that
-    // strategy's length field (rlist.py:116 inline field for object storage;
+    // strategy's length field (rlist.py inline field for object storage;
     // typed items-block length for int/float storage).  str: a plain
     // codepoint-length getfield (no strategy, `bh_unicodelen`).
     let raw_len = if let Some(sid) = sid {
@@ -3118,7 +3118,7 @@ unsafe fn orthodox_list_append_recognize(
     // Empty-strategy first-append promotion (gated). `w_list_can_append_without_realloc`
     // is false for Empty (no backing block yet), so classify by the value's
     // type using switch_to_correct_strategy's int -> float -> object order
-    // (listobject.py:1154) and let the commit path install the typed storage.
+    // (listobject.py) and let the commit path install the typed storage.
     if pyre_object::w_list_uses_empty_storage(inner_self) {
         if !empty_append_virt_enabled() {
             // Gate off: preserve the prior behavior (Empty always declined).
@@ -3165,7 +3165,7 @@ unsafe fn orthodox_list_append_recognize(
     // precondition.
     let obj_ok = pyre_object::w_list_uses_object_storage(inner_self) && !value.is_null();
     // Float-storage specialization: a strict `W_FloatObject` stored
-    // unboxed. `FloatListStrategy.is_correct_type` (listobject.py:2061) is
+    // unboxed. `FloatListStrategy.is_correct_type` (listobject.py) is
     // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
     // arm also uses. No fits-* long analogue (a float is never re-boxed
     // across arithmetic, unlike a fits-int W_LongObject).
@@ -3252,7 +3252,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // the receiver BEFORE the value-class pin / storage read below, so those
     // observe the post-promotion strategy. Classify the target strategy from
     // the value with recognize's int -> float -> object guards
-    // (switch_to_correct_strategy, listobject.py:1154), then emit the
+    // (switch_to_correct_strategy, listobject.py), then emit the
     // transition IR mutating the existing wrapper, promote the concrete list,
     // and journal the rewind to Empty.
     use pyre_object::listobject::ListStrategy;
@@ -3594,9 +3594,9 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
 ///
 /// PyPy's `W_TypeObject.descr_call` promotes the class, then resolves
 /// `__new__` and `__init__` through its versioned MRO
-/// (`typeobject.py:703-735`).  When both resolve to
+/// (`typeobject.py`).  When both resolve to
 /// `W_BaseException.descr_new` / `descr_init`
-/// (`interp_exceptions.py:76-126`), a trivial subclass has the same traced
+/// (`interp_exceptions.py`), a trivial subclass has the same traced
 /// allocation and `args_w` store as its builtin base; only `w_class` differs.
 ///
 /// Returns `None` (fall through to the generic residual) for any non-matching
@@ -3665,7 +3665,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         // lookups have been proved identical to a canonical exception class.
         // Consequently force_plain_eval below can execute only the builtin
         // Rust `descr_new` / `descr_init`, never user Python code.  This is the
-        // promoted-class lookup contract of typeobject.py:703-735.
+        // promoted-class lookup contract of typeobject.py.
         if !unsafe { pyre_object::typeobject::w_type_is_heaptype(concrete_callable) } {
             return Ok(None);
         }
@@ -3866,7 +3866,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     if let Some(version_tag) = subclass_version_tag {
         // Guard the promoted class version that made both MRO descriptor
         // identities constant.  `W_TypeObject.mutated` recursively changes
-        // subclass tags (`typeobject.py:266-291`), so mutating this class or a
+        // subclass tags (`typeobject.py`), so mutating this class or a
         // base side-exits before reusing the folded constructor.
         let class_const = ctx.trace_ctx.const_ref(concrete_callable as i64);
         let live_version = crate::state::opimpl_getfield_gc_i(
@@ -4187,7 +4187,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             return Ok(None);
         }
         let (prev, prev_obj) = if let Some(seed) = ctx.fbw_mode.current_exception_seed {
-            // resume.py:993-1007 applies pending fields before resumed
+            // resume.py applies pending fields before resumed
             // execution.  Bridge tracing does not mutate the live EC, so use
             // the decoded fieldbox directly; a runtime GETFIELD here would
             // read the pre-guard TLS value before the bridge applies anything.
@@ -4467,7 +4467,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         crate::state::trace_float_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
     }
 
-    // Tracing is execution (pyjitpl.py:2095 execute_and_record): apply the
+    // Tracing is execution (pyjitpl.py execute_and_record): apply the
     // store to the concrete list now, so the walk's own region — and a
     // walk-end commit that hands the END state to the interpreter with no
     // replay — sees the mutation exactly once.  The displaced element goes
@@ -5099,7 +5099,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         crate::state::trace_int_block_setitem_value(ctx.trace_ctx, tgt_block, tgt_idx, src_raw);
     }
 
-    // Tracing is execution (pyjitpl.py:2095 execute_and_record): apply the
+    // Tracing is execution (pyjitpl.py execute_and_record): apply the
     // assignment to the concrete lists now as `slice_len` in-bounds setitems,
     // journaling each displaced element first so a non-committing walk's legacy
     // replay re-executes against the pre-walk heap (FBW_STORE_JOURNAL).  Each
@@ -5401,7 +5401,7 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
 /// [`try_walker_load_global_cell_fold`].  At module scope the frame's
 /// `w_locals` is null and `w_locals` aliases `w_globals`
 /// (`createframe` sets `debugdata.w_locals = w_globals_storage`,
-/// pyframe.rs:1323), so `load_name_value`'s probe + LOAD_GLOBAL fallthrough
+/// pyframe.rs), so `load_name_value`'s probe + LOAD_GLOBAL fallthrough
 /// both resolve in `w_globals` — the same dict the global cell fold reads.
 /// A non-module frame (class body / `exec(code, g, l)` with separate locals)
 /// has a non-null `w_locals`, so the gate routes it to the live
@@ -5423,7 +5423,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // Only module scope (w_locals IS w_globals) is foldable. Module frames bind
-    // `w_locals = w_globals` (pyframe.py:216-218); a `w_locals`
+    // `w_locals = w_globals` (pyframe.py); a `w_locals`
     // that is a DIFFERENT object means the LOAD_NAME probe targets a separate
     // locals namespace the module-dict cell fold (keyed on `w_globals`) would
     // skip. (Class bodies / `exec(code, g, l)` set a separate one; they also do

@@ -57,7 +57,7 @@ fn fresh_trace_ctx() -> TraceCtx {
 }
 
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
-/// production fallback at `pyjitpl.rs:4733` (`make_fail_descr_typed`)
+/// production fallback at `pyjitpl.rs` (`make_fail_descr_typed`)
 /// when the staticdata singleton was never attached.
 fn done_descr_ref_for_tests() -> DescrRef {
     make_fail_descr(1)
@@ -572,7 +572,7 @@ fn regular_record_table_is_the_sole_dispatcher() {
 
     // (b) every key is a real codewriter-emitted opname, except the
     // documented dormant `int_same_as/i>i` forward-prep arm: RPython
-    // `jtransform.py:246 rewrite_op_same_as` strips `same_as` before
+    // `jtransform.py rewrite_op_same_as` strips `same_as` before
     // assembly, so it is intentionally absent from the runtime table while
     // its dispatch entry is kept for the walker's forward-prep path.
     let runtime = insns_opname_to_byte();
@@ -792,7 +792,7 @@ fn switch_id_requires_concrete_int_value() {
 fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     // `goto_if_not/iL` with a concrete non-zero Int: emit GuardTrue,
     // do NOT take the jump (pc advances past the 3-byte operand
-    // block).  RPython `pyjitpl.py:511-520 opimpl_goto_if_not`
+    // block).  RPython `pyjitpl.py opimpl_goto_if_not`
     // `if switchcase: opnum = rop.GUARD_TRUE; ... if not switchcase: self.pc = target`.
     let goto_if_byte = *insns_opname_to_byte()
         .get("goto_if_not/iL")
@@ -1275,7 +1275,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     // `SubReturn { result: Some(callee.registers_i[0]) }`; the
     // caller's helper writes that OpRef into the caller's
     // `registers_i[dst]` (NOT registers_r — the kind discriminator
-    // for this variant). RPython parity: pyjitpl.py:1266-1324
+    // for this variant). RPython parity: pyjitpl.py
     // exec-generated `_opimpl_inline_call_r_i` template paired with
     // `_opimpl_any_return` for `int_return`.
     //
@@ -1439,7 +1439,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
     // Acceptance: caller's `inline_call_ir_r/dIR>r` carries
     // both an I-list and an R-list. The callee's int + ref register
     // banks must both be populated (RPython
-    // `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r,
+    // `pyjitpl.py setup_call(argboxes_i, argboxes_r,
     // argboxes_f)`). Smoke test: callee body is `ref_return r0` —
     // the ref arg routes through registers_r[0] back to the caller's
     // dst slot. The int arg flowing into registers_i[0] is dead but
@@ -1771,7 +1771,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     // `SubRaise { exc }` to the caller's inline_call handler. With
     // no caller-side `catch_exception/L` and is_top_level=true on
     // the outermost walker, RPython
-    // `pyjitpl.py:2533-2538 finishframe_exception` records
+    // `pyjitpl.py finishframe_exception` records
     // `compile_exit_frame_with_exception(last_exc_box)` — i.e.
     // FINISH(exc, exit_frame_with_exception_descr_ref) and exits
     // the trace. Walker mirrors this in `walk()`: top-level
@@ -2207,7 +2207,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
     // `int_return/i` mirrors `ref_return/r` on the int bank.
     // Top-level re-boxes the int for the Type::Ref portal exit
     // (`wrapint` = NEW_WITH_VTABLE + SETFIELD_GC) and stashes the
-    // boxed value as the finish payload (RPython `pyjitpl.py:3206-3208
+    // boxed value as the finish payload (RPython `pyjitpl.py
     // compile_done_with_this_frame`).
     let ret_byte = *insns_opname_to_byte()
         .get("int_return/i")
@@ -2292,7 +2292,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
 fn step_through_int_return_subwalk_surfaces_subreturn_some() {
     // nested `int_return/i` propagates SubReturn{Some(value)}
     // — same shape as `ref_return/r` sub-walk. RPython
-    // `pyjitpl.py:1688-1698 finishframe → popframe` returns control to
+    // `pyjitpl.py finishframe → popframe` returns control to
     // caller's metainterp loop with the box in hand.
     let ret_byte = *insns_opname_to_byte()
         .get("int_return/i")
@@ -2362,7 +2362,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
 #[test]
 fn step_through_void_return_stashes_void_finish_payload() {
     // Top-level `void_return/` is the VOID portal exit (RPython
-    // `pyjitpl.py:3202-3205 compile_done_with_this_frame`, the
+    // `pyjitpl.py compile_done_with_this_frame`, the
     // `result_type == VOID` branch — `exits = []`,
     // `token = sd.done_with_this_frame_descr_void`).  Under the
     // `PYRE_FBW_CALL_ASSEMBLER` gate (default on) it mirrors the three
@@ -2436,7 +2436,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
 #[test]
 fn step_through_void_return_subwalk_surfaces_subreturn_none() {
     // nested `void_return/` propagates SubReturn{None} —
-    // RPython `pyjitpl.py:467-469 opimpl_void_return → finishframe(None)`.
+    // RPython `pyjitpl.py opimpl_void_return → finishframe(None)`.
     // The caller's `inline_call_*_v` variant (when one exists) does
     // not write a dst register; today the walker has no `_v`
     // inline_call handler so `SubReturn{None}` reaching an `_r_r`
@@ -2564,7 +2564,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
 fn step_through_goto_jumps_to_label_target() {
     // `goto/L` reads its 2-byte LE label and the walker
     // returns Continue at the label target, not the linear next pc.
-    // RPython `blackhole.py:950-952 bhimpl_goto(target): return target`.
+    // RPython `blackhole.py bhimpl_goto(target): return target`.
     let goto_byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
@@ -2684,7 +2684,7 @@ fn step_through_goto_handles_high_byte_of_label() {
 #[test]
 fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
     // `finishframe_lookahead_at` must mirror RPython
-    // `pyjitpl.py:2506-2531 finishframe_exception` line-by-line —
+    // `pyjitpl.py finishframe_exception` line-by-line —
     // sequential `catch_exception/L` then `rvmprof_code/ii` then
     // fall-through.
     //
@@ -2736,7 +2736,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
 
 #[test]
 fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
-    // RPython `pyjitpl.py:497-504 opimpl_catch_exception`:
+    // RPython `pyjitpl.py opimpl_catch_exception`:
     //   assert not self.metainterp.last_exc_value
     // Reaching catch_exception/L on the normal walk path with
     // last_exc_value=Some(_) violates the codewriter invariant —
@@ -2798,7 +2798,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
 #[test]
 fn step_through_catch_exception_advances_past_label_operand() {
     // `catch_exception/L` records nothing on the normal
-    // walk (RPython `pyjitpl.py:497-504 opimpl_catch_exception` is
+    // walk (RPython `pyjitpl.py opimpl_catch_exception` is
     // an `assert not last_exc_value` only) and the walker advances
     // linearly past the 2-byte target.
     let catch_byte = *insns_opname_to_byte()
@@ -2863,7 +2863,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
 
 #[test]
 fn step_through_raise_records_outermost_finish_and_terminates() {
-    // RPython `pyjitpl.py:1688-1698 opimpl_raise` →
+    // RPython `pyjitpl.py opimpl_raise` →
     // `finishframe_exception` (outermost-frame branch) →
     // `compile_exit_frame_with_exception` records
     // `FINISH(exc, descr=exit_frame_with_exception_descr_ref)`.
@@ -2970,7 +2970,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     let mut tc = fresh_trace_ctx();
     // Use a non-constant OpRef so the heapcache class-known flag
     // actually pins. pyre's `is_class_known(constant)` returns
-    // false (`heapcache.rs:1014`) while `class_now_known(constant)`
+    // false (`heapcache.rs`) while `class_now_known(constant)`
     // is a no-op, so constants never round-trip through the
     // class-pinned cache.
     let exc_box = OpRef::input_arg_ref(0);
@@ -3035,7 +3035,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
 
     // Only the GuardClass op lands inline: `raise/r` records it during
     // dispatch (the GUARD_CLASS precedes the FINISH per
-    // `pyjitpl.py:1690-1696`), then the top-level SubRaise stashes the
+    // `pyjitpl.py`), then the top-level SubRaise stashes the
     // exception as an `is_exception` finish payload — the FINISH is
     // recorded by the FBW Terminate arm's compile consumer, not inline.
     assert_eq!(
@@ -3075,10 +3075,10 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
     // `reraise/` mirrors `raise/r` for the top-level
     // frame — it records `FINISH(last_exc_value,
     // exit_frame_with_exception_descr_ref)`. RPython parity:
-    // `pyjitpl.py:1700-1704 opimpl_reraise → popframe →
+    // `pyjitpl.py opimpl_reraise → popframe →
     // finishframe_exception` when the framestack is empty falls
     // through to `compile_exit_frame_with_exception(last_exc_box)`
-    // (pyjitpl.py:2533-2538).
+    // (pyjitpl.py).
     let reraise_byte = *insns_opname_to_byte()
         .get("reraise/")
         .expect("`reraise/` must be in insns table");
@@ -3159,7 +3159,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
 
 #[test]
 fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
-    // RPython `pyjitpl.py:1702 opimpl_reraise`:
+    // RPython `pyjitpl.py opimpl_reraise`:
     //   assert self.metainterp.last_exc_value
     // — reaching `reraise` without an active exception is a
     // codewriter invariant violation. Walker surfaces it as a
@@ -3217,7 +3217,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
 #[test]
 fn raise_at_top_level_populates_last_exc_value_before_finish() {
     // `raise/r` at top-level records FINISH and *also*
-    // sets `ctx.last_exc_value` (RPython `pyjitpl.py:1695`). The
+    // sets `ctx.last_exc_value` (RPython `pyjitpl.py`). The
     // post-condition matters because a future opcode in a
     // wrap-around (e.g. an unconditional `reraise/` after the
     // raise) would read it. Independently asserting the field
@@ -3283,7 +3283,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     // the caller; caller's inline_call SubRaise arm probes
     // `op.next_pc` for `live/` + `catch_exception/L`, finds it,
     // sets `last_exc_value = exc`, and resumes at the catch target.
-    // RPython parity: `pyjitpl.py:2506-2522 finishframe_exception`
+    // RPython parity: `pyjitpl.py finishframe_exception`
     // line-by-line — `op_live` skip then `op_catch_exception`
     // target jump.
     let raise_byte = *insns_opname_to_byte()
@@ -3427,7 +3427,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
     // loop with no `catch_exception/L` match, the loop returns
     // `SubRaise` unchanged so the parent's inline_call SubRaise arm
     // can scan its own op.next_pc for a catch handler.
-    // RPython parity: `pyjitpl.py:2533 finishframe_exception` loops
+    // RPython parity: `pyjitpl.py finishframe_exception` loops
     // through the framestack — only when `framestack` is exhausted
     // does it call `compile_exit_frame_with_exception`. Sub-walks
     // are not the framestack root.
@@ -3541,7 +3541,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     // `int_copy/i>i` reads the src `i` operand for OOR
     // validation, advances past 2 operand bytes, records nothing.
     // Dst writeback (`registers_i[dst] = registers_i[src]`) is
-    // deferred — RPython `pyjitpl.py:471-477 _opimpl_any_copy(box)
+    // deferred — RPython `pyjitpl.py _opimpl_any_copy(box)
     // -> box` is a register rename only, no IR op.
     let int_copy_byte = *insns_opname_to_byte()
         .get("int_copy/i>i")
@@ -4184,7 +4184,7 @@ fn int_and_records_intand() {
 // `int_or/ii>i` is not currently in `pipeline.insns` — pyre's
 // interpreter source does not emit Rust `|` on integers in any
 // path the JIT traces.  RPython's `Assembler.insns` only carries
-// emitted opnames (`assembler.py:220
+// emitted opnames (`assembler.py
 // setdefault(key, len(self.insns))`); pyre's runtime now mirrors
 // that (build.rs walks only `pipeline.insns`).  The dispatcher
 // handler exists; this test will unignore once an interpreter
@@ -4336,7 +4336,7 @@ fn drive_int_between(
     (new_ops, dst_post, arg_b1)
 }
 
-/// `pyjitpl.py:2648-2662 execute_and_record` — when every argbox
+/// `pyjitpl.py execute_and_record` — when every argbox
 /// is `ConstInt`, a pure op like `INT_SUB` / `INT_EQ` is folded
 /// via `wrap_constant` and never reaches `_record_helper`.
 /// `opimpl_int_between(ConstInt, ConstInt, ConstInt)` chains three
@@ -4361,7 +4361,7 @@ fn int_between_const_inputs_with_unit_width_takes_inteq_fast_path() {
     );
 }
 
-/// All-Const generic path: `pyjitpl.py:2648-2662` folds the three
+/// All-Const generic path: `pyjitpl.py` folds the three
 /// pure binops without recording.  Destination must carry the
 /// folded UINT_LT result.
 #[test]
@@ -4661,7 +4661,7 @@ fn int_invert_records_intinvert() {
 
 #[test]
 fn int_same_as_is_eliminated_from_generated_insns_table() {
-    // RPython `jtransform.py:246 rewrite_op_same_as` removes
+    // RPython `jtransform.py rewrite_op_same_as` removes
     // `same_as` before assembly. The walker keeps a handler arm for
     // forward-prep, but the production insns table should not contain
     // the opname unless a future codewriter path legitimately emits it.
@@ -4942,7 +4942,7 @@ fn unsupported_opname_surfaces_typed_error() {
     // Stable choice for exercising the catch-all `UnsupportedOpname`
     // error path.  `vtable_method_ptr/rd>i` is a pyre-only backend
     // adaptation (emitted by `OpKind::VtableMethodPtr` /
-    // `assembler.rs:2762`) without a PyPy analog: Python dispatch
+    // `assembler.rs`) without a PyPy analog: Python dispatch
     // resolves through `cpu.bh_call_*` at runtime rather than
     // reifying a method pointer into the bytecode stream.  Zero
     // JitCode hits in production traces (per
@@ -5000,7 +5000,7 @@ fn unsupported_opname_surfaces_typed_error() {
 }
 
 /// `ptr_nonzero/r>i` records `PtrNe(box, CONST_NULL)` into the
-/// int dst.  RPython parity: `pyjitpl.py:378-380 opimpl_ptr_nonzero`
+/// int dst.  RPython parity: `pyjitpl.py opimpl_ptr_nonzero`
 /// returns `self.execute(rop.PTR_NE, box, CONST_NULL)`.
 #[test]
 fn ptr_nonzero_records_ptrne_with_box_and_null() {
@@ -5060,7 +5060,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
     assert!(matches!(outcome, DispatchOutcome::Continue));
     assert_eq!(next_pc, 3);
     // `get_or_insert_typed` mints a fresh OpRef on every call (see
-    // `constant_pool.rs:87` — equality is `Const.same_constant`, not
+    // `constant_pool.rs` — equality is `Const.same_constant`, not
     // OpRef identity), so we cannot compare against a freshly-minted
     // null_const.  Verify args[1] is a Ref-typed constant whose
     // pooled value is 0 instead.
@@ -5094,7 +5094,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
 
 /// `abort/>r` is a pyre-only no-op result marker — the walker
 /// counterpart of blackhole's `handler_abort_result_marker_r`
-/// (`blackhole.rs:5149`).  No operand read, no register write, no
+/// (`blackhole.rs`).  No operand read, no register write, no
 /// IR op recorded; dispatch advances past the 1B dst slot only.
 #[test]
 fn abort_result_r_is_pure_pc_advance() {
@@ -5157,7 +5157,7 @@ fn abort_result_r_is_pure_pc_advance() {
 
 /// `ref_guard_value/r` records `GuardValue(value, ConstPtr(concrete))`
 /// when the symbolic OpRef is non-Const and a concrete pointer is
-/// available in the shadow.  Mirrors `pyjitpl.py:1916-1927
+/// available in the shadow.  Mirrors `pyjitpl.py
 /// implement_guard_value`.
 #[test]
 fn ref_guard_value_records_guardvalue_with_concrete_constant() {
@@ -5340,7 +5340,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
 }
 
 /// Symbolic OpRef already a Const → `ref_guard_value/r` is a no-op
-/// (`pyjitpl.py:1920-1921 if isinstance(box, Const): return box`).
+/// (`pyjitpl.py if isinstance(box, Const): return box`).
 #[test]
 fn ref_guard_value_on_const_records_nothing() {
     let opname = "ref_guard_value/r";
@@ -5411,7 +5411,7 @@ fn ref_guard_value_on_const_records_nothing() {
 fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     // `residual_call_r_r/iRd>r` records `OpCode::CallR`
     // with `[funcptr, ...args]` and `descr=descr_refs[d]`. RPython
-    // `pyjitpl.py:1334-1347 _opimpl_residual_call1` →
+    // `pyjitpl.py _opimpl_residual_call1` →
     // `do_residual_or_indirect_call → execute_and_record_varargs(
     // rop.CALL_R, [funcbox]+argboxes, descr=calldescr)`.
     let residual_byte = *insns_opname_to_byte()
@@ -5548,11 +5548,11 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     );
     // `walker_capture_snapshot_for_last_guard` ports
     // `capture_resumedata(after_residual_call=True)`
-    // (`pyjitpl.py:2599-2603`).  Every guard emitted by a
+    // (`pyjitpl.py`).  Every guard emitted by a
     // residual_call dispatcher now carries a snapshot whose
     // `rd_resume_position` is the freshly-allocated snapshot id
     // (`>= 0`), so the optimizer's `store_final_boxes_in_guard`
-    // (`optimizeopt/mod.rs:5033`) finds attached resume data
+    // (`optimizeopt/mod.rs`) finds attached resume data
     // instead of panicking on the `-1` sentinel.
     assert!(
         guard_op.rd_resume_position.get() >= 0,
@@ -5615,7 +5615,7 @@ fn call_descr_with_oopspec(
 
 #[test]
 fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
-    // RPython parity: `do_residual_call` (pyjitpl.py:2111-2118) reads
+    // RPython parity: `do_residual_call` (pyjitpl.py) reads
     // `effectinfo.check_is_elidable()` + `effectinfo.check_can_raise()`,
     // then `execute_varargs(rop.CALL_R, ..., exc, pure)`. With
     // EF_ELIDABLE_CANNOT_RAISE: `pure=True` (CALL_PURE_R) + `exc=False`
@@ -5927,14 +5927,14 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     );
 }
 
-// pyjitpl.py:3329-3330 / 3349-3353 vable token protocol around a
+// pyjitpl.py / 3349-3353 vable token protocol around a
 // concrete-executed may-force call: with an active standard
 // virtualizable the executor sets TOKEN_TRACING_RESCALL before the
 // call and probes-and-clears after it.  A token still intact means
 // no force — execute + stamp as usual, token back to TOKEN_NONE.  A
 // cleared token means the callee forced the virtualizable —
 // `DispatchError::VableEscapedDuringResidualCall` (ABORT_ESCAPE,
-// pyjitpl.py:3365).
+// pyjitpl.py).
 fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     assert!(
@@ -6035,7 +6035,7 @@ static FORCING_CALLEE_TOKEN_ADDR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn forces_vable_for_walker_test(a: i64, b: i64) -> i64 {
-    // A force path clears the vable token (virtualizable.rs:543
+    // A force path clears the vable token (virtualizable.rs
     // force_now on TOKEN_TRACING_RESCALL).
     let addr = FORCING_CALLEE_TOKEN_ADDR.load(std::sync::atomic::Ordering::SeqCst);
     unsafe { *(addr as *mut u64) = 0 };
@@ -6126,10 +6126,10 @@ fn may_force_vable_escape_surfaces_typed_abort() {
 
 #[test]
 fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py:2003-2005` routes
+    // RPython parity: `pyjitpl.py` routes
     // `OS_NOT_IN_TRACE` residual calls through `do_not_in_trace_call`
     // which executes the callee concretely and aborts to blackhole
-    // only if it raises (`pyjitpl.py:3683-3697`). The walker has no
+    // only if it raises (`pyjitpl.py`). The walker has no
     // concrete executor, so it must surface a typed error rather
     // than recording either the normal-return or
     // SwitchToBlackhole shape.
@@ -6195,7 +6195,7 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
 
 #[test]
 fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py:2011-2014` short-circuits
+    // RPython parity: `pyjitpl.py` short-circuits
     // `do_residual_call` via `_do_jit_force_virtual` when
     // `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`.  The
     // walker can't reproduce that short-circuit (needs concrete
@@ -6470,7 +6470,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
     wc.outer_resume_marker_jit_pc = Some(0);
     let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
     // The dst slot must hold the OpRef of the recorded CallR. Each
-    // Op carries its OpRef in `op.pos` (recorder.rs:159), which lets
+    // Op carries its OpRef in `op.pos` (recorder.rs), which lets
     // the test compare without re-deriving the index (input args
     // also occupy OpRef indices, so `ops.iter().position()` would
     // be off by `num_inputargs`).
@@ -6494,11 +6494,11 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
 
 #[test]
 fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
-    // pyjitpl.py:1950 _opimpl_residual_call*: result lands in
+    // pyjitpl.py _opimpl_residual_call*: result lands in
     // `registers_*[reg_index]` BEFORE
     // `handle_possible_exception()` records GUARD_NO_EXCEPTION.
     // `walker_capture_snapshot_for_last_guard`
-    // (`pyjitpl.py:2599-2603 capture_resumedata(after_residual_call
+    // (`pyjitpl.py capture_resumedata(after_residual_call
     // =True)`) snapshots the active registers AFTER the writeback,
     // so the dst slot's recorded OpRef rides the snapshot's
     // fail_arg list.  The structural invariant tested here is:
@@ -6810,10 +6810,10 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
 #[test]
 fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
     // kind sibling of `_r_r`. Same `iRd>X` operand
-    // layout, dst kind flipped to int. RPython `pyjitpl.py:1346
+    // layout, dst kind flipped to int. RPython `pyjitpl.py
     // opimpl_residual_call_r_i = _opimpl_residual_call1` shares
     // the body; `do_residual_call`'s `descr.get_normalized_result_type()`
-    // dispatch (pyjitpl.py:2022-2044) selects `'i' → CALL_*_I`.
+    // dispatch (pyjitpl.py) selects `'i' → CALL_*_I`.
     // CallDescr required (RPython do_residual_call invariant);
     // walker records `OpCode::CallI` + `OpCode::GuardNoException`,
     // writes the call's OpRef into `registers_i[dst]`.
@@ -7163,7 +7163,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
 fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
     // The `_ir_*` shape gives
     // the walker source-list-order argboxes `[i_args..., r_args...]`,
-    // but RPython `_build_allboxes` (pyjitpl.py:1960-1993) re-orders
+    // but RPython `_build_allboxes` (pyjitpl.py) re-orders
     // those to match the callee's `descr.get_arg_types()` ABI. This
     // test pins the non-identity permutation.
     //
@@ -7272,7 +7272,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
 #[test]
 fn residual_call_descr_not_call_descr_surfaces_typed_error() {
     // Walker requires CallDescr per RPython invariant
-    // (pyjitpl.py:1995 do_residual_call). When the descr_pool entry
+    // (pyjitpl.py do_residual_call). When the descr_pool entry
     // at the operand-encoded index lacks a CallDescr downcast (here
     // a FailDescr), the walker surfaces ResidualCallDescrNotCallDescr.
     // In production the codewriter never emits non-CallDescr; this
@@ -8610,7 +8610,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     // writes the recorder OpRef into `registers_i[dst]` — the same
     // shape `getfield_gc_via_heapcache` produces on a cache miss.
     // The handler itself stays orthodox to RPython
-    // `pyjitpl.py:1167-1172 opimpl_getfield_vable_i`; the
+    // `pyjitpl.py opimpl_getfield_vable_i`; the
     // GETFIELD_GC fallback is `vable_getfield_int`'s decision, not
     // the walker's, so this test exercises the walker→trace_ctx
     // boundary without depending on a `virtualizable_info` fixture.
@@ -8798,7 +8798,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
     // When the heapcache already knows
     // valuebox is the current value of (obj, descr), the
     // SETFIELD_GC IR op must NOT be recorded. RPython parity:
-    // `pyjitpl.py:976 if upd.currfieldbox is valuebox: return`.
+    // `pyjitpl.py if upd.currfieldbox is valuebox: return`.
     let byte = *insns_opname_to_byte()
         .get("setfield_gc_i/rid")
         .expect("`setfield_gc_i/rid` must be in insns table");
@@ -9447,7 +9447,7 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     );
     // Post-condition: dispatch_via_miframe also sets
     // sym.class_of_last_exc_is_const to mirror RPython's
-    // `pyjitpl.py:1694 opimpl_raise: class_of_last_exc_is_const = True`.
+    // `pyjitpl.py opimpl_raise: class_of_last_exc_is_const = True`.
     assert!(
         sym.class_of_last_exc_is_const(),
         "sym.class_of_last_exc_is_const must be true after a raise/r",
@@ -9588,7 +9588,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
 /// visit of a (green key, red shape) registers the merge point and
 /// continues unrolling; the second visit with the same key + shape
 /// closes the loop with the reds as jump args.  Mirrors
-/// `pyjitpl.py:2994-3036` first-visit/found split.
+/// `pyjitpl.py` first-visit/found split.
 #[test]
 fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let jmp_byte = *insns_opname_to_byte()
@@ -9664,25 +9664,25 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     };
 
     // Arrival without a preceding `loop_header` stamp and with no
-    // recorded ops is a plain pass-through (pyjitpl.py:1547-1548):
+    // recorded ops is a plain pass-through (pyjitpl.py):
     // nothing registers, nothing closes.
     let (gated, gated_next) = step(&code, 0, &mut wc).expect("gated jit_merge_point must dispatch");
     assert_eq!(gated, DispatchOutcome::Continue);
     assert_eq!(gated_next, code.len());
 
     // First crossing via a backward jump: `loop_header` stamped the
-    // per-trace flag (pyjitpl.py:1527-1528) — registers
+    // per-trace flag (pyjitpl.py) — registers
     // (key, [red0, red1]) and continues.
     wc.trace_ctx.seen_loop_header_for_jdindex = 0;
     let (first, first_next) = step(&code, 0, &mut wc).expect("first jit_merge_point must dispatch");
     assert_eq!(first, DispatchOutcome::Continue);
     assert_eq!(first_next, code.len());
-    // The stamp is consumed (pyjitpl.py:1562).
+    // The stamp is consumed (pyjitpl.py).
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
 
     // Second stamped crossing (same key + red shape): closes the loop.
     // The reds here are constants, so `remove_consts_and_duplicates`
-    // (pyjitpl.py:2934-2965) replaces each with a freshly recorded
+    // (pyjitpl.py) replaces each with a freshly recorded
     // `same_as` op before the close — the jump args are runtime
     // OpRefs wrapping the original const reds, not the consts.
     wc.trace_ctx.seen_loop_header_for_jdindex = 0;
@@ -9705,7 +9705,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
 }
 
 /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
-/// int-constant operand and records nothing (pyjitpl.py:1527-1528).
+/// int-constant operand and records nothing (pyjitpl.py).
 #[test]
 fn loop_header_stamps_seen_flag() {
     let lh_byte = *insns_opname_to_byte()

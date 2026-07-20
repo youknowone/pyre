@@ -13,7 +13,7 @@ use super::*;
 /// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
 /// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
 ///
-/// RPython parity: `pyjitpl.py:1167-1186 opimpl_getfield_vable_{i,r,f}`:
+/// RPython parity: `pyjitpl.py opimpl_getfield_vable_{i,r,f}`:
 ///
 ///   def opimpl_getfield_vable_i(self, box, fielddescr, pc):
 ///       if self._nonstandard_virtualizable(pc, box, fielddescr):
@@ -23,8 +23,8 @@ use super::*;
 ///       return self.metainterp.virtualizable_boxes[index]
 ///
 /// The walker delegates to the orthodox `TraceCtx::vable_getfield_{int,
-/// ref,float}` ports (`majit-metainterp/src/trace_ctx.rs:1715, 1801,
-/// 1839`) which already implement the full
+/// ref,float}` ports (`majit-metainterp/src/trace_ctx.rs`)
+/// which already implement the full
 /// `_nonstandard_virtualizable` check + heapcache-aware GETFIELD_GC
 /// fallback + `virtualizable_boxes[index]` cache read.  Only the OpRef
 /// component of the `(OpRef, Value)` tuple is meaningful here, since
@@ -77,12 +77,12 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 
     // R7 parity: RPython `opimpl_getfield_vable_{i,r,f}(box, fielddescr,
     // pc)` threads orgpc through `_nonstandard_virtualizable(pc, ...)`
-    // (pyjitpl.py:1167-1186 + :1137).  Pyre's walker has the matching
+    // (pyjitpl.py).  Pyre's walker has the matching
     // JitCode PC in `op.pc`; pass it through so the helper signature
     // stays line-by-line equivalent even if `is_nonstandard_virtualizable`
     // currently ignores the pc at the leaf (`trace_ctx.rs let _ = pc;`).
     let pc = op.pc;
-    // Concrete struct pointer for pyjitpl.py:934-945 cache-hit sanity
+    // Concrete struct pointer for pyjitpl.py cache-hit sanity
     // check.  The walker keeps a parallel concrete Ref-bank shadow;
     // thread the same live pointer that RPython's `box.getref_base()`
     // would expose to `executor.execute(...)`.
@@ -106,7 +106,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     };
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
-    // `virtualizable_boxes[index]` (`pyjitpl.py:1186`) — a Box whose
+    // `virtualizable_boxes[index]` (`pyjitpl.py`) — a Box whose
     // `_resint`/`_resref`/`_resfloat` is filled at construction time.
     // `box.getint()` returns the live value without any side-lookup.
     // Pyre splits OpRef↔concrete into a side table; mirror the Box.value
@@ -158,7 +158,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 /// 1B r-reg(vable_box) + 1B <v>-reg(value) + 2B descr(field).
 /// No dst byte (set, not get).
 ///
-/// RPython parity: `pyjitpl.py:1188-1199 _opimpl_setfield_vable`:
+/// RPython parity: `pyjitpl.py _opimpl_setfield_vable`:
 ///
 ///   def _opimpl_setfield_vable(self, box, valuebox, fielddescr, pc):
 ///       if self._nonstandard_virtualizable(pc, box, fielddescr):
@@ -169,12 +169,12 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 ///       # XXX only the index'th field needs to be synchronized, really
 ///
 /// The walker delegates to `TraceCtx::vable_setfield`
-/// (`majit-metainterp/src/trace_ctx.rs:1759`) which implements the
+/// (`majit-metainterp/src/trace_ctx.rs`) which implements the
 /// full `_nonstandard_virtualizable` -> SETFIELD_GC fallback +
 /// `virtualizable_boxes[index] = valuebox` write + `synchronize_virtualizable`
 /// mirror.  The concrete `Value` is reconstructed via
 /// `TraceCtx::concrete_of_opref` (matching the
-/// `pyjitpl/dispatch.rs:1608-1609` shape `let (value, concrete) =
+/// `pyjitpl/dispatch.rs` shape `let (value, concrete) =
 /// self.read_<bank>_reg(src); ctx.vable_setfield(...)`).
 ///
 /// `value_bank` selects the value register bank (`'i'`/`'r'`/`'f'`),
@@ -189,7 +189,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // own (unseeded) portal frame is a virtual-field write — `valuestackdepth`
     // / `last_instr` sync on a branchless leaf that resumes at the caller
     // boundary — so it folds to a no-op, emitting no SETFIELD_GC.  The
-    // `fresh_virtualizable` OptVirtualize elision (jtransform.py:990-993).
+    // `fresh_virtualizable` OptVirtualize elision (jtransform.py).
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -208,7 +208,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     };
     let descr = read_descr(code, op, 2, ctx)?;
     let concrete = ctx.trace_ctx.concrete_of_opref(value);
-    // R7 parity: pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box,
+    // R7 parity: pyjitpl.py `_opimpl_setfield_vable(box,
     // valuebox, fielddescr, pc)` threads orgpc through
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
     // JitCode PC, pass through.
@@ -223,14 +223,14 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
 /// `(VableArray, Array)` jitcode descr-pool pair.
 ///
 /// RPython parity: `MIFrame.vable_array_index_pair_at`
-/// (`blackhole.rs:1613-1628`) reads the two 2-byte descr-pool indices,
+/// (`blackhole.rs`) reads the two 2-byte descr-pool indices,
 /// asserts they resolve to `(BhDescr::VableArray { index }, BhDescr::Array
 /// { .. })`, and yields the `index`. `vable_array_descrs`
-/// (`pyjitpl/dispatch.rs:845-856`) then maps that index through the
+/// (`pyjitpl/dispatch.rs`) then maps that index through the
 /// jitdriver's `VirtualizableInfo` to the canonical `array_field_descrs`
 /// /`array_descrs` pair.  The walker must use the *vinfo* descrs (not the
 /// raw jitcode-pool descrs) because `TraceCtx::vable_array_flat_index`
-/// keys on `array_field_by_descr` (descr identity, `virtualizable.rs:602`).
+/// keys on `array_field_by_descr` (descr identity, `virtualizable.rs`).
 ///
 /// `field_offset` / `array_offset` are byte offsets (from `op.pc + 1`) of
 /// the two descr operands, matching the per-op argcode layout.
@@ -304,14 +304,14 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
 /// 1B r-reg(vable) + 1B i-reg(index) + 2B fdescr(VableArray) + 2B
 /// adescr(Array) + 1B X-dst.
 ///
-/// RPython parity: `pyjitpl.py:1218-1234 _opimpl_getarrayitem_vable`
+/// RPython parity: `pyjitpl.py _opimpl_getarrayitem_vable`
 /// (`opimpl_getarrayitem_vable_{i,r,f}`).  Delegates to
 /// `TraceCtx::vable_getarrayitem_{int,ref,float}_indexed`
-/// (`trace_ctx.rs:2982/3043/3099`) which implements the
+/// (`trace_ctx.rs`) which implements the
 /// `_nonstandard_virtualizable` GETFIELD_GC + GETARRAYITEM_GC fallback
 /// and the standard-vable `virtualizable_boxes[index]` cache read.
 /// Mirrors `getfield_vable_via_metainterp`'s concrete-stamp + dst-write
-/// shape; the trait counterpart is `pyjitpl/dispatch.rs:1909-1977`.
+/// shape; the trait counterpart is `pyjitpl/dispatch.rs`.
 pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -321,7 +321,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // Strict fresh-frame fold: when this op reads the current inline level's
     // own (unseeded) portal frame, resolve it register-to-register through the
     // per-slot OpRef shadow and emit NO GC op — the `fresh_virtualizable` case
-    // (jtransform.py:990-993 `is_virtualizable_getset` returns `False`).  The
+    // (jtransform.py `is_virtualizable_getset` returns `False`).  The
     // param-store seed dominates every read of a branchless leaf's own frame,
     // so the slot is present; a genuinely-unbound read falls through to the
     // `VableBoxNotSeeded` abort below (never the 16 GiB metainterp path).
@@ -366,7 +366,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
     let index = read_int_reg(code, op, 1, ctx)?;
-    // pyjitpl.py:1206 `indexbox.getint()` — the array slot is chosen from
+    // pyjitpl.py `indexbox.getint()` — the array slot is chosen from
     // the concrete index. Fail loud if the walker can't resolve it.
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
@@ -486,12 +486,12 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
 /// 1B r-reg(vable) + 1B i-reg(index) + 1B X-reg(value) + 2B
 /// fdescr(VableArray) + 2B adescr(Array). No dst byte.
 ///
-/// RPython parity: `pyjitpl.py:1236-1247 _opimpl_setarrayitem_vable`.
+/// RPython parity: `pyjitpl.py _opimpl_setarrayitem_vable`.
 /// Delegates to `TraceCtx::vable_setarrayitem_indexed`
-/// (`trace_ctx.rs:3153`) which implements the `_nonstandard_virtualizable`
+/// (`trace_ctx.rs`) which implements the `_nonstandard_virtualizable`
 /// SETARRAYITEM_GC fallback + the standard-vable
 /// `virtualizable_boxes[index] = valuebox` + `synchronize_virtualizable`.
-/// Trait counterpart: `pyjitpl/dispatch.rs:1978-2052`.
+/// Trait counterpart: `pyjitpl/dispatch.rs`.
 pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -658,12 +658,12 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
 /// `arraylen_vable/rdd>i` handler. Operand layout `rdd>i`: 1B r-reg(vable)
 /// + 2B fdescr(VableArray) + 2B adescr(Array) + 1B i-dst.
 ///
-/// RPython parity: `pyjitpl.py:1253-1263 opimpl_arraylen_vable`.
-/// Delegates to `TraceCtx::vable_arraylen_vable` (`trace_ctx.rs:3195`)
+/// RPython parity: `pyjitpl.py opimpl_arraylen_vable`.
+/// Delegates to `TraceCtx::vable_arraylen_vable` (`trace_ctx.rs`)
 /// which implements the `_nonstandard_virtualizable` GETFIELD_GC +
 /// ARRAYLEN_GC fallback and the standard-vable
 /// `ConstInt(get_array_length(...))` read.  Trait counterpart:
-/// `pyjitpl/dispatch.rs:2053-2068`.
+/// `pyjitpl/dispatch.rs`.
 pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,

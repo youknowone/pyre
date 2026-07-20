@@ -26,7 +26,7 @@ use super::*;
 /// magnitude more blackhole resumes than the folded path, ~20-30× slower).
 /// This mirrors `max_unroll_recursion` bounding the same runaway: past the
 /// bound the recursive call folds straight to `CALL_ASSEMBLER`
-/// (`_opimpl_recursive_call` → `do_recursive_call`, `pyjitpl.py:1404-1416`)
+/// (`_opimpl_recursive_call` → `do_recursive_call`, `pyjitpl.py`)
 /// rather than continuing to unroll the call tree.  `try_multiframe`
 /// (`inline_depth < fbw_max_multiframe_depth()`) therefore only fires at the
 /// top inline level by default. (The depth-≥2 blackhole-resume crash that
@@ -106,7 +106,7 @@ pub(crate) fn fbw_nsvable_multiframe_enabled() -> bool {
 /// the recursive portal `CALL_ASSEMBLER`.
 ///
 /// RPython parity: `opimpl_recursive_call` / `do_recursive_call`
-/// (`pyjitpl.py:1376-1432`) inline within `max_unroll_recursion`; only once the
+/// (`pyjitpl.py`) inline within `max_unroll_recursion`; only once the
 /// cap is reached does recursion fall back to the assembler-call path.  The
 /// prior fold-only default (every self-recursive call cut straight to
 /// `CALL_ASSEMBLER`) was the pyre deviation; inlining below the depth bound is
@@ -126,8 +126,8 @@ pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
 
 /// Full-portal recursive-call cutover (`PYRE_FBW_REC_MUTUAL_CUTOVER`): at the
 /// inline-unroll cap, route a recursive callee (self OR mutual) through
-/// `get_assembler_token` → `compile_tmp_callback` (warmstate.py:714-723,
-/// compile.py:1101-1150) so a not-yet-compiled callee still enters via a real
+/// `get_assembler_token` → `compile_tmp_callback` (warmstate.py,
+/// compile.py) so a not-yet-compiled callee still enters via a real
 /// CALL_ASSEMBLER tmp-callback token instead of poisoning the trace with
 /// `LoopBearingCalleeInlineUnsupported`.  Mirrors the `build_jit_driver_pair`
 /// gate of the same name (eval.rs); default ON, `=0` opts out.
@@ -188,8 +188,8 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
 /// scalar to a callee jitframe slot), so the optimizer can elide the per-call
 /// frame-array build (`NewArrayClear` + per-element `SetarrayitemGc`) instead
 /// of forcing the virtual frame. Mirrors `direct_assembler_call`
-/// (`pyjitpl.py:3613`, raw red boxes) + `handle_call_assembler`
-/// (`rewrite.py:665`, GC_STORE scalars into the callee jitframe). Default OFF
+/// (`pyjitpl.py`, raw red boxes) + `handle_call_assembler`
+/// (`rewrite.py`, GC_STORE scalars into the callee jitframe). Default OFF
 /// until the callee scalar contract + optimizer array-elision land and the
 /// path is verified fib-safe on both backends.
 pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
@@ -344,7 +344,7 @@ pub(crate) fn fbw_callee_vstack_enabled() -> bool {
 }
 
 /// `PYRE_FBW_STACK_LIVEREG` (default ON) — for branch-guard operand-stack
-/// snapshot slots, prefer the live Ref register (`pyjitpl.py:222`
+/// snapshot slots, prefer the live Ref register (`pyjitpl.py`
 /// `get_list_of_active_boxes` reads `self.registers_r[index]`) when the
 /// guard PC's per-PC color map proves that color owns the same stack slot.
 /// `=0` restores the shadow-first pyre-local order everywhere.
@@ -507,7 +507,7 @@ pub(crate) fn fbw_executed_body_residual_reset() {
 /// prints the structured reason (the `DispatchError` variant or the
 /// non-loop-closing `DispatchOutcome`) for every walk that maps to
 /// `TraceAction::Abort` / `AbortPermanent`.  The metainterp's own
-/// "abort trace at key={} (permanent={})" log (`pyjitpl.rs:6348`) only
+/// "abort trace at key={} (permanent={})" log (`pyjitpl.rs`) only
 /// reports the key and permanence; the walker-side reason is otherwise
 /// swallowed.  Default OFF → no output, zero production effect.
 pub fn fbw_debug_abort_enabled() -> bool {
@@ -1179,7 +1179,7 @@ pub(crate) fn fbw_abort_carrier_clear() {
 thread_local! {
     /// Marks the self-recursive `CALL_ASSEMBLER` fold's concrete-stamp
     /// executor call. RPython `do_residual_call` executes the recorded
-    /// residual at any framestack depth (`pyjitpl.py:2019-2044`), while
+    /// residual at any framestack depth (`pyjitpl.py`), while
     /// pyre's nested-residual decline below is a local protection for
     /// FOREIGN unjournaled residuals.
     pub(crate) static SELFREC_CA_FOLD_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1251,7 +1251,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
             != Some(std::ffi::OsStr::new("0"))
     });
     // RPython `do_residual_call` runs the residual executor at any framestack
-    // depth (`pyjitpl.py:2019-2044`). Exempt only the self-recursive
+    // depth (`pyjitpl.py`). Exempt only the self-recursive
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
     let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
@@ -1374,7 +1374,7 @@ pub fn capture_fbw_store_journal_root_area() -> *const () {
 
 /// FBW-native port of [`crate::state::ensure_boxed_for_ca`] that operates
 /// purely on the [`TraceCtx`] (no borrowed `MIFrame`).  A portal-exit
-/// FINISH must carry `Type::Ref` (`pyjitpl.py:2489-2502` REF result_type);
+/// FINISH must carry `Type::Ref` (`pyjitpl.py` REF result_type);
 /// if the optimizer left the return value unboxed as Int/Float, re-box it
 /// (`wrapint` / `wrapfloat` = `NewWithVtable` + `SetfieldGc`).  `value_type`
 /// here is `ctx.get_opref_type(value).unwrap_or(Type::Ref)`, the exact body
@@ -1398,7 +1398,7 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
     Ok(boxed)
 }
 
-/// FBW-native port of `MIFrame::store_token_in_vable` (`pyjitpl.py:3222`).
+/// FBW-native port of `MIFrame::store_token_in_vable` (`pyjitpl.py`).
 /// Records `FORCE_TOKEN` + `SETFIELD_GC(vbox, token, vable_token_descr)`
 /// via `store_token_in_vable_setfield` and, when that fires, the
 /// `GUARD_NOT_FORCED_2` with resumedata captured through the walker's own
@@ -1437,7 +1437,7 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
 /// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
-/// branch, pyjitpl.py:3202-3205).  Records the vable store-back +
+/// branch, pyjitpl.py).  Records the vable store-back +
 /// `GUARD_NOT_FORCED_2`, then stashes a `Type::Void`-marked payload so
 /// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
@@ -1453,7 +1453,7 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
 }
 
 /// Exception variant of [`fbw_terminate_with_finish`] for the top-level
-/// uncaught raise (`compile_exit_frame_with_exception`, pyjitpl.py:3238-3242).
+/// uncaught raise (`compile_exit_frame_with_exception`, pyjitpl.py).
 /// Stashes the exception box (`exc`, already a `Type::Ref`) as an
 /// `is_exception` payload and, when the raised exception has a concrete Ref,
 /// the concrete disposition for the GC root walker / no-replay portal.  Like

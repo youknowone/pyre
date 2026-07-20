@@ -11,7 +11,7 @@
 
 use super::*;
 
-/// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`
+/// `generate_guard` (`pyjitpl.py`) keys `after_residual_call`
 /// on the guard opcode itself: `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` /
 /// `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS` resume *after* the residual
 /// call; every other guard resumes at its own opcode.  The call already
@@ -196,12 +196,12 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
     // Snapshot semantics for walker-emitted guards
-    // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
+    // (`pyjitpl.py generate_guard` + `capture_resumedata`):
     //
     // RPython treats helper jitcodes (pop_value, nlocals, etc.) as
     // separate `MIFrame`s on `metainterp.framestack`, capturing one
     // snapshot frame per `MIFrame` plus a vable_array / vref_array
-    // prefix on the top frame (`opencoder.py:767 create_top_snapshot`).
+    // prefix on the top frame (`opencoder.py create_top_snapshot`).
     // At resume, RPython's blackhole interpreter re-enters each frame's
     // jitcode and replays from the saved pc.
     //
@@ -233,7 +233,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // via `collect_outer_active_boxes` / `frame_liveness_reg_indices_
     // by_bank_at`).
     //
-    // `opencoder.py:772-775 create_top_snapshot` writes vable_array +
+    // `opencoder.py create_top_snapshot` writes vable_array +
     // vref_array on the top snapshot.  The walker-emitted guard IS
     // a top snapshot for pyre (helper frames don't resume), so feed
     // the trace-time vable/vref shadow through.  Empty when no
@@ -331,14 +331,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // at `semantic_fallthrough_pc` / `jump_target_forward`,
                 // both of which forward-skip trivia.  Advance to the same
                 // real opcode so the resume reader's BACKWARD trivia
-                // backtrack (call_jit.rs:837) is a no-op — otherwise a
+                // backtrack (call_jit.rs) is a no-op — otherwise a
                 // `NOT_TAKEN` py_pc backtracks to the preceding branch
                 // opcode, whose block-entry liveness differs from the
                 // target's and desyncs the snapshot box-count.
                 if !jc.payload.code_ptr.is_null() {
                     let code = &*jc.payload.code_ptr;
                     py = skip_python_trivia_forward(code, py as usize) as u32;
-                    // after_residual_call=True (`pyjitpl.py:2599-2603`): the
+                    // after_residual_call=True (`pyjitpl.py`): the
                     // may-force call already executed in compiled code and
                     // consumed its Python stack operands. Resume at the NEXT
                     // executable opcode so the blackhole continues past the call
@@ -415,8 +415,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             };
             // `capture_resumedata(after_residual_call=True)` snapshots the
             // trailing `-live-`, after the residual result has replaced the
-            // Python opcode's consumed operands (pyjitpl.py:177-198,
-            // opencoder.py:767-770).  The walk-level stack mirror normally
+            // Python opcode's consumed operands (pyjitpl.py,
+            // opencoder.py).  The walk-level stack mirror normally
             // applies that replacement only when `step_vstack_mirror` reaches
             // the next Python opcode.  A guard emitted by the residual itself
             // captures before that step, so advance the mirror here to the
@@ -595,7 +595,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // is the guard-PC color read (as `resolved_recovered` does for
             // `registers_r[src]`), NOT the retired stale merge-color read.
             // This ports `get_list_of_active_boxes`
-            // (rpython/jit/metainterp/pyjitpl.py:177-234), which captures guard
+            // (rpython/jit/metainterp/pyjitpl.py), which captures guard
             // resume boxes from `registers_r[index]` via the per-PC `-live-`
             // set.
             // Capture-only: writes the transient snapshot overlay, never the live
@@ -629,7 +629,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     }
                     // Guard-PC Ref color that owns operand-stack slot
                     // `nlocals + s` (`get_list_of_active_boxes` `if length_r:`
-                    // section, `pyjitpl.py:211-215`).
+                    // section, `pyjitpl.py`).
                     if let Some(color) =
                         crate::state::semantic_slot_color_for_ref_slot(&pcdep, nlocals + s)
                     {
@@ -645,16 +645,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             // snapshot reference a box defined after the guard,
                             // so the box was never computed on guard failure.
                             // RPython materializes failargs before appending the
-                            // guard (`optimizer.py:664-672,705,708-710`).
+                            // guard (`optimizer.py`).
                             //
                             // The hole stands because pyre elides the int box at
                             // the tracer layer, losing the descr/known_class/
                             // field structure deopt needs. RPython elides at
-                            // the optimizer layer (`virtualize.py:197-209`),
+                            // the optimizer layer (`virtualize.py`),
                             // keeps `InstancePtrInfo`, and serializes a
-                            // TAGVIRTUAL recipe (`resume.py:415-426,487-500`)
+                            // TAGVIRTUAL recipe (`resume.py`)
                             // materialized lazily only on guard failure
-                            // (`resume.py:618-621`). The orthodox fix is
+                            // (`resume.py`). The orthodox fix is
                             // push-time boxing plus optimizer virtualization,
                             // beyond this capture hook.
                             if box_op != OpRef::NONE
@@ -731,7 +731,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 };
                 // A specialization guard (`GuardValue`/`GuardClass`) sources its
                 // resume coordinate from the walk cursor's per-op `-live-`
-                // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py:198`)
+                // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py`)
                 // directly, dropping the py_pc-keyed block-head lookup.
                 // Requires a stepped `-live-` and a resolvable
                 // block-head marker (else keep the baseline, byte-identical).
@@ -871,10 +871,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             };
             // A residual result is installed in the active register bank before
             // the exception guard captures resume data
-            // (`rpython/jit/metainterp/pyjitpl.py:1951-1955`).  Project every
+            // (`rpython/jit/metainterp/pyjitpl.py`).  Project every
             // live Ref register of the owning frame through the resume
             // position's color-to-slot map so the separately encoded
-            // virtualizable array read by `virtualizable.py:86-99` carries the
+            // virtualizable array read by `virtualizable.py` carries the
             // same locals and operand-stack values as the frame section.  Inner
             // frames have no ownership of this shadow and are handled by the
             // multi-frame path above.
@@ -1392,12 +1392,12 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // inline (this frame is the paused MIDDLE caller), the multi-frame snapshot
     // captures this frame virtual and numbers its array — an unwritten operand
     // slot numbers to `NULLREF`, which `reconstruct_inline_recipe`
-    // (state.rs:5954-5998, semantic-slot-ordered `arr[k]` read) decodes to a
+    // (state.rs, semantic-slot-ordered `arr[k]` read) decodes to a
     // concrete-NULL Ref box, aborting the reconstructed middle at its next
     // `CALL_MAY_FORCE` (`MayForceNullRefArgUnsupported`).  Materialize the live
     // operand boxes into the frame array now — at the point we pause this frame to
-    // enter the nested inline — mirroring the locals seed at `helpers.rs:1418`
-    // (`virtualizable.py:101-113` write_boxes writes the frame's field boxes into
+    // enter the nested inline — mirroring the locals seed at `helpers.rs`
+    // (`virtualizable.py` write_boxes writes the frame's field boxes into
     // its array when it is forced).  Only NON-pending operand slots are written;
     // the top slot is the not-yet-produced nested-call result, delivered on resume
     // (`pending_result_abs_slot`), so the decoder skips it and so do we.  Emitting
@@ -1428,7 +1428,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                 );
                 let array_descr = crate::state::pyobject_gcarray_descr();
                 // Heapcache array-element key = the virtualizable info's array
-                // item descr, matching the seed store at `helpers.rs:1414-1417`.
+                // item descr, matching the seed store at `helpers.rs`.
                 let item_descr_index = ctx
                     .trace_ctx
                     .virtualizable_info()
@@ -1489,8 +1489,8 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
 /// (top/innermost) frame built from the live sub-walk register banks, plus the
 /// pre-computed paused caller frame(s) on the walk framestack. Frame
-/// order is OUTERMOST-FIRST (`recorder.rs:56` / `build_resumed_frames`
-/// `eval.rs:6505`): the parent chain followed by the callee top frame.  The
+/// order is OUTERMOST-FIRST (`recorder.rs` / `build_resumed_frames`
+/// `eval.rs`): the parent chain followed by the callee top frame.  The
 /// stale doc on `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`
 /// claiming `frames[0]=top` is wrong — the function writes frames verbatim.
 pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(

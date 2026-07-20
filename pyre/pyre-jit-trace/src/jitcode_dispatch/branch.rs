@@ -16,7 +16,7 @@ use super::*;
 
 /// Follow a synthetic register-renaming trampoline (`ref_copy*; goto L`,
 /// emitted by `emit_trampoline_for_multi_pred_link` for multi-predecessor
-/// link rewrites — `flatten.py:306-334 insert_renamings`) to the real
+/// link rewrites — `flatten.py insert_renamings`) to the real
 /// py-boundary target block.
 ///
 /// These `epsilon_link` trampolines carry no Python pc: they sit between
@@ -73,9 +73,9 @@ pub(crate) fn resolve_branch_target_through_trampoline(code: &[u8], target: usiz
 /// Re-derive a branch guard's resume `other_target` from
 /// the guard's OWN `-live-` BEFORE anchor `orgpc` (== ctx.live_before_jit_pc at
 /// the goto_if_not) + the recorded flavor (GuardTrue/GuardFalse), WITHOUT the
-/// runtime condbox — mirroring PyPy generate_guard(resumepc=orgpc) (pyjitpl.py:520),
+/// runtime condbox — mirroring PyPy generate_guard(resumepc=orgpc) (pyjitpl.py),
 /// where orgpc is arm-independent and the arm is re-derived. A BOUNDED single
-/// leading `-live-` skip (NOT a permissive loop), mirroring pyjitpl.py:198's
+/// leading `-live-` skip (NOT a permissive loop), mirroring pyjitpl.py's
 /// `assert code[pc]==op_live`: a mispositioned orgpc (e.g. `live; ref_copy;
 /// goto_if_not`, orgpc one op early) FAILS loudly rather than being walked forward.
 ///
@@ -144,7 +144,7 @@ pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) ->
 /// Decode a not-taken branch trampoline's `ref_copy` parallel-move
 /// sequence into `(dst, src)` Ref-color pairs (`#420`).  The trampoline
 /// (`live; (ref_copy|int_copy|float_copy)*; [goto]; live; <op>`,
-/// `flatten.rs:2145 insert_renamings`) resolves the not-taken edge's Phi:
+/// `flatten.rs insert_renamings`) resolves the not-taken edge's Phi:
 /// each `ref_copy(dst <- src)` moves the kept value's guard-pc Ref color
 /// `src` into the merge block's inputarg color `dst`.  The walk does NOT
 /// execute these moves — they fire only when the branch is taken at

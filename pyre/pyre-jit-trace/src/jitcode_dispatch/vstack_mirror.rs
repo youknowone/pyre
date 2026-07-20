@@ -75,7 +75,7 @@ pub(crate) fn classify_vstack_opcode(
         // MAKE_FUNCTION pops the code object and pushes the built function
         // (net 0, `stack_effects` `(d, d)`).  The `make_function_value`
         // residual's Ref result reaches the new TOS through the operand-stack
-        // push chokepoint (`emit_pushvalue_ref!`, codewriter.rs:9260), so it is
+        // push chokepoint (`emit_pushvalue_ref!`, codewriter.rs), so it is
         // the same `ResultToTos` shape as the value producers above.  Left
         // unmodeled it killed the mirror for the rest of the walk at the first
         // nested `def`, declining any later depth > 1 kept-stack branch guard.
@@ -279,7 +279,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     let class = classify_vstack_opcode(&instr, op_arg);
     // RPython's MIFrame follows one flow-graph link at a time; the target
     // block receives its register state from that link's inputargs
-    // (pyjitpl.py:2371-2387 `interpret` / `run_one_step`).  The full-body
+    // (pyjitpl.py `interpret` / `run_one_step`).  The full-body
     // walk instead traverses flattened JitCode whose layout can switch to a
     // different source block without the Python PCs forming a CFG edge.  Do
     // not replay the previous Python opcode across such a layout switch: its

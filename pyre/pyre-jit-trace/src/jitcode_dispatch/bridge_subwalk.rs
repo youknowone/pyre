@@ -28,7 +28,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     done_with_this_frame_descr_void: DescrRef,
     exit_frame_with_exception_descr_ref: DescrRef,
     is_top_level: bool,
-    // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: the
+    // PyPy `pyjitpl.py MIFrame.__init__` analog: the
     // top-level jitcode's per-bank register count.  `dispatch_via_miframe`
     // allocates fresh `Vec<OpRef>`s sized to `top_num_regs_* +
     // top_constants_*.len()` — replacing the prior TODO that
@@ -42,11 +42,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     top_num_regs_f: usize,
     // Top-level jitcode's per-bank constant pool — seeded into
     // register slots `[num_regs_*, num_regs_* + constants_*.len())`
-    // per `pyjitpl.py:98-119 copy_constants`.
+    // per `pyjitpl.py copy_constants`.
     top_constants_r: &[i64],
     top_constants_i: &[i64],
     top_constants_f: &[i64],
-    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog.
+    // PyPy `pyjitpl.py setup_call(argboxes)` analog.
     // `argboxes_*[i]` is written to `registers_*[i]` before walking.
     // Production callers supply `argboxes_r = [const_ref(miframe_ptr)]`
     // so the codewriter-compiled arm finds the MIFrame self ptr at
@@ -78,18 +78,18 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     seed_execution_context_for_walk(sym, trace_ctx);
     seed_standing_exception_for_walk(sym, trace_ctx);
 
-    // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
+    // RPython parity: `metainterp.last_exc_value` (pyjitpl.py)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
     // mirrors this as `Option<OpRef>` — `None` means "no active
     // exception", matching RPython's `assert self.metainterp.last_exc_value`
-    // (pyjitpl.py:1702).
+    // (pyjitpl.py).
     let initial_last_exc_value = if sym.last_exc_box().is_none() {
         None
     } else {
         Some(sym.last_exc_box())
     };
 
-    // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: allocate
+    // PyPy `pyjitpl.py MIFrame.__init__` analog: allocate
     // fresh per-bank register vectors sized to `top_num_regs_* +
     // top_constants_*.len()`.  This replaces the prior TODO
     // that reused `sym.registers_r` (a Python locals/stack mirror,
@@ -107,7 +107,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     let mut top_concrete_r = vec![ConcreteValue::Null; total_r];
     let mut top_concrete_i = vec![ConcreteValue::Null; total_i];
 
-    // PyPy `pyjitpl.py:98-119 copy_constants` analog: seed each
+    // PyPy `pyjitpl.py copy_constants` analog: seed each
     // constant into the upper slot range `[num_regs_*, total_*)`.
     // `box_value` resolves these via `TraceCtx::constants` so
     // downstream getfield chains see the constant's `Value::*`.
@@ -125,7 +125,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         top_regs_f[top_num_regs_f + i] = trace_ctx.const_float(v);
     }
 
-    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog: write
+    // PyPy `pyjitpl.py setup_call(argboxes)` analog: write
     // each argbox into the leading register slot.  The concrete
     // shadow is derived from `box_value(box)` — for `ConstRef(ptr)`
     // (the common case: argbox=miframe self ptr), this is
@@ -374,7 +374,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         drop(wc);
         // Full `sym.last_exc_*` state writeback parity.
         //
-        // RPython `pyjitpl.py:1694-1696 opimpl_raise` sets THREE pieces
+        // RPython `pyjitpl.py opimpl_raise` sets THREE pieces
         // of metainterp state when a raise fires:
         //   self.metainterp.class_of_last_exc_is_const = True
         //   self.metainterp.last_exc_value = exc_value_box.getref(rclass.OBJECTPTR)
@@ -389,7 +389,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         //   - `class_of_last_exc_is_const`: true after a raise/r or a
         //     SubRaise routed into a catch handler. RPython sets this
         //     in `opimpl_raise` (line 1694) AND `execute_ll_raised`
-        //     (pyjitpl.py:2752 with `constant=...` parameter — set
+        //     (pyjitpl.py with `constant=...` parameter — set
         //     after GUARD_CLASS / GUARD_EXCEPTION). Walker's raise/r
         //     arm always sets `wc.last_exc_value = Some(exc)` so
         //     mirroring `Some` → const=true is RPython-orthodox.
@@ -435,8 +435,8 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // shared borrow.
     //
     // `collect_outer_active_boxes` reads the Ref bank by abstract register
-    // color (`_get_list_of_active_boxes`, pyjitpl.py:216-233), so it needs the
-    // color-indexed `f.registers_r` (`consume_boxes`, resume.py:1055), NOT the
+    // color (`_get_list_of_active_boxes`, pyjitpl.py), so it needs the
+    // color-indexed `f.registers_r` (`consume_boxes`, resume.py), NOT the
     // slot-indexed semantic mirror `setup_bridge_sym` left in
     // `sym.registers_r`.  The mirror leaves an operand live across the resumed
     // call (e.g. `t1` in `return fib(n-1)+fib(n-2)`) at `OpRef::NONE` under its
@@ -502,7 +502,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
 /// its registers seeded by `argboxes_r` (portal reds + in-flight operand-stack
 /// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
 /// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
-/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py:1688 finishframe`)
+/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py finishframe`)
 /// instead of the top-level `Finish` that pyre's own-portal model rejects with
 /// `NonStandardVableFinishPortalUnsupported` — the original #215 item-2 wall.
 ///
@@ -550,7 +550,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     // Reconstruct this paused parent frame's vable + ec (the same
     // `emit_new_pyframe_inline_with_params` the deepest-callee setup uses) so
     // the paused-frame snapshot resolves the portal reds
-    // [frame, ec] (`interp_jit.py:67`) to real boxes rather than reading the
+    // [frame, ec] (`interp_jit.py`) to real boxes rather than reading the
     // slot-indexed `registers_r` at the portal-red color positions.  Only
     // `pending.sym.frame` / `pending.sym.execution_context` are consumed here;
     // the `argboxes_r` register seeding is for the forward drive, not the
@@ -820,11 +820,11 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // The carrier sub-walk IS the bridge-resume metainterp: after a
             // guard failure `handle_guard_failure` rebuilds the frame state and
             // drives it forward through the SAME `self.interpret()` the initial
-            // trace uses (`pyjitpl.py:2937 _handle_guard_failure` →
+            // trace uses (`pyjitpl.py _handle_guard_failure` →
             // `prepare_resume_from_failure` → `interpret`, cf.
             // `_compile_and_run_once:2899`).  There is no second-class executor
             // mode: the resume walk concrete-executes every residual call
-            // (`do_residual_call` → `execute_varargs`, `pyjitpl.py:1995`) exactly
+            // (`do_residual_call` → `execute_varargs`, `pyjitpl.py`) exactly
             // like the initial trace, which is what lets a nested self-recursive
             // call fold to a live `CALL_ASSEMBLER`.  The residual it reaches was
             // never run pre-deopt (the deopt cut the trace there), so this is its
@@ -950,7 +950,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
 /// The outer resumes AFTER its residual call (`entry` = the jitcode pc of the
 /// `live/` marker following the call), so the callee `result` is delivered into
 /// the outer's call-dst register (`call_dst_reg`) — the physical slot the call
-/// op wrote, i.e. `make_result_of_lastop` (`pyjitpl.py:258-275`), NOT a resume
+/// op wrote, i.e. `make_result_of_lastop` (`pyjitpl.py`), NOT a resume
 /// color. The frame vable identity is seeded at `frame_reg` (the standard
 /// virtualizable box) so the outer's local reads (`getarrayitem_vable`) resolve
 /// off the paused root frame. `is_top_level=true`: the outer IS the portal, so
@@ -1044,7 +1044,7 @@ pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
     let outer_active_boxes = root_frame.boxes.clone();
 
     // Seed the full live outer-frame register file, matching `consume_boxes`
-    // (resume.py:1054-1055 + `_callback_i/_r/_f`) which fills every live
+    // (resume.py + `_callback_i/_r/_f`) which fills every live
     // register color of `framestack[-1]` from the resume numbering.  Without
     // this only `frame_reg`/`call_dst_reg` are bound: an operand live across
     // the resumed call (e.g. the first result of `return fib(n-1)+fib(n-2)`)

@@ -19,7 +19,7 @@ use super::*;
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
 /// callee's OWN (unseeded) portal frame to the callee's compile-time
 /// constant.  This is the walk-time mirror of the codewriter's non-portal
-/// branch (`codewriter.rs:6720-6732` LOAD_CONST, `:7347-7369` LOAD_GLOBAL):
+/// branch (`codewriter.rs` LOAD_CONST/LOAD_GLOBAL):
 /// a non-portal callee's `pycode`/`w_globals` are constants fed as
 /// `ConstRef`, never read off the portal frame reg (which, when inlined,
 /// aliases the caller's frame and would read the wrong field).  Only the
@@ -142,10 +142,10 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
 /// reading a compile-time-constant static field (`pycode` / `w_globals`):
 /// [`try_resolve_inline_callee_static_field`] folds it to the callee constant
 /// (the walk-time mirror of the codewriter non-portal branch,
-/// `codewriter.rs:6720-6732` / `:7347-7369`).  Detect everything else
+/// `codewriter.rs`).  Detect everything else
 /// pre-flight so the call lowers to an ordinary residual call (the orthodox
 /// non-inlinable path, `should_inline` = False → `do_residual_call`,
-/// `pyjitpl.py:1422`) instead of aborting.
+/// `pyjitpl.py`) instead of aborting.
 ///
 /// Also decline callees that are not *straight-line leaves*.  The inline
 /// convention resumes a guard inside the callee at the caller's CALL boundary
@@ -450,7 +450,7 @@ pub(crate) fn exception_string_override_has_nested_call(
 /// virtualizable (any vable op declines the inline), so the owns_vable /
 /// portal-reg / semantic-slot machinery in [`collect_outer_active_boxes`]
 /// reduces to a plain per-bank `registers_{i,r,f}[live_color]` read — RPython
-/// `pyjitpl.py:218-225 _get_list_of_active_boxes`, banks in int → ref → float
+/// `pyjitpl.py _get_list_of_active_boxes`, banks in int → ref → float
 /// order to match the `all_liveness` header layout the decoder consumes.  A
 /// liveness-active register holding `OpRef::NONE` is a tracer-side invariant
 /// violation (callee banks are sized to the jitcode num_regs co-published with
@@ -539,8 +539,8 @@ pub(crate) fn collect_callee_active_boxes(
 /// `fib_recursive` ~30x slowdown).  This emits instead the direct
 /// assembler->assembler jump: `CALL_ASSEMBLER_R` to the callee's own
 /// loop/pending token (mirror of `_opimpl_recursive_call`
-/// `recursion_exceeded -> assembler_call`, `pyjitpl.py:1404-1422`, and
-/// `do_residual_call`'s assembler branch, `pyjitpl.py:2053-2082`).
+/// `recursion_exceeded -> assembler_call`, `pyjitpl.py`, and
+/// `do_residual_call`'s assembler branch, `pyjitpl.py`).
 ///
 /// First cut — the `fib` shape only: a single positional INT argument to a
 /// self-recursive (`callee code == portal code`) callee whose frame is
@@ -553,7 +553,7 @@ pub(crate) fn collect_callee_active_boxes(
 /// identity is pinned upstream by the same `LOAD_GLOBAL` machinery the
 /// residual path already relies on.
 ///
-/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py:1376-1423`)
+/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py`)
 /// counts same-greenkey portal frames on the framestack and flips to
 /// `assembler_call` only at `count >= memmgr.max_unroll_recursion`,
 /// inlining (`perform_call`) below the bound.  This function fires for
@@ -762,7 +762,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         }
         return Ok(None);
     }
-    // warmstate.py:714-723 / compile.py:1101-1150: resolve an installed
+    // warmstate.py / compile.py: resolve an installed
     // procedure token, or synthesize a tmp callback token while the real loop
     // is still tracing.
     let greenboxes = [
@@ -837,7 +837,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ec,
     );
 
-    // do_residual_call step 1 (`pyjitpl.py:2017`): FORCE_TOKEN +
+    // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
@@ -846,13 +846,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         &[callee_frame, ec],
         &[Type::Ref, Type::Ref],
     );
-    // pyjitpl.py:2080-2081: KEEPALIVE on the callee virtualizable so it
+    // pyjitpl.py: KEEPALIVE on the callee virtualizable so it
     // survives until the result is consumed.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
 
-    // pyjitpl.py:2055 `execute_and_record_varargs(CALL_MAY_FORCE_R)`:
+    // pyjitpl.py `execute_and_record_varargs(CALL_MAY_FORCE_R)`:
     // the forces branch EXECUTES the call during tracing —
-    // `direct_assembler_call` (pyjitpl.py:2080) only rewrites the
+    // `direct_assembler_call` (pyjitpl.py) only rewrites the
     // already-recorded op into CALL_ASSEMBLER afterwards, so the result
     // box always carries the executed value. The retired call-replay leg's
     // `trace_guarded_int_payload(ca_result)` consumed the same concrete
@@ -891,19 +891,19 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         }
     };
 
-    // pyjitpl.py:2072: heapcache invalidation for the escaped frame.
+    // pyjitpl.py: heapcache invalidation for the escaped frame.
     ctx.trace_ctx
         .heap_cache_mut()
         .invalidate_caches_for_escaped();
 
-    // pyjitpl.py:2077 `make_result_of_lastop`: the result lands in
+    // pyjitpl.py `make_result_of_lastop`: the result lands in
     // `registers_*[reg_index]` BEFORE GUARD_NOT_FORCED (2079) and
     // `handle_possible_exception` (2082).  The writeback MUST precede the
     // two guards so their after-call resume snapshots read the recorded
     // OpRef in the dst slot the resume position points at — deferring it
     // past the guards surfaces a stale box in the fail_args for the `>X`
     // slot on a raising/forcing deopt.  Mirror of the sibling residual
-    // path (jitcode_dispatch.rs:6856-6857, contract at 6844-6849) and
+    // path (jitcode_dispatch.rs) and
     // `do_residual_call_walker_emit`.  `CALL_ASSEMBLER_R` yields the boxed
     // PyObject return value, taken as-is by the Ref dst (the consuming
     // BINARY_OP unboxes); eligibility pinned `dst_bank == 'r'`.
@@ -911,7 +911,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // the recorded CALL_ASSEMBLER OpRef (carrying a Null concrete shadow,
     // never read on the exception path), and the after-call resume snapshots
     // must see it in the dst slot — the same unconditional non-void writeback
-    // as the residual dispatcher (pyjitpl.py:1950-1954 / 2074-2077:
+    // as the residual dispatcher (pyjitpl.py / 2074-2077:
     // make_result_of_lastop before handle_possible_exception for
     // get_list_of_active_boxes).
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
@@ -942,13 +942,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ctx.vstack_last_ref = OpRef::NONE;
     }
 
-    // pyjitpl.py:2079: GUARD_NOT_FORCED + resume snapshot advanced past
+    // pyjitpl.py: GUARD_NOT_FORCED + resume snapshot advanced past
     // the call (`capture_resumedata(after_residual_call=True)`).
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    // pyjitpl.py:2082 `handle_possible_exception`.
+    // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
-        // Raising branch (pyjitpl.py:2156-2168): `GUARD_EXCEPTION` with
+        // Raising branch (pyjitpl.py): `GUARD_EXCEPTION` with
         // the const class pin, then `finishframe_exception()` — the
         // remaining bytes of the arm never run.  Mirror of the residual
         // dispatcher's raising tail: surface `SubRaise` so `walk_loop`
@@ -1022,7 +1022,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     ctx.trace_ctx
         .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
 
-    // do_residual_call step 1 (`pyjitpl.py:2017`): FORCE_TOKEN +
+    // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
@@ -1115,7 +1115,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 /// body to `call_assembler_with_vable_expansion` — passing the callee's
 /// loop-carried locals as scalar args plus a `VableExpansion` whose
 /// `arg_overrides` map each scalar to a callee jitframe slot
-/// (`rewrite.py:665-695` handle_call_assembler parity) — would let the
+/// (`rewrite.py` handle_call_assembler parity) — would let the
 /// optimizer elide the per-call frame-array build.
 pub(crate) fn emit_loop_callee_ca_vable_scalar<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -1319,7 +1319,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // Bound recursive inlining at `max_unroll_recursion`: a callee already
     // this deep on the FBW inline stack falls back to a residual call rather
     // than unrolling its (exponentially branching) call tree at trace time.
-    // Mirror of `pyjitpl.py:1388-1416` `recursion_exceeded` →
+    // Mirror of `pyjitpl.py` `recursion_exceeded` →
     // `assembler_call` instead of trace-through.
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
     if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
@@ -1463,7 +1463,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 == w_code as usize;
         if self_recursive {
             // RPython `opimpl_recursive_call` / `do_recursive_call`
-            // (`pyjitpl.py:1376-1432`) unroll within `max_unroll_recursion`,
+            // (`pyjitpl.py`) unroll within `max_unroll_recursion`,
             // then fall back to the assembler-call path.  Default-on
             // (`fbw_rec_multiframe_enabled`): a primary trace spends the
             // multiframe budget unrolling recursion below the depth bound
@@ -1648,7 +1648,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // OpRef::NONE so an in-callee guard snapshot cannot source them
     // (`collect_callee_active_boxes` declines).  RPython seeds these reds as
     // part of `setup_call(allboxes)` for a recursive-portal inline
-    // (`pyjitpl.py:1862-1874`, reds=['frame','ec'] `interp_jit.py:67`): a
+    // (`pyjitpl.py`, reds=['frame','ec'] `interp_jit.py`): a
     // freshly-built (virtual) callee `PyFrame` plus the caller's shared `ec`.
     // pyre's "every function is its own portal" model makes every inlined
     // callee portal-shaped, so the same seeding applies.  The frame box stays
@@ -1846,7 +1846,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
                 // An un-entered multiframe-inline CALL declined at its
                 // try-block catch marker is re-run whole and forward, exactly
-                // as if it had never been inlined (`pyjitpl.py:2949`).  The
+                // as if it had never been inlined (`pyjitpl.py`).  The
                 // multi-frame guard snapshot itself remains declined.
                 if is_top_inline
                     && !unjournaled_before_subwalk
@@ -1875,7 +1875,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // `trace_opcode.rs`). With the callee frame red now seeded,
         // `collect_callee_active_boxes` sources the callee's live boxes and the
         // snapshot succeeds, producing the full RPython `Snapshot.frames` chain
-        // (`opencoder.py:767 create_top_snapshot`, resumed by
+        // (`opencoder.py create_top_snapshot`, resumed by
         // `resume.py rebuild_from_resumedata`).  This replaces the single-frame
         // collapse, whose caller-boundary re-execute both mis-sizes the resumed
         // frame (a decode / `LOAD_FAST` overrun) and re-applies the callee's
@@ -1902,7 +1902,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // heap, the `SubLoopCalleeCallAssembler` arm below would re-run the WHOLE
     // call through the residual executor to stamp `ca_result`, applying the
     // prologue's side effects a second time at trace time.  RPython's
-    // `do_residual_call` runs the call exactly once (`pyjitpl.py:2019`), so a
+    // `do_residual_call` runs the call exactly once (`pyjitpl.py`), so a
     // side-effecting prologue must decline the CA inline (see the arm).
     let prologue_journal_before = fbw_store_journal_len();
     // Compute fresh outer_active_boxes for the inline sub-walk when the
@@ -2288,7 +2288,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // store.  Discarding a zero-executed-effect callee attempt and
             // re-running its CALL is observationally identical to upstream
             // never having inlined it: tracing aborts and `switch_to_blackhole`
-            // re-runs the call (`pyjitpl.py:2949`; gh#467).  The operand
+            // re-runs the call (`pyjitpl.py`; gh#467).  The operand
             // stack the CALL opcode expects (`[callable, null_or_self,
             // args...]`) is re-read from the (now GC-forwarded) outer registers,
             // not the pre-sub-walk `arg_concretes`, so it is current after the
@@ -2850,7 +2850,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
 /// `[num_regs_X, num_regs_and_consts_X)`) finds a populated slot.
 /// Constant slots are filled via `TraceCtx::const_int` / `const_ref` /
 /// `const_float`, matching RPython
-/// `pyjitpl.py:98-119 MIFrame.copy_constants`.
+/// `pyjitpl.py MIFrame.copy_constants`.
 ///
 /// Also returns Ref- and Int-bank concrete shadows sized to match
 /// `registers_r` / `registers_i`.  Constant slots seed their concrete
@@ -2912,7 +2912,7 @@ pub(crate) fn allocate_callee_register_banks(
 /// reporting. An empty arg slice for an unused bank passes its arity
 /// check trivially. The callee runs with `is_top_level == false` and
 /// inherits the caller's descr pool + sub-jitcode lookup (RPython
-/// `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r, argboxes_f)`).
+/// `pyjitpl.py setup_call(argboxes_i, argboxes_r, argboxes_f)`).
 /// Only Ref-bank concrete shadows are seeded — matching the
 /// `inline_call_*` handlers, which thread `ref_arg_concretes` but no
 /// Int/Float concrete shadows across the frame boundary.
@@ -3037,7 +3037,7 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
-/// RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call*`. The
+/// RPython parity: `pyjitpl.py _opimpl_inline_call*`. The
 /// `_X` suffix is the callee's *return kind* — e.g. `_opimpl_inline_call_r_i`
 /// dispatches an inline call whose callee body returns via
 /// `int_return/i`. Walker semantics are otherwise identical to the
@@ -3085,7 +3085,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         } => {
             if dst_bank == 'v' {
                 // `inline_call_r_v/dR`
-                // (`bhimpl_inline_call_r_v` `blackhole.py:1287-1290`)
+                // (`bhimpl_inline_call_r_v` `blackhole.py`)
                 // expects a void-return callee. A `Some` return here is
                 // a codewriter shape mismatch.
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
@@ -3189,10 +3189,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 ///   1B R-len + M×1B ref args +
 ///   1B `>X` dst.
 ///
-/// RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call*` —
+/// RPython parity: `pyjitpl.py _opimpl_inline_call*` —
 /// kind-aware variants call `setup_call(argboxes_i, argboxes_r,
 /// argboxes_f)` which distributes args into the callee's typed banks
-/// (`pyjitpl.py:230-260`).
+/// (`pyjitpl.py`).
 ///
 /// `dst_bank` selects where the SubReturn value lands: `'r'` writes to
 /// `registers_r[dst]` (paired with callee `ref_return/r`), `'i'`
@@ -3332,7 +3332,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
 ///   1B F-len + K×1B float args +
 ///   1B `>X` dst.
 ///
-/// RPython parity: same `pyjitpl.py:230-260 setup_call(argboxes_i,
+/// RPython parity: same `pyjitpl.py setup_call(argboxes_i,
 /// argboxes_r, argboxes_f)` distribution — all three kind banks
 /// populated from the three lists.
 ///

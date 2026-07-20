@@ -14,7 +14,7 @@ use super::*;
 /// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
 /// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B X-dst.
 ///
-/// RPython parity: `pyjitpl.py:639-673 _do_getarrayitem_gc_any`:
+/// RPython parity: `pyjitpl.py _do_getarrayitem_gc_any`:
 ///
 ///   tobox = heapcache.getarrayitem(arraybox, indexbox, arraydescr)
 ///   if tobox: return tobox        # cache hit, no IR (recording-only)
@@ -42,7 +42,7 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_getarrayitem(array, index, descr_index)
     {
-        // pyjitpl.py:639-673 `_do_getarrayitem_gc_any` cache hit:
+        // pyjitpl.py `_do_getarrayitem_gc_any` cache hit:
         //   tobox = heapcache.getarrayitem(...)
         //   if tobox:
         //       profiler.count_ops(rop.GETARRAYITEM_GC_I, HEAPCACHED_OPS)
@@ -61,9 +61,9 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             .record_op_with_descr(opcode, &[array, index], descr.clone());
         // Box.value parity: `box_value` exposes the resolution chain
         // PyPy reads off `arraybox.getref_base()` / `indexbox.getint()`
-        // (`rpython/jit/metainterp/executor.py:117`).  Any operand
+        // (`rpython/jit/metainterp/executor.py`).  Any operand
         // whose Box.value is known unblocks `array_sanity_load`, not
-        // just Const-pool entries (`pyjitpl.py:648-666 resbox =
+        // just Const-pool entries (`pyjitpl.py resbox =
         // execute_with_descr(...); getarrayitem_now_known(...)`
         // parity).
         let load_type = match opcode {
@@ -138,10 +138,10 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
 
 /// `setarrayitem_gc_<i|r|f>/ri{i,r,f}d` handler. Operand layout per
 /// `bhimpl_setarrayitem_gc_{i,r,f}(cpu, array, index, newvalue,
-/// arraydescr)` (`blackhole.py:1351-1359`):
+/// arraydescr)` (`blackhole.py`):
 /// 1B r-reg(array) + 1B i-reg(index) + 1B {i,r,f}-reg(newvalue) + 2B descr.
 ///
-/// RPython parity: `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any`
+/// RPython parity: `pyjitpl.py _opimpl_setarrayitem_gc_any`
 /// dispatches through `metainterp.execute_setarrayitem_gc(arraydescr,
 /// arraybox, indexbox, itembox)` — RPython's wrapper records
 /// `rop.SETARRAYITEM_GC` and updates the heapcache via
@@ -165,7 +165,7 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
     // Operand layout `<r><i><v>d`: r-reg(array) + i-reg(index) + v(value)
     // + 2B descr-index.  For the `c`-coded short form
     // (`setarrayitem_gc_i/ricd`) the value byte is an inline signed
-    // constant (`signedord`, `blackhole.py:123`) read as a `ConstInt`
+    // constant (`signedord`, `blackhole.py`) read as a `ConstInt`
     // box instead of an `i`-register slot, mirroring `setfield_gc_i/rcd`.
     let value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
@@ -179,7 +179,7 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
 
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
-    // `upd.setarrayitem(valuebox)` (heapcache.py:142) parity — the
+    // `upd.setarrayitem(valuebox)` (heapcache.py) parity — the
     // cache stores the Box identity (`value` OpRef); cache-hit
     // readers fetch the intrinsic value via `box_value(cached)` at
     // hit time.
@@ -209,7 +209,7 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     index: OpRef,
     value: OpRef,
 ) {
-    // heapcache.py:493 is_unescaped — only a fresh, not-yet-escaped allocation
+    // heapcache.py is_unescaped — only a fresh, not-yet-escaped allocation
     // is a materialization candidate; a loaded (escaped) array is a real store.
     if !ctx.trace_ctx.heap_cache().is_unescaped(array) {
         return;
@@ -264,7 +264,7 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
 /// the IR emission (cache says the same value is already there) or
 /// record `OpCode::SetfieldGc` and write through to the heapcache.
 ///
-/// RPython parity: `pyjitpl.py:973-988 _opimpl_setfield_gc_any`:
+/// RPython parity: `pyjitpl.py _opimpl_setfield_gc_any`:
 ///
 ///   upd = heapcache.get_field_updater(box, fielddescr)
 ///   if upd.currfieldbox is valuebox:
@@ -276,10 +276,10 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
 /// **Alias-clearing writeback**: goes through
 /// `HeapCache::setfield_cached` instead of `getfield_now_known`. The
 /// difference is the alias-clearing semantic that RPython's
-/// `FieldUpdater.setfield()` carries (heapcache.py:142-143 routes to
+/// `FieldUpdater.setfield()` carries (heapcache.py routes to
 /// `CacheEntry.do_write_with_aliasing`):
 ///
-///   `_clear_cache_on_write(seen_alloc)` (heapcache.py:70-77) wipes
+///   `_clear_cache_on_write(seen_alloc)` (heapcache.py) wipes
 ///   `cache_anything` unconditionally and additionally wipes
 ///   `cache_seen_allocation` when the write target itself is not
 ///   seen-allocated.  This conservatively kills any cached entry whose
@@ -301,7 +301,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Operand layout `<r><v>d`: 1B r-reg(box) + 1B v(value) + 2B descr-index.
     // For the `c`-coded short form (`setfield_gc_i/rcd`) the value byte is
-    // an inline signed constant (`signedord`, `blackhole.py:123`) read as a
+    // an inline signed constant (`signedord`, `blackhole.py`) read as a
     // `ConstInt` box instead of an `i`-register slot; obj and descr keep the
     // `rid` byte positions.
     let obj = read_ref_reg(code, op, 0, ctx)?;
@@ -317,7 +317,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 
     // Cache hit: if the heapcache already records `valuebox` as the
     // current value of `(obj, descr)`, the SETFIELD_GC is redundant —
-    // skip recording. RPython pyjitpl.py:973-979 _opimpl_setfield_gc_any:
+    // skip recording. RPython pyjitpl.py _opimpl_setfield_gc_any:
     //   if upd.currfieldbox is valuebox:
     //       self.metainterp.staticdata.profiler.count_ops(rop.SETFIELD_GC, Counters.HEAPCACHED_OPS)
     //       return
@@ -335,8 +335,8 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
         // Write-through with alias-clearing semantics
-        // (`heapcache.py:90-94 do_write_with_aliasing`).  Mirrors
-        // `upd.setfield(valuebox)` (heapcache.py:142).
+        // (`heapcache.py do_write_with_aliasing`).  Mirrors
+        // `upd.setfield(valuebox)` (heapcache.py).
         ctx.trace_ctx
             .heapcache_setfield_cached(obj, descr_index, valuebox);
     }
@@ -348,9 +348,9 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 /// cached field box (no IR op recorded) or record the appropriate
 /// `OpCode::GetfieldGc<I|R>` op and update the cache.
 ///
-/// RPython parity: `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r>` →
-/// `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`).
-/// RPython has a ConstPtr+is_always_pure() fast path at lines 856-860
+/// RPython parity: `opimpl_getfield_gc_<i|r>` →
+/// `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py`).
+/// RPython has a ConstPtr+is_always_pure() fast path
 /// that fires `executor.execute(cpu, metainterp, opnum, fielddescr,
 /// box)` and returns `ConstInt/ConstFloat/ConstPtr(resvalue)` —
 /// recording NO trace op (the value is directly substituted as a Const
@@ -364,8 +364,8 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 /// heapcache miss records `GetfieldGc<I|R>` (non-pure variant) +
 /// writes through. The optimizer's always-pure pass later folds the
 /// non-pure read into `GetfieldGcPure*` based on `descr.is_always_pure()`,
-/// which is `OpHelpers.getfield_pure_for_descr` (resoperation.py:
-/// 1284-1289) parity. Walker emitting Pure variants directly would be
+/// which is `OpHelpers.getfield_pure_for_descr` (resoperation.py)
+/// parity. Walker emitting Pure variants directly would be
 /// a TODO since RPython's opimpl_* never emits the Pure
 /// opcodes; they're an optimizer-rewrite artifact.
 ///
@@ -383,7 +383,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
 
-    // ConstPtr + always-pure fast path (pyjitpl.py:856-860): a constant
+    // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
     // substitutes the value as a Const literal, recording no op.
     let const_pure_result = if obj.is_constant() && descr.is_always_pure() {
@@ -417,7 +417,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         None
     };
 
-    // heaptracker.py:66 special-cases the `typeptr` field: once a GUARD_CLASS
+    // heaptracker.py special-cases the `typeptr` field: once a GUARD_CLASS
     // has pinned an object's class, reading its typeptr yields the known
     // class constant.  Inside an inline sub-walk the receiver's concrete
     // pointer often lives only in the register shadow (not the box value), so
@@ -448,7 +448,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     } else if let Some(constant) = const_pure_result {
         constant
     } else if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) {
-        // Cache hit (RPython pyjitpl.py:929-947 _opimpl_getfield_gc_any_pureornot):
+        // Cache hit (RPython _opimpl_getfield_gc_any_pureornot):
         //   if upd.currfieldbox is not None:
         //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
         //       return upd.currfieldbox
@@ -463,7 +463,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     } else {
         // Recording a `getfield_gc_*` whose FieldDescr lacks a parent_descr
         // backreference would later crash the optimizer's
-        // `ensure_ptr_info_arg0` (`optimizer.py:478-484`).  Inside a sub-walk
+        // `ensure_ptr_info_arg0` (`optimizer.py`).  Inside a sub-walk
         // abort gracefully instead, so the trace falls back to the interpreter
         // rather than carrying an op the optimizer cannot lower.  The fold
         // paths above (typeptr / const-pure / cache-hit) record nothing, so
@@ -488,9 +488,9 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         // Cache miss — record op + write through.  `box_value`
         // resolves the Box.value chain PyPy reads off
         // `box.getref_base()` in `executor.do_getfield_gc_*`
-        // (`executor.py:188`); the sanity load fires whenever the
+        // (`executor.py`); the sanity load fires whenever the
         // struct pointer is known (Const, vable shadow, or stamped),
-        // mirroring `pyjitpl.py:948-949 resbox = execute_with_descr(...);
+        // mirroring `pyjitpl.py resbox = execute_with_descr(...);
         // upd.getfield_now_known(resbox)`.
         let resbox = ctx
             .trace_ctx
@@ -559,7 +559,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `virtualizable_gen.rs:33-60` pyre PyFrame static-field order
+/// `virtualizable_gen.rs` pyre PyFrame static-field order
 /// `[last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals]`.
 pub(crate) const VABLE_CODE_FIELD_IDX: usize = 1;
 pub(crate) const VABLE_NAMESPACE_FIELD_IDX: usize = 5;
