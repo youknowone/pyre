@@ -45,7 +45,7 @@ impl JitCodeSym for UnpackSym {
     }
 
     fn loop_header_pc(&self) -> usize {
-        0x5c
+        0x5b
     }
 
     fn fail_args(&self) -> Option<Vec<OpRef>> {
@@ -164,7 +164,7 @@ mod tests {
             .filter(|op| op.opname == "jit_merge_point")
             .collect();
         assert_eq!(merge_points.len(), 1);
-        assert_eq!(merge_points[0].pc, 0x5c);
+        assert_eq!(merge_points[0].pc, 0x5b);
 
         crate::jitcode_runtime::install_global_build_descr_pool();
         let jitcode = JitCode::from_canonical((*canonical).clone());
