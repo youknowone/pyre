@@ -351,7 +351,7 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
             let (address, length, readonly) = view?;
             return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
