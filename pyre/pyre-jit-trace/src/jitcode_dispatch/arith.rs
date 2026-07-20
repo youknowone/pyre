@@ -23,10 +23,10 @@ use super::*;
 /// `registers_i[dst]`. Walker collapses execute+writeback into
 /// `record_op + slot store`, which matches the recording-only side of
 /// `execute`'s split (`pyjitpl.py:_record_helper`).
-pub(crate) fn binop_int_record(
+pub(crate) fn binop_int_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
@@ -82,10 +82,10 @@ pub(crate) fn binop_int_record(
 /// `inline_const_to_value`, mirroring `isinstance(b5, ConstInt)` —
 /// box_value's concrete-stamp layer does not participate in that
 /// branch decision.
-pub(crate) fn int_between_record(
+pub(crate) fn int_between_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let b1 = read_int_reg(code, op, 0, ctx)?;
     let b2 = read_int_reg(code, op, 1, ctx)?;
@@ -131,8 +131,8 @@ pub(crate) fn int_between_record(
 /// holds for a pure opcode.  Mirroring that here keeps the trace
 /// free of all-constant subexpressions exactly where upstream keeps
 /// it free — `opimpl_int_between` chains three such pure binops.
-pub(crate) fn execute_pure_binop_i(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn execute_pure_binop_i<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
     a: OpRef,
     b: OpRef,
@@ -161,10 +161,10 @@ pub(crate) fn execute_pure_binop_i(
 /// the `>i` decorator's writeback. Walker reads `registers_i[src]`,
 /// records `OpCode::<Variant>` with `[a]`, writes the recorder result
 /// into `registers_i[dst]`.
-pub(crate) fn unop_int_record(
+pub(crate) fn unop_int_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
@@ -193,10 +193,10 @@ pub(crate) fn unop_int_record(
 /// b1, b2)` — both `b1`/`b2` are ref boxes, result is an int box. The
 /// `b1 is b2` fast path is omitted (same rationale as `binop_int_record`'s
 /// comparison family — pyre's recorder shares constants by value).
-pub(crate) fn binop_ref_to_int_record(
+pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_ref_reg(code, op, 0, ctx)?;
@@ -241,10 +241,10 @@ pub(crate) fn binop_ref_to_int_record(
 /// `opimpl_ptr_eq` but the nullity test against `CONST_NULL` cannot
 /// short-circuit because `box` is never the literal `CONST_NULL`
 /// constant (codewriter would have folded that).
-pub(crate) fn ptr_nullity_record(
+pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     nonzero: bool,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let box_ = read_ref_reg(code, op, 0, ctx)?;
@@ -316,10 +316,10 @@ pub(crate) fn ptr_nullity_record(
 /// TODO: guards record with empty resume data
 /// (`record_guard(..., 0)`) — same caveat as `dispatch_switch_id`
 /// (no MIFrame liveness / framestack in the standalone walker).
-pub(crate) fn ref_guard_value_record(
+pub(crate) fn ref_guard_value_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let value = read_ref_reg(code, op, 0, ctx)?;
     if value.is_constant() {
@@ -350,10 +350,10 @@ pub(crate) fn ref_guard_value_record(
 /// `bhimpl_float_{lt,le,eq,ne,gt,ge}` (`blackhole.py:721-746`) — read
 /// two `f` regs, record `OpCode::Float<Cmp>`, write the recorder
 /// result into `registers_i[dst]`.
-pub(crate) fn binop_float_to_int_record(
+pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
@@ -380,10 +380,10 @@ pub(crate) fn binop_float_to_int_record(
 /// belongs to the same exec-generated unary opimpl loop —
 /// `self.execute(rop.CAST_INT_TO_FLOAT, b)`. Result lands in the
 /// float bank (the `>f` decorator) instead of the int bank.
-pub(crate) fn cast_int_to_float_record(
+pub(crate) fn cast_int_to_float_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let result = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[a]);
@@ -415,10 +415,10 @@ pub(crate) fn cast_int_to_float_record(
 /// `opimpl_float_<binop>` reads two `f` regs, calls
 /// `self.execute(rop.<OPNUM>, b1, b2)`, and the trailing `>f`
 /// decorator writes the result into `registers_f[dst]`.
-pub(crate) fn binop_float_record(
+pub(crate) fn binop_float_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
@@ -452,10 +452,10 @@ pub(crate) fn binop_float_record(
 /// + 1B dst). RPython equivalent: `bhimpl_float_neg(value)` →
 /// `pyjitpl.py:execute(rop.FLOAT_NEG, value)`. Recording-only path
 /// is the same shape as `binop_float_record` minus one read.
-pub(crate) fn unop_float_record(
+pub(crate) fn unop_float_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
@@ -491,10 +491,10 @@ pub(crate) fn unop_float_record(
 /// product into one metaprogrammed table rather than spelling out each arm.
 macro_rules! regular_record_table {
     ( $( $helper:ident { $( $key:literal => $variant:ident, )+ } )* ) => {
-        pub(crate) fn dispatch_regular_record(
+        pub(crate) fn dispatch_regular_record<Sym: WalkSym>(
             op: &DecodedOp,
             code: &[u8],
-            ctx: &mut WalkContext<'_, '_>,
+            ctx: &mut WalkContext<'_, '_, Sym>,
         ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
             match op.key {
                 $( $( $key => Some($helper(code, op, ctx, OpCode::$variant)), )+ )*

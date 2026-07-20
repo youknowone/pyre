@@ -45,7 +45,10 @@ pub(crate) fn fbw_max_multiframe_depth() -> usize {
 }
 
 /// Recursion depth of `w_code` on the walk's framestack.
-pub(crate) fn fbw_inline_recursion_count(ctx: &WalkContext<'_, '_>, w_code: usize) -> usize {
+pub(crate) fn fbw_inline_recursion_count<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    w_code: usize,
+) -> usize {
     ctx.session
         .borrow()
         .framestack
@@ -56,7 +59,7 @@ pub(crate) fn fbw_inline_recursion_count(ctx: &WalkContext<'_, '_>, w_code: usiz
 
 /// The innermost inline level's strict-fold frame register (`u16::MAX` when
 /// inactive / no inline level).
-pub(crate) fn fbw_strict_fold_frame_reg(ctx: &WalkContext<'_, '_>) -> u16 {
+pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> u16 {
     ctx.callee_shadow
         .as_ref()
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
@@ -1160,8 +1163,8 @@ thread_local! {
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn fbw_abort_nested_unjournaled_residual(
-    ctx: &WalkContext<'_, '_>,
+pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Result<(), DispatchError> {
     // `PYRE_FBW_NESTED_RESID_ABORT=0` opts back into the prior
@@ -1286,8 +1289,8 @@ pub fn capture_fbw_store_journal_root_area() -> *const () {
 /// (`wrapint` / `wrapfloat` = `NewWithVtable` + `SetfieldGc`).  `value_type`
 /// here is `ctx.get_opref_type(value).unwrap_or(Type::Ref)`, the exact body
 /// of `MIFrame::value_type` minus the borrow.
-pub(crate) fn fbw_ensure_boxed_for_ca(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     value: OpRef,
 ) -> Result<OpRef, DispatchError> {
@@ -1313,8 +1316,8 @@ pub(crate) fn fbw_ensure_boxed_for_ca(
 /// — the same resume coordinate (`entry_py_pc` / `outer_active_boxes`) every
 /// other FBW guard uses, since pyre's blackhole can only re-enter the outer
 /// Python opcode boundary.  No-op when there is no standard virtualizable.
-pub(crate) fn fbw_store_token_in_vable(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.trace_ctx.store_token_in_vable_setfield() {
@@ -1331,8 +1334,8 @@ pub(crate) fn fbw_store_token_in_vable(
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs:6427) records it from
 /// `finish_args`, so recording it here too would double it.
-pub(crate) fn fbw_terminate_with_finish(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     result: OpRef,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
@@ -1350,8 +1353,8 @@ pub(crate) fn fbw_terminate_with_finish(
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
 /// void descr).  Like the value path it does NOT record the `FINISH` op —
 /// the compile consumer records it from the empty `finish_args`.
-pub(crate) fn fbw_terminate_void_with_finish(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     fbw_store_token_in_vable(ctx, op_pc)?;
@@ -1392,16 +1395,16 @@ pub(crate) fn fbw_finish_is_exception() -> bool {
 /// marker coordinate here to flush the abort-point frame instead of replaying
 /// the walked region.  Returns None when the sym's jitcode / `code_ptr` is
 /// unavailable (no resume coordinate derivable → legacy replay).
-pub(crate) fn fbw_abort_resume_py_pc(
-    sym: &crate::state::PyreSym,
+pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
+    sym: &Sym,
     abort_jit_pc: usize,
 ) -> Option<usize> {
-    if sym.jitcode.is_null() {
+    if sym.jitcode().is_null() {
         return None;
     }
     // SAFETY: read-only access to the sym's immutable jitcode layout, live
     // for the walk that produced `abort_jit_pc`.
-    let jc = unsafe { &*sym.jitcode };
+    let jc = unsafe { &*sym.jitcode() };
     if jc.payload.code_ptr.is_null() {
         return None;
     }

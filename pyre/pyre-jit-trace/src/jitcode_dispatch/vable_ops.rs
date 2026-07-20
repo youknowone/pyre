@@ -32,10 +32,10 @@ use super::*;
 /// via the per-step concrete frame snapshot.  `dst_bank` selects the result bank
 /// (`'i'`/`'r'`/`'f'`) the walker writes back into, mirroring
 /// `getfield_gc_via_heapcache`'s shape.
-pub(crate) fn getfield_vable_via_metainterp(
+pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
@@ -179,10 +179,10 @@ pub(crate) fn getfield_vable_via_metainterp(
 ///
 /// `value_bank` selects the value register bank (`'i'`/`'r'`/`'f'`),
 /// mirroring `setfield_gc_via_heapcache`'s parameter shape.
-pub(crate) fn setfield_vable_via_metainterp(
+pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Strict fresh-frame fold: a scalar setfield to the current inline level's
@@ -234,12 +234,12 @@ pub(crate) fn setfield_vable_via_metainterp(
 ///
 /// `field_offset` / `array_offset` are byte offsets (from `op.pc + 1`) of
 /// the two descr operands, matching the per-op argcode layout.
-pub(crate) fn vable_array_descrs_from_jitcode(
+pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     field_offset: usize,
     array_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<(DescrRef, DescrRef), DispatchError> {
     let read_pool_idx = |off: usize| {
         let lo = code[op.pc + 1 + off] as usize;
@@ -311,10 +311,10 @@ pub(crate) fn vable_array_descrs_from_jitcode(
 /// and the standard-vable `virtualizable_boxes[index]` cache read.
 /// Mirrors `getfield_vable_via_metainterp`'s concrete-stamp + dst-write
 /// shape; the trait counterpart is `pyjitpl/dispatch.rs:1909-1977`.
-pub(crate) fn getarrayitem_vable_via_metainterp(
+pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Strict fresh-frame fold: when this op reads the current inline level's
@@ -474,10 +474,10 @@ pub(crate) fn getarrayitem_vable_via_metainterp(
 /// SETARRAYITEM_GC fallback + the standard-vable
 /// `virtualizable_boxes[index] = valuebox` + `synchronize_virtualizable`.
 /// Trait counterpart: `pyjitpl/dispatch.rs:1978-2052`.
-pub(crate) fn setarrayitem_vable_via_metainterp(
+pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Strict fresh-frame fold (twin of `getarrayitem_vable_via_metainterp`): a
@@ -546,7 +546,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp(
         let full_body_sym = ctx.fbw_mode.snapshot_sym;
         if !full_body_sym.is_null() {
             // SAFETY: pointer live for the full-body walk; read-only.
-            let nlocals = unsafe { (*full_body_sym).nlocals as i64 };
+            let nlocals = unsafe { (*full_body_sym).nlocals() as i64 };
             if index_value >= 0 && index_value < nlocals {
                 if let Some(&tos) = ctx.vstack_boxes.last() {
                     if !tos.is_none() {
@@ -593,10 +593,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp(
         let full_body_sym = ctx.fbw_mode.snapshot_sym;
         if !full_body_sym.is_null() {
             // SAFETY: pointer live for the full-body walk; read-only.
-            let nlocals = unsafe { (*full_body_sym).nlocals } as i64;
+            let nlocals = unsafe { (*full_body_sym).nlocals() } as i64;
             if index_value >= nlocals {
                 let method_load = unsafe {
-                    let jitcode = (*full_body_sym).jitcode;
+                    let jitcode = (*full_body_sym).jitcode();
                     if jitcode.is_null() {
                         false
                     } else {
@@ -641,10 +641,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp(
 /// ARRAYLEN_GC fallback and the standard-vable
 /// `ConstInt(get_array_length(...))` read.  Trait counterpart:
 /// `pyjitpl/dispatch.rs:2053-2068`.
-pub(crate) fn arraylen_vable_via_metainterp(
+pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let vable = read_ref_reg(code, op, 0, ctx)?;
     // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`

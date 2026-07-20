@@ -112,8 +112,8 @@ pub(crate) fn inflight_foriter_body_pc(body: InflightForiterBody) -> Option<usiz
 
 /// Capture the native coordinates that identify a `for_iter_next` residual.
 /// The Python continue-arm fallthrough is intentionally not derived here.
-pub(crate) fn fbw_foriter_body_from_op_pc(
-    snapshot_sym: *const crate::state::PyreSym,
+pub(crate) fn fbw_foriter_body_from_op_pc<Sym: WalkSym>(
+    snapshot_sym: *const Sym,
     op_pc: usize,
 ) -> Option<InflightForiterBody> {
     if snapshot_sym.is_null() {
@@ -122,11 +122,11 @@ pub(crate) fn fbw_foriter_body_from_op_pc(
     // SAFETY: the snapshot root stays live for the full-body walk. Only the
     // immutable JitCode identity is read here.
     let sym = unsafe { &*snapshot_sym };
-    if sym.jitcode.is_null() {
+    if sym.jitcode().is_null() {
         return None;
     }
     Some(InflightForiterBody::Jit {
-        outer_jitcode_index: unsafe { (*sym.jitcode).index as u32 },
+        outer_jitcode_index: unsafe { (*sym.jitcode()).index as u32 },
         op_pc,
     })
 }

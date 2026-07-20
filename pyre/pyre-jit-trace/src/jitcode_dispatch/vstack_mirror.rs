@@ -262,8 +262,8 @@ pub(crate) fn classify_vstack_opcode(
 /// function latches `ctx.vstack_valid = false` so the `stack_sync`
 /// overlay omits every operand slot, which resume re-materializes (zero
 /// regression).
-pub(crate) fn reconcile_vstack_at_boundary(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &pyre_interpreter::CodeObject,
     new_pypc: u32,
     new_depth: usize,
@@ -495,13 +495,16 @@ pub(crate) fn reconcile_vstack_at_boundary(
 /// Returns `true` on success (every slot `0..new_depth` sourced as a
 /// non-NONE box), `false` if any slot is unsourceable (caller then
 /// latches `vstack_valid = false`).
-pub(crate) fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) -> bool {
+pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    new_depth: usize,
+) -> bool {
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return false;
     }
     // SAFETY: pointer live for the full-body walk; read-only nlocals.
-    let nlocals = unsafe { (*full_body_sym).nlocals };
+    let nlocals = unsafe { (*full_body_sym).nlocals() };
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     // Only FILL the NONE holes the per-op reconcile could not source from
     // the walk register file; keep the boxes the reconcile DID capture (the
@@ -598,7 +601,7 @@ pub(crate) fn vstack_step_py_pc(
 /// (`fbw_mode.snapshot_sym` non-null); the per-opcode arm walk leaves the
 /// mirror untouched (its guards use the static outer coordinate).  Writes
 /// only the `vstack_*` side-fields; never the registers / snapshot.
-pub(crate) fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
+pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, jit_pc: usize) {
     if !ctx.vstack_valid {
         return;
     }
@@ -631,11 +634,11 @@ pub(crate) fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
         // (set in `dispatch_via_miframe`); read-only access to immutable
         // layout fields (jitcode / code_ptr / metadata).
         let sym = unsafe { &*full_body_sym };
-        if sym.jitcode.is_null() {
+        if sym.jitcode().is_null() {
             return;
         }
         unsafe {
-            let jc = &*sym.jitcode;
+            let jc = &*sym.jitcode();
             if jc.payload.code_ptr.is_null() {
                 return;
             }
@@ -655,7 +658,10 @@ pub(crate) fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
     reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
 }
 
-pub(crate) fn seed_callee_vstack_mirror(ctx: &mut WalkContext<'_, '_>, frame: &ActiveResumeFrame) {
+pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame: &ActiveResumeFrame,
+) {
     if !fbw_callee_vstack_enabled() {
         return;
     }
@@ -680,12 +686,12 @@ pub(crate) fn seed_callee_vstack_mirror(ctx: &mut WalkContext<'_, '_>, frame: &A
 /// `collect_outer_active_boxes` / `stack_sync` read.  Any unsourceable
 /// slot leaves `vstack_valid = false`; the overlay then omits operand
 /// slots, which resume re-materializes (zero regression).
-pub(crate) fn seed_vstack_mirror(
-    ctx: &mut WalkContext<'_, '_>,
-    sym: &crate::state::PyreSym,
+pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    sym: &Sym,
     start_pc: usize,
 ) {
-    if sym.jitcode.is_null() || !sym.owns_virtualizable_shadow() {
+    if sym.jitcode().is_null() || !sym.owns_virtualizable_shadow() {
         return;
     }
     // Ordinarily seed at the opcode containing the first walked jitcode op,
@@ -696,7 +702,7 @@ pub(crate) fn seed_vstack_mirror(
     // let `vstack_step_py_pc` ignore the marker itself, preventing the
     // predecessor permutation from being applied to the mirror a second time.
     let (first_pypc, depth, nlocals) = unsafe {
-        let jc = &*sym.jitcode;
+        let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             return;
         }
@@ -731,7 +737,7 @@ pub(crate) fn seed_vstack_mirror(
             .get(first_pypc as usize)
             .copied()
             .unwrap_or(0) as usize;
-        (first_pypc, d, sym.nlocals)
+        (first_pypc, d, sym.nlocals())
     };
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     let mut boxes = Vec::with_capacity(depth);
@@ -771,8 +777,8 @@ pub(crate) fn seed_vstack_mirror(
 /// `handler_jit_pc` is the catch target (an OUTER full-body jitcode pc).
 /// No-op outside the full-body walk or inside an inline sub-walk (where the
 /// pc is a callee coordinate the outer metadata cannot map).
-pub(crate) fn vstack_enter_exception_handler(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     handler_jit_pc: usize,
     exc: OpRef,
 ) {
@@ -794,12 +800,12 @@ pub(crate) fn vstack_enter_exception_handler(
     }
     // SAFETY: pointer live for the full-body walk; read-only layout fields.
     let sym = unsafe { &*full_body_sym };
-    if sym.jitcode.is_null() {
+    if sym.jitcode().is_null() {
         ctx.vstack_valid = false;
         return;
     }
     let (handler_py, code_ptr) = unsafe {
-        let jc = &*sym.jitcode;
+        let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             ctx.vstack_valid = false;
             return;

@@ -10,7 +10,7 @@
 use majit_metainterp::{MetaInterp, TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 
-use crate::state::{PyreMeta, PyreSym};
+use crate::state::{PyreMeta, PyreSym, WalkSym};
 
 struct ObjectSlotRoot {
     slot: *mut *mut u8,
@@ -531,9 +531,9 @@ fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize)
 /// the per-step concrete frame snapshot.  A location the walk declines
 /// re-interprets without JIT (the trait `PyreMetaInterp` interpret loop is
 /// retired, gap-10 of issue #73 Phase 6).
-pub fn trace_bytecode(
+pub fn trace_bytecode<Sym: WalkSym>(
     meta: &mut MetaInterp<PyreMeta>,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     _code: &CodeObject,
     start_pc: usize,
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
@@ -567,7 +567,7 @@ pub fn trace_bytecode(
     // exception held only in `sym.trace_built_exc` (and the seeded/caught
     // `last_exc_value` / `current_exc_value`). The guard restores the prior
     // anchor on every return path, including panics and nested tracing.
-    let _active_sym_guard = set_active_sym_exc(&mut *sym as *mut PyreSym);
+    let _active_sym_guard = sym.active_exc_anchor().map(set_active_sym_exc);
 
     let ctx = meta
         .trace_ctx()
@@ -622,7 +622,7 @@ pub fn trace_bytecode(
     // gap 10 slice 2b: set this BEFORE `init_symbolic` so the root vable
     // identity (seed_virtualizable_boxes) is baked against the live frame
     // address, not the discarded snapshot's.
-    sym.live_vable_frame_addr = live_frame_addr;
+    sym.set_live_vable_frame_addr(live_frame_addr);
     // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
     // construction. Callee (inline) frames are set up by perform_call
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
@@ -630,7 +630,7 @@ pub fn trace_bytecode(
     sym.init_symbolic(ctx, cf_addr);
     if let Some(ref carrier) = carrier {
         debug_assert_eq!(
-            unsafe { (*sym.jitcode).index as i32 },
+            unsafe { (*sym.jitcode()).index as i32 },
             carrier.root_jitcode_index
         );
     }
@@ -815,8 +815,11 @@ type PerfnWalkResult = Result<
 /// lookup off `pjc.jitcode.exec.descrs`, and runs `dispatch_via_miframe` from
 /// `entry` with the caller-seeded `argboxes_r`.  Returns
 /// `(code_len, walk_result)`; `None` when the terminal descrs are unwired.
-fn dispatch_perfn_frame(
-    mi: &mut crate::state::MIFrame,
+fn dispatch_perfn_frame<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    sym: &mut Sym,
+    concrete_frame_addr: usize,
+    orgpc: usize,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     pjc: &std::sync::Arc<crate::PyJitCode>,
     entry: usize,
@@ -829,7 +832,7 @@ fn dispatch_perfn_frame(
     // identities.  A missing one means setup never ran — log and bail
     // rather than feed placeholder descrs.
     let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
-        let sd = mi.ctx().metainterp_sd();
+        let sd = ctx.metainterp_sd();
         match (
             sd.done_with_this_frame_descr_void.clone(),
             sd.done_with_this_frame_descr_int.clone(),
@@ -898,7 +901,10 @@ fn dispatch_perfn_frame(
     let code = pjc.jitcode.code.as_slice();
     let code_len = code.len();
     let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
-        mi,
+        ctx,
+        sym,
+        concrete_frame_addr,
+        orgpc,
         session,
         code,
         entry,
@@ -988,11 +994,15 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// `bridge_local_oprefs` / `bridge_stack_oprefs`, so mirror the destination
 /// there too.  Returns `false` (caller declines the compile) when the register
 /// is unresolved.
-fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
-    if sym.jitcode.is_null() {
+fn inject_root_call_result<Sym: WalkSym>(
+    sym: &mut Sym,
+    root_pc: usize,
+    result: majit_ir::OpRef,
+) -> bool {
+    if sym.jitcode().is_null() {
         return false;
     }
-    let payload = unsafe { &(*sym.jitcode).payload };
+    let payload = unsafe { &(*sym.jitcode()).payload };
     let result_reg = residual_ref_call_dst_before(payload.jitcode.code.as_slice(), root_pc)
         .or_else(|| {
             payload
@@ -1003,15 +1013,15 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
     let Some(result_reg) = result_reg else {
         return false;
     };
-    let nlocals = sym.nlocals;
-    if let Some(ref mut bridge_regs) = sym.bridge_registers_r {
+    let nlocals = sym.nlocals();
+    if let Some(bridge_regs) = sym.bridge_registers_r_mut().as_mut() {
         if bridge_regs.len() <= result_reg {
             bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
         }
         bridge_regs[result_reg] = result;
     }
     if result_reg < nlocals {
-        if let Some(ref mut locals) = sym.bridge_local_oprefs {
+        if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
             if locals.len() <= result_reg {
                 locals.resize(result_reg + 1, majit_ir::OpRef::NONE);
             }
@@ -1019,7 +1029,7 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
         }
     } else {
         let slot = result_reg - nlocals;
-        let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
+        let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
         if bridge.len() <= slot {
             bridge.resize(slot + 1, majit_ir::OpRef::NONE);
         }
@@ -1028,9 +1038,9 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
     true
 }
 
-fn drive_bridge_carrier_walk(
+fn drive_bridge_carrier_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
     cf_addr: usize,
@@ -1041,7 +1051,7 @@ fn drive_bridge_carrier_walk(
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
 
-    let root_ec = sym.concrete_execution_context;
+    let root_ec = sym.concrete_execution_context();
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         let pcs: Vec<usize> = carrier
             .recipes
@@ -1218,9 +1228,9 @@ fn drive_bridge_carrier_walk(
 /// reconstruction and re-interprets with the correct result (no SEGV). The
 /// [`drive_bridge_carrier_walk`] abort-to-blackhole drain is the safe default;
 /// this framestack walk remains reachable with `PYRE_P2_DRAIN=0` pending #343.
-fn drive_bridge_framestack_walk(
+fn drive_bridge_framestack_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
     cf_addr: usize,
@@ -1265,7 +1275,7 @@ fn drive_bridge_framestack_walk(
         return full_body_walk_trace(ctx, sym, w_code, root_pc, cf_addr, WalkJournals::Reset);
     };
 
-    let root_ec = sym.concrete_execution_context;
+    let root_ec = sym.concrete_execution_context();
     let pre_pos = ctx.get_trace_position();
     // Reconstruct the deepest resumed callee frame vable + its `argboxes_r`
     // portal reds (mirror of the `drive_bridge_carrier_walk` setup).
@@ -1465,10 +1475,10 @@ fn drive_bridge_framestack_walk(
 /// not proceed so the caller falls through to its clean abort (which cuts the
 /// whole reconstruction).  Delivery is by physical call-dst register, decoded
 /// from the residual-call op whose `next_pc` is the outer resume entry.
-fn drive_outer_continuation_and_map(
+fn drive_outer_continuation_and_map<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
     _cf_addr: usize,
@@ -1603,9 +1613,9 @@ fn drive_outer_continuation_and_map(
     }
 }
 
-fn run_perfn_walk(
+fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     w_code: *const (),
     start_pc: usize,
     cf_addr: usize,
@@ -1626,10 +1636,10 @@ fn run_perfn_walk(
     let is_entry_green = start_pc == 0 || is_loop_header;
     let uses_entry_sidecar = is_plain_portal && is_entry_green;
     let sidecar_entry = pjc.merge_entry_for(start_pc);
-    let pc_map_entry = if sym.bridge_walk_entry_pc.is_some() {
+    let pc_map_entry = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
-        sym.bridge_walk_entry_pc
+        sym.bridge_walk_entry_pc()
     } else if uses_entry_sidecar {
         sidecar_entry
     } else {
@@ -1662,10 +1672,10 @@ fn run_perfn_walk(
     // reading abstract-register colors that were live at entry but dead
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
-    let entry = sym.bridge_walk_entry_pc.unwrap_or(pc_map_entry);
+    let entry = sym.bridge_walk_entry_pc().unwrap_or(pc_map_entry);
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
-        let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals);
-        let live_stack = sym.valuestackdepth.saturating_sub(stack_base);
+        let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
+        let live_stack = sym.valuestackdepth().saturating_sub(stack_base);
         // A mismatch is unsound only when the carried coordinate IS the
         // resume marker.  That is the marker-inside-super-instruction shape:
         // the live frame has advanced through the super-instruction while the
@@ -1708,7 +1718,6 @@ fn run_perfn_walk(
     }
 
     let is_bridge_trace = ctx.is_bridge_trace;
-    let mut mi = crate::state::MIFrame::from_sym(ctx, sym, cf_addr, start_pc, start_pc);
 
     // setup_call argbox: seed r0 = the standard virtualizable identity box
     // (`virtualizable_boxes[-1]`, the `InputArgRef(SYM_FRAME_IDX)` that
@@ -1731,10 +1740,9 @@ fn run_perfn_walk(
     // nonstandard leg → `getarrayitem_vable` returns `Value::Void` even though
     // the virtualizable SHADOW entry is correct.  Closing that needs the live
     // loop-input registers seeded at walk entry (task #53), not just r0.
-    let frame_box = mi
-        .ctx()
+    let frame_box = ctx
         .standard_virtualizable_box()
-        .unwrap_or_else(|| mi.ctx().const_ref(cf_addr as i64));
+        .unwrap_or_else(|| ctx.const_ref(cf_addr as i64));
     // 51d.1 (B1 blocker): seed the loop's live INPUT registers so the
     // post-merge-point loop body resolves its loop-invariant reads.  The
     // walk enters PAST the loop-header `jit_merge_point`, which would
@@ -1748,8 +1756,8 @@ fn run_perfn_walk(
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `pycode`/`ec` are const-refs to the live
     // pointers.  `argboxes_r[i] -> top_regs_r[i]` is the seed channel.
-    let ec_box = mi.ctx().const_ref(sym.concrete_execution_context as i64);
-    let pycode_box = mi.ctx().const_ref(w_code as i64);
+    let ec_box = ctx.const_ref(sym.concrete_execution_context() as i64);
+    let pycode_box = ctx.const_ref(w_code as i64);
     let static_entry_green_ref_regs = if is_bridge_trace {
         None
     } else {
@@ -1878,7 +1886,7 @@ fn run_perfn_walk(
         // op onto the nonstandard leg (NonStandardVableFinishPortalUnsupported
         // abort).
         if is_bridge_trace {
-            if sym.bridge_walk_entry_pc.is_some() {
+            if sym.bridge_walk_entry_pc().is_some() {
                 // Kept-stack branch guard resumed at the guard's own jitcode
                 // offset (`entry` above).  The live registers there are the
                 // guard-time abstract-register colors the resume data decoded
@@ -1888,7 +1896,7 @@ fn run_perfn_walk(
                 // non-NONE color directly; the `nlocals + depth` slot→color
                 // shortcut below is wrong here because a kept temp's abstract
                 // color is not `nlocals + depth` under free register coloring.
-                if let Some(ref bridge_regs_r) = sym.bridge_registers_r {
+                if let Some(bridge_regs_r) = sym.bridge_registers_r() {
                     for (color, &opref) in bridge_regs_r.iter().enumerate() {
                         if opref.is_none() {
                             continue;
@@ -1933,7 +1941,7 @@ fn run_perfn_walk(
                         seed(color, opref);
                     }
                 }
-            } else if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
+            } else if let Some(bridge_stack) = sym.bridge_stack_oprefs() {
                 // Non-branch-guard resume at the opcode-entry
                 // marker: the walk re-executes the opcode from the top, reading
                 // its operand-stack inputs POSITIONALLY — `registers_r[nlocals +
@@ -1961,7 +1969,7 @@ fn run_perfn_walk(
                 //
                 // A NONE `bridge_stack[i]` (dead/empty slot) leaves the color's
                 // red seed intact — the red genuinely still owns the color there.
-                let nl = sym.nlocals;
+                let nl = sym.nlocals();
                 for (i, &opref) in bridge_stack.iter().enumerate() {
                     if !opref.is_none() {
                         let color = (nl + i) as u8;
@@ -1981,14 +1989,14 @@ fn run_perfn_walk(
     // so `dispatch_via_miframe` writes `top_regs_i[color] = value`. Empty for a
     // non-branch-guard resume (`bridge_walk_entry_pc == None`), where the walk
     // enters at the opcode boundary with no live mid-opcode Int temps.
-    let argboxes_i: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc.is_some() {
+    let argboxes_i: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
         // Clamp to the jitcode's Int register count: `sym.registers_i` may carry
         // trailing scratch/constant colors beyond `num_regs_i`, and
         // `dispatch_via_miframe` rejects an argbox list longer than the callee
         // bank (`InlineCallIntArityMismatch`). Only the leading `num_regs_i`
         // colors are real Int registers the walk reads.
         let num_regs_i = pjc.jitcode.num_regs_i() as usize;
-        let mut v = sym.registers_i.clone();
+        let mut v = sym.registers_i().to_vec();
         v.truncate(num_regs_i);
         v
     } else {
@@ -1996,7 +2004,10 @@ fn run_perfn_walk(
     };
 
     let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
-        &mut mi,
+        ctx,
+        sym,
+        cf_addr,
+        start_pc,
         &session,
         &pjc,
         entry,
@@ -2059,11 +2070,15 @@ fn run_perfn_walk(
             let loop_header_pc = *loop_header_pc;
             let restart_pc = close_loop_restart_pc.expect("close loop has a restart pc");
             WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
-            // `close_loop_args_at` reads `self.orgpc` for the last_instr anchor; the merge point
-            // closes at the loop header, so anchor orgpc there.
-            mi.orgpc = loop_header_pc;
-            *jump_args =
-                mi.close_loop_args_at(ctx, Some(loop_header_pc), *loop_header_marker_jit_pc);
+            // `close_loop_args_at` reads the loop-header `orgpc` for the
+            // last_instr anchor, so pass that coordinate explicitly.
+            *jump_args = sym.close_loop_args_at(
+                ctx,
+                cf_addr,
+                loop_header_pc,
+                Some(loop_header_pc),
+                *loop_header_marker_jit_pc,
+            );
         }
         // pyjitpl.py:3048-3091 raise_continue_running_normally parity: a
         // walk that ends at a merge point hands the interpreter (and the
@@ -2597,9 +2612,9 @@ fn run_perfn_walk(
 /// walk advances past the loop `goto_if_not`); it corrupts the live
 /// frame/iterator state because the probe still discards the trace, so it
 /// must never be set outside a throwaway run.
-fn probe_walk_perfn_jitcode(
+fn probe_walk_perfn_jitcode<Sym: WalkSym>(
     ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     w_code: *const (),
     start_pc: usize,
     cf_addr: usize,
@@ -3096,9 +3111,9 @@ enum WalkJournals {
 /// mapped to a real `CloseLoopWithArgs`; every other outcome (`Terminate`
 /// finish-arg recovery, `SubReturn`/`SubRaise`, `SwitchToBlackhole`, any
 /// `DispatchError`) aborts the trace and returns to interpretation.
-fn full_body_walk_trace(
+fn full_body_walk_trace<Sym: WalkSym>(
     ctx: &mut TraceCtx,
-    sym: &mut PyreSym,
+    sym: &mut Sym,
     w_code: *const (),
     start_pc: usize,
     cf_addr: usize,

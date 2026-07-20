@@ -165,8 +165,8 @@ use super::*;
 /// `try_execute_residual_call_via_executor` which concrete-executes the
 /// helper and records the blackbox `CallMayForce*` IR.  No-op for
 /// non-STORE_SUBSCR residual calls.
-pub(crate) fn try_walker_store_subscr_specialization(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_store_subscr_specialization<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     funcptr: OpRef,
@@ -318,8 +318,8 @@ pub(crate) fn try_walker_store_subscr_specialization(
 /// `GUARD_NO_EXCEPTION`, whose kept-stack blackhole resume reads NULL peeled
 /// outer-Label slots in the short-circuit value-context shape
 /// (`(i % 7) and ...`).
-pub(crate) fn try_walker_specialize_truth_int(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     operand: OpRef,
 ) -> Result<Option<OpRef>, DispatchError> {
@@ -358,8 +358,8 @@ pub(crate) fn try_walker_specialize_truth_int(
 /// not both concrete `W_IntObject`, or the helper raises — the caller
 /// then falls through to the generic `CallMayForce` record so the
 /// Python-level `__op__` semantics are preserved.
-pub(crate) fn try_walker_specialize_binary_op_int(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -586,8 +586,8 @@ pub(crate) fn try_walker_specialize_binary_op_int(
 /// operand return `Ok(None)` so the caller falls through to the generic record,
 /// preserving the `__op__` semantics.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_binary_op_long(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -745,8 +745,8 @@ pub(crate) fn try_walker_specialize_binary_op_long(
 /// downstream float op keeps the quotient unboxed.  Walker-only — the trait path
 /// defers true-divide to the generic residual.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_truediv_op_long(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -838,8 +838,8 @@ pub(crate) fn try_walker_specialize_truediv_op_long(
 /// fall through to the opaque residual record, which stays correct for any
 /// other shape — so a non-foldable sequence is not declined.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_unpack(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     helper: majit_ir::PyreHelperKind,
     i_args: &[OpRef],
@@ -948,8 +948,8 @@ pub(crate) fn try_walker_specialize_unpack(
 /// dropping the residual's exception guard is sound even in a handler-bearing
 /// body (same reasoning as the LoadGlobal fold).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_load_attr(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     w_code_ptr: usize,
@@ -1178,8 +1178,8 @@ pub(crate) fn try_walker_specialize_load_attr(
 /// `w_descr` as a green constant so the following `CALL` can use the existing
 /// constant-callee inline path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_load_method_attr(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     w_code_ptr: usize,
@@ -1274,8 +1274,8 @@ pub(crate) fn try_walker_specialize_load_method_attr(
 /// instance-method bind writes the original red receiver box, not a baked
 /// `ConstRef`, matching `callmethod.py:68 f.pushvalue(w_obj)`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_fold_load_method_self(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     attr: OpRef,
@@ -1313,8 +1313,8 @@ pub(crate) fn try_walker_fold_load_method_self(
     Ok(Some(()))
 }
 
-pub(crate) fn try_walker_specialize_store_attr(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     value: OpRef,
@@ -1614,8 +1614,8 @@ pub(crate) fn try_walker_specialize_store_attr(
 /// without a concrete Ref shadow, or an Integer-strategy list that carries a
 /// fits-in-word `W_LongObject` / tagged immediate (which `walker_unbox_int`'s
 /// `&INT_TYPE` guard does not cover).
-pub(crate) fn try_walker_specialize_newlist(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     dst: usize,
@@ -1794,8 +1794,8 @@ pub(crate) fn try_walker_specialize_newlist(
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
 /// for any other shape (object tuple, arity ≠ 2, long element, cache miss)
 /// — so a non-foldable build is not declined.
-pub(crate) fn try_walker_specialize_newtuple(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     dst: usize,
@@ -1965,8 +1965,8 @@ pub(crate) fn try_walker_specialize_newtuple(
 ///
 /// Same gate + return contract as
 /// [`try_walker_specialize_binary_op_int`].
-pub(crate) fn try_walker_specialize_compare_op_int(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -2069,8 +2069,8 @@ pub(crate) fn try_walker_specialize_compare_op_int(
 /// Declines (`None` → generic residual) when either operand lacks a
 /// concrete shadow, or `match_type` is not a valid exception class /
 /// tuple (the residual then raises the correct `TypeError`).
-pub(crate) fn try_walker_fold_check_exc_match(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     dst: usize,
@@ -2150,8 +2150,8 @@ pub(crate) fn try_walker_fold_check_exc_match(
 /// boxing to a `W_Bool` (same #62 dead-box elision as the int path).  Same gate
 /// + return contract as [`try_walker_specialize_binary_op_long`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_compare_op_long(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -2257,8 +2257,8 @@ pub(crate) fn try_walker_specialize_compare_op_long(
 /// `guard_no_exception` there).  Tried as a fallback only after the int
 /// specialization declines, so two-int operands keep int `__op__`
 /// arithmetic.
-pub(crate) fn try_walker_specialize_binary_op_float(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -2407,8 +2407,8 @@ pub(crate) fn try_walker_specialize_binary_op_float(
 /// Tuples, empty-strategy lists, negative indices, and non-`list[int]`
 /// operands fall through to the generic `CallMayForce` record (`Ok(None)`),
 /// preserving Python `__getitem__` semantics.
-pub(crate) fn try_walker_specialize_subscr(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     allboxes: &[OpRef],
@@ -2648,8 +2648,8 @@ pub(crate) fn try_walker_specialize_subscr(
 /// unbox/rebox).  The authentic boxed result is taken from the same
 /// `execute_may_force` path the generic leg uses.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_subscr_tuple(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     list_op: OpRef,
     key_op: OpRef,
@@ -2779,8 +2779,8 @@ pub(crate) fn try_walker_specialize_subscr_tuple(
 /// Returns `None` (fall through to the generic residual, SAFE) for any
 /// other shape: non-list/str/tuple arg, a subclass, empty-strategy list, a
 /// bound receiver, or wrong arity.
-pub(crate) fn try_walker_specialize_builtin_len(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
@@ -2995,8 +2995,8 @@ pub(crate) fn try_walker_specialize_builtin_len(
 /// declines it (`OrthodoxSubWalkTraceUnsupported`) and the descent aborts
 /// gracefully (interpreter fallback) instead of baking the hash as a code
 /// address and branching to garbage.
-pub(crate) fn try_walker_orthodox_list_append(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
@@ -3182,9 +3182,9 @@ unsafe fn orthodox_list_append_recognize(
 /// Returns `None` (decline — no IR emitted yet) when the body jitcode is not
 /// compiled or the snapshot sym is absent.  The returned `sym_ptr` is
 /// non-null with a set `jitcode` field.
-pub(crate) fn orthodox_list_append_body_and_sym(
-    ctx: &WalkContext<'_, '_>,
-) -> Option<(SubJitCodeBody, *const crate::state::PyreSym)> {
+pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(SubJitCodeBody, *const Sym)> {
     let jc_arc = crate::jitcode_runtime::list_append_jitcode()?;
     let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -3192,7 +3192,7 @@ pub(crate) fn orthodox_list_append_body_and_sym(
         return None;
     }
     // SAFETY: set for the lifetime of the enclosing full-body walk.
-    if unsafe { &*sym_ptr }.jitcode.is_null() {
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return None;
     }
     Some((sub_body, sym_ptr))
@@ -3212,10 +3212,10 @@ pub(crate) fn orthodox_list_append_body_and_sym(
 /// propagates as `DispatchError` (graceful interpreter fallback), never a wrong
 /// trace.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn orthodox_list_append_commit(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
-    sym: &crate::state::PyreSym,
+    sym: &Sym,
     sub_body: &SubJitCodeBody,
     self_ref: OpRef,
     value_op: OpRef,
@@ -3342,19 +3342,19 @@ pub(crate) fn orthodox_list_append_commit(
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode;
+        let jc = &*sym.jitcode();
         let jc_index = jc.index as u32;
         let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
         let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
         if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth as i64, jc_index, marker)
+            (py, sym.valuestackdepth() as i64, jc_index, marker)
         } else {
             let codeobj = &*jc.payload.code_ptr;
             py = skip_python_trivia_forward(codeobj, py as usize) as u32;
             let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
             let vsd = match lv.depth_at_py_pc().get(py as usize).copied() {
-                Some(d) => (sym.nlocals + d as usize) as i64,
-                None => sym.valuestackdepth as i64,
+                Some(d) => (sym.nlocals() + d as usize) as i64,
+                None => sym.valuestackdepth() as i64,
             };
             (py, vsd, jc_index, marker)
         }
@@ -3481,8 +3481,8 @@ pub(crate) fn orthodox_list_append_commit(
 /// ([`try_walker_orthodox_list_append`]).  Returns `None` (fall through to the
 /// generic residual, SAFE — identical to the trait tracer's `jit_list_append`)
 /// for any non-matching shape; the residual is void so no result is written.
-pub(crate) fn try_walker_orthodox_list_append_opcode(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
@@ -3551,8 +3551,8 @@ pub(crate) fn try_walker_orthodox_list_append_opcode(
 /// Returns `None` (fall through to the generic residual) for any non-matching
 /// shape: an overriding or uncacheable subclass, a non-trivial-args kind
 /// (OSError / Unicode errors store extra fields), or a null concrete arg.
-pub(crate) fn try_walker_trace_exception_new(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
@@ -3987,8 +3987,8 @@ pub(crate) fn try_walker_trace_exception_new(
 ///
 /// Returns `None` (fall through to the residual) when `exc` was not
 /// inline-built or a `from` cause is present.
-pub(crate) fn try_walker_trace_raise_builtin(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
@@ -4123,8 +4123,8 @@ pub(crate) fn try_walker_trace_raise_builtin(
 /// so a non-escaping exception virtualizes and DCEs (no per-raise
 /// `CallMallocNursery`).  Declines (`None` → generic residual) when the EC
 /// cannot be recovered or the operand shape does not match (SAFE).
-pub(crate) fn try_walker_lower_exc_info_residual(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     pyre_helper: majit_ir::PyreHelperKind,
@@ -4272,8 +4272,8 @@ pub(crate) fn try_walker_lower_exc_info_residual(
 /// lists, long values, strategy mismatches, negative indices, and
 /// non-`list[int]` operands fall through to the generic `CALL_MAY_FORCE`
 /// record (`Ok(None)`), preserving Python `__setitem__` semantics.
-pub(crate) fn try_walker_specialize_store_subscr(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<()>, DispatchError> {
@@ -4467,8 +4467,8 @@ pub(crate) fn try_walker_specialize_store_subscr(
 /// The Phase 1 result remains a normal `W_IntObject` allocation.  Its mask is
 /// only for the exhaustion result; item virtualization is intentionally not
 /// attempted here.
-pub(crate) fn try_walker_specialize_for_iter_next(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     _dst: usize,
@@ -4674,8 +4674,8 @@ pub(crate) fn try_walker_specialize_for_iter_next(
 /// non-unit step, a resizing (length-changing) slice, an empty slice, a
 /// non-Integer-storage target or source, or a list subclass (which may override
 /// `__setitem__` / `__iter__`).
-pub(crate) fn try_walker_specialize_setslice(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<()>, DispatchError> {
@@ -4912,8 +4912,8 @@ pub(crate) fn try_walker_specialize_setslice(
 /// Tried as a fallback only after the int compare specialization declines,
 /// so two-int operands keep int comparison.  All six `ComparisonOperator`
 /// variants are handled (float compare has no deferred operators).
-pub(crate) fn try_walker_specialize_compare_op_float(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     op_tag: i64,
     r_args: &[OpRef],
@@ -5009,8 +5009,8 @@ pub(crate) fn try_walker_specialize_compare_op_float(
 /// the module-dict `version` and fails the loop's GUARD_NOT_INVALIDATED.  This
 /// mirrors `bh_load_global_fn`'s `finditem_str(globals)` →
 /// `get_builtin().getdictvalue` fallback chain.
-pub(crate) fn try_walker_load_global_cell_fold(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     dst: usize,
     dst_bank: char,
@@ -5142,8 +5142,8 @@ pub(crate) fn try_walker_load_global_cell_fold(
 /// A non-module frame (class body / `exec(code, g, l)` with separate locals)
 /// has a non-null `w_locals`, so the gate routes it to the live
 /// residual `bh_load_name_fn`.
-pub(crate) fn try_walker_load_name_cell_fold(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     dst: usize,
     dst_bank: char,
@@ -5185,8 +5185,8 @@ pub(crate) fn try_walker_load_name_cell_fold(
 /// `IntMutableCell`, or the value is not a provably-plain-int box (bool /
 /// int-subclass / long / object all fall through — `write_cell` REPLACES the
 /// cell + bumps the version for those, which the setfield fast path must not).
-pub(crate) fn try_walker_store_name_cell_fold(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     frame_ptr: usize,
     w_name_ptr: usize,

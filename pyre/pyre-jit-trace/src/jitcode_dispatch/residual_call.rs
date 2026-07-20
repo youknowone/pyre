@@ -227,8 +227,8 @@ pub(crate) fn select_residual_call_opcode(
 /// when the arity exceeds `MAX_HOST_CALL_ARITY` (16) — the trace still
 /// has the recorded `CallPure*` op for the optimizer to consume later,
 /// just without the per-record fold.
-pub(crate) fn try_fold_pure_call_via_executor(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -346,11 +346,11 @@ pub(crate) fn try_fold_pure_call_via_executor(
 /// NULL where the callee entry expects its globals/closure, yielding a NULL
 /// result (closures / locals-bound callees called in a loop). See
 /// [`DispatchError::MayForceNullRefArgUnsupported`].
-pub(crate) fn walker_abort_if_mayforce_null_ref_arg(
+pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     call_opcode: OpCode,
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Result<(), DispatchError> {
     if !matches!(
@@ -442,8 +442,8 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg(
 /// constant, and its `box_value`.  Attributes an unj_val census walk to a
 /// knowable-but-unpopulated value versus a genuinely-symbolic heap object
 /// without re-instrumenting.
-pub(crate) fn probe_resid_decline_ctx(
-    ctx: &WalkContext<'_, '_>,
+pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
     why: &str,
     op_pc: usize,
     arg_index: usize,
@@ -453,8 +453,8 @@ pub(crate) fn probe_resid_decline_ctx(
     let sym = ctx.fbw_mode.snapshot_sym;
     let (py_pc, opcode) = if !sym.is_null() {
         let s = unsafe { &*sym };
-        if !s.jitcode.is_null() {
-            let jc = unsafe { &*s.jitcode };
+        if !s.jitcode().is_null() {
+            let jc = unsafe { &*s.jitcode() };
             let pc = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc) as usize;
             let op = if !jc.payload.code_ptr.is_null() {
                 pyre_interpreter::decode_instruction_at(unsafe { &*jc.payload.code_ptr }, pc)
@@ -494,8 +494,8 @@ pub(crate) fn probe_resid_decline_ctx(
 /// bridge resume, etc.).  Mirrors the callee/self resolution in
 /// `try_walker_call_assembler_self_recursive`.  Keeps the recursion itself out
 /// of the foreign-body-residual latch so pure recursion (`fib`) still folds.
-pub(crate) fn residual_callee_is_walk_self_recursive(
-    ctx: &WalkContext<'_, '_>,
+pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
     helper: majit_ir::PyreHelperKind,
 ) -> bool {
@@ -523,17 +523,18 @@ pub(crate) fn residual_callee_is_walk_self_recursive(
             return false;
         };
         let sym = &*sym_ptr;
-        if sym.jitcode.is_null() {
+        if sym.jitcode().is_null() {
             return false;
         }
-        let caller_code = pyre_interpreter::live_code_wrapper((*sym.jitcode).raw_code() as *const ())
-            as *const ();
+        let caller_code =
+            pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
+                as *const ();
         w_code as usize == caller_code as usize
     }
 }
 
-pub(crate) fn try_execute_residual_call_via_executor(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -1428,7 +1429,9 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
 /// Kept as a thin pass-through so the dispatcher call sites stay
 /// readable; collapses to direct `walker_*` once the dispatchers
 /// inline.
-pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call(ctx: &mut WalkContext<'_, '_>) {
+pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) {
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
@@ -1441,8 +1444,8 @@ pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call(ctx: &mut WalkCo
 /// `handle_possible_exception()` captures the guard's `fail_args`,
 /// otherwise a raising call surfaces NONE in the slot the resume
 /// snapshot reads.
-pub(crate) fn write_residual_call_result_to_dst(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     dst: usize,
     dst_bank: char,
@@ -1570,10 +1573,10 @@ pub(crate) fn residual_call_is_specialized_plain_int_add(
     )
 }
 
-pub(crate) fn dispatch_residual_call_iRd_kind(
+pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py:1940-1941) opens every residual call
@@ -2339,10 +2342,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind(
 }
 
 #[allow(non_snake_case)]
-pub(crate) fn dispatch_residual_call_iIRd_kind(
+pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
@@ -3118,10 +3121,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind(
 /// ([`select_residual_call_opcode`], [`direct_call_release_gil`],
 /// [`loopinvariant_lookup`] / [`loopinvariant_now_known`]).
 #[allow(non_snake_case)]
-pub(crate) fn dispatch_residual_call_iIRFd_kind(
+pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every

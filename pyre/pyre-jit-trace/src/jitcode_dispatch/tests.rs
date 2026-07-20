@@ -3,6 +3,10 @@ use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
 use majit_metainterp::make_fail_descr;
 
+fn test_fbw_mode() -> FbwWalkMode<crate::state::PyreSym> {
+    FbwWalkMode::default()
+}
+
 /// Install the minimal `-live-`-anchored outer JitCode required by
 /// per-opcode guard tests. Production obtains this coordinate from the
 /// codewriter; these isolated dispatcher fixtures supply the same shape.
@@ -160,7 +164,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     let wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -232,7 +236,7 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -294,7 +298,7 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -374,7 +378,7 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
         let mut wc = WalkContext {
             callee_shadow: None,
             inline_callee_consts: None,
-            fbw_mode: Default::default(),
+            fbw_mode: test_fbw_mode(),
             session: &session,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
@@ -618,7 +622,7 @@ fn switch_id_hit_jumps_to_matching_target() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -681,7 +685,7 @@ fn switch_id_miss_falls_through() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -743,7 +747,7 @@ fn switch_id_requires_concrete_int_value() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -814,7 +818,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -877,7 +881,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -939,7 +943,7 @@ fn goto_if_not_requires_concrete_int_value() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -1210,7 +1214,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -1384,7 +1388,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -1506,7 +1510,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -1623,7 +1627,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -1729,7 +1733,7 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -1831,7 +1835,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -1915,7 +1919,7 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -1978,7 +1982,7 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2037,7 +2041,7 @@ fn step_through_live_opcode_advances_by_offset_size() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2105,7 +2109,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs,
         registers_i: &mut [],
@@ -2171,7 +2175,7 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2240,7 +2244,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -2325,7 +2329,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -2398,7 +2402,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2472,7 +2476,7 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2534,7 +2538,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2599,7 +2603,7 @@ fn step_through_goto_jumps_to_label_target() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2664,7 +2668,7 @@ fn step_through_goto_handles_high_byte_of_label() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2777,7 +2781,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs,
         registers_i: &mut [],
@@ -2837,7 +2841,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -2911,7 +2915,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs,
         registers_i: &mut [],
@@ -3016,7 +3020,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs,
         registers_i: &mut [],
@@ -3122,7 +3126,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -3205,7 +3209,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -3265,7 +3269,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -3389,7 +3393,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -3515,7 +3519,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -3591,7 +3595,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -3663,7 +3667,7 @@ fn int_copy_writes_src_value_into_dst_register() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -3726,7 +3730,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -3788,7 +3792,7 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [], // empty — index 7 must surface OOR
@@ -3870,7 +3874,7 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -3940,7 +3944,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -4001,7 +4005,7 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -4061,7 +4065,7 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [], // empty — index 7 must surface OOR
         registers_i: &mut [],
@@ -4132,7 +4136,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -4329,7 +4333,7 @@ fn drive_int_between(
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -4472,7 +4476,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -4567,7 +4571,7 @@ fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -4640,7 +4644,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -4738,7 +4742,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -4816,7 +4820,7 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -4877,7 +4881,7 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -4940,7 +4944,7 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -5011,7 +5015,7 @@ fn unsupported_opname_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -5073,7 +5077,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5163,7 +5167,7 @@ fn abort_result_r_is_pure_pc_advance() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -5235,7 +5239,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5325,7 +5329,7 @@ fn ref_guard_value_on_const_records_nothing() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5426,7 +5430,7 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5601,7 +5605,7 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5693,7 +5697,7 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5756,7 +5760,7 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5834,7 +5838,7 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -5936,7 +5940,7 @@ fn may_force_with_active_vable_executes_and_clears_token() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6042,7 +6046,7 @@ fn may_force_vable_escape_surfaces_typed_abort() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6123,7 +6127,7 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6192,7 +6196,7 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6255,7 +6259,7 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6330,7 +6334,7 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6407,7 +6411,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6504,7 +6508,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6590,7 +6594,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6675,7 +6679,7 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -6740,7 +6744,7 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -6843,7 +6847,7 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -6945,7 +6949,7 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -7055,7 +7059,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -7197,7 +7201,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -7275,7 +7279,7 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -7339,7 +7343,7 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -7427,7 +7431,7 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -7560,7 +7564,7 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -7669,7 +7673,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -7777,7 +7781,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -7864,7 +7868,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -7954,7 +7958,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8042,7 +8046,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8135,7 +8139,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8226,7 +8230,7 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8306,7 +8310,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8407,7 +8411,7 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8486,7 +8490,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -8553,7 +8557,7 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -8632,7 +8636,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8731,7 +8735,7 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8820,7 +8824,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8887,7 +8891,7 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -8980,7 +8984,7 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut [],
@@ -9056,7 +9060,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -9143,7 +9147,7 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -9218,7 +9222,7 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -9301,10 +9305,10 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
     let expected_arg = tc.const_ref(0xCAFE_F00D);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
-    sym.registers_r = vec![OpRef::NONE; 8];
-    sym.registers_r[2] = expected_arg;
+    *sym.registers_r_mut() = vec![OpRef::NONE; 8];
+    sym.registers_r_mut()[2] = expected_arg;
 
-    let mut miframe = MIFrame {
+    let miframe = MIFrame {
         ctx: &mut tc,
         sym: &mut sym,
         fallthrough_pc: 0,
@@ -9333,7 +9337,10 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
     fbw_finish_payload_reset();
     let session = std::cell::RefCell::new(WalkSession::default());
     let (outcome, end_pc) = dispatch_via_miframe(
-        &mut miframe,
+        unsafe { &mut *miframe.ctx },
+        unsafe { &mut *miframe.sym },
+        miframe.concrete_frame_addr,
+        miframe.orgpc,
         &session,
         &code,
         0,
@@ -9382,12 +9389,12 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
     let exc_oprep = tc.const_ref(0xDEAD_BEEF);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
-    sym.registers_r = vec![OpRef::NONE; 8];
-    sym.registers_r[3] = exc_oprep;
+    *sym.registers_r_mut() = vec![OpRef::NONE; 8];
+    sym.registers_r_mut()[3] = exc_oprep;
     // Pre-condition: sym.last_exc_box is unset.
-    assert!(sym.last_exc_box.is_none());
+    assert!(sym.last_exc_box().is_none());
 
-    let mut miframe = MIFrame {
+    let miframe = MIFrame {
         ctx: &mut tc,
         sym: &mut sym,
         fallthrough_pc: 0,
@@ -9414,7 +9421,10 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     let argboxes_r = [OpRef::NONE, OpRef::NONE, OpRef::NONE, exc_oprep];
     let session = std::cell::RefCell::new(WalkSession::default());
     let (outcome, _) = dispatch_via_miframe(
-        &mut miframe,
+        unsafe { &mut *miframe.ctx },
+        unsafe { &mut *miframe.sym },
+        miframe.concrete_frame_addr,
+        miframe.orgpc,
         &session,
         &code,
         0,
@@ -9444,7 +9454,8 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     // Post-condition: sym.last_exc_box was mirrored from the
     // walker's last_exc_value (set by raise/r before terminate).
     assert_eq!(
-        sym.last_exc_box, exc_oprep,
+        sym.last_exc_box(),
+        exc_oprep,
         "sym.last_exc_box must mirror the exc OpRef the walker captured \
              via WalkContext::last_exc_value",
     );
@@ -9452,7 +9463,7 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     // sym.class_of_last_exc_is_const to mirror RPython's
     // `pyjitpl.py:1694 opimpl_raise: class_of_last_exc_is_const = True`.
     assert!(
-        sym.class_of_last_exc_is_const,
+        sym.class_of_last_exc_is_const(),
         "sym.class_of_last_exc_is_const must be true after a raise/r",
     );
 }
@@ -9469,14 +9480,14 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
     let value = tc.const_ref(0xC0FFEE);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
-    sym.registers_r = vec![OpRef::NONE; 8];
-    sym.registers_r[2] = value;
+    *sym.registers_r_mut() = vec![OpRef::NONE; 8];
+    sym.registers_r_mut()[2] = value;
     // Pre-condition: simulate prior raise — class_of_last_exc_is_const
     // is true and last_exc_box is set.
-    sym.class_of_last_exc_is_const = true;
-    sym.last_exc_box = value;
+    sym.set_class_of_last_exc_is_const(true);
+    sym.set_last_exc_box(value);
 
-    let mut miframe = MIFrame {
+    let miframe = MIFrame {
         ctx: &mut tc,
         sym: &mut sym,
         fallthrough_pc: 0,
@@ -9500,7 +9511,10 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
     let argboxes_r = [OpRef::NONE, OpRef::NONE, value];
     let session = std::cell::RefCell::new(WalkSession::default());
     let _ = dispatch_via_miframe(
-        &mut miframe,
+        unsafe { &mut *miframe.ctx },
+        unsafe { &mut *miframe.sym },
+        miframe.concrete_frame_addr,
+        miframe.orgpc,
         &session,
         &code,
         0,
@@ -9529,7 +9543,7 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
     // Walker preserved the carried-in class flag because no raise
     // happened during the walk.
     assert!(
-        sym.class_of_last_exc_is_const,
+        sym.class_of_last_exc_is_const(),
         "no-raise walk must not clear class_of_last_exc_is_const",
     );
 }
@@ -9544,7 +9558,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut [],
@@ -9629,7 +9643,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
@@ -9723,7 +9737,7 @@ fn loop_header_stamps_seen_flag() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut [],
         registers_i: &mut regs_i,
@@ -9793,7 +9807,7 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,

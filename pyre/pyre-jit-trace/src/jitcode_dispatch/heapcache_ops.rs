@@ -26,10 +26,10 @@ use super::*;
 /// result bank (`'i'`/`'r'`/`'f'`) the walker writes back into.  The
 /// index operand is always int-classified, so it is decoded from the
 /// `i` register bank.
-pub(crate) fn getarrayitem_gc_via_heapcache(
+pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
@@ -154,10 +154,10 @@ pub(crate) fn getarrayitem_gc_via_heapcache(
 ///
 /// `value_bank` selects the newvalue register source: `'i'` /
 /// `'r'` / `'f'`.
-pub(crate) fn setarrayitem_gc_via_heapcache(
+pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let array = read_ref_reg(code, op, 0, ctx)?;
@@ -203,8 +203,8 @@ pub(crate) fn setarrayitem_gc_via_heapcache(
 /// `GetfieldGcR` load of a live container's items block, not a fresh
 /// allocation — is left untouched because `is_unescaped(array)` is false, so
 /// the runtime trace's own SETARRAYITEM is never duplicated eagerly here.
-pub(crate) fn walker_fill_materialized_array(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     array: OpRef,
     index: OpRef,
     value: OpRef,
@@ -293,10 +293,10 @@ pub(crate) fn walker_fill_materialized_array(
 ///
 /// `value_bank` selects the valuebox source: `'i'` reads
 /// `registers_i[v]`, `'r'` reads `registers_r[v]`.
-pub(crate) fn setfield_gc_via_heapcache(
+pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Operand layout `<r><v>d`: 1B r-reg(box) + 1B v(value) + 2B descr-index.
@@ -371,10 +371,10 @@ pub(crate) fn setfield_gc_via_heapcache(
 ///
 /// `dst_bank` selects the result bank: `'i'` writes `registers_i[dst]`,
 /// `'r'` writes `registers_r[dst]`.
-pub(crate) fn getfield_gc_via_heapcache(
+pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {

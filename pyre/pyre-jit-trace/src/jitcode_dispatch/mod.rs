@@ -177,7 +177,7 @@
 //!    concrete frame snapshot, the same source used for items 2 and 5.
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
-use crate::state::{ConcreteValue, MIFrame};
+use crate::state::{ConcreteValue, MIFrame, WalkSym};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceCtx, default_effect_info};
 
@@ -503,13 +503,12 @@ pub struct InlineCalleeConsts {
 
 /// Walk-scoped FBW modes inherited parent-to-child across sub-walk
 /// constructions. Formerly three thread-locals.
-#[derive(Clone, Copy)]
-pub struct FbwWalkMode {
+pub struct FbwWalkMode<Sym: WalkSym> {
     /// Full-body snapshot root used to map a guard's jitcode `op_pc` through
     /// the outer jitcode and read the live walk banks. Null for per-opcode
     /// walks, where `walker_capture_snapshot_for_last_guard` keeps its legacy
     /// single-coordinate behavior.
-    pub snapshot_sym: *const crate::state::PyreSym,
+    pub snapshot_sym: *const Sym,
     /// Guards emitted in an inline sub-walk resume at the caller's CALL
     /// boundary rather than mapping the callee `op_pc` through the outer
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
@@ -532,6 +531,14 @@ pub struct FbwWalkMode {
     pub class_of_last_exc_is_const: bool,
 }
 
+impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Sym: WalkSym> Copy for FbwWalkMode<Sym> {}
+
 /// The outer snapshot's Python-PC coordinate. Non-root producers preserve the
 /// raw JitCode offset that produced the Python word, postponing the exact
 /// `backxlat_py_pc` inversion until a consumer needs it. Root entries and test
@@ -551,7 +558,7 @@ impl EntryPyPc {
     }
 }
 
-impl Default for FbwWalkMode {
+impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
     fn default() -> Self {
         Self {
             snapshot_sym: std::ptr::null(),
@@ -572,7 +579,7 @@ impl Default for FbwWalkMode {
 /// * `'static_a` — the outer lifetime: descr pool + sub-jitcode
 ///   lookup. These flow unchanged from caller into callee, so they
 ///   keep their original (longer) lifetime.
-pub struct WalkContext<'frame, 'static_a: 'frame> {
+pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// Present only for an inlined-callee sub-walk. Top-level and other walks
     /// have no callee shadow, preserving the former empty-stack no-op behavior.
     pub callee_shadow: Option<CalleeLocalsShadow>,
@@ -584,7 +591,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// inlined-callee sub-walk.
     pub inline_callee_consts: Option<InlineCalleeConsts>,
     /// FBW walk modes inherited by nested sub-walk contexts.
-    pub fbw_mode: FbwWalkMode,
+    pub fbw_mode: FbwWalkMode<Sym>,
     /// Caller-owned state shared by every frame in this walk attempt.
     pub session: &'static_a std::cell::RefCell<WalkSession>,
     /// Symbolic Ref-bank register file. Indexing matches RPython
@@ -923,7 +930,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     pub live_after_jit_pc: usize,
 }
 
-impl WalkContext<'_, '_> {
+impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
     /// Resolve the outer snapshot coordinate at the exact consumer boundary.
     fn entry_py_pc(&self) -> u32 {
         match self.entry_py_pc {
@@ -1689,10 +1696,10 @@ pub(crate) fn census_dump() {
 /// The returned `next_pc` is normally `op.next_pc` (linear advance
 /// past the operand bytes); branch handlers (`goto/L` etc.) override
 /// this with their target.
-pub fn step(
+pub fn step<Sym: WalkSym>(
     code: &[u8],
     pc: usize,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     // #73: maintain the `-live-` BEFORE anchor.  Every
@@ -1747,10 +1754,10 @@ pub fn step(
 /// before returning. Sub-walk frames keep returning `SubRaise` to
 /// their callers (the unwind continues until either a handler
 /// matches or the outermost walker handles it).
-pub fn walk(
+pub fn walk<Sym: WalkSym>(
     code: &[u8],
     start_pc: usize,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let mut pc = start_pc;
     loop {
@@ -1833,11 +1840,11 @@ pub fn walk(
 /// Read a Ref-bank register operand byte at `pc + offset` and resolve
 /// to its symbolic [`OpRef`]. RPython
 /// `pyjitpl.py:registers_r[code[pc+1]]` for an `r`-coded operand.
-fn read_ref_reg(
+fn read_ref_reg<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
@@ -1855,11 +1862,11 @@ fn read_ref_reg(
 /// Read an Int-bank register operand byte at `pc + offset` and resolve
 /// to its symbolic [`OpRef`]. RPython
 /// `pyjitpl.py:registers_i[code[pc+1]]` for an `i`-coded operand.
-fn read_int_reg(
+fn read_int_reg<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
@@ -1877,11 +1884,11 @@ fn read_int_reg(
 /// Read a Float-bank register operand byte at `pc + offset` and resolve
 /// to its symbolic [`OpRef`]. RPython
 /// `pyjitpl.py:registers_f[code[pc+1]]` for an `f`-coded operand.
-fn read_float_reg(
+fn read_float_reg<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
@@ -2030,11 +2037,11 @@ fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
 /// the descr from [`WalkContext::descr_refs`]. RPython equivalent:
 /// `BlackholeInterpreter.descrs[code[pc] | (code[pc+1] << 8)]`
 /// (`blackhole.py:102-103` setup + per-`bhimpl_*` site).
-fn read_descr(
+fn read_descr<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<DescrRef, DispatchError> {
     let lo = code[op.pc + 1 + operand_offset] as usize;
     let hi = code[op.pc + 1 + operand_offset + 1] as usize;
@@ -2049,10 +2056,10 @@ fn read_descr(
         })
 }
 
-fn concrete_int_for_switch(
+fn concrete_int_for_switch<Sym: WalkSym>(
     op: &DecodedOp,
     value: OpRef,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<i64, DispatchError> {
     match ctx.trace_ctx.concrete_of_opref(value) {
         Some(Value::Int(v)) => Ok(v),
@@ -2085,11 +2092,11 @@ fn concrete_int_for_switch(
 ///
 /// RPython parity: `assembler.py:write_varlist` emits exactly this
 /// shape — `chr(len(args))` followed by one byte per arg register.
-fn read_ref_var_list(
+fn read_ref_var_list<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<(Vec<OpRef>, usize), DispatchError> {
     let len_pc = op.pc + 1 + operand_offset;
     let len = code[len_pc] as usize;
@@ -2119,11 +2126,11 @@ fn read_ref_var_list(
 /// `RegisterOutOfRange` via [`read_ref_reg`]; this helper assumes the
 /// OpRef read succeeded, so a missing concrete slot is "stack tail not
 /// yet seeded" not "register byte out of range".
-fn read_ref_reg_concrete(
+fn read_ref_reg_concrete<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> ConcreteValue {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
@@ -2150,8 +2157,8 @@ fn read_ref_reg_concrete(
 ///   ops: field reads, residual calls, …).  Downstream GUARD_CLASS
 ///   gates treat Null as "skip the guard", same as slots the snapshot
 ///   never populated.
-fn write_ref_reg(
-    ctx: &mut WalkContext<'_, '_>,
+fn write_ref_reg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     dst: usize,
     value: OpRef,
@@ -2212,8 +2219,8 @@ fn write_ref_reg(
 /// grounds the same scalar-vs-array split, and `pyjitpl.py:177-234
 /// get_list_of_active_boxes` sources liveness-indexed register boxes, not
 /// scalar virtualizable fields.
-fn write_vable_field_ref_reg(
-    ctx: &mut WalkContext<'_, '_>,
+fn write_vable_field_ref_reg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     dst: usize,
     value: OpRef,
@@ -2231,11 +2238,11 @@ fn write_vable_field_ref_reg(
 /// out-of-range reads — the only legal time the slice is shorter than
 /// `registers_i` is at test fixtures that pass `&mut []`, and those
 /// don't trigger `goto_if_not/iL` / `switch/id` paths.
-fn read_int_reg_concrete(
+fn read_int_reg_concrete<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> ConcreteValue {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
@@ -2258,8 +2265,8 @@ fn read_int_reg_concrete(
 /// * `ConcreteValue::Null` — the handler doesn't know (e.g. residual
 ///   `Call*I`, `getfield_gc_i` cache miss).  Downstream consumers
 ///   surface `GotoIfNotValueNotConcrete` for unknown branch inputs.
-fn write_int_reg(
-    ctx: &mut WalkContext<'_, '_>,
+fn write_int_reg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     dst: usize,
     value: OpRef,
@@ -2318,7 +2325,10 @@ fn write_int_reg(
 /// (`vable_setfield`) is likewise mapped to Null since it signals "no
 /// concrete known" rather than an actual pointer.
 #[inline]
-fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> ConcreteValue {
+fn concrete_from_recorded_opref<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+) -> ConcreteValue {
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Int(v)) => ConcreteValue::Int(v),
         Some(Value::Float(v)) => ConcreteValue::Float(v),
@@ -2334,11 +2344,11 @@ fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> Conc
 /// same byte indices but resolves through `ctx.concrete_registers_r`.
 /// Used by `inline_call_*` to propagate per-arg concrete shadow into
 /// the callee's fresh shadow Vec.
-fn read_ref_var_list_concrete(
+fn read_ref_var_list_concrete<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Vec<ConcreteValue> {
     let len_pc = op.pc + 1 + operand_offset;
     let len = code[len_pc] as usize;
@@ -2359,11 +2369,11 @@ fn read_ref_var_list_concrete(
 /// to propagate each int arg's concrete shadow into the callee's fresh
 /// shadow Vec (`setup_call` int-bank parity), so a callee body can fold
 /// a `goto_if_not/iL` / `switch/id` over a concrete primitive-int arg.
-fn read_int_var_list_concrete(
+fn read_int_var_list_concrete<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Vec<ConcreteValue> {
     let len_pc = op.pc + 1 + operand_offset;
     let len = code[len_pc] as usize;
@@ -2383,11 +2393,11 @@ fn read_int_var_list_concrete(
 /// `assembler.py:write_varlist` emits a single shape regardless of
 /// kind; the kind letter (`I` / `R` / `F`) only steers which register
 /// file the bytes index into.
-fn read_int_var_list(
+fn read_int_var_list<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<(Vec<OpRef>, usize), DispatchError> {
     let len_pc = op.pc + 1 + operand_offset;
     let len = code[len_pc] as usize;
@@ -2411,11 +2421,11 @@ fn read_int_var_list(
 
 /// Read a Float-bank variadic operand list (`F` argcode). Mirror of
 /// [`read_int_var_list`] for the float bank.
-fn read_float_var_list(
+fn read_float_var_list<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<(Vec<OpRef>, usize), DispatchError> {
     let len_pc = op.pc + 1 + operand_offset;
     let len = code[len_pc] as usize;
@@ -2452,10 +2462,10 @@ fn read_float_var_list(
 /// framestack infrastructure, so attaching a snapshot here would
 /// approximate it (wrong layout, all-typed-registers vs liveness-
 /// filtered) and downstream layout matching consumes it as truth.
-fn dispatch_switch_id(
+fn dispatch_switch_id<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let valuebox = read_int_reg(code, op, 0, ctx)?;
     let descr = read_descr(code, op, 1, ctx)?;
@@ -2573,8 +2583,8 @@ fn dispatch_switch_id(
 /// `ResumeGuardExcDescr`/`ResumeGuardCopiedExcDescr` source guard carries
 /// exception state into bridge tracing. Operand-stack values are never scanned
 /// to infer a standing exception.
-fn seed_standing_exception_for_walk(sym: &mut crate::state::PyreSym, trace_ctx: &mut TraceCtx) {
-    if !sym.last_exc_box.is_none() {
+fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut TraceCtx) {
+    if !sym.last_exc_box().is_none() {
         return;
     }
     if trace_ctx.is_bridge_trace && !trace_ctx.bridge_source_is_exception_guard() {
@@ -2586,11 +2596,11 @@ fn seed_standing_exception_for_walk(sym: &mut crate::state::PyreSym, trace_ctx: 
         let exc = bh_exc as pyre_object::PyObjectRef;
         if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
             let exc_box = trace_ctx.const_ref(exc as i64);
-            sym.current_exc_value = exc;
-            sym.current_exc_box = exc_box;
-            sym.last_exc_value = exc;
-            sym.last_exc_box = exc_box;
-            sym.class_of_last_exc_is_const = true;
+            sym.set_current_exc_value(exc);
+            sym.set_current_exc_box(exc_box);
+            sym.set_last_exc_value(exc);
+            sym.set_last_exc_box(exc_box);
+            sym.set_class_of_last_exc_is_const(true);
             return;
         }
     }
@@ -2598,11 +2608,11 @@ fn seed_standing_exception_for_walk(sym: &mut crate::state::PyreSym, trace_ctx: 
     let current = pyre_interpreter::eval::get_current_exception();
     if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
         let exc_box = trace_ctx.const_ref(current as i64);
-        sym.current_exc_value = current;
-        sym.current_exc_box = exc_box;
-        sym.last_exc_value = current;
-        sym.last_exc_box = exc_box;
-        sym.class_of_last_exc_is_const = true;
+        sym.set_current_exc_value(current);
+        sym.set_current_exc_box(exc_box);
+        sym.set_last_exc_value(current);
+        sym.set_last_exc_box(exc_box);
+        sym.set_class_of_last_exc_is_const(true);
     }
 }
 
@@ -2617,15 +2627,15 @@ fn seed_standing_exception_for_walk(sym: &mut crate::state::PyreSym, trace_ctx: 
 /// fallback: their code comes from their own `InlineCalleeConsts`, and the
 /// existing loop-callee handling below decides whether they may cross a merge
 /// point.
-fn top_level_live_code(ctx: &WalkContext<'_, '_>) -> Option<*const ()> {
+fn top_level_live_code<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<*const ()> {
     if !ctx.is_top_level || ctx.fbw_mode.snapshot_sym.is_null() {
         return None;
     }
     let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
-    if sym.jitcode.is_null() {
+    if sym.jitcode().is_null() {
         return None;
     }
-    let raw = unsafe { (&(*sym.jitcode).payload).code_ptr };
+    let raw = unsafe { (&(*sym.jitcode()).payload).code_ptr };
     if raw.is_null() {
         None
     } else {
@@ -2633,8 +2643,8 @@ fn top_level_live_code(ctx: &WalkContext<'_, '_>) -> Option<*const ()> {
     }
 }
 
-fn guard_current_frame_globals_identity(
-    ctx: &mut WalkContext<'_, '_>,
+fn guard_current_frame_globals_identity<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     expected_globals: pyre_object::PyObjectRef,
 ) -> Result<bool, DispatchError> {
@@ -2666,8 +2676,8 @@ fn guard_current_frame_globals_identity(
     Ok(true)
 }
 
-fn replace_movable_load_global_namespace_with_frame_globals(
-    ctx: &mut WalkContext<'_, '_>,
+fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     ei: &majit_ir::EffectInfo,
     allboxes: &mut [OpRef],
 ) {
@@ -2822,8 +2832,8 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 /// matching upstream's identity comparison on `descr` more closely than
 /// the operand-encoded descr-table slot.
 #[inline]
-fn loopinvariant_lookup(
-    ctx: &WalkContext<'_, '_>,
+fn loopinvariant_lookup<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
     ei: &majit_ir::EffectInfo,
     descr_key: u32,
     funcptr: OpRef,
@@ -2859,8 +2869,8 @@ fn loopinvariant_lookup(
 /// (concrete shadow tracking) or dropping the field from
 /// the cache shape entirely (separate cleanup).
 #[inline]
-fn loopinvariant_now_known(
-    ctx: &mut WalkContext<'_, '_>,
+fn loopinvariant_now_known<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     ei: &majit_ir::EffectInfo,
     descr_key: u32,
     funcptr: OpRef,
@@ -2890,7 +2900,10 @@ fn loopinvariant_now_known(
 /// (`pyjitpl.py:2174-2186`), so `None` means "skip the loop-invariant
 /// cache" rather than inventing an alias-prone sentinel key.
 #[inline]
-fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64> {
+fn funcptr_concrete_int<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+) -> Option<i64> {
     if !funcptr.is_constant() {
         return None;
     }
@@ -3183,8 +3196,8 @@ impl OuterActiveBoxesEntryTwin {
     }
 }
 
-fn collect_outer_active_boxes(
-    sym: &crate::state::PyreSym,
+fn collect_outer_active_boxes<Sym: WalkSym>(
+    sym: &Sym,
     trace_ctx: &mut TraceCtx,
     regs_i: &[OpRef],
     regs_r: &[OpRef],
@@ -3232,11 +3245,11 @@ fn collect_outer_active_boxes(
     // portal-owner frames, and route the two portal red regs through
     // `sym.frame` / `sym.execution_context` directly.
     let (nlocals, valid_stack_only, owns_vable, portal_frame_reg, portal_ec_reg) =
-        if sym.jitcode.is_null() {
+        if sym.jitcode().is_null() {
             (0usize, 0usize, false, u16::MAX, u16::MAX)
         } else {
             unsafe {
-                let jc = &*sym.jitcode;
+                let jc = &*sym.jitcode();
                 let payload = &jc.payload;
                 // Operand-stack depth at the snapshot coordinate. The liveness
                 // banks (`frame_liveness_reg_indices_by_bank_at`) are read at
@@ -3267,7 +3280,7 @@ fn collect_outer_active_boxes(
                     }
                 };
                 (
-                    sym.nlocals,
+                    sym.nlocals(),
                     stack_depth_at_pc,
                     sym.owns_virtualizable_shadow(),
                     payload.metadata.portal_frame_reg,
@@ -3286,11 +3299,11 @@ fn collect_outer_active_boxes(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode.is_null() {
+    let pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
         Vec::new()
     } else {
         unsafe {
-            let jc = &*sym.jitcode;
+            let jc = &*sym.jitcode();
             match (entry_twin, entry_jitcode_pc >= 0) {
                 (OuterActiveBoxesEntryTwin::Plain, true) => jc
                     .payload
@@ -3312,11 +3325,11 @@ fn collect_outer_active_boxes(
     let stack_livereg_gate = fbw_stack_livereg_enabled();
     let (guard_pcdep_entries, guard_stack_only) = if stack_livereg_gate {
         if let Some(gpc) = guard_py_pc {
-            if sym.jitcode.is_null() {
+            if sym.jitcode().is_null() {
                 (Vec::new(), 0usize)
             } else {
                 unsafe {
-                    let jc = &*sym.jitcode;
+                    let jc = &*sym.jitcode();
                     let cjc = carried_jitcode_pc;
                     let entries = if cjc >= 0 {
                         jc.payload
@@ -3361,8 +3374,8 @@ fn collect_outer_active_boxes(
     // register that the trait dispatcher never filled, the candidate fill
     // is one of these sym shadow OpRefs.  Including them in the diagnostic
     // lets fallback work jump straight to the right source.
-    let vable_vsd = sym.vable_valuestackdepth;
-    let vable_last_instr = sym.vable_last_instr;
+    let vable_vsd = sym.vable_valuestackdepth();
+    let vable_last_instr = sym.vable_last_instr();
     let dump_ctx = |bank: &'static str, reg_idx: u32| -> String {
         let int_hint = if bank == "int" {
             format!(
@@ -3478,11 +3491,11 @@ fn collect_outer_active_boxes(
                 .copied()
                 .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
             let red_field = if color as u16 == portal_frame_reg {
-                sym.frame
-            } else if !sym.execution_context.is_none() {
+                sym.frame()
+            } else if !sym.execution_context().is_none() {
                 // EC red already seeded on this snapshot path.
-                sym.execution_context
-            } else if !sym.frame.is_none() {
+                sym.execution_context()
+            } else if !sym.frame().is_none() {
                 // Adapter / inline-caller snapshot path leaves
                 // `sym.execution_context` unseeded (`OpRef::NONE`).  This is the
                 // pre-guard inline-parent-frame collection (the paused caller's
@@ -3506,14 +3519,14 @@ fn collect_outer_active_boxes(
                 // is not taken.
                 trace_ctx.record_op_with_descr(
                     OpCode::GetfieldGcR,
-                    &[sym.frame],
+                    &[sym.frame()],
                     crate::descr::pyframe_execution_context_descr(),
                 )
             } else {
                 // Neither EC nor frame is recoverable: keep the raw NONE so the
                 // downstream Ref-bank NONE guard surfaces the unrecoverable case
                 // instead of silently masking it.
-                sym.execution_context
+                sym.execution_context()
             };
             live_reg
                 .or_else(|| {
@@ -4520,7 +4533,7 @@ struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>);
 impl ActiveResumeFrame {
     /// The outermost portal/main frame (`fbw_mode.snapshot_sym`).  `None`
     /// outside a full-body walk (per-opcode / trait path).
-    fn outer(snapshot_sym: *const crate::state::PyreSym) -> Option<Self> {
+    fn outer<Sym: WalkSym>(snapshot_sym: *const Sym) -> Option<Self> {
         let full_body_sym = snapshot_sym;
         if full_body_sym.is_null() {
             return None;
@@ -4529,18 +4542,18 @@ impl ActiveResumeFrame {
         // only for the lifetime of the full-body `dispatch_via_miframe`, and
         // only the immutable `payload` Arc is cloned.
         let sym = unsafe { &*full_body_sym };
-        if sym.jitcode.is_null() {
+        if sym.jitcode().is_null() {
             return None;
         }
-        let jc = unsafe { &*sym.jitcode };
+        let jc = unsafe { &*sym.jitcode() };
         Some(ActiveResumeFrame(jc.payload.clone()))
     }
 
     /// The active frame at the current walk point: the innermost inlined
     /// callee when a sub-walk is in progress, else the portal frame.
-    fn current(
+    fn current<Sym: WalkSym>(
         session: &std::cell::RefCell<WalkSession>,
-        snapshot_sym: *const crate::state::PyreSym,
+        snapshot_sym: *const Sym,
     ) -> Option<Self> {
         let current_code = session.borrow().framestack.last().map(|frame| frame.w_code);
         match current_code {
@@ -4592,7 +4605,7 @@ impl ActiveResumeFrame {
 /// the residual call op stays in the trace and the optimizer's
 /// per-call guard-emission still catches exception divergence at
 /// replay, just without the class pin.
-fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
+fn walker_record_guard_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, pc: usize) {
     let exc_obj = match ctx.last_exc_value_concrete {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
@@ -4632,13 +4645,13 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     ctx.fbw_mode.class_of_last_exc_is_const = true;
 }
 
-fn clear_walk_exception(ctx: &mut WalkContext<'_, '_>) {
+fn clear_walk_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
     ctx.last_exc_value = None;
     ctx.last_exc_value_concrete = ConcreteValue::Null;
 }
 
-fn direct_call_release_gil(
-    ctx: &mut WalkContext<'_, '_>,
+fn direct_call_release_gil<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     ei: &majit_ir::EffectInfo,
     allboxes: &[OpRef],
     descr: DescrRef,
@@ -4943,8 +4956,8 @@ type ExceptionInlineReceiverGuard = (
 /// or `None` when an arg is non-concrete (vable sentinel / unstamped) or
 /// the helper raises — both gates then defer to the generic record so the
 /// Python-level `__op__` semantics are preserved.
-fn walker_execute_may_force_boxed(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_execute_may_force_boxed<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<i64> {
@@ -4985,8 +4998,8 @@ fn walker_execute_may_force_boxed(
 
 /// Resolve the concrete `PyObjectRef` carried by a Ref-bank operand's
 /// recorded concrete, or `None` when it is the vable sentinel / null.
-fn walker_concrete_ref_object(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_concrete_ref_object<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
     match ctx.trace_ctx.concrete_of_opref(opref) {
@@ -5008,16 +5021,18 @@ fn walker_concrete_ref_object(
 /// `None` outside a production full-body walk (no materialized portal sym)
 /// or when the portal frame OpRef is unset — the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info lowering then declines to the residual (SAFE).
-fn walker_ensure_execution_context(ctx: &mut WalkContext<'_, '_>) -> Option<OpRef> {
+fn walker_ensure_execution_context<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Option<OpRef> {
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
         return None;
     }
     let sym = unsafe { &*sym_ptr };
-    if !sym.execution_context.is_none() {
-        return Some(sym.execution_context);
+    if !sym.execution_context().is_none() {
+        return Some(sym.execution_context());
     }
-    let frame = sym.frame;
+    let frame = sym.frame();
     if frame.is_none() {
         return None;
     }
@@ -5051,23 +5066,23 @@ fn walker_ensure_execution_context(ctx: &mut WalkContext<'_, '_>) -> Option<OpRe
 /// before any opcode is dispatched and thus before any guard — mirroring the
 /// trait's cache-once semantics.  When the EC is already seeded, or the frame
 /// itself is unset, this is a no-op.
-pub(crate) fn seed_execution_context_for_walk(
-    sym: &mut crate::state::PyreSym,
+pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
+    sym: &mut Sym,
     trace_ctx: &mut TraceCtx,
 ) {
-    if !sym.execution_context.is_none() || sym.frame.is_none() {
+    if !sym.execution_context().is_none() || sym.frame().is_none() {
         return;
     }
     let ec = trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
-        &[sym.frame],
+        &[sym.frame()],
         crate::descr::pyframe_execution_context_descr(),
     );
-    sym.execution_context = ec;
+    sym.set_execution_context(ec);
 }
 
-fn walker_int_specialization_operands(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_int_specialization_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     r_args: &[OpRef],
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -5128,8 +5143,8 @@ fn walker_int_specialization_operands(
 /// specialization (int `__op__`, not float).  Returns the per-operand
 /// `is_int` flag + coerced `f64` value alongside the authentic boxed
 /// result.
-fn walker_float_specialization_operands(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_float_specialization_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     r_args: &[OpRef],
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -5191,8 +5206,8 @@ fn walker_float_specialization_operands(
 /// instead of via `MIFrame::generate_guard` — the full-body walk has
 /// decomposed `MIFrame` into the reborrowed sym slices held by
 /// `WalkContext`, so reconstructing an `MIFrame` here would alias them.
-fn walker_unbox_int(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_unbox_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     int_type_addr: i64,
@@ -5232,7 +5247,10 @@ fn walker_unbox_int(
 /// source `reseed_vstack_from_shadow` uses for `nlocals`); `false` when the
 /// pointer is null (no materialized portal — the trait leg / tests), which
 /// keeps the guard (correct-but-conservative).
-fn walker_inputarg_is_converted_local(ctx: &WalkContext<'_, '_>, obj: OpRef) -> bool {
+fn walker_inputarg_is_converted_local<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+) -> bool {
     if !obj.is_input_arg() {
         return false;
     }
@@ -5242,7 +5260,7 @@ fn walker_inputarg_is_converted_local(ctx: &WalkContext<'_, '_>, obj: OpRef) -> 
     }
     // SAFETY: pointer live for the full-body walk; read-only nlocals /
     // vable_array_base.
-    let (nlocals, base) = unsafe { ((*sym_ptr).nlocals, (*sym_ptr).vable_array_base) };
+    let (nlocals, base) = unsafe { ((*sym_ptr).nlocals(), (*sym_ptr).vable_array_base()) };
     let Some(base) = base else {
         return false;
     };
@@ -5253,8 +5271,8 @@ fn walker_inputarg_is_converted_local(ctx: &WalkContext<'_, '_>, obj: OpRef) -> 
 /// [`walker_unbox_int`] with an explicit `intval` descr so a `bool` operand
 /// can guard its own `&BOOL_TYPE` and read through `bool_intval_descr`
 /// (`bool` shares `W_IntObject`'s `intval` field).
-fn walker_unbox_int_typed(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_unbox_int_typed<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     type_addr: i64,
@@ -5327,8 +5345,8 @@ fn walker_unbox_int_typed(
 /// snapshot) when the operand's class is not yet known, then the ctx-only
 /// `trace_unbox_float` getfield (its own `is_class_known` check is then a
 /// no-op because `class_now_known` was just set).
-fn walker_unbox_float(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_unbox_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     float_type_addr: i64,
@@ -5356,8 +5374,8 @@ fn walker_unbox_float(
 /// (`space.float_w` dispatches int through int2float).  Stamps the result
 /// with the already-known concrete `val` so downstream `box_value` sees it.
 /// Shared by the float-binary and float-compare specializations.
-fn walker_coerce_operand_to_float(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_coerce_operand_to_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
@@ -5381,8 +5399,8 @@ fn walker_coerce_operand_to_float(
 /// Emit a walker-native guard (`record_guard` + the walker snapshot for
 /// the just-recorded guard).  Mirrors `MIFrame::generate_guard` for the
 /// full-body walk.
-fn walker_emit_guard_with_snapshot(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     opcode: OpCode,
     args: &[OpRef],
@@ -5402,8 +5420,8 @@ fn walker_emit_guard_with_snapshot(
 /// `walker_capture_snapshot_for_last_guard_impl` re-derives `py_pc` from
 /// `op_pc` and computes a fresh active-box set per guard, matching the
 /// decoder's liveness query.
-fn walker_emit_fold_guard_with_snapshot(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     opcode: OpCode,
     args: &[OpRef],
@@ -5412,8 +5430,8 @@ fn walker_emit_fold_guard_with_snapshot(
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
 
-fn walker_flush_guard_not_invalidated(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_flush_guard_not_invalidated<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.trace_ctx.pending_guard_not_invalidated_pc().is_some() {
@@ -5425,8 +5443,8 @@ fn walker_flush_guard_not_invalidated(
 
 /// Record `int_eq(raw, const k)` and stamp its already-known concrete
 /// truth.  Used to build the div/mod precondition guards walker-native.
-fn walker_int_eq_const(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_int_eq_const<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     raw: OpRef,
     k: i64,
     concrete_truth: i64,
@@ -5444,8 +5462,8 @@ fn walker_int_eq_const(
 /// must bail to the generic (bignum-capable) leg rather than shift by `count &
 /// 63`. `uint_lt` folds the negative case in (a negative count reads as a huge
 /// unsigned value `>= k`).
-fn walker_uint_lt_const(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_uint_lt_const<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     raw: OpRef,
     k: i64,
     concrete_truth: i64,
@@ -5461,8 +5479,8 @@ fn walker_uint_lt_const(
 /// truth.  Used to build the float-div zero-divisor precondition guard
 /// walker-native (the JIT representation of `floatobject.py:519 _floatdiv`'s
 /// `if y == 0.0: raise ZeroDivisionError`).
-fn walker_float_eq_const(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_float_eq_const<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     raw: OpRef,
     k: f64,
     concrete_truth: i64,
@@ -5489,8 +5507,8 @@ fn very_large_float() -> f64 {
 /// Record a float comparison with its already-known concrete truth, then
 /// pin the observed direction with `GuardTrue`/`GuardFalse` (walker
 /// snapshot at `op_pc`).
-fn walker_float_cmp_guard(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_float_cmp_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     opcode: OpCode,
     args: &[OpRef],
@@ -5532,8 +5550,8 @@ fn walker_float_cmp_guard(
 /// trailing isfinite guard — `bx` is already pinned finite, so the check
 /// reduces to `isinf(z)`, emitted as `ll_math_isfinite`'s jitted form
 /// `(z - z) == 0.0` (ll_math.py:106-110).
-fn walker_emit_float_pow_inline(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_emit_float_pow_inline<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     x: OpRef,
     y: OpRef,
@@ -5621,8 +5639,8 @@ fn walker_emit_float_pow_inline(
 /// fits check, and a runtime value that does not fit deopts instead of
 /// producing a wrong box. Otherwise (or flag off) fall back to the heap
 /// `wrapint` box. The caller stamps the Ref concrete.
-fn walker_box_int(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_box_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     raw: OpRef,
     value: i64,
@@ -5651,8 +5669,8 @@ fn box_int_concrete(value: i64, runtime_ptr: i64) -> majit_ir::Value {
 /// snapshot) when `obj`'s class is not yet known, then record it as known.
 /// The guard-only counterpart of [`walker_unbox_int_typed`] for operands
 /// that are passed to a residual call by reference rather than unboxed.
-fn walker_guard_class(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_guard_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     type_addr: i64,
@@ -5689,8 +5707,8 @@ fn walker_guard_class(
 /// `INSTANCE_TYPE` proves the receiver has `W_ObjectObject` fields; the
 /// promoted map identity pins its class and storage coordinates
 /// (mapdict.py:905-906).
-fn walker_guard_mapdict_instance_shape(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     w_type: pyre_object::PyObjectRef,
@@ -5763,8 +5781,8 @@ fn walker_guard_mapdict_instance_shape(
 /// Exception `w_dict` lookup follows these arms in `baseobjspace.rs`, so it is
 /// intentionally not part of the guard set.  This is the same promoted-class
 /// lookup shape used by the mapdict folds (`mapdict.py`).
-fn walker_guard_exception_attr_slot(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_guard_exception_attr_slot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
@@ -5822,8 +5840,8 @@ fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<Stri
     }
 }
 
-fn walker_record_getfield_gc_i_uncached(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_record_getfield_gc_i_uncached<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     obj: OpRef,
     descr: DescrRef,
 ) -> OpRef {
@@ -5835,8 +5853,8 @@ fn walker_record_getfield_gc_i_uncached(
     ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr)
 }
 
-fn walker_record_getfield_gc_r_uncached(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     obj: OpRef,
     descr: DescrRef,
 ) -> OpRef {
@@ -5852,10 +5870,10 @@ fn walker_record_getfield_gc_r_uncached(
 /// paired `load_method_self(obj, attr, code, name_idx)` residual emitted for
 /// `LOAD_METHOD`.  Plain `LOAD_ATTR` of a function descriptor must keep the
 /// normal bound-method semantics and cannot be rewritten to the raw function.
-fn next_op_is_load_method_self_for_attr(
+fn next_op_is_load_method_self_for_attr<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
     attr_dst_reg: usize,
 ) -> bool {
     let Some(mut next) = crate::jitcode_runtime::decode_op_at(code, op.next_pc) else {
@@ -5923,8 +5941,8 @@ enum WalkerStoreAttrSpecialization {
 /// silently rewrapped as a plain int.  Skipped for an unescaped element (a
 /// fresh `wrapint` box is provably plain, and reading its `w_class` would
 /// force the box OptVirtualize removes).
-fn walker_guard_exact_w_class(
-    ctx: &mut WalkContext<'_, '_>,
+fn walker_guard_exact_w_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
     expected_typeobj: pyre_object::PyObjectRef,
@@ -5986,7 +6004,11 @@ fn empty_append_virt_enabled() -> bool {
 /// register reuse, kept-on-stack short-circuit, missing branch) returns
 /// `false` → the caller emits the real box (current behaviour).  FBW-only
 /// (returns `false` when `fbw_mode.snapshot_sym` is null).
-fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_reg: u8) -> bool {
+fn compare_box_provably_dead<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    compare_pc: usize,
+    dst_reg: u8,
+) -> bool {
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return false;
@@ -5995,10 +6017,10 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // pointer live for the full-body walk, immutable layout fields only.
     let (code, jitcode_index, payload): (&[u8], i32, &crate::PyJitCode) = unsafe {
         let sym = &*full_body_sym;
-        if sym.jitcode.is_null() {
+        if sym.jitcode().is_null() {
             return false;
         }
-        let jc = &*sym.jitcode;
+        let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             return false;
         }
@@ -6142,17 +6164,20 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// have a distinct callee JitCode but deliberately share the root snapshot;
 /// decline their range fold rather than associating a callee guard with the
 /// caller's key.
-fn walker_foriter_green_key(ctx: &WalkContext<'_, '_>, op_pc: usize) -> Option<u64> {
+fn walker_foriter_green_key<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Option<u64> {
     if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.snapshot_sym.is_null() {
         return None;
     }
     // SAFETY: snapshot-root mode keeps the outer `PyreSym` live throughout
     // the full-body walk.  This reads immutable code metadata only.
     let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
-    if sym.jitcode.is_null() {
+    if sym.jitcode().is_null() {
         return None;
     }
-    let jitcode = unsafe { &*sym.jitcode };
+    let jitcode = unsafe { &*sym.jitcode() };
     let raw_code = unsafe { jitcode.raw_code() };
     let w_code = pyre_interpreter::live_code_wrapper(raw_code as *const ()) as *const ();
     if w_code.is_null() {
@@ -6225,8 +6250,8 @@ fn mark_trace_reads_module_global_from_frame_name(
 /// + elidable `jit_namespace_cell_lookup`, reading an `ObjectMutableCell`'s
 /// `w_value` live.  Returns `false` (fall through to the residual) for a
 /// missing / `IntMutableCell` / still-movable slot.
-fn emit_module_dict_cell_fold(
-    ctx: &mut WalkContext<'_, '_>,
+fn emit_module_dict_cell_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     dst: usize,
     dst_bank: char,
@@ -6276,8 +6301,8 @@ fn emit_module_dict_cell_fold(
 /// `ObjectMutableCell` reads `cell.w_value` (`getfield_gc_r`); an
 /// `IntMutableCell` reads `cell.intvalue` (`getfield_gc_i`) and re-boxes it
 /// (the box is elided by the optimizer when the sole consumer unboxes).
-fn emit_namespace_cell_fold(
-    ctx: &mut WalkContext<'_, '_>,
+fn emit_namespace_cell_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     dst: usize,
     dst_bank: char,
@@ -6375,8 +6400,8 @@ fn emit_namespace_cell_fold(
 /// `QUASIIMMUT_FIELD` guard) still protects cell IDENTITY: reassigning the
 /// global to a non-int replaces the cell + bumps the strategy version,
 /// invalidating this loop.
-fn emit_namespace_cell_store_fold(
-    ctx: &mut WalkContext<'_, '_>,
+fn emit_namespace_cell_store_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     ns: pyre_object::PyObjectRef,
     slot: usize,
@@ -6463,10 +6488,10 @@ fn append_virtualizable_boxes(ctx: &TraceCtx, mut reds: Vec<OpRef>) -> Vec<OpRef
 /// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
 /// branching handlers (`goto/L`) override the linear `op.next_pc`
 /// advance; non-branching handlers return `op.next_pc` unchanged.
-fn handle(
+fn handle<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // The `int_*` / `float_*` / `ptr_*` families whose arm is a uniform
     // `HELPER(code, op, ctx, OpCode::VARIANT)` call are dispatched from the
@@ -8083,10 +8108,10 @@ fn handle(
                 } else {
                     unsafe {
                         let sym = &*sym_ptr;
-                        if sym.jitcode.is_null() {
+                        if sym.jitcode().is_null() {
                             None
                         } else {
-                            let jc = &*sym.jitcode;
+                            let jc = &*sym.jitcode();
                             let raw = jc.payload.code_ptr;
                             if raw.is_null() {
                                 None
@@ -8288,9 +8313,9 @@ fn handle(
                 let sym_ptr = ctx.fbw_mode.snapshot_sym;
                 if !sym_ptr.is_null() && ri.is_empty() && rf.is_empty() && rr.len() == 2 {
                     let sym = unsafe { &*sym_ptr };
-                    live_args[0] = sym.frame;
-                    if !sym.execution_context.is_none() {
-                        live_args[1] = sym.execution_context;
+                    live_args[0] = sym.frame();
+                    if !sym.execution_context().is_none() {
+                        live_args[1] = sym.execution_context();
                     }
                 }
             }
@@ -8458,11 +8483,13 @@ fn handle(
                             None
                         } else {
                             let sym = unsafe { &*sym_ptr };
-                            if sym.jitcode.is_null() {
+                            if sym.jitcode().is_null() {
                                 None
                             } else {
                                 unsafe {
-                                    (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op.pc)
+                                    (&*sym.jitcode())
+                                        .payload
+                                        .resume_marker_for_jitcode_pc(op.pc)
                                 }
                             }
                         }

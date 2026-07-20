@@ -2174,6 +2174,273 @@ pub struct PyreSym {
     pub(crate) registers_f: Vec<OpRef>,
 }
 
+pub trait WalkSym {
+    fn frame(&self) -> OpRef;
+    fn execution_context(&self) -> OpRef;
+    fn set_execution_context(&mut self, value: OpRef);
+    fn registers_i(&self) -> &[OpRef];
+    fn registers_i_mut(&mut self) -> &mut Vec<OpRef>;
+    fn registers_r(&self) -> &[OpRef];
+    fn registers_r_mut(&mut self) -> &mut Vec<OpRef>;
+    fn registers_f(&self) -> &[OpRef];
+    fn registers_f_mut(&mut self) -> &mut Vec<OpRef>;
+    fn nlocals(&self) -> usize;
+    fn valuestackdepth(&self) -> usize;
+    fn jitcode(&self) -> *const JitCode;
+    fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext;
+    fn live_vable_frame_addr(&self) -> usize;
+    fn set_live_vable_frame_addr(&mut self, value: usize);
+    fn bridge_walk_entry_pc(&self) -> Option<usize>;
+    fn bridge_registers_r(&self) -> Option<&Vec<OpRef>>;
+    fn bridge_registers_r_mut(&mut self) -> &mut Option<Vec<OpRef>>;
+    fn bridge_stack_oprefs(&self) -> Option<&Vec<OpRef>>;
+    fn bridge_stack_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>>;
+    fn bridge_local_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>>;
+    fn vable_array_base(&self) -> Option<u32>;
+    fn vable_last_instr(&self) -> OpRef;
+    fn vable_valuestackdepth(&self) -> OpRef;
+    fn last_exc_value(&self) -> pyre_object::PyObjectRef;
+    fn set_last_exc_value(&mut self, value: pyre_object::PyObjectRef);
+    fn last_exc_box(&self) -> OpRef;
+    fn set_last_exc_box(&mut self, value: OpRef);
+    fn class_of_last_exc_is_const(&self) -> bool;
+    fn set_class_of_last_exc_is_const(&mut self, value: bool);
+    fn current_exc_value(&self) -> pyre_object::PyObjectRef;
+    fn set_current_exc_value(&mut self, value: pyre_object::PyObjectRef);
+    fn current_exc_box(&self) -> OpRef;
+    fn set_current_exc_box(&mut self, value: OpRef);
+    fn trace_built_exc(&self) -> &indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>;
+    fn trace_built_exc_mut(&mut self) -> &mut indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>;
+    fn owns_virtualizable_shadow(&self) -> bool;
+    /// The trace-time exception-carrier anchor to publish for GC rooting, or
+    /// `None` for syms holding no such carriers (novable drivers). Only
+    /// `PyreSym` carries `last_exc_value` / `current_exc_value` /
+    /// `trace_built_exc`, which a mid-trace collection reaches through
+    /// [`crate::trace::walk_active_sym_exc_roots`].
+    fn active_exc_anchor(&mut self) -> Option<*mut PyreSym> {
+        None
+    }
+    fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize);
+    fn close_loop_args_at(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_frame: usize,
+        orgpc: usize,
+        target_pc: Option<usize>,
+        header_marker_jit_pc: Option<usize>,
+    ) -> Vec<OpRef>;
+}
+
+impl WalkSym for PyreSym {
+    #[inline]
+    fn frame(&self) -> OpRef {
+        self.frame
+    }
+
+    #[inline]
+    fn execution_context(&self) -> OpRef {
+        self.execution_context
+    }
+
+    #[inline]
+    fn set_execution_context(&mut self, value: OpRef) {
+        self.execution_context = value;
+    }
+
+    #[inline]
+    fn registers_i(&self) -> &[OpRef] {
+        &self.registers_i
+    }
+
+    #[inline]
+    fn registers_i_mut(&mut self) -> &mut Vec<OpRef> {
+        &mut self.registers_i
+    }
+
+    #[inline]
+    fn registers_r(&self) -> &[OpRef] {
+        &self.registers_r
+    }
+
+    #[inline]
+    fn registers_r_mut(&mut self) -> &mut Vec<OpRef> {
+        &mut self.registers_r
+    }
+
+    #[inline]
+    fn registers_f(&self) -> &[OpRef] {
+        &self.registers_f
+    }
+
+    #[inline]
+    fn registers_f_mut(&mut self) -> &mut Vec<OpRef> {
+        &mut self.registers_f
+    }
+
+    #[inline]
+    fn nlocals(&self) -> usize {
+        self.nlocals
+    }
+
+    #[inline]
+    fn valuestackdepth(&self) -> usize {
+        self.valuestackdepth
+    }
+
+    #[inline]
+    fn jitcode(&self) -> *const JitCode {
+        self.jitcode
+    }
+
+    #[inline]
+    fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
+        self.concrete_execution_context
+    }
+
+    #[inline]
+    fn live_vable_frame_addr(&self) -> usize {
+        self.live_vable_frame_addr
+    }
+
+    #[inline]
+    fn set_live_vable_frame_addr(&mut self, value: usize) {
+        self.live_vable_frame_addr = value;
+    }
+
+    #[inline]
+    fn bridge_walk_entry_pc(&self) -> Option<usize> {
+        self.bridge_walk_entry_pc
+    }
+
+    #[inline]
+    fn bridge_registers_r(&self) -> Option<&Vec<OpRef>> {
+        self.bridge_registers_r.as_ref()
+    }
+
+    #[inline]
+    fn bridge_registers_r_mut(&mut self) -> &mut Option<Vec<OpRef>> {
+        &mut self.bridge_registers_r
+    }
+
+    #[inline]
+    fn bridge_stack_oprefs(&self) -> Option<&Vec<OpRef>> {
+        self.bridge_stack_oprefs.as_ref()
+    }
+
+    #[inline]
+    fn bridge_stack_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>> {
+        &mut self.bridge_stack_oprefs
+    }
+
+    #[inline]
+    fn bridge_local_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>> {
+        &mut self.bridge_local_oprefs
+    }
+
+    #[inline]
+    fn vable_array_base(&self) -> Option<u32> {
+        self.vable_array_base
+    }
+
+    #[inline]
+    fn vable_last_instr(&self) -> OpRef {
+        self.vable_last_instr
+    }
+
+    #[inline]
+    fn vable_valuestackdepth(&self) -> OpRef {
+        self.vable_valuestackdepth
+    }
+
+    #[inline]
+    fn last_exc_value(&self) -> pyre_object::PyObjectRef {
+        self.last_exc_value
+    }
+
+    #[inline]
+    fn set_last_exc_value(&mut self, value: pyre_object::PyObjectRef) {
+        self.last_exc_value = value;
+    }
+
+    #[inline]
+    fn last_exc_box(&self) -> OpRef {
+        self.last_exc_box
+    }
+
+    #[inline]
+    fn set_last_exc_box(&mut self, value: OpRef) {
+        self.last_exc_box = value;
+    }
+
+    #[inline]
+    fn class_of_last_exc_is_const(&self) -> bool {
+        self.class_of_last_exc_is_const
+    }
+
+    #[inline]
+    fn set_class_of_last_exc_is_const(&mut self, value: bool) {
+        self.class_of_last_exc_is_const = value;
+    }
+
+    #[inline]
+    fn current_exc_value(&self) -> pyre_object::PyObjectRef {
+        self.current_exc_value
+    }
+
+    #[inline]
+    fn set_current_exc_value(&mut self, value: pyre_object::PyObjectRef) {
+        self.current_exc_value = value;
+    }
+
+    #[inline]
+    fn current_exc_box(&self) -> OpRef {
+        self.current_exc_box
+    }
+
+    #[inline]
+    fn set_current_exc_box(&mut self, value: OpRef) {
+        self.current_exc_box = value;
+    }
+
+    #[inline]
+    fn trace_built_exc(&self) -> &indexmap::IndexMap<OpRef, pyre_object::PyObjectRef> {
+        &self.trace_built_exc
+    }
+
+    #[inline]
+    fn trace_built_exc_mut(&mut self) -> &mut indexmap::IndexMap<OpRef, pyre_object::PyObjectRef> {
+        &mut self.trace_built_exc
+    }
+
+    #[inline]
+    fn owns_virtualizable_shadow(&self) -> bool {
+        PyreSym::owns_virtualizable_shadow(self)
+    }
+
+    #[inline]
+    fn active_exc_anchor(&mut self) -> Option<*mut PyreSym> {
+        Some(self as *mut PyreSym)
+    }
+
+    #[inline]
+    fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
+        PyreSym::init_symbolic(self, ctx, concrete_frame);
+    }
+
+    #[inline]
+    fn close_loop_args_at(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_frame: usize,
+        orgpc: usize,
+        target_pc: Option<usize>,
+        header_marker_jit_pc: Option<usize>,
+    ) -> Vec<OpRef> {
+        let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
+        frame.close_loop_args_at(ctx, target_pc, header_marker_jit_pc)
+    }
+}
+
 #[doc(hidden)]
 pub struct TestSymState {
     pub frame: OpRef,

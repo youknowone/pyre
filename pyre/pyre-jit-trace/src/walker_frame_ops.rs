@@ -251,8 +251,8 @@ impl WalkerFrameOps for crate::state::MIFrame {
 // are direct register reads, not field loads), so the
 // `flush_guard_not_invalidated` step that `MIFrame::generate_guard`
 // performs is intentionally omitted here.
-impl<'frame, 'static_a: 'frame> WalkerFrameOps
-    for crate::jitcode_dispatch::WalkContext<'frame, 'static_a>
+impl<'frame, 'static_a: 'frame, Sym: crate::state::WalkSym> WalkerFrameOps
+    for crate::jitcode_dispatch::WalkContext<'frame, 'static_a, Sym>
 {
     fn ctx_mut(&mut self) -> &mut TraceCtx {
         self.trace_ctx

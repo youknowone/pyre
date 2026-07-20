@@ -342,8 +342,8 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
 /// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
 /// Same `fbw_mode.snapshot_sym` contract as
 /// [`branch_resume_target_stack_depth`].
-pub(crate) fn branch_arm_resume_ref_liveness(
-    fbw_mode: FbwWalkMode,
+pub(crate) fn branch_arm_resume_ref_liveness<Sym: WalkSym>(
+    fbw_mode: FbwWalkMode<Sym>,
     target: usize,
 ) -> Option<(std::collections::HashSet<u16>, u16)> {
     // Conservative under an inline sub-walk: `target` indexes the innermost
@@ -359,11 +359,11 @@ pub(crate) fn branch_arm_resume_ref_liveness(
         return None;
     }
     let sym = unsafe { &*full_body_sym };
-    if sym.jitcode.is_null() {
+    if sym.jitcode().is_null() {
         return None;
     }
     unsafe {
-        let jc = &*sym.jitcode;
+        let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             return None;
         }

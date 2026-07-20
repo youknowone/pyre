@@ -10,8 +10,11 @@
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_via_miframe(
-    miframe: &mut MIFrame,
+pub fn dispatch_via_miframe<Sym: WalkSym>(
+    trace_ctx: &mut TraceCtx,
+    sym: &mut Sym,
+    concrete_frame_addr: usize,
+    orgpc: usize,
     session: &std::cell::RefCell<WalkSession>,
     jitcode_code: &[u8],
     position: usize,
@@ -52,27 +55,8 @@ pub fn dispatch_via_miframe(
     argboxes_i: &[OpRef],
     argboxes_f: &[OpRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Extract raw pointers before any borrow. `miframe.ctx` and
-    // `miframe.sym` are `*mut`, distinct objects (the trace
-    // recorder vs. the symbolic frame state) — distinct pointers
-    // means dereferencing both simultaneously is sound.
-    let ctx_ptr = miframe.ctx;
-    let sym_ptr = miframe.sym;
-    let concrete_frame_addr = miframe.concrete_frame_addr;
-    let entry_py_pc = EntryPyPc::Py(miframe.orgpc as u32);
-    // SAFETY: both pointers were initialized at MIFrame
-    // construction time and outlive this call (TraceCtx and
-    // PyreSym are pinned by the surrounding tracing session).
-    // `&mut sym` is held only for the post-walk
-    // `last_exc_box`/`class_of_last_exc_is_const` writeback below;
-    // during the walk itself we re-borrow only specific sym fields
-    // (`registers_*`) into the `WalkContext` slices — the walker no
-    // longer takes a fresh `&mut PyreSym` inside any helper, so there
-    // is no Stacked-Borrows aliasing between WalkContext's slice
-    // borrows and a parallel sym reborrow (parity #2 — the prior
-    // `miframe_sym: Option<*mut PyreSym>` field has been removed).
-    let trace_ctx = unsafe { &mut *ctx_ptr };
-    let sym = unsafe { &mut *sym_ptr };
+    let sym_ptr = sym as *mut Sym;
+    let entry_py_pc = EntryPyPc::Py(orgpc as u32);
 
     // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,
     // so guard snapshots can resolve a per-guard resume coordinate from
@@ -101,10 +85,10 @@ pub fn dispatch_via_miframe(
     // mirrors this as `Option<OpRef>` — `None` means "no active
     // exception", matching RPython's `assert self.metainterp.last_exc_value`
     // (pyjitpl.py:1702).
-    let initial_last_exc_value = if sym.last_exc_box.is_none() {
+    let initial_last_exc_value = if sym.last_exc_box().is_none() {
         None
     } else {
-        Some(sym.last_exc_box)
+        Some(sym.last_exc_box())
     };
 
     // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: allocate
@@ -198,10 +182,10 @@ pub fn dispatch_via_miframe(
     // sym.last_exc_value (the live PyObjectRef written by trait-side
     // `seed_raised_exception` at `trace_opcode.rs:6646`).  Null when
     // no active exception, matching `initial_last_exc_value == None`.
-    let initial_last_exc_value_concrete = if sym.last_exc_value.is_null() {
+    let initial_last_exc_value_concrete = if sym.last_exc_value().is_null() {
         ConcreteValue::Null
     } else {
-        ConcreteValue::Ref(sym.last_exc_value)
+        ConcreteValue::Ref(sym.last_exc_value())
     };
 
     let result = {
@@ -210,14 +194,15 @@ pub fn dispatch_via_miframe(
             inline_callee_consts: None,
             fbw_mode: FbwWalkMode {
                 snapshot_sym: sym_ptr,
-                current_exception_seed: (trace_ctx.is_bridge_trace && !sym.last_exc_box.is_none())
-                    .then_some(sym.last_exc_box),
+                current_exception_seed: (trace_ctx.is_bridge_trace
+                    && !sym.last_exc_box().is_none())
+                .then_some(sym.last_exc_box()),
                 current_exception_seed_concrete: if trace_ctx.is_bridge_trace {
-                    sym.last_exc_value
+                    sym.last_exc_value()
                 } else {
                     pyre_object::PY_NULL
                 },
-                class_of_last_exc_is_const: sym.class_of_last_exc_is_const,
+                class_of_last_exc_is_const: sym.class_of_last_exc_is_const(),
                 ..Default::default()
             },
             session,
@@ -316,8 +301,8 @@ pub fn dispatch_via_miframe(
         //     TODO (the walker is symbolic-only,
         //     concrete state is fed by another path).
         if let Some(exc) = final_last_exc {
-            sym.last_exc_box = exc;
-            sym.class_of_last_exc_is_const = final_class_of_last_exc_is_const;
+            sym.set_last_exc_box(exc);
+            sym.set_class_of_last_exc_is_const(final_class_of_last_exc_is_const);
         }
         outcome
     };
@@ -332,15 +317,15 @@ pub fn dispatch_via_miframe(
 /// the root register banks come straight from the bridge-seeded `root_sym`
 /// rather than a live caller [`WalkContext`] (the root walk has not started —
 /// this resumes mid-flight).
-pub(crate) fn compute_bridge_root_parent_frame(
-    root_sym: &crate::state::PyreSym,
+pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
+    root_sym: &Sym,
     trace_ctx: &mut TraceCtx,
     root_pc: usize,
 ) -> Option<InlineParentFrame> {
-    if root_sym.jitcode.is_null() {
+    if root_sym.jitcode().is_null() {
         return None;
     }
-    let jitcode_index = unsafe { (*root_sym.jitcode).index as u32 };
+    let jitcode_index = unsafe { (*root_sym.jitcode()).index as u32 };
     // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
     // point — the slot the inner frame's result lands in — so its Python
     // coordinate is a direct backtranslation (no `semantic_fallthrough_pc`).
@@ -362,10 +347,10 @@ pub(crate) fn compute_bridge_root_parent_frame(
     // call.  Prefer the persisted color decode; fall back to `registers_r` for
     // non-bridge callers (`bridge_registers_r == None`).
     let mut regs_r = root_sym
-        .bridge_registers_r
-        .clone()
-        .unwrap_or_else(|| root_sym.registers_r.clone());
-    if let Some(result_color) = unsafe { &(*root_sym.jitcode).payload }
+        .bridge_registers_r()
+        .cloned()
+        .unwrap_or_else(|| root_sym.registers_r().to_vec());
+    if let Some(result_color) = unsafe { &(*root_sym.jitcode()).payload }
         .result_color_trivia_for_jitcode_pc(root_pc)
         .map(|c| c as usize)
         .filter(|&c| c != u16::MAX as usize)
@@ -384,9 +369,9 @@ pub(crate) fn compute_bridge_root_parent_frame(
     let boxes = collect_outer_active_boxes(
         root_sym,
         trace_ctx,
-        &root_sym.registers_i,
+        root_sym.registers_i(),
         &regs_r,
-        &root_sym.registers_f,
+        root_sym.registers_f(),
         jitcode_index,
         root_py_pc,
         None,
@@ -475,8 +460,8 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     // snapshot.
     let (pending, _argboxes_r) =
         crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())?;
-    let frame_box = pending.sym.frame;
-    let ec_box = pending.sym.execution_context;
+    let frame_box = pending.sym.frame();
+    let ec_box = pending.sym.execution_context();
 
     let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(recipe.jitcode_index);
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
@@ -563,10 +548,10 @@ pub(crate) fn recipe_parent_frame_from_recipe(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn drive_bridge_frame_subwalk(
+pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<WalkSession>,
-    root_sym: &crate::state::PyreSym,
+    root_sym: &Sym,
     root_pc: usize,
     callee_pjc: &std::sync::Arc<crate::PyJitCode>,
     callee_code_key: usize,
@@ -695,7 +680,7 @@ pub(crate) fn drive_bridge_frame_subwalk(
 
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
     // guards snapshot the paused root.
-    let root_sym_ptr = root_sym as *const crate::state::PyreSym;
+    let root_sym_ptr = root_sym as *const Sym;
 
     let mut parent_guards = Vec::new();
     let mut parent_for_current = root_frame.clone();
@@ -709,7 +694,7 @@ pub(crate) fn drive_bridge_frame_subwalk(
         parent_for_current = recipe_parent_frame_from_recipe(
             ctx,
             parent_recipe,
-            root_sym.concrete_execution_context,
+            root_sym.concrete_execution_context(),
         )?;
     }
 
@@ -721,10 +706,10 @@ pub(crate) fn drive_bridge_frame_subwalk(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
-                current_exception_seed: (!root_sym.last_exc_box.is_none())
-                    .then_some(root_sym.last_exc_box),
-                current_exception_seed_concrete: root_sym.last_exc_value,
-                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const,
+                current_exception_seed: (!root_sym.last_exc_box().is_none())
+                    .then_some(root_sym.last_exc_box()),
+                current_exception_seed_concrete: root_sym.last_exc_value(),
+                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
             },
             session,
             registers_r: &mut regs_r,
@@ -800,10 +785,10 @@ pub(crate) fn drive_bridge_frame_subwalk(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn drive_bridge_carrier_subwalk(
+pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<WalkSession>,
-    root_sym: &crate::state::PyreSym,
+    root_sym: &Sym,
     root_pc: usize,
     callee_pjc: &std::sync::Arc<crate::PyJitCode>,
     callee_code_key: usize,
@@ -830,10 +815,10 @@ pub(crate) fn drive_bridge_carrier_subwalk(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn drive_bridge_middle_frame(
+pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<WalkSession>,
-    root_sym: &crate::state::PyreSym,
+    root_sym: &Sym,
     root_pc: usize,
     middle_pjc: &std::sync::Arc<crate::PyJitCode>,
     middle_code_key: usize,
@@ -874,10 +859,10 @@ pub(crate) fn drive_bridge_middle_frame(
 /// off the paused root frame. `is_top_level=true`: the outer IS the portal, so
 /// its `*_return` surfaces the portal `Terminate`/finish, not a `SubReturn`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn drive_outer_frame_continuation(
+pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<WalkSession>,
-    root_sym: &crate::state::PyreSym,
+    root_sym: &Sym,
     root_pjc: &std::sync::Arc<crate::PyJitCode>,
     root_code_key: usize,
     root_w_globals: usize,
@@ -1057,7 +1042,7 @@ pub(crate) fn drive_outer_frame_continuation(
         w_code: root_code_key,
     };
 
-    let root_sym_ptr = root_sym as *const crate::state::PyreSym;
+    let root_sym_ptr = root_sym as *const Sym;
 
     let outcome = {
         let mut outer_wc = WalkContext {
@@ -1067,10 +1052,10 @@ pub(crate) fn drive_outer_frame_continuation(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
-                current_exception_seed: (!root_sym.last_exc_box.is_none())
-                    .then_some(root_sym.last_exc_box),
-                current_exception_seed_concrete: root_sym.last_exc_value,
-                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const,
+                current_exception_seed: (!root_sym.last_exc_box().is_none())
+                    .then_some(root_sym.last_exc_box()),
+                current_exception_seed_concrete: root_sym.last_exc_value(),
+                class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
             },
             session,
             registers_r: &mut regs_r,

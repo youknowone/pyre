@@ -29,10 +29,10 @@ use super::*;
 /// resolvable, or the layout is absent — callers fall through to the
 /// `VableBoxNotSeeded` error (such callees are declined up-front by
 /// [`callee_fast_path_inlinable`], so reaching here unresolved is genuine).
-pub(crate) fn try_resolve_inline_callee_static_field(
+pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if dst_bank != 'r' {
@@ -160,10 +160,10 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
 /// a ref → `resume.rs decode_ref: unexpected tag`).  Until the multi-frame
 /// resume coordinate is ported (#68), only branchless leaves are inlinable;
 /// a branchy callee lowers to an ordinary residual call (correct).
-pub(crate) fn callee_fast_path_inlinable(
+pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
 ) -> bool {
     let mut pc = 0usize;
@@ -212,11 +212,11 @@ pub(crate) fn callee_fast_path_inlinable(
 /// [`try_resolve_inline_callee_static_field`] can satisfy without a seeded
 /// frame box.  `setfield_vable`, array vable ops, and `getfield_vable_i/f`
 /// (mutable Int/Float frame state) all return false → decline the inline.
-pub(crate) fn inline_resolvable_static_vable_read(
+pub(crate) fn inline_resolvable_static_vable_read<Sym: WalkSym>(
     body_code: &[u8],
     d: &DecodedOp,
     callee_descr_refs: &[DescrRef],
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
     if !d.opname.starts_with("getfield_vable_r") {
         return false;
@@ -257,10 +257,10 @@ pub(crate) fn inline_resolvable_static_vable_read(
 /// `VableBoxNotSeeded`.  Every `setfield_vable_*` / `setarrayitem_vable_*`
 /// (a write into a vable, which would escape the virtual frame) and any vable
 /// op against a base reg OTHER than the seeded frame still decline.
-pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch(
+pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
 ) -> bool {
     let mut pc = 0usize;
@@ -532,8 +532,8 @@ pub(crate) fn collect_callee_active_boxes(
 /// compiled loop either way), but recursion shallower than
 /// `max_unroll_recursion` that upstream would have unrolled in-trace is
 /// cut over to `CALL_ASSEMBLER` immediately here.
-pub(crate) fn try_walker_call_assembler_self_recursive(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
     funcptr: OpRef,
@@ -658,7 +658,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let caller_frame = sym.frame;
+    let caller_frame = sym.frame();
     // `is_self_recursive = callee code == portal code`
     // (`trace_opcode.rs:5959-5960`: `callee_raw == caller_raw`).  During
     // recording `we_are_jitted()` is false, so `function_get_code` (the
@@ -666,7 +666,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive(
     // jit_merge_point green key and the portal jitcode were registered
     // under.
     let caller_code = unsafe {
-        pyre_interpreter::live_code_wrapper((*sym.jitcode).raw_code() as *const ()) as *const ()
+        pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ()) as *const ()
     };
     // Self-fold requires callee code == portal code.  The full-portal cutover
     // (`PYRE_FBW_REC_MUTUAL_CUTOVER`) additionally admits a *mutual*-recursive
@@ -895,7 +895,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive(
     // TOS.  The register writeback above already carries the same result, but
     // guard snapshotting sources operand-stack slots from this mirror.
     if ctx.vstack_valid {
-        let caller_jitcode = unsafe { &*sym.jitcode };
+        let caller_jitcode = unsafe { &*sym.jitcode() };
         let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
         let call_py_pc = python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
         let resume_py_pc = crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32;
@@ -956,8 +956,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive(
 /// writeback, GUARD_NOT_FORCED + GUARD_NO_EXCEPTION) mirrors
 /// [`try_walker_call_assembler_self_recursive`]. `PYRE_FBW_LOOP_CALLEE_CA`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_walker_loop_callee_call_assembler(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     funcptr: OpRef,
     r_args: &[OpRef],
@@ -1089,8 +1089,8 @@ pub(crate) fn emit_walker_loop_callee_call_assembler(
 /// `arg_overrides` map each scalar to a callee jitframe slot
 /// (`rewrite.py:665-695` handle_call_assembler parity) — so the optimizer can
 /// elide the per-call frame-array build.
-pub(crate) fn emit_loop_callee_ca_vable_scalar(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn emit_loop_callee_ca_vable_scalar<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     callee_frame: OpRef,
     callee_ec: OpRef,
     token: std::sync::Arc<majit_backend::JitCellToken>,
@@ -1123,10 +1123,10 @@ pub(crate) fn emit_loop_callee_ca_vable_scalar(
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
 /// sound for side-effect-free leaves (re-execute the whole call on deopt).
-pub(crate) fn reconstructed_all_ref_call_stack(
+pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &WalkContext<'_, '_>,
+    ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
     let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
     let mut stack = Vec::with_capacity(fresh.len());
@@ -1142,8 +1142,8 @@ pub(crate) fn reconstructed_all_ref_call_stack(
     stack.first().is_some_and(|c| !c.is_null()).then_some(stack)
 }
 
-pub(crate) fn try_walker_inline_user_call(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
     ref_operand_offset: usize,
@@ -1247,8 +1247,8 @@ pub(crate) fn try_walker_inline_user_call(
 /// resolve an app-level descriptor first and enter here with that function as
 /// the callee while independently pinning the original builtin callable.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_inline_resolved_user_call(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
     funcptr: OpRef,
@@ -1419,7 +1419,7 @@ pub(crate) fn try_walker_inline_resolved_user_call(
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         let self_recursive = !sym_ptr.is_null()
             && unsafe {
-                pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode).raw_code() as *const ())
+                pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode()).raw_code() as *const ())
                     as *const ()
             } as usize
                 == w_code as usize;
@@ -1709,7 +1709,7 @@ pub(crate) fn try_walker_inline_resolved_user_call(
             let sym = unsafe { &*sym_ptr };
             let callee_ec = ctx.trace_ctx.record_op_with_descr(
                 OpCode::GetfieldGcR,
-                &[sym.frame],
+                &[sym.frame()],
                 crate::descr::pyframe_execution_context_descr(),
             );
 
@@ -1753,11 +1753,11 @@ pub(crate) fn try_walker_inline_resolved_user_call(
                 None
             } else {
                 let sym = unsafe { &*sym_ptr };
-                if sym.jitcode.is_null() {
+                if sym.jitcode().is_null() {
                     None
                 } else {
                     unsafe {
-                        let jc = &*sym.jitcode;
+                        let jc = &*sym.jitcode();
                         Some((jc.index as u32, op.pc))
                     }
                 }
@@ -1874,7 +1874,7 @@ pub(crate) fn try_walker_inline_resolved_user_call(
             )
         } else {
             let sym = unsafe { &*sym_ptr };
-            if sym.jitcode.is_null() {
+            if sym.jitcode().is_null() {
                 (
                     ctx.outer_active_boxes.clone(),
                     ctx.entry_py_pc,
@@ -1892,7 +1892,7 @@ pub(crate) fn try_walker_inline_resolved_user_call(
                 // coordinate from the snapshot sym's jitcode at the CALL op's
                 // pc, matching `orthodox_list_append_commit`.
                 let (call_site_jc_index, call_site_marker) = unsafe {
-                    let jc = &*sym.jitcode;
+                    let jc = &*sym.jitcode();
                     let jc_index = jc.index as u32;
                     (jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
                 };
@@ -2308,8 +2308,8 @@ pub(crate) fn try_walker_inline_resolved_user_call(
 /// promoted exception class, then enter the ordinary resolved-callee inline
 /// plumbing with the receiver as `self`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_inline_exception_string_override(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
     funcptr: OpRef,
@@ -2452,8 +2452,8 @@ pub(crate) fn try_walker_inline_exception_string_override(
 /// specializations decline. The receiver class and its version tag pin the
 /// descriptor lookup, matching `try_dispatch_binary_special`'s forward arm.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_inline_user_binop(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
     op_tag: i64,
@@ -2580,8 +2580,8 @@ pub(crate) fn try_walker_inline_user_binop(
 /// descriptor lookup; a proper-subclass rhs declines so its reflected dunder
 /// retains priority.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_inline_user_compareop(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
     op_tag: i64,
@@ -2786,8 +2786,8 @@ pub(crate) fn allocate_callee_register_banks(
 /// Only Ref-bank concrete shadows are seeded — matching the
 /// `inline_call_*` handlers, which thread `ref_arg_concretes` but no
 /// Int/Float concrete shadows across the frame boundary.
-pub(crate) fn run_sub_jitcode_walk(
-    ctx: &mut WalkContext<'_, '_>,
+pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     sub_body: &SubJitCodeBody,
     int_args: &[OpRef],
@@ -2916,10 +2916,10 @@ pub(crate) fn run_sub_jitcode_walk(
 ///
 /// `kind_label` mirrors `dst_bank` as a static `&str` for typed-error
 /// reporting (`RegisterOutOfRange::bank`).
-pub(crate) fn dispatch_inline_call_dr_kind(
+pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let sub_descr = read_descr(code, op, 0, ctx)?;
@@ -3061,10 +3061,10 @@ pub(crate) fn dispatch_inline_call_dr_kind(
 /// `dst_bank` selects where the SubReturn value lands: `'r'` writes to
 /// `registers_r[dst]` (paired with callee `ref_return/r`), `'i'`
 /// writes to `registers_i[dst]` (paired with callee `int_return/i`).
-pub(crate) fn dispatch_inline_call_dir_kind(
+pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let sub_descr = read_descr(code, op, 0, ctx)?;
@@ -3204,10 +3204,10 @@ pub(crate) fn dispatch_inline_call_dir_kind(
 /// `dst_bank` selects where the SubReturn value lands: `'f'` writes
 /// `registers_f[dst]` (paired with callee `float_return/f`), `'r'`
 /// writes `registers_r[dst]` (paired with callee `ref_return/r`).
-pub(crate) fn dispatch_inline_call_dirf_kind(
+pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let sub_descr = read_descr(code, op, 0, ctx)?;
