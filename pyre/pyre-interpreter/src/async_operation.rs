@@ -62,39 +62,60 @@ def anext(iterator, default=_NOT_PROVIDED):
 const AITER: usize = 0;
 const ANEXT: usize = 1;
 
-thread_local! {
-    static HANDLES: std::cell::OnceCell<[PyObjectRef; 2]> = const { std::cell::OnceCell::new() };
-}
+static HANDLES: std::sync::Mutex<[usize; 2]> = std::sync::Mutex::new([0; 2]);
 
 /// Resolve (and cache) the two app-level handles.  Executes `ASYNC_OP_SRC`
 /// into its own fresh module globals and stores the `aiter` / `anext`
 /// function objects; both retain that namespace as their `__globals__`,
 /// keeping the `_NOT_PROVIDED` sentinel reachable.
 fn handle(which: usize) -> PyObjectRef {
-    HANDLES.with(|cell| {
-        cell.get_or_init(|| {
-            let ctx = crate::call::getexecutioncontext();
-            if ctx.is_null() {
-                panic!("async_operation: no execution context");
-            }
-            let _roots = pyre_object::gc_roots::push_roots();
-            let save_point = pyre_object::gc_roots::shadow_stack_len();
-            let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
-            pyre_object::gc_roots::pin_root(w_app_globals);
-            crate::importing::appleveldef_install(
-                pyre_object::gc_roots::shadow_stack_get(save_point),
-                ASYNC_OP_SRC,
-                "app_operation.py",
-                &["aiter", "anext"],
-            );
-            let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
-            let get = |name: &str| {
-                unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }
-                    .unwrap_or_else(|| panic!("async_operation: `{name}` not bound"))
-            };
-            [get("aiter"), get("anext")]
-        })[which]
-    })
+    let cached = HANDLES.lock().unwrap()[which];
+    if cached != 0 {
+        return cached as PyObjectRef;
+    }
+
+    // Do not hold HANDLES while executing Python: applevel installation can
+    // collect, and the root walker below must be able to lock the slots.  The
+    // shadow root keeps the namespace/functions alive until the finished
+    // array is published.  A racing initializer may duplicate this work, but
+    // publication remains atomic under the mutex and either complete set is
+    // equivalent.
+    let ctx = crate::call::getexecutioncontext();
+    if ctx.is_null() {
+        panic!("async_operation: no execution context");
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
+    pyre_object::gc_roots::pin_root(w_app_globals);
+    crate::importing::appleveldef_install(
+        pyre_object::gc_roots::shadow_stack_get(save_point),
+        ASYNC_OP_SRC,
+        "app_operation.py",
+        &["aiter", "anext"],
+    );
+    let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
+    let get = |name: &str| {
+        unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }
+            .unwrap_or_else(|| panic!("async_operation: `{name}` not bound"))
+    };
+    let initialized = [get("aiter") as usize, get("anext") as usize];
+    let mut handles = HANDLES.lock().unwrap();
+    if handles[which] == 0 {
+        *handles = initialized;
+    }
+    handles[which] as PyObjectRef
+}
+
+/// RPython's GC transform treats the app-level interphook cache as a normal
+/// object graph.  Pyre stores the equivalent shared handles outside the GC,
+/// so expose each slot to the global root walker and write relocated pointers
+/// back in place.
+pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let mut handles = HANDLES.lock().unwrap();
+    for slot in handles.iter_mut().filter(|slot| **slot != 0) {
+        unsafe { visitor(&mut *(slot as *mut usize as *mut majit_ir::GcRef)) };
+    }
 }
 
 /// `aiter(obj)` — delegates to the app-level `aiter`, whose `def aiter(obj)`

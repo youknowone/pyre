@@ -948,6 +948,8 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // expose the equivalent slots on every collection so both minor moves and
     // major marking preserve their functions and private globals namespace.
     crate::reduce_protocol::walk_handle_roots(visitor);
+    // The aiter/anext app-level handles are the same off-GC-slot case.
+    crate::async_operation::walk_handle_roots(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor

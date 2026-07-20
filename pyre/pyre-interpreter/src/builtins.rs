@@ -8294,12 +8294,12 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // The concrete builtin advertises `__hash__ = None`, but a user
             // subclass may replace that slot.  PyPy's normal special-method
             // lookup reaches the subclass entry before the inherited typedef
-            // value (Bug #1257731 in CPython's set tests), so only reject the
-            // object after giving a non-None override the call.
+            // value (`descroperation.py:556-565`), so only reject the object
+            // after giving a non-None override the call.
             if let Some(w_type) = crate::typedef::r#type(obj) {
                 if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
                     if !pyre_object::is_none(method) {
-                        return hash_call_normalize(method, obj);
+                        return hash_call_normalize(method, obj, w_type);
                     }
                 }
             }
@@ -8340,7 +8340,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                     let base_hash =
                         base.and_then(|b| crate::baseobjspace::lookup_in_type(b, "__hash__"));
                     if Some(method) != base_hash {
-                        return hash_call_normalize(method, obj);
+                        return hash_call_normalize(method, obj, w_type);
                     }
                 }
             }
@@ -8387,7 +8387,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 if pyre_object::is_none(method) {
                     return Err(unhashable_type_error(obj));
                 }
-                return hash_call_normalize(method, obj);
+                return hash_call_normalize(method, obj, w_type);
             }
         }
         // A type may declare itself unhashable via `__hash__ = None`
@@ -8408,7 +8408,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 let default_hash =
                     crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__hash__");
                 if default_hash != Some(method) {
-                    return hash_call_normalize(method, obj);
+                    return hash_call_normalize(method, obj, w_type);
                 }
             }
         }
@@ -8445,8 +8445,12 @@ fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// Call a resolved `__hash__` method and normalize its result:
 /// `descroperation.py:576-579` — accept `bool` / `int` / `long`, reject other
 /// return types, and map a `-1` result to `-2`.
-fn hash_call_normalize(method: PyObjectRef, obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let r = call_and_check(method, &[obj])?;
+fn hash_call_normalize(
+    method: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<i64, crate::PyError> {
+    let r = unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }?;
     let h = unsafe {
         if is_bool(r) {
             pyre_object::w_bool_get_value(r) as i64
@@ -10535,9 +10539,12 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 Ok(bytes) => bytes,
                 Err(_e) if writing => Vec::new(),
                 Err(e) => {
+                    // Report the original path object as `.filename`, keeping a
+                    // bytes path a bytes object (`interp_fileio.py` wraps the raw
+                    // `w_name`, not the decoded buffer).
                     return Err(crate::PyError::os_error_syscall(
                         e.raw_os_error().unwrap_or(2),
-                        pyre_object::w_str_new(&path),
+                        path_obj,
                     ));
                 }
             }

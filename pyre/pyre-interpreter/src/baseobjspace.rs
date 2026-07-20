@@ -5918,8 +5918,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             let w_descr = unsafe { lookup_in_type_where(w_type, name) };
             if let Some(descr) = w_descr {
                 if unsafe { is_data_descr(descr) } {
-                    if let Some(result) = unsafe { get(descr, obj, w_type)? } {
-                        return Ok(result);
+                    match unsafe { get(descr, obj, w_type) } {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {}
+                        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                            return unsafe { instance_getattr_hook_or_err(w_type, obj, name, e) };
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -5933,11 +5938,20 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 if unsafe { crate::is_function(method) } {
                     return Ok(pyre_object::w_method_new(method, obj, w_type));
                 }
-                if let Some(result) = unsafe { get(method, obj, w_type)? } {
-                    return Ok(result);
+                match unsafe { get(method, obj, w_type) } {
+                    Ok(Some(result)) => return Ok(result),
+                    Ok(None) => {}
+                    Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                        return unsafe { instance_getattr_hook_or_err(w_type, obj, name, e) };
+                    }
+                    Err(e) => return Err(e),
                 }
                 return Ok(method);
             }
+            // No type-dict attribute, instance-dict entry, or descriptor
+            // matched.  Fall through to the shared resolvers below (exception
+            // typed slots, function/code attributes, the generic type-dict
+            // path) — the terminal `__getattr__` hook runs at the final miss.
         } else if let Some(method) = unsafe { lookup_in_type_where(w_type, name) } {
             if unsafe { crate::is_function(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type));
@@ -6569,15 +6583,26 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     unsafe {
         // Name the object's type via the tag-safe `typedef::r#type`
         // (a tagged immediate has no `ob_type` slot to deref).
-        let tp_name = match crate::typedef::r#type(obj) {
+        let w_type = crate::typedef::r#type(obj);
+        let tp_name = match w_type {
             Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
             None => "NULL".to_string(),
         };
-        Err(PyError::attribute_error_with_context(
+        let e = PyError::attribute_error_with_context(
             format!("'{tp_name}' object has no attribute '{name}'"),
             obj,
             name,
-        ))
+        );
+        // descroperation.py:243-252 `_handle_getattribute`: on the terminal
+        // miss, `__getattr__` is the last resort.  Gate on `call_getattr` so
+        // `space.getattr` consults the hook while internal lookups propagate
+        // the AttributeError unchanged.
+        if call_getattr {
+            if let Some(w_type) = w_type {
+                return instance_getattr_hook_or_err(w_type, obj, name, e);
+            }
+        }
+        Err(e)
     }
 }
 
@@ -9265,9 +9290,12 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(da) = lookup_in_type(w_type, "__delattr__") {
-                let w_name = w_str_new(name);
-                return crate::call::call_function_impl_result(da, &[obj, w_name])
-                    .map(|_| w_none());
+                let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
+                    .is_some_and(|d| std::ptr::eq(da, d));
+                if !is_default {
+                    let w_name = w_str_new(name);
+                    return get_and_call_function(da, obj, w_type, &[w_name]).map(|_| w_none());
+                }
             }
         } else if is_type(obj) {
             // descroperation.py:254 looks up __delattr__ on the receiver type
@@ -9281,7 +9309,7 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                         .is_some_and(|d| std::ptr::eq(da, d));
                     if !is_default {
                         let w_name = w_str_new(name);
-                        return crate::call::call_function_impl_result(da, &[obj, w_name])
+                        return get_and_call_function(da, obj, w_metatype, &[w_name])
                             .map(|_| w_none());
                     }
                 }

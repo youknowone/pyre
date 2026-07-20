@@ -650,7 +650,17 @@ impl PyError {
             (PyErrorKind::OSError, ExcKind::OSError)
         };
         let message = format!("[Errno {errno}] {strerror}");
+        // Root the caller's filename and the fresh exception across the
+        // exception and args allocations below: they live only in Rust locals,
+        // which the precise collector does not scan, so a collection inside
+        // `w_exception_new` / `w_list_new` could sweep them before the setters
+        // stamp them onto `exc`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        if !w_filename.is_null() {
+            pyre_object::gc_roots::pin_root(w_filename);
+        }
         let exc = w_exception_new(exc_kind, &message);
+        pyre_object::gc_roots::pin_root(exc);
         // Retag to the errno subclass through `w_class`, like
         // `os_error_family_new`: the subclasses share OSError's layout, so
         // the ExcKind stays OSError and only the class differs.
@@ -716,7 +726,13 @@ impl PyError {
             ExcKind::OSError
         };
         let message = format!("[Errno {errno}] {strerror}");
+        // Root the fresh exception across the args allocation below: `exc`
+        // lives only in this Rust local while `w_int_new` / `w_str_new` /
+        // `w_list_new` run, so a collection there could sweep the unrooted
+        // exception before `w_exception_set_args` writes through it.
+        let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(exc_kind, &message);
+        pyre_object::gc_roots::pin_root(exc);
         let args_list = pyre_object::w_list_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
