@@ -1127,9 +1127,7 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
         if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
             let w_msg = crate::baseobjspace::syntax_error_attr(obj, "msg");
             // `type(self.msg) is not str` → `return str(self.msg)`.
-            if w_msg.is_null()
-                || !pyre_object::pyobject::is_exact_type(w_msg, &STR_TYPE)
-            {
+            if w_msg.is_null() || !pyre_object::pyobject::is_exact_type(w_msg, &STR_TYPE) {
                 return Ok(Some(Wtf8Buf::from_string(py_str(w_msg)?)));
             }
             let compose = |extra: Option<Wtf8Buf>| -> Wtf8Buf {

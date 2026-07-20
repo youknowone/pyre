@@ -1445,7 +1445,11 @@ fn write_traceback_chain_from_exc<W: Write>(
                 // no information, so it is suppressed. A `<name> = <call>(…)` or
                 // `return <call>(…)` whose call value exactly covers the span is
                 // likewise suppressed even though it has a call sub-anchor.
-                let before_ws_only = raw_line.get(..start_col).unwrap_or("").trim_start().is_empty();
+                let before_ws_only = raw_line
+                    .get(..start_col)
+                    .unwrap_or("")
+                    .trim_start()
+                    .is_empty();
                 let after_ws_only = raw_line.get(end_col..).unwrap_or("").trim_end().is_empty();
                 let full_line_call = spawns_full_line_call(
                     shown_line,

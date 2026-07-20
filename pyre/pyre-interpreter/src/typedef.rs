@@ -1225,7 +1225,11 @@ fn patch_complex_realimag_descriptors() {
             "the real part of a complex number",
             make_builtin_function_with_arity(
                 "real",
-                |args| Ok(pyre_object::w_float_new(unsafe { pyre_object::w_complex_get_real(args[1]) })),
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_real(args[1])
+                    }))
+                },
                 2,
             ),
         ),
@@ -1234,7 +1238,11 @@ fn patch_complex_realimag_descriptors() {
             "the imaginary part of a complex number",
             make_builtin_function_with_arity(
                 "imag",
-                |args| Ok(pyre_object::w_float_new(unsafe { pyre_object::w_complex_get_imag(args[1]) })),
+                |args| {
+                    Ok(pyre_object::w_float_new(unsafe {
+                        pyre_object::w_complex_get_imag(args[1])
+                    }))
+                },
                 2,
             ),
         ),
