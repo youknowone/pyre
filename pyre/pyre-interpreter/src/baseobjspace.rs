@@ -8557,12 +8557,7 @@ pub unsafe fn exception_attr_slot_fold(
     // `descr_setcontext` (`interp_exceptions.py:183-190`) type-validates and
     // `descr_setcause` (`:166-174`) also flips `suppress_context` to True, so a
     // direct slot write would drop those effects.
-    if is_store
-        && matches!(
-            slot,
-            ExceptionAttrSlot::Context | ExceptionAttrSlot::Cause
-        )
-    {
+    if is_store && matches!(slot, ExceptionAttrSlot::Context | ExceptionAttrSlot::Cause) {
         return None;
     }
     let w_type = crate::typedef::r#type(obj)?;

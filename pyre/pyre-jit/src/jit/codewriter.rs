@@ -13887,34 +13887,111 @@ fn backward_jump_target(
     }
 }
 
+/// Control-flow successors of every code-unit index: fall-through (except
+/// after an unconditional transfer), forward and backward jump targets, and
+/// the exception edge from each protected pc to its handler landing.  Built in
+/// one sequential decode pass so an `EXTENDED_ARG` prefix folds into the
+/// following opcode's argument, matching the edge model of
+/// `find_branch_target_pcs`.
+fn code_successors(code: &CodeObject) -> Vec<Vec<usize>> {
+    let num_instrs = code.instructions.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); num_instrs];
+    let mut scan_state = OpArgState::default();
+    for pc in 0..num_instrs {
+        let (instr, op_arg) = scan_state.get(code.instructions[pc]);
+        if let Some(target) = backward_jump_target(code, pc, instr, op_arg) {
+            if target < num_instrs {
+                succ[pc].push(target);
+            }
+        }
+        let forward_delta = match instr {
+            Instruction::PopJumpIfFalse { delta }
+            | Instruction::PopJumpIfTrue { delta }
+            | Instruction::PopJumpIfNone { delta }
+            | Instruction::PopJumpIfNotNone { delta }
+            | Instruction::JumpForward { delta }
+            | Instruction::ForIter { delta } => Some(delta.get(op_arg).as_usize()),
+            _ => None,
+        };
+        if let Some(delta) = forward_delta {
+            let target = jump_target_forward(code, num_instrs, pc + 1, delta);
+            if target < num_instrs {
+                succ[pc].push(target);
+            }
+        }
+        let terminates = matches!(
+            instr,
+            Instruction::JumpForward { .. }
+                | Instruction::JumpBackward { .. }
+                | Instruction::JumpBackwardNoInterrupt { .. }
+                | Instruction::ReturnValue
+                | Instruction::RaiseVarargs { .. }
+                | Instruction::Reraise { .. }
+        );
+        if !terminates {
+            let fallthrough = pc + 1;
+            if fallthrough < num_instrs {
+                succ[pc].push(fallthrough);
+            }
+        }
+    }
+    for entry in pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable) {
+        let start = entry.start as usize / 2;
+        let end = (entry.end as usize / 2).min(num_instrs);
+        let handler = entry.target as usize / 2;
+        if handler < num_instrs {
+            for pc in start..end {
+                succ[pc].push(handler);
+            }
+        }
+    }
+    succ
+}
+
+/// True when `target_pc` dominates `source_pc`: every control-flow path from
+/// the code entry (pc 0) to `source_pc` passes through `target_pc`.  Answered
+/// by a forward reachability from the entry that never enters `target_pc` — if
+/// `source_pc` stays unreachable, `target_pc` dominates it.
+fn target_dominates(succ: &[Vec<usize>], target_pc: usize, source_pc: usize) -> bool {
+    let num_instrs = succ.len();
+    if target_pc == source_pc || target_pc == 0 {
+        return true;
+    }
+    if source_pc >= num_instrs {
+        return false;
+    }
+    let mut seen = vec![false; num_instrs];
+    let mut stack = vec![0usize];
+    seen[0] = true;
+    while let Some(pc) = stack.pop() {
+        for &next in &succ[pc] {
+            if next == target_pc || seen[next] {
+                continue;
+            }
+            seen[next] = true;
+            stack.push(next);
+        }
+    }
+    !seen[source_pc]
+}
+
 /// True when a backward bytecode jump is only a control-flow return from an
-/// out-of-line exception handler to earlier mainline code, rather than a loop
-/// backedge.  Python 3.14 lays handler cleanup blocks after the protected
-/// body, so a `break` in a handler can be encoded as `JUMP_BACKWARD` even
-/// though its landing is after the source loop.  `interp_jit.py:103-114`
+/// exception handler to earlier code, rather than a loop backedge.  Python
+/// 3.14 lays handler blocks after the protected body, so a `break` / handler
+/// rejoin can be encoded as `JUMP_BACKWARD` even though its target is not a
+/// loop header.  A genuine loop backedge's target dominates the jump (every
+/// path to the jump enters through the loop header); a handler-return target
+/// does not, because the handler is reached from the protected body through
+/// the exception edge, bypassing that target.  `interp_jit.py:103-114`
 /// attaches `loop_header` / `can_enter_jit` to semantic loop backedges; do not
-/// manufacture a JIT loop header for this layout-only backward coordinate.
+/// manufacture a JIT loop header for a non-dominating backward coordinate.
 fn backward_jump_is_handler_only_target(
     code: &CodeObject,
     source_pc: usize,
     target_pc: usize,
 ) -> bool {
-    let handler_boundary = pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
-        .map(|entry| entry.target as usize / 2)
-        .filter(|&handler_pc| target_pc < handler_pc && handler_pc <= source_pc)
-        .min();
-    let Some(handler_boundary) = handler_boundary else {
-        return false;
-    };
-
-    let mut arg_state = OpArgState::default();
-    for pc in 0..handler_boundary.min(code.instructions.len()) {
-        let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
-        if backward_jump_target(code, pc, instruction, op_arg) == Some(target_pc) {
-            return false;
-        }
-    }
-    true
+    let succ = code_successors(code);
+    !target_dominates(&succ, target_pc, source_pc)
 }
 
 /// Match pyre-interpreter/pyopcode.rs:skip_caches.
@@ -14190,12 +14267,13 @@ fn compile_jitcode_via_raw_code(
 /// `CallControl.jitdrivers_sd`, matching codewriter.py:37.
 pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
     let num_instrs = code.instructions.len();
+    let succ = code_successors(code);
     let mut loop_header_pcs: VecSet<usize> = VecSet::new();
     let mut scan_state = OpArgState::default();
     for scan_pc in 0..num_instrs {
         let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
         if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
-            if target < num_instrs && !backward_jump_is_handler_only_target(code, scan_pc, target) {
+            if target < num_instrs && target_dominates(&succ, target, scan_pc) {
                 loop_header_pcs.insert(target);
             }
         }
@@ -15641,9 +15719,15 @@ mod tests {
     }
 
     #[test]
-    fn handler_break_backward_jump_is_not_a_loop_header() {
+    fn handler_rejoin_backward_jump_is_not_a_loop_header() {
+        // Nested try/except inside a `while`: each handler ends in a backward
+        // jump that rejoins the loop body after the protected region.  Its
+        // target does not dominate the jump (the handler is entered from the
+        // protected body via the exception edge), so it is a handler return,
+        // not a loop backedge — excluded from the loop headers — while the
+        // `while` backedge dominates its source and stays.
         let code = first_nested_function_code(
-            "def f():\n    total = 0\n    for _ in range(3):\n        value = 0\n        while True:\n            try:\n                value = may_raise()\n            except Exception as exc:\n                value = exc.value\n                break\n        total += value\n    return total\n",
+            "def k(n):\n    s = 0\n    while n > 0:\n        try:\n            try:\n                s += 1\n            except KeyError:\n                s += 2\n        except ValueError:\n            s += 3\n        n -= 1\n    return s\n",
         );
         let mut arg_state = OpArgState::default();
         let mut handler_only_targets = Vec::new();
@@ -15660,15 +15744,42 @@ mod tests {
             }
         }
 
-        assert_eq!(handler_only_targets.len(), 1);
+        assert!(!handler_only_targets.is_empty());
         assert!(!ordinary_targets.is_empty());
         let loop_headers = find_loop_header_pcs(&code);
-        assert!(!loop_headers.contains(&handler_only_targets[0]));
+        assert!(
+            handler_only_targets
+                .iter()
+                .all(|target| !loop_headers.contains(target))
+        );
         assert!(
             ordinary_targets
                 .iter()
                 .all(|target| loop_headers.contains(target))
         );
+    }
+
+    #[test]
+    fn loop_with_try_except_body_keeps_its_loop_header() {
+        // A `while`/`for` whose body contains a try/except still registers its
+        // backedge target as a loop header.  The loop backedge sits after the
+        // handler block, so its target dominates the jump even though a handler
+        // landing lies between the header and the backedge.
+        let code = first_nested_function_code(
+            "def run(n):\n    acc = 0\n    i = 0\n    while i < n:\n        try:\n            raise ValueError\n        except ValueError:\n            acc += 1\n        i += 1\n    return acc\n",
+        );
+        let mut arg_state = OpArgState::default();
+        let mut backedge_targets = Vec::new();
+        for pc in 0..code.instructions.len() {
+            let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
+            if let Some(target) = backward_jump_target(&code, pc, instruction, op_arg) {
+                backedge_targets.push(target);
+            }
+        }
+        // The sole backward jump is the `while` backedge.
+        assert_eq!(backedge_targets.len(), 1);
+        let loop_headers = find_loop_header_pcs(&code);
+        assert!(loop_headers.contains(&backedge_targets[0]));
     }
 
     #[test]
