@@ -2751,6 +2751,12 @@ fn collect_loop_body_referenced_roots(
             return;
         };
         match instr {
+            I::LoadName { namei } => {
+                let name_idx = namei.get(op_arg) as usize;
+                if let Some(name) = code.names.get(name_idx) {
+                    global_names.insert(name.to_string());
+                }
+            }
             I::LoadGlobal { namei } => {
                 let name_idx = (namei.get(op_arg) as usize) >> 1;
                 if let Some(name) = code.names.get(name_idx) {
@@ -2848,7 +2854,7 @@ fn collect_loop_body_referenced_roots(
 /// The scan resolves candidate callees CONCRETELY from the live frame (the
 /// walk has not run yet, so no store has executed).  Two root seed sources,
 /// both scoped to identifiers the loop body or its in-loop handlers read:
-/// - module globals named by loop-body `LOAD_GLOBAL`;
+/// - module globals named by loop-body `LOAD_GLOBAL` or `LOAD_NAME`;
 /// - ROOT-frame fastlocals + closure cells whose slots are read by loop-body
 ///   local-load opcodes.
 ///
@@ -3075,6 +3081,49 @@ fn loop_inlines_abort_permanent_callee(
     None
 }
 
+/// True when the loop header is about to resume a generator whose body uses
+/// SEND delegation.
+///
+/// The full-body walker executes iterator advances while recording.  A SEND
+/// marker aborts that walk, but the delegated iterator is shared with the live
+/// generator frame, so replaying from the loop header would observe the
+/// already-advanced delegate and drop values.  The upstream blackhole path
+/// continues forward from the live generator frame.  Until that forward
+/// resume is available here, decline before the first shared-iterator advance.
+fn loop_iterates_send_generator(cf_addr: usize, start_pc: usize) -> bool {
+    if cf_addr == 0 {
+        return false;
+    }
+    unsafe {
+        let frame = &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame);
+        let code = frame.code();
+        if !matches!(
+            pyre_interpreter::decode_instruction_at(code, start_pc),
+            Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+        ) || frame.valuestackdepth <= frame.stack_base()
+        {
+            return false;
+        }
+
+        let iterator = frame.peek();
+        if !pyre_object::generator::is_generator_or_coroutine(iterator) {
+            return false;
+        }
+        let generator_frame = pyre_object::generator::w_generator_get_frame(iterator)
+            as *const pyre_interpreter::pyframe::PyFrame;
+        if generator_frame.is_null() {
+            return false;
+        }
+        let generator_code = (*generator_frame).code();
+        (0..generator_code.instructions.len()).any(|pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(generator_code, pc),
+                Some((pyre_interpreter::Instruction::Send { .. }, _))
+            )
+        })
+    }
+}
+
 /// Whether [`full_body_walk_trace`] starts a fresh walk or continues one that
 /// has already applied eager stores.
 enum WalkJournals {
@@ -3125,6 +3174,16 @@ fn full_body_walk_trace<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
         if std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some() {
             eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc}");
+        }
+        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        return TraceAction::Abort;
+    }
+    if loop_iterates_send_generator(cf_addr, start_pc) {
+        crate::jitcode_dispatch::census_record("FullBodyWalk::SendGeneratorIterator");
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort] start_pc={start_pc} SEND generator iterator; declining before delegation"
+            );
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
