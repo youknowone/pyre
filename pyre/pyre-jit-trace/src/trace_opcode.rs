@@ -884,7 +884,6 @@ impl MIFrame {
             orgpc,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -956,21 +955,12 @@ impl MIFrame {
     /// opcode that mutates the concrete stack (the walker records the
     /// residual_call but does not run `MIFrame::pop_value`'s `sym.valuestackdepth -= 1`).
     ///
-    /// Returns `None` when:
-    /// 1. `concrete_frame_addr == 0` (tests constructing a sym-only `MIFrame`)
-    /// 2. `self.parent_frames` is non-empty (this MIFrame is an inline
-    ///    callee — its `concrete_frame_addr` is the heap PyFrame snapshot
-    ///    frozen at CALL entry and does not advance during inline body
-    ///    tracing.  The live traced depth for an inline frame lives only in
-    ///    `sym.valuestackdepth`, which the walker / trait dispatch update
-    ///    via `push_typed_value` / `pop_value` as the inline body executes).
+    /// Returns `None` when `concrete_frame_addr == 0` (tests constructing a
+    /// sym-only `MIFrame`).
     ///
     /// Production tracer paths always seed `concrete_frame_addr` from the
     /// live `PyFrame` for the top frame.
     pub(crate) fn concrete_valuestackdepth(&self) -> Option<usize> {
-        if !self.parent_frames.is_empty() {
-            return None;
-        }
         crate::state::concrete_stack_depth(self.concrete_frame_addr)
     }
 
@@ -2785,65 +2775,6 @@ impl MIFrame {
             // re-executing the current opcode from orgpc.
             self.clear_pre_opcode_state();
         }
-        // opencoder.py:819 capture_resumedata(framestack) parity:
-        // Encode the full framestack [callee (top), caller (parent)] into
-        // a multi-frame snapshot. The callee's pc is set to resumepc
-        // (orgpc), while the caller keeps its original pc (return_point).
-        // pyjitpl.py:2597 passes full framestack + vable/vref boxes.
-        if !self.parent_frames.is_empty() {
-            // pyjitpl.py:2593-2596: top frame pc = resumepc (orgpc)
-            self.flush_to_frame_for_guard(ctx);
-            // pyjitpl.py:177: active boxes = registers only (no header).
-            let callee_active_boxes =
-                self.get_list_of_active_boxes(ctx, false, after_residual_call, Some(self.orgpc));
-            // RPython Box.type parity: snapshot types match the full
-            // (un-filtered) active_boxes — constants are part of the
-            // snapshot via TAGCONST.
-            let callee_snapshot_types_full =
-                self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
-
-            // snapshot.pc must match the liveness PC used for active boxes.
-            // This retired MIFrame trait-interpret leg has no production
-            // driver; production guard capture carries a genuine jitcode
-            // post-call coordinate instead. Preserve the trait-leg decline
-            // without rewriting the resume word.
-            if after_residual_call {
-                crate::state::request_trace_abort();
-            }
-            let callee_live_pc = self.orgpc;
-            // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
-            let snapshot = self.build_framestack_snapshot(
-                ctx,
-                callee_live_pc,
-                &callee_active_boxes,
-                &callee_snapshot_types_full,
-            );
-            // Snapshot is the source of truth — the
-            // optimizer's `store_final_boxes_in_guard`
-            // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
-            // the snapshot via `op.store_final_boxes(liveboxes)`
-            // (mod.rs:3392), so the inline `fail_args` copy that the
-            // legacy `record_guard_typed_with_fail_args` path used to
-            // write was redundant.  Mirrors RPython
-            // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602)
-            // which records the guard with no inline fail_args and lets
-            // `capture_resumedata` + `_number_boxes` populate them from
-            // the snapshot chain.
-            //
-            // The state-fields header `[s.frame, s.vable_*]` that fed
-            // the inline fail_args is now dead and removed; the
-            // snapshot's `vable_boxes` already encodes the same
-            // information via `build_virtualizable_boxes`. Parent-frame
-            // types still flow into the recorded guard via
-            // `extend_types_with_parents`.
-            let types = self.extend_types_with_parents(ctx, callee_snapshot_types_full);
-            let snapshot_id = ctx.capture_resumedata(snapshot);
-
-            ctx.record_guard_typed(opcode, args, types);
-            ctx.set_last_guard_resume_position(snapshot_id);
-            return;
-        }
-
         // pyjitpl.py:2586-2596 capture_resumedata(resumepc) parity:
         // Normal guards: resumepc = orgpc (re-execute the opcode from start).
         // after_residual_call guards (GUARD_NOT_FORCED, GUARD_NO_EXCEPTION):
@@ -2909,13 +2840,11 @@ impl MIFrame {
 
     /// pyjitpl.py:2586-2602 capture_resumedata parity.
     ///
-    /// Temporarily sets frame.pc = resumepc, captures the full framestack
-    /// ([self as top/callee] + self.parent_frames as parents) plus
+    /// Temporarily sets frame.pc = resumepc, captures this frame plus
     /// virtualizable_boxes + virtualref_boxes into a snapshot, then
     /// restores frame.pc.  Matches opencoder.py:819-832
     /// `capture_resumedata(framestack, virtualizable_boxes,
-    /// virtualref_boxes, after_residual_call=False)` which walks the full
-    /// `self.framestack` to build one SnapshotFrame per live frame.
+    /// virtualref_boxes, after_residual_call=False)`.
     fn capture_resumedata(
         &mut self,
         ctx: &mut TraceCtx,
@@ -2958,104 +2887,8 @@ impl MIFrame {
         s.vable_valuestackdepth = saved_vsd;
     }
 
-    /// Extend a single-frame callee's `fail_arg_types` with the type
-    /// contribution of every active parent frame.  Mirrors the
-    /// `pyjitpl.py:2597` generate_guard collection: parent boxes ride
-    /// the snapshot (built by `build_framestack_snapshot`), and the
-    /// optimizer's `store_final_boxes_in_guard` (`optimizeopt/mod.rs:
-    /// 3200`) overwrites `op.fail_args` from the snapshot via
-    /// `op.store_final_boxes(liveboxes)` (mod.rs:3392), so an inline
-    /// `fail_args` collection is redundant — only the per-frame
-    /// `parent_types` need to flow into `record_guard_typed`.
-    ///
-    /// `build_framestack_snapshot` strips the `[s.frame, s.vable_*..]`
-    /// scalar inputarg header from each parent frame's snapshot boxes
-    /// (`opencoder.py:806` — parent frames contribute only active
-    /// boxes; the virtualizable section is emitted once for the whole
-    /// snapshot via `list_of_boxes_virtualizable`).  Mirror that here
-    /// so the static type vector matches the static box shape per
-    /// frame, otherwise the inline `fail_arg_types` stretched parent
-    /// types over the snapshot's header-less box positions before the
-    /// optimizer's snapshot-derived overwrite hid the divergence.
-    fn extend_types_with_parents(&mut self, ctx: &mut TraceCtx, mut types: Vec<Type>) -> Vec<Type> {
-        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        for parent in self.parent_frames.clone() {
-            let (parent_types_full, _jitcode_index) =
-                self.materialize_parent_frame_state(ctx, parent);
-            if parent_types_full.len() > n {
-                types.extend_from_slice(&parent_types_full[n..]);
-            }
-        }
-        types
-    }
-
-    /// Append `self.parent_frames` onto an innermost-first `lead` frame
-    /// list and reverse the whole vector to the outermost-first order
-    /// required by `recorder.rs:54` ("Frames in the snapshot, outermost
-    /// first") and `resume.rs:252`.  Extracted so both the ordinary
-    /// `build_framestack_snapshot` (lead = `[top]`) and the issue #143
-    /// synthetic-callee path (lead = `[helper, self-as-parent]`) share one
-    /// parent-collection + reverse seam.
-    fn build_framestack_frames(
-        &mut self,
-        ctx: &mut TraceCtx,
-        mut lead: Vec<majit_metainterp::recorder::SnapshotFrame>,
-    ) -> Vec<majit_metainterp::recorder::SnapshotFrame> {
-        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        // opencoder.py:806: parent frames keep their original pc.
-        // Snapshot boxes = active boxes only (skip scalar inputarg header).
-        for parent in self.parent_frames.clone() {
-            let (parent_types_full, parent_jitcode_index, parent_active) =
-                self.materialize_parent_snapshot_state(ctx, parent);
-            let parent_types: &[Type] = if parent_types_full.len() > n {
-                &parent_types_full[n..]
-            } else {
-                &[]
-            };
-            if parent.call_pc.is_some() {
-                crate::state::request_trace_abort();
-            }
-            let parent_pc = parent.resume_pc;
-            let parent_word = parent
-                .resume_marker_jit_pc
-                .map(|m| m as i32)
-                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-            let parent_pc_word =
-                crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
-                    .and_then(|payload| {
-                        let resolved = payload.resolve_resume_pc_with_jitcode_pc(
-                            parent_word,
-                            crate::state::op_live(),
-                        );
-                        resolved
-                    })
-                    .map(|offset| offset as u32)
-                    .unwrap_or_else(|| {
-                        // Do not publish an invented resume coordinate. The
-                        // recording loop observes this request and discards
-                        // the trace before the provisional snapshot can run.
-                        crate::state::request_trace_abort();
-                        parent_pc as u32
-                    });
-            lead.push(majit_metainterp::recorder::SnapshotFrame {
-                jitcode_index: parent_jitcode_index,
-                pc: parent_pc_word,
-                boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
-            });
-        }
-        // opencoder.py:217 `SnapshotIterator.__init__` calls
-        // `self.framestack.reverse()` so the numbering loop at
-        // `resume.py:249-253` iterates outermost-first.  pyre builds the
-        // frame list innermost-first (`[top, immediate_caller, ...,
-        // outermost]`); reverse so `Snapshot.frames[0]` is outermost,
-        // matching `recorder.rs:54` / `resume.rs:252`.
-        lead.reverse();
-        lead
-    }
-
-    /// Build the full framestack `Snapshot` — top (callee) frame
-    /// followed by every parent frame in `self.parent_frames` — plus
-    /// virtualizable and virtualref boxes.  Mirrors opencoder.py:819-832
+    /// Build the single-frame `Snapshot` — this frame plus virtualizable
+    /// and virtualref boxes.  Mirrors opencoder.py:819-832
     /// `capture_resumedata(framestack, virtualizable_boxes,
     /// virtualref_boxes, ...)`.
     ///
@@ -3096,7 +2929,9 @@ impl MIFrame {
                 ctx,
             ),
         };
-        let frames = self.build_framestack_frames(ctx, vec![top_frame]);
+        // Single-frame snapshot: the walker records one frame per guard; the
+        // multi-frame parent chain was the retired trait-interpret leg.
+        let frames = vec![top_frame];
         let vable_boxes = self.list_of_boxes_virtualizable(ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         // PHASE 1.4 candidate D probe: detect snapshot-time divergence
@@ -3147,58 +2982,6 @@ impl MIFrame {
             vable_boxes,
             vref_boxes,
         }
-    }
-
-    fn materialize_parent_frame_state(
-        &mut self,
-        ctx: &mut TraceCtx,
-        parent: ResumeFrameState,
-    ) -> (Vec<Type>, u32) {
-        let (full_types, jitcode_index, _active_boxes) =
-            self.materialize_parent_snapshot_state(ctx, parent);
-        (full_types, jitcode_index)
-    }
-
-    fn materialize_parent_snapshot_state(
-        &mut self,
-        ctx: &mut TraceCtx,
-        parent: ResumeFrameState,
-    ) -> (Vec<Type>, u32, Vec<OpRef>) {
-        // pyjitpl.py:2586 capture_resumedata parity: parent frames
-        // contribute only their per-frame regular boxes (locals + stack)
-        // to the snapshot.  The virtualizable scalars are emitted once
-        // via `list_of_boxes_virtualizable` for the whole snapshot, not
-        // per-frame.  Earlier pyre revisions called
-        // `parent_frame.flush_to_frame_for_guard(ctx)` here and built a
-        // `[s.frame, s.vable_*..., active_boxes]` fail_args vec for the
-        // legacy `record_guard_typed_with_fail_args` path; both are dead
-        // since the snapshot reader (`build_framestack_snapshot`) reads
-        // active boxes directly and `store_final_boxes_in_guard`
-        // overwrites `op.fail_args` from the snapshot
-        // (`optimizeopt/mod.rs:3200`).  Keeping the parent flush around
-        // mutates parent's `s.vable_*` mid-callee snapshot — the
-        // structural blocker called out in
-        // `vable_shadow_split_brain_load_bearing_2026_04_28` — so it is
-        // dropped together with the dead fail_args build.
-        let parent_sym = unsafe { &mut *parent.sym };
-        let mut parent_frame = MIFrame::from_sym(
-            ctx,
-            parent_sym,
-            parent.concrete_frame_addr,
-            parent.resume_pc,
-            parent.resume_pc,
-        );
-        parent_frame.pending_result_stack_idx = parent.pending_result_stack_idx;
-        parent_frame.pending_result_type = parent.pending_result_type;
-        // When the parent's CALL sits in a try-block, read this frame's
-        // liveness at the call's post-residual-call `-live-`/catch (mirroring
-        // `pyjitpl.py:194-195 pc=self.pc`) so the encoded box count matches
-        // the blackhole's carried jitcode resume position.
-        parent_frame.residual_call_pc = parent.call_pc;
-        let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false, None);
-        let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
-        let jitcode_index = unsafe { (*parent_frame.sym().jitcode).index } as u32;
-        (full_types, jitcode_index, active_boxes)
     }
 
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
@@ -3728,7 +3511,6 @@ mod tests {
             ctx,
             sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -3882,7 +3664,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -3975,7 +3756,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,

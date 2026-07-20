@@ -2490,12 +2490,6 @@ pub struct MIFrame {
     /// bank may include post-regalloc color slots above the semantic
     /// locals+stack prefix.
     pub(crate) pre_opcode_semantic_depth: Option<usize>,
-    /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
-    /// Each entry points at one parent frame plus the resumepc that
-    /// should be used when that parent is snapshotted. This stays much
-    /// closer to RPython's `self.framestack` than the old flattened
-    /// `(fail_args, fail_arg_types, resumepc, jitcode_index)` tuples.
-    pub parent_frames: Vec<ResumeFrameState>,
     /// `pyjitpl.py:181-193` `_result_argcode` analogue for non-top-frame
     /// snapshotting. When present, `get_list_of_active_boxes(in_a_call=True)`
     /// overwrites this caller stack slot with a zero/null placeholder before
@@ -11067,7 +11061,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -11108,7 +11101,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -11164,7 +11156,6 @@ mod tests {
                 ctx: &mut ctx,
                 sym: &mut sym,
                 fallthrough_pc: 0,
-                parent_frames: Vec::new(),
                 pending_result_stack_idx: None,
                 pending_result_type: None,
                 pending_inline_frame: None,
@@ -11857,7 +11848,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,
@@ -11971,7 +11961,6 @@ mod tests {
             ctx: &mut ctx,
             sym: &mut sym,
             fallthrough_pc: 0,
-            parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
             pending_inline_frame: None,

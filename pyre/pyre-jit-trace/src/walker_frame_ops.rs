@@ -30,7 +30,6 @@
 //! Five of the six methods are pure compositions over `ctx_mut` +
 //! `generate_guard` and live as default impls below.  The lone
 //! load-bearing method is `generate_guard`, which on `MIFrame` walks
-//! `parent_frames`, `flush_to_frame_for_guard`,
 //! `get_list_of_active_boxes`, `build_framestack_snapshot`, etc.  The
 //! walker has the same semantic responsibility (capture a multi-frame
 //! resume snapshot before recording the guard op) but reaches it
@@ -216,8 +215,8 @@ pub trait WalkerFrameOps {
 
 // `MIFrame` impl — delegates `generate_guard` to the existing
 // `MIFrame::generate_guard` method so the trait-dispatch leg keeps its
-// current `flush_guard_not_invalidated` / `parent_frames` / `orgpc`
-// plumbing untouched.  The `ctx_mut` / `ctx` accessors materialise the
+// current `flush_guard_not_invalidated` / `orgpc` plumbing untouched.
+// The `ctx_mut` / `ctx` accessors materialise the
 // borrow from `self.ctx: *mut TraceCtx` via unsafe deref.  The deref is
 // sound because `MIFrame`'s lifetime invariant
 // (`pyjitpl.py:177 MIFrame.metainterp`) guarantees `self.ctx` always
