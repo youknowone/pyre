@@ -1,4 +1,6 @@
-from _weakref import proxy, ref
+import gc
+
+from _weakref import getweakrefcount, getweakrefs, proxy, ref
 
 from testutils import assert_raises
 
@@ -21,6 +23,8 @@ assert b.__callback__ is None, (
 callback = lambda r: None
 c = ref(a, callback)
 assert c.__callback__ is callback, "weakref with callback should return the callback"
+assert getweakrefcount(a) == 2
+assert set(getweakrefs(a)) == {b, c}
 
 # Test __callback__ is read-only
 try:
@@ -31,11 +35,18 @@ except AttributeError:
 
 # Test __callback__ after referent deletion
 x = X()
-cb = lambda r: None
-w = ref(x, cb)
-assert w.__callback__ is cb
+seen = []
+cb1 = lambda r: seen.append((1, r()))
+cb2 = lambda r: seen.append((2, r()))
+w1 = ref(x, cb1)
+w2 = ref(x, cb2)
+assert w1.__callback__ is cb1
+assert w2.__callback__ is cb2
 del x
-assert w.__callback__ is None, "__callback__ should be None after referent is collected"
+gc.collect()
+assert seen == [(2, None), (1, None)]
+assert w1.__callback__ is None
+assert w2.__callback__ is None
 
 
 class G:
@@ -49,5 +60,6 @@ p = proxy(g)
 assert p.h == 5
 
 del g
+gc.collect()
 
 assert_raises(ReferenceError, lambda: p.h)

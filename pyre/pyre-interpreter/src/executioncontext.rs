@@ -122,6 +122,21 @@ pub fn register_generator_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
 }
 
+/// Register an object that owns a `WeakrefLifeline`. PyPy's GC invalidates the
+/// rweakrefs and registers callback-bearing lifelines themselves; until pyre's
+/// mapdict weakref SPECIAL slot is inline, the address-keyed slot keeps that
+/// lifeline rooted, so the equivalent death notification is registered on its
+/// owner. Objects with `__del__` are already in this queue and must not be
+/// registered twice.
+pub fn register_weakref_finalizer(obj: PyObjectRef) {
+    let already_registered = crate::typedef::r#type(obj)
+        .map(|w_type| unsafe { pyre_object::w_type_get_hasuserdel(w_type) })
+        .unwrap_or(false);
+    if !already_registered {
+        pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+    }
+}
+
 /// Shared execution context for all frames in one interpreter run.
 ///
 /// Holds the builtin module dict used by module-level frames.
@@ -1914,6 +1929,7 @@ impl UserDelAction {
     }
 
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
+        crate::module::_weakref::interp__weakref::finalize_weakrefs(w_obj);
         if unsafe { pyre_object::generator::is_generator_or_coroutine(w_obj) } {
             if self.gc_disabled(w_obj) {
                 return;

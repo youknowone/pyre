@@ -16,12 +16,13 @@ use pyre_object::*;
 
 use std::sync::OnceLock;
 
-thread_local! {
-    static WEAKREF_LIFELINE_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
-    static WEAKREF_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
-    static PROXY_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
-    static CALLABLE_PROXY_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
-}
+// Type objects belong to the process-wide object space, not to an OS thread.
+// Store their addresses as `usize` because `PyObjectRef` is a raw pointer and
+// therefore cannot itself be held by a `Sync` static.
+static WEAKREF_LIFELINE_TYPE: OnceLock<usize> = OnceLock::new();
+static WEAKREF_TYPE: OnceLock<usize> = OnceLock::new();
+static PROXY_TYPE: OnceLock<usize> = OnceLock::new();
+static CALLABLE_PROXY_TYPE: OnceLock<usize> = OnceLock::new();
 
 // ── Instance attribute names ──────────────────────────────────────────
 //
@@ -32,6 +33,8 @@ thread_local! {
 
 const ATTR_CACHED_WEAKREF: &str = "cached_weakref";
 const ATTR_CACHED_PROXY: &str = "cached_proxy";
+const ATTR_OTHER_REFS_WEAK: &str = "other_refs_weak";
+const ATTR_HAS_CALLBACKS: &str = "has_callbacks";
 const ATTR_W_OBJ_WEAK: &str = "w_obj_weak";
 const ATTR_W_CALLABLE: &str = "w_callable";
 const ATTR_W_HASH: &str = "w_hash";
@@ -115,13 +118,11 @@ impl Drop for InstanceRoot {
 // ── Type registration ─────────────────────────────────────────────────
 
 fn weakref_lifeline_type() -> PyObjectRef {
-    WEAKREF_LIFELINE_TYPE.with(|cell| {
-        *cell.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("WeakrefLifeline", |_| {});
-            unsafe { pyre_object::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *WEAKREF_LIFELINE_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("WeakrefLifeline", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 /// pypy/module/_weakref/interp__weakref.py:270-280 W_Weakref.typedef
@@ -189,16 +190,26 @@ fn init_weakref_type(ns: PyObjectRef) {
             make_builtin_function_with_arity("__repr__", descr__repr__, 1),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__callback__",
+            crate::typedef::make_getset_property_named(
+                make_builtin_function_with_arity("__callback__", descr_callback, 2),
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "__callback__",
+            ),
+        )
+    };
 }
 
 pub fn weakref_type() -> PyObjectRef {
-    WEAKREF_TYPE.with(|cell| {
-        *cell.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("weakref", init_weakref_type);
-            unsafe { pyre_object::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *WEAKREF_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("weakref", init_weakref_type);
+        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 /// pypy/module/_weakref/interp__weakref.py:405-410 W_Proxy.typedef
@@ -237,21 +248,19 @@ fn init_proxy_type(ns: PyObjectRef) {
     register_proxy_typedef_dict(ns, /*include_comparisons=*/ true);
 }
 
-/// `dont_look_inside`: the `PROXY_TYPE` thread-local `OnceLock` read has
+/// `dont_look_inside`: the `PROXY_TYPE` process-global `OnceLock` read has
 /// no extractable graph; the call stays a residual returning the lazily
 /// built type object (same shape as [`crate::typedef::w_type`]).
 #[majit_macros::dont_look_inside]
 pub fn proxy_type() -> PyObjectRef {
-    PROXY_TYPE.with(|cell| {
-        *cell.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("weakproxy", init_proxy_type);
-            unsafe {
-                pyre_object::w_type_set_hasdict(tp, true);
-                pyre_object::w_type_set_acceptable_as_base_class(tp, false);
-            }
-            tp
-        })
-    })
+    *PROXY_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("weakproxy", init_proxy_type);
+        unsafe {
+            pyre_object::w_type_set_hasdict(tp, true);
+            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+        }
+        tp as usize
+    }) as PyObjectRef
 }
 
 /// pypy/module/_weakref/interp__weakref.py:412-418 W_CallableProxy.typedef
@@ -303,17 +312,14 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
 /// `dont_look_inside` for the same reason as [`proxy_type`].
 #[majit_macros::dont_look_inside]
 pub fn callable_proxy_type() -> PyObjectRef {
-    CALLABLE_PROXY_TYPE.with(|cell| {
-        *cell.get_or_init(|| {
-            let tp =
-                crate::typedef::make_builtin_type("weakcallableproxy", init_callable_proxy_type);
-            unsafe {
-                pyre_object::w_type_set_hasdict(tp, true);
-                pyre_object::w_type_set_acceptable_as_base_class(tp, false);
-            }
-            tp
-        })
-    })
+    *CALLABLE_PROXY_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("weakcallableproxy", init_callable_proxy_type);
+        unsafe {
+            pyre_object::w_type_set_hasdict(tp, true);
+            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+        }
+        tp as usize
+    }) as PyObjectRef
 }
 
 // ── WeakrefLifeline ───────────────────────────────────────────────────
@@ -342,7 +348,52 @@ pub fn weakref_lifeline_new() -> PyObjectRef {
     let _root = InstanceRoot::new(&mut obj);
     write_attr(obj, ATTR_CACHED_WEAKREF, pyre_object::w_none());
     write_attr(obj, ATTR_CACHED_PROXY, pyre_object::w_none());
+    write_attr(obj, ATTR_OTHER_REFS_WEAK, pyre_object::w_none());
+    write_attr(obj, ATTR_HAS_CALLBACKS, pyre_object::w_bool_from(false));
     obj
+}
+
+/// pypy/module/_weakref/interp__weakref.py:30-33
+/// `WeakrefLifeline.append_wref_to`.
+fn append_wref_to(self_lifeline: PyObjectRef, w_ref: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_lifeline);
+    pyre_object::gc_roots::pin_root(w_ref);
+    let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+    );
+    pyre_object::gc_roots::pin_root(weak);
+    let lifeline = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let mut refs = read_attr(lifeline, ATTR_OTHER_REFS_WEAK);
+    if refs.is_null() {
+        refs = pyre_object::w_list_new_object(vec![pyre_object::gc_roots::shadow_stack_get(
+            root_base + 2,
+        )]);
+        write_attr(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            ATTR_OTHER_REFS_WEAK,
+            refs,
+        );
+    } else {
+        unsafe {
+            pyre_object::w_list_append(refs, pyre_object::gc_roots::shadow_stack_get(root_base + 2))
+        };
+    }
+}
+
+/// pypy/module/_weakref/interp__weakref.py:105-109
+/// `WeakrefLifeline.enable_callbacks`.
+fn enable_callbacks(self_lifeline: PyObjectRef) {
+    let enabled = read_attr(self_lifeline, ATTR_HAS_CALLBACKS);
+    if !enabled.is_null() && crate::baseobjspace::is_true(enabled).unwrap_or(false) {
+        return;
+    }
+    write_attr(
+        self_lifeline,
+        ATTR_HAS_CALLBACKS,
+        pyre_object::w_bool_from(true),
+    );
 }
 
 /// pypy/module/_weakref/interp__weakref.py:60-77 get_or_make_weakref
@@ -449,13 +500,10 @@ pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyOb
 ///     return space.w_None
 /// ```
 pub fn get_any_weakref(self_lifeline: PyObjectRef) -> PyObjectRef {
-    // interp__weakref.py:95-98: cached_weakref is a weakref TO the
-    // W_Weakref; w_ref = self.cached_weakref() returns the W_Weakref
-    // or None.
-    let cached_slot = read_attr(self_lifeline, ATTR_CACHED_WEAKREF);
-    let cached = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(cached_slot) };
-    if !cached.is_null() {
-        return cached;
+    for w_ref in lifeline_refs(self_lifeline) {
+        if is_w_weakref(w_ref) {
+            return w_ref;
+        }
     }
     pyre_object::w_none()
 }
@@ -473,12 +521,15 @@ pub fn get_any_weakref(self_lifeline: PyObjectRef) -> PyObjectRef {
 ///     return w_ref
 /// ```
 pub fn make_weakref_with_callback(
-    _self_lifeline: PyObjectRef,
+    self_lifeline: PyObjectRef,
     w_subtype: PyObjectRef,
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    W_Weakref_new(w_subtype, w_obj, w_callable)
+    let w_ref = W_Weakref_new(w_subtype, w_obj, w_callable);
+    append_wref_to(self_lifeline, w_ref);
+    enable_callbacks(self_lifeline);
+    w_ref
 }
 
 /// pypy/module/_weakref/interp__weakref.py:120-129 make_proxy_with_callback
@@ -496,15 +547,18 @@ pub fn make_weakref_with_callback(
 ///     return w_proxy
 /// ```
 pub fn make_proxy_with_callback(
-    _self_lifeline: PyObjectRef,
+    self_lifeline: PyObjectRef,
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    if is_callable(w_obj) {
+    let w_proxy = if is_callable(w_obj) {
         W_CallableProxy_new(w_obj, w_callable)
     } else {
         W_Proxy_new(w_obj, w_callable)
-    }
+    };
+    append_wref_to(self_lifeline, w_proxy);
+    enable_callbacks(self_lifeline);
+    w_proxy
 }
 
 // ── W_WeakrefBase / W_Weakref ─────────────────────────────────────────
@@ -764,6 +818,18 @@ pub fn descr__ne__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     compare(args[0], args[1], true)
 }
 
+/// pypy/module/_weakref/interp__weakref.py:252-253
+/// `__callback__ = GetSetProperty(W_Weakref.descr_callback)`.
+/// GetSetProperty passes `(descriptor, instance)` to the getter.
+pub fn descr_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_callable = read_attr(args[1], ATTR_W_CALLABLE);
+    if w_callable.is_null() {
+        Ok(pyre_object::w_none())
+    } else {
+        Ok(w_callable)
+    }
+}
+
 fn is_w_weakref(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -797,7 +863,83 @@ pub fn getlifeline(w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     let lifeline = weakref_lifeline_new();
     crate::baseobjspace::setweakref(w_obj, lifeline)?;
+    // RPython's collector invalidates every rweakref when its target dies.
+    // pyre routes the equivalent lifeline clear through the shared finalizer
+    // queue, including for refs/proxies without callbacks.
+    crate::executioncontext::register_weakref_finalizer(w_obj);
     Ok(lifeline)
+}
+
+fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
+    let mut refs = Vec::new();
+    for name in [ATTR_CACHED_WEAKREF, ATTR_CACHED_PROXY] {
+        let weak = read_attr(lifeline, name);
+        let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
+        if !w_ref.is_null() {
+            refs.push(w_ref);
+        }
+    }
+    let others = read_attr(lifeline, ATTR_OTHER_REFS_WEAK);
+    if !others.is_null() {
+        let length = unsafe { pyre_object::w_list_len(others) };
+        for i in 0..length {
+            let Some(weak) = (unsafe { pyre_object::w_list_getitem(others, i as i64) }) else {
+                continue;
+            };
+            let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
+            if !w_ref.is_null() {
+                refs.push(w_ref);
+            }
+        }
+    }
+    refs
+}
+
+/// `WeakrefLifeline._finalize_` (interp__weakref.py:131-153), invoked
+/// from pyre's shared finalizer queue when the referent becomes unreachable.
+pub fn finalize_weakrefs(w_obj: PyObjectRef) {
+    let Some(lifeline) = crate::baseobjspace::getweakref(w_obj) else {
+        return;
+    };
+    let refs = lifeline_refs(lifeline);
+
+    // `clear_all_weakrefs` / rweakref invalidation must be visible before a
+    // callback runs: every callback observes `ref() is None`.
+    for &w_ref in &refs {
+        let target = read_attr(w_ref, ATTR_W_OBJ_WEAK);
+        unsafe { pyre_object::weakref::w_gc_weakref_box_clear(target) };
+        write_attr(w_ref, ATTR_W_OBJ_WEAK, pyre_object::w_none());
+    }
+
+    // PyPy runs `other_refs_weak` in reverse creation order. Cached refs and
+    // proxies have no callback and therefore need only the clearing above.
+    for &w_ref in refs.iter().rev() {
+        let w_callable = read_attr(w_ref, ATTR_W_CALLABLE);
+        if w_callable.is_null() {
+            continue;
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_ref);
+        pyre_object::gc_roots::pin_root(w_callable);
+        let current_ref = || pyre_object::gc_roots::shadow_stack_get(root_base);
+        let current_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        if let Err(error) =
+            crate::call::call_function_impl_result(current_callable(), &[current_ref()])
+        {
+            let ec = crate::call::getexecutioncontext();
+            if !ec.is_null() {
+                crate::executioncontext::report_error(
+                    unsafe { (*ec).space },
+                    &error,
+                    "weakref callback ",
+                    current_callable(),
+                );
+            }
+        }
+        write_attr(current_ref(), ATTR_W_CALLABLE, pyre_object::w_none());
+    }
+    crate::baseobjspace::delweakref(w_obj);
 }
 
 /// pypy/module/_weakref/interp__weakref.py:260-268 descr__new__weakref
@@ -873,15 +1015,9 @@ pub fn getweakrefcount(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj = args[0];
     let count = match crate::baseobjspace::getweakref(w_obj) {
         None => 0,
-        Some(lifeline) => {
-            // interp__weakref.py:286: `if wref() is not None: count += 1`
-            let cached_slot = read_attr(lifeline, ATTR_CACHED_WEAKREF);
-            let cached =
-                unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(cached_slot) };
-            if !cached.is_null() { 1 } else { 0 }
-        }
+        Some(lifeline) => lifeline_refs(lifeline).len(),
     };
-    Ok(pyre_object::w_int_new(count))
+    Ok(pyre_object::w_int_new(count as i64))
 }
 
 /// pypy/module/_weakref/interp__weakref.py:297-309 getweakrefs
@@ -900,15 +1036,9 @@ pub fn getweakrefs(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         return Ok(pyre_object::w_list_new(vec![]));
     }
     let w_obj = args[0];
-    let mut result = Vec::new();
-    if let Some(lifeline) = crate::baseobjspace::getweakref(w_obj) {
-        // interp__weakref.py:300-302: deref each cached wref; live ones go in.
-        let cached_slot = read_attr(lifeline, ATTR_CACHED_WEAKREF);
-        let cached = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(cached_slot) };
-        if !cached.is_null() {
-            result.push(cached);
-        }
-    }
+    let result = crate::baseobjspace::getweakref(w_obj)
+        .map(lifeline_refs)
+        .unwrap_or_default();
     Ok(pyre_object::w_list_new(result))
 }
 

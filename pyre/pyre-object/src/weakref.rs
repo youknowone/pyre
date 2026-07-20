@@ -230,6 +230,23 @@ pub unsafe fn w_gc_weakref_box_deref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { w_weakref_deref(wref) }
 }
 
+/// Clear the wrapped rweakref, mirroring
+/// `W_WeakrefBase.clear(): self.w_obj_weak = dead_ref`.
+///
+/// # Safety
+///
+/// `obj` must either be null or a live `GcWeakrefBox`.
+pub unsafe fn w_gc_weakref_box_clear(obj: PyObjectRef) {
+    if !unsafe { is_gc_weakref_box(obj) } {
+        return;
+    }
+    let boxed = obj as *mut GcWeakrefBox;
+    let wref = unsafe { (*boxed).inner };
+    if !wref.is_null() {
+        unsafe { (*wref).weakptr = std::ptr::null_mut() };
+    }
+}
+
 /// Allocate a GcWeakrefBox for `target`, falling back to a strong
 /// PyObjectRef when no GC hook is installed (unit-test environments
 /// that did not wire `pyre-jit`). The strong-ref fallback restores
