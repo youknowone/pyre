@@ -837,6 +837,19 @@ pub fn init_typeobjects() {
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
             seq_iterator_type as usize,
         );
+        let callable_iterator_type = new_typeobject_with_base(
+            "callable_iterator",
+            init_callable_iterator_type,
+            object_type,
+        );
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(callable_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(callable_iterator_type, false);
+        }
+        reg.insert(
+            &pyre_object::operation::CALLABLE_ITERATOR_TYPE as *const PyType as usize,
+            callable_iterator_type as usize,
+        );
         for (pytype, name, init) in [
             (
                 &pyre_object::iterobject::LIST_ITER_TYPE as *const PyType,
@@ -21443,6 +21456,31 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+/// Python 3.14 `PyCallIter_Type` (`callable_iterator`) surface. PyPy 3.11's
+/// `_CallableIterator` is app-level and has only the iteration methods; 3.14
+/// additionally exposes the native pickle reduction hook.
+fn init_callable_iterator_type(ns: PyObjectRef) {
+    for (name, function) in [
+        (
+            "__iter__",
+            crate::baseobjspace::iter_self_method as fn(&[PyObjectRef]) -> crate::PyResult,
+        ),
+        ("__next__", crate::baseobjspace::iter_next_method),
+        (
+            "__reduce__",
+            crate::baseobjspace::callable_iter_reduce_method,
+        ),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, function, 1),
+            )
+        };
     }
 }
 

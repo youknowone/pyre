@@ -30,7 +30,7 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-#[pyre_class("_CallableIterator", static_name = "CALLABLE_ITERATOR")]
+#[pyre_class("callable_iterator", static_name = "CALLABLE_ITERATOR")]
 pub struct _CallableIterator {
     /// The zero-argument callable invoked on each `__next__`.  Set to
     /// `PY_NULL` once the sentinel has been returned, latching the

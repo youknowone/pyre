@@ -1941,6 +1941,44 @@ pub(crate) fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// Python 3.14 `calliter_reduce` — a live `iter(callable, sentinel)` reduces
+/// to `(iter, (callable, sentinel))`; an exhausted iterator reduces through
+/// the same empty-iterator shape as the other builtin iterators.
+pub(crate) fn callable_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    if obj.is_null() || unsafe { !pyre_object::operation::is_callable_iterator(obj) } {
+        return Err(PyError::type_error(
+            "descriptor '__reduce__' requires a 'callable_iterator' object",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    pyre_object::gc_roots::pin_root(builtin_callable("iter"));
+    let obj = pyre_object::gc_roots::shadow_stack_get(sp);
+    let callable = unsafe { pyre_object::operation::w_callable_iterator_get_callable(obj) };
+    let state = if callable.is_null() {
+        let empty = w_tuple_new(vec![]);
+        pyre_object::gc_roots::pin_root(empty);
+        w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(
+            pyre_object::gc_roots::shadow_stack_len() - 1,
+        )])
+    } else {
+        let sentinel = unsafe { pyre_object::operation::w_callable_iterator_get_sentinel(obj) };
+        pyre_object::gc_roots::pin_root(callable);
+        pyre_object::gc_roots::pin_root(sentinel);
+        w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            pyre_object::gc_roots::shadow_stack_get(sp + 3),
+        ])
+    };
+    pyre_object::gc_roots::pin_root(state);
+    Ok(w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(sp + 1),
+        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+    ]))
+}
+
 /// `sequenceiterator.__setstate__(index)` — `iterobject.py:40-45
 /// W_AbstractSeqIterObject.descr_setstate`: restore the cursor only while the
 /// sequence is live, clamping a negative index to 0.  There is no upper clamp —
@@ -4450,6 +4488,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 match name {
                     "__reduce__" => Some((zip_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((zip_setstate_method, "__setstate__", 2)),
+                    _ => None,
+                }
+            } else if pyre_object::operation::is_callable_iterator(obj) {
+                match name {
+                    "__reduce__" => Some((callable_iter_reduce_method, "__reduce__", 1)),
                     _ => None,
                 }
             } else {
