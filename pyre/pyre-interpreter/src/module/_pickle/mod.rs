@@ -425,7 +425,8 @@ crate::py_module! {
         "Unpickler" => unpickler::type_object(),
         // Shared singleton with `__pypy__.PickleBuffer`; `pickle.py` does
         // `from _pickle import PickleBuffer` to set `_HAVE_PICKLE_BUFFER`.
-        "PickleBuffer" => crate::module::__pypy__::interp_buffer::type_object(),
+        "PickleBuffer" =>
+            crate::module::__pypy__::interp_buffer::picklebuffer_type_object(),
     },
     exceptions: {
         "PickleError" => crate::builtins::lookup_exc_class("Exception")

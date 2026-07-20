@@ -25,7 +25,7 @@ crate::py_module! {
     // buffers; `identity_dict` keys a memo by object identity (id(key))
     // so the Pickler can memoize unhashable containers.
     interpleveldefs: {
-        "PickleBuffer" => interp_buffer::type_object(),
+        "PickleBuffer" => interp_buffer::picklebuffer_type_object(),
     },
     appleveldefs: {
         "identity_dict_app.py" =>

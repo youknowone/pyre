@@ -15,29 +15,39 @@ pub struct W_PickleBuffer {
 }
 
 #[crate::pyre_methods(
-    doc = "PickleBuffer(buffer) -> wrapper for potentially out-of-band serialization."
+    doc = "PickleBuffer(buffer) -> wrapper for potentially out-of-band serialization.",
+    // interp_buffer.py:209 make_weakref_descr(W_PickleBuffer)
+    weakrefable
 )]
 impl W_PickleBuffer {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
-        W_PickleBuffer::allocate(W_PickleBuffer {
-            ob: pyre_object::PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
-            },
-            w_obj: pyre_object::w_none(),
-        })
-    }
-
-    fn __init__(&mut self, buffer: PyObjectRef) -> Result<(), PyError> {
-        if !is_buffer_like(buffer) {
-            let name = type_name(buffer);
+    fn __new__(_cls: PyObjectRef, w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        // interp_buffer.py:201-203 descr_new_picklebuffer — acquire the
+        // export while constructing the object; PickleBuffer has no separate
+        // __init__ phase.
+        if !is_buffer_like(w_obj) {
+            let name = type_name(w_obj);
             return Err(PyError::type_error(format!(
                 "a bytes-like object is required, not '{name}'"
             )));
         }
-        self.w_obj = buffer;
-        Ok(())
+        // `space.buffer_w(w_obj, BUF_FULL_RO)` rejects a released
+        // memoryview at construction time, before the PickleBuffer exists.
+        if is_memoryview(w_obj) {
+            unsafe { crate::builtins::memoryview_check_released(w_obj) }?;
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        // `allocate` may collect; store the post-collection exporter rather
+        // than the stale Rust-stack copy.
+        Ok(W_PickleBuffer::allocate(W_PickleBuffer {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_obj: pyre_object::gc_roots::shadow_stack_get(sp),
+        }))
     }
 
     /// `raw()` — a memoryview of the raw bytes underlying the wrapped buffer.
@@ -70,6 +80,16 @@ impl W_PickleBuffer {
     fn release(&mut self) {
         self.w_obj = pyre_object::w_none();
     }
+}
+
+/// `W_PickleBuffer.typedef.acceptable_as_base_class = False` — return the
+/// shared type after applying PyPy's explicit final-type flag. Both
+/// `__pypy__.PickleBuffer` and `_pickle.PickleBuffer` call this accessor, so
+/// the flag is installed regardless of which module is imported first.
+pub(crate) fn picklebuffer_type_object() -> PyObjectRef {
+    let tp = type_object();
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
+    tp
 }
 
 impl W_PickleBuffer {

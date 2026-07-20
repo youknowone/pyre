@@ -126,6 +126,30 @@ def test_bytesio_readinto():
 test_bytesio_readinto()
 
 
+# PyPy interp_buffer.py descr_new_picklebuffer acquires the buffer in
+# __new__, and its typedef is explicitly final.  CPython 3.14 exposes the
+# same constructor and final-type behavior through pickle.PickleBuffer.
+pickle_buffer_source = bytearray(b"abc")
+pickle_buffer = pickle.PickleBuffer(memoryview(pickle_buffer_source))
+assert pickle_buffer.raw().tobytes() == b"abc"
+pickle_buffer_source[0] = ord("z")
+assert pickle_buffer.raw().tobytes() == b"zbc"
+assert weakref.ref(pickle_buffer)() is pickle_buffer
+
+assert_raises(TypeError, lambda: pickle.PickleBuffer(1))
+released_pickle_buffer_source = memoryview(b"released")
+released_pickle_buffer_source.release()
+assert_raises(ValueError, lambda: pickle.PickleBuffer(released_pickle_buffer_source))
+
+
+def subclass_pickle_buffer():
+    class PickleBufferSubclass(pickle.PickleBuffer):
+        pass
+
+
+assert_raises(TypeError, subclass_pickle_buffer)
+
+
 def test_pickle_rejected():
     view = memoryview(b"abc")
     assert_raises(TypeError, lambda: copy.copy(view))
