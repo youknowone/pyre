@@ -375,37 +375,69 @@ pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `cast_int_to_float/i>f` handler. Operand layout `i>f` (1B i-src +
-/// 1B f-dst). RPython parity: `pyjitpl.py:357 cast_int_to_float`
-/// belongs to the same exec-generated unary opimpl loop —
-/// `self.execute(rop.CAST_INT_TO_FLOAT, b)`. Result lands in the
-/// float bank (the `>f` decorator) instead of the int bank.
-pub(crate) fn cast_int_to_float_record<Sym: WalkSym>(
+/// Bank-crossing unary cast family from the `pyjitpl.py`
+/// exec-generated unary loop (`cast_int_to_float` / `cast_int_to_ptr`
+/// / `cast_ptr_to_int`). PyPy generates these from one template
+/// because its boxes are untyped; pyre's typed register banks make
+/// each cast a distinct (src-bank, dst-bank, concrete-fold) triple, so
+/// the recorded `opcode` selects the shape. Operand layout `<s>><d>`
+/// (1B src + 1B dst); the recorded result lands in the destination
+/// bank per the trailing `>X` decorator.
+pub(crate) fn unop_cast_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let a = read_int_reg(code, op, 0, ctx)?;
-    let result = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[a]);
-    // Box.value parity — if `a`'s runtime concrete is known, stamp
-    // the cast result with the corresponding float bit-pattern so
-    // downstream `box_value(result)` callers see the live value.
-    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
-        ctx.trace_ctx
-            .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
-    }
     let dst = code[op.pc + 2] as usize;
-    let len = ctx.registers_f.len();
-    let slot = ctx
-        .registers_f
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "f",
-        })?;
-    *slot = result;
+    match opcode {
+        // `cast_int_to_float/i>f`: Int-bank → Float-bank. Stamp the
+        // result with the operand's Box.value as an f64 so downstream
+        // `box_value(result)` callers see the live value.
+        OpCode::CastIntToFloat => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(opcode, &[a]);
+            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
+            }
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = result;
+        }
+        // `cast_int_to_ptr/i>r`: Int-bank → Ref-bank. Bit-cast the
+        // operand's Box.value (`BoxInt(n)` → `BoxRef(n as ptr)`).
+        OpCode::CastIntToPtr => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(opcode, &[a]);
+            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(n as usize)));
+            }
+            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+        }
+        // `cast_ptr_to_int/r>i`: Ref-bank → Int-bank. Bit-cast the
+        // operand's Box.value (`BoxRef(p)` → `BoxInt(p as i64)`).
+        OpCode::CastPtrToInt => {
+            let a = read_ref_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(opcode, &[a]);
+            if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(a) {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Int(r.0 as i64));
+            }
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
+        _ => panic!("unop_cast_record: unsupported opcode {opcode:?}"),
+    }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -575,6 +607,15 @@ regular_record_table! {
     }
     unop_float_record {
         "float_neg/f>f" => FloatNeg,
+    }
+    // Bank-crossing unary casts from the same `pyjitpl.py:356-368`
+    // generated unary loop; `unop_cast_record` selects the src/dst bank
+    // shape from the opcode (pyre's typed banks cannot share one template
+    // the way PyPy's untyped boxes do).
+    unop_cast_record {
+        "cast_int_to_float/i>f" => CastIntToFloat,
+        "cast_int_to_ptr/i>r" => CastIntToPtr,
+        "cast_ptr_to_int/r>i" => CastPtrToInt,
     }
     // `ptr_eq` / `ptr_ne` (`pyjitpl.py:326-336`): Ref operands, int result.
     binop_ref_to_int_record {

@@ -7269,38 +7269,10 @@ fn handle<Sym: WalkSym>(
         // long_mod / long_div until the build-pipeline jtransform
         // port lands) get a `setdefault`-allocated dynamic byte and
         // resolve through BH dispatch only.
-        "cast_int_to_float/i>f" => cast_int_to_float_record(code, op, ctx),
-        // `cast_int_to_ptr/i>r`: RPython `pyjitpl.py:357` exec-generated
-        // unary, same shape as `cast_int_to_float` but result lands in
-        // the Ref bank. The recorded op is `CastIntToPtr`.
-        "cast_int_to_ptr/i>r" => {
-            let a = read_int_reg(code, op, 0, ctx)?;
-            let result = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[a]);
-            let dst = code[op.pc + 2] as usize;
-            // Box(value) parity: bit-cast the operand's Box.value
-            // (BoxInt(n) → BoxRef(n as ptr)).
-            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
-                ctx.trace_ctx
-                    .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(n as usize)));
-            }
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        // `cast_ptr_to_int/r>i`: Ref-bank → Int-bank cast.
-        "cast_ptr_to_int/r>i" => {
-            let a = read_ref_reg(code, op, 0, ctx)?;
-            let result = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[a]);
-            // Box(value) parity: bit-cast the operand's Box.value
-            // (BoxRef(p) → BoxInt(p as i64)).
-            if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(a) {
-                ctx.trace_ctx
-                    .set_opref_concrete(result, majit_ir::Value::Int(r.0 as i64));
-            }
-            let dst = code[op.pc + 2] as usize;
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
-            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
+        // `cast_int_to_float` / `cast_int_to_ptr` / `cast_ptr_to_int`
+        // route through `dispatch_regular_record` (see `arith.rs`
+        // `unop_cast_record`) — part of the `pyjitpl.py:356-368`
+        // exec-generated unary family.
         "ptr_nonzero/r>i" => ptr_nullity_record(code, op, ctx, true),
         "ptr_iszero/r>i" => ptr_nullity_record(code, op, ctx, false),
         "ref_guard_value/r" => ref_guard_value_record(code, op, ctx),
