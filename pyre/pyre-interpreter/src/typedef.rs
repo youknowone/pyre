@@ -9160,13 +9160,12 @@ fn init_type_type(ns: PyObjectRef) {
     // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
     let mro_method = make_builtin_function("mro", |args| {
         let cls = args[0];
-        unsafe {
-            let mro_ptr = pyre_object::w_type_get_mro(cls);
-            if mro_ptr.is_null() {
-                return Ok(pyre_object::w_list_new(vec![]));
-            }
-            Ok(pyre_object::w_list_new((*mro_ptr).to_vec()))
-        }
+        // typeobject.py:1081-1084 `descr_mro` computes the default C3 MRO
+        // afresh. In particular this is callable from `Meta.mro()` while the
+        // nascent class has not installed its final MRO yet.
+        Ok(pyre_object::w_list_new(unsafe {
+            crate::baseobjspace::compute_default_mro(cls)
+        }))
     });
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
 
@@ -9186,7 +9185,7 @@ fn init_type_type(ns: PyObjectRef) {
                 ));
             }
         };
-        let subs = unsafe { pyre_object::w_type_get_subclasses(cls) };
+        let subs = unsafe { pyre_object::w_type_get_subclasses(cls, true) };
         Ok(pyre_object::w_list_new(subs))
     });
     unsafe {

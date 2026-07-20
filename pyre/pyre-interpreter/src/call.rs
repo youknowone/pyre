@@ -3710,20 +3710,10 @@ fn build_class_inner(
                 "metaclass call for {name} returned NULL"
             )));
         }
-        // baseobjspace.py:76 getclass() — set w_class to the metaclass
-        // so type(C) returns the correct metatype.
-        if unsafe { pyre_object::is_type(result) } {
-            let mro = unsafe { crate::baseobjspace::compute_default_mro(result) };
-            unsafe { pyre_object::w_type_set_mro(result, mro) };
-            // typeobject.py:373-377 ready() — register self on each
-            // base's `weak_subclasses` after MRO is in place.
-            unsafe { pyre_object::typeobject::w_type_ready(result) };
-            unsafe {
-                if (*result).w_class.is_null() {
-                    (*result).w_class = w_metaclass;
-                }
-            }
-        }
+        // compiling.py:224 `w_class = space.call_args(w_meta, args)` returns
+        // the metaclass result unchanged. `type.__new__` owns classcell, MRO,
+        // ready(), and metaclass identity; a custom metaclass that bypasses
+        // type.__new__ must not be repaired or overwritten here.
         result
     } else {
         // No metaclass observes the namespace on the default path, so

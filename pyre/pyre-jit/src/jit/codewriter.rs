@@ -11794,20 +11794,40 @@ impl CodeWriter {
                         // mirroring the STORE_FAST shadow write.
                         Instruction::StoreDeref { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
-                            emit_load_fast_ref!(current_depth, idx, py_pc);
-                            let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "store_deref_value",
-                                vec![cell_value.into(), value_value.into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            {
+                            // CPython 3.14 emits STORE_NAME for an explicit
+                            // class-body `__class__` binding.  Normalize the
+                            // pinned compiler's STORE_DEREF exactly as the
+                            // interpreter opcode boundary does, preserving the
+                            // distinct implicit cell filled by type.__new__.
+                            if pyre_interpreter::pyframe::class_scope_class_deref_is_name(
+                                code,
+                                idx as usize,
+                            ) {
+                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let name = super::flow::Constant::string("__class__");
+                                emit_frontend_store_name(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    frame_var.into(),
+                                    name.into(),
+                                    value_value,
+                                    py_pc as i64,
+                                );
+                            } else {
+                                emit_load_fast_ref!(current_depth, idx, py_pc);
+                                let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "store_deref_value",
+                                    vec![cell_value.into(), value_value.into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
                                 let local_slot = local_to_vable_slot(idx as usize) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -11822,8 +11842,8 @@ impl CodeWriter {
                                     None,
                                     py_pc as i64,
                                 );
+                                current_state.store_local_value(idx as usize, result_value.into());
                             }
-                            current_state.store_local_value(idx as usize, result_value.into());
                         }
 
                         // MAKE_CELL: wraps the slot value in a cell. Touches
@@ -12079,51 +12099,63 @@ impl CodeWriter {
                         // that they are bound (pyopcode.py:597 DELETE_DEREF).
                         Instruction::DeleteDeref { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let deref_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(idx as i64).into();
-                            emit_load_fast_ref!(current_depth, idx, py_pc);
-                            let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _checked = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_deref_value",
-                                vec![
-                                    cell_value.clone().into(),
-                                    code_const.into(),
-                                    deref_idx_const.into(),
-                                ],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "store_deref_value",
-                                vec![cell_value.into(), super::flow::Constant::none().into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            let local_slot = local_to_vable_slot(idx as usize) as i64;
-                            let v_idx: super::flow::FlowValue =
-                                super::flow::Constant::signed(local_slot).into();
-                            record_graph_op(
-                                &current_block.block(),
-                                "setarrayitem_vable_r",
-                                vable_setarrayitem_ref_graph_args(
-                                    frame_var.into(),
-                                    v_idx.into(),
-                                    super::flow::FlowValue::from(result_value).into(),
-                                ),
-                                None,
-                                py_pc as i64,
-                            );
-                            current_state.store_local_value(idx as usize, result_value.into());
+                            if pyre_interpreter::pyframe::class_scope_class_deref_is_name(
+                                code,
+                                idx as usize,
+                            ) {
+                                // DELETE_NAME already forms a permanent trace
+                                // boundary.  Resume this compiler-normalized
+                                // case in the interpreter with the namespace
+                                // and operand stack untouched.
+                                emit_abort_permanent!(py_pc);
+                            } else {
+                                let code_const: super::flow::FlowValue =
+                                    super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                        Some(Kind::Ref),
+                                    )
+                                    .into();
+                                let deref_idx_const: super::flow::FlowValue =
+                                    super::flow::Constant::signed(idx as i64).into();
+                                emit_load_fast_ref!(current_depth, idx, py_pc);
+                                let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let _checked = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_deref_value",
+                                    vec![
+                                        cell_value.clone().into(),
+                                        code_const.into(),
+                                        deref_idx_const.into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "store_deref_value",
+                                    vec![cell_value.into(), super::flow::Constant::none().into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                let local_slot = local_to_vable_slot(idx as usize) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        super::flow::FlowValue::from(result_value).into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
+                                current_state.store_local_value(idx as usize, result_value.into());
+                            }
                         }
 
                         // Instructions that don't touch the operand stack (locals/cells only).

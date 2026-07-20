@@ -6872,7 +6872,7 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
         pyre_object::w_type_set_hasuserdel(w_type, true);
     }
     // typeobject.py:288-291 — walk direct subclasses recursively.
-    let subs = pyre_object::typeobject::w_type_get_subclasses(w_type);
+    let subs = pyre_object::typeobject::w_type_get_subclasses(w_type, false);
     for w_sub in subs {
         mutated(w_sub, key);
     }
@@ -7579,6 +7579,69 @@ pub unsafe fn super_lookup_binding(
 /// Public wrapper for use by isinstance and other external callers.
 pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     compute_mro(w_type)
+}
+
+/// `typeobject.py:1595-1613 compute_mro` — install the default C3 MRO, or
+/// call a heap type's metaclass override before installing its validated
+/// result.
+///
+/// The new type already has its metaclass and `__classcell__` installed when
+/// this runs. That ordering is observable: a custom `Meta.mro()` may execute
+/// a method from the nascent class dictionary, and that method's
+/// zero-argument `super()` / `__class__` closure must already resolve to the
+/// new type.
+pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
+    let default_mro = compute_default_mro(w_self);
+    if pyre_object::w_type_is_heaptype(w_self) {
+        let w_metaclass = (*w_self).w_class;
+        if !w_metaclass.is_null() {
+            if let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(w_metaclass, "mro")
+            {
+                if !std::ptr::eq(w_where, crate::typedef::w_type()) {
+                    let w_mro = get_and_call_function(w_mro_func, w_self, w_metaclass, &[])?;
+                    let mro_w = crate::builtins::collect_iterable(w_mro)?;
+                    // `fixedview` keeps PyPy's items GC-visible through the
+                    // returned list.  Pyre materializes an untraced Rust Vec,
+                    // so pin every yielded class while validation can execute
+                    // Python (`abstract_isclass_w`) and allocate.
+                    let _mro_roots = pyre_object::gc_roots::push_roots();
+                    let mro_root_start = pyre_object::gc_roots::shadow_stack_len();
+                    for &w_class in &mro_w {
+                        pyre_object::gc_roots::pin_root(w_class);
+                    }
+                    for index in 0..mro_w.len() {
+                        let w_class =
+                            pyre_object::gc_roots::shadow_stack_get(mro_root_start + index);
+                        if !abstract_isclass_w(w_class)? {
+                            return Err(PyError::type_error("mro() returned a non-class"));
+                        }
+                    }
+                    let mro_w: Vec<_> = (0..mro_w.len())
+                        .map(|index| {
+                            pyre_object::gc_roots::shadow_stack_get(mro_root_start + index)
+                        })
+                        .collect();
+                    pyre_object::w_type_set_mro(w_self, mro_w.clone());
+
+                    // typeobject.py `_add_mro_classes_as_subclasses`: custom
+                    // MRO entries outside the default hierarchy participate
+                    // in invalidation just like real bases.
+                    for w_ancestor in mro_w {
+                        if !default_mro
+                            .iter()
+                            .any(|&default| std::ptr::eq(default, w_ancestor))
+                            && pyre_object::is_type(w_ancestor)
+                        {
+                            pyre_object::typeobject::w_type_add_subclass(w_ancestor, w_self);
+                        }
+                    }
+                    return Ok(pyre_object::w_none());
+                }
+            }
+        }
+    }
+    pyre_object::w_type_set_mro(w_self, default_mro);
+    Ok(pyre_object::w_none())
 }
 
 /// Reject a base tuple whose C3 merge has no valid next head.

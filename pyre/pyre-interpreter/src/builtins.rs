@@ -3823,20 +3823,24 @@ fn type_descr_new_with_metaclass(
         unsafe {
             (*w_type).w_class = w_metaclass;
         }
-        let mro = unsafe { crate::baseobjspace::compute_default_mro(w_type) };
-        unsafe { pyre_object::w_type_set_mro(w_type, mro) };
-        // typeobject.py:373-377 ready() — link self into each base's
-        // `weak_subclasses` so `mutated()` and `__subclasses__()`
-        // observe this class.
-        unsafe { pyre_object::typeobject::w_type_ready(w_type) };
 
         // type_new_classcell — bind the captured `__classcell__` to the
         // new type so `__class__` / zero-arg `super()` in the methods
         // resolve; the key was already dropped from the namespace above.
+        // PyPy `_store_type_in_classcell` runs before W_TypeObject.__init__,
+        // whose `ensure_common_attributes` invokes a custom metaclass mro().
         if let Some(classcell_root) = classcell_root {
             let classcell = pyre_object::gc_roots::shadow_stack_get(classcell_root);
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
+
+        // typeobject.py:1595-1613 compute_mro — a custom metaclass `mro`
+        // runs after the class cell is bound and before ready().
+        unsafe { crate::baseobjspace::compute_and_set_mro(w_type)? };
+        // typeobject.py:373-377 ready() — link self into each base's
+        // `weak_subclasses` so `mutated()` and `__subclasses__()`
+        // observe this class.
+        unsafe { pyre_object::typeobject::w_type_ready(w_type) };
 
         // _set_names (typeobject.py:1006) — call `__set_name__(owner, name)`
         // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),

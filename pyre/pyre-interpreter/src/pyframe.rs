@@ -1465,6 +1465,32 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
     }
 }
 
+/// Whether the pinned RustPython compiler encoded a class-namespace
+/// `__class__` assignment as `STORE_DEREF`.  CPython 3.14 emits `STORE_NAME`
+/// for the explicit binding while retaining the separate implicit
+/// `__class__` cell used by methods.  A class body is non-optimized and the
+/// affected slot is a cell variable, never a free variable (`nonlocal
+/// __class__` must continue to mutate its enclosing cell).
+#[inline]
+pub fn class_scope_class_deref_is_name(code: &CodeObject, idx: usize) -> bool {
+    if code.flags.contains(CodeFlags::OPTIMIZED) {
+        return false;
+    }
+    let (name, is_free) = deref_name_and_kind(code, idx);
+    !is_free && name == "__class__"
+}
+
+/// Unified localsplus index of an outer `__class__` free variable, when a
+/// class body also owns the distinct implicit `__class__` cell.  CPython 3.14
+/// addresses this collision with `LOAD_FROM_DICT_OR_DEREF`.
+pub fn class_scope_outer_class_freevar(code: &CodeObject) -> Option<usize> {
+    let free_pos = code
+        .freevars
+        .iter()
+        .position(|name| name.as_str() == "__class__")?;
+    Some(code.varnames.len() + npure_cellvars(code) + free_pos)
+}
+
 pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
     let (name, is_free) = deref_name_and_kind(code, idx);
     let message = if is_free {

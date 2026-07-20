@@ -181,7 +181,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         }
     }
     // _py_abc.py:140-144 — subclass of a subclass (recursive).
-    for scls in unsafe { w_type_get_subclasses(cls) } {
+    for scls in unsafe { w_type_get_subclasses(cls, false) } {
         if crate::baseobjspace::issubclass(subclass, scls)? {
             return Ok(true);
         }

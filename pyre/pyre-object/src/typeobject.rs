@@ -1092,15 +1092,16 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
 /// Returns the recorded direct subclasses.  Under PyPy's weakref
 /// path, dead refs are filtered; pyre's strong-ref fallback has
 /// no dead entries to filter so the result is a copy of the
-/// stored vector.  The `only_real_subclasses` flag from PyPy
-/// (`:672-688`) — used by `descr___subclasses__` to filter
-/// metaclass-mro override leaks — is omitted because pyre has no
-/// `_add_mro_classes_as_subclasses` call site yet; invalidation
-/// callers only need the inclusive list.
+/// stored vector.  `only_real_subclasses` mirrors PyPy's filter for
+/// `descr___subclasses__`: custom-MRO ancestors are registered for cache
+/// invalidation but are not real entries in the subclass's `__bases__`.
 ///
 /// # Safety
 /// `w_parent` must point at a valid `W_TypeObject`.
-pub unsafe fn w_type_get_subclasses(w_parent: PyObjectRef) -> Vec<PyObjectRef> {
+pub unsafe fn w_type_get_subclasses(
+    w_parent: PyObjectRef,
+    only_real_subclasses: bool,
+) -> Vec<PyObjectRef> {
     if w_parent.is_null() || !is_type(w_parent) {
         return Vec::new();
     }
@@ -1115,6 +1116,17 @@ pub unsafe fn w_type_get_subclasses(w_parent: PyObjectRef) -> Vec<PyObjectRef> {
     for &slot in subs.iter() {
         let target = crate::weakref::w_weakref_deref(slot);
         if !target.is_null() {
+            if only_real_subclasses {
+                let bases = w_type_get_bases(target);
+                if bases.is_null()
+                    || !(0..crate::tupleobject::w_tuple_len(bases)).any(|index| {
+                        crate::tupleobject::w_tuple_getitem(bases, index as i64)
+                            .is_some_and(|base| std::ptr::eq(base, w_parent))
+                    })
+                {
+                    continue;
+                }
+            }
             alive.push(target);
         }
     }
