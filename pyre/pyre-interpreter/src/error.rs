@@ -1,5 +1,7 @@
 use pyre_object::PyObjectRef;
 use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
+use ruff_text_size::Ranged;
+use rustpython_compiler::{ast, parser};
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -1386,18 +1388,34 @@ fn write_traceback_chain_from_exc<W: Write>(
         }
         let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(tb) };
         let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
-        let (filename, funcname) = if w_code.is_null() {
-            (String::from("<unknown>"), String::from("<unknown>"))
+        let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
+        let (filename, funcname, location) = if w_code.is_null() {
+            (String::from("<unknown>"), String::from("<unknown>"), None)
         } else {
             // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
             if code_obj.is_null() {
-                (String::from("<unknown>"), String::from("<unknown>"))
+                (String::from("<unknown>"), String::from("<unknown>"), None)
             } else {
                 let code = unsafe { &*code_obj };
-                (code.source_path.to_string(), code.obj_name.to_string())
+                let location = usize::try_from(lasti)
+                    .ok()
+                    .and_then(|index| code.locations.get(index))
+                    .map(|(start, end)| {
+                        (
+                            start.line.get(),
+                            end.line.get(),
+                            start.character_offset.get().saturating_sub(1),
+                            end.character_offset.get().saturating_sub(1),
+                        )
+                    });
+                (
+                    code.source_path.to_string(),
+                    code.obj_name.to_string(),
+                    location,
+                )
             }
         };
         writeln!(
@@ -1406,12 +1424,143 @@ fn write_traceback_chain_from_exc<W: Write>(
             filename, lineno, funcname
         )?;
         if let Some(line) = read_source_line(&filename, lineno) {
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            writeln!(writer, "    {}", trimmed.trim_start())?;
+            let raw_line = line.trim_end_matches(['\n', '\r']);
+            let shown_line = raw_line.trim_start();
+            writeln!(writer, "    {shown_line}")?;
+
+            if let Some((start_line, end_line, start_col, end_col)) = location
+                && usize::try_from(lineno).ok() == Some(start_line)
+                && end_line == start_line
+                && end_col > start_col
+                && start_col <= raw_line.len()
+                && end_col <= raw_line.len()
+                && raw_line.is_char_boundary(start_col)
+                && raw_line.is_char_boundary(end_col)
+            {
+                let lead = raw_line.len() - shown_line.len();
+                let anchors = traceback_anchors(raw_line, start_col, end_col);
+                // `traceback.py:_should_show_carets` — a plain caret span covering
+                // the whole stripped line (nothing but whitespace before the start
+                // or after the end, and no binary-op/subscript sub-anchor) carries
+                // no information, so it is suppressed. A `<name> = <call>(…)` or
+                // `return <call>(…)` whose call value exactly covers the span is
+                // likewise suppressed even though it has a call sub-anchor.
+                let before_ws_only = raw_line.get(..start_col).unwrap_or("").trim_start().is_empty();
+                let after_ws_only = raw_line.get(end_col..).unwrap_or("").trim_end().is_empty();
+                let full_line_call = spawns_full_line_call(
+                    shown_line,
+                    start_col.saturating_sub(lead),
+                    end_col.saturating_sub(lead),
+                );
+                if !full_line_call && (anchors.is_some() || !before_ws_only || !after_ws_only) {
+                    let mut caret_line = String::from("    ");
+                    caret_line.push_str(&" ".repeat(start_col.saturating_sub(lead)));
+                    for col in start_col..end_col {
+                        let marker = if let Some((lo, hi)) = anchors {
+                            if (lo..hi).contains(&col) { '^' } else { '~' }
+                        } else {
+                            '^'
+                        };
+                        caret_line.push(marker);
+                    }
+                    writeln!(writer, "{caret_line}")?;
+                }
+            }
         }
         tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(tb) };
     }
     Ok(())
+}
+
+/// `traceback.py:_should_show_carets` special case: a `<name> = <call>(…)` or
+/// `return <call>(…)` statement whose call value exactly spans the failing
+/// instruction (byte offsets `seg_start..seg_end` into `line`, the already-
+/// dedented source line). Such a caret would merely re-underline the whole
+/// right-hand side, so it is suppressed.
+fn spawns_full_line_call(line: &str, seg_start: usize, seg_end: usize) -> bool {
+    let Ok(parsed) = parser::parse_module(line) else {
+        return false;
+    };
+    let body = &parsed.syntax().body;
+    let [stmt] = body.as_slice() else {
+        return false;
+    };
+    let call = match stmt {
+        ast::Stmt::Assign(assign) => {
+            if assign.targets.len() != 1
+                || !matches!(assign.targets.first(), Some(ast::Expr::Name(_)))
+                || !matches!(assign.value.as_ref(), ast::Expr::Call(_))
+            {
+                return false;
+            }
+            assign.value.range()
+        }
+        ast::Stmt::Return(ret) => match ret.value.as_deref() {
+            Some(ast::Expr::Call(call)) if matches!(call.func.as_ref(), ast::Expr::Name(_)) => {
+                call.range()
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
+    call.start().to_usize() == seg_start && call.end().to_usize() == seg_end
+}
+
+/// Return the secondary-marker span used by `traceback.py` for an expression.
+fn traceback_anchors(raw_line: &str, start_col: usize, end_col: usize) -> Option<(usize, usize)> {
+    let segment = raw_line.get(start_col..end_col)?;
+    let wrapped = format!("(\n{segment}\n)");
+    let parsed = parser::parse_expression(&wrapped).ok()?;
+    let expr = parsed.syntax().body.as_ref();
+
+    let map_offset = |offset: usize| {
+        offset
+            .checked_sub(2)
+            .and_then(|offset| offset.checked_add(start_col))
+            .map(|offset| offset.clamp(start_col, end_col))
+    };
+    let map_range = |lo: usize, hi: usize| {
+        let lo = map_offset(lo)?;
+        let hi = map_offset(hi)?;
+        (lo < hi).then_some((lo, hi))
+    };
+
+    match expr {
+        ast::Expr::BinOp(bin_op) => {
+            let left_end = bin_op.left.range().end().to_usize();
+            let right_start = bin_op.right.range().start().to_usize();
+            if left_end > right_start || right_start > wrapped.len() {
+                return None;
+            }
+            let between = wrapped.as_bytes().get(left_end..right_start)?;
+            let op_relative = between
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace() && *byte != b')')?;
+            let op_start = left_end.checked_add(op_relative)?;
+            let mut op_end = op_start;
+            while op_end < right_start {
+                let byte = *wrapped.as_bytes().get(op_end)?;
+                if byte.is_ascii_whitespace()
+                    || byte == b')'
+                    || byte.is_ascii_alphanumeric()
+                    || byte == b'_'
+                {
+                    break;
+                }
+                op_end = op_end.checked_add(1)?;
+            }
+            map_range(op_start, op_end)
+        }
+        ast::Expr::Subscript(subscript) => map_range(
+            subscript.value.range().end().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        ast::Expr::Call(call) => map_range(
+            call.func.range().end().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        _ => None,
+    }
 }
 
 /// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
