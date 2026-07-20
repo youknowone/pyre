@@ -558,19 +558,42 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(ExcKind::SyntaxError, &message);
         pyre_object::gc_roots::pin_root(exc);
-        let w_text = match text {
+        // Build the `(filename, lineno, offset, text, end_lineno, end_offset)`
+        // details tuple element by element. Each is pinned as it is created and
+        // reloaded before the tuple is assembled: an int / str allocation for a
+        // later element can trigger a minor collection that relocates an earlier
+        // young element (the filename or text string, or an uncached line/col
+        // int), leaving its raw local pointing at the old address.
+        let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
+        let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
+        let offset_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
+        let text_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(match text {
             Some(t) => pyre_object::w_str_new(t),
             None => pyre_object::w_none(),
-        };
+        });
+        let end_lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_lineno));
+        let end_offset_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_offset));
         let details = pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(filename),
-            pyre_object::w_int_new(lineno),
-            pyre_object::w_int_new(offset),
-            w_text,
-            pyre_object::w_int_new(end_lineno),
-            pyre_object::w_int_new(end_offset),
+            pyre_object::gc_roots::shadow_stack_get(filename_slot),
+            pyre_object::gc_roots::shadow_stack_get(lineno_slot),
+            pyre_object::gc_roots::shadow_stack_get(offset_slot),
+            pyre_object::gc_roots::shadow_stack_get(text_slot),
+            pyre_object::gc_roots::shadow_stack_get(end_lineno_slot),
+            pyre_object::gc_roots::shadow_stack_get(end_offset_slot),
         ]);
-        let args_list = pyre_object::w_list_new(vec![pyre_object::w_str_new(&message), details]);
+        // Root the details tuple across the message allocation below before it
+        // becomes `args[1]`.
+        let details_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(details);
+        let w_msg = pyre_object::w_str_new(&message);
+        let details = pyre_object::gc_roots::shadow_stack_get(details_slot);
+        let args_list = pyre_object::w_list_new(vec![w_msg, details]);
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         PyError {
             kind: PyErrorKind::SyntaxError,
@@ -653,6 +676,7 @@ impl PyError {
         // The key is pinned before `py_repr` because that repr itself
         // allocates.
         let _roots = pyre_object::gc_roots::push_roots();
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
         if !key.is_null() {
             pyre_object::gc_roots::pin_root(key);
         }
@@ -665,6 +689,10 @@ impl PyError {
         let exc = pyre_object::interp_exceptions::w_exception_new(ExcKind::KeyError, &message);
         pyre_object::gc_roots::pin_root(exc);
         if !key.is_null() {
+            // Reload the key after the repr / exception allocations: the pin
+            // keeps it alive, but a minor collection may have relocated the
+            // young key, leaving this raw local pointing at the old address.
+            let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
             let args_list = pyre_object::w_list_new(vec![key]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         }
@@ -722,6 +750,7 @@ impl PyError {
         // `w_exception_new` / `w_list_new` could sweep them before the setters
         // stamp them onto `exc`.
         let _roots = pyre_object::gc_roots::push_roots();
+        let filename_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_filename.is_null() {
             pyre_object::gc_roots::pin_root(w_filename);
         }
@@ -750,6 +779,10 @@ impl PyError {
                 pyre_object::w_str_new(&strerror),
             );
             if !w_filename.is_null() {
+                // Reload the filename after the args allocations: the pin keeps
+                // it alive, but a minor collection may have relocated the young
+                // path, leaving this raw local pointing at the old address.
+                let w_filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
                 pyre_object::interp_exceptions::w_exception_set_filename(exc, w_filename);
             }
         }
@@ -831,9 +864,11 @@ impl PyError {
         // inside `w_exception_new` / `w_str_new` could sweep them before the
         // setters stamp them onto `exc`.
         let _roots = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_name.is_null() {
             pyre_object::gc_roots::pin_root(w_name);
         }
+        let path_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_path.is_null() {
             pyre_object::gc_roots::pin_root(w_path);
         }
@@ -845,6 +880,20 @@ impl PyError {
             pyre_object::w_none()
         } else {
             pyre_object::w_str_new(&message)
+        };
+        // Reload name/path after the message allocation: the pins keep them
+        // alive, but a minor collection may have relocated the young objects,
+        // leaving these raw locals stale. A null (absent) ref was never pinned,
+        // so it has no slot and stays null.
+        let w_name = if w_name.is_null() {
+            w_name
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(name_slot)
+        };
+        let w_path = if w_path.is_null() {
+            w_path
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(path_slot)
         };
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_import_msg(exc, w_msg);
@@ -908,9 +957,11 @@ impl PyError {
         // `w_exception_new` could sweep them before they are stamped onto `exc`
         // at the `set_name` / `set_attr_obj` calls.
         let _roots = pyre_object::gc_roots::push_roots();
+        let name_ctx_slot = pyre_object::gc_roots::shadow_stack_len();
         if !self.w_name_context.is_null() {
             pyre_object::gc_roots::pin_root(self.w_name_context);
         }
+        let obj_ctx_slot = pyre_object::gc_roots::shadow_stack_len();
         if !self.w_obj_context.is_null() {
             pyre_object::gc_roots::pin_root(self.w_obj_context);
         }
@@ -921,7 +972,9 @@ impl PyError {
         // (non-moving oldgen) exception before it is written through.
         pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
+            let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_new(&self.message);
+            pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::w_list_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
@@ -932,6 +985,10 @@ impl PyError {
                 self.kind,
                 PyErrorKind::ImportError | PyErrorKind::ModuleNotFoundError
             ) {
+                // Reload `msg` after the args allocation: the pin keeps it
+                // alive, but `w_list_new` may have relocated the young string,
+                // leaving this raw local pointing at the old address.
+                let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc, msg) };
             }
         }
@@ -939,15 +996,16 @@ impl PyError {
         // materialised NameError / AttributeError instance, the lazy
         // equivalent of `_PyEval_FormatExcCheckArg` /
         // `set_attribute_error_context` (Python 3.10+).
+        // Reload the deferred context refs after the exception / args
+        // allocations: the pins keep them alive, but a minor collection may
+        // have relocated the young objects, leaving the stored fields stale.
         if !self.w_name_context.is_null() {
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_name(exc, self.w_name_context)
-            };
+            let w_name_context = pyre_object::gc_roots::shadow_stack_get(name_ctx_slot);
+            unsafe { pyre_object::interp_exceptions::w_exception_set_name(exc, w_name_context) };
         }
         if !self.w_obj_context.is_null() {
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, self.w_obj_context)
-            };
+            let w_obj_context = pyre_object::gc_roots::shadow_stack_get(obj_ctx_slot);
+            unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, w_obj_context) };
         }
         // Write-once memo (`get_w_value` self.w_value): cache the materialised
         // instance so a second call returns the same object (identity `e1 is e2`)
