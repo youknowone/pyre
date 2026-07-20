@@ -1267,7 +1267,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     nparams: usize,
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
-    arg_class_guard: Option<(OpRef, i64)>,
+    arg_class_guard: Option<ArgClassGuard>,
     allow_method_load_attr: bool,
     require_str_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -1518,8 +1518,39 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             version_tag,
         )?;
     }
-    if let Some((arg, w_class)) = arg_class_guard {
-        walker_guard_class(ctx, op.pc, arg, w_class)?;
+    if let Some((arg, concrete_arg, w_type)) = arg_class_guard {
+        // `GuardClass` compares the object's physical `ob_type`, not its Python
+        // `W_TypeObject`.  Pin the physical type: a boxed builtin whose
+        // `ob_type` the optimizer already knows would make a `GuardClass`
+        // against the heap type object provably fail, discarding the loop
+        // (`InvalidLoop`).  `walker_guard_class` also emits the tagged-int
+        // low-bit test, needed when `arg` may arrive as a tagged int.
+        let physical_type = unsafe { (*concrete_arg).ob_type } as i64;
+        walker_guard_class(ctx, op.pc, arg, physical_type)?;
+        // A builtin subclass / user instance shares its `ob_type` with the base
+        // layout, so `ob_type` alone does not pin the class the reflected-op
+        // decline (`w_type_issubtype`) was computed against.  Guard the live
+        // `w_class` too so an arg of a distinct class deopts.  Singletons with a
+        // null `w_class` (`Ellipsis`/`NotImplemented`) are pinned exactly by
+        // `ob_type`, and guarding their null slot against `w_type` would itself
+        // be provably false — so guard `w_class` only when it is populated.
+        if !unsafe { (*concrete_arg).w_class }.is_null() {
+            let live_w_class = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                arg,
+                crate::descr::w_class_descr(),
+            );
+            let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[live_w_class, w_class_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(live_w_class, w_class_const);
+        }
     }
 
     let callable_expected = ctx
@@ -2544,7 +2575,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, w_typ_r as i64)),
+        Some((rhs, concrete_rhs, w_typ_r)),
         false,
         false,
     )?
@@ -2680,7 +2711,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, w_typ_r as i64)),
+        Some((rhs, concrete_rhs, w_typ_r)),
         false,
         false,
     )?

@@ -4908,6 +4908,12 @@ type ExceptionInlineReceiverGuard = (
     u64,
 );
 
+/// `(arg, concrete_arg, w_type)` for an inlined operator's non-receiver
+/// argument: the operand op to guard, its record-time concrete object (for the
+/// physical `ob_type`), and the Python `W_TypeObject` the reflected-op decline
+/// was computed against (pinned via the live `w_class`).
+type ArgClassGuard = (OpRef, pyre_object::PyObjectRef, pyre_object::PyObjectRef);
+
 /// `residual_call` shape `iIRd>X` dispatcher — `_ir_*` arglist with
 /// both an int-bank list and a ref-bank list before the descr. RPython
 /// parity: `pyjitpl.py:1338-1340 _opimpl_residual_call2` (`@arguments`
