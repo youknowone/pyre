@@ -4666,6 +4666,16 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::BuildList { .. }
             | I::BuildSet { .. }
             | I::BuildMap { .. }
+            // In-frame exception raise / handling. These opcodes already trace
+            // in the while-loop form (whose body bypasses this FOR_ITER-only
+            // scan): the raised exception is virtualized and a walk abort
+            // rewinds partial trace state. The finally-duplicated FOR_ITER
+            // hazard is gated separately by for_iter_frame_is_finally_duplicated.
+            | I::RaiseVarargs { .. }
+            | I::PushExcInfo
+            | I::CheckExcMatch
+            | I::PopExcept
+            | I::Reraise { .. }
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
@@ -9939,6 +9949,22 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_try_except_body_is_jit_safe() {
+        // A `for` loop whose body raises and catches in-frame: the exception
+        // opcodes (RAISE_VARARGS / CHECK_EXC_MATCH / PUSH_EXC_INFO / POP_EXCEPT)
+        // are allow-listed, so the frame is admitted for tracing. The FOR_ITER
+        // is not inside the try range, so it is not finally-duplicated.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def r(n):\n    acc = 0\n    for i in range(n):\n        try:\n            if i % 3 == 0:\n                raise ValueError\n            acc += i\n        except ValueError:\n            acc += 1\n    return acc\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "r");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
