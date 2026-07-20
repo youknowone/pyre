@@ -9860,6 +9860,7 @@ impl CodeWriter {
                             let iter_var = residual_call!(
                                 get_iter_fn_idx,
                                 CallFlavor::MayForce,
+                                majit_ir::PyreHelperKind::GetIter,
                                 vec![],
                                 vec![iterable_value],
                                 vec![],

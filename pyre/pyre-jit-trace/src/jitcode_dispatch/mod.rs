@@ -529,6 +529,21 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// This is shared logically across recursive MIFrame walks; catch routing
     /// writes the proven-class state back into the caller's copy.
     pub class_of_last_exc_is_const: bool,
+    /// Python-pc of a guard-failure bridge walk's own resume coordinate.
+    /// `Some` only on the top-level walk of a bridge trace, `None` otherwise
+    /// (loop compiles and sub-walks).
+    ///
+    /// `generate_guard(resumepc=orgpc)` (`pyjitpl.py:2610-2626`) places a
+    /// guard's resume coordinate INSIDE the guarded opcode's implementation,
+    /// strictly past the dispatch-top `jit_merge_point`, so an RPython MIFrame
+    /// resumed from a guard never re-crosses the loop-header merge point at
+    /// position zero. Pyre's bridge walker instead resumes at the opcode
+    /// BOUNDARY and would re-cross the header immediately with an empty body,
+    /// closing a 0-progress no-op bridge. The merge-point arm consumes this
+    /// (via `take()`) to skip exactly the first crossing that lands on the
+    /// bridge's own resume coordinate, restoring the RPython positional
+    /// semantics.
+    pub bridge_entry_merge_pc: Option<usize>,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -567,6 +582,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
             class_of_last_exc_is_const: false,
+            bridge_entry_merge_pc: None,
         }
     }
 }
@@ -8222,6 +8238,22 @@ fn handle<Sym: WalkSym>(
             // jdindex is the op's leading `c` byte (pyjitpl.py:1537
             // `jdindex = ord(self.jitcode.code[orgpc+1])`).
             let jdindex = code[op.pc + 1] as i8 as usize;
+            // pyjitpl.py:2610-2626: a guard's resume coordinate
+            // (`resumepc=orgpc`) lies INSIDE the guarded opcode's
+            // implementation, past the dispatch-top `jit_merge_point`, so an
+            // RPython MIFrame resumed from a guard never re-crosses the
+            // loop-header merge point at position zero. The walker resumes a
+            // bridge at the opcode BOUNDARY, so its first crossing at the
+            // resume coordinate is the same op it is resuming INTO — not a
+            // loop crossing. Skip exactly once. `take()` clears on the first
+            // crossing regardless of pc, so a mid-body-resume bridge whose
+            // first crossing is a DIFFERENT header is unaffected.
+            if ctx.is_top_level
+                && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && ctx.fbw_mode.bridge_entry_merge_pc.take() == Some(next_instr)
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py:1548 `if not any_operation: return`.
                 if ctx.trace_ctx.num_ops() == 0 {

@@ -4819,11 +4819,24 @@ fn assemble_peeled_trace_with_jump_args(
 
     // Label position
     let label_pos = next_free_pos(max_pos);
-    let mut full_label_args: Vec<OpRef> = label_args
-        .iter()
-        .copied()
-        .filter(|arg| !is_trace_constant_ref(*arg, constants))
-        .collect();
+    // compile.py:327-328 splices `label_op` verbatim: the label arg list produced
+    // by import_state (make_inputargs) IS the loop-header contract, and the jump
+    // args (assemble_jump below) enumerate the SAME VirtualState positionally, so
+    // the two must stay arity-aligned. Constant virtual-state slots were already
+    // dropped at enum time (virtualstate.rs NotVirtual `position_in_notvirtuals`
+    // only assigned to non-LEVEL_CONSTANT leaves), so every arg present here is a
+    // live carried position. Do NOT re-derive the slot set from the post-hoc
+    // backend-constants map: a phase-2 guard postprocess may const-forward a
+    // still-live loop-carried box (e.g. the exhaust-guard's `remaining` proving
+    // `<=0 ∧ >=0 ⇒ ==0`), and dropping that label slot while the jump keeps
+    // rebinding it desyncs the label/jump contract and orphans the head guard's
+    // operand. RPython performs no such filter.
+    let mut full_label_args: Vec<OpRef> = label_args.iter().copied().collect();
+    debug_assert!(
+        full_label_args.iter().all(|arg| !arg.is_constant()),
+        "base label arg is an inline-Const OpRef; LEVEL_CONSTANT virtual-state \
+         slots must be dropped at make_inputargs enum time, not at assembly"
+    );
 
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).

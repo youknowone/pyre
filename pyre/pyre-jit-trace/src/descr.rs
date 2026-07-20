@@ -902,6 +902,45 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<W_Range>(),
+        pyre_object::functional::W_RANGE_GC_TYPE_ID,
+        &pyre_object::functional::RANGE_TYPE as *const _ as usize,
+        &[
+            (
+                "W_Range.start",
+                RANGE_START_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "W_Range.step",
+                RANGE_STEP_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "W_Range.length",
+                RANGE_LENGTH_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+        ],
+        "W_Range",
+        "functional::W_Range",
+    )
+});
+
 /// `Method` field layout — `w_function`, `w_self`, `w_class` per
 /// `function.rs:9-15`. All three are Ref slots; the JIT only consumes
 /// `w_function` (for guarding which method) and `w_self` (for recovering
@@ -1689,6 +1728,7 @@ pub fn make_array_descr_with_full_id(
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
+    RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET,
@@ -1761,6 +1801,21 @@ pub fn range_iter_remaining_descr() -> DescrRef {
 /// Field descriptor for `W_IntRangeIterator.step` (i64, signed).
 pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
+}
+
+/// Field descriptor for `W_Range.start` (wrapped PyObjectRef).
+pub fn range_start_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_Range.step` (wrapped PyObjectRef).
+pub fn range_step_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_DESCR_GROUP, 1)
+}
+
+/// Field descriptor for `W_Range.length` (wrapped PyObjectRef).
+pub fn range_length_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_DESCR_GROUP, 2)
 }
 
 /// `Method.w_function` — the underlying function (`Function` or

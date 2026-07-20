@@ -631,6 +631,10 @@ pub enum PyreHelperKind {
     /// the in-flight iteration to the live frame instead of dropping it (the
     /// iterator advance is an irreversible side effect with no journal undo).
     ForIterNext,
+    /// `get_iter(obj)` — the GET_ITER residual (`iter(obj)`).  The full-body
+    /// walker recognises exact machine-word `range` objects and emits the
+    /// virtual `W_IntRangeIterator` allocation shape directly.
+    GetIter,
     /// `store_deref_value(cell, value)` — the STORE_DEREF residual
     /// (`bh_store_deref_value_fn` via `cpu.store_deref_value_fn`).  It mutates
     /// the cell's contents in place and RETURNS the slot value (`Ref`), so it

@@ -1891,6 +1891,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // Range GET_ITER: virtualize exact machine-word `range` into the same
+    // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::GetIter
+    {
+        if let Some(iter_op) =
+            try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)?
+        {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+
     // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
     // updates so the opaque ForIterNext residual cannot invalidate optheap;
     // other iterator families retain the residual and its Python semantics.

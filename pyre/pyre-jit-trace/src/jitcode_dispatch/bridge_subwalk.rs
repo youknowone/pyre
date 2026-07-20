@@ -203,6 +203,15 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     pyre_object::PY_NULL
                 },
                 class_of_last_exc_is_const: sym.class_of_last_exc_is_const(),
+                // A guard-failure bridge resumes at the opcode boundary, so
+                // its first `jit_merge_point` crossing at this python-pc is
+                // the same op it is resuming INTO, not a loop crossing. The
+                // merge-point arm skips exactly that first crossing. Seeded
+                // only for bridge walks; a loop compile leaves it `None`.
+                bridge_entry_merge_pc: match (trace_ctx.is_bridge_trace, entry_py_pc) {
+                    (true, EntryPyPc::Py(pc)) => Some(pc as usize),
+                    _ => None,
+                },
                 ..Default::default()
             },
             session,
@@ -710,6 +719,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     .then_some(root_sym.last_exc_box()),
                 current_exception_seed_concrete: root_sym.last_exc_value(),
                 class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
+                ..Default::default()
             },
             session,
             registers_r: &mut regs_r,
@@ -1056,6 +1066,7 @@ pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
                     .then_some(root_sym.last_exc_box()),
                 current_exception_seed_concrete: root_sym.last_exc_value(),
                 class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
+                ..Default::default()
             },
             session,
             registers_r: &mut regs_r,

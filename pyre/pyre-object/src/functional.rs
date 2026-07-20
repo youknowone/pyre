@@ -689,6 +689,10 @@ pub struct W_Range {
     pub length: PyObjectRef,
 }
 
+pub const RANGE_START_OFFSET: usize = std::mem::offset_of!(W_Range, start);
+pub const RANGE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, step);
+pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
+
 /// Allocate a `W_Range` from three wrapped int/long bounds.  `step` must
 /// already be non-zero (the caller raises `ValueError` for a zero step
 /// before reaching here).  The element count is computed once here and
@@ -733,6 +737,13 @@ pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
 #[inline]
 pub unsafe fn is_w_range(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &RANGE_TYPE) }
+}
+
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_exact_w_range(obj: PyObjectRef) -> bool {
+    unsafe { std::ptr::eq((*obj).ob_type, &RANGE_TYPE) }
 }
 
 /// Read the wrapped `(start, stop, step)` triple of a range object.
