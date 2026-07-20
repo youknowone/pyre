@@ -99,7 +99,7 @@ delete, do not count as gates.**
 - `PYRE_JIT_DISABLED` — a `OnceLock<bool>` cache name holding the `PYRE_JIT==0` result (`pyre-jit/src/eval.rs`); the env var is `PYRE_JIT`
 - `PYRE_STACKTOOBIG` — `pub static PyreStackTooBig` runtime symbol (`stack_check.rs`)
 
-## §3 — Dead (9): no env read site
+## §3 — Dead (10): no env read site
 
 No source reads these. Comment-only or absent. **Historical measurement notes
 are preserved in place per N7** (they record why code was deemed dead / what a
@@ -116,6 +116,7 @@ census verified); they are not live gates and cost nothing.
 | PYRE_REMAP_PROBE | retired probe; "0 fires 2026-06-11" measurement kept |
 | PYRE_S8B_HARNESS | retired census; "82/82 agreement" measurement kept |
 | PYRE_MODULE_LOOP_TRACE | retired switch; historical note kept |
+| PYRE_FULL_BODY_WALK | retired switch; the full-body walk is the sole tracer, so the OFF path (the deleted trait leg) is gone (#344) |
 
 ## §4 — Live default-ON gates KEPT (retire when the epic closes)
 
@@ -124,7 +125,6 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FULL_BODY_WALK | master: full-body-walk tracer vs trait leg | WS1 / #344 / #366 single-executor lands (the OFF path *is* the trait leg #344 deletes) |
 | PYRE_FBW_INLINE, _INLINE_MULTIFRAME, _INLINE_NSFOLD, _LOOP_CALLEE_CA | walker inlining (#62/#68/gap-10) | same epic cluster |
 | PYRE_FBW_CALL_ASSEMBLER, _NO_REPLAY_EXIT, _RAISE, _REC_CA | walker return/raise/recursion | same |
 | PYRE_FBW_ABORT_FLUSH, _BRANCH_FLUSH, _END_FLUSH, _BRIDGE_LOCAL_SEED | shadow-stack flush/seed on resume | same (couples to F1 resume convergence) |

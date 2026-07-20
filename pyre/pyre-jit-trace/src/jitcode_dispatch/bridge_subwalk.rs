@@ -63,11 +63,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `op_pc`.  Set `fbw_mode.snapshot_sym` for the walk's lifetime;
     // `walker_capture_snapshot_for_last_guard` and
     // `fbw_foriter_body_from_op_pc` read it.  This is the PRODUCTION
-    // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
-    // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
-    // so `fbw_mode.snapshot_sym` is non-null on every default-JIT
-    // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
-    // (the transitional trait leg), which leaves the pointer null.
+    // default tracer: `trace.rs` enters `full_body_walk_trace` for every
+    // traced key (unless a prior walk structurally declined it), so
+    // `fbw_mode.snapshot_sym` is non-null on every default-JIT run.
     // Recover the portal EC red off `sym.frame` before the first opcode is
     // dispatched (thus before any guard is recorded), caching it into
     // `sym.execution_context`.  A bridge-from-guard sym whose ec color collides
