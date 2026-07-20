@@ -85,3 +85,30 @@ assert p1.__get__(None, object) is p1
 
 p2 = property("a", doc="pdoc")
 # assert p2.__doc__ == 'pdoc'
+
+
+def documented_getter_2(self):
+    """doc 2"""
+
+
+def documented_getter_3(self):
+    """doc 3"""
+
+
+# Python 3.14 keeps the constructor's getter-doc provenance even after a
+# direct write, so replacing the getter derives the replacement doc again.
+p3 = property(documented_getter_2)
+p3.__doc__ = "user"
+assert p3.getter(documented_getter_3).__doc__ == "doc 3"
+
+
+class SlottedProperty(property):
+    __slots__ = ("__doc__",)
+
+
+assert SlottedProperty(doc="slot doc").__doc__ == "slot doc"
+assert SlottedProperty(documented_getter_2).__doc__ == "doc 2"
+
+for count in (0, 1, 3):
+    with assert_raises(TypeError):
+        property().__set_name__(*([0] * count))

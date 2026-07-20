@@ -3793,6 +3793,15 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 /// (`mapdict::INSTANCE_DICT`) that already holds the subclass's regular
 /// attributes. `None`/`false` means the receiver has no writable dict.
 pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    // Python 3.14 permits a native-layout `property` subclass to declare an
+    // explicit `__doc__` slot.  PyPy's extended instance layout stores that
+    // slot on the object; pyre's equivalent object-resident location is the
+    // existing `W_Property.w_doc` field, not the native-subclass dict
+    // fallback below (a slots-only subclass deliberately has no dict).
+    if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
+        let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
+        return (!value.is_null()).then_some(value);
+    }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
         return None;
@@ -3801,6 +3810,10 @@ pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
 }
 
 pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+    if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
+        unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
+        return true;
+    }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
         return false;
@@ -3810,6 +3823,14 @@ pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) 
 }
 
 pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
+    if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
+        let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
+        if value.is_null() {
+            return false;
+        }
+        unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
+        return true;
+    }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
         return false;
@@ -12042,11 +12063,15 @@ unsafe fn property_no_accessor(
 pub(crate) fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.
-    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__set_name__")?;
-    if args.len() > 2 {
-        let w_name = args[2];
-        unsafe { pyre_object::descriptor::w_property_set_name(prop, w_name) };
+    if args.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "__set_name__() takes 2 positional arguments but {} were given",
+            args.len().saturating_sub(1),
+        )));
     }
+    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__set_name__")?;
+    let w_name = args[2];
+    unsafe { pyre_object::descriptor::w_property_set_name(prop, w_name) };
     Ok(pyre_object::w_none())
 }
 

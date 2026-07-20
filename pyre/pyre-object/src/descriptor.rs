@@ -238,12 +238,14 @@ pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).w_doc
 }
 
-/// `descriptor.py:252-254 W_Property.set_doc` — explicit doc writes
-/// also clear `getter_doc`.
+/// `descriptor.py:252-254 W_Property.set_doc`, with the Python 3.14
+/// `property_set_doc` rule taking precedence: replacing the visible member
+/// does not change whether the constructor originally copied it from the
+/// getter.  `_copy` still needs that provenance so a later `.getter()` can
+/// derive the new getter's docstring.
 pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_Property;
     (*prop).w_doc = w_doc;
-    (*prop).getter_doc = false;
     // Record the old→young edge: `w_doc` is a traced slot and the
     // property may already have been promoted out of the nursery.
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
