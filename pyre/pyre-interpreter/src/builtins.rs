@@ -477,7 +477,11 @@ fn memoryview_pack_value(
         if unsafe { pyre_object::is_int_or_long(w_val) } {
             Ok(w_val)
         } else {
-            unsafe { crate::baseobjspace::space_index(w_val) }.map_err(|_| bad_type())
+            match unsafe { crate::baseobjspace::space_index(w_val) } {
+                Ok(index) => Ok(index),
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => Err(bad_type()),
+                Err(err) => Err(err),
+            }
         }
     };
     let int_val = || -> Result<i64, crate::PyError> {
@@ -523,17 +527,22 @@ fn memoryview_pack_value(
             v.to_ne_bytes().to_vec()
         }
         b'f' => {
-            if !unsafe { pyre_object::is_int_or_long(w_val) || pyre_object::is_float(w_val) } {
-                return Err(bad_type());
-            }
-            let v = crate::baseobjspace::float_w(w_val).map_err(|_| bad_type())? as f32;
+            // `PackFormatIterator.accept_float_arg`: use `space.float_w`,
+            // including a user `__float__`; only TypeError becomes the
+            // memoryview format error and other user exceptions propagate.
+            let v = match crate::baseobjspace::float_w(w_val) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
+                Err(err) => return Err(err),
+            } as f32;
             v.to_ne_bytes().to_vec()
         }
         b'd' => {
-            if !unsafe { pyre_object::is_int_or_long(w_val) || pyre_object::is_float(w_val) } {
-                return Err(bad_type());
-            }
-            let v = crate::baseobjspace::float_w(w_val).map_err(|_| bad_type())?;
+            let v = match crate::baseobjspace::float_w(w_val) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
+                Err(err) => return Err(err),
+            };
             v.to_ne_bytes().to_vec()
         }
         b'?' => {
@@ -587,7 +596,46 @@ unsafe fn memoryview_slice_view(
         } else {
             0
         };
-        let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+
+        // CPython 3.14 `memory_subscript`: `mbuf_add_view(self->mbuf, view)`
+        // registers the result *before* `init_slice` evaluates the slice
+        // bounds.  A bound's `__index__` may release `mv`; the registered
+        // result must keep the export alive and continue from its private
+        // view snapshot (gh-92888).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(mv);
+        pyre_object::gc_roots::pin_root(index);
+        let sliced = w_memoryview_alloc_header(false, true);
+        let r_mv = pyre_object::gc_roots::shadow_stack_get(sp);
+        let snapshot = w_memoryview_view(r_mv).clone();
+        // The root `Buffer` tag was fixed by `buffer_w`; follow it directly
+        // instead of repeating an objspace isinstance lookup in this hot/JIT
+        // path.  `Buffer::sub` never nests, so one parent peel is sufficient.
+        let backing = snapshot.backing();
+        match backing {
+            pyre_object::buffer::Buffer::Byte { w_obj } => {
+                pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
+            }
+            pyre_object::buffer::Buffer::Array { w_obj } => {
+                pyre_object::interp_array::w_array_exports_incref(*w_obj)
+            }
+            pyre_object::buffer::Buffer::Sub { parent, .. } => match parent.as_ref() {
+                pyre_object::buffer::Buffer::Byte { w_obj } => {
+                    pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
+                }
+                pyre_object::buffer::Buffer::Array { w_obj } => {
+                    pyre_object::interp_array::w_array_exports_incref(*w_obj)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        w_memoryview_set_view(sliced, bufferview_alloc(snapshot));
+        pyre_object::gc_roots::pin_root(sliced);
+
+        let r_index = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let (start, stop, step) = crate::baseobjspace::normalize_slice(r_index, count)?;
         let slicelength = if (step < 0 && stop >= start) || (step > 0 && start >= stop) {
             0
         } else if step < 0 {
@@ -595,9 +643,13 @@ unsafe fn memoryview_slice_view(
         } else {
             (stop - start - 1) / step + 1
         };
-        Ok(w_memoryview_new_derived(mv, |v| unsafe {
-            v.new_slice(start, step, slicelength)
-        }))
+        let r_sliced = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        let old_view =
+            (*(r_sliced as *mut W_MemoryView)).view as *mut pyre_object::bufferview::BufferView;
+        let view = (&*old_view).new_slice(start, step, slicelength);
+        w_memoryview_set_view(r_sliced, bufferview_alloc(view));
+        drop(Box::from_raw(old_view));
+        Ok(r_sliced)
     }
 }
 
@@ -688,7 +740,12 @@ unsafe fn memoryview_start_from_tuple(
             if !memoryview_is_index(w) {
                 return Err(crate::PyError::type_error("memoryview: invalid slice key"));
             }
-            start += memoryview_get_offset(mv, dim, getindex_w(w)?)?;
+            let index = getindex_w(w)?;
+            // memoryobject.py `_start_from_tuple`: `__index__` is arbitrary
+            // Python code and may release this memoryview before the offset
+            // reads its view geometry.
+            memoryview_check_released(mv)?;
+            start += memoryview_get_offset(mv, dim, index)?;
         }
         Ok(start)
     }
@@ -742,6 +799,9 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             let length = w_memoryview_length(mv);
             let count = if itemsize > 0 { length / itemsize } else { 0 };
             let mut i = getindex_w(index)?;
+            // memoryobject.py `descr_getitem`: `_decode_index` may invoke a
+            // user `__index__` which releases the view.
+            memoryview_check_released(mv)?;
             if i < 0 {
                 i += count;
             }
@@ -834,6 +894,9 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 ));
             }
             let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+            // `decode_index4` evaluates arbitrary slice-bound `__index__`
+            // methods before the assignment touches the backing.
+            memoryview_check_released(mv)?;
             let mut indices = Vec::new();
             let mut i = start;
             while (step > 0 && i < stop) || (step < 0 && i > stop) {

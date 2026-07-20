@@ -50,6 +50,28 @@ def test_slice():
     assert m[::-1].tobytes() == b"987654321"
     assert m[::-2].tobytes() == b"97531"
 
+    # CPython 3.14 `memory_subscript` registers the result view before slice
+    # bound conversion.  Releasing the source from `__index__` therefore
+    # rejects scalar access but leaves a slice result backed by the original
+    # export (gh-92888).
+    source = bytearray(b"abcdefgh")
+    m = memoryview(source)
+
+    class ReleasingIndex:
+        def __index__(self):
+            m.release()
+            return 4
+
+    assert_raises(ValueError, lambda: m[ReleasingIndex()])
+
+    source = bytearray(b"abcdefgh")
+    m = memoryview(source)
+    sliced = m[:ReleasingIndex()]
+    assert sliced.tobytes() == b"abcd"
+    assert_raises(BufferError, lambda: source.append(0))
+    sliced.release()
+    source.append(0)
+
 
 test_slice()
 
