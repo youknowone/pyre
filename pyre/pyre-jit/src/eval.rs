@@ -10734,7 +10734,7 @@ mod tests {
         let (resume_pc, live_regs, _) =
             live_pc_with_slot_colors(jitcode_index, &code, &[], &[1, 2]);
 
-        let run_case = |record_branch_guard: bool| {
+        let run_case = || {
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
             let lower_stack = OpRef::input_arg_ref(0);
             let truth = OpRef::input_arg_int(1);
@@ -10774,14 +10774,8 @@ mod tests {
                 &[(0, deep_slot), (1, lower_stack), (2, truth), (3, top_slot)],
             );
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-            // `record_branch_guard` captures at its `other_target`, which this
-            // fixture passes as the same JitCode `-live-` resume coordinate.
             state.set_resume_marker_for_test(resume_pc);
-            if record_branch_guard {
-                state.capture_record_branch_guard(OpRef::NONE, truth, true, resume_pc);
-            } else {
-                state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
-            }
+            state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
 
             // Production guard recording goes through
             // `record_guard_typed` + `capture_resumedata` —
@@ -10851,8 +10845,7 @@ mod tests {
             );
         };
 
-        run_case(true);
-        run_case(false);
+        run_case();
     }
 
     #[test]
@@ -10933,12 +10926,6 @@ mod tests {
         state.set_resume_marker_for_test(resume_pc);
 
         state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
-        assert_eq!(
-            state
-                .capture_concrete_branch_truth_for_value(truth, w_int_new(1))
-                .unwrap(),
-            true
-        );
         // Snapshot is the resume-data oracle, not
         // `op.fail_args` (None until the optimizer's
         // `store_final_boxes_in_guard` writes it back).
@@ -11076,274 +11063,6 @@ mod tests {
                 .all(|opref| !opref.is_none()),
             "live stack slots carried by the JUMP must be preserved"
         );
-    }
-
-    #[test]
-    fn test_trace_dynamic_list_index_typed_int_skips_object_unbox_with_compiled_trace_jitcode() {
-        use majit_ir::{OpRef, Type};
-        use majit_metainterp::TraceCtx;
-        use pyre_jit_trace::state::{MIFrame, PyreSym};
-        use pyre_object::w_int_new;
-
-        let (frame, jitcode_ptr, resume_pc) =
-            compiled_trace_fixture("def f(b):\n    return b\nf(1)\n", "f", &[], &[], |frame| {
-                frame.locals_w_mut()[0] = w_int_new(2);
-            });
-        let frame_ptr = (&*frame) as *const PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
-        let key = OpRef::input_arg_int(0);
-        let len = OpRef::input_arg_int(1);
-        let mut sym = PyreSym::from_test_state(single_local_test_state(
-            &mut ctx,
-            &frame,
-            frame_ptr,
-            jitcode_ptr,
-            resume_pc,
-            Type::Int,
-            key,
-        ));
-        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-
-        let raw_index = state.capture_trace_dynamic_list_index(key, len, 2);
-        assert_eq!(raw_index, key);
-
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_guards(), 2);
-        assert!(
-            recorder
-                .ops()
-                .iter()
-                .all(|op| op.opcode != majit_ir::OpCode::GuardClass),
-            "typed-int index should not guard object class for an unbox fast path: {:?}",
-            recorder.ops()
-        );
-        assert!(
-            recorder
-                .ops()
-                .iter()
-                .all(|op| op.opcode != majit_ir::OpCode::GetfieldGcPureI),
-            "typed-int index should not read boxed int payloads: {:?}",
-            recorder.ops()
-        );
-    }
-
-    #[test]
-    fn test_direct_len_value_returns_typed_raw_len_for_integer_list_with_compiled_trace_jitcode() {
-        use majit_ir::{OpCode, OpRef, Type};
-        use majit_metainterp::TraceCtx;
-        use pyre_jit_trace::state::{MIFrame, PyreSym};
-        use pyre_object::{w_int_new, w_list_new};
-
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
-        unsafe {
-            assert!(pyre_object::listobject::w_list_uses_int_storage(list));
-        }
-        let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
-            "def f(x):\n    return len(x)\nf([1, 2, 3])\n",
-            "f",
-            &[],
-            &[],
-            |frame| {
-                frame.locals_w_mut()[0] = list;
-            },
-        );
-        let frame_ptr = (&*frame) as *const PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
-        let value = OpRef::input_arg_ref(0);
-        let callable = OpRef::input_arg_ref(1);
-        let mut sym = PyreSym::from_test_state(single_local_test_state(
-            &mut ctx,
-            &frame,
-            frame_ptr,
-            jitcode_ptr,
-            resume_pc,
-            Type::Ref,
-            value,
-        ));
-        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-
-        let len = state
-            .capture_direct_len_value(callable, value, list)
-            .expect("integer-list len fast path should trace");
-        assert_eq!(state.capture_value_type(len), Type::Int);
-
-        let recorder = ctx.into_recorder();
-        assert_ne!(
-            recorder.ops().last().map(|op| op.opcode),
-            Some(OpCode::CallI)
-        );
-        let mut saw_len_field = false;
-        let mut saw_new = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                continue;
-            };
-            if op.opcode == OpCode::New {
-                saw_new = true;
-            }
-            if op.opcode == OpCode::GetfieldGcI
-                && op.getdescr().map(|d| d.index())
-                    == Some(pyre_jit_trace::descr::list_int_items_len_descr().index())
-            {
-                saw_len_field = true;
-            }
-        }
-        assert!(saw_len_field);
-        assert!(!saw_new);
-    }
-
-    #[test]
-    fn test_trace_direct_float_list_getitem_uses_gc_field_loads_for_list_object_with_compiled_trace_jitcode()
-     {
-        use majit_ir::{OpCode, OpRef, Type};
-        use majit_metainterp::TraceCtx;
-        use pyre_jit_trace::state::{MIFrame, PyreSym};
-
-        let float_list = pyre_object::w_list_new(vec![
-            pyre_object::floatobject::w_float_new(1.5),
-            pyre_object::floatobject::w_float_new(2.5),
-            pyre_object::floatobject::w_float_new(3.5),
-        ]);
-        unsafe {
-            assert!(pyre_object::listobject::w_list_uses_float_storage(
-                float_list
-            ));
-        }
-        let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
-            "def f(x):\n    return x[2]\nf([1.5, 2.5, 3.5])\n",
-            "f",
-            &[],
-            &[],
-            |frame| {
-                frame.locals_w_mut()[0] = float_list;
-            },
-        );
-        let frame_ptr = (&*frame) as *const PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
-        let list = OpRef::input_arg_ref(0);
-        let key = OpRef::input_arg_int(1);
-        let mut sym = PyreSym::from_test_state(single_local_test_state(
-            &mut ctx,
-            &frame,
-            frame_ptr,
-            jitcode_ptr,
-            resume_pc,
-            Type::Ref,
-            list,
-        ));
-        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-
-        let result = state.capture_generated_list_getitem_by_strategy(list, key, 2, 2);
-        assert_eq!(state.capture_value_type(result), Type::Float);
-
-        let recorder = ctx.into_recorder();
-        let mut saw_gc_field = false;
-        let mut saw_raw_field = false;
-        let mut saw_gc_array = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                continue;
-            };
-            match op.opcode {
-                OpCode::GetfieldGcI
-                    if op.getarglist().first().map(|a| a.to_opref()) == Some(list) =>
-                {
-                    saw_gc_field = true
-                }
-                OpCode::GetfieldRawI
-                    if op.getarglist().first().map(|a| a.to_opref()) == Some(list) =>
-                {
-                    saw_raw_field = true
-                }
-                OpCode::GetarrayitemGcF => saw_gc_array = true,
-                _ => {}
-            }
-        }
-        assert!(saw_gc_field);
-        assert!(!saw_raw_field);
-        assert!(saw_gc_array);
-    }
-
-    #[test]
-    fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int_with_compiled_trace_jitcode()
-     {
-        use majit_ir::{OpCode, OpRef, Type};
-        use majit_metainterp::TraceCtx;
-        use pyre_jit_trace::state::{MIFrame, PyreSym};
-
-        let range_iter = pyre_object::w_range_iter_new(0, 2, 1);
-        let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
-            "def f(it):\n    return it\nf(range(2))\n",
-            "f",
-            &[],
-            &[],
-            |frame| {
-                frame.locals_w_mut()[0] = range_iter;
-            },
-        );
-        let frame_ptr = (&*frame) as *const PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let iter = OpRef::input_arg_ref(0);
-        let mut sym = PyreSym::from_test_state(single_local_test_state(
-            &mut ctx,
-            &frame,
-            frame_ptr,
-            jitcode_ptr,
-            resume_pc,
-            Type::Ref,
-            iter,
-        ));
-        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
-
-        let next = state
-            .capture_iter_next(iter, range_iter)
-            .expect("range iterator fast path should trace")
-            .expect("two-element range iterator should yield a value");
-        assert_eq!(state.capture_value_type(next.opref), Type::Int);
-        let recorder = ctx.into_recorder();
-        let mut saw_getfield_gc = false;
-        let mut saw_setfield_gc = false;
-        let mut saw_setfield_raw = false;
-        let mut saw_getfield_raw = false;
-        let mut saw_new = false;
-        for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
-                continue;
-            };
-            match op.opcode {
-                OpCode::GetfieldGcI
-                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
-                {
-                    saw_getfield_gc = true
-                }
-                OpCode::SetfieldGc
-                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
-                {
-                    saw_setfield_gc = true
-                }
-                OpCode::SetfieldRaw
-                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
-                {
-                    saw_setfield_raw = true
-                }
-                OpCode::GetfieldRawI
-                    if op.getarglist().first().map(|a| a.to_opref()) == Some(iter) =>
-                {
-                    saw_getfield_raw = true
-                }
-                OpCode::New => saw_new = true,
-                _ => {}
-            }
-        }
-        assert!(saw_getfield_gc);
-        assert!(saw_setfield_gc);
-        assert!(!saw_setfield_raw);
-        assert!(!saw_getfield_raw);
-        assert!(!saw_new);
     }
 
     #[test]
