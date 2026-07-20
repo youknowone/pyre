@@ -90,6 +90,9 @@ BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
 BENCH_COMPARE_BUFFER_S = 0.005
+# Windows process CPU accounting advances in scheduler ticks (normally 1/64 s).
+# Keep the execution floor at least one observable tick on that platform.
+WIN_TIMER_QUANTUM_S = 1.0 / 64
 # Empty-program user-CPU startup is MEASURED per interpreter/backend (median of
 # STARTUP_SAMPLES runs) and subtracted from every timed run before ratios and
 # perf gates are computed, so a large fixed startup — notably wasmtime
@@ -98,17 +101,11 @@ BENCH_COMPARE_BUFFER_S = 0.005
 # Floored so a bench at/below its own startup (or noise) cannot drive a time
 # to <= 0 and blow up a ratio.
 STARTUP_SAMPLES = 3
-EXEC_TIME_FLOOR_S = 0.005
+EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
-# quantized (see WIN_TIMER_QUANTUM_S below).
+# quantized (see WIN_TIMER_QUANTUM_S above).
 PERF_RETRY_RUNS = 5 if sys.platform == "win32" else 3
-# Windows `GetProcessTimes` / JobObject user-CPU accounting is quantized to
-# the system scheduler tick (default 1/64 s ≈ 15.625 ms).  Any measured time
-# could be off by up to one tick, so add one tick to every Windows
-# measurement to absorb the quantization error.
-WIN_TIMER_QUANTUM_S = 1.0 / 64
-
 CARGO_CONFIG = {
     "dynasm": {
         "extra": ["--no-default-features", "--features", "dynasm"],
@@ -260,7 +257,6 @@ def _run_timed_win32(args, timeout_s, env=None):
         ):
             utime = ((ut.dwHighDateTime << 32) | ut.dwLowDateTime) / 1e7
     kernel32.CloseHandle(job)
-    utime += WIN_TIMER_QUANTUM_S
     return (
         stdout_bytes.decode("utf-8", errors="replace"),
         utime,
@@ -995,10 +991,20 @@ class Check:
         The pass/fail decision compares execution-only (startup-subtracted)
         times; the returned elapsed/baseline stay raw for reporting.
         """
+        # Each execution-only value is a difference between two independently
+        # measured quantities (bench - empty-program startup).  On Windows each
+        # quantity may be off by one scheduler tick, so the comparison
+        # ``pyre <= baseline * limit`` needs 2q on the left and 2q*limit on the
+        # right.  Adding one tick to every raw sample cannot model this: those
+        # additions cancel during startup subtraction.
+        compare_buffer = BENCH_COMPARE_BUFFER_S
+        if sys.platform == "win32":
+            compare_buffer += 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
+
         if (
             self._exec_time(backend, elapsed)
             <= self._exec_time(baseline_key, baseline_time) * limit
-            + BENCH_COMPARE_BUFFER_S
+            + compare_buffer
         ):
             return True, elapsed, baseline_time, ""
 
@@ -1010,7 +1016,7 @@ class Check:
             if (
                 self._exec_time(backend, median_elapsed)
                 <= self._exec_time(baseline_key, median_baseline) * limit
-                + BENCH_COMPARE_BUFFER_S
+                + compare_buffer
             ):
                 return True, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
             return False, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
