@@ -113,6 +113,218 @@ fn maxlen_obj(self_obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+// PyPy `W_DequeIter`: the iterator owns the deque, current position, number
+// of remaining entries, and a snapshot of the deque mutation lock.
+mod deque_iter {
+    use super::{W_Deque, checklock, data, getlock};
+    use pyre_object::*;
+
+    #[crate::pyre_class("_collections._deque_iterator")]
+    pub struct W_DequeIter {
+        deque: PyObjectRef,
+        index: i64,
+        counter: i64,
+        lock: i64,
+    }
+
+    fn constructor_args(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
+        let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+        // `__new__`'s descriptor ABI leaves the requested class at the front
+        // of the varargs slice (the typed `_cls` slot is the descriptor
+        // receiver).  PyPy's W_DequeIter__new__ starts parsing after it.
+        let positional = positional.get(1..).unwrap_or(&[]);
+        if positional.is_empty() || positional.len() > 2 {
+            return Err(crate::PyError::type_error(format!(
+                "_deque_iterator expected 1 or 2 arguments, got {}",
+                positional.len()
+            )));
+        }
+        let deque = positional[0];
+        if W_Deque::from_obj(deque).is_none() {
+            let name = unsafe { pyre_object::type_name_of(deque) };
+            return Err(crate::PyError::type_error(format!(
+                "must be collections.deque, not {name}"
+            )));
+        }
+        let index = match positional.get(1) {
+            Some(&value) => crate::builtins::space_index_w(value)?,
+            None => 0,
+        };
+        Ok((deque, index))
+    }
+
+    #[crate::pyre_methods]
+    impl W_DequeIter {
+        #[staticmethod]
+        fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let (deque, requested) = constructor_args(args)?;
+            Ok(make(deque, requested))
+        }
+
+        fn __iter__(&self) -> PyObjectRef {
+            self as *const W_DequeIter as PyObjectRef
+        }
+
+        fn __length_hint__(&self) -> i64 {
+            self.counter.max(0)
+        }
+
+        fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+            if let Err(error) = checklock(self.deque, self.lock) {
+                self.counter = 0;
+                return Err(error);
+            }
+            if self.counter <= 0 {
+                return Err(crate::PyError::stop_iteration());
+            }
+            let item = unsafe { w_list_getitem(data(self.deque), self.index) }
+                .ok_or_else(crate::PyError::stop_iteration)?;
+            self.index += 1;
+            self.counter -= 1;
+            Ok(item)
+        }
+
+        fn __reduce__(&self) -> PyObjectRef {
+            let self_obj = self as *const W_DequeIter as PyObjectRef;
+            let ty = unsafe { w_instance_get_type(self_obj) };
+            let consumed = W_Deque::from_obj(self.deque)
+                .map(|deque| unsafe { w_list_len(deque.data) as i64 } - self.counter)
+                .unwrap_or(0);
+            w_tuple_new(vec![ty, w_tuple_new(vec![self.deque, w_int_new(consumed)])])
+        }
+    }
+
+    pub fn make(deque: PyObjectRef, requested: i64) -> PyObjectRef {
+        let _ = type_object();
+        let len = W_Deque::from_obj(deque)
+            .map(|deque| unsafe { w_list_len(deque.data) as i64 })
+            .unwrap_or(0);
+        let index = requested.max(0);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(deque);
+        W_DequeIter::allocate(W_DequeIter {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            deque,
+            index,
+            counter: len - index,
+            lock: getlock(deque),
+        })
+    }
+
+    pub fn public_type() -> PyObjectRef {
+        let ty = type_object();
+        // `interp_deque.py`: W_DequeIter.typedef explicitly sets
+        // acceptable_as_base_class=False.
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(ty, false) };
+        ty
+    }
+}
+
+// PyPy `W_DequeRevIter`, with the same state shape and reverse indexing into
+// pyre's list-backed deque payload.
+mod deque_rev_iter {
+    use super::{W_Deque, checklock, data, getlock};
+    use pyre_object::*;
+
+    #[crate::pyre_class("_collections._deque_reverse_iterator")]
+    pub struct W_DequeRevIter {
+        deque: PyObjectRef,
+        index: i64,
+        counter: i64,
+        lock: i64,
+    }
+
+    #[crate::pyre_methods]
+    impl W_DequeRevIter {
+        #[staticmethod]
+        fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+            let positional = positional.get(1..).unwrap_or(&[]);
+            if positional.is_empty() || positional.len() > 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "_deque_reverse_iterator expected 1 or 2 arguments, got {}",
+                    positional.len()
+                )));
+            }
+            let deque = positional[0];
+            if W_Deque::from_obj(deque).is_none() {
+                let name = unsafe { pyre_object::type_name_of(deque) };
+                return Err(crate::PyError::type_error(format!(
+                    "must be collections.deque, not {name}"
+                )));
+            }
+            let requested = match positional.get(1) {
+                Some(&value) => crate::builtins::space_index_w(value)?,
+                None => 0,
+            };
+            Ok(make(deque, requested))
+        }
+
+        fn __iter__(&self) -> PyObjectRef {
+            self as *const W_DequeRevIter as PyObjectRef
+        }
+
+        fn __length_hint__(&self) -> i64 {
+            self.counter.max(0)
+        }
+
+        fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+            if let Err(error) = checklock(self.deque, self.lock) {
+                self.counter = 0;
+                return Err(error);
+            }
+            if self.counter <= 0 {
+                return Err(crate::PyError::stop_iteration());
+            }
+            let item = unsafe { w_list_getitem(data(self.deque), self.index) }
+                .ok_or_else(crate::PyError::stop_iteration)?;
+            self.index -= 1;
+            self.counter -= 1;
+            Ok(item)
+        }
+
+        fn __reduce__(&self) -> PyObjectRef {
+            let self_obj = self as *const W_DequeRevIter as PyObjectRef;
+            let ty = unsafe { w_instance_get_type(self_obj) };
+            let consumed = W_Deque::from_obj(self.deque)
+                .map(|deque| unsafe { w_list_len(deque.data) as i64 } - self.counter)
+                .unwrap_or(0);
+            w_tuple_new(vec![ty, w_tuple_new(vec![self.deque, w_int_new(consumed)])])
+        }
+    }
+
+    pub fn make(deque: PyObjectRef, requested: i64) -> PyObjectRef {
+        let _ = type_object();
+        let len = W_Deque::from_obj(deque)
+            .map(|deque| unsafe { w_list_len(deque.data) as i64 })
+            .unwrap_or(0);
+        let offset = requested.max(0);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(deque);
+        W_DequeRevIter::allocate(W_DequeRevIter {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            deque,
+            index: len - offset - 1,
+            counter: len - offset,
+            lock: getlock(deque),
+        })
+    }
+
+    pub fn public_type() -> PyObjectRef {
+        let ty = type_object();
+        // `interp_deque.py`: W_DequeRevIter.typedef explicitly sets
+        // acceptable_as_base_class=False.
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(ty, false) };
+        ty
+    }
+}
+
 /// `W_Deque.append` + `trimleft`: drop from the left once over the bound.
 fn do_append(self_obj: PyObjectRef, item: PyObjectRef) {
     let d = data(self_obj);
@@ -538,7 +750,11 @@ impl W_Deque {
     }
     fn __iter__(&self) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
-        crate::baseobjspace::iter(data(self_obj))
+        Ok(deque_iter::make(self_obj, 0))
+    }
+    fn __reversed__(&self) -> PyObjectRef {
+        let self_obj = self as *const W_Deque as PyObjectRef;
+        deque_rev_iter::make(self_obj, 0)
     }
     fn __getitem__(&self, index: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
@@ -659,8 +875,9 @@ impl W_Deque {
 crate::py_module! {
     "_collections",
     interpleveldefs: {
-        "deque"           => type_object(),
-        "_deque_iterator" => crate::typedef::w_object(),
+        "deque"                   => type_object(),
+        "_deque_iterator"         => deque_iter::public_type(),
+        "_deque_reverse_iterator" => deque_rev_iter::public_type(),
     },
     // `defaultdict` and `OrderedDict` are app-level `dict` subclasses —
     // see the module header and `app_defaultdict.py` / `app_odict.py`

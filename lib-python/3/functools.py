@@ -377,6 +377,14 @@ class partial:
     __new__ = _partial_new
     __repr__ = recursive_repr()(_partial_repr)
 
+    def __delattr__(self, name):
+        # The C accelerator exposes __dict__ as a non-deletable getset
+        # descriptor.  Keep the Python fallback behavior identical when
+        # _functools.partial is unavailable.
+        if name == "__dict__":
+            raise TypeError("cannot delete __dict__")
+        object.__delattr__(self, name)
+
     def __call__(self, /, *args, **keywords):
         phcount = self._phcount
         if phcount:

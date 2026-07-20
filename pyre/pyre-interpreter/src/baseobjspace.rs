@@ -11611,6 +11611,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return crate::call::call_function_impl_result(method, &[obj]);
             }
         }
+        // PyPy `space.next(w_obj)` performs a type-MRO `__next__` lookup for
+        // every W_Root object.  Typed-payload builtins are not INSTANCE_TYPE
+        // layouts, so give them the same generic dispatch used by `iter`
+        // above instead of requiring one hardcoded branch per iterator type.
+        if !is_instance(obj) {
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = lookup_in_type_where(w_type, "__next__") {
+                    return crate::call::call_function_impl_result(method, &[obj]);
+                }
+            }
+        }
     }
     Err(PyError::type_error(format!(
         "'{}' object is not an iterator",

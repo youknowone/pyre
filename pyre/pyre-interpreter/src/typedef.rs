@@ -2464,6 +2464,12 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// check_user_subclass prevents subclassing (acceptable_as_base_class=False).
 /// Only positional obj argument accepted.
 fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "bool() takes no keyword arguments",
+        ));
+    }
     // args[0] = w_booltype (cls)
     let w_booltype = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_bool) = gettypefor(&pyre_object::BOOL_TYPE) {

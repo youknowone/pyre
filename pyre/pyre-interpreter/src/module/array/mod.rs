@@ -789,37 +789,72 @@ fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_str_new(&array_repr_string(args[0])?))
 }
 
-// Comparison: lexicographic over elements (`compare_arrays`).
+// `interp_array.py compare_arrays`: compare each element with the requested
+// operation.  In particular, an unordered pair such as NaN is neither less
+// nor greater; treating every non-equal/non-less pair as greater is wrong.
 fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
     if !unsafe { arr::is_array(a) } || !unsafe { arr::is_array(b) } {
         return Ok(pyre_object::w_not_implemented());
     }
     let la = unsafe { arr::w_array_len(a) };
     let lb = unsafe { arr::w_array_len(b) };
+    if op == 0 && la != lb {
+        return Ok(pyre_object::w_bool_from(false));
+    }
+    if op == 1 && la != lb {
+        return Ok(pyre_object::w_bool_from(true));
+    }
     let n = la.min(lb);
-    let mut decided: Option<std::cmp::Ordering> = None;
     for i in 0..n {
         let ea = unsafe { arr::w_array_unpack_item(a, i) };
         let eb = unsafe { arr::w_array_unpack_item(b, i) };
-        if !crate::baseobjspace::eq_w(ea, eb)? {
-            // First differing element decides the ordering via `<`.
-            let lt = crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Lt)?)?;
-            decided = Some(if lt {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            });
-            break;
+        match op {
+            0 => {
+                if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+            }
+            1 => {
+                if crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Ne)?)? {
+                    return Ok(pyre_object::w_bool_from(true));
+                }
+            }
+            2 | 4 => {
+                let cmp = if op == 2 {
+                    CompareOp::Lt
+                } else {
+                    CompareOp::Gt
+                };
+                if crate::baseobjspace::is_true(compare(ea, eb, cmp)?)? {
+                    return Ok(pyre_object::w_bool_from(true));
+                }
+                if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+            }
+            3 | 5 => {
+                let cmp = if op == 3 {
+                    CompareOp::Le
+                } else {
+                    CompareOp::Ge
+                };
+                if !crate::baseobjspace::is_true(compare(ea, eb, cmp)?)? {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
+                    return Ok(pyre_object::w_bool_from(true));
+                }
+            }
+            _ => unreachable!(),
         }
     }
-    let ord = decided.unwrap_or_else(|| la.cmp(&lb));
     let result = match op {
-        0 => ord == std::cmp::Ordering::Equal,   // ==
-        1 => ord != std::cmp::Ordering::Equal,   // !=
-        2 => ord == std::cmp::Ordering::Less,    // <
-        3 => ord != std::cmp::Ordering::Greater, // <=
-        4 => ord == std::cmp::Ordering::Greater, // >
-        5 => ord != std::cmp::Ordering::Less,    // >=
+        0 => true,
+        1 => false,
+        2 => la < lb,
+        3 => la <= lb,
+        4 => la > lb,
+        5 => la >= lb,
         _ => unreachable!(),
     };
     Ok(pyre_object::w_bool_from(result))

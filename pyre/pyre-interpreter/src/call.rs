@@ -2151,25 +2151,6 @@ pub fn call_with_kwargs(
     // For type objects: allocate via __new__ then call __init__ with kwargs.
     // PyPy: typeobject.py descr_call → __new__ + __init__
     if unsafe { pyre_object::is_type(callable) } {
-        // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
-        // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function` type is non-acceptable-as-base too, but its
-        // `tp_new` (`FunctionType(code, globals, ..., kwdefaults=...)`)
-        // does take keyword arguments, so route those through `__new__`.
-        let is_function_type = std::ptr::eq(
-            callable,
-            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-        );
-        if !kwargs.is_empty()
-            && !is_function_type
-            && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }
-        {
-            let type_name = unsafe { pyre_object::w_type_get_name(callable) };
-            return Err(crate::PyError::type_error(format!(
-                "{}() takes no keyword arguments",
-                type_name,
-            )));
-        }
         // Calculate the winning metaclass from bases.
         // type(name, bases, dict, **kw) needs to find the correct metaclass
         // and call its __new__ with the kwargs.
