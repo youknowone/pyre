@@ -1897,9 +1897,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::GetIter
     {
-        if let Some(iter_op) =
-            try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)?
-        {
+        if let Some(iter_op) = try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }

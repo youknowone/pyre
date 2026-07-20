@@ -25,6 +25,21 @@ pub struct WasmFailDescr {
     pub meta_descr: Option<DescrRef>,
 }
 
+/// `compile.py:658-662` ExitFrameWithExceptionDescrRef parity: whether a FINISH
+/// exit is an ExitFrameWithException (the callee raised; slot 0 holds the
+/// exception) rather than a DoneWithThisFrame. `is_finish` alone is true for
+/// both, so the self-recursive CALL_ASSEMBLER arm must exclude the exception
+/// variant when it picks the "clean callee finish" `fail_index` — an
+/// ExitFrameWithException must route to `wasm_ca_resume_deopt`, which propagates
+/// the exception, not be short-circuited to its output slot.
+pub fn meta_descr_is_exit_frame_with_exception(meta_descr: &Option<DescrRef>) -> bool {
+    meta_descr
+        .as_ref()
+        .and_then(|d| d.as_fail_descr())
+        .map(|fd| fd.is_exit_frame_with_exception())
+        .unwrap_or(false)
+}
+
 impl Descr for WasmFailDescr {
     fn index(&self) -> u32 {
         self.fail_index

@@ -4562,8 +4562,11 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
             .heap_cache_mut()
             .class_now_known(start_r, int_type_addr);
     }
-    let start_i =
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, start_r, crate::descr::int_intval_descr());
+    let start_i = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        start_r,
+        crate::descr::int_intval_descr(),
+    );
     ctx.trace_ctx
         .set_opref_concrete(start_i, majit_ir::Value::Int(concrete_start));
 
@@ -4613,9 +4616,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         .set_opref_concrete(mul, majit_ir::Value::Int(concrete_mul));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
 
-    let one_past = ctx
-        .trace_ctx
-        .record_op(OpCode::IntAddOvf, &[start_i, mul]);
+    let one_past = ctx.trace_ctx.record_op(OpCode::IntAddOvf, &[start_i, mul]);
     ctx.trace_ctx
         .set_opref_concrete(one_past, majit_ir::Value::Int(concrete_one_past));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
@@ -4771,8 +4772,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
             crate::descr::range_iter_remaining_descr(),
         );
         let continues = ctx.trace_ctx.record_op(OpCode::IntGt, &[remaining, zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(continues, Value::Int(0));
+        ctx.trace_ctx.set_opref_concrete(continues, Value::Int(0));
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[continues])?;
         let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
         ctx.trace_ctx

@@ -1367,7 +1367,9 @@ pub fn build_wasm_module(
     // home-slot writes overflow into the next arena slot.
     let bridge_finish_fi = guards
         .iter()
-        .find(|g| g.is_finish)
+        .find(|g| {
+            g.is_finish && !crate::failguard::meta_descr_is_exit_frame_with_exception(&g.meta_descr)
+        })
         .map(|g| g.fail_index)
         .unwrap_or(0);
     // CA frames execute the source loop and this bridge on the same frozen

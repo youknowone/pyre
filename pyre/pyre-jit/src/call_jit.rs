@@ -3377,6 +3377,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
     // values so the driver borrow is released before the blackhole re-enters it.
     enum Outcome {
         Finished(i64),
+        FinishedException(i64),
         Deopt {
             descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
             green_key: u64,
@@ -3394,7 +3395,19 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             .as_fail_descr()
             .expect("CA deopt: get_latest_descr_arc returned a non-FailDescr Descr");
         if descr.is_finish() {
-            Outcome::Finished(backend.get_ref_value(&frame, 0).as_usize() as i64)
+            let result = backend.get_ref_value(&frame, 0).as_usize() as i64;
+            // compile.py:658-662 ExitFrameWithExceptionDescrRef parity: a FINISH
+            // descr is either DoneWithThisFrame (return the value) or
+            // ExitFrameWithException (the callee raised; slot 0 holds the
+            // exception). The self-recursive callee re-raised — propagate it
+            // through the exception channel like the outer Finished arm
+            // (eval.rs:6066) instead of banking it as the recursive-call
+            // return, which would surface as `int + <exc>`.
+            if descr.is_exit_frame_with_exception() {
+                Outcome::FinishedException(result)
+            } else {
+                Outcome::Finished(result)
+            }
         } else {
             let green_key = majit_backend::descr_owning_jct(descr)
                 .map(|jct| jct.green_key())
@@ -3424,6 +3437,16 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
 
     match outcome {
         Outcome::Finished(r) => r,
+        // warmspot.py:998-1005 ExitFrameWithExceptionRef: the callee raised.
+        // Publish the exception so the caller's GUARD_NO_EXCEPTION (after the
+        // CALL_ASSEMBLER) fires, and return garbage — parity with
+        // `handle_blackhole_result`'s ExitFrameWithExceptionRef arm.
+        Outcome::FinishedException(exc) => {
+            if exc != 0 {
+                store_jit_exception(exc);
+            }
+            0
+        }
         Outcome::Deopt {
             descr_arc,
             green_key,

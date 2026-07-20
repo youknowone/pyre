@@ -1783,7 +1783,10 @@ impl majit_backend::Backend for WasmBackend {
             .fail_descrs
             .borrow()
             .iter()
-            .find(|descr| descr.is_finish)
+            .find(|descr| {
+                descr.is_finish
+                    && !failguard::meta_descr_is_exit_frame_with_exception(&descr.meta_descr)
+            })
             .map(|descr| descr.fail_index)
             .unwrap_or(0);
         // For a pending self target this is the exact map already embedded in
