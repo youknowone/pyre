@@ -146,7 +146,7 @@ pub use pyjitpl::{
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
     MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
     call_int_function, call_ref_function, call_void_function, counters,
-    struct_field_write_effect_info, trace_jitcode, trace_jitcode_from_merge_point,
+    struct_fields_write_effect_info, trace_jitcode, trace_jitcode_from_merge_point,
     trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;

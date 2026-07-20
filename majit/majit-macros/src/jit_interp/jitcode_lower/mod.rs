@@ -1027,14 +1027,18 @@ impl LowererConfig {
         }
         // Resolve each `residual_writes` entry into per-helper
         // `(helper segments, struct Path, field Ident)`, recovering the struct
-        // `Path` from `state_ref_scalars[ref_scalar]` (same source the matching
-        // getfield uses for `offset_of!` + `struct_type_id`).
+        // `Path` from `state_ref_scalars[ref_scalar]` unless the declaration
+        // explicitly names a nominal layout alias.  The latter supports raw
+        // pointers which type-pun compatible repr(C) prefixes but whose field
+        // descr identities remain per concrete struct type.
         let residual_writes = residual_writes
             .iter()
             .flat_map(|entry| {
-                let struct_path = state_ref_scalars
-                    .get(&entry.ref_scalar.to_string())
-                    .map(|(_, p)| p.clone());
+                let struct_path = entry.struct_type.clone().or_else(|| {
+                    state_ref_scalars
+                        .get(&entry.ref_scalar.to_string())
+                        .map(|(_, p)| p.clone())
+                });
                 entry.helpers.iter().filter_map(move |helper| {
                     struct_path
                         .clone()

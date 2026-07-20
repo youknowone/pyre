@@ -4,8 +4,8 @@ use super::*;
 impl<'c> Lowerer<'c> {
     /// If `func` is a registered `residual_writes` mutator, return the
     /// `struct_field_write_effect_info(...)` expression naming the written
-    /// field, so the residual call records a write-set `EffectInfo` that
-    /// invalidates the cached `getfield_gc_i` on that field.  `None` for a
+    /// fields, so the residual call records a write-set `EffectInfo` that
+    /// invalidates cached getfields on those fields.  `None` for a
     /// plain residual call (empty write-set).  `can_raise` carries the
     /// call policy's extra-effect into the write-set `EffectInfo` so a
     /// `ResidualVoidCannotRaise` mutator keeps `CannotRaise` instead of
@@ -17,29 +17,59 @@ impl<'c> Lowerer<'c> {
     ) -> Option<TokenStream> {
         let config = self.config?;
         let func_segments = canonical_expr_segments(func)?;
-        let (_, struct_path, field) = config
+        let writes: Vec<_> = config
             .residual_writes
             .iter()
-            .find(|(segments, _, _)| *segments == func_segments)?;
-        // Raw host-owned struct (the ref-scalar's pointee, no GC header) →
-        // `is_gc_managed = false`, the same id the getfield/setfield lowering
-        // uses so this write-EI rebuilds the SAME parent SizeDescr identity.
-        let tid = struct_type_id_tokens(struct_path, false);
+            .filter(|(segments, _, _)| *segments == func_segments)
+            .collect();
+        let mut layouts: Vec<(&syn::Path, Vec<TokenStream>)> = Vec::new();
+        for (_, path, field) in writes {
+            let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
+                fields
+            } else {
+                layouts.push((path, Vec::new()));
+                &mut layouts.last_mut().unwrap().1
+            };
+            let struct_last = path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default();
+            let key = format!("{}::{}", struct_last, field);
+            let is_ref = config.ref_fields.contains_key(&key);
+            fields.push(quote! {
+                (
+                    ::core::mem::offset_of!(#path, #field),
+                    #is_ref,
+                    stringify!(#field),
+                )
+            });
+        }
+        let layouts: Vec<_> = layouts
+            .iter()
+            .map(|(struct_path, fields)| {
+                // Raw host-owned struct (the ref-scalar's pointee, no GC header)
+                // → `is_gc_managed = false`, the same id the getfield/setfield
+                // lowering uses so the write-EI rebuilds the SAME parent
+                // SizeDescr identity.
+                let tid = struct_type_id_tokens(struct_path, false);
+                quote! {
+                    (
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        false,
+                        &[#(#fields),*],
+                    )
+                }
+            })
+            .collect();
         Some(quote! {
             // The residual mutates a host-owned native struct field (no
             // GC header) → `is_gc_managed = false`, matching the
             // getfield/setfield lowering so the write-EI rebuilds the
             // SAME parent SizeDescr identity the getfield reads back.
-            majit_metainterp::struct_field_write_effect_info(
-                ::core::mem::size_of::<#struct_path>(),
-                #tid,
-                false,
-                &[(
-                    ::core::mem::offset_of!(#struct_path, #field),
-                    false,
-                    stringify!(#field),
-                )],
-                stringify!(#field),
+            majit_metainterp::struct_fields_write_effect_info(
+                &[#(#layouts),*],
                 #can_raise,
             )
         })

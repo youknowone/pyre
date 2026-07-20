@@ -192,92 +192,92 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
 /// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
 /// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
 /// residual helper that mutates a struct field through opaque host code — e.g.
-/// aheui's `jit_storage_*` advancing the selected `Stack.size` — declares this
-/// so `OptHeap::force_from_effectinfo` invalidates the cached `getfield_gc_i`
-/// on that field after the call.  Without it the residual call carries an empty
-/// write-set, the optimizer CSE-folds the field load to a single loop-invariant
-/// read, and a loop whose exit condition derives from that field never
-/// re-observes the mutation.  This is the residual analogue of the in-trace
-/// `setfield_gc` write barrier a traced mutator would emit.
+/// aheui's `jit_storage_*` changing selected `Stack` fields — declares them so
+/// `OptHeap::force_from_effectinfo` invalidates cached getfields after the
+/// call.  Without it the residual call carries an empty write-set and the
+/// optimizer can CSE-fold a mutable field load across the call.  This is the
+/// residual analogue of the in-trace `setfield_gc` write barrier a traced
+/// mutator would emit.
 ///
 /// `fields` is the same `(offset, is_ref, name)` layout the matching getfield
 /// passes to `register_struct_layout`; the parented size+field group is rebuilt
 /// here identically (`make_simple_descr_group_keyed`, idempotent / first-write-
-/// wins) so the field descr published into `gc_cache()._cache_field[Struct
-/// (type_id)][name]` is the one `field_descr_ref_from_bh` reads back for the
+/// wins) so every field descr published into `gc_cache()._cache_field[Struct
+/// (type_id)][name]` is the one `field_descr_ref_from_bh` reads back for its
 /// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
 /// before `finish_setup_descrs` (jitcode assembly does), matching the
 /// non-trivial-raw-set construction-timing `call_descr` asserts.
-pub fn struct_field_write_effect_info(
-    struct_size: usize,
-    type_id: u64,
-    is_gc_managed: bool,
-    fields: &[(usize, bool, &str)],
-    write_field: &str,
+pub fn struct_fields_write_effect_info(
+    layouts: &[(usize, u64, bool, &[(usize, bool, &str)])],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
-    let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
-    ordered.sort_by_key(|&(offset, _, _)| offset);
-    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
-        .iter()
-        .enumerate()
-        .map(|(idx, &(offset, is_ref, name))| {
-            let (field_type, flag) = if is_ref {
-                (
-                    majit_ir::value::Type::Ref,
-                    majit_ir::descr::ArrayFlag::Pointer,
-                )
-            } else {
-                (
-                    majit_ir::value::Type::Int,
-                    majit_ir::descr::ArrayFlag::Signed,
-                )
-            };
-            majit_ir::descr::SimpleFieldDescrSpec {
-                index: u32::MAX,
-                name: name.to_string(),
-                offset,
-                field_size: 8,
-                field_type,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                flag,
-                virtualizable: false,
-                index_in_parent: idx,
-            }
-        })
-        .collect();
-    majit_ir::descr::make_simple_descr_group_keyed(
-        u32::MAX,
-        struct_size,
-        type_id as u32,
-        type_id,
-        0,
-        is_gc_managed,
-        &specs,
-    );
-    let struct_key = majit_ir::descr::LLType::Struct(type_id);
-    let fd = majit_ir::descr::gc_cache()
-        .lock()
-        .unwrap()
-        ._cache_field
-        .get(&struct_key)
-        .and_then(|m| m.get(write_field))
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "struct_field_write_effect_info: field `{write_field}` not registered for type {type_id}"
-            )
-        });
+    let mut fds = Vec::new();
+    for &(struct_size, type_id, is_gc_managed, fields) in layouts {
+        let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _)| offset);
+        let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
+            .iter()
+            .enumerate()
+            .map(|(idx, &(offset, is_ref, name))| {
+                let (field_type, flag) = if is_ref {
+                    (
+                        majit_ir::value::Type::Ref,
+                        majit_ir::descr::ArrayFlag::Pointer,
+                    )
+                } else {
+                    (
+                        majit_ir::value::Type::Int,
+                        majit_ir::descr::ArrayFlag::Signed,
+                    )
+                };
+                majit_ir::descr::SimpleFieldDescrSpec {
+                    index: u32::MAX,
+                    name: name.to_string(),
+                    offset,
+                    field_size: 8,
+                    field_type,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    flag,
+                    virtualizable: false,
+                    index_in_parent: idx,
+                }
+            })
+            .collect();
+        majit_ir::descr::make_simple_descr_group_keyed(
+            u32::MAX,
+            struct_size,
+            type_id as u32,
+            type_id,
+            0,
+            is_gc_managed,
+            &specs,
+        );
+        let struct_key = majit_ir::descr::LLType::Struct(type_id);
+        fds.extend(fields.iter().map(|(_, _, write_field)| {
+            majit_ir::descr::gc_cache()
+                .lock()
+                .unwrap()
+                ._cache_field
+                .get(&struct_key)
+                .and_then(|m| m.get(*write_field))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "struct_fields_write_effect_info: field `{write_field}` not registered for type {type_id}"
+                    )
+                }) as majit_ir::DescrRef
+        }));
+    }
     let extra_effect = if can_raise {
         majit_ir::ExtraEffect::CanRaise
     } else {
         majit_ir::ExtraEffect::CannotRaise
     };
     let mut ei = majit_ir::EffectInfo::const_new(extra_effect, majit_ir::OopSpecIndex::None);
-    ei._write_descrs_fields = Some(vec![fd as majit_ir::DescrRef]);
+    ei._write_descrs_fields = Some(fds);
     ei
 }
 

@@ -112,7 +112,8 @@ pub struct JitInterpConfig {
     pub recursive_entry: Option<Path>,
     /// Residual helpers that mutate a `state.<ref_scalar>.<field>` through
     /// opaque host code, declared as `residual_writes = { <ref_scalar>.<field>
-    /// => [helpers] }`.  Drives the write-set `EffectInfo` the lowering attaches
+    /// [@ StructType] => [helpers] }`.  `@ StructType` adds a nominal-layout
+    /// alias for a type-punned ref scalar.  Drives the write-set `EffectInfo` the lowering attaches
     /// so the optimizer invalidates the matching cached `getfield_gc_i` after
     /// the call.  Empty for interpreters with no residual field mutators.
     pub residual_writes: Vec<ResidualWriteEntry>,
@@ -331,7 +332,7 @@ pub struct CallEntry {
     pub policy: Option<CallPolicyKind>,
 }
 
-/// One entry in the `residual_writes = { <ref_scalar>.<field> => [helpers] }`
+/// One entry in the `residual_writes = { <ref_scalar>.<field> [@ StructType] => [helpers] }`
 /// map.  Each listed residual helper mutates `<ref_scalar>.<field>` through
 /// opaque host code; the lowering attaches a write-set `EffectInfo` naming that
 /// field so `OptHeap::force_from_effectinfo` invalidates the cached
@@ -343,6 +344,10 @@ pub struct CallEntry {
 pub struct ResidualWriteEntry {
     pub ref_scalar: Ident,
     pub field: Ident,
+    /// Optional nominal struct layout alias.  This is needed when the raw
+    /// pointer carried by `ref_scalar` type-puns several repr(C) layouts whose
+    /// shared field offsets nevertheless have distinct field-descr identities.
+    pub struct_type: Option<Path>,
     pub helpers: Vec<Path>,
 }
 
@@ -695,7 +700,7 @@ impl Parse for JitInterpConfig {
     }
 }
 
-/// Parse `residual_writes = { <ref_scalar>.<field> => [helper, ...], ... }`.
+/// Parse `residual_writes = { <ref_scalar>.<field> [@ StructType] => [helper, ...], ... }`.
 /// Each map key is a `state` ref-scalar field path (`selected_ref.size`) and
 /// the value is a bracketed list of residual helper function paths that mutate
 /// it.  See [`ResidualWriteEntry`].
@@ -707,6 +712,12 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
         let ref_scalar: Ident = content.parse()?;
         content.parse::<Token![.]>()?;
         let field: Ident = content.parse()?;
+        let struct_type = if content.peek(Token![@]) {
+            content.parse::<Token![@]>()?;
+            Some(content.parse::<Path>()?)
+        } else {
+            None
+        };
         content.parse::<Token![=>]>()?;
         let helpers_content;
         bracketed!(helpers_content in content);
@@ -715,6 +726,7 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
         entries.push(ResidualWriteEntry {
             ref_scalar,
             field,
+            struct_type,
             helpers: helpers.into_iter().collect(),
         });
         let _ = content.parse::<Token![,]>();
