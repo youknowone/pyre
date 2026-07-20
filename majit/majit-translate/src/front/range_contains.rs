@@ -372,11 +372,7 @@ fn range_value_single_op_consumer(
         let mut grew = false;
         for block in &graph.blocks {
             for link in &block.exits {
-                let Some(target_idx) = graph
-                    .blocks
-                    .iter()
-                    .position(|b| b.id == link.target)
-                else {
+                let Some(target_idx) = graph.blocks.iter().position(|b| b.id == link.target) else {
                     continue;
                 };
                 let target_inputargs = &graph.blocks[target_idx].inputargs;

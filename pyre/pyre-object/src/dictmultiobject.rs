@@ -1304,10 +1304,8 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
         let key_obj = crate::celldict::_wrapkey(k);
         new_storage.insert(object_key_for(key_obj), v);
     }
-    raw.object_storage = crate::gc_storage::gc_alloc_storage_box(
-        new_storage,
-        object_dict_storage_gc_type_id(),
-    );
+    raw.object_storage =
+        crate::gc_storage::gc_alloc_storage_box(new_storage, object_dict_storage_gc_type_id());
     storage.clear();
     // `celldict.py:180-184`: every live GlobalCache becomes invalid
     // because the strategy is being swapped out; the JIT must
