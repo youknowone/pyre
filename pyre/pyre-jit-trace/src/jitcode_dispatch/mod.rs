@@ -1627,9 +1627,7 @@ impl DispatchError {
             Self::InplaceContainerMutationUnsupported { .. } => {
                 "InplaceContainerMutationUnsupported"
             }
-            Self::ExcEdgeCrossFrameReturnUnsupported { .. } => {
-                "ExcEdgeCrossFrameReturnUnsupported"
-            }
+            Self::ExcEdgeCrossFrameReturnUnsupported { .. } => "ExcEdgeCrossFrameReturnUnsupported",
         }
     }
 }
