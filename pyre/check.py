@@ -85,6 +85,11 @@ WASM_ENGINE = "wasmtime"
 # slower still on loaded CI runners, so give it extra headroom by default to
 # avoid flaky timeouts. Overridable with --wasm-timeout-scale.
 WASM_TIMEOUT_SCALE = 4.0
+# Native Windows CI can spend substantially more wall time than reported
+# process user-CPU while antivirus and concurrent matrix jobs contend for the
+# runner.  Keep the timeout as a hang guard by granting native backends 2x
+# headroom; performance still gates on measured user-CPU below.
+WIN_NATIVE_TIMEOUT_SCALE = 2.0
 
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
@@ -570,6 +575,8 @@ class Check:
                 return self.args.wasm_timeout_scale
             # Default wasm headroom composes with --timeout-scale.
             return WASM_TIMEOUT_SCALE * self.args.timeout_scale
+        if sys.platform == "win32":
+            return WIN_NATIVE_TIMEOUT_SCALE * self.args.timeout_scale
         return self.args.timeout_scale
 
     def measure_startups(self):
