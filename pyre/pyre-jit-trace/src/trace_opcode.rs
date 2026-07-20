@@ -2725,18 +2725,6 @@ impl MIFrame {
         }
     }
 
-    /// PyPy generate_guard + capture_resumedata: uses current_fail_args
-    /// which encodes the full framestack for multi-frame resume.
-    /// pyjitpl.py:3222 store_token_in_vable():
-    ///   force_token = self.history.record0(rop.FORCE_TOKEN, ...)
-    ///   self.history.record2(rop.SETFIELD_GC, vbox, force_token, ...)
-    ///   self.generate_guard(rop.GUARD_NOT_FORCED_2)
-    pub(crate) fn store_token_in_vable(&mut self, ctx: &mut TraceCtx) {
-        if ctx.store_token_in_vable_setfield() {
-            self.generate_guard(ctx, OpCode::GuardNotForced2, &[]);
-        }
-    }
-
     pub(crate) fn generate_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         // pyjitpl.py:2558-2560 generate_guard parity:
         //     if isinstance(box, Const):    # no need for a guard
