@@ -8148,6 +8148,31 @@ impl CodeWriter {
                             let _ = binary_op_tag(op_kind)
                                 .expect("unsupported binary op tag in jitcode lowering")
                                 as i64;
+                            let operands_are_local_loads = {
+                                let block = current_block.block();
+                                let block = block.borrow();
+                                current_state.stack.len() >= 2
+                                    && current_state.stack.iter().rev().take(2).all(|value| {
+                                        block.operations.iter().rev().any(|operation| {
+                                            operation.opname == "getarrayitem_vable_r"
+                                                && operation.result.as_ref() == Some(value)
+                                        })
+                                    })
+                            };
+                            // RPython puts a live marker immediately before
+                            // overflowing integer arithmetic.  Python bytecode
+                            // is dynamically typed, so preserve that boundary
+                            // for the local-load shape handled by the integer
+                            // fast path.
+                            if operands_are_local_loads {
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "-live-",
+                                    Vec::new(),
+                                    None,
+                                    py_pc as i64,
+                                );
+                            }
                             // Pop rhs (blackhole will see vsd reflect this pop).
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
