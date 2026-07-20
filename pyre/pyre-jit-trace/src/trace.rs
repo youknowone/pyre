@@ -698,7 +698,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
 ///
 /// Attempts to walk the per-CodeObject JitCode body via
 /// [`crate::jitcode_dispatch::dispatch_via_miframe`] from the resume
-/// entry pc (`pc_map[start_pc]`) and logs how far the symbolic walk
+/// entry pc and logs how far the symbolic walk
 /// gets: a terminator outcome (`Finish` / `CloseLoop` / `SubReturn`)
 /// or the first `DispatchError` stop with its pc.
 ///
@@ -1630,7 +1630,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     let is_entry_green = start_pc == 0 || is_loop_header;
     let uses_entry_sidecar = is_plain_portal && is_entry_green;
     let sidecar_entry = pjc.merge_entry_for(start_pc);
-    let pc_map_entry = if sym.bridge_walk_entry_pc().is_some() {
+    let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
@@ -1641,8 +1641,8 @@ fn run_perfn_walk<Sym: WalkSym>(
         // one the site-specific decline below rejects the walk.
         None
     };
-    let Some(pc_map_entry) = pc_map_entry else {
-        // The frozen pc_map of this already-built body does not encode
+    let Some(entry_coord) = entry_coord else {
+        // This already-built body does not encode
         // `start_pc` as a resume coordinate, so the same body walked from
         // the same entry recurs identically on every retrace.  Decline the
         // key so retraces interpret without JIT instead of re-walking and
@@ -1650,7 +1650,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // structural decline below.
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
-                "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={}); declining walk",
+                "[walk-perfn] no jitcode entry for start_pc={start_pc} (n_py_instrs={}); declining walk",
                 pjc.metadata.n_py_instrs as usize
             );
         }
@@ -1661,12 +1661,12 @@ fn run_perfn_walk<Sym: WalkSym>(
     // A kept-stack branch-guard bridge resumes at the guard's OWN mid-opcode
     // jitcode offset (`setup_bridge_sym` resolved it into
     // `sym.bridge_walk_entry_pc`, the same coordinate the blackhole
-    // `setposition`s to) — NOT the opcode-entry marker `pc_map[start_pc]`.
+    // `setposition`s to) — NOT the opcode-entry resume marker for `start_pc`.
     // Resuming at the entry marker re-executes the whole opcode from the top,
     // reading abstract-register colors that were live at entry but dead
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
-    let entry = sym.bridge_walk_entry_pc().unwrap_or(pc_map_entry);
+    let entry = sym.bridge_walk_entry_pc().unwrap_or(entry_coord);
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
         let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
         let live_stack = sym.valuestackdepth().saturating_sub(stack_base);
@@ -3190,7 +3190,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     }
     let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
     // A guard snapshot emitted during the walk may have hit a resume
-    // coordinate the jitcode pc_map cannot encode (#124/#130) and requested
+    // coordinate the jitcode resume markers cannot encode (#124/#130) and requested
     // an abort (`state::request_trace_abort`).  The walker does not poll the
     // flag mid-walk, so honor it here before mapping the outcome — otherwise a
     // walk that reaches a terminator would compile a trace carrying the bad
@@ -3380,7 +3380,7 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     let code = pjc.jitcode.code.as_slice();
     let entry = pjc.merge_entry_for(start_pc);
     eprintln!(
-        "[perfn-jitcode] code_len={} pc_map_len={} start_pc={} entry_jitcode_pc={:?} \
+        "[perfn-jitcode] code_len={} n_py_instrs={} start_pc={} entry_jitcode_pc={:?} \
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
          built_as_portal={}",
         code.len(),

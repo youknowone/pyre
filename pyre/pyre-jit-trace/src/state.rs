@@ -308,7 +308,7 @@ impl MetaInterpStaticData {
     /// RPython's `metainterp_sd.jitcodes[i]` entries are immutable after
     /// `warmspot.py:282`: every `rd_numb` frame records `(jitcode_index,
     /// pc)` and the blackhole decoder re-derives the per-frame value
-    /// count from that index's pc_map + liveness tables, so a populated
+    /// count from that index's liveness tables, so a populated
     /// entry must never change shape under an index that live resume
     /// data already references. Pyre's runtime codewriter can re-splice
     /// a graph (when a later primary compile re-queues an inlined
@@ -544,7 +544,7 @@ thread_local! {
         RefCell::new(MetaInterpStaticData::new());
 
     /// Set when a guard's frame reports a resume coordinate the jitcode
-    /// `pc_map` cannot resolve — the cross-frame snapshot gap (an inlined
+    /// resume markers cannot resolve — the cross-frame snapshot gap (an inlined
     /// callee + exception-resume shape whose parent resume pc was never
     /// recorded; #124/#130).  `get_list_of_active_boxes` raises it instead of
     /// panicking; `metainterp::interpret` polls it each step and aborts the
@@ -990,8 +990,8 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
 /// header in `all_liveness`. Total live value count = `len_i +
 /// len_r + len_f`.
 ///
-/// Fallback: when the jitcode is still a skeleton payload (pc_map
-/// empty) or has no backing CodeObject, decode via the pyre-jit-trace
+/// Fallback: when the jitcode is still a skeleton payload or has no
+/// backing CodeObject, decode via the pyre-jit-trace
 /// `LiveVars` analysis over the Python bytecode. This path is used
 /// for inlined callee frames whose majit_jitcode has not been built
 /// at trace time.
@@ -1031,7 +1031,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         // This remains a fail-loud internal invariant, not a fallback path.
         panic!(
             "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
-             (pc_map.len={}, all_liveness.len={}). Phase X-0/X-1 removed \
+             (n_py_instrs={}, all_liveness.len={}). Phase X-0/X-1 removed \
              all known triggers — further hits are bugs.",
             jitcode_index,
             pc,
@@ -1994,13 +1994,13 @@ pub struct PyreSym {
     /// `goto_if_not`), resolved the same way the blackhole resolves its
     /// `setposition` (`resolve_resume_pc_with_jitcode_pc`).  A chained-compare /
     /// short-circuit guard resumes mid-opcode: the opcode-entry marker
-    /// (`pc_map[py_pc]`) re-executes the whole comparison from the top, reading
+    /// for `py_pc` re-executes the whole comparison from the top, reading
     /// abstract-register colors that were live at entry but dead (recolored /
     /// consumed) at the guard — colors the guard snapshot never preserved.  The
     /// walk must resume where the blackhole does (the guard offset), so the
     /// re-executed suffix only reads colors the resume data actually carries.
     /// `None` for a non-branch-guard resume, where the walk
-    /// keeps the `pc_map[py_pc]` opcode-entry offset.
+    /// keeps the opcode-entry offset for `py_pc`.
     pub(crate) bridge_walk_entry_pc: Option<usize>,
     /// The color-indexed Ref register bank as `consume_boxes`
     /// (resume.py:1055) fills `f.registers_r` — one box per abstract
@@ -9239,8 +9239,8 @@ impl JitState for PyreJitState {
         sym.bridge_stack_oprefs = Some(bridge_stack);
         // Kept-stack branch guards resume the full-body walk at the guard's OWN
         // mid-opcode jitcode offset — the same resolved coordinate stored in
-        // the frame pc — instead of the opcode-entry marker `pc_map[py_pc]`.
-        // `None` leaves the walk on the pc_map entry.
+        // the frame pc — instead of the opcode-entry marker for `py_pc`.
+        // `None` leaves the walk on the opcode-entry marker.
         sym.bridge_walk_entry_pc =
             crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
                 .then_some(frame0.pc as usize);

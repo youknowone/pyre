@@ -1150,7 +1150,7 @@ impl MIFrame {
                     Some(jit_pc) => Some(jit_pc),
                     None => {
                         // This (parent) frame reports a `live_pc` the jitcode
-                        // `pc_map` has no entry for — the cross-frame snapshot
+                        // has no resume entry for — the cross-frame snapshot
                         // coordinate gap (#124/#130): an inlined callee +
                         // exception-resume shape whose parent resume pc was
                         // never recorded.  Building the guard from this frame
@@ -1485,20 +1485,20 @@ impl MIFrame {
         // MetaInterpStaticData JitCode entry; upstream stores them on
         // metainterp_sd.
         //
-        // Skeleton payload (no `pc_map` yet) → fall back to the
+        // Skeleton payload (not yet populated) → fall back to the
         // pyre-jit-trace LiveVars analysis. With the call.py-parity
         // jitcode_for callback wired up, this branch only fires for
         // sentinel/null jitcodes (PyreSym::new_uninit) that never
         // reach final code emission.
         let jc = unsafe { &*jitcode_ptr };
         if jc.payload.is_skeleton() {
-            // `CallControl.get_jitcode` drain fills pc_map before any
+            // `CallControl.get_jitcode` drain populates the jitcode before any
             // guard capture (pyjitpl.py:199 parity). Phase X-0 eliminated
             // the out-of-range-pc source. Phase X-1(a) migrated the
             // remaining guard/resume tests to the real compile path in
             // `pyre-jit`. Unconditional panic — any hit is a bug.
             panic!(
-                "get_list_of_active_boxes: skeleton jitcode (pc_map empty) \
+                "get_list_of_active_boxes: skeleton jitcode (not populated) \
                  at jitcode_pc={:?} — Phase X-0/X-1 removed all known triggers; \
                  further hits are bugs.",
                 resume_jit_pc
