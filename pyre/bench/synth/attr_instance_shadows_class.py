@@ -1,6 +1,8 @@
 # An instance attribute shadows a same-named non-data-descriptor class
 # attribute on builtin-type subclasses (tuple/int/str), while a data descriptor
-# still wins over the instance dict. Output verified against CPython/PyPy.
+# still wins over a competing instance-dict entry (injected directly, since the
+# data descriptor's no-op __set__ never writes __dict__). Output verified
+# against CPython/PyPy.
 N = 30000
 
 
@@ -38,6 +40,7 @@ def main():
         s = S("hi")
         s.x = "inst"
         td = TD([1])
+        td.__dict__["d"] = "inst"
         if t.x == "inst" and a.x == "inst" and s.x == "inst" and td.d == "data":
             n += 1
     print(n)
