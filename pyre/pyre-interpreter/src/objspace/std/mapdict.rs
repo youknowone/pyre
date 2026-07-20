@@ -15,6 +15,7 @@ use pyre_object::PyObjectRef;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 // ── attribute shapes (mapdict.py:32-42, 720-732) ──────────────────────
 
@@ -120,7 +121,7 @@ pub struct Terminator {
     /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
     /// cache `(name, attrkind) -> CachedAttributeHolder`. PyPy lazily inits it
     /// to `{}`; the eager empty map here is equivalent.
-    pub cache_attrs: RefCell<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
+    pub cache_attrs: Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
     /// mapdict.py:53 `AbstractAttribute.terminator` — a Terminator points to
     /// itself.
     pub terminator: MapRef,
@@ -174,7 +175,7 @@ pub struct PlainAttribute {
     pub order: usize,
     /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
     /// cache `(name, attrkind) -> CachedAttributeHolder`.
-    pub cache_attrs: RefCell<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
+    pub cache_attrs: Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
     /// mapdict.py:53 `AbstractAttribute.terminator` (= `back.terminator`).
     pub terminator: MapRef,
     /// `Some` for an `UnboxedPlainAttribute` (mapdict.py:532); `None` for a
@@ -201,7 +202,7 @@ pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
         allow_unboxing: Cell::new(true),
         kind,
         devolved_dict_terminator: Cell::new(std::ptr::null()),
-        cache_attrs: RefCell::new(HashMap::new()),
+        cache_attrs: Mutex::new(HashMap::new()),
         terminator: std::ptr::null(),
     })));
     // Patch the self-referential terminator now that the address is known
@@ -541,7 +542,7 @@ pub unsafe fn new_plain_attribute(
         back,
         ever_mutated: Cell::new(false),
         order,
-        cache_attrs: RefCell::new(HashMap::new()),
+        cache_attrs: Mutex::new(HashMap::new()),
         terminator: back_node.terminator(),
         unboxed: None,
     }))
@@ -593,7 +594,7 @@ pub unsafe fn new_unboxed_plain_attribute(
         back,
         ever_mutated: Cell::new(false),
         order,
-        cache_attrs: RefCell::new(HashMap::new()),
+        cache_attrs: Mutex::new(HashMap::new()),
         terminator: back_node.terminator(),
         unboxed: Some(UnboxedExtra {
             typ,
@@ -664,7 +665,7 @@ impl MapNode {
     }
 
     /// mapdict.py:47 `AbstractAttribute.cache_attrs`.
-    pub fn cache_attrs(&self) -> &RefCell<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
+    pub fn cache_attrs(&self) -> &Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
         match self {
             MapNode::Terminator(t) => &t.cache_attrs,
             MapNode::Plain(p) => &p.cache_attrs,
@@ -2417,8 +2418,8 @@ unsafe fn new_cached_attribute_holder(
     attrkind: u16,
     back: MapRef,
     unbox_type: Option<UnboxType>,
+    order: usize,
 ) -> *const CachedAttributeHolder {
-    let order = unsafe { (*back).cache_attrs() }.borrow().len();
     let attr = match unbox_type {
         None => unsafe { new_plain_attribute(name, attrkind, back, order) },
         Some(typ) => unsafe { new_unboxed_plain_attribute(name, attrkind, back, order, typ) },
@@ -2467,14 +2468,19 @@ unsafe fn get_new_attr(
     unbox_type: Option<UnboxType>,
 ) -> *const CachedAttributeHolder {
     let key = (name.to_owned(), attrkind);
-    if let Some(&holder) = unsafe { (*self_node).cache_attrs() }.borrow().get(&key) {
+    // PyPy mutates this ordinary per-node dict while holding the GIL
+    // (mapdict.py:149-156). Map nodes are process-global in pyre, so keep the
+    // lookup, holder construction, and insertion under one lock: parallel
+    // interpreters must intern exactly one transition for a given key.
+    let mut cache = unsafe { (*self_node).cache_attrs() }.lock().unwrap();
+    if let Some(&holder) = cache.get(&key) {
         return holder;
     }
-    let holder =
-        unsafe { new_cached_attribute_holder(name.to_owned(), attrkind, self_node, unbox_type) };
-    unsafe { (*self_node).cache_attrs() }
-        .borrow_mut()
-        .insert(key, holder);
+    let order = cache.len();
+    let holder = unsafe {
+        new_cached_attribute_holder(name.to_owned(), attrkind, self_node, unbox_type, order)
+    };
+    cache.insert(key, holder);
     holder
 }
 
@@ -2494,7 +2500,8 @@ unsafe fn find_branch_to_move_into(
     let key = (name.to_owned(), attrkind);
     loop {
         let holder = unsafe { (*current).cache_attrs() }
-            .borrow()
+            .lock()
+            .unwrap()
             .get(&key)
             .copied();
         let reached_top = match holder {
@@ -3604,6 +3611,49 @@ mod tests {
             assert_eq!(find_map_attr(b, wn("missing"), DICT), None);
             assert_eq!(find_map_attr(b, wn("missing"), DICT), None);
         }
+    }
+
+    #[test]
+    fn new_attr_cache_interns_transitions_across_threads() {
+        use std::sync::{Arc, Barrier};
+
+        let term_addr = new_dict_terminator(std::ptr::null_mut()) as usize;
+        let barrier = Arc::new(Barrier::new(16));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let term = term_addr as MapRef;
+                        barrier.wait();
+                        (0..64)
+                            .map(|index| {
+                                let name = format!("attr_{index}");
+                                unsafe {
+                                    get_new_attr(term, Wtf8::new(name.as_str()), DICT, None)
+                                        as usize
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for result in &results[1..] {
+            assert_eq!(result, &results[0]);
+        }
+        assert_eq!(
+            unsafe { (*(term_addr as MapRef)).cache_attrs() }
+                .lock()
+                .unwrap()
+                .len(),
+            64
+        );
     }
 
     #[test]
