@@ -9397,6 +9397,17 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "writelines",
+            make_builtin_function_with_arity(
+                "writelines",
+                crate::module::_io::iobase_writelines,
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "close",
             make_builtin_function_with_arity("close", file_method_close, 1),
         )
@@ -10670,17 +10681,14 @@ fn textio_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// Shared `_io.TextIOWrapper` type for text-mode file objects.
 pub fn text_io_wrapper_type() -> PyObjectRef {
-    thread_local! {
-        static TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp =
-                crate::typedef::make_builtin_type("_io.TextIOWrapper", init_text_io_wrapper_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // PyPy owns one W_TypeObject process-wide.  A TLS cache would create
+    // incompatible TextIOWrapper identities in different host threads.
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_text_io_wrapper_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_text_io_wrapper_type(ns: PyObjectRef) {
@@ -10731,6 +10739,17 @@ fn init_text_io_wrapper_type(ns: PyObjectRef) {
             ns,
             "write",
             make_builtin_function_with_arity("write", textio_method_write, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "writelines",
+            make_builtin_function_with_arity(
+                "writelines",
+                crate::module::_io::iobase_writelines,
+                2,
+            ),
         )
     };
     unsafe {

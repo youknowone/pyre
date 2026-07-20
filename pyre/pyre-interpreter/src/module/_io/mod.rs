@@ -40,6 +40,49 @@ fn iobase_isatty(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_bool_from(false))
 }
 
+/// `interp_iobase.py:303-322 W_IOBase.writelines_w` — validate the stream,
+/// obtain the input iterator, and call the receiver's (possibly overridden)
+/// `write` method once for each line.  The iteration is deliberately lazy;
+/// no list snapshot is introduced.
+pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("writelines() requires self"))?;
+    let lines = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("writelines() requires lines"))?;
+    if io_closed(self_obj) {
+        return Err(crate::PyError::value_error("I/O operation on closed file."));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    pyre_object::gc_roots::pin_root(lines);
+    let iterator = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
+    pyre_object::gc_roots::pin_root(iterator);
+    loop {
+        let iterator = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        let line = match crate::baseobjspace::next(iterator) {
+            Ok(line) => line,
+            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) => return Err(err),
+        };
+        let _line_root = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(line);
+        let line =
+            pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
+        call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(sp),
+            "write",
+            &[line],
+        )?;
+    }
+    Ok(w_none())
+}
+
 fn init_iobase_type(ns: PyObjectRef) {
     type_method(ns, "closed", w_bool_from(false));
     type_method(
@@ -51,6 +94,11 @@ fn init_iobase_type(ns: PyObjectRef) {
         ns,
         "isatty",
         crate::make_builtin_function_with_arity("isatty", iobase_isatty, 1),
+    );
+    type_method(
+        ns,
+        "writelines",
+        crate::make_builtin_function_with_arity("writelines", iobase_writelines, 2),
     );
     type_method(
         ns,
