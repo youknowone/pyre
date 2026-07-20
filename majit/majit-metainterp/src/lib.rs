@@ -123,8 +123,8 @@ pub use jit_state::{
     ResumeDataResult, bridge_decode_red,
 };
 pub use jitcode::{
-    BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, insns,
-    live_slots_for_state_field_jit,
+    BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, RuntimeBhDescr, insns,
+    live_slots_for_state_field_jit, set_global_build_descr_pool,
 };
 pub use jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, TraceContinuationSuspendGuard,

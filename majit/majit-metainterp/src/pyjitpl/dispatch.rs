@@ -3734,8 +3734,12 @@ where
                         frame.next_u16() as usize,
                     )
                 };
-                let descr = self.frames.current_mut().jitcode.exec.descrs[descr_idx]
-                    .as_bh_descr()
+                let descr = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .descr_at(descr_idx)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                     .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
                     .clone();
                 let (value_box, concrete_value) = self.read_int_reg(value_idx);
@@ -4671,9 +4675,7 @@ where
                     .frames
                     .current_mut()
                     .jitcode
-                    .exec
-                    .descrs
-                    .get(sub_idx)
+                    .descr_at(sub_idx)
                     .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
                     .unwrap_or_else(|| {
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
@@ -4705,6 +4707,21 @@ where
                 sub_frame.return_r = return_r;
                 sub_frame.return_f = return_f;
                 self.frames.push(sub_frame);
+            }
+            jitcode::insns::BC_INLINE_CALL_R_I
+            | jitcode::insns::BC_INLINE_CALL_R_R
+            | jitcode::insns::BC_INLINE_CALL_R_V
+            | jitcode::insns::BC_INLINE_CALL_IR_I
+            | jitcode::insns::BC_INLINE_CALL_IR_R
+            | jitcode::insns::BC_INLINE_CALL_IR_V
+            | jitcode::insns::BC_INLINE_CALL_IRF_F
+            | jitcode::insns::BC_INLINE_CALL_IRF_R
+            | jitcode::insns::BC_INLINE_CALL_IRF_I
+            | jitcode::insns::BC_INLINE_CALL_IRF_V => {
+                match self.exec_typed_inline_call(ctx, bytecode) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             // Recursive portal call (self-recursion).  Unlike
             // BC_INLINE_CALL — which resolves its callee from the parent
@@ -4931,8 +4948,10 @@ where
                         }
                     }
                     let calldescr_idx = frame.next_u16();
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -5249,8 +5268,10 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_u8() as usize;
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_I descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -5546,8 +5567,10 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_u8() as usize;
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_R descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -5793,8 +5816,10 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_u8() as usize;
-                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
-                        .as_bh_descr()
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_IRF_F descr is not BhDescr")
                         .as_calldescr()
                         .clone();
@@ -6654,6 +6679,112 @@ where
             other => panic!("unknown jitcode bytecode {other}"),
         }
 
+        TraceAction::Continue
+    }
+
+    /// Trace the canonical `inline_call_{r,ir,irf}_*` family by entering a
+    /// callee frame.  RPython `rpython/jit/metainterp/pyjitpl.py:1266-1332`
+    /// enters the frame, and `:144-160` copies each grouped argument
+    /// positionally.
+    fn exec_typed_inline_call(&mut self, ctx: &mut TraceCtx, bytecode: u8) -> TraceAction {
+        let (has_i_list, has_f_list, return_kind) = match bytecode {
+            jitcode::insns::BC_INLINE_CALL_R_I => (false, false, Some(JitArgKind::Int)),
+            jitcode::insns::BC_INLINE_CALL_R_R => (false, false, Some(JitArgKind::Ref)),
+            jitcode::insns::BC_INLINE_CALL_R_V => (false, false, None),
+            jitcode::insns::BC_INLINE_CALL_IR_I => (true, false, Some(JitArgKind::Int)),
+            jitcode::insns::BC_INLINE_CALL_IR_R => (true, false, Some(JitArgKind::Ref)),
+            jitcode::insns::BC_INLINE_CALL_IR_V => (true, false, None),
+            jitcode::insns::BC_INLINE_CALL_IRF_F => (true, true, Some(JitArgKind::Float)),
+            jitcode::insns::BC_INLINE_CALL_IRF_R => (true, true, Some(JitArgKind::Ref)),
+            jitcode::insns::BC_INLINE_CALL_IRF_I => (true, true, Some(JitArgKind::Int)),
+            jitcode::insns::BC_INLINE_CALL_IRF_V => (true, true, None),
+            _ => unreachable!("typed inline-call dispatch arm passed bytecode {bytecode}"),
+        };
+
+        let (sub_idx, args_i, args_r, args_f, result_dst) = {
+            let frame = self.frames.current_mut();
+            let sub_idx = frame.next_u16() as usize;
+            let mut read_list = |frame: &mut MIFrame| {
+                let count = frame.next_u8() as usize;
+                let mut regs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    regs.push(frame.next_u8() as usize);
+                }
+                regs
+            };
+            let args_i = has_i_list.then(|| read_list(frame)).unwrap_or_default();
+            let args_r = read_list(frame);
+            let args_f = has_f_list.then(|| read_list(frame)).unwrap_or_default();
+            let result_dst = return_kind.map(|_| frame.next_u8() as usize);
+            frame._result_argcode = match return_kind {
+                Some(JitArgKind::Int) => b'i',
+                Some(JitArgKind::Ref) => b'r',
+                Some(JitArgKind::Float) => b'f',
+                None => b'v',
+            };
+            frame.result_arg_index = result_dst;
+            frame.pc = frame.code_cursor;
+            (sub_idx, args_i, args_r, args_f, result_dst)
+        };
+
+        let pc = self.frames.current_mut().pc;
+        // `descr_at` resolves the callee from the per-jitcode `exec.descrs`
+        // pool (runtime-built jitcodes) or the shared global build-time pool
+        // (LLBC-extracted jitcodes, whose per-jitcode pool is empty).
+        let sub_jitcode = self
+            .frames
+            .current_mut()
+            .jitcode
+            .descr_at(sub_idx)
+            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+            .cloned();
+        let Some(sub_jitcode) = sub_jitcode else {
+            // The callee is in neither pool; abort the trace instead of
+            // crashing the process.
+            return TraceAction::Abort;
+        };
+        let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
+        ctx.push_inline_frame((sub_idx, pc), u32::MAX);
+        sub_frame.inline_frame = true;
+
+        for (callee_dst, caller_src) in args_i.into_iter().enumerate() {
+            let (value, concrete) = self.read_int_reg(caller_src);
+            sub_frame.int_regs[callee_dst] = Some(value);
+            sub_frame.int_values[callee_dst] = Some(concrete);
+        }
+        for (callee_dst, caller_src) in args_r.into_iter().enumerate() {
+            let (value, concrete) = self.read_ref_reg(caller_src);
+            sub_frame.ref_regs[callee_dst] = Some(value);
+            sub_frame.ref_values[callee_dst] = Some(concrete);
+        }
+        for (callee_dst, caller_src) in args_f.into_iter().enumerate() {
+            let (value, concrete) = self.read_float_reg(caller_src);
+            sub_frame.float_regs[callee_dst] = Some(value);
+            sub_frame.float_values[callee_dst] = Some(concrete);
+        }
+
+        sub_frame.return_i = None;
+        sub_frame.return_r = None;
+        sub_frame.return_f = None;
+        match return_kind {
+            Some(JitArgKind::Int) => {
+                sub_frame.return_i = Some(
+                    result_dst.expect("BC_INLINE_CALL_*_I must encode an int destination"),
+                );
+            }
+            Some(JitArgKind::Ref) => {
+                sub_frame.return_r = Some(
+                    result_dst.expect("BC_INLINE_CALL_*_R must encode a ref destination"),
+                );
+            }
+            Some(JitArgKind::Float) => {
+                sub_frame.return_f = Some(
+                    result_dst.expect("BC_INLINE_CALL_IRF_F must encode a float destination"),
+                );
+            }
+            None => {}
+        }
+        self.frames.push(sub_frame);
         TraceAction::Continue
     }
 

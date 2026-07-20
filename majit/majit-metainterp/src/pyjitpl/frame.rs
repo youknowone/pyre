@@ -243,17 +243,16 @@ impl MIFrame {
         Some((code[pos] as u16) | ((code[pos + 1] as u16) << 8))
     }
 
-    /// Resolve a `d`-argcode descr index against the per-jitcode
-    /// runtime descr pool (`exec.descrs`), returning the canonical
-    /// `BhDescr` if present.  Trace dispatch uses this to detect when a
-    /// vable opcode was emitted in canonical form (descr lives in the
-    /// pool) versus pyre's pre-orthodox legacy form (descr operand is
-    /// the field index inline).
+    /// Resolve a `d`-argcode descr index against the per-jitcode runtime
+    /// descr pool (`exec.descrs`) — falling through to the shared global
+    /// build-time pool for LLBC-extracted jitcodes (via [`JitCode::descr_at`])
+    /// — and return the canonical `BhDescr` if present.  Trace dispatch uses
+    /// this to detect when a vable opcode was emitted in canonical form (descr
+    /// lives in the pool) versus pyre's pre-orthodox legacy form (descr
+    /// operand is the field index inline).
     pub fn runtime_bh_descr(&self, descr_idx: usize) -> Option<&crate::blackhole::BhDescr> {
         self.jitcode
-            .exec
-            .descrs
-            .get(descr_idx)
+            .descr_at(descr_idx)
             .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
     }
 

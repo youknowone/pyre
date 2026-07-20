@@ -319,6 +319,48 @@ impl RuntimeBhDescr {
     }
 }
 
+/// Newtype so the write-once, read-only global descr pool can live in a
+/// `static`.  `RuntimeBhDescr` is `!Sync` only because its
+/// `Call(JitCallTarget)` variant carries raw function-address pointers; the
+/// pool this crate installs never holds that variant (build-time jitcodes'
+/// residual-call targets resolve from a funcptr register at dispatch time),
+/// and the pool is written once through the `OnceLock` and thereafter only
+/// read, so sharing it across threads is sound — the same `unsafe impl`
+/// rationale as [`JitCode`] itself above.
+struct GlobalDescrPool(Vec<RuntimeBhDescr>);
+
+// SAFETY: `GlobalDescrPool` is written once (via `OnceLock::set`) and read-only
+// thereafter; the raw pointers `RuntimeBhDescr` can carry are stable code
+// addresses, and the pool this crate installs carries none. `OnceLock<T>: Sync`
+// additionally requires `T: Send`.
+unsafe impl Send for GlobalDescrPool {}
+unsafe impl Sync for GlobalDescrPool {}
+
+/// Process-global build-time descr pool — RPython's single shared
+/// `Assembler.descrs` (`assembler.py:23`).  Runtime-emitted jitcodes keep a
+/// per-`JitCode` `exec.descrs` pool (the lazy-emit adaptation described on
+/// [`JitCodeExecState`]); build-time (LLBC-extracted) jitcodes instead carry
+/// an empty per-jitcode pool and resolve their `d`/`j` argcodes through this
+/// shared pool via [`JitCode::descr_at`].  Installed once by the embedding
+/// crate (`pyre-jit-trace`) from its build-time `ALL_DESCRS` / `ALL_JITCODES`
+/// tables; `majit-metainterp` cannot build it because those tables live above
+/// it.
+static GLOBAL_BUILD_DESCR_POOL: std::sync::OnceLock<GlobalDescrPool> = std::sync::OnceLock::new();
+
+/// Install the process-global build-time descr pool.  Idempotent: the first
+/// call wins and later calls are ignored (the pool is a frozen build artifact,
+/// identical across callers).  See [`GLOBAL_BUILD_DESCR_POOL`].
+pub fn set_global_build_descr_pool(pool: Vec<RuntimeBhDescr>) {
+    let _ = GLOBAL_BUILD_DESCR_POOL.set(GlobalDescrPool(pool));
+}
+
+/// The installed global build-time descr pool, or `None` if the embedding
+/// crate has not installed one (e.g. a standalone metainterp unit test that
+/// only exercises runtime-built jitcodes).
+pub(crate) fn global_build_descr_pool() -> Option<&'static [RuntimeBhDescr]> {
+    GLOBAL_BUILD_DESCR_POOL.get().map(|pool| pool.0.as_slice())
+}
+
 /// Per-`JitCode` descrs.  Pyre's analog of
 /// `BlackholeInterpBuilder.descrs` (`blackhole.py:103`) /
 /// `BlackholeInterpreter.descrs` (`blackhole.py:288`).  RPython has a
@@ -515,7 +557,7 @@ impl JitCode {
     /// the `Call` variant because the call encoding pre-dates the
     /// RPython-orthodox register-fed function address.
     pub fn call_target(&self, index: usize) -> &JitCallTarget {
-        match self.exec.descrs.get(index) {
+        match self.descr_at(index) {
             Some(RuntimeBhDescr::Call(target)) => target,
             other => {
                 panic!("BC_CALL_*/RESIDUAL_CALL_*: descrs[{index}] is not a Call entry: {other:?}",)
@@ -529,14 +571,25 @@ impl JitCode {
     /// pyre mirrors the shape via the `AssemblerToken` variant.
     pub fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
         let target = self
-            .exec
-            .descrs
-            .get(index)
+            .descr_at(index)
             .and_then(RuntimeBhDescr::as_assembler_token)
             .unwrap_or_else(|| {
                 panic!("BC_CALL_ASSEMBLER_*: descrs[{index}] is not an AssemblerToken entry",)
             });
         (target.token_number, target.concrete_ptr)
+    }
+
+    /// Resolve a `d`/`j` argcode descr for this jitcode.  Runtime-emitted
+    /// jitcodes answer from their per-jitcode `exec.descrs` pool; build-time
+    /// (LLBC-extracted) jitcodes carry an empty pool and fall through to the
+    /// process-global [`GLOBAL_BUILD_DESCR_POOL`] (RPython's single shared
+    /// `Assembler.descrs`).  A populated per-jitcode slot always wins, so the
+    /// runtime path stays byte-identical to a direct `exec.descrs` read.
+    pub fn descr_at(&self, index: usize) -> Option<&RuntimeBhDescr> {
+        if let Some(entry) = self.exec.descrs.get(index) {
+            return Some(entry);
+        }
+        global_build_descr_pool().and_then(|pool| pool.get(index))
     }
 }
 
