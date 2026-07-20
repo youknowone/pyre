@@ -329,8 +329,8 @@ pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
 /// RPython `MIFrame.vable_array_index_pair_at` (`blackhole.rs:1613`) reads
 /// `self.descrs[idx]` and asserts `isinstance(BhDescr_VableArray)` to
 /// recover the array `index`.  Pyre's single per-walk descr table is
-/// either the shared global pool (production per-opcode arm walks +
-/// build-time canonical jitcodes resolve through `ALL_DESCRS`) or the
+/// either the shared global pool (build-time canonical jitcodes
+/// resolve through `ALL_DESCRS`) or the
 /// per-`CodeObject` body JitCode's own `exec.descrs`
 /// (`jitcode/mod.rs:332`) — runtime per-frame jitcodes have no global
 /// allocation index, so they carry their own pool.  This selector keeps
@@ -341,8 +341,9 @@ pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
 #[derive(Clone, Copy)]
 pub enum RawDescrPool<'a> {
     /// Shared global `ALL_DESCRS` (`jitcode_runtime::all_descrs`).
-    /// Production per-opcode arm walks, sub-walks of arms, and tests use
-    /// this — the arm jitcodes' `d`/`j` operands index the global pool.
+    /// Build-time canonical jitcodes (e.g. `w_list_append`, inlined by
+    /// the full-body walker's specialization sub-walks) and tests use
+    /// this — their `d`/`j` operands index the global pool.
     Global,
     /// Per-`CodeObject` body pool (`JitCode.exec.descrs`).  Full-body
     /// walks (the walker-as-tracer path) resolve `d`/`j` operands through
@@ -691,8 +692,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     pub descr_refs: &'static_a [DescrRef],
     /// Raw `BhDescr` pool source for vable-array `(VableArray, Array)`
     /// recognition (`vable_array_descrs_from_jitcode`).  [`RawDescrPool::
-    /// Global`] for production arm walks + tests (the arm jitcodes index
-    /// the shared `ALL_DESCRS`); [`RawDescrPool::PerFn`] for full-body
+    /// Global`] for build-time canonical jitcodes + tests (their operands
+    /// index the shared `ALL_DESCRS`); [`RawDescrPool::PerFn`] for full-body
     /// walks (the per-`CodeObject` body resolves through its own
     /// `exec.descrs`).  Index-parallel to [`Self::descr_refs`].
     pub raw_descrs: RawDescrPool<'static_a>,
@@ -706,8 +707,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// corrupt the live heap (`cut_trace` rolls back only the IR
     /// recorder, not heap/iterator state).
     ///
-    /// `true` (the production full-body walk AND the production
-    /// per-opcode arm walk): the walker is the only thing executing the
+    /// `true` (the production full-body walk and its inline
+    /// sub-walks): the walker is the only thing executing the
     /// JitCode body — `eval_loop_jit` skips `execute_opcode_step` for
     /// walker-handled opcodes — so
     /// [`try_execute_residual_call_via_executor`] runs residual calls
@@ -2968,10 +2969,7 @@ fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
 /// prior aborted walk's entries never leak into the next one.  This is the
 /// reset boundary for the walk-local thread-local; it is called at the two FBW
 /// walk entry points (`trace.rs` `full_body_walk_trace` at walk start, and
-/// after `probe_walk_perfn_jitcode` discards its throwaway trace).  The
-/// per-opcode arm walk is also authoritative but never consults this map
-/// (its specialization gates are FBW-shaped opcodes outside the arm
-/// allow-list), so it needs no reset boundary of its own.
+/// after `probe_walk_perfn_jitcode` discards its throwaway trace).
 pub fn bool_box_truth_reset() {
     BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
 }
@@ -3051,7 +3049,7 @@ pub fn bool_box_truth_reset() {
 /// **Authoritative-executor gate**: fires ONLY when the walk is the
 /// sole concrete-execution leg
 /// ([`WalkContext::is_authoritative_executor`]) — the production
-/// full-body walk and the production per-opcode arm walk both qualify
+/// full-body walk and its inline sub-walks qualify
 /// (`eval_loop_jit` skips `execute_opcode_step` for walker-handled
 /// opcodes).  In shadow / diagnostic-probe mode the flag is `false`, so
 /// the call is recorded symbolically only — re-executing there would
