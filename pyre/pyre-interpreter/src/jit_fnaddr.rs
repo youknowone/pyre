@@ -323,6 +323,36 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::runtime_ops::jit_next as *const (),
     );
 
+    // `unpackiterable_driver` (jd1) portal callees.  Its extracted body
+    // (`_unpackiterable_unknown_length`) residual-calls `next(w_iterator)` and
+    // `w_list_append(items, w_item)` directly in source, so the codewriter
+    // records the bare source paths; without a runtime binding the funcptr
+    // constants fall back to a `symbolic_fnaddr_for_path` hash the residual
+    // handler cannot resolve.  `next` returns `Result<PyObjectRef, PyError>`
+    // and rides the Ref-returning `bh_next` bridge (publishes StopIteration,
+    // unlike the FOR_ITER `jit_next`); `w_list_append` is a `-> ()` residual
+    // and binds its Rust `fn` directly.
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::next",
+        "pyre_interpreter::next",
+        crate::runtime_ops::bh_next as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "next",
+        crate::runtime_ops::bh_next as *const (),
+    );
+    let w_list_append: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
+        pyre_object::listobject::w_list_append;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_append",
+        "pyre_object::w_list_append",
+        w_list_append as *const (),
+    );
+    push_fnaddr(&mut entries, "w_list_append", w_list_append as *const ());
+
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_truth_value",

@@ -1595,6 +1595,30 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
     }
 }
 
+/// Ref-returning bridge for the `next(w_iterator)` residual call in
+/// `_unpackiterable_unknown_length` (the `unpackiterable_driver` portal).
+///
+/// Unlike [`jit_next`], StopIteration is published as an ordinary exception
+/// rather than collapsed to a null sentinel: the unpack loop body matches on
+/// it (`e.match(space.w_StopIteration) → break`) to terminate, so the trace's
+/// `GuardNoException` + exception-match ops must observe the raised
+/// StopIteration.  `jit_next`'s null-for-StopIteration convention exists for
+/// `FOR_ITER`'s `GuardNonnull` and is wrong here.
+#[majit_macros::jit_may_force]
+pub extern "C" fn bh_next(iter: i64) -> i64 {
+    match crate::baseobjspace::next(iter as PyObjectRef) {
+        Ok(value) => value as i64,
+        Err(mut err) => {
+            let exc_obj = err.to_exc_object();
+            if exc_obj != PY_NULL {
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            }
+            jit_publish_exception(exc_obj);
+            0
+        }
+    }
+}
+
 /// Residual PyPy `GET_ITER` operation.  `space.iter` may execute a user
 /// `__iter__`, so the trace treats this as may-force and consumes the
 /// published exception through the ordinary guards.
