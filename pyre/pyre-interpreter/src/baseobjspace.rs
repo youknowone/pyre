@@ -6920,7 +6920,11 @@ pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
 /// baseobjspace.py:1784 text_w.
 pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
     if unsafe { !isinstance_str_w(obj) } {
-        return Err(PyError::type_error("expected str"));
+        // `_typed_unwrap_error(space, "str")` — `"expected %s, got %T object"`.
+        return Err(PyError::type_error(format!(
+            "expected str, got {} object",
+            object_functionstr_type_name(obj)
+        )));
     }
     Ok(unsafe { pyre_object::w_str_get_value(obj) })
 }
