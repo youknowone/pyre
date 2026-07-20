@@ -53,6 +53,7 @@ pub mod _sre;
 pub mod _template;
 #[allow(non_snake_case)]
 pub mod _typing;
+pub mod _warnings;
 pub mod _weakref;
 pub mod array;
 pub mod atexit;

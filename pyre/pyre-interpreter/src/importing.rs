@@ -488,6 +488,7 @@ pub fn install_builtin_modules() {
     // C-extension stubs required for stdlib import chains
     // (PyPy: pypy/module/* mixed modules).
     pyre_install_module!(_weakref);
+    pyre_install_module!(_warnings);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));
@@ -607,7 +608,6 @@ pub fn install_builtin_modules() {
     // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
     // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
     for name in &[
-        "_warnings",
         "_heapq",
         "_tokenize",
         "_bisect",

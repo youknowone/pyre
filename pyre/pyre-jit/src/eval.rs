@@ -2648,6 +2648,22 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_collections::W_Deque
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `interp_deque.py` W_DequeIter / W_DequeRevIter each carry the source
+    // deque in an inline `deque` field. They use the same managed
+    // `#[pyre_class]::allocate` path as W_Deque, so register their payload
+    // layouts with the marker instead of treating them as immortal wrappers.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_collections::W_DequeIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_collections::W_DequeRevIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
