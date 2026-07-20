@@ -645,6 +645,17 @@ impl PyError {
     /// key object.  The display message is the key's repr, matching
     /// what `KeyError.__str__` yields.
     pub fn key_error_with_key(key: PyObjectRef) -> Self {
+        // Root the caller's key and the fresh exception across the repr,
+        // exception, and args allocations below: they live only in Rust
+        // locals, which the precise collector does not scan, so a collection
+        // inside `py_repr` / `w_exception_new` / `w_list_new` could sweep the
+        // key or the exception before `w_exception_set_args` stamps them.
+        // The key is pinned before `py_repr` because that repr itself
+        // allocates.
+        let _roots = pyre_object::gc_roots::push_roots();
+        if !key.is_null() {
+            pyre_object::gc_roots::pin_root(key);
+        }
         let message = if key.is_null() {
             "<null>".to_string()
         } else {
@@ -652,6 +663,7 @@ impl PyError {
                 .unwrap_or_else(|_| "<unrepresentable>".to_string())
         };
         let exc = pyre_object::interp_exceptions::w_exception_new(ExcKind::KeyError, &message);
+        pyre_object::gc_roots::pin_root(exc);
         if !key.is_null() {
             let args_list = pyre_object::w_list_new(vec![key]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
@@ -813,7 +825,20 @@ impl PyError {
         w_path: PyObjectRef,
     ) -> Self {
         let message = msg.into();
+        // Root the caller's name/path and the fresh exception across the
+        // exception and message allocations below: they live only in Rust
+        // locals, which the precise collector does not scan, so a collection
+        // inside `w_exception_new` / `w_str_new` could sweep them before the
+        // setters stamp them onto `exc`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        if !w_name.is_null() {
+            pyre_object::gc_roots::pin_root(w_name);
+        }
+        if !w_path.is_null() {
+            pyre_object::gc_roots::pin_root(w_path);
+        }
         let exc = w_exception_new(ExcKind::ImportError, &message);
+        pyre_object::gc_roots::pin_root(exc);
         // `ImportError.__init__` mirrors args[0] into the dedicated `msg`
         // slot; the prebuilt-instance path bypasses it, so stamp it here.
         let w_msg = if message.is_empty() {
