@@ -856,6 +856,35 @@ pub fn all_foreign_pytypes() -> &'static [(
     PYTYPES
 }
 
+/// Interpreter-owned PyType aliases in the shared GC inheritance census.
+/// `pyre-object::pyobject::all_subclass_range_aliases` supplies the object
+/// layer; `init_typeobjects` passes both slices to the common numbering
+/// writer.
+pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    use pyre_object::pyobject::subclass_range_alias;
+
+    fn typed<T: PyreClassPyTypeOf>() -> &'static pyre_object::PyType {
+        // Every `#[pyre_class]` descriptor points at its macro-emitted static
+        // PyType for the program lifetime.
+        unsafe { &*T::PYTYPE }
+    }
+
+    vec![
+        subclass_range_alias(13, &crate::gateway::BUILTIN_CODE_TYPE),
+        subclass_range_alias(14, &crate::function::FUNCTION_TYPE),
+        subclass_range_alias(14, &crate::function::BUILTIN_FUNCTION_TYPE),
+        subclass_range_alias(43, &crate::pycode::CODE_TYPE),
+        subclass_range_alias(44, &crate::pytraceback::PYTRACEBACK_TYPE),
+        subclass_range_alias(56, typed::<crate::module::_random::W_Random>()),
+        subclass_range_alias(89, typed::<crate::module::_pickle::W_Pickler>()),
+        subclass_range_alias(90, typed::<crate::module::_pickle::W_Unpickler>()),
+        subclass_range_alias(91, typed::<crate::module::__pypy__::W_PickleBuffer>()),
+        subclass_range_alias(92, typed::<crate::module::_pickle::PicklerMemoProxy>()),
+        subclass_range_alias(93, typed::<crate::module::_pickle::UnpicklerMemoProxy>()),
+    ]
+}
+
 // ── Print hook for wasm (stdout capture) ──
 use std::cell::RefCell;
 thread_local! {

@@ -276,9 +276,9 @@ pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
 ///   `int_between(cls.subclassrange_min, subcls.subclassrange_min, cls.subclassrange_max)`
 #[inline]
 pub fn ll_issubclass(subcls: &PyType, cls: &PyType) -> bool {
-    // Seqlock read: a concurrent one-time batch re-stamp (interpreter
-    // preorder ids vs JIT GC-tid ids) must not be observed half-applied, or
-    // `cls`/`subcls` could carry mismatched numberings.
+    // Seqlock read: a concurrent one-time batch re-stamp must not be observed
+    // half-applied, or `cls`/`subcls` could temporarily carry ranges from
+    // different completed batches.
     subclass_range_read(|| {
         let cls_min = cls.subclassrange_min.load(Ordering::Relaxed);
         let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
@@ -367,15 +367,10 @@ pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
 }
 
 /// Sequence lock (seqlock) guarding the batch (re)stamping of the static
-/// `subclassrange_{min,max}` fields.  Two independent initializers write
-/// them with *different* numberings: the interpreter's
-/// `compute_subclass_ranges_from` (preorder ids rooted at `INSTANCE_TYPE`)
-/// and the JIT's GC-tid writeback (`eval.rs`, from `assign_inheritance_ids`,
-/// which collapses every per-`ExcKind` PyType onto one tid).  Each set is
-/// internally consistent, but a reader that observes a half-completed swap —
-/// some types already re-stamped, others not — can see a parent/child pair
-/// carrying mismatched numberings and wrongly conclude the child is not a
-/// subclass.
+/// `subclassrange_{min,max}` fields. The interpreter and GC initializers use
+/// the same registration-ordered `TotalOrderSymbolic` numbering, but a reader
+/// must still not observe a partially written batch while startup writers run
+/// concurrently.
 ///
 /// A seqlock, not a mutex/rwlock, because this is free-threaded (`nogil`):
 /// the writes happen once at startup while `ll_issubclass` is a hot,
@@ -444,13 +439,144 @@ fn subclass_range_read<T>(read: impl Fn() -> T) -> T {
     }
 }
 
-/// Compute preorder subclass IDs for every PyType reachable from
-/// `INSTANCE_TYPE` through the supplied `(subtype, parent)` pairs and
-/// write them via `assign_subclass_range`. Mirrors
-/// `assign_inheritance_ids` (`normalizecalls.py:373-389`) — root gets
-/// `id=1`, then recursive preorder visit advances the counter so
-/// `int_between(parent.min, child.min, parent.max)` holds iff `child`
-/// is in `parent`'s subtree.
+/// One static `PyType` alias for an `rclass.OBJECT` typeid.
+///
+/// Several PyTypes can share one GC typeid (for example `set` and
+/// `frozenset`), while some GC typeids contribute an inheritance peer but
+/// have no vtable alias. Keeping aliases separate from the hierarchy
+/// preserves that exact GC registration shape.
+#[derive(Clone, Copy)]
+pub struct SubclassRangeAlias {
+    pub type_id: u32,
+    pub pytype: &'static PyType,
+}
+
+pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> SubclassRangeAlias {
+    SubclassRangeAlias { type_id, pytype }
+}
+
+/// Canonical `rclass.OBJECT` inheritance census in GC registration order.
+///
+/// Each entry is `(typeid, parent_typeid)`. This is the shared input for the
+/// interpreter-side fallback and is checked against the GC's `TypeRegistry`
+/// before `freeze_types`. Sparse non-object typeids are intentionally absent.
+/// The order and parent links mirror the `TypeInfo::object{,_subclass}` calls
+/// in `pyre-jit/src/eval.rs`.
+pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
+    (0, None),
+    (1, Some(0)),
+    (2, Some(0)),
+    (5, Some(1)),
+    (6, Some(0)),
+    (7, Some(0)),
+    (8, Some(0)),
+    (10, Some(0)),
+    (11, Some(0)),
+    (12, Some(0)),
+    (13, Some(0)),
+    (14, Some(0)),
+    (15, Some(0)),
+    (16, Some(0)),
+    (17, Some(0)),
+    (18, Some(0)),
+    (19, Some(0)),
+    (20, Some(0)),
+    (21, Some(0)),
+    (22, Some(0)),
+    (23, Some(0)),
+    (24, Some(0)),
+    (25, Some(0)),
+    (26, Some(0)),
+    (27, Some(0)),
+    (28, Some(0)),
+    (29, Some(0)),
+    (30, Some(0)),
+    (31, Some(0)),
+    (32, Some(0)),
+    (33, Some(0)),
+    (34, Some(0)),
+    (35, Some(0)),
+    (36, Some(0)),
+    (38, Some(0)),
+    (39, Some(0)),
+    (40, Some(0)),
+    (43, Some(0)),
+    (44, Some(0)),
+    (45, Some(0)),
+    (46, Some(0)),
+    (47, Some(0)),
+    (48, Some(0)),
+    (49, Some(0)),
+    (50, Some(0)),
+    (52, Some(0)),
+    (53, Some(0)),
+    (54, Some(0)),
+    (56, Some(0)),
+    (57, Some(31)),
+    (58, Some(31)),
+    (59, Some(31)),
+    (60, Some(57)),
+    (61, Some(60)),
+    (62, Some(60)),
+    (63, Some(57)),
+    (64, Some(57)),
+    (65, Some(64)),
+    (66, Some(65)),
+    (67, Some(65)),
+    (68, Some(65)),
+    (69, Some(57)),
+    (70, Some(57)),
+    (71, Some(70)),
+    (72, Some(70)),
+    (73, Some(57)),
+    (74, Some(57)),
+    (75, Some(74)),
+    (76, Some(74)),
+    (77, Some(57)),
+    (78, Some(57)),
+    (79, Some(57)),
+    (80, Some(57)),
+    (81, Some(57)),
+    (82, Some(81)),
+    (83, Some(57)),
+    (84, Some(57)),
+    (85, Some(0)),
+    (86, Some(0)),
+    (87, Some(0)),
+    (88, Some(0)),
+    (89, Some(0)),
+    (90, Some(0)),
+    (91, Some(0)),
+    (92, Some(0)),
+    (93, Some(0)),
+    (94, Some(0)),
+    (95, Some(0)),
+    (96, Some(0)),
+    (97, Some(0)),
+    (98, Some(0)),
+    (99, Some(0)),
+    (100, Some(0)),
+    (101, Some(0)),
+    (105, Some(0)),
+    (106, Some(0)),
+    (107, Some(0)),
+    (108, Some(0)),
+    (109, Some(0)),
+    (110, Some(0)),
+    (111, Some(0)),
+    (112, Some(0)),
+    (113, Some(0)),
+    (114, Some(0)),
+    (115, Some(0)),
+];
+
+/// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
+/// supplied PyType alias via `assign_subclass_range`.
+///
+/// This mirrors RPython `TotalOrderSymbolic.compute_fn`
+/// (`normalizecalls.py:302-354`): build each reversed-MRO witness, add its
+/// Min and `witness + [MAX]` peers, lexicographically sort all peers, then
+/// assign their 0-based `enumerate()` positions. The root Min peer is 0.
 ///
 /// Pyre's interpreter-only paths (tests + `run_exec_frame`) skip the
 /// JIT init that normally seeds ranges via `gc.subclass_range`, so
@@ -458,39 +584,94 @@ fn subclass_range_read<T>(read: impl Fn() -> T) -> T {
 /// false (every range stays at the static `0` default). Callers must
 /// invoke this once at startup before any `is_exception` /
 /// `ll_isinstance` call (typically from `init_typeobjects` on the
-/// interpreter side; JIT init then overwrites with identical values
-/// computed from the GC vtable side, which is harmless).
-pub fn compute_subclass_ranges_from(
-    pairs_chains: &[&[(&'static PyType, &'static PyType)]],
-    roots: &[&'static PyType],
-) {
-    // Cumulative pair list — preserves declared order so the resulting
-    // preorder traversal is deterministic.
-    let mut pairs: Vec<(&'static PyType, &'static PyType)> = Vec::new();
-    for chain in pairs_chains {
-        pairs.extend_from_slice(chain);
+/// interpreter side). The later GC writeback consumes the same hierarchy,
+/// so either writer leaves byte-identical ranges.
+pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum WitnessElement {
+        Cdef(u32),
+        Max,
     }
+
+    let slots = SUBCLASS_RANGE_HIERARCHY
+        .last()
+        .map_or(0, |(type_id, _)| *type_id as usize + 1);
+    let mut witnesses: Vec<Option<Vec<WitnessElement>>> = vec![None; slots];
+    for &(type_id, parent) in SUBCLASS_RANGE_HIERARCHY {
+        let mut witness = match parent {
+            Some(parent_id) => witnesses[parent_id as usize]
+                .clone()
+                .expect("subclass-range parent must precede its child"),
+            None => Vec::new(),
+        };
+        witness.push(WitnessElement::Cdef(type_id));
+        witnesses[type_id as usize] = Some(witness);
+    }
+
+    #[derive(Clone)]
+    struct Peer {
+        witness: Vec<WitnessElement>,
+        owner: u32,
+        is_max: bool,
+    }
+
+    let mut peers = Vec::with_capacity(SUBCLASS_RANGE_HIERARCHY.len() * 2);
+    for &(type_id, _) in SUBCLASS_RANGE_HIERARCHY {
+        let witness = witnesses[type_id as usize]
+            .as_ref()
+            .expect("every subclass-range typeid must have a witness");
+        peers.push(Peer {
+            witness: witness.clone(),
+            owner: type_id,
+            is_max: false,
+        });
+        let mut max_witness = witness.clone();
+        max_witness.push(WitnessElement::Max);
+        peers.push(Peer {
+            witness: max_witness,
+            owner: type_id,
+            is_max: true,
+        });
+    }
+    peers.sort_by(|a, b| a.witness.cmp(&b.witness));
+
+    let mut ranges = vec![(0, 0); slots];
+    for (value, peer) in peers.iter().enumerate() {
+        let range = &mut ranges[peer.owner as usize];
+        if peer.is_max {
+            range.1 = value as i64;
+        } else {
+            range.0 = value as i64;
+        }
+    }
+
     // Serialize against the JIT GC-tid writeback and publish the batch
     // atomically w.r.t. seqlock readers so none observes a half-renumbered
     // hierarchy.
     let _range_guard = subclass_range_write_guard();
-    let mut counter: i64 = 1;
-    for root in roots {
-        visit_preorder(root, &pairs, &mut counter);
+    for aliases in alias_chains {
+        for alias in *aliases {
+            let range = ranges
+                .get(alias.type_id as usize)
+                .copied()
+                .expect("subclass-range alias typeid must be in the hierarchy");
+            assert!(
+                witnesses[alias.type_id as usize].is_some(),
+                "subclass-range alias typeid must name an rclass.OBJECT node"
+            );
+            assign_subclass_range(alias.pytype, range.0, range.1);
+        }
     }
 }
 
 /// Lazy first-caller-wins gate around `compute_subclass_ranges_from`.
-/// Pyre's interpreter-side `init_typeobjects` calls
-/// `compute_subclass_ranges_from(&[object_pairs, interp_pairs], …)`
-/// directly so cross-crate types (e.g. `CODE_TYPE`,
-/// `PYTRACEBACK_TYPE`) get IDs; pyre-object's own tests instead reach
-/// `is_exception` without ever calling `init_typeobjects`, so this
-/// `OnceLock` triggers a fallback init with the object-only pair list
-/// the first time `is_exception` (or any caller that needs it) runs.
-/// After either init runs, subsequent calls are no-ops. JIT init's
-/// later GC-driven `assign_subclass_range` overwrites with identical
-/// values for the object subtree (harmless redundancy).
+/// Pyre's interpreter-side `init_typeobjects` passes both object and
+/// interpreter alias slices so cross-crate types (e.g. `CODE_TYPE`,
+/// `PYTRACEBACK_TYPE`) are written. Pyre-object's own tests can reach
+/// `is_exception` without calling `init_typeobjects`, so this `OnceLock`
+/// triggers a fallback write of the object-owned aliases. Both paths compute
+/// from the complete shared hierarchy; only the set of PyType aliases written
+/// differs. A later GC writeback is byte-identical.
 static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
 
 // `dont_look_inside`: one-time host initialization (`OnceLock` +
@@ -500,7 +681,8 @@ static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
 #[majit_macros::dont_look_inside]
 pub extern "C" fn ensure_object_subclass_ranges_initialized() {
     SUBCLASS_RANGES_INIT.get_or_init(|| {
-        compute_subclass_ranges_from(&[all_foreign_pytypes()], &[&INSTANCE_TYPE]);
+        let aliases = all_subclass_range_aliases();
+        compute_subclass_ranges_from(&[&aliases]);
     });
 }
 
@@ -511,22 +693,6 @@ pub extern "C" fn ensure_object_subclass_ranges_initialized() {
 /// with the object-only subset.
 pub fn mark_subclass_ranges_initialized() {
     let _ = SUBCLASS_RANGES_INIT.set(());
-}
-
-fn visit_preorder(
-    node: &'static PyType,
-    pairs: &[(&'static PyType, &'static PyType)],
-    counter: &mut i64,
-) {
-    let min = *counter;
-    *counter += 1;
-    let node_ptr = node as *const PyType;
-    for (subtype, parent) in pairs {
-        if std::ptr::eq(*parent as *const PyType, node_ptr) {
-            visit_preorder(subtype, pairs, counter);
-        }
-    }
-    assign_subclass_range(node, min, *counter);
 }
 
 /// Every built-in `PyType` static that represents a full `PyObject`
@@ -762,6 +928,134 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         ),
     ];
     PYTYPES
+}
+
+/// PyType aliases owned by `pyre-object`, keyed by the GC typeid whose
+/// inheritance peer supplies their range. Interpreter-owned aliases are
+/// appended by `pyre-interpreter::all_subclass_range_aliases`.
+pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
+    use crate::lltype::PyreClassPyTypeOf;
+
+    fn typed<T: PyreClassPyTypeOf>() -> &'static PyType {
+        // Every `#[pyre_class]` descriptor points at its macro-emitted static
+        // PyType for the program lifetime.
+        unsafe { &*T::PYTYPE }
+    }
+
+    vec![
+        subclass_range_alias(0, &INSTANCE_TYPE),
+        subclass_range_alias(1, &INT_TYPE),
+        subclass_range_alias(2, &FLOAT_TYPE),
+        subclass_range_alias(5, &BOOL_TYPE),
+        subclass_range_alias(6, &crate::functional::RANGE_ITER_TYPE),
+        subclass_range_alias(7, &LIST_TYPE),
+        subclass_range_alias(8, &TUPLE_TYPE),
+        subclass_range_alias(15, &crate::nestedscope::CELL_TYPE),
+        subclass_range_alias(16, &crate::function::METHOD_TYPE),
+        subclass_range_alias(17, &crate::sliceobject::SLICE_TYPE),
+        subclass_range_alias(18, &crate::descriptor::SUPER_TYPE),
+        subclass_range_alias(19, &crate::descriptor::PROPERTY_TYPE),
+        subclass_range_alias(20, &crate::function::STATICMETHOD_TYPE),
+        subclass_range_alias(21, &crate::function::CLASSMETHOD_TYPE),
+        subclass_range_alias(22, &crate::_pypy_generic_alias::UNION_TYPE),
+        subclass_range_alias(23, &crate::iterobject::SEQ_ITER_TYPE),
+        subclass_range_alias(24, typed::<crate::interp_itertools::W_Count>()),
+        subclass_range_alias(25, typed::<crate::interp_itertools::W_Repeat>()),
+        subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
+        subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
+        subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
+        subclass_range_alias(29, &DICT_TYPE),
+        subclass_range_alias(30, &crate::setobject::SET_TYPE),
+        subclass_range_alias(30, &crate::setobject::FROZENSET_TYPE),
+        subclass_range_alias(31, &crate::interp_exceptions::EXCEPTION_TYPE),
+        subclass_range_alias(31, &crate::interp_exceptions::EXC_SYNTAX_ERROR_TYPE),
+        subclass_range_alias(
+            31,
+            &crate::interp_exceptions::EXC_MODULE_NOT_FOUND_ERROR_TYPE,
+        ),
+        subclass_range_alias(31, &crate::interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE),
+        subclass_range_alias(31, &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE),
+        subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
+        subclass_range_alias(33, &TYPE_TYPE),
+        subclass_range_alias(34, &STR_TYPE),
+        subclass_range_alias(35, &LONG_TYPE),
+        subclass_range_alias(36, &MODULE_TYPE),
+        subclass_range_alias(38, &MAPPING_PROXY_TYPE),
+        subclass_range_alias(39, &crate::dictmultiobject::DICT_KEYS_TYPE),
+        subclass_range_alias(39, &crate::dictmultiobject::DICT_VALUES_TYPE),
+        subclass_range_alias(39, &crate::dictmultiobject::DICT_ITEMS_TYPE),
+        subclass_range_alias(40, &crate::typedef::GETSET_DESCRIPTOR_TYPE),
+        subclass_range_alias(45, &NONE_TYPE),
+        subclass_range_alias(46, &NOTIMPLEMENTED_TYPE),
+        subclass_range_alias(47, &ELLIPSIS_TYPE),
+        subclass_range_alias(48, &crate::dictmultiobject::MODULE_DICT_TYPE),
+        subclass_range_alias(49, &crate::celldict::OBJECT_MUTABLE_CELL_TYPE),
+        subclass_range_alias(50, &crate::celldict::INT_MUTABLE_CELL_TYPE),
+        subclass_range_alias(52, &crate::weakref::GC_WEAKREF_BOX_TYPE),
+        subclass_range_alias(54, &COMPLEX_TYPE),
+        subclass_range_alias(57, &crate::interp_exceptions::EXC_EXCEPTION_TYPE),
+        subclass_range_alias(58, &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE),
+        subclass_range_alias(59, &crate::interp_exceptions::EXC_GENERATOR_EXIT_TYPE),
+        subclass_range_alias(60, &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE),
+        subclass_range_alias(61, &crate::interp_exceptions::EXC_OVERFLOW_ERROR_TYPE),
+        subclass_range_alias(62, &crate::interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE),
+        subclass_range_alias(63, &crate::interp_exceptions::EXC_TYPE_ERROR_TYPE),
+        subclass_range_alias(64, &crate::interp_exceptions::EXC_VALUE_ERROR_TYPE),
+        subclass_range_alias(65, &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE),
+        subclass_range_alias(66, &crate::interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE),
+        subclass_range_alias(67, &crate::interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE),
+        subclass_range_alias(
+            68,
+            &crate::interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+        ),
+        subclass_range_alias(69, &crate::interp_exceptions::EXC_NAME_ERROR_TYPE),
+        subclass_range_alias(70, &crate::interp_exceptions::EXC_LOOKUP_ERROR_TYPE),
+        subclass_range_alias(71, &crate::interp_exceptions::EXC_INDEX_ERROR_TYPE),
+        subclass_range_alias(72, &crate::interp_exceptions::EXC_KEY_ERROR_TYPE),
+        subclass_range_alias(73, &crate::interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE),
+        subclass_range_alias(74, &crate::interp_exceptions::EXC_RUNTIME_ERROR_TYPE),
+        subclass_range_alias(
+            75,
+            &crate::interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE,
+        ),
+        subclass_range_alias(76, &crate::interp_exceptions::EXC_RECURSION_ERROR_TYPE),
+        subclass_range_alias(77, &crate::interp_exceptions::EXC_STOP_ITERATION_TYPE),
+        subclass_range_alias(78, &crate::interp_exceptions::EXC_IMPORT_ERROR_TYPE),
+        subclass_range_alias(79, &crate::interp_exceptions::EXC_ASSERTION_ERROR_TYPE),
+        subclass_range_alias(80, &crate::interp_exceptions::EXC_REFERENCE_ERROR_TYPE),
+        subclass_range_alias(81, &crate::interp_exceptions::EXC_OS_ERROR_TYPE),
+        subclass_range_alias(82, &crate::interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE),
+        subclass_range_alias(83, &crate::interp_exceptions::EXC_MEMORY_ERROR_TYPE),
+        subclass_range_alias(84, &crate::interp_exceptions::EXC_SYSTEM_ERROR_TYPE),
+        subclass_range_alias(85, typed::<crate::interp_sre::W_SRE_Pattern>()),
+        subclass_range_alias(86, typed::<crate::interp_sre::W_SRE_Match>()),
+        subclass_range_alias(87, typed::<crate::interp_sre::W_SRE_Scanner>()),
+        subclass_range_alias(88, typed::<crate::_pypy_generic_alias::GenericAlias>()),
+        subclass_range_alias(94, typed::<crate::functional::W_ReversedIterator>()),
+        subclass_range_alias(95, typed::<crate::functional::W_Filter>()),
+        subclass_range_alias(96, typed::<crate::functional::W_Map>()),
+        subclass_range_alias(97, typed::<crate::functional::W_Zip>()),
+        subclass_range_alias(98, typed::<crate::interp_itertools::W_Cycle>()),
+        subclass_range_alias(99, typed::<crate::interp_array::W_Array>()),
+        subclass_range_alias(100, typed::<crate::interp_itertools::W_Chain>()),
+        subclass_range_alias(101, typed::<crate::memoryview::W_MemoryView>()),
+        subclass_range_alias(105, typed::<crate::setobject::W_SetIterObject>()),
+        subclass_range_alias(106, typed::<crate::iterobject::W_ListIterObject>()),
+        subclass_range_alias(107, typed::<crate::iterobject::W_ListReverseIterObject>()),
+        subclass_range_alias(108, typed::<crate::iterobject::W_TupleIterObject>()),
+        subclass_range_alias(109, typed::<crate::interp_itertools::W_Compress>()),
+        subclass_range_alias(110, typed::<crate::interp_itertools::W_StarMap>()),
+        subclass_range_alias(111, typed::<crate::interp_itertools::W_Accumulate>()),
+        subclass_range_alias(112, typed::<crate::interp_itertools::W_ZipLongest>()),
+        subclass_range_alias(113, &crate::generator::COROUTINE_TYPE),
+        subclass_range_alias(114, typed::<crate::generator::CoroutineWrapper>()),
+        subclass_range_alias(115, &crate::dictmultiobject::DICT_KEYITERATOR_TYPE),
+        subclass_range_alias(115, &crate::dictmultiobject::DICT_VALUEITERATOR_TYPE),
+        subclass_range_alias(115, &crate::dictmultiobject::DICT_ITEMITERATOR_TYPE),
+        subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE),
+        subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE),
+        subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE),
+    ]
 }
 
 // ── Type checks ───────────────────────────────────────────────────────

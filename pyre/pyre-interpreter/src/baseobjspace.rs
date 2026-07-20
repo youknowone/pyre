@@ -9201,7 +9201,7 @@ impl UnpackIterableJitDriver {
     /// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
     #[inline]
     fn jit_merge_point(&self, greenkey: PyObjectRef) {
-        let _ = greenkey;
+        crate::call::unpack_merge_point(greenkey);
     }
 }
 

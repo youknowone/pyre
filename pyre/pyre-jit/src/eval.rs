@@ -991,6 +991,20 @@ impl Drop for GcMutatorRegistration {
     }
 }
 
+fn write_subclass_ranges<I, F>(classptrs: I, mut range_for: F)
+where
+    I: IntoIterator<Item = usize>,
+    F: FnMut(usize) -> Option<(i64, i64)>,
+{
+    let _range_guard = pyre_object::pyobject::subclass_range_write_guard();
+    for classptr in classptrs {
+        if let Some((min, max)) = range_for(classptr) {
+            let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
+            pyre_object::pyobject::assign_subclass_range(tp, min, max);
+        }
+    }
+}
+
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
@@ -2742,24 +2756,42 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // (normalizecalls.py:373-389), then we write the computed ranges
     // back into the static PyType structs so that ll_issubclass
     // (rclass.py:1133-1137) can read them directly from the typeptr.
+    let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+    let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
+    let mut expected_aliases: Vec<_> = object_aliases
+        .iter()
+        .chain(interpreter_aliases.iter())
+        .map(|alias| (alias.pytype as *const _ as usize, alias.type_id))
+        .collect();
+    expected_aliases.sort_unstable();
+    let mut actual_aliases: Vec<_> = pytype_to_tid
+        .iter()
+        .map(|(&classptr, &type_id)| (classptr, type_id))
+        .collect();
+    actual_aliases.sort_unstable();
+    assert_eq!(
+        actual_aliases, expected_aliases,
+        "GC vtable registrations must match the shared subclass-range alias census",
+    );
+
+    let actual_hierarchy: Vec<_> = (0..gc.types.len())
+        .filter_map(|id| {
+            let info = gc.types.get(id as u32);
+            info.is_object.then_some((id as u32, info.parent))
+        })
+        .collect();
+    assert_eq!(
+        actual_hierarchy,
+        pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY,
+        "GC rclass.OBJECT registration order must match the shared subclass-range census",
+    );
     gc.freeze_types();
-    // This writeback replaces every static `subclassrange_{min,max}`
-    // with the GC-tid numbering, which differs from the preorder
-    // numbering the interpreter seeds via `compute_subclass_ranges_from`.
-    // Publish the whole batch inside one seqlock write section so a
-    // concurrent interpreter `ll_issubclass` observes either the
-    // all-preorder or the all-GC set, never a half-swapped mix — a mixed
-    // read makes `ll_issubclass(TypeError, BaseException)` spuriously
-    // false.
-    {
-        let _range_guard = pyre_object::pyobject::subclass_range_write_guard();
-        for (&classptr, &_tid) in &pytype_to_tid {
-            if let Some((min, max)) = gc.subclass_range(classptr) {
-                let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
-                pyre_object::pyobject::assign_subclass_range(tp, min, max);
-            }
-        }
-    }
+    // Publish the byte-identical GC-side recomputation inside one seqlock
+    // write section so a concurrent interpreter `ll_issubclass` never sees a
+    // partially restamped hierarchy.
+    write_subclass_ranges(pytype_to_tid.keys().copied(), |classptr| {
+        gc.subclass_range(classptr)
+    });
     Box::new(gc)
 }
 
@@ -3115,6 +3147,17 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
     d.meta_interp_mut().register_jitdriver_sd(jd);
+    // baseobjspace.py:29 `unpackiterable_driver = JitDriver(greens=['greenkey'],
+    // reds='auto', ...)` — the second portal driver (jd1) for the
+    // unknown-length unpack loop `_unpackiterable_unknown_length`. Registered
+    // here, right after jd0, so it lands at `jitdrivers_sd[2]` and inherits the
+    // same `portal_finishtoken` / `propagate_exc_descr` via the
+    // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
+    // (`virtualizable_info` stays `None`), so `elect_active_jitdriver_sd`'s
+    // vinfo-scan keeps electing jd0 and jd1 stays inert until its merge point
+    // is traced in a later slice.
+    let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
+    d.meta_interp_mut().register_jitdriver_sd(jd1);
     // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -4207,6 +4250,13 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
         .set_param(name, value);
 }
 
+/// jd1 (`unpackiterable_driver`) merge-point hook body. Placeholder: a later
+/// slice ticks the loop counter for `greenkey` and, on threshold, enters tracing
+/// of `_unpackiterable_unknown_length`. No-op for now so behavior is unchanged.
+fn unpack_merge_point_jit(greenkey: pyre_object::PyObjectRef) {
+    let _ = greenkey;
+}
+
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
 /// not only after the first JIT-eligible eval.  Idempotent (the
@@ -4224,6 +4274,7 @@ pub fn init_jit_hooks() {
     init_gc_subsystem();
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+    pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -11416,6 +11467,62 @@ while i < 40:
             &FLOAT_TYPE,
             &INT_TYPE
         ));
+    }
+
+    #[test]
+    fn test_interpreter_and_gc_subclass_ranges_match_in_both_orders() {
+        use pyre_object::pyobject::compute_subclass_ranges_from;
+        use std::sync::atomic::Ordering;
+
+        let _ = driver_pair();
+
+        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+        let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
+        let aliases: Vec<_> = object_aliases
+            .iter()
+            .chain(interpreter_aliases.iter())
+            .copied()
+            .collect();
+        let expected: Vec<_> = aliases
+            .iter()
+            .map(|alias| {
+                majit_gc::subclass_range(alias.pytype as *const _ as usize)
+                    .expect("every subclass-range alias must be registered with the GC")
+            })
+            .collect();
+
+        let assert_matches_gc = || {
+            for (alias, &(gc_min, gc_max)) in aliases.iter().zip(&expected) {
+                assert_eq!(
+                    alias.pytype.subclassrange_min.load(Ordering::Relaxed),
+                    gc_min,
+                    "{} subclassrange_min",
+                    alias.pytype.name,
+                );
+                assert_eq!(
+                    alias.pytype.subclassrange_max.load(Ordering::Relaxed),
+                    gc_max,
+                    "{} subclassrange_max",
+                    alias.pytype.name,
+                );
+            }
+        };
+
+        // GC init ran in `driver_pair`; the interpreter writer must leave
+        // every object- and interpreter-owned alias byte-identical.
+        compute_subclass_ranges_from(&[&object_aliases, &interpreter_aliases]);
+        assert_matches_gc();
+
+        // Re-run the interpreter writer first, then the same batched GC
+        // writeback helper production init uses.
+        compute_subclass_ranges_from(&[&object_aliases, &interpreter_aliases]);
+        write_subclass_ranges(
+            aliases
+                .iter()
+                .map(|alias| alias.pytype as *const _ as usize),
+            majit_gc::subclass_range,
+        );
+        assert_matches_gc();
     }
 
     #[test]

@@ -133,16 +133,15 @@ thread_local! {
     static PORTAL_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
-fn compute_portal_jitcode_index() -> Option<usize> {
+fn compute_portal_jitcode_index_for_key(key: &str) -> Option<usize> {
     let drivers = COMPILED_JIT_DRIVERS.with(|cell| *cell.get_or_init(load_compiled_jit_drivers));
     let driver = drivers
         .iter()
-        .find(|driver| driver.portal.canonical_key() == "eval::eval_loop_jit")?;
+        .find(|driver| driver.portal.canonical_key() == key)?;
     let index = driver.main_jitcode_index;
     let jitcode = all_jitcodes().get(index).unwrap_or_else(|| {
         panic!(
-            "configured portal `{}` refers to missing JitCode index {index}",
-            driver.portal.canonical_key(),
+            "configured portal `{key}` refers to missing JitCode index {index}",
         )
     });
     assert!(
@@ -153,12 +152,16 @@ fn compute_portal_jitcode_index() -> Option<usize> {
     Some(index)
 }
 
+fn compute_portal_jitcode_index() -> Option<usize> {
+    compute_portal_jitcode_index_for_key("eval::eval_loop_jit")
+}
+
 /// RPython: `metainterp_sd.jitcodes[jitdriver_sd.mainjitcode.index]`
 /// (warmspot.py:281-282 + call.py:147-148) — the main
 /// `eval::eval_loop_jit` portal jitcode that `find_all_graphs(portal, policy)`
-/// seeds the jitcode closure from. Multiple drivers may be configured; a
-/// by-driver-index accessor for secondary portals is future work. Returns
-/// `None` when the main eval portal is absent from the compiled metadata.
+/// seeds the jitcode closure from. For a per-driver resolver, use
+/// [`portal_jitcode_for_key`]. Returns `None` when the main eval portal is
+/// absent from the compiled metadata.
 ///
 /// Trace-side user-function calls (`callee_frame_helper`,
 /// `jit_create_callee_frame_*`, `jit_force_callee_frame`) route through
@@ -170,6 +173,16 @@ fn compute_portal_jitcode_index() -> Option<usize> {
 /// `inline_call_*` emit.
 pub fn portal_jitcode() -> Option<Arc<JitCode>> {
     let idx = PORTAL_JITCODE_INDEX.with(|cell| *cell.get_or_init(compute_portal_jitcode_index))?;
+    get_jitcode_by_index(idx)
+}
+
+/// Resolve the portal `JitCode` for the configured driver whose portal
+/// graph has canonical key `key` (e.g. a secondary driver's
+/// `baseobjspace::_unpackiterable_unknown_length`). Per-driver analogue of
+/// [`portal_jitcode`] — `warmspot.py:281-282`
+/// `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
+pub fn portal_jitcode_for_key(key: &str) -> Option<Arc<JitCode>> {
+    let idx = compute_portal_jitcode_index_for_key(key)?;
     get_jitcode_by_index(idx)
 }
 
@@ -416,6 +429,41 @@ static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
 /// `WalkContext::descr_refs` parameter.
 pub fn all_descr_refs() -> &'static [DescrRef] {
     &ALL_DESCR_REFS
+}
+
+/// Build the metainterp-side `RuntimeBhDescr` pool from the shared
+/// build-time `ALL_DESCRS` and install it into `majit-metainterp` as the
+/// process-global build-time descr pool (`JitCode::descr_at`'s fallback for
+/// LLBC-extracted jitcodes, whose per-jitcode `exec.descrs` is empty).
+/// Mirrors RPython's single shared `Assembler.descrs`: build-time jitcodes
+/// resolve every `d`/`j` argcode through this one pool.
+///
+/// Each `BhDescr::JitCode { jitcode_index, .. }` becomes a
+/// `RuntimeBhDescr::JitCode` wrapping `ALL_JITCODES[jitcode_index]` via
+/// `from_canonical` — the callee itself carries an empty per-jitcode pool
+/// and so resolves its own descrs through this same global pool (no
+/// circularity: the wrapper embeds no descrs). Every other `BhDescr` variant
+/// is carried verbatim as `RuntimeBhDescr::Descr`, which is exactly what the
+/// residual-call / getfield / setfield / switch dispatch arms read back via
+/// `as_bh_descr()`.
+///
+/// Idempotent: the metainterp `OnceLock` keeps the first pool, so repeated
+/// calls (harness + production init) are safe.
+pub fn install_global_build_descr_pool() {
+    use majit_metainterp::RuntimeBhDescr;
+    let pool: Vec<RuntimeBhDescr> = all_descrs()
+        .iter()
+        .map(|bh| match bh {
+            BhDescr::JitCode { jitcode_index, .. } => match get_jitcode_by_index(*jitcode_index) {
+                Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
+                    majit_metainterp::JitCode::from_canonical((*canonical).clone()),
+                )),
+                None => RuntimeBhDescr::Descr(bh.clone()),
+            },
+            other => RuntimeBhDescr::Descr(other.clone()),
+        })
+        .collect();
+    majit_metainterp::set_global_build_descr_pool(pool);
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's

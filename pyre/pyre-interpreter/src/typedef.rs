@@ -255,22 +255,22 @@ pub fn init_typeobjects() {
     #[cfg(any(test, feature = "test-hooks"))]
     crate::test_hooks::install_hash_hook();
     TYPEOBJECT_CACHE.get_or_init(|| {
-        // Seed preorder `subclassrange_{min,max}` on every PyType
-        // reachable from `INSTANCE_TYPE` so `ll_isinstance` works on
-        // the interpreter-only test path that skips the JIT init.
-        // JIT init re-computes these via `gc.subclass_range` and
-        // overwrites with identical values (idempotent).  Calling
+        // Seed `subclassrange_{min,max}` on every registered PyType so
+        // `ll_isinstance` works on the interpreter-only test path that
+        // skips the JIT init. This uses the same registration-ordered
+        // reversed-MRO peer census as GC `assign_inheritance_ids`, so JIT
+        // init's later `gc.subclass_range` writeback is byte-identical.
+        // Calling
         // `mark_subclass_ranges_initialized` afterwards stops the
         // pyre-object-internal `is_exception` fallback from
-        // overwriting with the object-only subset (which would lose
-        // the cross-crate `CODE_TYPE` / `PYTRACEBACK_TYPE` ranges).
-        pyre_object::pyobject::compute_subclass_ranges_from(
-            &[
-                pyre_object::pyobject::all_foreign_pytypes(),
-                crate::all_foreign_pytypes(),
-            ],
-            &[&pyre_object::INSTANCE_TYPE],
-        );
+        // omitting the cross-crate `CODE_TYPE` / `PYTRACEBACK_TYPE`
+        // aliases from a later redundant write.
+        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+        let interpreter_aliases = crate::all_subclass_range_aliases();
+        pyre_object::pyobject::compute_subclass_ranges_from(&[
+            &object_aliases,
+            &interpreter_aliases,
+        ]);
         pyre_object::pyobject::mark_subclass_ranges_initialized();
         let mut reg: HashMap<usize, usize> = HashMap::new();
 
