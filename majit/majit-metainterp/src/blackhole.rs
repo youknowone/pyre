@@ -146,9 +146,12 @@ pub struct BhJitDriverSd {
     /// warmspot.py:449 `jd.result_type` projected to the blackhole
     /// dispatch char ('v','i','r','f') via `BhReturnType`.
     pub result_type: BhReturnType,
-    /// warmspot.py:1010-1013 `jd.portal_runner_ptr` — full portal arg
-    /// ABI: `fn(all_i, all_r, all_f) -> i64`.
-    pub portal_runner_ptr: Option<fn(&[i64], &[i64], &[i64]) -> i64>,
+    /// warmspot.py:1010-1013 `jd.portal_runner_ptr` — the portal runner as a
+    /// raw C function matching `mainjitcode_calldescr`. `get_portal_runner`
+    /// hands its address to `bh_call_r`, which invokes it via the calldescr
+    /// (`"iirrr"`: `next_instr:i, is_being_profiled:i, pycode:r, frame:r,
+    /// ec:r`), so the pointee must take those five scalars by the C ABI.
+    pub portal_runner_ptr: Option<extern "C" fn(i64, i64, i64, i64, i64) -> i64>,
     /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function returned by `get_portal_runner` for `bh_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,

@@ -838,12 +838,35 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
 ///   (Ref, 'red_ref', 0)   → frame = all_r[1]
 ///   (Ref, 'red_ref', 1)   → ec = all_r[2]
 pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> i64 {
-    // warmspot.py:972-975: extract portal args from merged lists.
-    let next_instr = all_i.first().copied().unwrap_or(0) as usize;
-    let _is_being_profiled = all_i.get(1).copied().unwrap_or(0);
-    let pycode = all_r.first().copied().unwrap_or(0) as PyObjectRef;
-    let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
-    let ec = all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
+    // warmspot.py:972-975: extract portal args from merged lists, then run
+    // through the shared `bh_portal_runner_c` body.
+    let next_instr = all_i.first().copied().unwrap_or(0);
+    let is_being_profiled = all_i.get(1).copied().unwrap_or(0);
+    let pycode = all_r.first().copied().unwrap_or(0);
+    let frame_ptr = all_r.get(1).copied().unwrap_or(0);
+    let ec = all_r.get(2).copied().unwrap_or(0);
+    bh_portal_runner_c(next_instr, is_being_profiled, pycode, frame_ptr, ec)
+}
+
+/// C-ABI portal runner matching the `mainjitcode_calldescr` arg layout
+/// (`"iirrr"`: `next_instr:i, is_being_profiled:i, pycode:r, frame:r, ec:r`).
+///
+/// This is the function `get_portal_runner` hands to `bh_call_r` for
+/// `bhimpl_recursive_call_*` (blackhole.py:1109-1116). `bh_call_r` invokes it
+/// through `collect_call_args` + `bh_call_i_dispatch`, i.e. as a raw C function
+/// whose five arguments arrive in integer registers per the calldescr — so the
+/// runner must take those five scalars directly. (A Rust `fn(&[i64], …)` would
+/// receive slice fat pointers there instead, corrupting every argument.)
+pub extern "C" fn bh_portal_runner_c(
+    next_instr: i64,
+    _is_being_profiled: i64,
+    pycode: i64,
+    frame_ptr: i64,
+    ec: i64,
+) -> i64 {
+    let pycode = pycode as PyObjectRef;
+    let frame_ptr = frame_ptr as *mut PyFrame;
+    let ec = ec as *const pyre_interpreter::PyExecutionContext;
 
     if frame_ptr.is_null() {
         return pyre_object::PY_NULL as i64;
@@ -856,7 +879,7 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     if !ec.is_null() {
         frame.execution_context = ec;
     }
-    frame.set_last_instr_from_next_instr(next_instr);
+    frame.set_last_instr_from_next_instr(next_instr as usize);
     match crate::eval::portal_runner_result(frame) {
         Ok(result) => result as i64,
         Err(mut err) => {
@@ -2017,13 +2040,13 @@ pub fn blackhole_resume_via_rd_numb(
     //   calldescr    = jitdriver_sd.mainjitcode.calldescr
     bh.jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
         result_type: majit_metainterp::blackhole::BhReturnType::Ref,
-        portal_runner_ptr: Some(bh_portal_runner),
+        portal_runner_ptr: Some(bh_portal_runner_c),
         mainjitcode_calldescr: {
             // `get_portal_runner` returns this descr paired with
-            // `bh_portal_runner`, and the blackhole recursive-portal resume
+            // `bh_portal_runner_c`, and the blackhole recursive-portal resume
             // (`bhimpl_recursive_call_r` -> `bh_call_r`) verifies the merged
             // green+red argument banks against it — so it must describe the
-            // portal runner, not the traced function.  `bh_portal_runner`
+            // portal runner, not the traced function.  `bh_portal_runner_c`
             // consumes the warmspot `portalfunc_ARGS` (`warmspot.py:972-975`):
             // greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
             // `[frame:r, ec:r]` (`interp_jit.py:67-68`) = 2 int + 3 ref.
