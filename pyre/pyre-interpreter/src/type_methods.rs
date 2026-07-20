@@ -5719,7 +5719,10 @@ mod dict_method_tests {
     fn assert_type_error<T: std::fmt::Debug>(result: Result<T, crate::PyError>) {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(err.message, "unhashable type: 'list'");
+        assert_eq!(
+            err.message,
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
+        );
     }
 
     #[test]

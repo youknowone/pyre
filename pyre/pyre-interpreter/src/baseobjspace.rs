@@ -101,10 +101,25 @@ pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
 /// The direct-hash counterpart of [`take_pending_dict_key_error`], used by
 /// bytecode paths which compute the key hash before entering `r_dict`.
 ///
-/// A bad dict key raises the bare `unhashable type: '<type>'` TypeError from
-/// hashing, with no container-specific prefix, so the error passes through.
-pub fn wrap_dict_key_hash_error(_key: PyObjectRef, err: PyError) -> PyError {
-    err
+/// Python 3.14 adds dict-key context to an exact `TypeError` raised while
+/// hashing. A different exception, including a `TypeError` subclass,
+/// propagates unchanged.
+pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
+    if err.kind != PyErrorKind::TypeError {
+        return err;
+    }
+    if !err.exc_object.is_null() {
+        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let raised_type = crate::typedef::r#type(err.exc_object).unwrap_or(PY_NULL);
+        if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
+            return err;
+        }
+    }
+    PyError::type_error(format!(
+        "cannot use '{}' as a dict key ({})",
+        object_functionstr_type_name(key),
+        err.message,
+    ))
 }
 
 /// The set-element counterpart of [`wrap_dict_key_hash_error`]: a bad element

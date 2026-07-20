@@ -462,10 +462,11 @@ iterator_value_dict[0] = 1
 assert next(iterator_value_iter) == 0
 
 
-# A dict operation that hashes an unhashable key raises a TypeError carrying
-# `unhashable type: 'list'`. PyPy raises it bare; CPython 3.14
-# (`dict_unhashable_type`) prefixes the key type, so match on the substring.
-unhashable_key_message = "unhashable type: 'list'"
+# Python 3.14's `dict_unhashable_type` adds the dict-key context to an exact
+# hashing TypeError.
+unhashable_key_message = (
+    "cannot use 'list' as a dict key (unhashable type: 'list')"
+)
 unhashable_dict = {"present": 1}
 for operation in (
     lambda: [] in unhashable_dict,
@@ -477,7 +478,7 @@ for operation in (
 ):
     with assert_raises(TypeError) as cm:
         operation()
-    assert unhashable_key_message in str(cm.exception)
+    assert str(cm.exception) == unhashable_key_message
 
 
 class DictHashTypeErrorSubclass(TypeError):
