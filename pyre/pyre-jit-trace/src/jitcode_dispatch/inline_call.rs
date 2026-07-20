@@ -2560,6 +2560,18 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // A tagged immediate is an exact builtin `int` with C-level operator slots:
+    // it has no heap `ob_type`/`w_class` to pin, and its dunder is not inlinable
+    // Python code.  Decline before the concrete derefs below, which would fault
+    // on the immediate (`typedef::r#type` stays the tagged-safe typing path).
+    // Inert behind `CAN_BE_TAGGED` (default false).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(concrete_lhs)
+            || pyre_object::tagged_int::is_tagged_int(concrete_rhs))
+    {
+        return Ok(None);
+    }
+
     let w_class = unsafe { (*concrete_lhs).w_class };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
@@ -2695,6 +2707,18 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
         return Ok(None);
     };
+
+    // A tagged immediate is an exact builtin `int` with C-level operator slots:
+    // it has no heap `ob_type`/`w_class` to pin, and its dunder is not inlinable
+    // Python code.  Decline before the concrete derefs below, which would fault
+    // on the immediate (`typedef::r#type` stays the tagged-safe typing path).
+    // Inert behind `CAN_BE_TAGGED` (default false).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(concrete_lhs)
+            || pyre_object::tagged_int::is_tagged_int(concrete_rhs))
+    {
+        return Ok(None);
+    }
 
     let w_class = unsafe { (*concrete_lhs).w_class };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
