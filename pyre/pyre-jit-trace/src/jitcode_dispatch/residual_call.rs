@@ -568,11 +568,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op_pc });
     }
-    // Authoritative-executor gate (#51b/#54): fire ONLY when the walk
-    // is the sole concrete-execution leg (production full-body walk and
-    // production per-opcode arm walk).  Shadow / diagnostic-probe runs
-    // leave the flag `false` so the call is recorded symbolically
-    // without re-running its side effects.
+    // Authoritative-executor gate: fire ONLY when the walk is the sole
+    // concrete-execution leg (the production full-body walk and its
+    // inline sub-walks; the per-opcode arm walk is retired).  Shadow /
+    // diagnostic-probe runs leave the flag `false` so the call is
+    // recorded symbolically without re-running its side effects.
     if !ctx.is_authoritative_executor {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
