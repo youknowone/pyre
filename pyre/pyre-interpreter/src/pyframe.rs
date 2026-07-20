@@ -3565,7 +3565,10 @@ pub(crate) fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -
         // `pyopcode.rs:360-366` — recurse + delegate to the default
         // `build_tuple` body (`eval.rs:767 build_tuple_from_refs`).
         ConstantData::Tuple { elements } => {
-            let items: Vec<PyObjectRef> = elements.iter().map(pyobject_from_constant).collect();
+            let mut items: Vec<PyObjectRef> = Vec::with_capacity(elements.len());
+            for element in elements {
+                items.push(pyobject_from_constant(element));
+            }
             crate::runtime_ops::build_tuple_from_refs(&items)
         }
         // `pyopcode.rs:382-393` — recurse over `[start, stop, step]`
@@ -3579,7 +3582,10 @@ pub(crate) fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -
         // `pyopcode.rs:375-381` — recurse + delegate to
         // `frozenset_constant` (`eval.rs:1350-1352`).
         ConstantData::Frozenset { elements } => {
-            let items: Vec<PyObjectRef> = elements.iter().map(pyobject_from_constant).collect();
+            let mut items: Vec<PyObjectRef> = Vec::with_capacity(elements.len());
+            for element in elements {
+                items.push(pyobject_from_constant(element));
+            }
             pyre_object::w_frozenset_from_items(&items)
         }
         ConstantData::Complex { value } => {

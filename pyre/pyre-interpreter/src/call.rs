@@ -2344,9 +2344,10 @@ pub fn call_function_impl_result(
     crate::stack_check::stack_check()?;
 
     let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
-    let rooted_args = (0..args.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
-        .collect::<Vec<_>>();
+    let mut rooted_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        rooted_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+    }
     let args = rooted_args.as_slice();
 
     unsafe {

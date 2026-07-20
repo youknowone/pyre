@@ -16922,6 +16922,15 @@ mod tests {
             iter_next_ops >= 1,
             "at least one native [__iter_next] op emitted"
         );
+        // The `rooted_args` reload is spelled as a `for i in 0..n` +
+        // `Vec::push` loop (not `.map().collect()`), so no residual
+        // `iter::adapters::map::Map::collect` dispatch wall survives — the
+        // deeper co-wall this graph exposed once the slice-iter wall fell.
+        assert_eq!(
+            count_call_leaf(&["iter", "adapters", "map", "Map", "collect"]),
+            0,
+            "no residual Map::collect reload wall"
+        );
     }
 
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
