@@ -39,6 +39,20 @@ assert i.names[0].name == "a"
 assert i.names[0].asname is None
 
 
+# compile() accepts a tree returned by ast.parse(), including ordinary
+# expression, assignment, call, attribute, list, and tuple nodes.
+compiled_tree = ast.parse("result = helper.value(40 + 2, items=[1, 2], pair=(3, 4))")
+namespace = {
+    "helper": type(
+        "Helper",
+        (),
+        {"value": staticmethod(lambda value, **kw: (value, kw["items"], kw["pair"]))},
+    )
+}
+exec(compile(compiled_tree, "<ast-object>", "exec"), namespace)
+assert namespace["result"] == (42, [1, 2], (3, 4))
+
+
 # Regression test for issue #4862:
 # A cyclic AST fed to compile() used to overflow the Rust stack and SIGSEGV.
 # After the fix, the recursion guard in ast_from_object raises RecursionError,

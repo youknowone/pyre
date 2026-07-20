@@ -7,6 +7,483 @@
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_compiler::{ast, parser};
 
+type AstResult<T> = Result<T, crate::PyError>;
+
+/// Convert an interpreter-level `_ast` tree back into Ruff's compiler AST and
+/// compile it.  This is the reverse of `Converter`, corresponding to PyPy's
+/// generated `ast_from_object` boundary.
+pub fn compile_object(
+    object: PyObjectRef,
+    filename: &str,
+    mode: crate::compile::Mode,
+    opts: crate::compile::CompileOpts,
+) -> AstResult<crate::compile::CodeObject> {
+    let ast_module = crate::importing::importhook(
+        "_ast",
+        PY_NULL,
+        PY_NULL,
+        0,
+        crate::call::take_last_exec_ctx(),
+    )?;
+    let mut converter = ObjectConverter {
+        ast_module,
+        depth: 0,
+    };
+    let module = converter.module(object)?;
+    let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, "").finish();
+    rustpython_compiler::codegen::compile::compile_top(module, source_file, mode, opts)
+        .map_err(|error| crate::PyError::syntax_error(error.to_string()))
+}
+
+struct ObjectConverter {
+    ast_module: PyObjectRef,
+    depth: usize,
+}
+
+impl ObjectConverter {
+    fn recurse<T>(&mut self, f: impl FnOnce(&mut Self) -> AstResult<T>) -> AstResult<T> {
+        // PyPy's generated ast_from_object calls space.getexecutioncontext()
+        // recursion guards around nested ASDL nodes.  Keep the state on this
+        // conversion, never in TLS or a global side table.
+        if self.depth >= 200 {
+            return Err(crate::PyError::recursion_error(
+                "maximum recursion depth exceeded while traversing AST node",
+            ));
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
+    }
+
+    fn is_node(&self, object: PyObjectRef, name: &str) -> AstResult<bool> {
+        let ty = crate::baseobjspace::getattr_str(self.ast_module, name)?;
+        Ok(unsafe { crate::baseobjspace::isinstance_w(object, ty) })
+    }
+
+    fn field(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<PyObjectRef> {
+        crate::baseobjspace::getattr_str(object, field).map_err(|_| {
+            crate::PyError::type_error(format!("required field {field:?} missing from {node}"))
+        })
+    }
+
+    fn optional_field(&self, object: PyObjectRef, field: &str) -> AstResult<Option<PyObjectRef>> {
+        match crate::baseobjspace::getattr_str(object, field) {
+            Ok(value) if unsafe { pyre_object::is_none(value) } => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn list(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<PyObjectRef>> {
+        let value = self.field(object, field, node)?;
+        if !unsafe { pyre_object::is_list(value) } {
+            return Err(crate::PyError::type_error(format!(
+                "AST list field must be a list, not {}",
+                unsafe { pyre_object::type_name_of(value) }
+            )));
+        }
+        Ok(unsafe { pyre_object::w_list_items_copy_as_vec(value) })
+    }
+
+    fn string(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<String> {
+        let value = self.field(object, field, node)?;
+        if !unsafe { pyre_object::is_str(value) } {
+            return Err(crate::PyError::type_error(
+                "AST identifier must be of type str",
+            ));
+        }
+        Ok(unsafe { pyre_object::w_str_get_value(value).to_string() })
+    }
+
+    fn module(&mut self, object: PyObjectRef) -> AstResult<ast::Mod> {
+        if self.is_node(object, "Module")? {
+            let values = self.list(object, "body", "Module")?;
+            let body = values
+                .into_iter()
+                .map(|value| self.recurse(|this| this.stmt(value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Mod::Module(ast::ModModule {
+                node_index: Default::default(),
+                range: Default::default(),
+                body,
+                runtime_body: None,
+            }))
+        } else if self.is_node(object, "Interactive")? {
+            let values = self.list(object, "body", "Interactive")?;
+            let body = values
+                .into_iter()
+                .map(|value| self.recurse(|this| this.stmt(value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Mod::Module(ast::ModModule {
+                node_index: Default::default(),
+                range: Default::default(),
+                body,
+                runtime_body: None,
+            }))
+        } else if self.is_node(object, "Expression")? {
+            let body = self.field(object, "body", "Expression")?;
+            Ok(ast::Mod::Expression(ast::ModExpression {
+                node_index: Default::default(),
+                range: Default::default(),
+                body: Box::new(self.recurse(|this| this.expr(body))?),
+            }))
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "expected some sort of mod, but got {}",
+                unsafe { pyre_object::type_name_of(object) }
+            )))
+        }
+    }
+
+    fn stmt(&mut self, object: PyObjectRef) -> AstResult<ast::Stmt> {
+        if self.is_node(object, "FunctionDef")? || self.is_node(object, "AsyncFunctionDef")? {
+            let is_async = self.is_node(object, "AsyncFunctionDef")?;
+            let name = ast::Identifier::new(
+                self.string(
+                    object,
+                    "name",
+                    if is_async {
+                        "AsyncFunctionDef"
+                    } else {
+                        "FunctionDef"
+                    },
+                )?,
+                Default::default(),
+            );
+            let args = self.field(object, "args", "FunctionDef")?;
+            let parameters = Box::new(self.recurse(|this| this.parameters(args))?);
+            let body = self
+                .list(object, "body", "FunctionDef")?
+                .into_iter()
+                .map(|value| self.recurse(|this| this.stmt(value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            // `type_params` was added after the original positional
+            // FunctionDef constructor.  Like RustPython/PyPy, a missing field
+            // on a manually constructed legacy node means an empty list.
+            let _type_params = self.optional_field(object, "type_params")?;
+            Ok(ast::Stmt::FunctionDef(ast::StmtFunctionDef {
+                node_index: Default::default(),
+                range: Default::default(),
+                is_async,
+                decorator_list: Vec::new(),
+                name,
+                type_params: None,
+                parameters,
+                returns: None,
+                body,
+                runtime_decorator_list: None,
+                runtime_type_comment: None,
+                runtime_type_comment_bytes: None,
+                runtime_body: None,
+            }))
+        } else if self.is_node(object, "Pass")? {
+            Ok(ast::Stmt::Pass(ast::StmtPass {
+                node_index: Default::default(),
+                range: Default::default(),
+            }))
+        } else if self.is_node(object, "Expr")? {
+            let value = self.field(object, "value", "Expr")?;
+            Ok(ast::Stmt::Expr(ast::StmtExpr {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: Box::new(self.recurse(|this| this.expr(value))?),
+            }))
+        } else if self.is_node(object, "Return")? {
+            let value = self.optional_field(object, "value")?;
+            Ok(ast::Stmt::Return(ast::StmtReturn {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: value
+                    .map(|value| self.recurse(|this| this.expr(value)).map(Box::new))
+                    .transpose()?,
+            }))
+        } else if self.is_node(object, "Assign")? {
+            let targets = self
+                .list(object, "targets", "Assign")?
+                .into_iter()
+                .map(|value| self.recurse(|this| this.expr(value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let value = self.field(object, "value", "Assign")?;
+            Ok(ast::Stmt::Assign(ast::StmtAssign {
+                node_index: Default::default(),
+                range: Default::default(),
+                targets,
+                value: Box::new(self.recurse(|this| this.expr(value))?),
+                runtime_targets: None,
+                runtime_type_comment: None,
+                runtime_type_comment_bytes: None,
+            }))
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "expected some sort of stmt, but got {}",
+                unsafe { pyre_object::type_name_of(object) }
+            )))
+        }
+    }
+
+    fn parameters(&mut self, object: PyObjectRef) -> AstResult<ast::Parameters> {
+        // Preserve the ASDL field reads even for empty argument lists.  Defaults
+        // are paired with parameters in source order by the complete converter.
+        for field in [
+            "posonlyargs",
+            "args",
+            "kwonlyargs",
+            "kw_defaults",
+            "defaults",
+        ] {
+            if !self.list(object, field, "arguments")?.is_empty() {
+                return Err(crate::PyError::not_implemented(
+                    "compiling AST functions with parameters is not implemented",
+                ));
+            }
+        }
+        if self.optional_field(object, "vararg")?.is_some()
+            || self.optional_field(object, "kwarg")?.is_some()
+        {
+            return Err(crate::PyError::not_implemented(
+                "compiling AST functions with variadic parameters is not implemented",
+            ));
+        }
+        Ok(ast::Parameters::default())
+    }
+
+    fn expr(&mut self, object: PyObjectRef) -> AstResult<ast::Expr> {
+        if self.is_node(object, "UnaryOp")? {
+            let operand = self.field(object, "operand", "UnaryOp")?;
+            let op = self.field(object, "op", "UnaryOp")?;
+            Ok(ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                node_index: Default::default(),
+                range: Default::default(),
+                op: self.unaryop(op)?,
+                operand: Box::new(self.recurse(|this| this.expr(operand))?),
+            }))
+        } else if self.is_node(object, "BinOp")? {
+            let left = self.field(object, "left", "BinOp")?;
+            let right = self.field(object, "right", "BinOp")?;
+            let op = self.field(object, "op", "BinOp")?;
+            Ok(ast::Expr::BinOp(ast::ExprBinOp {
+                node_index: Default::default(),
+                range: Default::default(),
+                left: Box::new(self.recurse(|this| this.expr(left))?),
+                op: self.operator(op)?,
+                right: Box::new(self.recurse(|this| this.expr(right))?),
+            }))
+        } else if self.is_node(object, "Call")? {
+            let func = self.field(object, "func", "Call")?;
+            let args = self
+                .list(object, "args", "Call")?
+                .into_iter()
+                .map(|arg| self.recurse(|this| this.expr(arg)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let keywords = self
+                .list(object, "keywords", "Call")?
+                .into_iter()
+                .map(|keyword| self.recurse(|this| this.keyword(keyword)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Expr::Call(ast::ExprCall {
+                node_index: Default::default(),
+                range: Default::default(),
+                func: Box::new(self.recurse(|this| this.expr(func))?),
+                arguments: ast::Arguments {
+                    node_index: Default::default(),
+                    range: Default::default(),
+                    args: args.into_boxed_slice(),
+                    keywords: keywords.into_boxed_slice(),
+                    runtime_args: None,
+                    runtime_bases: None,
+                },
+            }))
+        } else if self.is_node(object, "Attribute")? {
+            let value = self.field(object, "value", "Attribute")?;
+            let ctx = self.field(object, "ctx", "Attribute")?;
+            Ok(ast::Expr::Attribute(ast::ExprAttribute {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: Box::new(self.recurse(|this| this.expr(value))?),
+                attr: ast::Identifier::new(
+                    self.string(object, "attr", "Attribute")?,
+                    Default::default(),
+                ),
+                ctx: self.context(ctx)?,
+            }))
+        } else if self.is_node(object, "List")? || self.is_node(object, "Tuple")? {
+            let is_tuple = self.is_node(object, "Tuple")?;
+            let elements = self
+                .list(object, "elts", if is_tuple { "Tuple" } else { "List" })?
+                .into_iter()
+                .map(|element| self.recurse(|this| this.expr(element)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ctx = self.context(self.field(object, "ctx", "sequence")?)?;
+            if is_tuple {
+                Ok(ast::Expr::Tuple(ast::ExprTuple {
+                    node_index: Default::default(),
+                    range: Default::default(),
+                    elts: elements,
+                    ctx,
+                    parenthesized: true,
+                    runtime_elts: None,
+                }))
+            } else {
+                Ok(ast::Expr::List(ast::ExprList {
+                    node_index: Default::default(),
+                    range: Default::default(),
+                    elts: elements,
+                    ctx,
+                    runtime_elts: None,
+                }))
+            }
+        } else if self.is_node(object, "Name")? {
+            let ctx = self.context(self.field(object, "ctx", "Name")?)?;
+            Ok(ast::Expr::Name(ast::ExprName {
+                node_index: Default::default(),
+                range: Default::default(),
+                id: ast::name::Name::new(self.string(object, "id", "Name")?),
+                ctx,
+            }))
+        } else if self.is_node(object, "Constant")? {
+            let value = self.field(object, "value", "Constant")?;
+            Ok(ast::Expr::Constant(ast::ExprConstant {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: self.constant_value(value)?,
+                kind: None,
+                invalid_type: None,
+            }))
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "expected some sort of expr, but got {}",
+                unsafe { pyre_object::type_name_of(object) }
+            )))
+        }
+    }
+
+    fn keyword(&mut self, object: PyObjectRef) -> AstResult<ast::Keyword> {
+        let arg = self
+            .optional_field(object, "arg")?
+            .map(|value| {
+                if !unsafe { pyre_object::is_str(value) } {
+                    return Err(crate::PyError::type_error(
+                        "AST identifier must be of type str",
+                    ));
+                }
+                Ok(ast::Identifier::new(
+                    unsafe { pyre_object::w_str_get_value(value).to_string() },
+                    Default::default(),
+                ))
+            })
+            .transpose()?;
+        let value = self.field(object, "value", "keyword")?;
+        Ok(ast::Keyword {
+            node_index: Default::default(),
+            range: Default::default(),
+            arg,
+            value: self.recurse(|this| this.expr(value))?,
+        })
+    }
+
+    fn constant_value(&self, object: PyObjectRef) -> AstResult<ast::ConstantValue> {
+        unsafe {
+            if pyre_object::is_none(object) {
+                Ok(ast::ConstantValue::None)
+            } else if pyre_object::is_bool(object) {
+                Ok(ast::ConstantValue::Boolean(pyre_object::w_bool_get_value(
+                    object,
+                )))
+            } else if pyre_object::is_int(object) {
+                Ok(ast::ConstantValue::Integer(
+                    pyre_object::w_int_get_value(object)
+                        .to_string()
+                        .into_boxed_str(),
+                ))
+            } else if pyre_object::is_long(object) {
+                Ok(ast::ConstantValue::Integer(
+                    pyre_object::w_long_get_value(object)
+                        .to_string()
+                        .into_boxed_str(),
+                ))
+            } else if pyre_object::is_float(object) {
+                Ok(ast::ConstantValue::Float(pyre_object::w_float_get_value(
+                    object,
+                )))
+            } else if pyre_object::is_str(object) {
+                Ok(ast::ConstantValue::Str(
+                    pyre_object::w_str_get_value(object)
+                        .to_string()
+                        .into_boxed_str(),
+                ))
+            } else if pyre_object::is_bytes(object) {
+                Ok(ast::ConstantValue::Bytes(
+                    pyre_object::w_bytes_data(object)
+                        .to_vec()
+                        .into_boxed_slice(),
+                ))
+            } else if pyre_object::is_ellipsis(object) {
+                Ok(ast::ConstantValue::Ellipsis)
+            } else {
+                Err(crate::PyError::type_error(format!(
+                    "got an invalid type in Constant: {}",
+                    pyre_object::type_name_of(object)
+                )))
+            }
+        }
+    }
+
+    fn context(&self, object: PyObjectRef) -> AstResult<ast::ExprContext> {
+        for (name, ctx) in [
+            ("Load", ast::ExprContext::Load),
+            ("Store", ast::ExprContext::Store),
+            ("Del", ast::ExprContext::Del),
+            ("Invalid", ast::ExprContext::Invalid),
+        ] {
+            if self.is_node(object, name)? {
+                return Ok(ctx);
+            }
+        }
+        Err(crate::PyError::type_error(
+            "expected some sort of expr_context",
+        ))
+    }
+
+    fn unaryop(&self, object: PyObjectRef) -> AstResult<ast::UnaryOp> {
+        for (name, op) in [
+            ("Invert", ast::UnaryOp::Invert),
+            ("Not", ast::UnaryOp::Not),
+            ("UAdd", ast::UnaryOp::UAdd),
+            ("USub", ast::UnaryOp::USub),
+        ] {
+            if self.is_node(object, name)? {
+                return Ok(op);
+            }
+        }
+        Err(crate::PyError::type_error("expected some sort of unaryop"))
+    }
+
+    fn operator(&self, object: PyObjectRef) -> AstResult<ast::Operator> {
+        for (name, op) in [
+            ("Add", ast::Operator::Add),
+            ("Sub", ast::Operator::Sub),
+            ("Mult", ast::Operator::Mult),
+            ("MatMult", ast::Operator::MatMult),
+            ("Div", ast::Operator::Div),
+            ("Mod", ast::Operator::Mod),
+            ("Pow", ast::Operator::Pow),
+            ("LShift", ast::Operator::LShift),
+            ("RShift", ast::Operator::RShift),
+            ("BitOr", ast::Operator::BitOr),
+            ("BitXor", ast::Operator::BitXor),
+            ("BitAnd", ast::Operator::BitAnd),
+            ("FloorDiv", ast::Operator::FloorDiv),
+        ] {
+            if self.is_node(object, name)? {
+                return Ok(op);
+            }
+        }
+        Err(crate::PyError::type_error("expected some sort of operator"))
+    }
+}
+
 pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyResult {
     let parsed = match mode {
         crate::compile::Mode::Eval => parser::parse_expression(source)

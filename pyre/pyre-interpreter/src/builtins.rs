@@ -7149,15 +7149,15 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             // surrogate raises `UnicodeEncodeError` (strict) rather than
             // panicking in `w_str_get_value`.
             let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
-            String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8")
+            Some(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"))
         } else if pyre_object::bytesobject::is_bytes_like(source) {
             // A bytes-like source honours the PEP 263 coding cookie and raises
             // SyntaxError on undecodable bytes rather than lossily replacing.
-            crate::compile::decode_source_bytes(
+            Some(crate::compile::decode_source_bytes(
                 pyre_object::bytesobject::bytes_like_data(source),
                 &filename,
                 false,
-            )?
+            )?)
         } else {
             // PyPy returns an AST input unchanged when ONLY_AST is requested.
             // Keep this check at the public `_ast.AST` boundary so subclasses
@@ -7174,13 +7174,12 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 if flags & PYCF_ONLY_AST != 0 {
                     return Ok(source);
                 }
-                return Err(crate::PyError::not_implemented(
-                    "compiling an AST object is not implemented",
+                None
+            } else {
+                return Err(crate::PyError::type_error(
+                    "compile() arg 1 must be a string, bytes or AST object",
                 ));
             }
-            return Err(crate::PyError::type_error(
-                "compile() arg 1 must be a string, bytes or AST object",
-            ));
         }
     };
 
@@ -7194,10 +7193,25 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ..Default::default()
     };
     if flags & PYCF_ONLY_AST != 0 {
-        return crate::module::_ast::convert::parse_to_object(&source_str, mode);
+        return crate::module::_ast::convert::parse_to_object(
+            source_str
+                .as_deref()
+                .expect("AST input returned above for ONLY_AST"),
+            mode,
+        );
     }
-    let code = crate::compile::compile_source_with_opts(&source_str, mode, &filename, opts)
-        .map_err(compile_err_to_syntax_error)?;
+    if source_str.is_none() {
+        let code = crate::module::_ast::convert::compile_object(source, &filename, mode, opts)?;
+        let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+        return Ok(crate::w_code_new(code_ptr));
+    }
+    let code = crate::compile::compile_source_with_opts(
+        source_str.as_deref().expect("non-AST source"),
+        mode,
+        &filename,
+        opts,
+    )
+    .map_err(compile_err_to_syntax_error)?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
 }
