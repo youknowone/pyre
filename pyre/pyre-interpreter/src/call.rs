@@ -247,7 +247,9 @@ pub fn set_jit_param(name: &str, value: i64) {
 /// import pyre-jit (its upper crate), so the JIT registers this at boot and the
 /// `unpackiterable_driver.jit_merge_point` marker calls through it. Mirrors the
 /// `SET_JIT_PARAM_HOOK` / `EVAL_OVERRIDE` inversion pattern.
-type UnpackMergeFn = fn(greenkey: PyObjectRef);
+/// `greenkey` is the merge-point green; `w_iterator` and `items` are the two
+/// `reds='auto'` values the JIT walk backs its InputArgs with.
+type UnpackMergeFn = fn(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef);
 static UNPACK_MERGE_HOOK: OnceLock<UnpackMergeFn> = OnceLock::new();
 
 pub fn register_unpack_merge_hook(f: UnpackMergeFn) {
@@ -257,9 +259,9 @@ pub fn register_unpack_merge_hook(f: UnpackMergeFn) {
 /// Called from `UnpackIterableJitDriver::jit_merge_point`. No-op until the JIT
 /// installs the hook.
 #[inline]
-pub fn unpack_merge_point(greenkey: PyObjectRef) {
+pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef) {
     if let Some(f) = UNPACK_MERGE_HOOK.get() {
-        f(greenkey);
+        f(greenkey, w_iterator, items);
     }
 }
 

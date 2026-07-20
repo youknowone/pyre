@@ -798,7 +798,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
                 // twin at the guard's own `op_pc`.
-                let twin = unsafe { (&*sym.jitcode()).payload.resume_marker_for_jitcode_pc(op_pc) };
+                let twin = unsafe {
+                    (&*sym.jitcode())
+                        .payload
+                        .resume_marker_for_jitcode_pc(op_pc)
+                };
                 match twin {
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,

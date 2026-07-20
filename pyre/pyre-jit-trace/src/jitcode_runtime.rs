@@ -140,9 +140,7 @@ fn compute_portal_jitcode_index_for_key(key: &str) -> Option<usize> {
         .find(|driver| driver.portal.canonical_key() == key)?;
     let index = driver.main_jitcode_index;
     let jitcode = all_jitcodes().get(index).unwrap_or_else(|| {
-        panic!(
-            "configured portal `{key}` refers to missing JitCode index {index}",
-        )
+        panic!("configured portal `{key}` refers to missing JitCode index {index}",)
     });
     assert!(
         jitcode.jitdriver_sd().is_some(),

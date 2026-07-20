@@ -9198,10 +9198,13 @@ struct UnpackIterableJitDriver;
 
 impl UnpackIterableJitDriver {
     /// pypy/interpreter/baseobjspace.py:1012
-    /// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
+    /// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`. `reds='auto'`
+    /// (baseobjspace.py:31) auto-collects the loop's live locals `w_iterator`
+    /// and `items`; pyre's meta-tracer cannot auto-collect Rust locals, so the
+    /// merge-point passes them to the hook as the two concrete reds.
     #[inline]
-    fn jit_merge_point(&self, greenkey: PyObjectRef) {
-        crate::call::unpack_merge_point(greenkey);
+    fn jit_merge_point(&self, greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef) {
+        crate::call::unpack_merge_point(greenkey, w_iterator, items);
     }
 }
 
@@ -9363,7 +9366,7 @@ fn _unpackiterable_unknown_length(
     loop {
         // baseobjspace.py:1012
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
-        unpackiterable_driver.jit_merge_point(greenkey);
+        unpackiterable_driver.jit_merge_point(greenkey, w_iterator, items);
         match next(w_iterator) {
             Ok(w_item) => unsafe { pyre_object::listobject::w_list_append(items, w_item) },
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,

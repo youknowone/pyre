@@ -4252,9 +4252,14 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
 
 /// jd1 (`unpackiterable_driver`) merge-point hook body. Placeholder: a later
 /// slice ticks the loop counter for `greenkey` and, on threshold, enters tracing
-/// of `_unpackiterable_unknown_length`. No-op for now so behavior is unchanged.
-fn unpack_merge_point_jit(greenkey: pyre_object::PyObjectRef) {
-    let _ = greenkey;
+/// of `_unpackiterable_unknown_length` with `w_iterator` and `items` as the two
+/// concrete reds. No-op for now so behavior is unchanged.
+fn unpack_merge_point_jit(
+    greenkey: pyre_object::PyObjectRef,
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+) {
+    let _ = (greenkey, w_iterator, items);
 }
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers

@@ -6768,19 +6768,16 @@ where
         sub_frame.return_f = None;
         match return_kind {
             Some(JitArgKind::Int) => {
-                sub_frame.return_i = Some(
-                    result_dst.expect("BC_INLINE_CALL_*_I must encode an int destination"),
-                );
+                sub_frame.return_i =
+                    Some(result_dst.expect("BC_INLINE_CALL_*_I must encode an int destination"));
             }
             Some(JitArgKind::Ref) => {
-                sub_frame.return_r = Some(
-                    result_dst.expect("BC_INLINE_CALL_*_R must encode a ref destination"),
-                );
+                sub_frame.return_r =
+                    Some(result_dst.expect("BC_INLINE_CALL_*_R must encode a ref destination"));
             }
             Some(JitArgKind::Float) => {
-                sub_frame.return_f = Some(
-                    result_dst.expect("BC_INLINE_CALL_IRF_F must encode a float destination"),
-                );
+                sub_frame.return_f =
+                    Some(result_dst.expect("BC_INLINE_CALL_IRF_F must encode a float destination"));
             }
             None => {}
         }

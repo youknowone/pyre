@@ -22,7 +22,7 @@ use majit_ir::{OpRef, Type};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use crate::state::{PyreEnv, PyreMeta};
-use pyre_object::{PyObjectRef, PY_NULL};
+use pyre_object::{PY_NULL, PyObjectRef};
 
 /// jd1 symbolic state carried across the `unpackiterable_driver` back-edge.
 ///
@@ -181,7 +181,10 @@ mod tests {
         let callee_idx = canonical.code[inline.pc + 1] as usize
             | ((canonical.code[inline.pc + 2] as usize) << 8);
         assert!(
-            jitcode.descr_at(callee_idx).and_then(RuntimeBhDescr::as_jitcode).is_some(),
+            jitcode
+                .descr_at(callee_idx)
+                .and_then(RuntimeBhDescr::as_jitcode)
+                .is_some(),
             "inline_call callee must resolve to a JitCode through the global pool"
         );
 
