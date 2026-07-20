@@ -2664,6 +2664,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_collections::W_DequeRevIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // RustPython `_tokenize::PyTokenizerIter` keeps the callable source on
+    // the iterator.  The pyre adapter has the same ownership shape, so its
+    // inline `readline` field must be traced while tokenization is suspended.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_tokenize::W_TokenizerIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
