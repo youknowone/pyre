@@ -4250,17 +4250,250 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
         .set_param(name, value);
 }
 
-/// jd1 (`unpackiterable_driver`) merge-point hook body. Placeholder: a later
-/// slice ticks the loop counter for `greenkey` and, on threshold, enters tracing
-/// of `_unpackiterable_unknown_length` with `w_iterator` and `items` as the two
-/// concrete reds. No-op for now so behavior is unchanged.
+/// WIP gate for jd1 (`unpackiterable_driver`) live-path residual execution.
+/// OFF by default: the merge-point hook stays inert so the second driver does
+/// not perturb jd0 until the full activation slice (blackhole entry +
+/// compiled-loop reuse) lands. `PYRE_JD1=1` opts into driving the
+/// `JitCodeMachine` trace of `_unpackiterable_unknown_length` on the live
+/// unpack path.
+fn jd1_experiment_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_JD1").is_some())
+}
+
+thread_local! {
+    /// Scaffold jd1 warmup counter keyed by the iterator-type green key.
+    /// `unpackiterable_driver` in PyPy is gated by the per-driver `JitCounter`;
+    /// pyre's single `WarmState` is jd0-owned, so jd1 keeps its own tick until
+    /// it gets a dedicated warmstate. Fires once an iterator type's unpack loop
+    /// is hot.
+    static JD1_LOOP_COUNTER: std::cell::RefCell<std::collections::HashMap<u64, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Merge-point crossings for one iterator type before jd1 drives a trace.
+/// Above trivial fixed-size unpacks (`a, b = pair`) so only genuinely long
+/// drains warm it, matching the hot-loop intent of `unpackiterable_driver`.
+const JD1_TRACE_THRESHOLD: u32 = 100;
+
+/// Effective threshold; overridable via `PYRE_JD1_THRESHOLD` for experiments
+/// (e.g. `=1` to drive on the first crossing of every iterator type).
+fn jd1_trace_threshold() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("PYRE_JD1_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(JD1_TRACE_THRESHOLD)
+    })
+}
+
+fn jd1_counter_tick(green_key: u64) -> bool {
+    let threshold = jd1_trace_threshold();
+    JD1_LOOP_COUNTER.with(|c| {
+        let mut map = c.borrow_mut();
+        let n = map.entry(green_key).or_insert(0);
+        *n += 1;
+        if *n >= threshold {
+            *n = 0;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// jd1 (`unpackiterable_driver`) merge-point hook body. On the hot iterator
+/// type, drives one `JitCodeMachine` trace of the extracted
+/// `_unpackiterable_unknown_length` loop with `w_iterator`/`items` as the two
+/// `reds='auto'` values. Inert unless `PYRE_JD1=1`.
 fn unpack_merge_point_jit(
     greenkey: pyre_object::PyObjectRef,
     w_iterator: pyre_object::PyObjectRef,
     items: pyre_object::PyObjectRef,
 ) {
-    let _ = (greenkey, w_iterator, items);
+    if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed);
+        if n < 3 || n.is_multiple_of(500) {
+            eprintln!(
+                "[jd1] hook hit #{n} enabled={} gk_null={} it_null={} items_null={}",
+                jd1_experiment_enabled(),
+                greenkey.is_null(),
+                w_iterator.is_null(),
+                items.is_null(),
+            );
+        }
+    }
+    if !jd1_experiment_enabled() {
+        return;
+    }
+    if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
+        return;
+    }
+    // baseobjspace.py:368 iterator_greenkey → space.type(w_iterable): a per-type
+    // singleton, so its address hashes to one stable green key per iterator type
+    // (`pc = 0`, novable — no bytecode offset).
+    let green_key = make_green_key(greenkey as *const (), 0);
+    if !jd1_counter_tick(green_key) {
+        return;
+    }
+    if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
+        eprintln!("[jd1] counter fired for green_key={green_key}");
+    }
+    drive_unpack_iterable_trace(green_key, w_iterator, items);
 }
+
+/// Drive one jd1 trace of `_unpackiterable_unknown_length`. The tracer executes
+/// each residual (`self.next`, `items.append`) concretely on the shared reds,
+/// so this advances the live iterator and grows the live list in place; the
+/// Rust caller loop then resumes from the advanced state (cooperative drain).
+/// Slice-1 discards the recorded trace — compiled-loop reuse and blackhole
+/// entry are later activation slices.
+fn drive_unpack_iterable_trace(
+    green_key: u64,
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+) {
+    use majit_metainterp::BackEdgeAction;
+
+    // jd1's extracted portal jitcode carries an empty per-jitcode descr pool;
+    // its inline-call / residual-call `d`/`j` argcodes resolve through the
+    // shared global build-time pool, so install it before the walk reads the
+    // first descr (idempotent OnceLock).
+    let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        "baseobjspace::_unpackiterable_unknown_length",
+    ) {
+        Some(jc) => jc,
+        None => {
+            if dbg {
+                eprintln!("[jd1] portal_jitcode_for_key returned None");
+            }
+            return;
+        }
+    };
+    // The build-time canonical body has an empty per-jitcode descr pool; the
+    // runtime `JitCode` resolves its `d`/`j` argcodes through the shared global
+    // pool installed above (`descr_at`).
+    let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+
+    let (driver, _) = driver_pair();
+    let meta = driver.meta_interp_mut();
+    // The shared `MetaInterp.tracing` slot holds exactly one ctx; never nest a
+    // jd1 trace inside an active (jd0 or jd1) session.
+    if meta.is_tracing() {
+        if dbg {
+            eprintln!("[jd1] bail: meta.is_tracing()");
+        }
+        return;
+    }
+
+    // baseobjspace.py:31 reds='auto' → `w_iterator`, `items` as the two Ref
+    // input args, in the order `create_sym`/`collect_jump_args` use.
+    let live_values = [
+        majit_ir::Value::Ref(majit_ir::GcRef(w_iterator as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
+    ];
+
+    // jd1's registered descriptor lives at `jitdrivers_sd[2]` (registered right
+    // after jd0 in `build_jit_driver_pair`). `elect_active_jitdriver_sd` honours
+    // `descriptor.index` first, which is how the novable jd1 is elected over jd0
+    // (whose `virtualizable_info` would otherwise win the fallback scan). Only
+    // the index is read here; the wired descriptor at that slot carries the
+    // finish/exc tokens.
+    let mut descriptor =
+        pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
+    descriptor.index = Some(2);
+
+    let action = meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values);
+    if dbg {
+        let name = match action {
+            BackEdgeAction::Interpret => "Interpret",
+            BackEdgeAction::StartedTracing => "StartedTracing",
+            BackEdgeAction::AlreadyTracing => "AlreadyTracing",
+            BackEdgeAction::RunCompiled => "RunCompiled",
+        };
+        eprintln!("[jd1] force_start_tracing -> {name}");
+    }
+    if !matches!(action, BackEdgeAction::StartedTracing) {
+        return;
+    }
+
+    // reds='auto' as JitCode argboxes: seed the root frame's InputArg(0)/(1)
+    // registers with the concrete iterator/list pointers so each residual runs
+    // on the shared heap objects the caller loop holds.
+    let argboxes = [
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+            w_iterator as usize as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+            items as usize as i64,
+        ),
+    ];
+
+    let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
+        greenkey: pyre_object::PY_NULL,
+        w_iterator: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+        items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+    };
+
+    // Drive through the production resolver runtime (the same closures jd0's
+    // live JitCodeMachine dispatch uses): `resolve_token` /
+    // `recursive_call_assembler_target` / inline-decision / concrete
+    // recursive-callee executors, so any CALL_ASSEMBLER or recursive-portal op
+    // the extracted body reaches resolves against the real compiled-loop /
+    // warmstate state instead of the null defaults on a bare `ClosureRuntime`.
+    let drove = meta.with_trace_ctx_and_token_resolver(
+        |ctx,
+         resolve_token,
+         recursive_target,
+         recursive_decision,
+         recursive_exec,
+         recursive_exec_ref,
+         recursive_exec_float,
+         recursive_exec_void| {
+            let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                |_pc: usize| 0usize,
+                resolve_token,
+                recursive_target,
+                recursive_decision,
+                recursive_exec,
+                recursive_exec_ref,
+                recursive_exec_float,
+                recursive_exec_void,
+            );
+            majit_metainterp::trace_jitcode_with_args_and_runtime(
+                ctx,
+                &mut sym,
+                &jitcode,
+                JD1_LOOP_HEADER_PC,
+                &runtime,
+                &argboxes,
+            );
+        },
+    );
+    if dbg {
+        eprintln!("[jd1] trace_jitcode drove={}", drove.is_some());
+    }
+
+    // The residual side effects already landed on the shared reds; drop the
+    // recorded trace (non-permanent so the cell's abort budget self-limits
+    // retrace storms) without compiling.
+    meta.abort_trace(false);
+}
+
+/// The single `jit_merge_point` pc in jd1's extracted
+/// `_unpackiterable_unknown_length` body — matches `UnpackSym::loop_header_pc`
+/// (asserted in `unpack_state::jd1_build_time_descrs_resolve_through_global_pool`).
+const JD1_LOOP_HEADER_PC: usize = 0x5c;
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
