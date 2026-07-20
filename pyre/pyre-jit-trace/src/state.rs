@@ -10174,7 +10174,6 @@ mod tests {
     //! upstream parity point, that reference is called out inline.
 
     use super::*;
-    use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
     use pyre_interpreter::bytecode::{CodeObject, ConstantData, Instruction};
