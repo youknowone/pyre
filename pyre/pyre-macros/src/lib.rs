@@ -1731,6 +1731,49 @@ fn expand_pyre_methods(
             }
         };
 
+        // PyPy's `interp2app` gateway validates the positional count before
+        // entering the typed interp-level method.  `make_builtin_function`
+        // stores no signature contract of its own, so the generated wrapper
+        // must reject surplus positional arguments instead of silently
+        // ignoring everything beyond the final typed parameter.
+        let arity_preamble = {
+            let is_property = matches!(
+                kind,
+                MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..)
+            );
+            if has_varargs || is_property {
+                quote! {}
+            } else {
+                let receiver_slots = usize::from(matches!(kind, MethodKind::Instance));
+                let visible_max = param_names.len();
+                let visible_required = param_required.iter().filter(|&&required| required).count();
+                let expected_total = receiver_slots + visible_max;
+                let fn_name = mname.to_string();
+                let expected = if visible_required == visible_max {
+                    match visible_max {
+                        0 => "no arguments".to_string(),
+                        1 => "exactly one argument".to_string(),
+                        n => format!("exactly {n} arguments"),
+                    }
+                } else {
+                    format!(
+                        "at most {visible_max} argument{}",
+                        if visible_max == 1 { "" } else { "s" }
+                    )
+                };
+                quote! {
+                    if args.len() > #expected_total {
+                        return ::std::result::Result::Err(crate::PyError::type_error(format!(
+                            "{}() takes {} ({} given)",
+                            #fn_name,
+                            #expected,
+                            args.len().saturating_sub(#receiver_slots),
+                        )));
+                    }
+                }
+            }
+        };
+
         let call_inner = quote! { #call_target( #(#call_args),* ) };
         let body = wrap_return(&m.sig.output, call_inner)?;
 
@@ -1779,6 +1822,7 @@ fn expand_pyre_methods(
                 args: &[::pyre_object::PyObjectRef],
             ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
                 #kwargs_preamble
+                #arity_preamble
                 #preamble
                 #(#unwrap_stmts)*
                 #body

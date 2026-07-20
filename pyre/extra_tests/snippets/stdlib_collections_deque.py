@@ -98,5 +98,27 @@ class D(deque):
 assert repr(D()) == "D([])"
 assert repr(D([1, 2, 3])) == "D([1, 2, 3])"
 
+assert deque("abc") + deque("def") == deque("abcdef")
+assert deque("abcdef", maxlen=4) + deque("gh") == deque("efgh")
+assert type(D([1]) + deque([2])) is D
+assert_raises(TypeError, lambda: deque("abc") + "def")
+
+
+class EmptyIterDeque(deque):
+    def __iter__(self):
+        return iter(())
+
+
+subclass_sum = EmptyIterDeque([1, 2]) + deque([3])
+assert type(subclass_sum) is EmptyIterDeque
+assert len(subclass_sum) == 1
+assert subclass_sum[0] == 3
+
+d = deque("a")
+d += "bcd"
+assert d == deque("abcd")
+d += d
+assert d == deque("abcdabcd")
+
 
 assert_raises(ValueError, lambda: deque().index(10, 0, 10000000000000000000000000))
