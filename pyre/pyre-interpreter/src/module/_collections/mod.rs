@@ -331,9 +331,6 @@ mod deque_rev_iter {
     }
 }
 
-pub use deque_iter::W_DequeIter;
-pub use deque_rev_iter::W_DequeRevIter;
-
 /// `W_Deque.append` + `trimleft`: drop from the left once over the bound.
 fn do_append(self_obj: PyObjectRef, item: PyObjectRef) {
     let d = data(self_obj);

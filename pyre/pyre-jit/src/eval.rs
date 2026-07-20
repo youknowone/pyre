@@ -1873,6 +1873,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         <pyre_interpreter::module::_collections::W_DequeRevIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        // `_tokenize.TokenizerIter` holds the callable source in an inline
+        // `readline` field and is `allocate`-immortal, so its offsets are
+        // registered here rather than through the managed marker.
+        <pyre_interpreter::module::_tokenize::W_TokenizerIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     ] {
         pyre_object::gc_hook::register_pyre_class_offsets(
             descr.pytype_ptr as usize,
@@ -2664,31 +2669,6 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut gc,
         &mut pytype_to_tid,
         <pyre_interpreter::module::_collections::W_Deque
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // `interp_deque.py` W_DequeIter / W_DequeRevIter each carry the source
-    // deque in an inline `deque` field. They use the same managed
-    // `#[pyre_class]::allocate` path as W_Deque, so register their payload
-    // layouts with the marker instead of treating them as immortal wrappers.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_collections::W_DequeIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_collections::W_DequeRevIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // RustPython `_tokenize::PyTokenizerIter` keeps the callable source on
-    // the iterator.  The pyre adapter has the same ownership shape, so its
-    // inline `readline` field must be traced while tokenization is suspended.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // ── GC-root registration completeness oracle ─────────────────────────
