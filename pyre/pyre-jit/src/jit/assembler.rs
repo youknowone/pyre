@@ -2068,7 +2068,18 @@ fn expect_list_regs_or_pool(state: &mut AssemblyState, op: &Operand, expected: K
                      got {other:?}"
                 ),
             };
-            u8::try_from(reg_idx).expect("register index exceeds u8")
+            // A pool-backed index (`num_regs_kind + pool_idx`) can exceed a
+            // single operand byte even though `num_regs_kind` itself stays
+            // under the ceiling.  Latch the builder's overflow flag and emit a
+            // placeholder rather than panicking; `try_finish` then declines the
+            // JitCode and the interpreter keeps running the trace's function.
+            match u8::try_from(reg_idx) {
+                Ok(byte) => byte,
+                Err(_) => {
+                    state.builder.note_encoding_overflow();
+                    0
+                }
+            }
         })
         .collect()
 }

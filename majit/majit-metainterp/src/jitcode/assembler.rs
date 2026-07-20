@@ -4532,6 +4532,12 @@ impl JitCodeBuilder {
             || total_i > 256
             || total_r > 256
             || total_f > 256
+            // A resume frame records its jitcode `pc` as a single SHORT
+            // (`resumecode.py:90` `append_int` casts through `rffi.SHORT`), so
+            // a jitcode whose byte length cannot be addressed by an i16 pc
+            // would overflow the resume numbering.  Decline it like the
+            // register/const ceilings above; the interpreter keeps running it.
+            || self.code.len() > i16::MAX as usize
         {
             return None;
         }
@@ -4651,6 +4657,14 @@ impl JitCodeBuilder {
     pub fn finish(self) -> JitCode {
         self.try_finish()
             .expect("JitCodeBuilder::finish called for an unencodable JitCode")
+    }
+
+    /// Latch the single-byte-operand overflow flag so `try_finish` declines
+    /// the JitCode.  Used by front-ends that compute a pool-backed operand
+    /// index outside the builder's `push_reg_u8` seam and would otherwise have
+    /// to panic when the index exceeds a single byte.
+    pub fn note_encoding_overflow(&mut self) {
+        self.encoding_overflow = true;
     }
 
     fn push_u8(&mut self, value: u8) {
