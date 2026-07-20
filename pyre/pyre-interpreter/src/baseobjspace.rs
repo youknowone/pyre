@@ -8464,6 +8464,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExceptionAttrSlot {
     Args,
+    Context,
+    Cause,
     Code,
     Errno,
     Strerror,
@@ -8508,6 +8510,8 @@ pub unsafe fn exception_attr_slot_fold(
     let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
     let slot = match name {
         "args" => ExceptionAttrSlot::Args,
+        "__context__" => ExceptionAttrSlot::Context,
+        "__cause__" => ExceptionAttrSlot::Cause,
         "code" if kind == pyre_object::interp_exceptions::ExcKind::SystemExit => {
             ExceptionAttrSlot::Code
         }
@@ -8549,6 +8553,18 @@ pub unsafe fn exception_attr_slot_fold(
         }
         _ => return None,
     };
+    // Only loads of `__context__`/`__cause__` fold to a raw slot read.
+    // `descr_setcontext` (`interp_exceptions.py:183-190`) type-validates and
+    // `descr_setcause` (`:166-174`) also flips `suppress_context` to True, so a
+    // direct slot write would drop those effects.
+    if is_store
+        && matches!(
+            slot,
+            ExceptionAttrSlot::Context | ExceptionAttrSlot::Cause
+        )
+    {
+        return None;
+    }
     let w_type = crate::typedef::r#type(obj)?;
     // Any hit precedes the hard-coded exception arm.  The version-tag guard
     // below pins this miss across later heap-subclass mutations.
@@ -8564,6 +8580,10 @@ pub unsafe fn exception_attr_slot_fold(
             ExceptionAttrSlot::Args => {
                 pyre_object::interp_exceptions::w_exception_get_args_storage(obj)
             }
+            ExceptionAttrSlot::Context => {
+                pyre_object::interp_exceptions::w_exception_get_context(obj)
+            }
+            ExceptionAttrSlot::Cause => pyre_object::interp_exceptions::w_exception_get_cause(obj),
             ExceptionAttrSlot::Code => pyre_object::interp_exceptions::w_exception_get_code(obj),
             ExceptionAttrSlot::Errno => pyre_object::interp_exceptions::w_exception_get_errno(obj),
             ExceptionAttrSlot::Strerror => {

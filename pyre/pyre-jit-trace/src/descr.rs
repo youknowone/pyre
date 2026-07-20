@@ -2489,6 +2489,8 @@ pub fn w_exception_slot_descr(
     }
     let field_index = match slot {
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args => 2,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Context => 3,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause => 4,
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Errno => 11,
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Strerror => 12,
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename => 13,

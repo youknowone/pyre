@@ -1514,6 +1514,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                         concrete_stored,
                     )
                 }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Context
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause => {
+                    // `exception_attr_slot_fold` declines these for stores, so
+                    // the store fold never reaches here.
+                    unreachable!("__context__/__cause__ slots fold on load only")
+                }
                 pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => {
                     pyre_object::interp_exceptions::w_exception_set_code(
                         concrete_obj,
