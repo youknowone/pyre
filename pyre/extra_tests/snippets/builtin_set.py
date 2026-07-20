@@ -500,3 +500,22 @@ for _set_base in (set, frozenset):
     gc.collect()
     gc.collect()
     assert _finalized == [True]
+
+
+# test_set.py TestJointOps.test_container_iterator: the iterator's source and
+# an element may form a cycle.  A full explicit collection must finish any
+# in-progress major cycle and then collect this cycle in a fresh major pass.
+import weakref
+
+
+for _set_base in (set, frozenset):
+    class _SetCycleElement:
+        pass
+
+    _set_cycle_element = _SetCycleElement()
+    _set_cycle_ref = weakref.ref(_set_cycle_element)
+    _set_cycle_container = _set_base([_set_cycle_element, 1])
+    _set_cycle_element.iterator = iter(_set_cycle_container)
+    del _set_cycle_element, _set_cycle_container
+    gc.collect()
+    assert _set_cycle_ref() is None

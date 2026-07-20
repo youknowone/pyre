@@ -81,6 +81,20 @@ pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     });
 }
 
+/// interp_gc.py:12-15 — clear `space.fromcache(MethodCache)` before an
+/// explicit full collection.
+#[majit_macros::dont_look_inside]
+pub fn clear_method_cache() {
+    METHOD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.versions.fill(0);
+        cache.names.fill(None);
+        cache
+            .lookup_where
+            .fill((std::ptr::null_mut(), std::ptr::null_mut()));
+    });
+}
+
 /// CPython 3.14 `dict_unhashable_type` (`Objects/dictobject.c`) parity.
 /// Only an exact `TypeError` raised while hashing is replaced; equality
 /// callback errors, non-TypeError exceptions, and TypeError subclasses pass

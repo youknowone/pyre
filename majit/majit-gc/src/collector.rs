@@ -2676,9 +2676,15 @@ impl MiniMarkGC {
         } else {
             None
         };
+        // incminimark.py:2361-2369 `minor_and_major_collection`: first finish
+        // the current major cycle, if any.  Objects promoted by the complete
+        // minor below must be considered by a fresh major snapshot, not folded
+        // into a marking cycle that started before they existed.
+        self.gc_step_until_scanning();
+
         // Minor collection first to empty the nursery.
-        // Note: do_collect_nursery may itself start/advance an incremental
-        // cycle, but we need a complete mark-sweep here regardless.
+        // This is the `_minor_collection()` performed by upstream's
+        // `gc_step_until(STATE_MARKING)` before it starts the fresh cycle.
         self.do_collect_nursery();
 
         if self.gc_state == GcState::Scanning {
@@ -6214,6 +6220,25 @@ mod tests {
         }
         assert_eq!(count, 5, "entire chain should be reachable after cycle");
 
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn full_collection_finishes_active_cycle_then_runs_fresh_cycle() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut rooted = gc.alloc_with_type(tid, 16);
+        unsafe { gc.roots.add(&mut rooted) };
+        gc.do_collect_nursery();
+
+        gc.start_incremental_cycle();
+        assert!(gc.is_incremental_marking());
+        let major_before = gc.major_collections;
+
+        gc.do_collect_full();
+
+        assert_eq!(gc.major_collections, major_before + 2);
+        assert!(gc.oldgen.contains(rooted.0));
         gc.roots.clear();
     }
 

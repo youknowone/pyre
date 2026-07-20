@@ -1,7 +1,7 @@
 //! gc module — PyPy: `pypy/module/gc/`.
 //!
-//! Partial port of `interp_gc.py`. Explicit collection uses pyre's non-moving
-//! old-gen major, then drains the RPython finalizer queue synchronously.
+//! Partial port of `interp_gc.py`. Explicit collection runs the complete
+//! RPython collection, then drains the finalizer queue synchronously.
 
 use pyre_object::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,10 +66,11 @@ crate::py_module! {
     },
     functions: {
         // `interp_gc.py:7-26 collect` — argument `generation` ignored per
-        // upstream.  MethodCache / MapAttrCache clears (`:14-17`) skipped
-        // because pyre has no equivalent caches.
+        // upstream.
         "collect"       / 1 = |_| {
-            pyre_object::gc_hook::try_gc_collect_oldgen();
+            crate::baseobjspace::clear_method_cache();
+            crate::objspace::std::mapdict::clear_map_attr_cache();
+            pyre_object::gc_hook::try_gc_collect();
             if let Some(action) = user_del_action() {
                 let temp_reenable = !action.enabled_at_app_level;
                 if temp_reenable {

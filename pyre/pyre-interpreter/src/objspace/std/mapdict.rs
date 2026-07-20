@@ -2,8 +2,7 @@
 //!
 //! Mapdict provides per-instance dict and weakref slots for hasdict /
 //! weakrefable types. PyPy stores these inside the mapdict map's "dict"
-//! and "weakref" SPECIAL slots; pyre keeps thread-local side tables
-//! keyed by object address because pyre has no mapdict.
+//! and "weakref" SPECIAL slots; pyre does the same for user instances.
 //!
 //! The names below mirror PyPy: `MapdictDictSupport.getdict` →
 //! `_obj_getdict`, `MapdictWeakrefSupport.setweakref` →
@@ -439,6 +438,51 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
     node_write(map, inst, Wtf8::new("dict"), SPECIAL, w_dict)
 }
 
+/// Read the weakref lifeline from the instance's `"weakref"` SPECIAL slot
+/// (mapdict.py:787 `self._get_mapdict_map().read(self, "weakref", SPECIAL)`).
+///
+/// # Safety
+/// `obj` must be a live `W_ObjectObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
+    ensure_mapdict_initialized(obj);
+    let inst = &*(obj as *const pyre_object::W_ObjectObject);
+    let map = inst._get_mapdict_map();
+    node_read(map, inst, Wtf8::new("weakref"), SPECIAL)
+}
+
+/// Write the weakref lifeline into the instance's `"weakref"` SPECIAL slot
+/// (mapdict.py:798 `self._get_mapdict_map().write(...)`).
+///
+/// # Safety
+/// `obj` must be a live `W_ObjectObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef) -> bool {
+    ensure_mapdict_initialized(obj);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
+    let map = inst._get_mapdict_map();
+    node_write(map, inst, Wtf8::new("weakref"), SPECIAL, lifeline)
+}
+
+/// Clear the weakref lifeline in place, matching mapdict.py:802
+/// `self._get_mapdict_map().write(self, "weakref", SPECIAL, None)`.
+///
+/// # Safety
+/// `obj` must be a live `W_ObjectObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
+    ensure_mapdict_initialized(obj);
+    let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
+    let map = inst._get_mapdict_map();
+    let _ = node_write(
+        map,
+        inst,
+        Wtf8::new("weakref"),
+        SPECIAL,
+        pyre_object::PY_NULL,
+    );
+}
+
 // ── methods needed for slots (mapdict.py:764-780 MapdictSlotsSupport) ──
 
 /// mapdict.py:766-768 `MapdictSlotsSupport.getslotvalue` —
@@ -746,6 +790,13 @@ thread_local! {
     /// `space.fromcache(MapAttrCache)` (mapdict.py:80) — one cache per space;
     /// pyre runs one space per thread.
     static MAP_ATTR_CACHE: RefCell<MapAttrCache> = RefCell::new(MapAttrCache::new());
+}
+
+/// interp_gc.py:14-17 — clear `space.fromcache(MapAttrCache)` before an
+/// explicit full collection so cached map nodes do not retain stale entries.
+#[majit_macros::dont_look_inside]
+pub fn clear_map_attr_cache() {
+    MAP_ATTR_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// `objectmodel.compute_hash(name)` for a (utf8-encoded) str (mapdict.py:94).
@@ -2472,7 +2523,9 @@ unsafe fn get_new_attr(
     // (mapdict.py:149-156). Map nodes are process-global in pyre, so keep the
     // lookup, holder construction, and insertion under one lock: parallel
     // interpreters must intern exactly one transition for a given key.
-    let mut cache = unsafe { (*self_node).cache_attrs() }.lock().unwrap();
+    let mut cache = unsafe { (*self_node).cache_attrs() }
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Some(&holder) = cache.get(&key) {
         return holder;
     }
@@ -2501,7 +2554,7 @@ unsafe fn find_branch_to_move_into(
     loop {
         let holder = unsafe { (*current).cache_attrs() }
             .lock()
-            .unwrap()
+            .unwrap_or_else(|error| error.into_inner())
             .get(&key)
             .copied();
         let reached_top = match holder {
@@ -2774,8 +2827,8 @@ thread_local! {
 thread_local! {
     /// objspace/std/mapdict.py:780-797 MapdictWeakrefSupport stores the
     /// lifeline in the "weakref" SPECIAL slot of the mapdict map. pyre
-    /// keeps a side table because there is no mapdict; semantically
-    /// this is the same per-instance lifeline storage.
+    /// uses that slot for `W_ObjectObject`; this table remains only for
+    /// weakrefable non-instance wrappers that have no mapdict carrier.
     pub static WEAKREF_TABLE: RefCell<HashMap<usize, PyObjectRef>> =
         RefCell::new(HashMap::new());
 
@@ -3458,7 +3511,11 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
 ///     return lifeline
 /// ```
 pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
-    WEAKREF_TABLE.with(|table| table.borrow().get(&(self_ref as usize)).copied())
+    if unsafe { pyre_object::is_instance(self_ref) } {
+        unsafe { instance_get_weakref_slot(self_ref) }
+    } else {
+        WEAKREF_TABLE.with(|table| table.borrow().get(&(self_ref as usize)).copied())
+    }
 }
 
 /// objspace/std/mapdict.py:789-793 MapdictWeakrefSupport.setweakref.
@@ -3470,11 +3527,16 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, weakreflifeline)
 /// ```
 pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
-    WEAKREF_TABLE.with(|table| {
-        table
-            .borrow_mut()
-            .insert(self_ref as usize, weakreflifeline);
-    });
+    if unsafe { pyre_object::is_instance(self_ref) } {
+        let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
+        debug_assert!(flag, "write to the weakref SPECIAL slot failed");
+    } else {
+        WEAKREF_TABLE.with(|table| {
+            table
+                .borrow_mut()
+                .insert(self_ref as usize, weakreflifeline);
+        });
+    }
 }
 
 /// objspace/std/mapdict.py:795-797 MapdictWeakrefSupport.delweakref.
@@ -3484,9 +3546,13 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, None)
 /// ```
 pub fn delweakref(self_ref: PyObjectRef) {
-    WEAKREF_TABLE.with(|table| {
-        table.borrow_mut().remove(&(self_ref as usize));
-    });
+    if unsafe { pyre_object::is_instance(self_ref) } {
+        unsafe { instance_del_weakref_slot(self_ref) };
+    } else {
+        WEAKREF_TABLE.with(|table| {
+            table.borrow_mut().remove(&(self_ref as usize));
+        });
+    }
 }
 
 #[cfg(test)]

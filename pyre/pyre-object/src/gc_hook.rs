@@ -246,7 +246,7 @@ pub fn clear_gc_collect_hook() {
 
 /// Trigger a full mark-sweep collection via the installed hook. No-op
 /// when no hook is installed.
-#[inline]
+#[majit_macros::dont_look_inside]
 pub fn try_gc_collect() {
     if let Some(f) = GC_COLLECT_HOOK.get() {
         f();
