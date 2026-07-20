@@ -28,7 +28,19 @@ crate::py_module! {
 def strptime(string, format="%a %b %d %H:%M:%S %Y"):
     import _strptime
     return _strptime._strptime_time(string, format)
-"# => ["strptime"],
+
+def get_clock_info(name):
+    # PyPy app_time.py:36-44.  `types.SimpleNamespace` is the concrete type of
+    # sys.implementation in pyre's stdlib bootstrap.
+    import sys, time
+    info = type(sys.implementation)()
+    info.implementation = ""
+    info.monotonic = False
+    info.adjustable = False
+    info.resolution = 1.0
+    time._get_time_info(name, info)
+    return info
+"# => ["strptime", "get_clock_info"],
     },
     functions: {
         "time"         / 0 = t::time,
@@ -40,6 +52,7 @@ def strptime(string, format="%a %b %d %H:%M:%S %Y"):
         "perf_counter_ns" / 0 = t::perf_counter_ns,
         "process_time" / 0 = t::process_time,
         "process_time_ns" / 0 = t::process_time_ns,
+        "_get_time_info" / 2 = t::get_time_info,
         "localtime"    / * = t::localtime,
         "gmtime"       / * = t::gmtime,
         "strftime"     / * = t::strftime,
