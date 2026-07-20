@@ -39,21 +39,20 @@ fn struct_overflow(msg: &str) -> crate::PyError {
 }
 
 /// Accept a str or bytes-like format spec (`interp_struct.py:38
-/// text_or_bytes_w`).  A lone surrogate is never a valid format character;
-/// read a str via WTF-8 and degrade through the codec's `backslashreplace`
-/// handler rather than panicking in `w_str_get_value`.
+/// text_or_bytes_w`).  CPython's `_struct` boundary encodes text formats as
+/// strict ASCII, so non-ASCII text (including lone surrogates) raises
+/// `UnicodeEncodeError`; bytes are preserved byte-for-byte and rejected later
+/// as `struct.error` when they are not format codes.
 fn format_to_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         if is_str(obj) {
-            let w = w_str_get_wtf8(obj).to_wtf8_buf();
-            if let Ok(s) = w.as_str() {
-                return Ok(s.to_string());
-            }
-            let s_obj = w_str_from_wtf8(w);
-            let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")?;
-            Ok(String::from_utf8(bytes).unwrap_or_default())
+            let bytes = crate::type_methods::encode_object(obj, "ascii", "strict")?;
+            Ok(String::from_utf8(bytes).expect("ASCII encoding is valid UTF-8"))
         } else if bytesobject::is_bytes_like(obj) {
-            Ok(String::from_utf8_lossy(bytesobject::bytes_like_data(obj)).into_owned())
+            Ok(bytesobject::bytes_like_data(obj)
+                .iter()
+                .map(|byte| char::from(*byte))
+                .collect())
         } else {
             Err(crate::PyError::type_error(
                 "Struct() argument 1 must be str or bytes, not object",
