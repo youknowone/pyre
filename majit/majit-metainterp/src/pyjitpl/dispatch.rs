@@ -7220,7 +7220,32 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_pc);
-    machine.run_to_end(ctx, sym, runtime)
+    let action = machine.run_to_end(ctx, sym, runtime);
+    drop(machine);
+
+    // A fresh trace executes the portal JitCode forward against the real
+    // interpreter-owned heap.  If that walk aborts, its root frame still has
+    // the source interpreter pc in i0: dispatch advances i0 before executing
+    // the opcode arm.  Preserve that position before the temporary frame is
+    // dropped so the jit_merge_point single-pass handoff can resume after the
+    // committed prefix instead of replaying it from the trace header.
+    //
+    // This is the portal equivalent of blackhole.py:1799
+    // convert_and_run_from_pyjitpl(): resume from the current frame position,
+    // not from the trace-start snapshot.  CloseLoop and Finish already capture
+    // their own positions; only Abort needs this recovery handoff.
+    if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
+        if let Some(pc) = standalone.frames.frames[0]
+            .int_values
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|pc| usize::try_from(pc).ok())
+        {
+            ctx.walk_final_pc = Some(pc);
+        }
+    }
+    action
 }
 
 /// Enter a trace at a JitDriver merge point rather than the jitcode's entry.

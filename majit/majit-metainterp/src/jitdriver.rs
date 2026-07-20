@@ -1434,10 +1434,10 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds)`
-    /// snapshot captured at the last CloseLoop (set in `merge_point` before
-    /// `compile_loop` drains the ctx). The `__merge` wrapper reads this after
-    /// the walk to drive the merge-point state transfer. `None` outside
-    /// single-pass.
+    /// snapshot captured at a terminal trace transition. CloseLoop and Finish
+    /// publish it before draining the ctx; a fresh TraceAction::Abort publishes
+    /// the current portal pc so the `__merge` wrapper resumes after its
+    /// committed prefix. `None` outside single-pass.
     #[inline]
     pub fn take_single_pass_outcome(&mut self) -> Option<(usize, Vec<crate::Value>)> {
         self.meta.single_pass_outcome.take()
@@ -2540,7 +2540,7 @@ impl<S: JitState> JitDriver<S> {
             // (PyreMetaInterp::step_inline_frame pops the inline frame and
             // records the CALL_ASSEMBLER); it never reaches the jitdriver.
             // Defensive: treat an escaped instance as a plain Abort.
-            TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort => {
+            action @ (TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort) => {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }
@@ -2594,6 +2594,36 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or(AbortReason::Generic)
                         .as_int(),
                 };
+                // pyjitpl.py:2949-2956
+                // run_blackhole_interp_to_cancel_tracing: a fresh trace has
+                // executed its portal body forward with real residual heap
+                // effects.  Before dropping that live frame, publish its
+                // current source pc and scalar state for the single-pass
+                // jit_merge_point hook.  The hook restores those scalars,
+                // runs `recover_after_compiled_run`, and continues the native
+                // interpreter from this pc rather than replaying the committed
+                // trace prefix.
+                //
+                // Bridge/compiled guard-failure recovery owns a separate
+                // blackhole resume path below `back_edge_internal`; do not
+                // feed that path through this fresh-trace handoff.
+                if matches!(action, TraceAction::Abort) && self.meta.bridge_info().is_none() {
+                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                    if let Some(pc) = pc {
+                        self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                        if let Some(sym) = self.sym.as_ref() {
+                            let scalars = S::collect_scalar_state_field_values(sym);
+                            self.meta.single_pass_scalar_values = Some(scalars);
+                        }
+                        let virt_elems = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                        if let Some(elems) = virt_elems {
+                            self.meta.single_pass_virt_array_values = Some(elems);
+                        }
+                    }
+                }
                 self.meta.abort_trace_live(false);
                 self.meta.aborted_tracing(reason_int);
                 self.sym = None;
