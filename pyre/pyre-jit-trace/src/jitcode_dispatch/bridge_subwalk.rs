@@ -202,8 +202,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     let exc_edge_precondition = exc_edge_bridge_enabled()
         && trace_ctx.is_bridge_trace
         && trace_ctx.bridge_source_is_exception_guard()
-        && !sym.last_exc_box.is_none()
-        && !sym.last_exc_value.is_null();
+        && !sym.last_exc_box().is_none()
+        && !sym.last_exc_value().is_null();
     let exc_edge_catch_target = if exc_edge_precondition {
         find_catch_before_resume_live(jitcode_code, position)
             // Only route when the handler rejoins this frame's loop; a handler
@@ -221,7 +221,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // exactly as when the flag is off.
         return Err(DispatchError::ExcEdgeCrossFrameReturnUnsupported { pc: position });
     }
-    let exc_edge_concrete = sym.last_exc_value;
+    let exc_edge_concrete = sym.last_exc_value();
     // typeptr at offset 0 (`_store_exception` invariant): the expected class the
     // bridge-entry GUARD_EXCEPTION checks the restored pending exception against.
     let exc_edge_class = if exc_edge_catch_target.is_some() && !exc_edge_concrete.is_null() {

@@ -152,6 +152,43 @@ pub fn decode_instruction_at(code: &CodeObject, pc: usize) -> Option<(Instructio
     Some(arg_state.get(code_unit))
 }
 
+/// Whether `code` contains a `FOR_ITER` opcode — i.e. it is loop-bearing
+/// through a `for` loop.  Used to gate the nested-inline decline: a residual
+/// reached inside a loop-bearing inline callee risks the FOR_ITER-exempt
+/// double-advance on a refused Option-C delivery.
+pub fn code_has_for_iter(code: &CodeObject) -> bool {
+    let mut arg_state = OpArgState::default();
+    for unit in code.instructions.iter().copied() {
+        let (instruction, _) = arg_state.get(unit);
+        if matches!(instruction, Instruction::ForIter { .. }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `code` is directly self-recursive: it references its own name via
+/// `LOAD_GLOBAL <own name>`, the shape a module-level function calling itself
+/// compiles to.  A hot self-recursion forms a `CALL_ASSEMBLER` bridge, which
+/// the nested-inline decline refuses (its moving-nursery callee frame cannot
+/// survive the residual trampoline).  Misses indirect/closure recursion (a
+/// conservative false-negative), never a false positive beyond a function that
+/// names itself without calling (which only over-declines, still correct).
+pub fn code_is_self_recursive(code: &CodeObject) -> bool {
+    let own_name = code.obj_name.as_str();
+    let mut arg_state = OpArgState::default();
+    for unit in code.instructions.iter().copied() {
+        let (instruction, op_arg) = arg_state.get(unit);
+        if let Instruction::LoadGlobal { namei } = instruction {
+            let name_idx = (namei.get(op_arg) as usize) >> 1;
+            if code.names.get(name_idx).map(|n| n.as_ref()) == Some(own_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// pypy/interpreter/pyopcode.py:187-193 dispatch_bytecode parity.
 ///
 /// Returns the semantic opcode to execute for a dispatch step starting at

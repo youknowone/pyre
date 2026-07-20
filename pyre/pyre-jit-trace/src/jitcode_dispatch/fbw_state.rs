@@ -1181,6 +1181,54 @@ thread_local! {
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether the active inline sub-walk is one of the hazard classes the blanket
+/// nested-residual decline was masking, as opposed to a straight-line mutating
+/// callee (the #73 depth-≥2 payoff, which inlines).  Two classes decline:
+///
+/// * **Loop-bearing** — a framestack callee whose `CodeObject` has a
+///   `FOR_ITER`.  Its side-effecting `for` consume runs concretely in the
+///   sub-walk, and a later kept-stack guard abort can REFUSE the Option-C item
+///   delivery (a `for..break` frame parked past the loop header,
+///   eval.rs:5445), so the re-run re-executes the consume and double-advances
+///   the iterator (the two `foriter_exempt_*` witnesses).
+/// * **Self-recursive** — the callee calls itself.  A hot self-recursion
+///   forms a `CALL_ASSEMBLER` bridge whose moving-nursery callee frame cannot
+///   survive the residual trampoline retaining a pre-call frame pointer; on
+///   the wasm always-portal path the inlined body also type-confuses the
+///   optimizer (`setintbound: got Ref`, the `wasm_ca_trampoline_decline`
+///   witness).  Detected both dynamically (the same `w_code` already nested in
+///   the framestack — mutual/deep recursion) and statically
+///   (`code_is_self_recursive`), since the recursive call residualizes to a
+///   `CALL_ASSEMBLER` rather than nesting the framestack, so it is already a
+///   hazard at inline depth 1.
+///
+/// The `w_code` field is the `jitcode_for` code key, resolved to the raw
+/// `CodeObject` via the jitcode index (the `current`-frame pattern,
+/// mod.rs:4664).
+fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    let session = ctx.session.borrow();
+    let mut seen: Vec<usize> = Vec::with_capacity(session.framestack.len());
+    for frame in session.framestack.iter() {
+        if seen.contains(&frame.w_code) {
+            return true;
+        }
+        seen.push(frame.w_code);
+        if let Some(idx) = crate::state::ensure_jitcode_index(frame.w_code as *const ()) {
+            if let Some(raw_code) = crate::state::raw_code_for_jitcode_index(idx) {
+                let code = unsafe { raw_code.as_ref() };
+                if let Some(code) = code {
+                    if pyre_interpreter::code_has_for_iter(code)
+                        || pyre_interpreter::code_is_self_recursive(code)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -1198,10 +1246,24 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
     let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
     let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
+    // Narrowed decline (#73 Slice-1 payoff): the general depth-≥2 nested
+    // residual inline is sound now that the portal-runner ABI is correct — a
+    // straight-line mutating callee inlines bit-exact.  Only two callee shapes
+    // still miscompile, both masked by the old blanket decline and captured by
+    // [`fbw_inline_callee_hazardous`]: a LOOP-BEARING callee (the FOR_ITER
+    // Option-C refused-delivery double-advance, the `foriter_exempt_*`
+    // witnesses) and a SELF-RECURSIVE callee (the hot `CALL_ASSEMBLER`
+    // recursion-bridge / wasm always-portal `setintbound` type-confusion, the
+    // `wasm_ca_trampoline_decline` witness).  Both are properties of the
+    // framestack knowable at the residual decline point, so the whole trace
+    // aborts before the hazardous body is committed.  Every other nested
+    // residual inlines.  The hazard scan is last so the cheap flag checks
+    // short-circuit it.
     if enabled
         && !in_selfrec_fold
         && !in_exception_string_inline
         && !ctx.session.borrow().framestack.is_empty()
+        && fbw_inline_callee_hazardous(ctx)
     {
         let (outer_resume, stack_overrides) = {
             let session = ctx.session.borrow();
