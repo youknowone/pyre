@@ -1437,6 +1437,16 @@ impl JitCodeBuilder {
     /// emits `GUARD_GC_TYPE` against a raw pointer that has no GC header.
     /// Deduped structurally by `add_bh_descr`.
     pub fn add_raw_int_array_descr(&mut self, item_size: usize) -> u16 {
+        self.add_raw_int_array_descr_signed(item_size, false)
+    }
+
+    /// Add a descriptor for a raw native integer array, selecting sign- vs
+    /// zero-extension for sub-word `raw_load_i` results.
+    pub fn add_raw_int_array_descr_signed(
+        &mut self,
+        item_size: usize,
+        is_item_signed: bool,
+    ) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: 0,
             itemsize: item_size,
@@ -1445,7 +1455,7 @@ impl JitCodeBuilder {
             item_type: majit_ir::value::Type::Int,
             is_array_of_pointers: false,
             is_array_of_structs: false,
-            is_item_signed: false,
+            is_item_signed,
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),

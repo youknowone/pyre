@@ -225,7 +225,7 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_tag_small_call(call) {
                     return Some(binding);
                 }
-                // Raw native-memory load intrinsic `majit_raw_load_i64(base, ea)`
+                // Raw native-memory load intrinsic `majit_raw_load_iXX(base, ea)`
                 // → raw_load_i (jtransform.py:1165-1171 rewrite_op_raw_load).
                 if let Some(binding) = self.lower_raw_load_call(call) {
                     return Some(binding);
@@ -244,17 +244,24 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Lower a raw native-memory load intrinsic
-    /// `majit_raw_load_i64(base, ea)` to a `raw_load_i` op (the read-side
-    /// analogue of `lower_raw_store_stmt`).  RPython parity:
+    /// `majit_raw_load_{i,u}{8,16,32,64}(base, ea)` to a `raw_load_i` op (the
+    /// read-side analogue of `lower_raw_store_stmt`).  RPython parity:
     /// `jtransform.py:1165-1171 rewrite_op_raw_load` lowers a
     /// `rffi.raw_storage_getitem` to `raw_load_i(base, offset,
     /// arraydescrof(CArray(T)))`.  Both operands are int-kind (raw address,
     /// byte offset); the op writes an int result.
     fn lower_raw_load_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let segments = canonical_expr_segments(&call.func)?;
-        if segments.last().map(String::as_str) != Some("majit_raw_load_i64") {
-            return None;
-        }
+        let (item_size, is_signed) = match segments.last()?.as_str() {
+            "majit_raw_load_i8" => (1usize, true),
+            "majit_raw_load_u8" => (1usize, false),
+            "majit_raw_load_i16" => (2usize, true),
+            "majit_raw_load_u16" => (2usize, false),
+            "majit_raw_load_i32" => (4usize, true),
+            "majit_raw_load_u32" => (4usize, false),
+            "majit_raw_load_i64" => (8usize, true),
+            _ => return None,
+        };
         if call.args.len() != 2 {
             return None;
         }
@@ -269,7 +276,7 @@ impl<'c> Lowerer<'c> {
                 vec![Register::int(dst)],
             ),
             quote! {
-                let __raw_descr = __builder.add_raw_int_array_descr(8);
+                let __raw_descr = __builder.add_raw_int_array_descr_signed(#item_size, #is_signed);
                 __builder.raw_load_i(
                     #dst as u16,
                     #base_reg as u16,
@@ -2056,6 +2063,43 @@ mod tests {
             .collect::<String>();
         assert!(emitted.contains("raw_store_i"));
         assert!(emitted.contains("add_raw_int_array_descr"));
+    }
+
+    #[test]
+    fn raw_load_intrinsics_lower_with_width_and_sign() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("base".to_string(), binding(3, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("ea".to_string(), binding(4, BindingKind::Int));
+        let expr: Expr = syn::parse_str("majit_raw_load_i32(base, ea)").expect("parse raw load");
+
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("raw load should lower");
+
+        assert_eq!(result.kind, BindingKind::Int);
+        let kinds: Vec<_> = lowerer.op_metadata.iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, vec![OpKind::RawLoad]);
+        assert_eq!(
+            lowerer.op_metadata[0].reads,
+            vec![Register::int(3), Register::int(4)]
+        );
+        assert_eq!(
+            lowerer.op_metadata[0].writes,
+            vec![Register::int(result.reg)]
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("raw_load_i"));
+        assert!(emitted.contains("add_raw_int_array_descr_signed"));
+        assert!(emitted.contains("4usize"));
+        assert!(emitted.contains("true"));
     }
 
     #[test]

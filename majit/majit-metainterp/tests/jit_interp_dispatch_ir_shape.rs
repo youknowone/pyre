@@ -10,7 +10,7 @@ use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
     BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE, BC_STORE_STATE_FIELD,
 };
-use majit_metainterp::{Assembler, JitCode, JitDriver, BC_GOTO};
+use majit_metainterp::{Assembler, BC_GOTO, JitCode, JitDriver};
 
 struct DispatchTestState {
     a: i64,
@@ -225,7 +225,7 @@ mod literal_for_unroll {
 mod or_pattern {
     use super::{Bytecode, OP_INC_A, OP_NOP};
     use majit_metainterp::jitcode::insns::BC_INLINE_CALL;
-    use majit_metainterp::{Assembler, JitDriver, BC_GOTO};
+    use majit_metainterp::{Assembler, BC_GOTO, JitDriver};
 
     struct OrDispatchState {
         a: i64,
@@ -1056,8 +1056,8 @@ mod oparg_minimal {
     ///      arm boundaries.
     #[test]
     fn dispatch_oparg_minimal_pins_loop_header_jdindex() {
-        use majit_metainterp::jitcode::insns::BC_LOOP_HEADER;
         use majit_metainterp::BC_GOTO;
+        use majit_metainterp::jitcode::insns::BC_LOOP_HEADER;
 
         let dispatch_jc = build_oparg_minimal();
         let dispatch_code = &dispatch_jc.code;
