@@ -113,7 +113,13 @@ fn maxlen_obj(self_obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-// PyPy `W_DequeIter`: the iterator owns the deque, current position, number
+// The two deque iterators are `.allocate()`-immortal `#[pyre_class]` wrappers
+// holding a traced `deque` edge the marker never scans; re-export so `build_gc`
+// can register their offsets with the immortal-root walker.
+pub use deque_iter::W_DequeIter;
+pub use deque_rev_iter::W_DequeRevIter;
+
+// `W_DequeIter`: the iterator owns the deque, current position, number
 // of remaining entries, and a snapshot of the deque mutation lock.
 mod deque_iter {
     use super::{W_Deque, checklock, data, getlock};

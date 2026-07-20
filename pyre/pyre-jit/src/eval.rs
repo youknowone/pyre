@@ -1855,6 +1855,10 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         <pyre_interpreter::module::r#struct::unpack_iter::W_UnpackIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::_collections::W_DequeIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::_collections::W_DequeRevIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     ] {
         pyre_object::gc_hook::register_pyre_class_offsets(
             descr.pytype_ptr as usize,
