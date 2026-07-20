@@ -58,6 +58,9 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     a: OpRef,
     b: OpRef,
 ) -> OpRef {
+    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
+    // `_all_constants` / `b1 is b2` (`pyjitpl.py:2648-2661`, `:547-550`);
+    // the recorded compare and downstream guard are optimizer-folded/strengthened.
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -244,6 +247,9 @@ pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
     a: OpRef,
     b: OpRef,
 ) -> OpRef {
+    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
+    // `_all_constants` / `b1 is b2` (`pyjitpl.py:2648-2661`, `:547-550`);
+    // the recorded compare and downstream guard are optimizer-folded/strengthened.
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -318,7 +324,8 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `ref_guard_value/r` handler (operand layout `r`: 1B r-src, no dst).
+/// `int_guard_value/i`, `ref_guard_value/r`, and `float_guard_value/f`
+/// handler (operand layout is one 1B bank-specific source, no dst).
 ///
 /// RPython parity: `pyjitpl.py:1494-1496 _opimpl_guard_value` →
 /// `pyjitpl.py:1916-1927 implement_guard_value`:
@@ -335,49 +342,89 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
 ///         return promoted_box
 /// ```
 ///
+/// All three banks share this body exactly as `pyjitpl.py:1513-1515`
+/// aliases `_opimpl_guard_value` to the Int, Ref, and Float opimpl names.
+///
 /// Walker behaviour:
-///   * Read 1B Ref operand and its concrete shadow.
+///   * Read the 1B bank-specific operand and its concrete value.
 ///   * If the symbolic OpRef is already a Const, skip (Const arm of
 ///     `implement_guard_value`).
-///   * If the concrete shadow is `ConcreteValue::Null`, skip — the
-///     walker doesn't have a runtime value to mint the expected
-///     constant from.  This is the strictest mode (sibling
+///   * If the concrete value is null or has the wrong bank variant,
+///     skip — the walker doesn't have a runtime value to mint the
+///     expected constant from.  This is the strictest mode (sibling
 ///     `dispatch_switch_id` line 1207 falls into the same skip-guard
 ///     branch when `valuebox.is_constant()`).
-///   * Otherwise mint `ConstPtr(concrete_ptr)` (executor.py:544-551
-///     `constant_from_op` for a Ref-typed Box), emit `GuardValue`
-///     with `[value, expected_ref]`, and call `replace_box(value,
-///     expected_ref)` (pyjitpl.py:1923).  Also rewrite every
-///     `registers_r` slot still pointing at `value` to `expected_ref`,
+///   * Otherwise mint the bank-specific constant (executor.py:544-551
+///     `constant_from_op`), emit `GuardValue` with `[value, expected]`,
+///     and call `replace_box(value, expected)` (pyjitpl.py:1923).  Also
+///     rewrite every slot in the selected register bank still pointing
+///     at `value` to `expected`,
 ///     matching `dispatch_switch_id:1198-1202`.
 ///
-/// TODO: guards record with empty resume data
-/// (`record_guard(..., 0)`) — same caveat as `dispatch_switch_id`
-/// (no MIFrame liveness / framestack in the standalone walker).
-pub(crate) fn ref_guard_value_record<Sym: WalkSym>(
+/// The `0` in `record_guard(..., 0)` is only `record_guard`'s `num_live`
+/// argument; a full production resume snapshot is attached on the next line
+/// via `walker_capture_snapshot_for_last_guard`.
+#[derive(Clone, Copy)]
+pub(crate) enum GuardValueBank {
+    Int,
+    Ref,
+    Float,
+}
+
+pub(crate) fn guard_value_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
+    bank: GuardValueBank,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let value = read_ref_reg(code, op, 0, ctx)?;
+    let value = match bank {
+        GuardValueBank::Int => read_int_reg(code, op, 0, ctx)?,
+        GuardValueBank::Ref => read_ref_reg(code, op, 0, ctx)?,
+        GuardValueBank::Float => read_float_reg(code, op, 0, ctx)?,
+    };
     if value.is_constant() {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    let concrete = read_ref_reg_concrete(code, op, 0, ctx);
-    let ConcreteValue::Ref(ptr) = concrete else {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+    let concrete = match bank {
+        GuardValueBank::Int => read_int_reg_concrete(code, op, 0, ctx),
+        GuardValueBank::Ref => read_ref_reg_concrete(code, op, 0, ctx),
+        GuardValueBank::Float => read_float_reg_concrete(code, op, 0, ctx),
     };
-    if ptr.is_null() {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    let expected = ctx.trace_ctx.const_ref(ptr as usize as i64);
+    let expected = match (bank, concrete) {
+        (GuardValueBank::Int, ConcreteValue::Int(v)) => ctx.trace_ctx.const_int(v),
+        (GuardValueBank::Ref, ConcreteValue::Ref(ptr)) if !ptr.is_null() => {
+            ctx.trace_ctx.const_ref(ptr as usize as i64)
+        }
+        (GuardValueBank::Float, ConcreteValue::Float(f)) => {
+            ctx.trace_ctx.const_float(f.to_bits() as i64)
+        }
+        _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
+    };
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[value, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     ctx.trace_ctx.replace_box(value, expected);
-    for slot in ctx.registers_r.iter_mut() {
-        if *slot == value {
-            *slot = expected;
+    match bank {
+        GuardValueBank::Int => {
+            for slot in ctx.registers_i.iter_mut() {
+                if *slot == value {
+                    *slot = expected;
+                }
+            }
+        }
+        GuardValueBank::Ref => {
+            for slot in ctx.registers_r.iter_mut() {
+                if *slot == value {
+                    *slot = expected;
+                }
+            }
+        }
+        GuardValueBank::Float => {
+            for slot in ctx.registers_f.iter_mut() {
+                if *slot == value {
+                    *slot = expected;
+                }
+            }
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -419,6 +466,9 @@ pub(crate) fn record_float_cmp<Sym: WalkSym>(
     a: OpRef,
     b: OpRef,
 ) -> OpRef {
+    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
+    // `_all_constants` / `b1 is b2` (`pyjitpl.py:2648-2661`, `:547-550`);
+    // the recorded compare and downstream guard are optimizer-folded/strengthened.
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))

@@ -2369,6 +2369,27 @@ fn read_int_reg_concrete<Sym: WalkSym>(
         .unwrap_or(ConcreteValue::Null)
 }
 
+/// Float-bank twin of [`read_int_reg_concrete`]. Reads the Float-bank slot at
+/// the operand index and resolves its concrete value from the OpRef's value
+/// carrier. Returns `ConcreteValue::Null` when the register is out of range or
+/// has no concrete Float value.
+pub(crate) fn read_float_reg_concrete<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> ConcreteValue {
+    let byte_pc = op.pc + 1 + operand_offset;
+    let reg = code[byte_pc] as usize;
+    ctx.registers_f
+        .get(reg)
+        .and_then(|&value| ctx.trace_ctx.concrete_of_opref(value))
+        .map_or(ConcreteValue::Null, |value| match value {
+            Value::Float(v) => ConcreteValue::Float(v),
+            _ => ConcreteValue::Null,
+        })
+}
+
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
@@ -2571,14 +2592,10 @@ fn read_float_var_list<Sym: WalkSym>(
 /// * on miss, emit `INT_EQ(valuebox, ConstInt(key))` plus `GUARD_FALSE`
 ///   for every `switchdict.const_keys_in_order`, then fall through
 ///
-/// TODO: guards below record with empty resume data
-/// (`record_guard(..., 0)`).  RPython `pyjitpl.py:600 opimpl_switch`
-/// pairs every `GUARD_VALUE` / `GUARD_FALSE` with `generate_guard(...,
-/// resumepc=orgpc) → capture_resumedata(orgpc)` walking the framestack
-/// with liveness.  The standalone walker has no MIFrame liveness /
-/// framestack infrastructure, so attaching a snapshot here would
-/// approximate it (wrong layout, all-typed-registers vs liveness-
-/// filtered) and downstream layout matching consumes it as truth.
+/// Each `GUARD_VALUE` / `GUARD_FALSE` attaches a production resume snapshot
+/// via `walker_capture_snapshot_for_last_guard`, mirroring `pyjitpl.py:600
+/// opimpl_switch`'s `generate_guard(..., resumepc=orgpc) →
+/// capture_resumedata(orgpc)`.
 fn dispatch_switch_id<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -7357,7 +7374,9 @@ fn handle<Sym: WalkSym>(
         // exec-generated unary family.
         "ptr_nonzero/r>i" => ptr_nullity_record(code, op, ctx, true),
         "ptr_iszero/r>i" => ptr_nullity_record(code, op, ctx, false),
-        "ref_guard_value/r" => ref_guard_value_record(code, op, ctx),
+        "int_guard_value/i" => guard_value_record(code, op, ctx, GuardValueBank::Int),
+        "ref_guard_value/r" => guard_value_record(code, op, ctx, GuardValueBank::Ref),
+        "float_guard_value/f" => guard_value_record(code, op, ctx, GuardValueBank::Float),
         "abort/>r" => {
             // pyre-only result marker: `Assembler::encode_op`'s default
             // branch emits this when an untranslatable op's result is

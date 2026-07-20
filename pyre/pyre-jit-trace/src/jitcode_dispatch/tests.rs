@@ -5248,6 +5248,97 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     );
 }
 
+/// `int_guard_value/i` records `GuardValue(value, ConstInt(concrete))`
+/// through the same bank-parameterized body as the Ref and Float variants.
+#[test]
+fn int_guard_value_records_guardvalue_with_concrete_constant() {
+    let opname = "int_guard_value/i";
+    let byte = *insns_opname_to_byte()
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+    // Operand encoding `i`: 1B i-src only.
+    let code = [byte, 0];
+    let mut tc = fresh_trace_ctx();
+    let descr = done_descr_ref_for_tests();
+    // Symbolic side: a recorded op OpRef (not a Const).
+    let value_opref = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [OpRef::None];
+    let mut regs_i = [value_opref];
+    let mut concrete_i = [ConcreteValue::Int(42)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: Default::default(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        is_full_body_walk: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: descr.clone(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+    wc.outer_resume_marker_jit_pc = Some(0);
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).expect("int_guard_value must record GuardValue");
+    assert!(matches!(outcome, DispatchOutcome::Continue));
+    assert_eq!(next_pc, 2);
+    assert_eq!(
+        wc.trace_ctx.num_ops(),
+        ops_before + 1,
+        "int_guard_value must record exactly one GuardValue op",
+    );
+    let (last_opcode, last_args0, last_args1, last_args_len) = {
+        let ops = wc.trace_ctx.ops();
+        let last = ops.last().expect("int_guard_value must record one op");
+        let args = last.getarglist();
+        (last.opcode, args[0].clone(), args[1].clone(), args.len())
+    };
+    assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
+    assert_eq!(last_args_len, 2);
+    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(wc.trace_ctx.const_value(last_args1.to_opref()), Some(42));
+    assert_eq!(
+        wc.trace_ctx.const_type(last_args1.to_opref()),
+        Some(Type::Int)
+    );
+    assert_eq!(
+        wc.registers_i[0],
+        last_args1.to_opref(),
+        "register slot still holding the original OpRef must be rewritten \
+         to the promoted constant (pyjitpl.py:1923 replace_box)",
+    );
+}
+
 /// Symbolic OpRef already a Const → `ref_guard_value/r` is a no-op
 /// (`pyjitpl.py:1920-1921 if isinstance(box, Const): return box`).
 #[test]
