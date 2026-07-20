@@ -15004,7 +15004,13 @@ fn init_object_type(ns: PyObjectRef) {
                 "__eq__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    Ok(pyre_object::w_bool_from(std::ptr::eq(args[0], args[1])))
+                    if std::ptr::eq(args[0], args[1]) {
+                        Ok(pyre_object::w_bool_from(true))
+                    } else {
+                        // objectobject.py descr__eq__: give the reflected
+                        // comparison a chance instead of deciding False here.
+                        Ok(pyre_object::w_not_implemented())
+                    }
                 },
                 2,
             ),
@@ -15022,11 +15028,25 @@ fn init_object_type(ns: PyObjectRef) {
                 "__ne__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    let eq = crate::baseobjspace::compare(
-                        args[0],
-                        args[1],
-                        crate::baseobjspace::CompareOp::Eq,
-                    )?;
+                    // objectobject.py descr__ne__: look up and call the live
+                    // receiver's __eq__ descriptor, then invert that one
+                    // result.  Running the full comparison dispatcher here
+                    // would apply reflection and the identity fallback too
+                    // early.
+                    let eq_descr = unsafe {
+                        crate::baseobjspace::lookup(args[0], "__eq__")
+                            .expect("every object type inherits object.__eq__")
+                    };
+                    let w_type =
+                        crate::typedef::r#type(args[0]).expect("every Python object has a type");
+                    let eq = unsafe {
+                        crate::baseobjspace::get_and_call_function(
+                            eq_descr,
+                            args[0],
+                            w_type,
+                            &[args[1]],
+                        )?
+                    };
                     // A `NotImplemented` from `__eq__` must pass through so the
                     // caller can try the reflected comparison.
                     if unsafe { pyre_object::is_not_implemented(eq) } {
@@ -15046,7 +15066,14 @@ fn init_object_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_not_implemented()), 2),
+                make_builtin_function_with_arity(
+                    name,
+                    |args| {
+                        crate::type_methods::arity_slot(args, 1)?;
+                        Ok(pyre_object::w_not_implemented())
+                    },
+                    2,
+                ),
             )
         };
     }
@@ -15086,8 +15113,11 @@ fn init_object_type(ns: PyObjectRef) {
                 "__repr__",
                 |args| {
                     if args.is_empty() {
-                        return Ok(pyre_object::w_str_new("<object>"));
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__repr__' of 'object' object needs an argument",
+                        ));
                     }
+                    crate::type_methods::arity_no_args(args, "object.__repr__")?;
                     let obj = args[0];
                     unsafe {
                         if pyre_object::is_instance(obj) {
@@ -15113,8 +15143,11 @@ fn init_object_type(ns: PyObjectRef) {
                 "__str__",
                 |args| {
                     if args.is_empty() {
-                        return Ok(pyre_object::w_str_new("<object>"));
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__str__' of 'object' object needs an argument",
+                        ));
                     }
+                    crate::type_methods::arity_no_args(args, "object.__str__")?;
                     // Delegate to __repr__ to avoid infinite recursion
                     // PyPy: objectobject.py descr___str__ → space.repr(w_self)
                     Ok(pyre_object::w_str_new(&unsafe { crate::py_repr(args[0])? }))
@@ -15132,23 +15165,22 @@ fn init_object_type(ns: PyObjectRef) {
                 "__format__",
                 |args| {
                     if args.is_empty() {
-                        return Ok(pyre_object::w_str_new(""));
+                        return Err(crate::PyError::type_error(
+                            "unbound method object.__format__() needs an argument",
+                        ));
                     }
-                    if args.len() > 1 {
-                        // object.__format__(self, format_spec): the spec must be
-                        // a `str` (a `bytes` spec is rejected like any other
-                        // non-`str`); a non-empty one is unsupported, an empty
-                        // one falls through to `str(self)`.
-                        let spec = crate::type_methods::read_format_spec(
-                            args[1],
-                            "__format__() argument",
-                        )?;
-                        if !spec.is_empty() {
-                            return Err(crate::PyError::type_error(format!(
-                                "unsupported format string passed to {}.__format__",
-                                crate::type_methods::arg_type_name(args[0])
-                            )));
-                        }
+                    crate::type_methods::arity_exact(args, "object.__format__", 1)?;
+                    // object.__format__(self, format_spec): the spec must be
+                    // a `str` (a `bytes` spec is rejected like any other
+                    // non-`str`); a non-empty one is unsupported, an empty
+                    // one falls through to `str(self)`.
+                    let spec =
+                        crate::type_methods::read_format_spec(args[1], "__format__() argument")?;
+                    if !spec.is_empty() {
+                        return Err(crate::PyError::type_error(format!(
+                            "unsupported format string passed to {}.__format__",
+                            crate::type_methods::arg_type_name(args[0])
+                        )));
                     }
                     Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }))
                 },
@@ -15163,7 +15195,15 @@ fn init_object_type(ns: PyObjectRef) {
             "__reduce__",
             make_builtin_function_with_arity(
                 "__reduce__",
-                |args| crate::reduce_protocol::descr_reduce(args[0]),
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "unbound method object.__reduce__() needs an argument",
+                        ));
+                    }
+                    crate::type_methods::arity_no_args(args, "object.__reduce__")?;
+                    crate::reduce_protocol::descr_reduce(args[0])
+                },
                 1,
             ),
         )
@@ -15175,6 +15215,12 @@ fn init_object_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__reduce_ex__",
                 |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "unbound method object.__reduce_ex__() needs an argument",
+                        ));
+                    }
+                    crate::type_methods::arity_exact(args, "object.__reduce_ex__", 1)?;
                     let proto = crate::builtins::space_index_w(args[1])?;
                     crate::reduce_protocol::descr_reduce_ex(args[0], proto)
                 },
@@ -15188,7 +15234,15 @@ fn init_object_type(ns: PyObjectRef) {
             "__getstate__",
             make_builtin_function_with_arity(
                 "__getstate__",
-                |args| crate::reduce_protocol::object_getstate_default(args[0]),
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "unbound method object.__getstate__() needs an argument",
+                        ));
+                    }
+                    crate::type_methods::arity_no_args(args, "object.__getstate__")?;
+                    crate::reduce_protocol::object_getstate_default(args[0])
+                },
                 1,
             ),
         )
@@ -15200,20 +15254,13 @@ fn init_object_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__dir__",
                 |args| {
-                    // `object.__dir__` is a no-extra-arg method: reject a
-                    // missing receiver and any surplus positional.
-                    let Some(&receiver) = args.first() else {
+                    if args.is_empty() {
                         return Err(crate::PyError::type_error(
-                            "unbound method object.__dir__() needs an argument".to_string(),
+                            "unbound method object.__dir__() needs an argument",
                         ));
-                    };
-                    if args.len() > 1 {
-                        return Err(crate::PyError::type_error(format!(
-                            "object.__dir__() takes no arguments ({} given)",
-                            args.len() - 1
-                        )));
                     }
-                    crate::builtins::object_dir_default(receiver)
+                    crate::type_methods::arity_no_args(args, "object.__dir__")?;
+                    crate::builtins::object_dir_default(args[0])
                 },
                 1,
             ),
@@ -15223,7 +15270,19 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__sizeof__",
-            make_builtin_function_with_arity("__sizeof__", object_descr_sizeof, 1),
+            make_builtin_function_with_arity(
+                "__sizeof__",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "unbound method object.__sizeof__() needs an argument",
+                        ));
+                    }
+                    crate::type_methods::arity_no_args(args, "object.__sizeof__")?;
+                    object_descr_sizeof(args)
+                },
+                1,
+            ),
         )
     };
     // typeobject.py descr___init_subclass__ — the default accepts no
