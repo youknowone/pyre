@@ -2381,6 +2381,11 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
 
+        // incminimark.py:2617-2631: pyre has explicit death deques but no
+        // collector-run execute_finalizers phase. Make recursive collections
+        // see SCANNING first, then fire the queue-notification triggers below.
+        self.gc_state = GcState::Scanning;
+
         // incminimark.py:2601-2615 — max heap size (PYPY_GC_MAX). If the capped
         // threshold was bounded by `max_heap_size` and the heap has already
         // reached it, signal out-of-memory. The first time, ask the triggering
@@ -2396,12 +2401,14 @@ impl MiniMarkGC {
             }
             self.max_heap_size_already_raised = true;
             self.oom_pending = true;
+            // incminimark.py:2614-2615: STATE_SCANNING (set above) then an
+            // immediate `raise MemoryError` exits `major_collection_step`
+            // before the finalizing phase. Return before the queue-notification
+            // triggers so none fire ahead of the `MemoryError` the pending NULL
+            // will raise.
+            return;
         }
 
-        // incminimark.py:2617-2631: pyre has explicit death deques but no
-        // collector-run execute_finalizers phase. Make recursive collections
-        // see SCANNING first, then fire the queue-notification triggers now.
-        self.gc_state = GcState::Scanning;
         self.execute_finalizer_triggers();
     }
 
