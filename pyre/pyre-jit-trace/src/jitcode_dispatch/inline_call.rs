@@ -628,6 +628,26 @@ pub(crate) fn try_walker_call_assembler_self_recursive(
             return Ok(None);
         }
     }
+    // Loopless self-call shape only: the operand stack below the call's own
+    // operands (`r_args = [callable, null_or_self, arg0..]`) must hold no
+    // loop-carried input arg.  A self-call inside a `for`/`while` body keeps
+    // the loop's InputArg operands (the `FOR_ITER` iterator, an accumulator
+    // reloaded for `+=`) on the caller stack under the call; the concrete
+    // CALL_ASSEMBLER fold cannot carry them across the assembler call, so the
+    // loop-back-edge guard resumes the loop-carried iterator as NULL and the
+    // blackhole faults on the next `FOR_ITER`.  The residual path keeps those
+    // operands live, so decline the loop-bearing shape to it.  The loopless
+    // `fib` shape keeps only within-iteration temps (a prior call result), no
+    // InputArg, and stays foldable.
+    if ctx.vstack_valid {
+        let kept_below = ctx.vstack_boxes.len().saturating_sub(r_args.len());
+        if ctx.vstack_boxes[..kept_below]
+            .iter()
+            .any(|slot| slot.is_input_arg())
+        {
+            return Ok(None);
+        }
+    }
     // The outer portal sym (the only materialized frame across sub-walks)
     // via the FBW thread-local — the same read mechanism
     // `walker_capture_snapshot_for_last_guard` uses.  Null outside a
