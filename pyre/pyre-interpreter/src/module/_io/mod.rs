@@ -49,10 +49,18 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("writelines() requires self"))?;
-    let lines = args
-        .get(1)
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("writelines() requires lines"))?;
+    // The registered arity is only a fast-dispatch hint, so surplus
+    // positionals still arrive here.  PyPy's interp2app gateway exposes one
+    // argument after the bound receiver and rejects the call before it can
+    // iterate or write anything.
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{}.writelines() takes exactly one argument ({} given)",
+            crate::type_methods::arg_type_name(self_obj),
+            args.len() - 1,
+        )));
+    }
+    let lines = args[1];
     if io_closed(self_obj) {
         return Err(crate::PyError::value_error("I/O operation on closed file."));
     }

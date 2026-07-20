@@ -110,3 +110,24 @@ textio = TextIOWrapper(raw, encoding="utf-8", write_through=True)
 raw.textio = textio
 with assert_raises(AttributeError):
     textio.writelines(["x"])
+
+
+# PyPy's interp2app signature rejects a wrong argument count before the
+# receiver can observe any writes.  The registered Rust arity is only a call
+# dispatch hint, so the implementation must retain the same gateway check.
+class WriteSink(RawIOBase):
+    def __init__(self):
+        self.items = []
+
+    def write(self, item):
+        self.items.append(item)
+
+
+sink = WriteSink()
+with assert_raises(TypeError):
+    sink.writelines()
+with assert_raises(TypeError):
+    sink.writelines([b"line"], "surplus")
+assert sink.items == []
+sink.writelines([b"first", b"second"])
+assert sink.items == [b"first", b"second"]
