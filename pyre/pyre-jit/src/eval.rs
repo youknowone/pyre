@@ -4343,7 +4343,7 @@ fn unpack_merge_point_jit(
     if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
         eprintln!("[jd1] counter fired for green_key={green_key}");
     }
-    drive_unpack_iterable_trace(green_key, w_iterator, items);
+    drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
 }
 
 /// Drive one jd1 trace of `_unpackiterable_unknown_length`. The tracer executes
@@ -4354,6 +4354,7 @@ fn unpack_merge_point_jit(
 /// entry are later activation slices.
 fn drive_unpack_iterable_trace(
     green_key: u64,
+    greenkey_raw: pyre_object::PyObjectRef,
     w_iterator: pyre_object::PyObjectRef,
     items: pyre_object::PyObjectRef,
 ) {
@@ -4380,6 +4381,22 @@ fn drive_unpack_iterable_trace(
     // runtime `JitCode` resolves its `d`/`j` argcodes through the shared global
     // pool installed above (`descr_at`).
     let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+
+    // Diagnostic: dump the extracted jd1 body's op layout (pc / opname /
+    // argcodes / raw operand bytes) so the merge-point register operands are
+    // visible for wiring the merge-point trace entry. Returns before any
+    // tracing state is established.
+    if std::env::var_os("PYRE_JD1_DUMP").is_some() {
+        for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
+            let end = op.next_pc.min(canonical.code.len());
+            let operands = &canonical.code[(op.pc + 1).min(end)..end];
+            eprintln!(
+                "[jd1dump] pc={} {} /{} operands={:?}",
+                op.pc, op.opname, op.argcodes, operands
+            );
+        }
+        return;
+    }
 
     let (driver, _) = driver_pair();
     let meta = driver.meta_interp_mut();
@@ -4423,21 +4440,24 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // reds='auto' as JitCode argboxes: seed the root frame's InputArg(0)/(1)
-    // registers with the concrete iterator/list pointers so each residual runs
-    // on the shared heap objects the caller loop holds.
-    let argboxes = [
+    // reds='auto' as the merge-point InputArgs: (w_iterator, items) in the
+    // order `collect_jump_args` returns, seeded onto the registers the
+    // `jit_merge_point` op names (decoded inside
+    // `trace_jitcode_from_merge_point`) so each residual runs on the shared
+    // heap objects the caller loop holds.
+    let red_refs = [
         (
-            majit_metainterp::JitArgKind::Ref,
             majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
             w_iterator as usize as i64,
         ),
         (
-            majit_metainterp::JitArgKind::Ref,
             majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
             items as usize as i64,
         ),
     ];
+    // baseobjspace.py:1012 green `greenkey` = `iterator_greenkey(w_iterator)`,
+    // a per-type singleton pointer — seeded as the merge-point green Const.
+    let green_ref = greenkey_raw as usize as i64;
 
     let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
         greenkey: pyre_object::PY_NULL,
@@ -4445,12 +4465,13 @@ fn drive_unpack_iterable_trace(
         items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
     };
 
-    // Drive through the production resolver runtime (the same closures jd0's
-    // live JitCodeMachine dispatch uses): `resolve_token` /
-    // `recursive_call_assembler_target` / inline-decision / concrete
-    // recursive-callee executors, so any CALL_ASSEMBLER or recursive-portal op
-    // the extracted body reaches resolves against the real compiled-loop /
-    // warmstate state instead of the null defaults on a bare `ClosureRuntime`.
+    // Enter the trace AT the merge point (pc `0x5c`), not the jitcode entry:
+    // the extracted body's prologue (`length_hint`/`newlist`/
+    // `iterator_greenkey`) takes `w_iterable`, which the merge-point hook does
+    // not carry, so replaying from pc 0 would run `length_hint` on the wrong
+    // red. Drive through the production resolver runtime (the same closures
+    // jd0's live dispatch uses) so any CALL_ASSEMBLER / recursive-portal op
+    // resolves against real compiled-loop / warmstate state.
     let drove = meta.with_trace_ctx_and_token_resolver(
         |ctx,
          resolve_token,
@@ -4470,13 +4491,14 @@ fn drive_unpack_iterable_trace(
                 recursive_exec_float,
                 recursive_exec_void,
             );
-            majit_metainterp::trace_jitcode_with_args_and_runtime(
+            majit_metainterp::trace_jitcode_from_merge_point(
                 ctx,
                 &mut sym,
                 &jitcode,
                 JD1_LOOP_HEADER_PC,
                 &runtime,
-                &argboxes,
+                green_ref,
+                &red_refs,
             );
         },
     );

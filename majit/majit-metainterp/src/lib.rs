@@ -146,8 +146,8 @@ pub use pyjitpl::{
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
     MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
     call_int_function, call_ref_function, call_void_function, counters,
-    struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    struct_field_write_effect_info, trace_jitcode, trace_jitcode_from_merge_point,
+    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::BridgeInlineCarrier;
@@ -232,6 +232,14 @@ pub fn tldbg_enabled() -> bool {
 pub fn heapdbg_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_HEAPDBG").is_some())
+}
+
+/// Per-op trace of `run_to_end`'s dispatch loop (frame depth, pc, raw opcode).
+/// Diagnostic for pinpointing the op that faults a hardware-signal crash
+/// (SIGBUS/SIGSEGV) which `catch_unwind` cannot capture.
+pub fn optrace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_OPTRACE").is_some())
 }
 
 pub fn diag_enabled() -> bool {

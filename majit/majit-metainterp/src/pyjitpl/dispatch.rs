@@ -1976,6 +1976,21 @@ where
                 sym.abort_portal_op();
                 return TraceAction::Abort;
             }
+            if crate::optrace_enabled() {
+                let fr = self.frames.current_mut();
+                let cur = fr.code_cursor;
+                let anchor_pc = fr.pc;
+                let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+                let name = fr.jitcode.name.clone();
+                eprintln!(
+                    "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+                    self.frames.len(),
+                    cur,
+                    anchor_pc,
+                    opcode,
+                    name
+                );
+            }
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
             let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7168,6 +7183,86 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_pc);
+    machine.run_to_end(ctx, sym, runtime)
+}
+
+/// Enter a trace at a JitDriver merge point rather than the jitcode's entry.
+///
+/// `trace_jitcode_with_args_and_runtime` starts the walk at pc 0 (setup_call
+/// resets it), so it replays the portal function's prologue. A `reds='auto'`
+/// driver whose portal carries a prologue — jd1's
+/// `_unpackiterable_unknown_length` builds `items` and computes `greenkey`
+/// before its loop — cannot re-run that prologue: the merge-point hook holds
+/// only the loop-carried reds (`w_iterator`, `items`), not the original
+/// prologue inputs (`w_iterable`). Replaying from pc 0 would call
+/// `length_hint(w_iterable)` on a red that is not `w_iterable`.
+///
+/// This entry seeds the reds/green directly into the registers the
+/// `jit_merge_point` op at `header_pc` names, then begins the walk AT
+/// `header_pc` so the recorded trace is exactly the loop body. The op payload
+/// (`blackhole.py:1066` `@arguments("i","I","R","F","I","R","F")`) lists the
+/// green {I,R,F} register slots then the red {I,R,F} slots, each as
+/// `[len:u8][reg:u8 * len]`. The green ref is seeded as a `Const`
+/// (verify_green_args); each red ref as its InputArg, paired positionally with
+/// the op's red-ref list (the `collect_jump_args` order). Reds are Ref-typed
+/// to match the `reds='auto'` pointer set; int/float reds are unimplemented
+/// (no such driver exists yet).
+pub fn trace_jitcode_from_merge_point<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    header_pc: usize,
+    runtime: &R,
+    green_ref: i64,
+    red_refs: &[(OpRef, i64)],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    let jitcode_arc = Arc::new(jitcode.clone());
+    // Decode the six register lists of the `jit_merge_point` op at
+    // `header_pc`: opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` per
+    // slot in (green I, green R, green F, red I, red R, red F) order.
+    let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+    {
+        let code = &jitcode_arc.code;
+        let mut cur = header_pc + 2;
+        for regs in slot_regs.iter_mut() {
+            let len = code[cur] as usize;
+            cur += 1;
+            for _ in 0..len {
+                regs.push(code[cur] as usize);
+                cur += 1;
+            }
+        }
+    }
+    let green_r = std::mem::take(&mut slot_regs[1]);
+    let red_r = std::mem::take(&mut slot_regs[4]);
+
+    let mut frame = MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
+    // The green ref must be a Const at trace time (verify_green_args).
+    if let Some(&greg) = green_r.first() {
+        let gconst = ctx.const_ref(green_ref);
+        frame.ref_regs[greg] = Some(gconst);
+        frame.ref_values[greg] = Some(green_ref);
+    }
+    // Each loop-carried red into the register the op names, paired
+    // positionally with the driver's `collect_jump_args` red order.
+    for (&reg, &(opref, value)) in red_r.iter().zip(red_refs.iter()) {
+        frame.ref_regs[reg] = Some(opref);
+        frame.ref_values[reg] = Some(value);
+    }
+    // The walker reads from `code_cursor`; `pc` is only the portal anchor.
+    // Start both at the merge point so the first executed op is the loop
+    // header itself.
+    frame.code_cursor = header_pc;
+    frame.pc = header_pc;
+
+    let mut standalone = StandaloneFrameStack::new();
+    standalone.frames.push(frame);
+    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
+    machine.set_outer_program_pc(header_pc);
     machine.run_to_end(ctx, sym, runtime)
 }
 
