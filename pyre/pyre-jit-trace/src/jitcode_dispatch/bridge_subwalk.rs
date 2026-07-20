@@ -179,8 +179,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     }
 
     // Seed last_exc_value_concrete from
-    // sym.last_exc_value (the live PyObjectRef written by trait-side
-    // `seed_raised_exception` at `trace_opcode.rs:6646`).  Null when
+    // sym.last_exc_value (the live PyObjectRef written by the retired
+    // trait-side raise path).  Null when
     // no active exception, matching `initial_last_exc_value == None`.
     let initial_last_exc_value_concrete = if sym.last_exc_value().is_null() {
         ConcreteValue::Null

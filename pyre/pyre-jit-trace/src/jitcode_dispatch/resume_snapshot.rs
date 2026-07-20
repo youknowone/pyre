@@ -170,7 +170,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // only resume point pyre's blackhole can re-enter.  The
     // framestack-collapse is a deliberate adaptation, not a parity
     // miss; the walker context carries the outer Python frame only.
-    // Inline-traced Python frames (`build_pending_inline_frame`) are
+    // Inline-traced Python frames from the retired inline-frame builder are
     // not reachable from this entry point because the production
     // walker allow-list does not yet enable opcodes that drive inline
     // tracing — when that expands, `WalkContext` must grow a parent-

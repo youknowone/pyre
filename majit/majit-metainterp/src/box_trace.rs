@@ -186,8 +186,8 @@ pub fn trace_int_binop_ovf(
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     // No production caller of this AST→trace helper: pyre-jit-trace
-    // routes overflow guards through `frame.generate_guard` in
-    // `generated_binary_int_value` instead.  The bare
+    // routes overflow guards through the retired int fast path's
+    // `frame.generate_guard` instead.  The bare
     // `record_guard_typed` keeps the guard shape correct in unit tests
     // (`trace_verify.rs`) without a synthetic snapshot — convergence
     // path is convergence to register-machine jitcode.

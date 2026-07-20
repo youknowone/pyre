@@ -2176,7 +2176,7 @@ impl TraceCtx {
     /// (pypy/interpreter/pyframe.py:84 `list[W_Object]`).  Pyre's codewriter
     /// does not yet mirror that boxing at STORE_FAST → vable (Phase 4-5 of
     /// the portal-locals lowering plan); until it does, non-Phase-D paths
-    /// like `pyre::trace_opcode::store_local_value` may write a pyre-unboxed
+    /// like the retired pyre trace-side local-store path may write a pyre-unboxed
     /// `Value::Int`/`Value::Float` into a Ref slot and a later
     /// `BC_GETARRAYITEM_VABLE_R` read will decode 0 via `value_as_ref_bits`.
     /// That null is a pyre-upstream parity gap, not a shadow bug — the

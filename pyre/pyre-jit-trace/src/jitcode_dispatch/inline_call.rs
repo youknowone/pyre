@@ -516,7 +516,7 @@ pub(crate) fn collect_callee_active_boxes(
 /// self-recursive (`callee code == portal code`) callee whose frame is
 /// `ncells == 0`, non-global-storing, and inline-buildable via
 /// [`crate::helpers::emit_new_pyframe_inline_self_recursive`]
-/// (Branch A of the trait's `emit_call_assembler_callee_frame`).  Any unmet
+/// (Branch A of the retired trait-side callee-frame path).  Any unmet
 /// precondition returns `Ok(None)` *before* recording any IR, so the call
 /// falls back to the proven (slow) residual path.  No callable-identity
 /// guard is emitted: matching the trait's self-recursive arm, the function
@@ -1366,8 +1366,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // register convention `registers_r[0..nparams] = positional args` —
     // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
     // inline calls and the trait path's `can_skip_traced_callee_frame`
-    // branch applies (`build_pending_inline_frame`:
-    // `sym.registers_r = args.to_vec()`).  This only holds for a callee
+    // branch applies (`sym.registers_r = args.to_vec()`).  This only holds for a callee
     // that reads its params straight from `r0`/`r1` (ref_copy +
     // residual_call args).  A callee that materializes a frame — any
     // `*_vable_*` op, emitted when a local must survive a sub-call —

@@ -342,11 +342,11 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
 
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
-/// `generated_binary_int_value`'s structure (`guard_class` +
-/// `getfield_gc_i` per operand, `int_OP_ovf` + `guard_no_overflow`,
-/// `wrapint`) walker-native rather than calling the trait
-/// `binary_int_value` (which would alias the reborrowed sym slices and
-/// emit `MIFrame`-style snapshots inconsistent with the walker model).
+/// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
+/// operand, `int_OP_ovf` + `guard_no_overflow`, `wrapint`) walker-native rather
+/// than calling back into the retired trait path (which would alias the
+/// reborrowed sym slices and emit `MIFrame`-style snapshots inconsistent with
+/// the walker model).
 ///
 /// The concrete boxed result is obtained from the same
 /// `execute_residual_call` path the generic leg uses, so
@@ -425,7 +425,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // intobject.py range validation (mirror generated_binary_int_value's
+    // intobject.py range validation (mirror the former int fast path's
     // needs_concrete_check): bail to the generic leg when the bare-IR-op
     // emission would be unsound (zero / INT_MIN-overflow divisor, oversized
     // / overflowing shift); large right-shift folds to a const.
@@ -1783,7 +1783,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
 /// (oopspec [`majit_ir::PyreHelperKind::NewtupleFromArray`]).  When both
 /// backing-array elements are concrete plain `W_IntObject`, re-emit the
-/// trait `trace_build_tuple_value` spec_ii shape walker-native
+/// former trait-side spec_ii shape walker-native
 /// (`new_with_vtable` + `w_class` / `value0` / `value1` `setfield_gc`),
 /// reading the elements straight out of the array heap-cache so the array
 /// build keeps no consumer and DCEs.  The partner
@@ -1841,7 +1841,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     // on `is_plain_int1` (rejects int subclasses + non-fitting longs) AND
     // an exact `&INT_TYPE` `ob_type` — that excludes the fits-in-word
     // `W_LongObject` arm `is_plain_int1` also accepts, which would need the
-    // long unbox the trait `trace_plain_int_payload` does (out of scope
+    // long unbox the retired trait-side payload helper did (out of scope
     // here).  Any other shape falls through to the residual (correct).
     if pyre_object::tagged_int::CAN_BE_TAGGED
         && (pyre_object::tagged_int::is_tagged_int(c0)
@@ -1871,7 +1871,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         )
     };
 
-    // --- emit the virtual spec_ii (walker-native trace_build_tuple_value) ---
+    // --- emit the virtual spec_ii walker-native ---
     // Paired `w_class` guard per element so a runtime int subclass sharing
     // `&INT_TYPE`'s payload side-exits, then the plain-int payload unbox.
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
@@ -2245,7 +2245,7 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
 /// #57 SLICE 3c: walker-native speculative float specialization for the
 /// `BINARY_OP` helper residual_call (oopspec `BinaryOp`), the float
 /// analogue of [`try_walker_specialize_binary_op_int`].  Re-derives
-/// `generated_binary_float_value`'s structure walker-native: per operand
+/// the former float fast path's structure walker-native: per operand
 /// either `guard_class FLOAT` + `getfield_gc_pure_f`, or (int operand)
 /// `guard_class INT` + `getfield_gc_i` + `cast_int_to_float`; then
 /// `float_OP` and `wrapfloat`.
@@ -2394,8 +2394,8 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
 
 /// #62: walker-native speculative specialization for the `BINARY_SUBSCR`
 /// helper residual_call (oopspec `BinaryOp`, op_tag `Subscr`).  Ports
-/// `generated_binary_subscr_value` → `generated_list_getitem_by_strategy`
-/// for the object-, int-, and float-storage list strategies with a
+/// the former subscription/list-strategy path for the object-, int-, and
+/// float-storage list strategies with a
 /// non-negative concrete index: `guard_class LIST` + `guard_value(strategy)`
 /// + unbox index + `IntLt` bounds guard, then the strategy-specific element
 /// load — `getarrayitem_gc_r` against the `Ptr(GcArray(OBJECTPTR))` items
@@ -3948,7 +3948,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     }
 
     // Mark the class known so the following `raise/r` skips its
-    // redundant GUARD_CLASS (mirrors `seed_raised_exception`'s
+    // redundant GUARD_CLASS (mirrors the retired raise path's
     // `heapcache.class_now_known`).  The vtable on the NewWithVtable
     // already pins the class for the optimizer; this keeps the heapcache
     // model in agreement.
@@ -4904,7 +4904,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
 /// #57 SLICE 3c (compare): walker-native speculative float specialization
 /// for the `COMPARE_OP` helper residual_call (oopspec `CompareOp`), the
 /// float analogue of [`try_walker_specialize_compare_op_int`] and the
-/// float-compare arm of `generated_compare_value_direct`.  Per operand
+/// former float-compare arm.  Per operand
 /// either `guard_class FLOAT` + `getfield_gc_pure_f`, or (int operand)
 /// `guard_class INT` + `getfield_gc_i` + `cast_int_to_float`; then
 /// `float_<cmp>` for the raw truth, then NON-fused box to a `W_Bool`.

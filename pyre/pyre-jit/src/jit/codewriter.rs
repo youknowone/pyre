@@ -838,8 +838,8 @@ fn derive_pc_live_indices_from_sparse(
     // other opcode.  An unconditional jump emits no resume-relevant jitcode
     // of its own: the blackhole steps it and lands at the target, so its
     // resume liveness IS the target block's.  Used by the break-arm
-    // re-key below (matches the target computation in
-    // `trace_opcode.rs::record_branch_guard` and `liveness.rs`).
+    // re-key below (matches the retired trace-side branch recorder's target
+    // computation and `liveness.rs`).
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {

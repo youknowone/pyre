@@ -50,7 +50,7 @@
 //! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
 //! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
-//! | `raise/r`           | PARITY (`GUARD_CLASS` via `seed_raised_exception`) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; `trace_opcode.rs:5980-6000 seed_raised_exception` reads `concrete_exc.ob_header.ob_type` from the concrete frame snapshot and emits the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. |
+//! | `raise/r`           | PARITY (`GUARD_CLASS`) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the retired trait-side path read `concrete_exc.ob_header.ob_type` from the concrete frame snapshot and emitted the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. |
 //! | `reraise/`          | PARITY        | reads `ctx.last_exc_value` (asserts via `ReraiseWithoutLastExcValue` matching `pyjitpl.py:1702 assert`); same dual top-level/sub-walk routing as `raise/r` (`pyjitpl.py:1700-1704 popframe + finishframe_exception`). |
 //! | `last_exc_value/>r` | PARITY        | reads `ctx.last_exc_value`, writes the OpRef into `registers_r[dst]` — pure SSA rename, no IR op recorded. RPython `pyjitpl.py:1716-1719 opimpl_last_exc_value` returns `self.metainterp.last_exc_box` after asserting `last_exc_value` is non-null; missing slot surfaces `LastExcValueWithoutActiveException` (codewriter invariant: only emits inside `catch_exception/L` body). |
 //!
@@ -138,8 +138,7 @@
 //!    (`_build_allboxes` ABI re-ordering is wired — see
 //!    [`build_allboxes`].)
 //! 2. `raise/r`'s `GUARD_CLASS` (`pyjitpl.py:1690-1693 opimpl_raise`)
-//!    is emitted via `trace_opcode.rs:5980-6000 seed_raised_exception`,
-//!    which reads `concrete_exc.ob_header.ob_type`, checks
+//!    is emitted by reading `concrete_exc.ob_header.ob_type`, checking
 //!    `heap_cache.is_class_known(exc_box)`, and emits
 //!    `GuardClass(exc_box, cls_const)` when needed — the orthodox
 //!    `pyjitpl.py:1690-1696` flow.
@@ -164,17 +163,15 @@
 //!    `WalkContext` carries `OpRef`s rather than concrete
 //!    `box.getint()` values, so these opnames are resolved against the
 //!    per-step concrete frame snapshot: the walker reads the runtime
-//!    truth and records the corresponding branch guard via
-//!    `record_branch_guard(concrete_truth: bool)` (`trace_opcode.rs`).
+//!    truth and records the corresponding branch guard directly.
 //!    Same handling for `goto_if_exception_mismatch/iL`
 //!    (`pyjitpl.py:484-496` — `last_exc_value`/llexitcase comparison).
 //! 6. Class-introspection opname `last_exception/>i`. RPython
 //!    `pyjitpl.py:1707-1713 opimpl_last_exception`: returns
 //!    `ConstInt(ptr2int(rclass.ll_cast_to_object(exc_value).typeptr))` —
 //!    the class pointer of the standing exception. Resolving the class
-//!    needs `concrete_exc.ob_header.ob_type`, which
-//!    `trace_opcode.rs:5980-6000 seed_raised_exception` reads from the
-//!    concrete frame snapshot, the same source used for items 2 and 5.
+//!    needs `concrete_exc.ob_header.ob_type`, read from the concrete frame
+//!    snapshot, the same source used for items 2 and 5.
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
@@ -794,7 +791,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// the `inline_call` SubRaise arm when it catches at
     /// `catch_exception/L`, and by `dispatch_via_miframe`'s entry
     /// from `sym.last_exc_value` when the trait path seeded the
-    /// exception via `seed_raised_exception`.
+    /// exception via the retired trait-side raise path.
     ///
     /// `ConcreteValue::Null` means "no active exception concrete
     /// known" — matches `last_exc_value == None` for the common case,
@@ -5138,7 +5135,7 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
 /// operand must be a concrete int or float (long → `None`: the long→float
-/// cast can lose precision, matching `generated_binary_float_value`'s long
+/// cast can lose precision, matching the former float fast path's long
 /// fallback).  Two ints → `None` so they route through the int
 /// specialization (int `__op__`, not float).  Returns the per-operand
 /// `is_int` flag + coerced `f64` value alongside the authentic boxed
@@ -7821,8 +7818,7 @@ fn handle<Sym: WalkSym>(
             // didn't know, in which case the guard skips — same
             // semantics as the snapshot's tail).
             //
-            // Mirrors trait-side `seed_raised_exception` at
-            // `trace_opcode.rs:seed_raised_exception`.  The read at
+            // Mirrors the retired trait-side raise path.  The read at
             // `ob_header.ob_type` resolves to the per-`ExcKind` `PyType`
             // static (`interp_exceptions.rs::exc_kind_to_pytype`), so the
             // emitted `GuardClass` discriminates the actual subclass.
@@ -7934,7 +7930,7 @@ fn handle<Sym: WalkSym>(
             // Propagate the standing exception's
             // concrete shadow into the dst slot.  `ctx.last_exc_value_
             // concrete` is the live `PyObjectRef` (seeded by either the
-            // trait path's `seed_raised_exception` or an earlier walker
+            // retired trait path or an earlier walker
             // `raise/r`).  This lets a follow-on `raise/r` reading
             // `registers_r[dst]` find a non-Null concrete and emit the
             // correct GUARD_CLASS.
@@ -7956,8 +7952,7 @@ fn handle<Sym: WalkSym>(
             // The class pointer is the standing exception's `ob_type`.
             // `read_typeptr_from_exception` (`dispatch.rs:1117`) routes
             // through `cpu.cls_of_box`; the trait leg reads it directly off
-            // `W_BaseException.ob_header.ob_type` (`trace_opcode.rs:7042`,
-            // `seed_raised_exception` at `:7171`). Walker mirrors the
+            // `W_BaseException.ob_header.ob_type`. Walker mirrors the
             // direct read from the live concrete exception. The result is
             // a `ConstInt(typeptr)` — no IR op recorded, matching
             // RPython's `return ConstInt(...)`.

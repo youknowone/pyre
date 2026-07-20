@@ -534,7 +534,7 @@ use crate::frame_layout::{
 /// (live virtualizable values that `close_loop_args_at`'s JUMP-arg
 /// derivation consumes), while `s.vable_last_instr/vsd`
 /// carry the pre-opcode override that the snapshot reader needs.
-/// The two stores stay distinct deliberately: `record_branch_guard`
+/// The two stores stay distinct deliberately: branch-guard recording
 /// saves `s.vable_last_instr/vsd` before flushing and restores them
 /// after the snapshot is built, but the shared shadow has no
 /// symmetric save/restore — mirroring the override there would leak
@@ -1759,7 +1759,7 @@ impl MIFrame {
                 // fallthrough is the non-vable-owner path —
                 // `s.locals_cells_stack_array_ref` is the callee's own
                 // locals_cells_stack_w array (seeded by Stage 1 at
-                // inline_function_call).
+                // the retired inline-call path).
                 let idx_const = ctx.const_int(idx as i64);
                 s.registers_r[idx] =
                     trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
@@ -1881,7 +1881,7 @@ impl MIFrame {
     /// then carry the pre-opcode stack state so the blackhole interpreter
     /// can re-execute the opcode from orgpc.
     ///
-    /// Note: `record_branch_guard` does NOT call this — branch guards
+    /// Note: branch-guard recording does NOT call this — branch guards
     /// build their own fail_args with post-pop state and other_target PC
     /// (see the comment there for why).
     fn flush_to_frame_for_guard(&mut self, ctx: &mut TraceCtx) {
@@ -1918,7 +1918,7 @@ impl MIFrame {
         // not mirrored here — see `mirror_vable_static_to_boxes` doc
         // for the convention.  The two stores have distinct roles:
         // `s.vable_*` is the snapshot reader's view (carries pre-opcode
-        // overrides set here, save/restored by `record_branch_guard`),
+        // overrides set here, save/restored by branch-guard recording),
         // `ctx.virtualizable_boxes` is the JUMP/JIT-time view (consumed
         // by `close_loop_args_at`'s JUMP-arg derivation).
     }
@@ -3680,7 +3680,7 @@ impl MIFrame {
 
 /// Returns (is_int, is_float) for the fused-dispatch fuseability gate.
 /// Mirrors the concrete-type classification codegen.rs uses to pick
-/// between the int and float fast paths in generated_compare_value_direct,
+/// between the int and float fast paths in the retired compare helper,
 /// but reads the ConcreteValue variant directly so the check does not
 /// have to allocate an intermediate w_int/w_float box.
 /// Trace-side mirror of `pyre_interpreter::eval::check_exc_match_against`

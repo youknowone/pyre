@@ -2039,7 +2039,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // (`normalize_raise_varargs_jit`) that publishes it.  The construct fold
     // (`try_walker_trace_exception_new`) emits the inline virtualizable
     // `NewWithVtable` + SetField shape instead of the opaque `bh_call_fn`
-    // constructor call (mirrors the trait's `try_trace_exception_new`); the
+    // constructor call (mirrors the retired trait-side constructor fold); the
     // raise fold (`try_walker_trace_raise_builtin`) then skips the residual
     // publish for a freshly-built exception with no `from` cause, emitting
     // `__context__` as a `SetfieldGc` on the still-virtual exception.
@@ -2828,8 +2828,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // flatten.rs `build_residual_call_ir_r_insn_from_operands`).  When both
     // operands are concrete `W_IntObject`, re-emit the guard_class + unbox
     // + int_OP (+ rebox / bool-box) sequence instead of an opaque
-    // CALL_MAY_FORCE, matching the trait path's `binary_int_value` /
-    // `compare_value_direct`.  Falls through to the generic record for
+    // CALL_MAY_FORCE, matching the retired trait-side int binop / compare
+    // paths.  Falls through to the generic record for
     // non-int operands / deferred operators.
     if matches!(
         ei.pyre_helper,

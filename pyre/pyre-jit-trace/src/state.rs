@@ -2134,7 +2134,7 @@ pub struct PyreSym {
     /// The entry is dropped as soon as freshness can no longer be proven:
     /// `RAISE_VARARGS` consumes it (a re-raise of the same object must
     /// take the residual path — its `w_context` is set by then), and
-    /// `box_value_for_python_helper` removes any value escaping into a
+    /// the retired Python-helper boxing path removed any value escaping into a
     /// python-helper residual call (which may mutate the exception).
     pub(crate) trace_built_exc: indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
@@ -2556,10 +2556,10 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             | Instruction::UnaryInvert
             | Instruction::RaiseVarargs { .. }
             // Both pop the operand stack (BUILD_TUPLE pop_n, UNPACK_SEQUENCE
-            // pop_value) before emitting a guard: trace_build_tuple_value emits
-            // the specialised-tuple w_class guards on the popped items, and
-            // unpack_sequence_value emits the sequence class / length guards on
-            // the popped sequence. Without the opcode-start snapshot the guard's
+            // pop_value) before emitting a guard: the specialised tuple path
+            // emits w_class guards on the popped items, and the unpack path
+            // emits sequence class / length guards on the popped sequence.
+            // Without the opcode-start snapshot the guard's
             // resume state reflects the post-pop stack, so resuming at the
             // opcode start restores the consumed operands as null / mismatched.
             | Instruction::BuildTuple { .. }
@@ -3175,8 +3175,8 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
 /// `trace_guarded_int_payload`), step 1's `GUARD_CLASS` carries no
 /// `is_tagged_int` pre-check before its `ob_type` deref, and needs none: a
 /// tagged immediate can never select this arm. Both call sites gate it on
-/// `is_long(concrete)` — `trace_plain_int_payload` (`trace_opcode.rs` `if
-/// is_long(concrete_item)`) and `unbox_int_or_long_for_int_strategy` (fed by
+/// `is_long(concrete)` — the former plain-int payload path (`trace_opcode.rs`
+/// `if is_long(concrete_item)`) and `unbox_int_or_long_for_int_strategy` (fed by
 /// `unbox_long = is_long(concrete_value)` in `detect_list_setitem_strategy`).
 /// `is_long` routes through `py_type_check`, which short-circuits a tagged
 /// immediate to `ptr::eq(tp, &INT_TYPE)` — false for `LONG_TYPE` — before any
@@ -4634,7 +4634,7 @@ impl PyreSym {
     ///      `interp_jit.py:25-31`); the frame still owns the shadow
     ///      semantically though.
     ///
-    /// Callee inline frames (`inline_function_call` allocates a fresh
+    /// Callee inline frames (the retired inline-call path allocated a fresh
     /// `PyreSym::new_uninit`) keep both fields at their defaults and
     /// must NOT mirror into the caller's shadow — their
     /// `nlocals + stack_idx` space is the callee's own, not the
@@ -4899,8 +4899,8 @@ impl PyreSym {
         // seeding, `vable_setarrayitem_indexed` / `vable_getarrayitem_*`
         // fall through to raw SetarrayitemGc / GetarrayitemGc ops, and
         // `close_loop_args_at`'s `set_virtualizable_box_at` mirror
-        // becomes a no-op — the very reason `MIFrame::store_local_value`
-        // cannot route through the standard vable path today.
+        // becomes a no-op — the very reason the retired MIFrame local-store
+        // hook could not route through the standard vable path.
         if let Some(base) = self.vable_array_base {
             // virtualizable.py:86-99 read_boxes iterates `len(lst)` — the
             // heap-side `locals_cells_stack_w` length, which is
@@ -10805,16 +10805,16 @@ mod tests {
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
 
-        // BUILD_TUPLE pops its operands before trace_build_tuple_value emits
-        // the specialised-tuple w_class guards.
+        // BUILD_TUPLE pops its operands before the specialised tuple path
+        // emits the w_class guards.
         let build_tuple_code = compile_function_body("def f(a, b):\n    return (a, b)\n");
         assert!(contains_instruction(&build_tuple_code, |instruction| {
             matches!(instruction, Instruction::BuildTuple { .. })
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
 
-        // UNPACK_SEQUENCE pops the sequence before unpack_sequence_value emits
-        // the sequence class / length guards.
+        // UNPACK_SEQUENCE pops the sequence before the unpack path emits the
+        // sequence class / length guards.
         let unpack_code = compile_function_body("def f(s):\n    a, b = s\n    return a + b\n");
         assert!(contains_instruction(&unpack_code, |instruction| {
             matches!(instruction, Instruction::UnpackSequence { .. })
@@ -12091,8 +12091,8 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// into a [`PendingInlineFrame`] (concrete `PyFrame` + symbolic `PyreSym`)
 /// for `trace_bytecode` to push onto the bridge framestack.
 ///
-/// Mirrors `build_pending_inline_frame`'s IR-FREE FAST branch
-/// (`trace_opcode.rs:6035-6084`): set `jitcode` FIRST (the
+/// Mirrors the retired inline-frame builder's IR-FREE FAST branch: set
+/// `jitcode` FIRST (the
 /// `setup_kind_register_banks` debug_assert requires a non-null jitcode),
 /// then fill the per-bank register files + the lazy-boxing concrete shadow.
 /// It emits NO trace IR — the forward FAST branch's guard_value /

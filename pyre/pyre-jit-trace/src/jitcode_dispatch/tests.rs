@@ -2988,9 +2988,8 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     // a reliable concrete pointer.  Allocate a real
     // `W_BaseException` so the deref against
     // `ob_header.ob_type` is sound; expect GuardClass + Finish
-    // recorded and the heapcache class-known flag pinned.  Mirrors
-    // trait-side `seed_raised_exception` at `trace_opcode.rs:
-    // 6629-6643`.
+    // recorded and the heapcache class-known flag pinned.  Mirrors the
+    // retired trait-side raise path.
     let exc_ptr = pyre_object::interp_exceptions::w_exception_new(
         pyre_object::interp_exceptions::ExcKind::ValueError,
         "shadow-walker probe",

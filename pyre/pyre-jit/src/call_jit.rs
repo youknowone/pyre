@@ -3952,7 +3952,7 @@ pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
     }
 }
 
-/// Force callee and return BOXED result (for inline_function_call).
+/// Force callee and return BOXED result for the retired inline-call path.
 /// warmspot.py:449 result_type=REF: jit_force_callee_frame already
 /// returns boxed Ref, so this is just a pass-through.
 #[majit_macros::jit_may_force]

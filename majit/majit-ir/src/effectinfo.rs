@@ -580,8 +580,8 @@ pub enum PyreHelperKind {
     /// `lower_tuple_build_hlop_to_insn` emits after `new_array_clear` +
     /// `setarrayitem_gc`.  The full-body walker recognises this tag to
     /// virtualize an arity-2 plain-int tuple as a `spec_ii`
-    /// `new_with_vtable` + `value0` / `value1` (mirroring
-    /// `trace_build_tuple_value`), so the backing array build and the
+    /// `new_with_vtable` + `value0` / `value1` (mirroring the retired
+    /// trace-side tuple builder), so the backing array build and the
     /// partner [`PyreHelperKind::UnpackItem`] reads DCE to a pure-int loop.
     NewtupleFromArray,
     /// `newlist_from_array(array)` — the BUILD_LIST array consumer that
