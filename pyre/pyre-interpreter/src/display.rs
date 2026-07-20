@@ -973,6 +973,17 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
                         return Ok(format!("[Errno {errno}] {strerror}"));
                     }
                 }
+                // `interp_exceptions.py:859-883 W_SyntaxError.descr_str` —
+                // a non-str `msg` stringifies plainly; otherwise the message
+                // is suffixed with the `basename(filename)` and `line N` /
+                // `lines N-M` derived from the location attributes.  The
+                // WTF-8 path already implements this; reuse it and drop any
+                // lone surrogates for the plain-`String` caller.
+                pyre_object::interp_exceptions::ExcKind::SyntaxError => {
+                    if let Some(w) = exception_descr_str_wtf8(obj)? {
+                        return Ok(w.to_string_lossy().into_owned());
+                    }
+                }
                 _ => {}
             }
             // A user subclass that overrides `__str__` shadows the builtin

@@ -816,7 +816,10 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("{e}");
+            // Render the `File "…", line N` + source + caret + `SyntaxError:`
+            // banner for the malformed source, matching an interactive run.
+            let err = pyre_interpreter::compile_err_to_syntax_error(e, source);
+            pyre_interpreter::eprint_syntax_error(&err);
             std::process::exit(1);
         }
     };

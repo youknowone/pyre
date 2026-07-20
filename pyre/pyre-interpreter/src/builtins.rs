@@ -7279,14 +7279,32 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// bits), `dont_inherit` controls whether the caller's `__future__`
 /// flags are inherited, and `optimize` selects the -1/0/1/2 optimisation
 /// level (assert / `__debug__` / docstring stripping).
-/// Map a compiler failure string to a Python `SyntaxError`, matching
-/// CPython where `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError`
-/// (not `ValueError`) for malformed source.  The `compile error: ` prefix
-/// `compile_source` prepends is stripped so the message reads like
-/// CPython's (`'yield' outside function`).
-fn compile_err_to_syntax_error(e: String) -> crate::PyError {
-    let msg = e.strip_prefix("compile error: ").unwrap_or(&e).to_string();
-    crate::PyError::syntax_error(msg)
+/// Map a compiler failure to a Python `SyntaxError`, matching where
+/// `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError` (not
+/// `ValueError`) for malformed source.  The error's `python_location` /
+/// `python_end_location` / `source_path` populate `e.lineno` / `e.offset`
+/// / `e.end_lineno` / `e.end_offset` / `e.filename`, and `e.text` is the
+/// offending line sliced from `source`; a location-less codegen error
+/// (line 0) falls back to a bare, message-only SyntaxError.
+pub fn compile_err_to_syntax_error(e: crate::compile::CompileError, source: &str) -> crate::PyError {
+    let msg = e.to_string();
+    let (lineno, offset) = e.python_location();
+    if lineno == 0 {
+        return crate::PyError::syntax_error(msg);
+    }
+    let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
+    let filename = e.source_path().to_string();
+    // The offending source line, keeping its trailing newline like `e.text`.
+    let text = source.split_inclusive('\n').nth(lineno - 1);
+    crate::PyError::syntax_error_located(
+        msg,
+        &filename,
+        lineno as i64,
+        offset as i64,
+        end_lineno as i64,
+        end_offset as i64,
+        text,
+    )
 }
 
 /// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.
@@ -7477,13 +7495,9 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let code_ptr = Box::into_raw(Box::new(code)) as *const ();
         return Ok(crate::w_code_new(code_ptr));
     }
-    let code = crate::compile::compile_source_with_opts(
-        source_str.as_deref().expect("non-AST source"),
-        mode,
-        &filename,
-        opts,
-    )
-    .map_err(compile_err_to_syntax_error)?;
+    let source = source_str.as_deref().expect("non-AST source");
+    let code = crate::compile::compile_source_with_opts(source, mode, &filename, opts)
+        .map_err(|e| compile_err_to_syntax_error(e, source))?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
 }
@@ -7575,8 +7589,8 @@ fn exec_or_eval(
             } else {
                 crate::compile::Mode::Exec
             };
-            let code =
-                crate::compile::compile_source(&s, mode).map_err(compile_err_to_syntax_error)?;
+            let code = crate::compile::compile_source(&s, mode)
+                .map_err(|e| compile_err_to_syntax_error(e, &s))?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
             (crate::w_code_new(code_ptr), false)
         } else if !source.is_null() && crate::is_code(source) {

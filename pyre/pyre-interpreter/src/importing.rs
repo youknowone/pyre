@@ -1520,7 +1520,7 @@ fn parent_package_path(parent: PyObjectRef) -> Option<Vec<PathBuf>> {
 // PyPy equivalent: importing.py `parse_source_module(space, pathname, source)`
 
 fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, String> {
-    compile_source_with_filename(source, Mode::Exec, pathname)
+    compile_source_with_filename(source, Mode::Exec, pathname).map_err(|e| e.to_string())
 }
 
 // ── exec_code_module ─────────────────────────────────────────────────

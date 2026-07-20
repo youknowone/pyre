@@ -532,6 +532,60 @@ impl PyError {
         Self::new(PyErrorKind::SyntaxError, msg)
     }
 
+    /// Build a compile-time SyntaxError carrying the parser location so
+    /// `e.msg` / `e.filename` / `e.lineno` / `e.offset` / `e.text` /
+    /// `e.end_lineno` / `e.end_offset` read back once the instance is
+    /// materialised.  `args` becomes `(msg, (filename, lineno, offset,
+    /// text, end_lineno, end_offset))`, the shape
+    /// `interp_exceptions.py:836 W_SyntaxError.descr_init` stores and
+    /// `syntax_error_attr` / `descr_str` read from.  `text` is the
+    /// offending source line (`None` → `text` reads back as `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn syntax_error_located(
+        msg: impl Into<String>,
+        filename: &str,
+        lineno: i64,
+        offset: i64,
+        end_lineno: i64,
+        end_offset: i64,
+        text: Option<&str>,
+    ) -> Self {
+        let message = msg.into();
+        // Root the fresh exception across the args/details allocations: `exc`
+        // lives only in this Rust local while `w_str_new` / `w_int_new` /
+        // `w_tuple_new` / `w_list_new` run, so a collection there could sweep
+        // the unrooted exception before `w_exception_set_args` writes it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc = w_exception_new(ExcKind::SyntaxError, &message);
+        pyre_object::gc_roots::pin_root(exc);
+        let w_text = match text {
+            Some(t) => pyre_object::w_str_new(t),
+            None => pyre_object::w_none(),
+        };
+        let details = pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new(filename),
+            pyre_object::w_int_new(lineno),
+            pyre_object::w_int_new(offset),
+            w_text,
+            pyre_object::w_int_new(end_lineno),
+            pyre_object::w_int_new(end_offset),
+        ]);
+        let args_list = pyre_object::w_list_new(vec![pyre_object::w_str_new(&message), details]);
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+        PyError {
+            kind: PyErrorKind::SyntaxError,
+            // Leave the display message empty so `message_text` derives it from
+            // `exc_object` via the SyntaxError `descr_str`, which appends the
+            // `(filename, line N)` suffix.
+            message: String::new(),
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
     pub fn zero_division(msg: impl Into<String>) -> Self {
         Self::new(PyErrorKind::ZeroDivisionError, msg)
     }
@@ -1252,6 +1306,67 @@ pub fn write_exception<W: Write>(
     } else {
         writeln!(writer, "{}", err.render_exception())
     }
+}
+
+/// Render an uncaught compile-time SyntaxError as the top-level banner
+/// (`print_error_text`): the `File "…", line N` header, the offending
+/// source line, a caret under the offending column span, and
+/// `<Class>: <msg>` (the raw `msg`, not `str(e)`'s `(file, line N)`
+/// suffix — the header already carries the location).  There is no
+/// traceback frame chain: a malformed source never began executing.
+/// Falls back to the plain header when the instance lacks structured
+/// location (a location-less codegen error).
+pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::Result<()> {
+    let exc = err.exc_object;
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return writeln!(writer, "{}", err.render_exception());
+    }
+    let attr = |name: &str| crate::baseobjspace::syntax_error_attr(exc, name);
+    let str_of = |w: PyObjectRef| -> Option<String> {
+        (!w.is_null() && unsafe { pyre_object::is_str(w) })
+            .then(|| unsafe { pyre_object::w_str_get_value(w) }.to_string())
+    };
+    let int_of = |w: PyObjectRef| -> Option<i64> {
+        (!w.is_null() && unsafe { pyre_object::is_int(w) })
+            .then(|| unsafe { pyre_object::intobject::w_int_get_value(w) })
+    };
+    let filename = str_of(attr("filename"));
+    let lineno = int_of(attr("lineno"));
+    if let (Some(fname), Some(lineno)) = (filename.as_ref(), lineno) {
+        writeln!(writer, "  File \"{fname}\", line {lineno}")?;
+    }
+    if let Some(text) = str_of(attr("text")) {
+        let raw = text.trim_end_matches(['\n', '\r']);
+        let shown = raw.trim_start();
+        let lead = raw.len() - shown.len();
+        writeln!(writer, "    {shown}")?;
+        if let Some(offset) = int_of(attr("offset")) {
+            let start_col = (offset.max(1) as usize) - 1;
+            let end_col = int_of(attr("end_offset"))
+                .filter(|&e| e >= offset)
+                .map_or(start_col, |e| (e as usize) - 1);
+            let caret_start = start_col.saturating_sub(lead);
+            let caret_len = end_col.saturating_sub(start_col).max(1);
+            let mut caret = String::from("    ");
+            caret.push_str(&" ".repeat(caret_start));
+            caret.push_str(&"^".repeat(caret_len));
+            writeln!(writer, "{caret}")?;
+        }
+    }
+    let name = exc_object_class_name(exc)
+        .unwrap_or_else(|| exc_kind_name(err.to_exc_kind()).to_string());
+    match str_of(attr("msg")) {
+        Some(msg) if !msg.is_empty() => writeln!(writer, "{name}: {msg}"),
+        _ => writeln!(writer, "{name}"),
+    }
+}
+
+/// Emit `write_syntax_error` through the mediated stderr seam, mirroring
+/// `eprint_exception`.
+pub fn eprint_syntax_error(err: &PyError) {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = write_syntax_error(&mut buf, err);
+    crate::host_seam::emit_stderr(&buf);
 }
 
 /// `Lib/traceback.py:171-200 TracebackException._format_*` parity —
