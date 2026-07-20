@@ -16862,6 +16862,68 @@ mod tests {
         );
     }
 
+    /// Anchor the `next()` fold to the real lowered IR of
+    /// `call_function_impl_result` — the generic-dispatch slice for-loop
+    /// `for &arg in args { pin_root(arg) }` that 16 census heads funnel
+    /// through.  The unregistered `next()` returns an opaque `Ref` the MIR
+    /// recasts to `Option<*mut PyObject>` via a trailing
+    /// `__pyre_cast_instance` narrow, so the raw call is not the block's
+    /// last op; `peel_recast_chain` must strip the recast and fold anyway.
+    /// After the fold no residual `slice::iter::Iter::next` call survives
+    /// and the native `[__iter_next]` op is present.  Ignored by default
+    /// (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn iter_next_fold_real_call_function_impl_result() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "call_function_impl_result")
+            .expect("lower call_function_impl_result");
+
+        let count_call_leaf = |leaf: &[&str]| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(segments, leaf)
+                    )
+                })
+                .count()
+        };
+        // The residual `slice::iter::Iter::next` dispatch wall is gone.
+        assert_eq!(
+            count_call_leaf(&["slice", "iter", "Iter", "next"]),
+            0,
+            "residual slice-iter next removed by the fold"
+        );
+        // The native `[__iter_next]` marker op is present.
+        let iter_next_ops = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.first().is_some_and(|s| s == "__iter_next")
+                )
+            })
+            .count();
+        assert!(
+            iter_next_ops >= 1,
+            "at least one native [__iter_next] op emitted"
+        );
+    }
+
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
     /// its int census callers — `setitem_bytearray` / `byte_w`
     /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as

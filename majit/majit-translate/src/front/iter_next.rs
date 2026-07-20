@@ -61,7 +61,8 @@ use crate::front::result_exc::{
     follow_single_exit, op_operand_vars, split_diamond_exits,
 };
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+    CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+    ValueType,
 };
 
 /// The `[__iter_next]` FunctionPath marker the rewrite emits in place of
@@ -250,10 +251,97 @@ pub(crate) fn rewire_next_call_sites(graph: &mut FunctionGraph, sites: &[Variabl
     rewritten
 }
 
+/// `true` iff `segments` is a `__pyre_cast_instance` narrow — the front-end
+/// pointer-downcast marker (`front::mir` `Rvalue::Cast` #298 arm) the MIR
+/// emits when an opaque `Ref` result is reinterpreted as a registered struct
+/// root.  It lowers to `cast_pointer` (a pure alias), so it carries no
+/// side effect and its result is bit-identical to its operand.
+fn is_recast_narrow(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__pyre_cast_instance")
+    )
+}
+
+/// An unregistered `next()` returns an opaque `Ref`; the MIR immediately
+/// narrows it to the concrete `Option<T>` with one or more pure
+/// `__pyre_cast_instance` recasts (the front-end analogue of
+/// `ListIteratorRepr::rtype_next`'s `recast`, `rpython/rtyper/rlist.py:448`).
+/// Peel that trailing chain: starting from the raw `next` result at
+/// `next_idx`, follow each contiguous recast whose sole operand is the prior
+/// result, and return the chain's final result — the value the block forwards
+/// as the `Option` scrutinee.  Every op from `next_idx+1` to the block end
+/// must be part of the chain (so the native `next` op, replacing the whole
+/// chain, becomes the block's last / raising op), and no chain intermediate
+/// may be read by anything but the next recast (else collapsing the chain to
+/// a single value would drop a live use).  With no recast (`next` registered,
+/// or a list element that needs no narrow) the chain is length 0 and this
+/// returns `opt` unchanged.  Any other shape declines (fail-safe).
+fn peel_recast_chain(
+    graph: &FunctionGraph,
+    a: usize,
+    next_idx: usize,
+    opt: &Variable,
+) -> Result<Variable, String> {
+    let name = &graph.name;
+    let ops = &graph.blocks[a].operations;
+    let mut cur = opt.clone();
+    let mut idx = next_idx;
+    while idx + 1 < ops.len() {
+        let follow = &ops[idx + 1];
+        // The next op must be a recast whose single operand is `cur`.
+        let OpKind::Call { args, .. } = &follow.kind else {
+            return Err(format!(
+                "{name}: op after next() in block {a} is not the block terminator \
+                 nor a recast narrow"
+            ));
+        };
+        if !is_recast_narrow(&follow.kind) || args[0] != cur {
+            return Err(format!(
+                "{name}: op after next() in block {a} is not a recast of the prior result"
+            ));
+        }
+        // `cur` (a non-final chain intermediate) must be dead except for
+        // this recast: no other op reads it AND it does not escape block A
+        // on any exit link arg.  Otherwise truncating the chain to the
+        // native `next` result would strand a live reference.
+        let other_reads = ops
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx + 1)
+            .any(|(_, op)| op_operand_vars(&op.kind).contains(&cur));
+        if other_reads {
+            return Err(format!(
+                "{name}: recast operand in block {a} has a second reader — cannot peel"
+            ));
+        }
+        let escapes = graph.blocks[a].exits.iter().any(|l| {
+            l.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == cur))
+        });
+        if escapes {
+            return Err(format!(
+                "{name}: recast operand in block {a} escapes on an exit link — cannot peel"
+            ));
+        }
+        cur = follow
+            .result
+            .clone()
+            .ok_or_else(|| format!("{name}: recast narrow in block {a} has no result"))?;
+        idx += 1;
+    }
+    Ok(cur)
+}
+
 fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(), String> {
     let name = graph.name.clone();
-    // Block A: the `next()` residual call producing `opt`, closed by
-    // lower_call with a single forwarding exit.
+    // Block A: the block whose op produces `opt` — the residual `next()`
+    // call, closed by lower_call with a single forwarding exit.
     let a = graph
         .blocks
         .iter()
@@ -263,18 +351,15 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
                 .any(|op| op.result.as_ref() == Some(opt))
         })
         .ok_or_else(|| format!("{name}: next() result var has no producer block"))?;
+    let next_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(opt))
+        .ok_or_else(|| format!("{name}: next() producer op vanished from block {a}"))?;
 
-    // The call must be A's last op (lower_call closes the block right
-    // after pushing it) so it becomes the block's `raising_op`.
-    let call_idx = graph.blocks[a].operations.len() - 1;
-    let last_is_call = graph.blocks[a].operations[call_idx].result.as_ref() == Some(opt);
-    if !last_is_call {
-        return Err(format!(
-            "{name}: next() call is not the last op of block {a}"
-        ));
-    }
-    // Capture the iterator operand (the `next` op's single argument).
-    let iter_arg = match &graph.blocks[a].operations[call_idx].kind {
+    // Capture the iterator operand (the `next` op's single argument) from
+    // the raw call, before peeling any recast narrows off its result.
+    let iter_arg = match &graph.blocks[a].operations[next_idx].kind {
         OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
         other => {
             return Err(format!(
@@ -282,6 +367,17 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
             ));
         }
     };
+
+    // `lower_call` closes the block right after the raising call, so the
+    // `next()` call is normally A's last op.  An UNREGISTERED `next()`
+    // returns an opaque `Ref` that the MIR immediately recasts to the
+    // concrete `Option<T>` via one or more pure `__pyre_cast_instance`
+    // narrows (the front-end analogue of `ListIteratorRepr::rtype_next`'s
+    // `recast`, `rpython/rtyper/rlist.py:448` `self.r_list.recast`).  Such a
+    // narrow is a `cast_pointer` alias, so the native `next` op subsumes it:
+    // peel the trailing chain and scrutinise its final result as the Option.
+    let effective_opt = peel_recast_chain(graph, a, next_idx, opt)?;
+    let opt = &effective_opt;
 
     // The 2-exit StopIteration-only shape is faithful ONLY for a list
     // iterator (`ListIteratorRepr::rtype_next` / `ll_listnext` raises
@@ -484,14 +580,20 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
 
     // Replace A's residual `next()` call with the native `next` op: the
     // `[__iter_next]` marker, the iterator as its single operand, `opt`
-    // reused as the element.  The `LastException` exitswitch below makes
-    // the block a `canraise` block whose `raising_op` is this op.
-    graph.blocks[a].operations[call_idx].kind = OpKind::Call {
-        target: CallTarget::FunctionPath {
-            segments: next_op_segments(),
+    // reused as the element.  Any pure recast narrows that followed the raw
+    // call (peeled above) are dropped so the native `next` op — which
+    // produces the scrutinised `opt` directly — is A's last op and thus the
+    // block's `raising_op` under the `LastException` exitswitch below.
+    graph.blocks[a].operations.truncate(next_idx + 1);
+    graph.blocks[a].operations[next_idx] = SpaceOperation {
+        result: Some(opt.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: next_op_segments(),
+            },
+            args: vec![iter_arg],
+            result_ty: ValueType::Ref(None),
         },
-        args: vec![iter_arg],
-        result_ty: ValueType::Ref(None),
     };
 
     // Rewire A: `LastException` exits.
