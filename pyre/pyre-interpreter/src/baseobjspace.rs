@@ -3724,6 +3724,53 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { pyre_object::is_exception(obj) } {
         return unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
     }
+    // bytesobject.py W_BytesObject subclasses inherit mapdict support.  Their
+    // dict SPECIAL slot lives on the native bytes payload so the GC sees the
+    // `subclass -> dict` edge and can collect cycles through a memoryview.
+    if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return PY_NULL;
+        };
+        if unsafe { pyre_object::w_type_get_hasdict(w_type) } {
+            let existing = unsafe { pyre_object::bytesobject::w_bytes_getdict(obj) };
+            if !existing.is_null() {
+                return existing;
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let w_dict = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::bytesobject::w_bytes_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
+            return w_dict;
+        }
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return PY_NULL;
+        };
+        if unsafe { pyre_object::w_type_get_hasdict(w_type) } {
+            let existing = unsafe { pyre_object::bytearrayobject::w_bytearray_getdict(obj) };
+            if !existing.is_null() {
+                return existing;
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let w_dict = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::bytearrayobject::w_bytearray_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
+            return w_dict;
+        }
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return pyre_object::PY_NULL,
@@ -3825,6 +3872,28 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
     }
+    if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
+            return Err(PyError::type_error(format!(
+                "__dict__ must be set to a dictionary, not a '{}'",
+                object_functionstr_type_name(w_dict),
+            )));
+        }
+        unsafe { pyre_object::bytesobject::w_bytes_setdict(obj, w_dict) };
+        return Ok(());
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
+            return Err(PyError::type_error(format!(
+                "__dict__ must be set to a dictionary, not a '{}'",
+                object_functionstr_type_name(w_dict),
+            )));
+        }
+        unsafe { pyre_object::bytearrayobject::w_bytearray_setdict(obj, w_dict) };
+        return Ok(());
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => {
@@ -3870,6 +3939,28 @@ fn getdict_backing(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// MapdictWeakrefSupport.getweakref overrides it.
 pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
+        return (!lifeline.is_null()).then_some(lifeline);
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type) })
+        {
+            let lifeline = unsafe { pyre_object::bytesobject::w_bytes_getweakref(obj) };
+            return (!lifeline.is_null()).then_some(lifeline);
+        }
+        return None;
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type) })
+        {
+            let lifeline = unsafe { pyre_object::bytearrayobject::w_bytearray_getweakref(obj) };
+            return (!lifeline.is_null()).then_some(lifeline);
+        }
+        return None;
+    }
     let w_type = crate::typedef::r#type(obj)?;
     if unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
         crate::objspace::std::mapdict::getweakref(obj)
@@ -3888,6 +3979,26 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// MapdictWeakrefSupport.setweakref overrides it.
 pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
+        return Ok(());
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type) })
+        {
+            unsafe { pyre_object::bytesobject::w_bytes_setweakref(obj, weakreflifeline) };
+            return Ok(());
+        }
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type) })
+        {
+            unsafe { pyre_object::bytearrayobject::w_bytearray_setweakref(obj, weakreflifeline) };
+            return Ok(());
+        }
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => {
@@ -3915,6 +4026,26 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
 ///     pass
 /// ```
 pub fn delweakref(obj: PyObjectRef) {
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
+        return;
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type) })
+        {
+            unsafe { pyre_object::bytesobject::w_bytes_setweakref(obj, PY_NULL) };
+            return;
+        }
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type) })
+        {
+            unsafe { pyre_object::bytearrayobject::w_bytearray_setweakref(obj, PY_NULL) };
+            return;
+        }
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return,

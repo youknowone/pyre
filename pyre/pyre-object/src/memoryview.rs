@@ -33,6 +33,15 @@ pub struct W_MemoryView {
     pub w_hash: i64,
     /// Flips on `release()` / context-manager exit.
     pub released: bool,
+    /// CPython 3.14 `PyMemoryViewObject.exports`: active buffers exported by
+    /// this view.  `release()` is forbidden while this is positive; hash and
+    /// contiguous hex temporarily increment it across re-entrant callbacks.
+    pub exports: i64,
+    /// `W_Root`'s per-object weakref lifeline.  PyPy's memoryview typedef
+    /// installs `make_weakref_descr(W_MemoryView)`, so the lifeline belongs
+    /// to this exact view and dies with it; it must not live in a global
+    /// side-table.
+    pub w_weakreflifeline: PyObjectRef,
     /// `owns_export` (`memoryobject.py`).  True for a view built directly over
     /// an exporter (holds one `_exports` count on the backing); false for a
     /// slice or a copy that shares the original's export.  Only an owning view
@@ -69,6 +78,8 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         view: std::ptr::null(),
         w_hash: -1,
         released,
+        exports: 0,
+        w_weakreflifeline: PY_NULL,
         owns_export,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
@@ -162,6 +173,44 @@ mv_view_scalar!(w_memoryview_readonly, readonly, bool);
 #[inline]
 pub unsafe fn w_memoryview_released(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).released }
+}
+
+/// Number of buffers currently exported by this memoryview.
+#[inline]
+pub unsafe fn w_memoryview_exports(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_MemoryView)).exports }
+}
+
+/// Temporarily protect the view from `release()` across a callback.
+#[inline]
+pub unsafe fn w_memoryview_exports_incref(obj: PyObjectRef) {
+    unsafe { (*(obj as *mut W_MemoryView)).exports += 1 }
+}
+
+/// End a temporary/exported-buffer protection interval.
+#[inline]
+pub unsafe fn w_memoryview_exports_decref(obj: PyObjectRef) {
+    unsafe {
+        let mv = obj as *mut W_MemoryView;
+        debug_assert!((*mv).exports > 0);
+        (*mv).exports -= 1;
+    }
+}
+
+/// `W_Root.getweakref()` storage supplied by
+/// `make_weakref_descr(W_MemoryView)` in PyPy's memoryview typedef.
+#[inline]
+pub unsafe fn w_memoryview_getweakref(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_MemoryView)).w_weakreflifeline }
+}
+
+/// Store the per-view weakref lifeline and remember the old-to-young edge.
+#[inline]
+pub unsafe fn w_memoryview_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_MemoryView)).w_weakreflifeline = lifeline;
+    }
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// The cached content hash (`self._hash`), `-1` until computed.

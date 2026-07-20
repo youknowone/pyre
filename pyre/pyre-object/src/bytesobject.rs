@@ -48,6 +48,12 @@ pub struct W_BytesObject {
     /// `sys.getrefcount` compatibility without changing object identity or
     /// storing a parallel object side table.
     pub ctypes_keepalive_refs: usize,
+    /// Mapdict's per-instance `dict` SPECIAL slot for a user subclass.
+    /// Exact bytes objects leave this null.
+    pub w_dict: PyObjectRef,
+    /// Mapdict's per-instance `weakref` SPECIAL slot for a user subclass.
+    /// Exact bytes objects leave this null.
+    pub w_weakreflifeline: PyObjectRef,
 }
 
 /// GC type id assigned to `W_BytesObject` at JitDriver init time.
@@ -91,6 +97,8 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
                     data,
                     len,
                     ctypes_keepalive_refs: 0,
+                    w_dict: PY_NULL,
+                    w_weakreflifeline: PY_NULL,
                 },
             );
         }
@@ -101,8 +109,63 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
             data,
             len,
             ctypes_keepalive_refs: 0,
+            w_dict: PY_NULL,
+            w_weakreflifeline: PY_NULL,
         }) as PyObjectRef
     }
+}
+
+/// Allocate a bytes-subclass instance in the managed heap.  PyPy's
+/// `W_BytesObject` user subclasses carry mapdict state and therefore
+/// participate in cycle collection; only exact immutable bytes may use the
+/// prebuilt/immortal allocation path above.
+pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_class);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        <W_BytesObject as crate::lltype::GcType>::type_id(),
+        <W_BytesObject as crate::lltype::GcType>::SIZE,
+    );
+    let payload = W_BytesObject {
+        ob_header: PyObject {
+            ob_type: &BYTES_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(root_base),
+        },
+        data: crate::lltype::malloc_raw(bytes.to_vec()),
+        len: bytes.len(),
+        ctypes_keepalive_refs: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    };
+    if raw.is_null() {
+        crate::lltype::malloc_typed(payload) as PyObjectRef
+    } else {
+        unsafe { std::ptr::write(raw as *mut W_BytesObject, payload) };
+        raw as PyObjectRef
+    }
+}
+
+#[inline]
+pub unsafe fn w_bytes_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BytesObject)).w_dict }
+}
+
+#[inline]
+pub unsafe fn w_bytes_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_BytesObject)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_bytes_getweakref(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BytesObject)).w_weakreflifeline }
+}
+
+#[inline]
+pub unsafe fn w_bytes_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
+    unsafe { (*(obj as *mut W_BytesObject)).w_weakreflifeline = lifeline };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// Allocate an empty bytes object.

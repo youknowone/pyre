@@ -41,6 +41,22 @@ class BytesIO:
     def read1(self, size=-1):
         return self.read(size)
 
+    def readinto(self, buffer):
+        self._check_closed()
+        # PyPy `W_BytesIO.readinto_w`: acquire a writable buffer for the
+        # duration of the read, consume at most its byte length, copy the
+        # output at offset zero, and return the number of bytes copied.
+        with memoryview(buffer) as view:
+            if view.readonly:
+                raise TypeError("readinto() argument must be read-write bytes-like object")
+            target = view.cast("B")
+            output = self.read(target.nbytes)
+            target[:len(output)] = output
+            return len(output)
+
+    def readinto1(self, buffer):
+        return self.readinto(buffer)
+
     def readline(self, size=-1):
         self._check_closed()
         buf = self._buffer

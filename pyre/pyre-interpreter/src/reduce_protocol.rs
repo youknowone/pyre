@@ -306,11 +306,16 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         // reconstruct, and that supplies no `__getnewargs__`, cannot be
         // rebuilt via `__newobj__`.  `reduce_newobj` gates this on
         // `tp_basicsize` exceeding the object+dict+weakref+slots baseline;
-        // pyre has no basicsize notion, so it recognises the one such builtin
-        // layout
-        // that reaches object-reduce — `module` (native name + dict
-        // payload).  Matches the proto < 2 `copyreg._reduce_ex` refusal.
-        if !hasargs && unsafe { pyre_object::is_module(w_obj) } {
+        // pyre has no basicsize notion, so recognise the native layouts that
+        // reach object-reduce with unreconstructable C-level state: `module`
+        // (native name + dict payload) and `memoryview` (private buffer view
+        // geometry/export state).  This is the `_PyObject_GetState(required)`
+        // refusal used by CPython 3.14 for every pickle protocol.
+        if !hasargs
+            && unsafe {
+                pyre_object::is_module(w_obj) || pyre_object::memoryview::is_w_memoryview(w_obj)
+            }
+        {
             return Err(PyError::type_error(format!(
                 "cannot pickle '{}' object",
                 typename(w_obj)

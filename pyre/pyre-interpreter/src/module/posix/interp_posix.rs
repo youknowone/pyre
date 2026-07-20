@@ -2247,6 +2247,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // rpython/rlib/rposix.py `ftruncate(fd, length)` — this must be a
+        // real fd mutation whenever HAVE_FTRUNCATE is advertised.  Shared
+        // memory sizes its newly-created object through this call before
+        // mapping it.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "ftruncate",
+            crate::make_builtin_function_with_arity(
+                "ftruncate",
+                |args| {
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                    let length =
+                        (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::off_t;
+                    let r = unsafe { libc::ftruncate(fd, length) };
+                    if r < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
         // os.mkfifo(path, mode=0o666) -> None
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(

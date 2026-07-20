@@ -15056,7 +15056,23 @@ fn init_object_type(ns: PyObjectRef) {
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
-                |args| Ok(default_identity_hash(pyre_object::PY_NULL, args[0])),
+                |args| {
+                    // The fixed arity above is only a fast-dispatch hint; the
+                    // direct path still delivers whatever the caller passed.
+                    if args.len() != 1 {
+                        let message = if args.is_empty() {
+                            "object.__hash__() missing 1 required positional argument: 'obj'"
+                                .to_string()
+                        } else {
+                            format!(
+                                "object.__hash__() takes 1 positional argument but {} were given",
+                                args.len(),
+                            )
+                        };
+                        return Err(crate::PyError::type_error(message));
+                    }
+                    Ok(default_identity_hash(pyre_object::PY_NULL, args[0]))
+                },
                 1,
             ),
         )
@@ -15342,10 +15358,7 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let value = bytearray_descr_new_impl(args)?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)? {
         let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
-        let fresh = pyre_object::bytearrayobject::w_bytearray_from_bytes(&data);
-        unsafe {
-            (*fresh).w_class = sub;
-        }
+        let fresh = pyre_object::bytearrayobject::w_bytearray_subclass_from_bytes(&data, sub);
         return Ok(fresh);
     }
     Ok(value)
@@ -17456,18 +17469,21 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // sep validation — must be a length-1 ASCII string or length-1
     // bytes; otherwise ValueError per PyPy.
     let sep_obj = sep_arg.unwrap();
+    // CPython 3.14 `_Py_strhex_impl` deliberately uses `PyObject_Length`
+    // before inspecting the separator payload.  A bytes/str subclass may
+    // therefore run arbitrary `__len__` code here (gh-143195).
+    if crate::baseobjspace::len_w(sep_obj)? != 1 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "sep must be length 1.",
+        ));
+    }
     let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
         let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
         let mut chars = s.chars();
         let first = chars.next().ok_or_else(|| {
             crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be length 1.")
         })?;
-        if chars.next().is_some() {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                "sep must be length 1.",
-            ));
-        }
         if (first as u32) >= 0x80 {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
@@ -17477,15 +17493,9 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         first
     } else if unsafe { pyre_object::is_bytes(sep_obj) } {
         let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
-        if sep_bytes.len() != 1 {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                "sep must be length 1.",
-            ));
-        }
         sep_bytes[0] as char
     } else {
-        return Err(crate::PyError::type_error("sep must be str or bytes"));
+        return Err(crate::PyError::type_error("sep must be str or bytes."));
     };
     let sep_str = sep_char.to_string();
     // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
@@ -18193,10 +18203,7 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // `bytes(b)` may return the argument unchanged, so rebuild a
         // fresh object before retagging to avoid aliasing the input.
         let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
-        let fresh = pyre_object::bytesobject::w_bytes_from_bytes(&data);
-        unsafe {
-            (*fresh).w_class = sub;
-        }
+        let fresh = pyre_object::bytesobject::w_bytes_subclass_from_bytes(&data, sub);
         return Ok(fresh);
     }
     Ok(value)

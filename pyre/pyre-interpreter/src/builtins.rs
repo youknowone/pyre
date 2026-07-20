@@ -240,6 +240,39 @@ unsafe fn w_memoryview_new_plain(
     }
 }
 
+/// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
+/// byte window whose owner remains the mmap object.
+#[cfg(unix)]
+unsafe fn w_memoryview_new_mmap(
+    w_obj: PyObjectRef,
+    address: usize,
+    length: usize,
+    readonly: bool,
+) -> PyObjectRef {
+    use pyre_object::buffer::Buffer;
+    use pyre_object::bufferview::BufferView;
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let view = BufferView::Simple {
+            backing: Buffer::External {
+                w_obj: r_obj,
+                address,
+                size: length,
+                readonly,
+            },
+            w_obj: r_obj,
+            length: length as i64,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
 /// The LIVE logical bytes of a view, honouring `offset`/strides/shape so a
 /// strided slice (`m[::2]`, `m[::-1]`) or an N-D view gathers the right
 /// elements in C order (`buffer.py as_str`).  Reads the backing object's own
@@ -317,6 +350,11 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
+        }
+        #[cfg(unix)]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
+            let (address, length, readonly) = view?;
+            return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
         }
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
@@ -442,6 +480,10 @@ unsafe fn memoryview_unpack_element(
     match memoryview_format_code(fmt) {
         b'c' => pyre_object::bytesobject::w_bytes_from_bytes(buf),
         b'?' => w_bool_from(buf.iter().any(|&x| x != 0)),
+        b'e' => {
+            let bits = u16::from_ne_bytes(buf.try_into().unwrap());
+            w_float_new(crate::module::r#struct::unpack_half(bits))
+        }
         tc => {
             let w = pyre_object::interp_array::unpack_value(tc, buf);
             if w == pyre_object::PY_NULL {
@@ -544,6 +586,16 @@ fn memoryview_pack_value(
                 Err(err) => return Err(err),
             };
             v.to_ne_bytes().to_vec()
+        }
+        b'e' => {
+            let v = match crate::baseobjspace::float_w(w_val) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
+                Err(err) => return Err(err),
+            };
+            crate::module::r#struct::pack_half(v)?
+                .to_ne_bytes()
+                .to_vec()
         }
         b'?' => {
             vec![crate::baseobjspace::is_true(w_val)? as u8]
@@ -670,7 +722,7 @@ fn memoryview_native_fmtchar(fmt: &str) -> Option<i64> {
     };
     Some(match f {
         b'c' | b'b' | b'B' | b'?' => 1,
-        b'h' | b'H' => 2,
+        b'h' | b'H' | b'e' => 2,
         b'i' | b'I' | b'f' => 4,
         b'l' | b'L' | b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
         _ => return None,
@@ -1361,6 +1413,22 @@ fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         if !pyre_object::memoryview::w_memoryview_released(mv) {
+            let exports = pyre_object::memoryview::w_memoryview_exports(mv);
+            if exports > 0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    format!(
+                        "memoryview has {exports} exported buffer{}",
+                        if exports == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            if exports < 0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::SystemError,
+                    "memoryview: negative export count",
+                ));
+            }
             // `_release_underlying`: read the backing before `set_released`
             // drops the view box.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
@@ -1588,7 +1656,14 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut fwd = Vec::with_capacity(args.len());
     fwd.push(w_bytes);
     fwd.extend_from_slice(&args[1..]);
-    crate::typedef::bytes_method_hex(&fwd)
+    // CPython 3.14 `memoryview_hex_impl`: a contiguous view increments its
+    // export count while separator coercion may run arbitrary Python code.
+    // All pyre memoryview formats accepted here are gathered from the same
+    // live view, so retain the identical release guard across the formatter.
+    unsafe { pyre_object::memoryview::w_memoryview_exports_incref(mv) };
+    let result = crate::typedef::bytes_method_hex(&fwd);
+    unsafe { pyre_object::memoryview::w_memoryview_exports_decref(mv) };
+    result
 }
 
 /// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
@@ -1606,6 +1681,15 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
                     "cannot hash writable memoryview object",
                 ));
             }
+            // CPython 3.14 `memory_hash`: hash the exporter while holding a
+            // temporary export.  The digest is deliberately discarded; the
+            // call validates hashability and, crucially, prevents a
+            // re-entrant `mv.release()` from freeing the bytes being hashed.
+            let backing = pyre_object::memoryview::w_memoryview_obj(mv);
+            pyre_object::memoryview::w_memoryview_exports_incref(mv);
+            let backing_hash = crate::baseobjspace::hash_w_strict(backing);
+            pyre_object::memoryview::w_memoryview_exports_decref(mv);
+            backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
             // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
             hash = hash_str_bytes(&memoryview_gather_bytes(mv));
@@ -1781,7 +1865,23 @@ fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let mv = args[0];
     unsafe { memoryview_check_released(mv)? };
-    let n = unsafe { pyre_object::memoryview::w_memoryview_length(mv) };
+    let ndim = unsafe { pyre_object::memoryview::w_memoryview_ndim(mv) };
+    if ndim == 0 {
+        return Err(crate::PyError::type_error("invalid lookup on 0-dim memory"));
+    }
+    if ndim != 1 {
+        return Err(crate::PyError::not_implemented(
+            "multi-dimensional lookup is not implemented",
+        ));
+    }
+    // CPython 3.14 `memoryview_index_impl`: lookup bounds are measured in
+    // elements (`view->shape[0]`), not bytes (`view->len`).
+    let n = unsafe {
+        pyre_object::memoryview::w_memoryview_native_shape(mv)
+            .first()
+            .copied()
+            .unwrap_or(0)
+    };
     let mut start = if args.len() >= 3 {
         crate::baseobjspace::getindex_w(args[2])?
     } else {
@@ -9933,6 +10033,30 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_list_new(lines))
 }
 
+/// `_io/interp_fileio.py:write_w` — `space.getarg_w('s*', w_data).as_str()`.
+/// The `s*` converter accepts readable buffer exporters, not only bytes.
+unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            return Ok(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            memoryview_check_released(obj)?;
+            if !memoryview_contiguity(obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            return Ok(memoryview_gather_bytes(obj));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            return Ok(pyre_object::interp_array::w_array_bytes(obj).to_vec());
+        }
+        Err(crate::PyError::type_error("write() expects str or bytes"))
+    }
+}
+
 fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
@@ -9947,10 +10071,8 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 // `w_str_get_value`.
                 let (encoding, errors) = stream_encoding_errors(args[0]);
                 crate::type_methods::encode_object(args[1], &encoding, &errors)?
-            } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
-                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
             } else {
-                return Err(crate::PyError::type_error("write() expects str or bytes"));
+                file_write_buffer_bytes(args[1])?
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
@@ -9989,12 +10111,10 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let (encoding, errors) = stream_encoding_errors(args[0]);
             let bytes = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
             (bytes, pyre_object::w_str_len(args[1]))
-        } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
-            let data = pyre_object::bytesobject::bytes_like_data(args[1]).to_vec();
+        } else {
+            let data = file_write_buffer_bytes(args[1])?;
             let len = data.len();
             (data, len)
-        } else {
-            return Err(crate::PyError::type_error("write() expects str or bytes"));
         };
         prev.extend_from_slice(&bytes);
         let _ = crate::baseobjspace::setattr_str(

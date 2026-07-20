@@ -620,15 +620,13 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
                 ));
             }
             let view = memoryview::w_memoryview_view(obj);
-            if bytearrayobject::is_bytearray(view.backing().w_obj())
-                && memoryview::w_memoryview_stride0(obj) == memoryview::w_memoryview_itemsize(obj)
-            {
+            if crate::builtins::memoryview_contiguity(obj).0 {
                 let off = view.offset() as usize;
                 let len = memoryview::w_memoryview_length(obj) as usize;
-                // The backing storage is already the view's `Buffer::Sub`
-                // window for a zero-copy slice.
                 if let Some(full) = view.backing().as_bytes_mut() {
-                    return Ok(&mut full[off..off + len]);
+                    if off <= full.len() && len <= full.len() - off {
+                        return Ok(&mut full[off..off + len]);
+                    }
                 }
             }
         }
@@ -871,7 +869,7 @@ fn ldexp(x: f64, e: i32) -> f64 {
 
 /// `_PyFloat_Pack2` — round `x` to IEEE binary16, raising `OverflowError`
 /// for a finite value too large to represent.
-fn pack_half(x: f64) -> Result<u16, crate::PyError> {
+pub(crate) fn pack_half(x: f64) -> Result<u16, crate::PyError> {
     let sign: u16;
     let e: i32;
     let bits: u16;
@@ -929,7 +927,7 @@ fn pack_half(x: f64) -> Result<u16, crate::PyError> {
 }
 
 /// `_PyFloat_Unpack2` — decode an IEEE binary16 to a double.
-fn unpack_half(bits: u16) -> f64 {
+pub(crate) fn unpack_half(bits: u16) -> f64 {
     let sign = (bits >> 15) & 1 == 1;
     let e = ((bits >> 10) & 0x1f) as i32;
     let f = (bits & 0x3ff) as u32;
@@ -1178,12 +1176,26 @@ pub fn is_unpack_iter(obj: PyObjectRef) -> bool {
 unsafe fn readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
         if bytesobject::is_bytes_like(obj) {
-            Ok(bytesobject::bytes_like_data(obj))
-        } else {
-            Err(crate::PyError::type_error(
-                "a bytes-like object is required",
-            ))
+            return Ok(bytesobject::bytes_like_data(obj));
         }
+        if interp_array::is_array(obj) {
+            return Ok(interp_array::w_array_bytes(obj));
+        }
+        if memoryview::is_w_memoryview(obj) {
+            crate::builtins::memoryview_check_released(obj)?;
+            if crate::builtins::memoryview_contiguity(obj).0 {
+                let view = memoryview::w_memoryview_view(obj);
+                let full = view.backing().as_bytes();
+                let off = view.offset() as usize;
+                let len = memoryview::w_memoryview_length(obj) as usize;
+                if off <= full.len() && len <= full.len() - off {
+                    return Ok(&full[off..off + len]);
+                }
+            }
+        }
+        Err(crate::PyError::type_error(
+            "a bytes-like object is required",
+        ))
     }
 }
 

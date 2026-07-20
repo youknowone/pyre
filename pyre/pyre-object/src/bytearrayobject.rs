@@ -16,6 +16,9 @@ pub struct W_BytearrayObject {
     /// `_exports` — count of active buffer exports.  Size-changing mutators
     /// are refused while this is positive (`_check_exports`).
     pub exports: i64,
+    /// Mapdict `dict`/`weakref` SPECIAL slots for user subclasses.
+    pub w_dict: PyObjectRef,
+    pub w_weakreflifeline: PyObjectRef,
 }
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
@@ -60,6 +63,8 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
                     ob_header: header,
                     data,
                     exports: 0,
+                    w_dict: PY_NULL,
+                    w_weakreflifeline: PY_NULL,
                 },
             );
         }
@@ -69,6 +74,8 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
             ob_header: header,
             data,
             exports: 0,
+            w_dict: PY_NULL,
+            w_weakreflifeline: PY_NULL,
         }) as PyObjectRef
     }
 }
@@ -89,6 +96,56 @@ pub fn w_bytearray_new(size: usize) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
     w_bytearray_alloc(bytes.to_vec())
+}
+
+/// Allocate a bytearray user subclass in the managed heap so its mapdict
+/// edges and buffer-export cycles participate in collection.
+pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_class);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        <W_BytearrayObject as crate::lltype::GcType>::type_id(),
+        <W_BytearrayObject as crate::lltype::GcType>::SIZE,
+    );
+    let payload = W_BytearrayObject {
+        ob_header: PyObject {
+            ob_type: &BYTEARRAY_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(root_base),
+        },
+        data: crate::lltype::malloc_raw(bytes.to_vec()),
+        exports: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    };
+    if raw.is_null() {
+        crate::lltype::malloc_typed(payload) as PyObjectRef
+    } else {
+        unsafe { std::ptr::write(raw as *mut W_BytearrayObject, payload) };
+        raw as PyObjectRef
+    }
+}
+
+#[inline]
+pub unsafe fn w_bytearray_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BytearrayObject)).w_dict }
+}
+
+#[inline]
+pub unsafe fn w_bytearray_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_BytearrayObject)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_bytearray_getweakref(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BytearrayObject)).w_weakreflifeline }
+}
+
+#[inline]
+pub unsafe fn w_bytearray_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
+    unsafe { (*(obj as *mut W_BytearrayObject)).w_weakreflifeline = lifeline };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {

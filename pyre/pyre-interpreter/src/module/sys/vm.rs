@@ -587,7 +587,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "get_int_max_str_digits",
         make_builtin_function_with_arity(
             "get_int_max_str_digits",
-            |_| Ok(w_int_new(crate::module::sys::state::int_max_str_digits() as i64)),
+            |args| {
+                // The fixed arity above is only a fast-dispatch hint; the
+                // direct path still delivers whatever the caller passed.
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(format!(
+                        "get_int_max_str_digits() takes 0 positional arguments but {} {} given",
+                        args.len(),
+                        if args.len() == 1 { "was" } else { "were" },
+                    )));
+                }
+                Ok(w_int_new(crate::module::sys::state::int_max_str_digits() as i64))
+            },
             0,
         ),
     );
@@ -597,6 +608,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function_with_arity(
             "set_int_max_str_digits",
             |args| {
+                if args.len() != 1 {
+                    let message = if args.is_empty() {
+                        "set_int_max_str_digits() missing 1 required positional argument: \
+                         'maxdigits'"
+                            .to_string()
+                    } else {
+                        format!(
+                            "set_int_max_str_digits() takes 1 positional argument but {} were given",
+                            args.len(),
+                        )
+                    };
+                    return Err(crate::PyError::type_error(message));
+                }
                 let maxdigits = crate::baseobjspace::c_int_w(args[0])?;
                 crate::module::sys::state::set_int_max_str_digits(maxdigits)?;
                 Ok(w_none())

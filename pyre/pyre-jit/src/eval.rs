@@ -812,12 +812,48 @@ fn trace_bufferview(
 }
 
 unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
+    let mv = obj_addr as *mut pyre_object::memoryview::W_MemoryView;
+    f(unsafe { &mut (*mv).ob.w_class } as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // memoryobject.py's make_weakref_descr(W_MemoryView) stores the lifeline
+    // inline on the view.  A custom trace replaces fixed-offset tracing, so
+    // forward that field explicitly before walking the off-heap BufferView.
+    f(
+        unsafe { &mut (*mv).w_weakreflifeline } as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if view_ptr.is_null() {
         return;
     }
     trace_bufferview(unsafe { &mut *view_ptr }, f);
+}
+
+/// W_BytesObject's mapdict SPECIAL slots for user subclasses.  Exact bytes
+/// leave both null, while subclass instances are managed and cycle-visible.
+unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let bytes = obj_addr as *mut pyre_object::bytesobject::W_BytesObject;
+    f(
+        unsafe { &mut (*bytes).ob_header.w_class } as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+    f(unsafe { &mut (*bytes).w_dict } as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(
+        unsafe { &mut (*bytes).w_weakreflifeline } as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+}
+
+unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let bytes = obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject;
+    f(
+        unsafe { &mut (*bytes).ob_header.w_class } as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+    f(unsafe { &mut (*bytes).w_dict } as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(
+        unsafe { &mut (*bytes).w_weakreflifeline } as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
 }
 
 /// Reclaim the off-heap `BufferView` box (and any nested `Buffer::Sub`

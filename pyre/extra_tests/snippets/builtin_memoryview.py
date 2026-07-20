@@ -1,4 +1,13 @@
 import array
+import copy
+import gc
+import io
+import mmap
+import os
+import pickle
+import struct
+import tempfile
+import weakref
 
 from testutils import assert_raises
 
@@ -24,6 +33,7 @@ memoryview(bytearray("abcde", encoding="utf-8"))
 memoryview(array.array("i", [1, 2, 3]))
 memoryview(A("b", [0]))
 memoryview(B("abcde", encoding="utf-8"))
+assert memoryview(object=b"abcde").tobytes() == b"abcde"
 
 assert_raises(TypeError, lambda: memoryview([1, 2, 3]))
 assert_raises(TypeError, lambda: memoryview((1, 2, 3)))
@@ -74,6 +84,134 @@ def test_slice():
 
 
 test_slice()
+
+
+def test_half_float():
+    packed = struct.pack("eee", 0.0, -1.5, 1.5)
+    view = memoryview(packed).cast("e")
+    assert view.itemsize == 2
+    assert view.tolist() == [0.0, -1.5, 1.5]
+
+
+test_half_float()
+
+
+def test_index_uses_element_shape():
+    values = array.array("i", [10, 20, 30])
+    view = memoryview(values)
+    assert view.index(30) == 2
+    assert view.index(20, -3, -1) == 1
+    assert_raises(ValueError, lambda: view.index(40))
+    assert_raises(ValueError, lambda: view.index(30, 0, 2))
+
+
+test_index_uses_element_shape()
+
+
+def test_bytesio_readinto():
+    stream = io.BytesIO(b"hello")
+    target = bytearray(b"testing")
+    assert stream.readinto(target) == 5
+    assert target == bytearray(b"hellong")
+
+    stream.seek(0)
+    writable = memoryview(bytearray(5))
+    assert stream.readinto1(writable) == 5
+    assert writable.tobytes() == b"hello"
+
+    stream.seek(0)
+    assert_raises(TypeError, lambda: stream.readinto(memoryview(b"hello")))
+
+
+test_bytesio_readinto()
+
+
+def test_pickle_rejected():
+    view = memoryview(b"abc")
+    assert_raises(TypeError, lambda: copy.copy(view))
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        assert_raises(TypeError, lambda protocol=protocol: pickle.dumps(view, protocol))
+
+
+test_pickle_rejected()
+
+
+def test_reentrant_release_is_export_guarded():
+    class HashingArray(array.array):
+        def __hash__(self):
+            hash_view.release()
+            self.clear()
+            return 123
+
+    exporter = HashingArray("B", b"A" * 32)
+    hash_view = memoryview(exporter).toreadonly()
+    assert_raises(BufferError, lambda: hash(hash_view))
+
+    backing = bytearray(b"A" * 32)
+    hex_view = memoryview(backing)
+
+    class Separator(bytes):
+        def __len__(self):
+            hex_view.release()
+            backing.clear()
+            return 1
+
+    assert_raises(BufferError, lambda: hex_view.hex(Separator(b":")))
+
+
+test_reentrant_release_is_export_guarded()
+
+
+def test_weakref_and_exporter_cycles():
+    callbacks = []
+    view = memoryview(b"abc")
+    ref = weakref.ref(view, lambda dead: callbacks.append(dead))
+    del view
+    gc.collect()
+    assert ref() is None
+    assert callbacks == [ref]
+
+    class Source(bytearray):
+        pass
+
+    class Payload:
+        pass
+
+    source = Source(b"abc")
+    view = memoryview(source)
+    payload = Payload()
+    source.view = view
+    source.payload = payload
+    payload_ref = weakref.ref(payload)
+    del source, view, payload
+    gc.collect()
+    assert payload_ref() is None
+
+
+test_weakref_and_exporter_cycles()
+
+
+def test_mmap_buffer_protocol():
+    fd, path = tempfile.mkstemp()
+    try:
+        os.ftruncate(fd, 64)
+        mapped = mmap.mmap(fd, 64)
+        view = memoryview(mapped)
+        struct.pack_into("q", view, 0, 1234)
+        assert struct.unpack_from("q", view, 0) == (1234,)
+        view.release()
+        mapped.close()
+
+        with open(path, "wb") as output:
+            assert output.write(memoryview(b"abc")) == 3
+        with open(path, "rb") as source:
+            assert source.read() == b"abc"
+    finally:
+        os.close(fd)
+        os.unlink(path)
+
+
+test_mmap_buffer_protocol()
 
 
 def test_compare_buffer_exporters():

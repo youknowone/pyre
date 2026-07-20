@@ -137,6 +137,23 @@ fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), crate::Py
     Ok((p, len))
 }
 
+/// `W_MMap.readbuf_w` / `writebuf_w` — expose the live mapping to the
+/// object-space buffer protocol.  `None` means the object is not an mmap;
+/// the inner error preserves the closed-mapping failure.
+#[cfg(unix)]
+pub(crate) fn mmap_buffer_view(
+    obj: pyre_object::PyObjectRef,
+) -> Option<Result<(usize, usize, bool), crate::PyError>> {
+    let w_type = crate::typedef::r#type(obj)?;
+    if !std::ptr::eq(w_type, mmap_type()) {
+        return None;
+    }
+    Some(mmap_ptr(obj).map(|(ptr, len)| {
+        let readonly = mmap_get_attr_i64(obj, "_access") == MMAP_ACCESS_READ;
+        (ptr as usize, len, readonly)
+    }))
+}
+
 #[cfg(unix)]
 fn mmap_get_attr_obj(obj: pyre_object::PyObjectRef, key: &str) -> pyre_object::PyObjectRef {
     let d = crate::baseobjspace::getdict(obj);
