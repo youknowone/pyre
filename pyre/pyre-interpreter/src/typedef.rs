@@ -3500,6 +3500,11 @@ fn set_alloc_for_class(
             (*obj).w_class = cls;
         }
     }
+    // objspace.py:486 `allocate_instance` registers every freshly allocated
+    // instance whose class carries `hasuserdel`.  Set/frozenset subclasses use
+    // this layout-specific allocator instead of `w_instance_new`, so perform
+    // the same post-allocation step after installing the real subclass.
+    pyre_object::gc_hook::maybe_register_finalizer(obj);
     Ok(obj)
 }
 

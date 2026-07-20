@@ -475,3 +475,28 @@ mutating_target = {mutating_key}
 MutatingSetKey.target = mutating_target
 MutatingSetKey.enabled = True
 mutating_target -= {0}
+
+
+# test_set.py TestJointOps.test_free_after_iterating: exhausting a set
+# iterator releases its source immediately. Layout-specific allocation must
+# also register `__del__` on set/frozenset subclasses, just like PyPy's common
+# objspace.allocate_instance path.
+import gc
+
+
+for _set_base in (set, frozenset):
+    _finalized = []
+
+    class _FinalizedSet(_set_base):
+        def __del__(self):
+            _finalized.append(True)
+
+    _set_iter = iter(_FinalizedSet())
+    try:
+        next(_set_iter)
+    except StopIteration:
+        pass
+    gc.collect()
+    gc.collect()
+    gc.collect()
+    assert _finalized == [True]
