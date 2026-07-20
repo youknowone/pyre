@@ -882,6 +882,10 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(91, typed::<crate::module::__pypy__::W_PickleBuffer>()),
         subclass_range_alias(92, typed::<crate::module::_pickle::PicklerMemoProxy>()),
         subclass_range_alias(93, typed::<crate::module::_pickle::UnpicklerMemoProxy>()),
+        // `collections.deque` W_Deque — auto-id registered at the tail of the
+        // GC type chain (`build_gc`), after the coroutine / dict-view-iterator
+        // slots, so its vtable alias lands at the current max tid.
+        subclass_range_alias(116, typed::<crate::module::_collections::W_Deque>()),
     ]
 }
 
