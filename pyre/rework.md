@@ -89,6 +89,14 @@ the full-body-walk mode bifurcation — is now recorded there as a scope
 supplement (2026-07-05 comment). gh#342 and gh#115 track the walker
 coverage gaps that force the trait leg to stay alive.
 
+**Status — pyre-side done.** The `is_full_body_walk` field and its fork, the
+`OpcodeHandler`-on-`MIFrame` trace-time methods, and the `PYRE_FULL_BODY_WALK`
+gate are deleted; the walker is the sole trace-time executor and observes a
+vable-force via the residual-call token protocol
+(`try_execute_residual_call_via_executor`), the metainterp mechanism — no
+second leg. The generic majit-engine half of gh#344 is separate; the F1
+resume side (pc_map / resume translation) is WS1 increments 1–2.
+
 ### F3 — GC root registration is a post-hoc walker registry
 
 **What exists.** `MAX_EXTRA_ROOT_WALKERS = 16`
@@ -214,7 +222,9 @@ Increments (each lands green on N4 gates, each with its kill switch):
    mechanism; delete the `OpcodeHandler` trace-time twin and the
    full-body-walk mode bifurcation (A7). gh#344 owns both halves (the
    pyre-side twin deletion was added to its scope 2026-07-05);
-   gh#342/gh#115 track the walker coverage gaps.
+   gh#342/gh#115 track the walker coverage gaps. *Pyre-side done
+   (2026-07-20): twin methods, mode field/fork, and the PYRE_FULL_BODY_WALK
+   gate deleted; walker is the sole trace-time leg.*
 
 Regression corpus (all must be tests before the increments that fix them):
 the pr354 FOR_ITER-in-called-function crash repro, the loop-carried `or`
