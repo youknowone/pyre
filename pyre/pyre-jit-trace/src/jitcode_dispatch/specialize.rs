@@ -368,11 +368,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || r_args.len() != 2
-        || dst_bank != 'r'
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
@@ -596,11 +592,7 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || r_args.len() != 2
-        || dst_bank != 'r'
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(spec) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
@@ -755,11 +747,7 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || r_args.len() != 2
-        || dst_bank != 'r'
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
     use pyre_interpreter::bytecode::BinaryOperator;
@@ -849,7 +837,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     let (Some(&int_arg), Some(&seq)) = (i_args.first(), r_args.first()) else {
@@ -957,7 +945,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     // The receiver must be a concrete instance for the map/storageindex
@@ -1187,7 +1175,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
@@ -1285,7 +1273,7 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
@@ -1322,7 +1310,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     name_idx: usize,
     original_effect: &majit_ir::EffectInfo,
 ) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk {
+    if !ctx.is_authoritative_executor {
         return Ok(None);
     }
     let (Some(concrete_obj), Some(concrete_value)) = (
@@ -1621,7 +1609,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     if r_args.len() != 1 {
@@ -1801,7 +1789,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     if r_args.len() != 1 {
@@ -1975,7 +1963,7 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
@@ -2160,11 +2148,7 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || r_args.len() != 2
-        || dst_bank != 'r'
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
@@ -2267,11 +2251,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || r_args.len() != 2
-        || dst_bank != 'r'
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
@@ -2416,11 +2396,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || r_args.len() != 2
-        || dst_bank != 'r'
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
     let list_op = r_args[0];
@@ -4293,7 +4269,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || r_args.len() != 3 {
+    if !ctx.is_authoritative_executor || r_args.len() != 3 {
         return Ok(None);
     }
     let list_op = r_args[0];
@@ -4682,11 +4658,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     _dst: usize,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || dst_bank != 'r'
-        || r_args.len() != 1
-    {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
         return Ok(None);
     }
 
@@ -4899,7 +4871,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || r_args.len() != 3 {
+    if !ctx.is_authoritative_executor || r_args.len() != 3 {
         return Ok(None);
     }
     let list_op = r_args[0];
@@ -5142,7 +5114,7 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
     let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {

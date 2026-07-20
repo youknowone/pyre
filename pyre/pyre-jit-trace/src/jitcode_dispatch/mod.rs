@@ -716,27 +716,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `executor.execute_varargs`, pyjitpl.py:1995), pure or not, so a
     /// downstream `goto_if_not` reads a concrete result.
     pub is_authoritative_executor: bool,
-    /// Whether this walk is a full-body walk (`dispatch_via_miframe`
-    /// rooted, including its inline sub-walks) as opposed to a
-    /// per-opcode arm walk (whose production root, the retired
-    /// `dispatch_via_miframe_at_opcode_entry`, is deleted; arm-style
-    /// contexts survive in test fixtures and the guard-capture arm
-    /// path).
-    ///
-    /// The distinction decides who applies a recorded-but-unexecuted
-    /// side effect.  A full-body walk is replay-backed: the walk is
-    /// symbolic and does not advance the interpreter, so on compile the
-    /// loop re-enters at the traced iteration and re-runs the recorded
-    /// ops — an effect declined at walk time still lands exactly once
-    /// (see the void gate in
-    /// [`try_execute_residual_call_via_executor`] and
-    /// [`fbw_has_unjournaled_effect`]).  A per-opcode arm walk has no
-    /// replay: the interpreter advances opcode by opcode during
-    /// tracing and the compiled loop is entered at the NEXT iteration,
-    /// so an effect the walker declines to execute is simply lost —
-    /// the arm walk must execute eagerly (`do_residual_call` runs
-    /// `execute_varargs` for void callees too, pyjitpl.py:2038-2040).
-    pub is_full_body_walk: bool,
     /// Live trace recorder. `record_finish` / `record_op` /
     /// `record_op_with_descr` go through this.
     pub trace_ctx: &'frame mut TraceCtx,
@@ -1777,18 +1756,6 @@ pub fn walk<Sym: WalkSym>(
     start_pc: usize,
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Tripwire: an authoritative concrete executor is always a full-body
-    // walk.  Every production walk roots at `dispatch_via_miframe` with
-    // `is_full_body_walk: true`; the retired per-opcode arm walk
-    // (`is_full_body_walk: false`) survives only in test fixtures, which
-    // always pair it with `is_authoritative_executor: false`.  Asserting
-    // the coupling at runtime turns that static invariant into executed
-    // evidence across the test + fuzz corpus before the dead arm-walk
-    // fork is removed.
-    debug_assert!(
-        !ctx.is_authoritative_executor || ctx.is_full_body_walk,
-        "authoritative executor must be a full-body walk; retired arm-walk leg is non-authoritative",
-    );
     let mut pc = start_pc;
     loop {
         let (outcome, next_pc) = step(code, pc, ctx)?;

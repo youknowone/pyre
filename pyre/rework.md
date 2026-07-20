@@ -85,7 +85,7 @@ way PyPy's metainterp does it rather than by keeping a second leg.
 **Tracking.** gh#344 (observer/replay two-executor → single authoritative
 walker) is the epic; its original scope was the generic majit engine only,
 and the pyre-side half — deleting the `OpcodeHandler` trace-time twin and
-the `is_full_body_walk` bifurcation — is now recorded there as a scope
+the full-body-walk mode bifurcation — is now recorded there as a scope
 supplement (2026-07-05 comment). gh#342 and gh#115 track the walker
 coverage gaps that force the trait leg to stay alive.
 
@@ -212,7 +212,7 @@ Increments (each lands green on N4 gates, each with its kill switch):
 4. **Single executor (W4)**: make walker-as-tracer the only trace-time
    leg; solve the vable-force observation blocker via the metainterp
    mechanism; delete the `OpcodeHandler` trace-time twin and the
-   `is_full_body_walk` bifurcation (A7). gh#344 owns both halves (the
+   full-body-walk mode bifurcation (A7). gh#344 owns both halves (the
    pyre-side twin deletion was added to its scope 2026-07-05);
    gh#342/gh#115 track the walker coverage gaps.
 
@@ -222,7 +222,7 @@ deopt underflow repro, rc_d32.py double-append, aheui logo --jit, the wasm
 timeout re-entry cases.
 
 Exit criteria: `pc_map`, the resume translation layer, `OpcodeHandler` twin, and
-`is_full_body_walk` no longer exist in the tree; full benchmark suite (all
+the full-body-walk mode flag no longer exist in the tree; full benchmark suite (all
 8) no regressions; crash corpus green; slot-vs-color epic closeable.
 
 ### WS2 — majit-translate systematization (F4)

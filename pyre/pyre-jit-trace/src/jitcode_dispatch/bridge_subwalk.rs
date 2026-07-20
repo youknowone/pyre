@@ -223,11 +223,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             descr_refs,
             raw_descrs,
             is_authoritative_executor,
-            // `dispatch_via_miframe` is the full-body walk entry
-            // (production tracer, diagnostic probe — the non-production
-            // roots are excluded from concrete execution by
-            // `is_authoritative_executor: false` instead).
-            is_full_body_walk: true,
             trace_ctx,
             done_with_this_frame_descr_ref,
             done_with_this_frame_descr_int,
@@ -742,7 +737,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // never run pre-deopt (the deopt cut the trace there), so this is its
             // first and only concrete execution.
             is_authoritative_executor: true,
-            is_full_body_walk: true,
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
@@ -1077,7 +1071,6 @@ pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
             descr_refs: &perfn_descr_refs,
             raw_descrs: RawDescrPool::PerFn(perfn_descrs),
             is_authoritative_executor: true,
-            is_full_body_walk: true,
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),

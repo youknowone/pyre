@@ -549,7 +549,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // bookkeeping is FBW machinery; the per-opcode arm walk records the
     // plain residual instead.
     if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
         || std::env::var_os("PYRE_FBW_REC_CA").as_deref() == Some(std::ffi::OsStr::new("0"))
     {
         return Ok(None);
@@ -1157,10 +1156,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // Default ON since the Phase 5 flip; `PYRE_FBW_INLINE=0` opts out.
     // Full-body walks only: inline sub-walks lean on FBW multi-frame
     // snapshot plumbing the per-opcode arm walk does not carry.
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0")
-    {
+    if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0") {
         return Ok(None);
     }
     // Only a genuine Python call helper (`call_fn` / `call_fn_N`, tagged
@@ -1745,25 +1741,24 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
     let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !ctx.fbw_mode.inline_subwalk;
-    let abort_flush_call_jitcode_coord: Option<(u32, usize)> =
-        if ctx.is_full_body_walk && is_top_inline {
-            let sym_ptr = ctx.fbw_mode.snapshot_sym;
-            if sym_ptr.is_null() {
+    let abort_flush_call_jitcode_coord: Option<(u32, usize)> = if is_top_inline {
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if sym_ptr.is_null() {
+            None
+        } else {
+            let sym = unsafe { &*sym_ptr };
+            if sym.jitcode().is_null() {
                 None
             } else {
-                let sym = unsafe { &*sym_ptr };
-                if sym.jitcode().is_null() {
-                    None
-                } else {
-                    unsafe {
-                        let jc = &*sym.jitcode();
-                        Some((jc.index as u32, op.pc))
-                    }
+                unsafe {
+                    let jc = &*sym.jitcode();
+                    Some((jc.index as u32, op.pc))
                 }
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
     // paused caller frame on the framestack so its in-callee guards
@@ -1862,7 +1857,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         inline_outer_entry_py_pc,
         inline_outer_jc_index,
         inline_outer_resume_marker_jit_pc,
-    ) = if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
+    ) = if ctx.outer_active_boxes.is_empty() {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         if sym_ptr.is_null() {
             (
@@ -1966,7 +1961,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             descr_refs: callee_descr_refs,
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
@@ -2461,11 +2455,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || dst_bank != 'r'
-        || r_args.len() != 2
-    {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
         return Ok(None);
     }
 
@@ -2589,11 +2579,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
-        || dst_bank != 'r'
-        || r_args.len() != 2
-    {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
         return Ok(None);
     }
 
@@ -2860,7 +2846,6 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
             descr_refs: ctx.descr_refs,
             raw_descrs: ctx.raw_descrs,
             is_authoritative_executor: ctx.is_authoritative_executor,
-            is_full_body_walk: ctx.is_full_body_walk,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
