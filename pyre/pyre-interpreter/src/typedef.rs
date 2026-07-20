@@ -17522,7 +17522,6 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "bytes_per_sep", pos.get(2).is_some())?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // No sep / default grouping — produces "ffff" for [0xff, 0xff].
     // The sep + bytes_per_sep kwargs are deferred until first observed
     // need; CPython callers without args hit the hot path.
@@ -17531,6 +17530,8 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
     if sep_arg.is_none() {
+        // Nothing below can run Python code, so the payload is read here.
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
         let mut out = String::with_capacity(data.len() * 2);
         for &b in data {
             out.push_str(&format!("{:02x}", b));
@@ -17543,29 +17544,28 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let sep_obj = sep_arg.unwrap();
     // CPython 3.14 `_Py_strhex_impl` deliberately uses `PyObject_Length`
     // before inspecting the separator payload.  A bytes/str subclass may
-    // therefore run arbitrary `__len__` code here (gh-143195).
+    // therefore run arbitrary `__len__` code here (gh-143195).  Once it
+    // reports one, the first payload unit is used; an empty payload supplies
+    // the terminating NUL, matching `_PyUnicode_AsUTF8AndSize`/`PyBytes_AS_STRING`.
+    let sep_length_error =
+        || crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be length 1.");
+    let sep_ascii_error =
+        || crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be ASCII.");
     if crate::baseobjspace::len_w(sep_obj)? != 1 {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            "sep must be length 1.",
-        ));
+        return Err(sep_length_error());
     }
     let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
         let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
-        let mut chars = s.chars();
-        let first = chars.next().ok_or_else(|| {
-            crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be length 1.")
-        })?;
-        if (first as u32) >= 0x80 {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                "sep must be ASCII.",
-            ));
+        if !s.is_ascii() {
+            return Err(sep_ascii_error());
         }
-        first
+        s.chars().next().unwrap_or('\0')
     } else if unsafe { pyre_object::is_bytes(sep_obj) } {
         let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
-        sep_bytes[0] as char
+        if !sep_bytes.is_ascii() {
+            return Err(sep_ascii_error());
+        }
+        sep_bytes.first().copied().unwrap_or(0) as char
     } else {
         return Err(crate::PyError::type_error("sep must be str or bytes."));
     };
@@ -17583,6 +17583,10 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     };
     let group = raw_group.unsigned_abs() as usize;
     let group_from_left = raw_group < 0;
+    // Read the payload only now: `bytes_per_sep` coercion above can run
+    // `__index__`, which may clear or resize a bytearray receiver and
+    // leave any slice taken earlier describing a stale length.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let mut out = String::with_capacity(data.len() * 2 + data.len());
     for (i, b) in data.iter().enumerate() {
         if i > 0 && group != 0 {

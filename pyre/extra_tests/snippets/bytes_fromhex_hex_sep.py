@@ -22,6 +22,45 @@ assert b'abcd'.hex('-', 2) == '6162-6364'
 assert b'abcd'.hex('_', -2) == '6162_6364'
 assert bytearray(b'ab').hex(':', 0) == '6162'
 
+# CPython 3.14 asks a separator subclass for its Python-visible length before
+# reading the raw payload (gh-143195).  A reported length of one accepts a
+# longer payload and uses its first unit.
+class BytesSep(bytes):
+    calls = 0
+
+    def __len__(self):
+        type(self).calls += 1
+        return 1
+
+
+class StrSep(str):
+    calls = 0
+
+    def __len__(self):
+        type(self).calls += 1
+        return 1
+
+
+assert b'ab'.hex(BytesSep(b'::')) == '61:62'
+assert BytesSep.calls == 1
+assert b'ab'.hex(StrSep('::')) == '61:62'
+assert StrSep.calls == 1
+
+# bytes_per_sep coercion can mutate a bytearray receiver.  Its payload must be
+# read after __index__ returns, not kept as a stale pre-call slice.
+class ClearReceiver:
+    def __init__(self, receiver):
+        self.receiver = receiver
+
+    def __index__(self):
+        self.receiver.clear()
+        return 1
+
+
+receiver = bytearray(b'ab')
+assert receiver.hex(':', ClearReceiver(receiver)) == ''
+assert receiver == bytearray()
+
 # slice.indices() with the wrong number of arguments raises TypeError,
 # not a Rust panic.
 try:
