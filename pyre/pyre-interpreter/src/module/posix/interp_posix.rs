@@ -213,7 +213,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "HAVE_FPATHCONF",
         #[cfg(not(feature = "sandbox"))]
         "HAVE_FSTATVFS",
-        #[cfg(not(feature = "sandbox"))]
+        #[cfg(all(unix, not(feature = "sandbox")))]
         "HAVE_FTRUNCATE",
         "HAVE_FUTIMENS",
         "HAVE_FUTIMES",
@@ -2251,19 +2251,57 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // real fd mutation whenever HAVE_FTRUNCATE is advertised.  Shared
         // memory sizes its newly-created object through this call before
         // mapping it.
-        #[cfg(not(feature = "sandbox"))]
+        #[cfg(all(unix, not(feature = "sandbox")))]
         crate::module_ns_store(
             ns,
             "ftruncate",
             crate::make_builtin_function_with_arity(
                 "ftruncate",
                 |args| {
-                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                    let length =
-                        (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::off_t;
-                    let r = unsafe { libc::ftruncate(fd, length) };
-                    if r < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    // interp_posix.py:404 `@unwrap_spec(fd=c_int, length=r_longlong)`.
+                    // CPython 3.14's clinic gateway accepts `__index__` but not
+                    // `__int__`; that newer coercion wins over PyPy's legacy
+                    // `gateway_int_w` behavior.
+                    if args.len() != 2 {
+                        return Err(crate::PyError::type_error(format!(
+                            "ftruncate expected 2 arguments, got {}",
+                            args.len(),
+                        )));
+                    }
+                    let w_fd = crate::baseobjspace::space_index(args[0])?;
+                    let fd_value = crate::baseobjspace::int_w(w_fd).map_err(|err| {
+                        if err.kind == crate::PyErrorKind::OverflowError {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C int",
+                            )
+                        } else {
+                            err
+                        }
+                    })?;
+                    let fd = libc::c_int::try_from(fd_value).map_err(|_| {
+                        crate::PyError::overflow_error("Python int too large to convert to C int")
+                    })?;
+                    let w_length = crate::baseobjspace::space_index(args[1])?;
+                    let length = crate::baseobjspace::int_w(w_length).map_err(|err| {
+                        if err.kind == crate::PyErrorKind::OverflowError {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C long",
+                            )
+                        } else {
+                            err
+                        }
+                    })? as libc::off_t;
+                    // interp_posix.py:407-412: retry EINTR, propagate every
+                    // other OSError.
+                    loop {
+                        let r = unsafe { libc::ftruncate(fd, length) };
+                        if r == 0 {
+                            break;
+                        }
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(io_err(err, ""));
+                        }
                     }
                     Ok(pyre_object::w_none())
                 },
