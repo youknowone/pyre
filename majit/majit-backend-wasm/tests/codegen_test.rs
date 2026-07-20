@@ -11,6 +11,7 @@ use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use smallvec::smallvec;
+use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store};
 
 fn validate_wasm(bytes: &[u8]) {
     wasmparser::validate(bytes).expect("generated wasm should be valid");
@@ -235,6 +236,112 @@ fn build_module_default(
         Some(0),
         &codegen::GuardGcTypeInfo::default(),
     )
+}
+
+fn execute_ovf_trace_with_guard(
+    opcode: OpCode,
+    guard_opcode: OpCode,
+    a: i64,
+    b: i64,
+) -> (i64, i64) {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let guard = Op::new(guard_opcode, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]);
+    finish.setfailargs(smallvec![rb(OpRef::int_op(2))]);
+    let ops = vec![
+        make_op(
+            opcode,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        guard,
+        finish,
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(1, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &a.to_le_bytes(),
+        )
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            (codegen::FRAME_SLOT_BASE + 8) as usize,
+            &b.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let mut fail_index = [0; 8];
+    let mut result = [0; 8];
+    memory.read(&store, 0, &mut fail_index).unwrap();
+    memory
+        .read(&store, codegen::FRAME_SLOT_BASE as usize, &mut result)
+        .unwrap();
+    (i64::from_le_bytes(fail_index), i64::from_le_bytes(result))
+}
+
+fn execute_ovf_trace(opcode: OpCode, a: i64, b: i64) -> (i64, i64) {
+    execute_ovf_trace_with_guard(opcode, OpCode::GuardNoOverflow, a, b)
+}
+
+#[test]
+fn test_int_add_ovf_guards_overflow() {
+    for (a, b, expected) in [(10, 20, 30), (i64::MIN, 1, i64::MIN + 1)] {
+        assert_eq!(execute_ovf_trace(OpCode::IntAddOvf, a, b), (1, expected));
+    }
+    assert_eq!(execute_ovf_trace(OpCode::IntAddOvf, i64::MAX, 1).0, 0);
+}
+
+#[test]
+fn test_int_sub_ovf_guards_overflow() {
+    for (a, b, expected) in [(100, 58, 42), (i64::MAX, 1, i64::MAX - 1)] {
+        assert_eq!(execute_ovf_trace(OpCode::IntSubOvf, a, b), (1, expected));
+    }
+    assert_eq!(execute_ovf_trace(OpCode::IntSubOvf, i64::MIN, 1).0, 0);
+}
+
+#[test]
+fn test_int_mul_ovf_guards_overflow() {
+    for (a, b, expected) in [(6, 7, 42), (i64::MIN, 1, i64::MIN), (-9, -7, 63)] {
+        assert_eq!(execute_ovf_trace(OpCode::IntMulOvf, a, b), (1, expected));
+    }
+    for (a, b) in [(i64::MIN, -1), (i64::MAX, 2), (1_i64 << 62, 3)] {
+        assert_eq!(execute_ovf_trace(OpCode::IntMulOvf, a, b).0, 0);
+    }
+}
+
+#[test]
+fn test_guard_overflow_uses_pending_flag() {
+    assert_eq!(
+        execute_ovf_trace_with_guard(OpCode::IntAddOvf, OpCode::GuardOverflow, i64::MAX, 1,).0,
+        1
+    );
+    assert_eq!(
+        execute_ovf_trace_with_guard(OpCode::IntAddOvf, OpCode::GuardOverflow, 1, 2).0,
+        0
+    );
 }
 
 #[test]

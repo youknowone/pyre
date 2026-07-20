@@ -1565,6 +1565,7 @@ dependencies = [
  "smallvec",
  "wasm-bindgen",
  "wasm-encoder 0.245.1",
+ "wasmi",
  "wasmparser 0.225.0",
 ]
 

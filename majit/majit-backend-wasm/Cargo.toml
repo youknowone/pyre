@@ -34,3 +34,4 @@ wasm-bindgen = { workspace = true, optional = true }
 majit-ir = { workspace = true, features = ["test-support"] }
 wasmparser = { workspace = true }
 smallvec = { workspace = true }
+wasmi = "1.1"

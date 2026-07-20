@@ -1639,25 +1639,31 @@ fn build_function(
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
     // branches are retained solely for the direct-family-disabled baseline.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
-    // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
-    // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
-    // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`). One i32 local
-    // past those (`num_vars+UMULHI_SCRATCH+1`) holds the bridge table slot for
-    // the epilogue `call_indirect` dispatch (unused when `!bridge_dispatch`).
-    let bridge_slot_local = num_vars + UMULHI_SCRATCH + 1;
+    // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` i64 locals
+    // past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) for the `UintMulHigh`
+    // 32-bit-split expansion, plus one i64 local for the pending overflow flag.
+    // One i32 local past those holds the bridge table slot for the epilogue
+    // `call_indirect` dispatch (unused when `!bridge_dispatch`).
+    let ovf_flag_local = num_vars + UMULHI_SCRATCH + 1;
+    let bridge_slot_local = num_vars + UMULHI_SCRATCH + 2;
     // The self-recursive CALL_ASSEMBLER arm needs two more i32 scratch locals:
     // `ca_cfp_local` (the current callee frame pointer) and `ca_fi_local` (the
     // returned frame[0] fail index). Reserve them only under `emit_ca` so a
     // flag-off module keeps exactly one i32 local (byte-identical).
-    let ca_cfp_local = num_vars + UMULHI_SCRATCH + 2;
-    let ca_fi_local = num_vars + UMULHI_SCRATCH + 3;
+    let ca_cfp_local = num_vars + UMULHI_SCRATCH + 3;
+    let ca_fi_local = num_vars + UMULHI_SCRATCH + 4;
     // Extra i32 scratches when the inline nursery-bump fast path is armed:
     // one holds the loaded `nursery_free` across the bump/commit sequence;
     // runtime varsize array allocation also needs one for the computed
     // total/new-free word.
     let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
-    let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 1 + base_i32_locals;
+    let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 2 + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
+    debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
+    debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
+    debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
+    debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
+    debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
     debug_assert_eq!(value_types.len(), num_vars as usize);
     let mut locals = Vec::new();
     let mut start = 0;
@@ -1671,9 +1677,9 @@ fn build_function(
         start = end;
     }
     if let Some((count, ValType::I64)) = locals.last_mut() {
-        *count += UMULHI_SCRATCH;
+        *count += UMULHI_SCRATCH + 1;
     } else {
-        locals.push((UMULHI_SCRATCH, ValType::I64));
+        locals.push((UMULHI_SCRATCH + 1, ValType::I64));
     }
     locals.push((
         base_i32_locals
@@ -1807,6 +1813,7 @@ fn build_function(
     let mut guard_idx = fail_index_base;
     let mut in_loop_body = false;
     let mut labels_passed = 0usize;
+    let mut ovf_flag_live = false;
 
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label && key_dispatch {
@@ -2093,23 +2100,39 @@ fn build_function(
             }
             OpCode::GuardNoOverflow => {
                 // RPython: 0 args — overflow flag implicit from preceding ovf op.
-                // Wasm MVP doesn't detect overflow, so always passes.
+                // If the optimizer proved the operation cannot overflow, the
+                // overflow op is absent and this guard is redundant.
+                if !ovf_flag_live {
+                    guard_idx += 1;
+                    continue;
+                }
+                ovf_flag_live = false;
+                sink.local_get(ovf_flag_local);
+                sink.i64_const(0);
+                sink.i64_ne();
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardOverflow => {
-                // Always fails (no overflow detected in wasm MVP).
-                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
-                match block_exit_depth {
-                    Some(d) => {
-                        sink.br(d);
-                    }
-                    // Straight-line: return directly so the following ops and
-                    // the terminal Finish do not overwrite this exit.
-                    None => {
-                        sink.local_get(0);
-                        sink.return_();
-                    }
-                }
+                assert!(ovf_flag_live, "GuardOverflow without preceding overflow op");
+                ovf_flag_live = false;
+                sink.local_get(ovf_flag_local);
+                sink.i64_eqz();
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardNotInvalidated => {
@@ -2220,13 +2243,37 @@ fn build_function(
 
             // Overflow variants: compute result + overflow flag
             OpCode::IntAddOvf => {
-                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Add)
+                ovf_flag_live = emit_ovf_binop(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op,
+                    BinOp::I64Add,
+                    num_vars,
+                    ovf_flag_local,
+                );
             }
             OpCode::IntSubOvf => {
-                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Sub)
+                ovf_flag_live = emit_ovf_binop(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op,
+                    BinOp::I64Sub,
+                    num_vars,
+                    ovf_flag_local,
+                );
             }
             OpCode::IntMulOvf => {
-                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Mul)
+                ovf_flag_live = emit_ovf_binop(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op,
+                    BinOp::I64Mul,
+                    num_vars,
+                    ovf_flag_local,
+                );
             }
 
             // ── Integer comparisons (signed) ──
@@ -4634,6 +4681,7 @@ fn emit_guard_exit(
 
 // ── Binary ops ──
 
+#[derive(Clone, Copy)]
 enum BinOp {
     I64Add,
     I64Sub,
@@ -4720,6 +4768,17 @@ fn emit_umulhi(
     if OpRef::raw_is_constant(vi) {
         return;
     }
+    emit_umulhi_to_local(sink, constants, value_types, op, num_vars, 1 + vi);
+}
+
+fn emit_umulhi_to_local(
+    sink: &mut InstructionSink<'_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
+    op: &Op,
+    num_vars: u32,
+    output_local: u32,
+) {
     const MASK32: i64 = 0xFFFF_FFFF;
     let al = num_vars + 1;
     let ah = num_vars + 2;
@@ -4779,22 +4838,86 @@ fn emit_umulhi(
     sink.i64_shr_u();
     sink.i64_add();
 
-    sink.local_set(1 + vi);
+    sink.local_set(output_local);
 }
 
-/// Overflow binary op: stores result in pos, overflow flag convention.
-/// The overflow flag is not stored separately — GuardNoOverflow/GuardOverflow
-/// is handled by checking after the fact (simplified for wasm MVP).
+/// Overflow binary op: stores the wrapping result in pos and the signed
+/// overflow flag in the dedicated scratch local.
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &[ValType],
     op: &Op,
     binop: BinOp,
-) {
-    // For wasm MVP, just compute the result without overflow detection.
-    // GuardNoOverflow/GuardOverflow are treated as always-pass.
-    emit_binop(sink, constants, value_types, op, binop);
+    num_vars: u32,
+    ovf_flag_local: u32,
+) -> bool {
+    let vi = op.pos.get().raw();
+    if OpRef::raw_is_constant(vi) {
+        return false;
+    }
+    let result_local = 1 + vi;
+
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    apply_binop(sink, binop);
+    sink.local_set(result_local);
+
+    match binop {
+        BinOp::I64Add => {
+            // ((a ^ result) & (b ^ result)) >>s 63
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.local_get(result_local);
+            sink.i64_xor();
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.local_get(result_local);
+            sink.i64_xor();
+            sink.i64_and();
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            sink.local_set(ovf_flag_local);
+        }
+        BinOp::I64Sub => {
+            // ((a ^ b) & (a ^ result)) >>s 63
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.i64_xor();
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.local_get(result_local);
+            sink.i64_xor();
+            sink.i64_and();
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            sink.local_set(ovf_flag_local);
+        }
+        BinOp::I64Mul => {
+            // Convert the unsigned high word to the signed high word:
+            // smulhi = umulhi - ((a >>s 63) & b) - ((b >>s 63) & a).
+            let high_local = num_vars + 1;
+            emit_umulhi_to_local(sink, constants, value_types, op, num_vars, high_local);
+            sink.local_get(high_local);
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.i64_and();
+            sink.i64_sub();
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.i64_and();
+            sink.i64_sub();
+            sink.local_get(result_local);
+            sink.i64_const(63);
+            sink.i64_shr_s();
+            sink.i64_ne();
+            sink.i64_extend_i32_u();
+            sink.local_set(ovf_flag_local);
+        }
+        _ => unreachable!("overflow emitter requires add, sub, or mul"),
+    }
+    true
 }
 
 // ── Comparison ops ──
