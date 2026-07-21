@@ -247,7 +247,10 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let mut startup_mark = std::time::Instant::now();
     let mut startup_lap = |label: &str| {
         if startup_trace {
-            eprintln!("[startup] {label} {:.1}ms", startup_mark.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[startup] {label} {:.1}ms",
+                startup_mark.elapsed().as_secs_f64() * 1e3
+            );
             startup_mark = std::time::Instant::now();
         }
     };

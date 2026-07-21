@@ -2681,10 +2681,7 @@ fn build_function(
             // as Array(Char) and routes these through the descr-driven
             // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops; decline
             // them (interpreter fallback) rather than ship a wrong hardcoded read.
-            OpCode::Strlen
-            | OpCode::Unicodelen
-            | OpCode::Strgetitem
-            | OpCode::Unicodegetitem => {
+            OpCode::Strlen | OpCode::Unicodelen | OpCode::Strgetitem | OpCode::Unicodegetitem => {
                 return Err(BackendError::Unsupported(format!(
                     "wasm codegen: string/unicode direct-memory op {:?} (no descr-driven layout)",
                     op.opcode
@@ -2937,7 +2934,12 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.i64_load(mem64(vtable_off as u64));
                     sink.i32_wrap_i64();
-                    emit_sized_int_load(&mut sink, offset2 as u64, std::mem::size_of::<usize>(), true);
+                    emit_sized_int_load(
+                        &mut sink,
+                        offset2 as u64,
+                        std::mem::size_of::<usize>(),
+                        true,
+                    );
                 } else {
                     // assembler.py:1957-1969 gcremovetypeptr path.
                     //     MOV32 loc_tmp, mem(loc_object, 0)
