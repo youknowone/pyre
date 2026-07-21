@@ -1086,7 +1086,9 @@ pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let mut result = Wtf8Buf::with_capacity(sa.len() + sb.len());
     result.push_wtf8(sa);
     result.push_wtf8(sb);
-    Ok(w_str_from_wtf8(result))
+    // Concatenation is a dominant dynamic-churn producer; its result lives in
+    // GC-traced slots (locals, list/dict/set members), so make it collectable.
+    Ok(w_str_from_wtf8_managed(result))
 }
 
 /// Extract a non-negative repeat count from an int or long.
@@ -1139,7 +1141,8 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
         out.extend_from_slice(bytes);
     }
     let buf = Wtf8Buf::from_bytes(out).expect("repetition of WTF-8 is WTF-8");
-    Ok(w_str_from_wtf8(buf))
+    // Repetition churns fresh dynamic strings; make the result collectable.
+    Ok(w_str_from_wtf8_managed(buf))
 }
 
 pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {

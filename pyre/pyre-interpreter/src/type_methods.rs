@@ -737,7 +737,8 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(*item) });
     }
-    Ok(pyre_object::w_str_from_wtf8(out))
+    // `str.join` is a dominant dynamic-churn producer; make the result collectable.
+    Ok(pyre_object::w_str_from_wtf8_managed(out))
 }
 
 /// `str.split` / `str.rsplit` take `sep` and `maxsplit` positionally or by
@@ -1372,7 +1373,8 @@ fn str_method_format_core(
         &mut numbering,
         2,
     )?;
-    Ok(pyre_object::w_str_from_wtf8(rendered))
+    // `str.format` / `%` rendering is a dominant dynamic-churn producer.
+    Ok(pyre_object::w_str_from_wtf8_managed(rendered))
 }
 
 /// `newformat.py Formatter.format` rendering pass.  Renders the
@@ -2238,15 +2240,16 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         String::new()
     };
     if spec.is_empty() {
-        // `str(self)` — a str self passes through as WTF-8.
+        // `str(self)` — a str self passes through as WTF-8. Dynamic result:
+        // collectable.
         if unsafe { pyre_object::is_str(args[0]) } {
-            return Ok(pyre_object::w_str_from_wtf8(unsafe {
+            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                 crate::display::py_str_wtf8(args[0])?
             }));
         }
-        return Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }));
+        return Ok(pyre_object::w_str_new_managed(&unsafe { crate::py_str(args[0])? }));
     }
-    Ok(pyre_object::w_str_from_wtf8(format_with_spec_public(
+    Ok(pyre_object::w_str_from_wtf8_managed(format_with_spec_public(
         args[0], &spec,
     )?))
 }

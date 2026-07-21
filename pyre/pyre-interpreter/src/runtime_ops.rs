@@ -615,7 +615,8 @@ pub fn build_string_from_refs(parts: &[PyObjectRef]) -> PyObjectRef {
             }
         }
     }
-    pyre_object::w_str_from_wtf8(result)
+    // BUILD_STRING / f-string result is a fresh dynamic string; make it collectable.
+    pyre_object::w_str_from_wtf8_managed(result)
 }
 
 /// CONVERT_VALUE conversion code, shared by the interpreter and the JIT
@@ -640,14 +641,14 @@ pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
 pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
     if conv == 0 || conv == 3 {
         let w = unsafe { crate::py_str_wtf8(value)? };
-        return Ok(pyre_object::w_str_from_wtf8(w));
+        return Ok(pyre_object::w_str_from_wtf8_managed(w));
     }
     let s = match conv {
         1 => unsafe { crate::py_repr(value)? },
         2 => crate::builtins::py_ascii(value)?,
         _ => unsafe { crate::py_str(value)? },
     };
-    Ok(pyre_object::w_str_new(&s))
+    Ok(pyre_object::w_str_new_managed(&s))
 }
 
 /// FORMAT_SIMPLE / FORMAT_WITH_SPEC evaluation, shared by the interpreter
@@ -668,7 +669,7 @@ pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef
         }
     };
     let s = crate::type_methods::format_value_dispatch(value, &spec_str)?;
-    Ok(pyre_object::w_str_from_wtf8(s))
+    Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
 /// STORE_SLICE evaluation (`obj[start:stop] = value`): builds a `slice`
@@ -740,7 +741,8 @@ pub fn binary_slice_values(
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
             let part = rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
                 .expect("code-point-aligned slice is WTF-8");
-            return Ok(pyre_object::w_str_from_wtf8(part.to_wtf8_buf()));
+            // Substring slicing churns fresh dynamic strings; make it collectable.
+            return Ok(pyre_object::w_str_from_wtf8_managed(part.to_wtf8_buf()));
         }
         if pyre_object::is_tuple(obj) {
             let len = pyre_object::w_tuple_len(obj) as i64;

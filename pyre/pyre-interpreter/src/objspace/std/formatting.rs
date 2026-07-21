@@ -105,7 +105,8 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
         ));
     }
 
-    Ok(w_str_from_wtf8(result))
+    // `str % args` printf formatting is a dominant dynamic-churn producer.
+    Ok(w_str_from_wtf8_managed(result))
 }
 
 pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {

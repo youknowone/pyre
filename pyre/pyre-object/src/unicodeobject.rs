@@ -81,12 +81,18 @@ impl crate::lltype::GcType for W_UnicodeObject {
     const SIZE: usize = W_UNICODE_OBJECT_SIZE;
 }
 
-/// Allocate a new W_UnicodeObject on the heap.
+/// Allocate a new exact `str` W_UnicodeObject from a Rust `&str`.
 ///
-/// Uses `Box::leak` for simplicity (objects are never freed).
-/// The inner `Wtf8Buf` is also `Box::into_raw`'d so it can be recovered.
-/// `from_string` takes ownership of the bytes with no copy or
-/// re-validation (every `&str` is already valid WTF-8).
+/// Exact strings are **immortal** by default: the header is `malloc_typed`
+/// (off-GC, never swept) and the inner `Wtf8Buf` is `malloc_raw`
+/// (`Box::into_raw`), so nothing reclaims them — the safe, structural-string
+/// default (dict keys, code constants, names all flow through here and must not
+/// be collectable, or the first collection would sweep them under the still-live
+/// immortal structures that hold them off the GC root graph).  Dynamic,
+/// short-lived strings that live only in GC-traced slots go through
+/// [`w_str_new_managed`] instead, which returns a collectable
+/// (`try_gc_alloc_stable`) header + GC value box.  `from_string` takes ownership
+/// of the bytes with no copy or re-validation (every `&str` is valid WTF-8).
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
 /// `box_str_constant` twin: the body runs a `str::chars` count plus an
@@ -110,11 +116,92 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// Collectable exact-`str` constructor for **dynamic, short-lived** strings
+/// (`str(int)`, concatenation, `%`/`format`, `join`, decode results) that live
+/// only in GC-traced slots (list/dict values, frame locals, instance attrs).
+///
+/// Config (b) of the exact-str split: the header is `try_gc_alloc_stable`
+/// (born-old, collectable) and the value is a GC-managed [`UnicodeValueStorage`]
+/// box greyed by the header's `value` gc-pointer edge and reclaimed by the box
+/// tid's drop glue on sweep (tid 34 carries **no** header destructor — the box
+/// is the sole reclaimer).  Gated on `gc_interp::enabled()`; when off (native
+/// default) or the alloc hook is absent it falls back to the immortal
+/// [`w_str_from_wtf8_immortal`] so a managed header never pairs with a
+/// non-greyable value.  Mirrors [`w_str_subclass_from_wtf8`]'s value handling.
+pub fn w_str_new_managed(s: &str) -> PyObjectRef {
+    w_str_from_wtf8_managed(Wtf8Buf::from_string(s.to_string()))
+}
+
 /// Allocate a new W_UnicodeObject from a WTF-8 buffer that may carry lone
 /// surrogate code points (produced by surrogateescape / surrogatepass
 /// decoding).  `byte_len` is the WTF-8 byte count, `len` the code point
 /// count (which counts each surrogate as one code point).
 pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
+    let byte_len = value.len();
+    let char_len = value.code_points().count();
+    let value = crate::lltype::malloc_raw(value);
+    crate::lltype::malloc_typed(W_UnicodeObject {
+        ob_header: PyObject {
+            ob_type: &STR_TYPE as *const PyType,
+            w_class: get_instantiate(&STR_TYPE),
+        },
+        value,
+        byte_len,
+        len: char_len,
+    }) as PyObjectRef
+}
+
+/// Collectable `w_str_from_wtf8` for dynamic strings — see [`w_str_new_managed`].
+///
+/// Builds config (b): a GC value box (greyed by the header `value` edge, tid 34
+/// has no destructor) under a `try_gc_alloc_stable` header.  Value box is
+/// allocated **before** the header (matching [`w_str_subclass_from_wtf8`]) so a
+/// header-alloc minor collection cannot observe a half-initialised header.
+/// Falls back to fully immortal when `gc_interp` is off or the hook is absent,
+/// keeping the header/value ownership consistent (a `malloc_typed` header must
+/// not hold a GC value box it cannot grey).
+pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
+    // Config (b) needs a registered value-box tid so the header greys a GC box,
+    // not a `malloc_raw` buffer it can never reclaim; fall back to immortal until
+    // both the collector path and the value tid are live.
+    if !crate::gc_interp::enabled() || unicode_value_gc_type_id() == 0 {
+        return w_str_from_wtf8_immortal(value);
+    }
+    let byte_len = value.len();
+    let char_len = value.code_points().count();
+    let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
+    let unicode = W_UnicodeObject {
+        ob_header: PyObject {
+            ob_type: &STR_TYPE as *const PyType,
+            w_class: get_instantiate(&STR_TYPE),
+        },
+        value,
+        byte_len,
+        len: char_len,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    if raw.is_null() {
+        // Hook vanished after the value box: `value` is a GC box that only a
+        // GC-managed header can keep alive, so recover the bytes and rebuild a
+        // fully immortal string rather than pair it with a `malloc_typed` header.
+        let recovered = unsafe { *Box::from_raw(value) };
+        return w_str_from_wtf8_immortal(recovered);
+    }
+    crate::gc_interp::note_alloc();
+    unsafe {
+        std::ptr::write(raw as *mut W_UnicodeObject, unicode);
+        raw as PyObjectRef
+    }
+}
+
+/// Immortal `w_str_from_wtf8`: always allocates through `malloc_typed`,
+/// bypassing the `gc_interp` gate so the result is never collected.
+///
+/// `box_str_constant` stores its result as a bare `usize` in the thread-local
+/// `STRING_CONSTANT_CACHE`, which is not a GC root; a collectable interned
+/// constant would be swept out from under the cache (use-after-free).  Interned
+/// constants are bounded, so keeping them immortal is the intended split.
+pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
     let byte_len = value.len();
     let char_len = value.code_points().count();
     let value = crate::lltype::malloc_raw(value);
@@ -183,7 +270,7 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
         if let Some(&cached) = cache.borrow().get(value) {
             return cached as PyObjectRef;
         }
-        let obj = w_str_from_wtf8(value.to_owned());
+        let obj = w_str_from_wtf8_immortal(value.to_owned());
         cache.borrow_mut().insert(value.to_owned(), obj as usize);
         obj
     })
@@ -271,7 +358,9 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
         let mut result = Wtf8Buf::with_capacity(sa.len() + sb.len());
         result.push_wtf8(sa);
         result.push_wtf8(sb);
-        w_str_from_wtf8(result) as i64
+        // Concatenation result is a dynamic, short-lived string (the `a + b`
+        // churn the RSS leak is dominated by); make it collectable.
+        w_str_from_wtf8_managed(result) as i64
     }
 }
 
@@ -285,7 +374,7 @@ pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
         for _ in 0..count {
             result.push_wtf8(sv);
         }
-        w_str_from_wtf8(result) as i64
+        w_str_from_wtf8_managed(result) as i64
     }
 }
 
@@ -324,7 +413,7 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
 /// identity, mirroring `ll_str` on a string).
 #[majit_macros::elidable]
 pub extern "C" fn jit_int_str(v: i64) -> i64 {
-    w_str_new(&v.to_string()) as i64
+    w_str_new_managed(&v.to_string()) as i64
 }
 
 #[cfg(test)]
