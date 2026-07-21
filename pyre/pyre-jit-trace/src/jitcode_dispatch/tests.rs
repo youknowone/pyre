@@ -604,7 +604,7 @@ fn regular_record_table_is_the_sole_dispatcher() {
 fn drive_int_add_jump_if_ovf(
     lhs_value: i64,
     rhs_value: i64,
-) -> (Vec<OpCode>, usize, bool, OpRef, OpRef, usize) {
+) -> (Vec<OpCode>, usize, bool, u32, OpRef, OpRef, usize) {
     let opname = "int_add_jump_if_ovf/Lii>i";
     let ovf_byte = *insns_opname_to_byte()
         .get(opname)
@@ -674,11 +674,19 @@ fn drive_int_add_jump_if_ovf(
     let opcodes = ops.iter().map(|op| op.opcode).collect();
     let guard_num_args = ops[1].num_args();
     let guard_has_snapshot = ops[1].rd_resume_position.get() >= 0;
+    let guard_resume_pc = tc
+        .get_snapshot(ops[1].rd_resume_position.get())
+        .expect("overflow guard snapshot must exist")
+        .frames
+        .last()
+        .expect("overflow guard snapshot must contain its frame")
+        .pc;
     let resbox = ops[0].pos.get();
     (
         opcodes,
         guard_num_args,
         guard_has_snapshot,
+        guard_resume_pc,
         resbox,
         dst,
         next_pc,
@@ -687,24 +695,73 @@ fn drive_int_add_jump_if_ovf(
 
 #[test]
 fn int_add_jump_if_ovf_no_overflow_records_guard_no_overflow_and_writes_dst() {
-    let (opcodes, guard_num_args, guard_has_snapshot, resbox, dst, next_pc) =
+    let (opcodes, guard_num_args, guard_has_snapshot, guard_resume_pc, resbox, dst, next_pc) =
         drive_int_add_jump_if_ovf(40, 2);
     assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardNoOverflow],);
     assert_eq!(guard_num_args, 0, "GuardNoOverflow is operand-less");
     assert!(guard_has_snapshot);
+    assert_eq!(
+        guard_resume_pc, 0,
+        "the guard resumes at the overflow opcode"
+    );
     assert_eq!(next_pc, 6, "no overflow continues at op.next_pc");
     assert_eq!(dst, resbox, "the no-overflow continue writes resbox to dst");
 }
 
 #[test]
 fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
-    let (opcodes, guard_num_args, guard_has_snapshot, _, dst, next_pc) =
+    let (opcodes, guard_num_args, guard_has_snapshot, guard_resume_pc, _, dst, next_pc) =
         drive_int_add_jump_if_ovf(i64::MAX, 1);
     assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardOverflow],);
     assert_eq!(guard_num_args, 0, "GuardOverflow is operand-less");
     assert!(guard_has_snapshot);
+    assert_eq!(
+        guard_resume_pc, 0,
+        "the guard resumes at the overflow opcode"
+    );
     assert_eq!(dst, OpRef::NONE, "the overflow jump does not write dst");
     assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+}
+
+#[test]
+fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
+    let byte = *insns_opname_to_byte()
+        .get("int_add_jump_if_ovf/Lii>i")
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let code = [byte, 6, 0, 0, 1, 2];
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_int(40);
+    let rhs = tc.const_int(2);
+    let mut regs_i = [lhs, rhs, OpRef::NONE];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("constant overflow arithmetic must fold");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    assert_eq!(
+        tc.num_ops(),
+        0,
+        "folding emits neither an ovf op nor a guard"
+    );
+    assert_eq!(regs_i[2].inline_const_to_value(), Some(Value::Int(42)));
+}
+
+#[test]
+fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("int_add_jump_if_ovf/Lii>i")
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let code = [byte, 6, 0, 0, 1, 2];
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let lhs = OpRef::input_arg_int(0);
+    let rhs = OpRef::input_arg_int(1);
+    let mut regs_i = [lhs, rhs, OpRef::NONE];
+    let err = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect_err("an unstamped overflow operand must decline");
+    assert_eq!(
+        err,
+        DispatchError::IntOvfOperandNotConcrete { pc: 0, value: lhs }
+    );
+    assert_eq!(tc.num_ops(), 0, "a declined overflow jump records nothing");
 }
 
 /// Drive one of the `d>r` struct-allocation handlers (`new`,
@@ -915,6 +972,99 @@ fn assert_not_none_declines_when_the_operand_has_no_concrete() {
         tc.num_ops(),
         ops_before,
         "a declined step must not leave a recorded op behind"
+    );
+}
+
+#[test]
+fn assert_not_none_uses_known_nonnull_heapcache_without_a_ref_shadow() {
+    let byte = *insns_opname_to_byte()
+        .get("assert_not_none/r")
+        .expect("`assert_not_none/r` must be in insns table");
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.heap_cache_mut().new_object(operand);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("a heapcache-known allocation needs no ref shadow");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the known-nonnull fast path records no AssertNotNone"
+    );
+}
+
+#[test]
+fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_int_eq/iiL")
+        .expect("`goto_if_not_int_eq/iiL` must be in insns table");
+    let code = [byte, 0x00, 0x00, 0x09, 0x00];
+    let mut same_tc = TraceCtx::for_test_types(&[Type::Int]);
+    let same = OpRef::input_arg_int(0);
+    let mut same_regs = [same];
+    let (_, same_next) = run_hint_step(&code, &mut same_tc, &mut [], &mut [], &mut same_regs)
+        .expect("a same-box equality has a static direction");
+    assert_eq!(same_next, code.len());
+    assert_eq!(
+        same_tc.num_ops(),
+        0,
+        "same-box equality records no compare or guard"
+    );
+
+    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let mut const_tc = fresh_trace_ctx();
+    let lhs = const_tc.const_int(4);
+    let rhs = const_tc.const_int(5);
+    let mut const_regs = [lhs, rhs];
+    let (_, const_next) = run_hint_step(&code, &mut const_tc, &mut [], &mut [], &mut const_regs)
+        .expect("constant equality has a static direction");
+    assert_eq!(const_next, 9);
+    assert_eq!(
+        const_tc.num_ops(),
+        0,
+        "constant equality records no compare or guard"
+    );
+
+    let ptr_byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_ne/rrL")
+        .expect("`goto_if_not_ptr_ne/rrL` must be in insns table");
+    let ptr_code = [ptr_byte, 0x00, 0x00, 0x09, 0x00];
+    let mut ptr_tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let same_ptr = OpRef::input_arg_ref(0);
+    let mut ptr_regs = [same_ptr];
+    let (_, ptr_next) = run_hint_step(&ptr_code, &mut ptr_tc, &mut ptr_regs, &mut [], &mut [])
+        .expect("a same-box pointer inequality has a static direction");
+    assert_eq!(ptr_next, 9);
+    assert_eq!(
+        ptr_tc.num_ops(),
+        0,
+        "same-box pointer inequality records no compare or guard"
+    );
+}
+
+#[test]
+fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_eq/rrL")
+        .expect("`goto_if_not_ptr_eq/rrL` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let lhs = OpRef::input_arg_ref(0);
+    let rhs = OpRef::input_arg_ref(1);
+    let mut regs_r = [lhs, rhs];
+    let ptr = 0xdead_beef_usize as *mut pyre_object::pyobject::PyObject;
+    let mut concrete_r = [ConcreteValue::Ref(ptr), ConcreteValue::Ref(ptr)];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("ref shadows determine the pointer comparison direction");
+    assert_eq!(next_pc, code.len());
+    assert_eq!(
+        tc.ops().iter().map(|op| op.opcode).collect::<Vec<_>>(),
+        vec![OpCode::PtrEq, OpCode::GuardTrue]
     );
 }
 
@@ -10355,6 +10505,77 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(next, code.len());
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
+}
+
+#[test]
+fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
+    let byte = *insns_opname_to_byte()
+        .get("jit_merge_point/iIRFIRF")
+        .expect("`jit_merge_point/iIRFIRF` must be in insns table");
+    let code = [
+        byte, 0x02, // jdindex is in i2, not the literal value 2
+        0x01, 0x00, // gi: [i0]
+        0x01, 0x00, // gr: [r0]
+        0x00, // gf
+        0x00, // ri
+        0x00, // rr
+        0x00, // rf
+    ];
+    let pycode_ptr = 0x1_0000usize;
+    let mut tc = TraceCtx::for_test_types_with_green_key(
+        &[Type::Ref],
+        crate::driver::make_green_key(pycode_ptr as *const (), 42),
+    );
+    let next_instr = tc.const_int(42);
+    let unused = tc.const_int(99);
+    let jdindex = tc.const_int(0);
+    let pycode = tc.const_ref(pycode_ptr as i64);
+    let mut regs_i = [next_instr, unused, jdindex];
+    let mut regs_r = [pycode];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.trace_ctx.seen_loop_header_for_jdindex = 0;
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int-form merge point must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, code.len());
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
 }
 
 /// A green list with no concrete leading element cannot form the

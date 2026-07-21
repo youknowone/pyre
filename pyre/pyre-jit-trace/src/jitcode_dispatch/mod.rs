@@ -1316,6 +1316,10 @@ pub enum DispatchError {
     /// or decide whether to jump to the label target, so surface the
     /// missing concrete explicitly instead of guessing.
     GotoIfNotValueNotConcrete { pc: usize, value: OpRef },
+    /// An overflow-checking integer jump needs both operands' runtime values
+    /// to choose the overflow arm. Decline when either value is unavailable
+    /// instead of crashing the tracer.
+    IntOvfOperandNotConcrete { pc: usize, value: OpRef },
     /// `OS_NOT_IN_TRACE` must run the callee concretely and record no
     /// IR on the normal path (`pyjitpl.py`). The standalone
     /// symbolic walker has no concrete executor, so it must stop here
@@ -1460,8 +1464,8 @@ pub enum DispatchError {
     /// `pyjitpl.py get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
-    /// `loop_header/i` could not resolve its jdindex operand to a
-    /// concrete Int. The assembler always encodes the jdindex as a
+    /// `loop_header/i` or `jit_merge_point/iIRFIRF` could not resolve its
+    /// jdindex operand to a concrete Int. The assembler encodes the jdindex as a
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
     /// `add_const_i` + patch at `finish()`), so an unresolved slot is a
     /// structural encoding bug, mirroring the `expect` on
@@ -1582,6 +1586,7 @@ impl DispatchError {
             Self::ExpectedSwitchDescr { .. } => "ExpectedSwitchDescr",
             Self::SwitchValueNotConcrete { .. } => "SwitchValueNotConcrete",
             Self::GotoIfNotValueNotConcrete { .. } => "GotoIfNotValueNotConcrete",
+            Self::IntOvfOperandNotConcrete { .. } => "IntOvfOperandNotConcrete",
             Self::NotInTraceRequiresConcreteExecution { .. } => {
                 "NotInTraceRequiresConcreteExecution"
             }
@@ -7107,35 +7112,26 @@ fn int_ovf_jump<Sym: WalkSym>(
     let b1 = read_int_reg(code, op, 2, ctx)?;
     let b2 = read_int_reg(code, op, 3, ctx)?;
     let dst = code[op.pc + 5] as usize;
-    let both_constant = b1.is_constant() && b2.is_constant();
-    let (resbox, overflow) = record_int_ovf(ctx, opcode, b1, b2);
+    let (resbox, overflow) = record_int_ovf(ctx, op.pc, opcode, b1, b2)?;
 
     // `pyjitpl.py opimpl_int_add_jump_if_ovf` and
     // `pyjitpl.py handle_possible_overflow_error`: Const operands branch
     // without a guard; symbolic operands emit an operand-less overflow guard.
-    let (guard_opcode, taken_pc, other_pc, result_write) = if overflow {
-        (OpCode::GuardOverflow, target, op.next_pc, None)
+    let (guard_opcode, taken_pc, result_write) = if overflow {
+        (OpCode::GuardOverflow, target, None)
     } else {
-        (
-            OpCode::GuardNoOverflow,
-            op.next_pc,
-            target,
-            Some((dst, resbox)),
-        )
+        (OpCode::GuardNoOverflow, op.next_pc, Some((dst, resbox)))
     };
-    if both_constant {
+    if resbox.is_constant() {
         branch_without_guard(op, ctx, taken_pc, result_write)
     } else {
-        guarded_branch_core(
-            code,
-            op,
-            ctx,
-            guard_opcode,
-            &[],
-            taken_pc,
-            other_pc,
-            result_write,
-        )
+        ctx.trace_ctx.record_guard(guard_opcode, &[], 0);
+        // `handle_possible_overflow_error` resumes at `orgpc`: unlike
+        // `goto_if_not`, blackhole must re-execute the arithmetic opcode so
+        // the no-overflow path writes its result register.
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        write_branch_result(ctx, op.pc, result_write)?;
+        Ok((DispatchOutcome::Continue, taken_pc))
     }
 }
 
@@ -7295,7 +7291,9 @@ fn fused_goto_if_not_ptr<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_ref_reg(code, op, 0, ctx)?;
     let b = read_ref_reg(code, op, 1, ctx)?;
-    let condbox = record_ptr_cmp(ctx, opcode, a, b);
+    let a_concrete = read_ref_reg_concrete(code, op, 0, ctx);
+    let b_concrete = read_ref_reg_concrete(code, op, 1, ctx);
+    let condbox = record_ptr_cmp(ctx, opcode, a, b, a_concrete, b_concrete);
     let switchcase = match ctx.trace_ctx.concrete_of_opref(condbox) {
         Some(Value::Int(v)) => v,
         _ => {
@@ -7842,18 +7840,28 @@ fn handle<Sym: WalkSym>(
         // Operand layout `r`: 1B ref reg.
         "assert_not_none/r" => {
             let opref = read_ref_reg(code, op, 0, ctx)?;
-            // `trace_assert_not_none` mirrors `executor.py do_assert_not_none`,
-            // which fatalerrors on a null operand — it can only be called with
-            // a concrete pointer in hand. The walker often has no shadow for a
-            // ref slot, and an absent shadow is not evidence of non-nullness,
-            // so decline rather than feed the check a value it did not observe.
-            let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
-                return Err(DispatchError::UnsupportedOpname {
-                    pc: op.pc,
-                    key: op.key,
-                });
+            let known_nonnull = ctx.trace_ctx.heap_cache().is_nullity_known(opref, |op| {
+                op.inline_const_to_value().and_then(|value| match value {
+                    Value::Int(value) => Some(value),
+                    Value::Ref(value) => Some(value.0 as i64),
+                    _ => None,
+                })
+            }) == Some(true);
+            let concrete = if known_nonnull {
+                0
+            } else {
+                // `trace_assert_not_none` reaches `executor.py
+                // do_assert_not_none` on a cache miss, so only that path needs
+                // the pointer value. An absent shadow cannot prove non-nullness.
+                let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: op.key,
+                    });
+                };
+                ptr as i64
             };
-            ctx.trace_ctx.trace_assert_not_none(opref, ptr as i64);
+            ctx.trace_ctx.trace_assert_not_none(opref, concrete);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // Operand layout `ri`: 1B ref reg + 1B int reg holding the class
@@ -8595,9 +8603,9 @@ fn handle<Sym: WalkSym>(
             }
         }
         // The `i` spelling is what the assembler emits once the jitdriver
-        // index outstrips a signed byte; it still occupies exactly one
-        // operand byte (a patched const-pool index instead of the literal),
-        // and the body below only skips that byte, so both forms share it.
+        // index outstrips a signed byte. Its leading byte names an Int-bank
+        // slot containing the jdindex; the `c` spelling stores the jdindex
+        // directly in that byte.
         "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
@@ -8617,7 +8625,16 @@ fn handle<Sym: WalkSym>(
             // greens, and `next_instr` is the SAME Python-pc coordinate the
             // trace-start seed uses (`trace.rs add_merge_point(make_green_key(
             // w_code, start_pc))`) — no jitcode-pc/python-pc mismatch.
-            let mut off = 1usize; // skip jdindex (`c`)
+            let jdindex = if op.key == "jit_merge_point/iIRFIRF" {
+                let jd_opref = read_int_reg(code, op, 0, ctx)?;
+                match ctx.trace_ctx.concrete_of_opref(jd_opref) {
+                    Some(Value::Int(value)) => value as usize,
+                    _ => return Err(DispatchError::LoopHeaderJdIndexUnresolved { pc: op.pc }),
+                }
+            } else {
+                code[op.pc + 1] as i8 as usize
+            };
+            let mut off = 1usize; // skip the jdindex operand
             let (gi, n) = read_int_var_list(code, op, off, ctx)?;
             off += n;
             let (gr, n) = read_ref_var_list(code, op, off, ctx)?;
@@ -8779,9 +8796,8 @@ fn handle<Sym: WalkSym>(
             // the inner loop's green key so its specialized retrace can
             // never compile. Mirrors majit's `BC_JIT_MERGE_POINT` auto
             // loop-header + close protocol (`pyjitpl/dispatch.rs`).
-            // jdindex is the op's leading `c` byte (pyjitpl.py
-            // `jdindex = ord(self.jitcode.code[orgpc+1])`).
-            let jdindex = code[op.pc + 1] as i8 as usize;
+            // The `c` form's jdindex is the leading literal byte; the `i`
+            // form was resolved through its Int-bank operand above.
             // pyjitpl.py:2610-2626: a guard's resume coordinate
             // (`resumepc=orgpc`) lies INSIDE the guarded opcode's
             // implementation, past the dispatch-top `jit_merge_point`, so an

@@ -58,9 +58,21 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     a: OpRef,
     b: OpRef,
 ) -> OpRef {
-    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
-    // `_all_constants` / `b1 is b2` (`pyjitpl.py`);
-    // the recorded compare and downstream guard are optimizer-folded/strengthened.
+    if a == b {
+        let folded = match opcode {
+            OpCode::IntEq | OpCode::IntLe | OpCode::IntGe => 1,
+            OpCode::IntNe | OpCode::IntLt | OpCode::IntGt => 0,
+            _ => unreachable!("record_int_cmp requires an integer comparison opcode"),
+        };
+        return ctx.trace_ctx.const_int(folded);
+    }
+    if let (Some(Value::Int(la)), Some(Value::Int(rb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        return ctx
+            .trace_ctx
+            .const_int(majit_metainterp::eval_binop_i(opcode, la, rb));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -96,17 +108,22 @@ pub(crate) fn record_int_unary<Sym: WalkSym>(
 /// chooses the guard separately from the concrete overflow flag.
 pub(crate) fn record_int_ovf<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
     opcode: OpCode,
     b1: OpRef,
     b2: OpRef,
-) -> (OpRef, bool) {
+) -> Result<(OpRef, bool), DispatchError> {
     let v1 = match ctx.trace_ctx.concrete_of_opref(b1) {
         Some(Value::Int(value)) => value,
-        _ => unreachable!("int ovf jump operand b1 must have a concrete integer value"),
+        _ => {
+            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b1 });
+        }
     };
     let v2 = match ctx.trace_ctx.concrete_of_opref(b2) {
         Some(Value::Int(value)) => value,
-        _ => unreachable!("int ovf jump operand b2 must have a concrete integer value"),
+        _ => {
+            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b2 });
+        }
     };
     let (wrapping_result, overflow) = match opcode {
         OpCode::IntAddOvf => (v1.wrapping_add(v2), v1.checked_add(v2).is_none()),
@@ -114,10 +131,13 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
         OpCode::IntMulOvf => (v1.wrapping_mul(v2), v1.checked_mul(v2).is_none()),
         _ => unreachable!("record_int_ovf requires an IntAddOvf/IntSubOvf/IntMulOvf opcode"),
     };
+    if b1.is_constant() && b2.is_constant() {
+        return Ok((ctx.trace_ctx.const_int(wrapping_result), overflow));
+    }
     let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
     ctx.trace_ctx
         .set_opref_concrete(resbox, Value::Int(wrapping_result));
-    (resbox, overflow)
+    Ok((resbox, overflow))
 }
 
 /// RPython `pyjitpl.py opimpl_int_between`:
@@ -294,19 +314,44 @@ pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
     opcode: OpCode,
     a: OpRef,
     b: OpRef,
+    a_concrete: ConcreteValue,
+    b_concrete: ConcreteValue,
 ) -> OpRef {
-    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
-    // `_all_constants` / `b1 is b2` (`pyjitpl.py`);
-    // the recorded compare and downstream guard are optimizer-folded/strengthened.
+    if a == b {
+        return ctx.trace_ctx.const_int(match opcode {
+            OpCode::PtrEq => 1,
+            OpCode::PtrNe => 0,
+            _ => unreachable!("record_ptr_cmp requires PtrEq or PtrNe"),
+        });
+    }
+    if let (Some(Value::Ref(la)), Some(Value::Ref(rb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        return ctx.trace_ctx.const_int(match opcode {
+            OpCode::PtrEq => (la == rb) as i64,
+            OpCode::PtrNe => (la != rb) as i64,
+            _ => unreachable!("record_ptr_cmp requires PtrEq or PtrNe"),
+        });
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
-    if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
+    let folded = if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
     {
-        let folded = match opcode {
+        Some(match opcode {
             OpCode::PtrEq => (la == rb) as i64,
             OpCode::PtrNe => (la != rb) as i64,
             _ => panic!("record_ptr_cmp: unsupported opcode {opcode:?}"),
-        };
+        })
+    } else if let (ConcreteValue::Ref(la), ConcreteValue::Ref(rb)) = (a_concrete, b_concrete) {
+        Some(match opcode {
+            OpCode::PtrEq => (la == rb) as i64,
+            OpCode::PtrNe => (la != rb) as i64,
+            _ => panic!("record_ptr_cmp: unsupported opcode {opcode:?}"),
+        })
+    } else {
+        None
+    };
+    if let Some(folded) = folded {
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
