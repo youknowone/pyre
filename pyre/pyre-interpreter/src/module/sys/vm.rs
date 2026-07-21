@@ -1057,77 +1057,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.warnoptions
     module_ns_store(ns, "warnoptions", w_list_new(vec![]));
     // sys.builtin_module_names — tuple of names of modules compiled into
-    // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names.
-    // Pyre: include all stub/native built-ins from importing.rs. The host-access
-    // modules importing.rs omits under `sandbox` are gated out here too, so the
-    // advertised set matches what is actually importable.
-    #[allow(unused_mut)]
-    let mut builtin_names = vec![
-        "__pypy__",
-        "_abc",
-        "_bisect",
-        "_blake2",
-        "_codecs",
-        "_collections",
-        "_collections_abc",
-        "_contextvars",
-        "_csv",
-        "_datetime",
-        "_decimal",
-        "_functools",
-        "_hashlib",
-        "_heapq",
-        "_imp",
-        "_io",
-        "_json",
-        "_locale",
-        "_md5",
-        "_opcode",
-        "_operator",
-        "_pickle",
-        "_random",
-        "_sha1",
-        "_sha2",
-        "_sha3",
-        "_signal",
-        "_socket",
-        "_sre",
-        "_stat",
-        "_string",
-        "_struct",
-        "_thread",
-        "_tokenize",
-        "_tracemalloc",
-        "_typing",
-        "_warnings",
-        "_weakref",
-        "atexit",
-        "binascii",
-        "builtins",
-        "errno",
-        "fcntl",
-        "grp",
-        "itertools",
-        "marshal",
-        "math",
-        "cmath",
-        "operator",
-        "posix",
-        "pwd",
-        "select",
-        "sys",
-        "time",
-    ];
-    // Host-access modules registered only in non-sandbox builds (importing.rs);
-    // under `sandbox` they are omitted, so drop them from the advertised set
-    // in place — the surrounding order is left untouched.
-    #[cfg(feature = "sandbox")]
-    builtin_names.retain(|n| {
-        !matches!(
-            *n,
-            "_signal" | "_socket" | "fcntl" | "grp" | "pwd" | "select"
-        )
-    });
+    // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names,
+    // which reads the same registry `import` resolves against, so the
+    // advertised set cannot drift from what is actually importable on a build.
+    let builtin_names = crate::importing::builtin_module_names();
     module_ns_store(
         ns,
         "builtin_module_names",

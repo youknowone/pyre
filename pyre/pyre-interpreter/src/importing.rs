@@ -439,6 +439,28 @@ pub fn register_builtin_module_with_startup(
     });
 }
 
+/// The registered builtin module names, for `sys.builtin_module_names`.
+///
+/// PyPy equivalent: `pypy/module/sys/state.py get_builtin_module_names`,
+/// which likewise reads `space.builtin_modules` rather than a second list.
+/// Reading the registry keeps the advertised set equal to the set `import`
+/// can satisfy under every `cfg` combination, which a parallel list cannot:
+/// the modules gated on `unix` / `wasm32` / `sandbox` differ per build.
+/// Dotted keys (`importlib.machinery`, `__pypy__.builders`) are registry
+/// entries for submodules, not top-level modules, so they are left out.
+pub fn builtin_module_names() -> Vec<&'static str> {
+    BUILTIN_MODULES.with(|m| {
+        let mut names: Vec<&'static str> = m
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|name| !name.contains('.'))
+            .collect();
+        names.sort_unstable();
+        names
+    })
+}
+
 /// Install all standard builtin modules.
 ///
 /// Mirrors PyPy's `baseobjspace.make_builtins()` +
