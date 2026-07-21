@@ -405,7 +405,13 @@ fn fill_user_function_args(
     let total_params = nparams + nkwonly;
     let mut filled_args: Vec<PyObjectRef> = Vec::with_capacity(total_params);
     let n_pos_copied = nargs.min(nparams);
-    filled_args.extend_from_slice(&args[..n_pos_copied]);
+    // argument.py:218-219 `for i in range(take): scope_w[...] = args_w[i]` —
+    // element-by-element positional fill (`args[i]`, a `usize` element index
+    // the rtyper lowers to an ArrayRead) rather than a range-slice copy
+    // (`&args[..n]` → `core::slice::index`, which has no graph lowering).
+    for i in 0..n_pos_copied {
+        filled_args.push(args[i]);
+    }
     for _ in n_pos_copied..total_params {
         filled_args.push(pyre_object::PY_NULL);
     }
@@ -480,9 +486,15 @@ fn fill_user_function_args(
     }
 
     // Append positional overflow AFTER kwonly slots so `pack_varargs` sees
-    // `args[total_params..]` as the `*args` source.
+    // `args[total_params..]` as the `*args` source.  argument.py:230
+    // `starargs_w = args_w[args_left:]` — the one place RPython slices; here
+    // spelled as the element-by-element `usize` push loop (`args[i]`, an
+    // ArrayRead) the rtyper lowers, rather than the `&args[nparams..]`
+    // range-slice (`core::slice::index`, no graph lowering).
     if has_varargs && nargs > nparams {
-        filled_args.extend_from_slice(&args[nparams..]);
+        for i in nparams..nargs {
+            filled_args.push(args[i]);
+        }
     }
 
     Ok(pack_varargs(code_ref, filled_args))
