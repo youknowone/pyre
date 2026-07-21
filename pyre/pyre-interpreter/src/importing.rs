@@ -489,6 +489,10 @@ pub fn install_builtin_modules() {
     // (PyPy: pypy/module/* mixed modules).
     pyre_install_module!(_weakref);
     pyre_install_module!(_warnings);
+    // `sys.platform == "win32"` sends shutil (and so tempfile) through the
+    // `_winapi` import even though the Windows build installs `posix`.
+    #[cfg(windows)]
+    pyre_install_module!(_winapi);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));

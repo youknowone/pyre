@@ -56,6 +56,9 @@ pub mod _tokenize;
 pub mod _typing;
 pub mod _warnings;
 pub mod _weakref;
+#[allow(non_snake_case)]
+#[cfg(windows)]
+pub mod _winapi;
 pub mod array;
 pub mod atexit;
 pub mod binascii;
