@@ -5611,11 +5611,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
             }
         }
-        let mut next_instr = frame_root.frame().next_instr();
+        // The ec block above may have run bytecode_trace / perform_actions
+        // (collection points) on a fall-through path; re-seed before the
+        // stack-effect reads and the opcode dispatch.
+        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+        let mut next_instr = unsafe { &*f }.next_instr();
         let raw_arg: u32 = op_arg.into();
         let delta = instruction.stack_effect(raw_arg);
         if delta > 0 {
-            let frame = frame_root.frame();
+            let frame = unsafe { &*f };
             let pushed_top = frame.valuestackdepth.saturating_add(delta as usize);
             let next_pc = opcode_pc + 1;
             // A JIT handoff can arrive with the stack depth for the point just
@@ -5627,12 +5631,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 && pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, next_pc)
                     == Some(frame.valuestackdepth)
             {
-                frame_root.frame().set_last_instr_from_next_instr(next_pc);
+                unsafe { &mut *f }.set_last_instr_from_next_instr(next_pc);
                 continue;
             }
         }
         let step_result =
-            execute_opcode_step(frame_root.frame(), code, instruction, op_arg, next_instr);
+            execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
         match step_result {
             Ok(StepResult::Continue) => {
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
