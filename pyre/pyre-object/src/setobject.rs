@@ -249,14 +249,8 @@ pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
     let key = crate::dictmultiobject::object_key_for(item);
-    if entries.insert(key, ()).is_none() {
-        s.len += 1;
-        s.hash = -1;
-        set_write_barrier(obj);
-    }
+    let _ = w_set_insert_key_checked(obj, key);
 }
 
 /// Insert an element keyed on a `space.hash_w` digest the caller already
@@ -280,6 +274,82 @@ pub unsafe fn w_set_add_hashed_checked(
     w_set_insert_key_checked(obj, crate::dictmultiobject::object_key_hashed(item, hash))
 }
 
+/// Run a set operation with the callback-free guard raised, so
+/// `dict_keys_equal` answers from its builtin type ladder and no user
+/// `__eq__` observes or mutates the set mid-probe.
+///
+/// Returns `None` when a comparison escaped the ladder: `op` withholds its
+/// mutation in that case, so the set is untouched and the caller re-runs the
+/// operation by scanning entries without holding a table borrow across a
+/// callback.
+#[inline]
+unsafe fn callback_free_set_op<T>(
+    op: impl FnOnce() -> T,
+) -> Option<Result<T, crate::dictmultiobject::DictKeyError>> {
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let result = op();
+    if crate::dict_eq_hook::end_callback_free_probe() {
+        return None;
+    }
+    if crate::dictmultiobject::take_dict_key_error() {
+        return Some(Err(crate::dictmultiobject::DictKeyError));
+    }
+    Some(Ok(result))
+}
+
+/// Find `key` by scanning same-hash entries one at a time.  The table borrow
+/// ends before equality can call user code.  If that callback changes the
+/// candidate entry, restart from the beginning like CPython's
+/// `set_add_entry` restart path.
+unsafe fn scan_set_key_reentrant(
+    obj: PyObjectRef,
+    mut key: crate::dictmultiobject::ObjectKey,
+) -> Result<(Option<usize>, crate::dictmultiobject::ObjectKey), crate::dictmultiobject::DictKeyError>
+{
+    'restart: loop {
+        let mut i = 0;
+        loop {
+            let Some((stored_hash, stored_obj)) = ({
+                let s = &*(obj as *const W_SetObject);
+                (*s.items)
+                    .get_index(i)
+                    .map(|(stored, _)| (stored.hash, stored.obj))
+            }) else {
+                return Ok((None, key));
+            };
+
+            if stored_hash == key.hash {
+                let _roots = crate::gc_roots::push_roots();
+                let stored_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(stored_obj);
+                let key_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(key.obj);
+
+                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
+                let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
+                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                if crate::dictmultiobject::take_dict_key_error() {
+                    return Err(crate::dictmultiobject::DictKeyError);
+                }
+                if equal {
+                    return Ok((Some(i), key));
+                }
+
+                let entry_unchanged = {
+                    let s = &*(obj as *const W_SetObject);
+                    (*s.items).get_index(i).is_some_and(|(stored, _)| {
+                        stored.hash == stored_hash && stored.obj == stored_obj
+                    })
+                };
+                if !entry_unchanged {
+                    continue 'restart;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Store a key that carries its own digest, propagating an `eq_w` raise from
 /// the bucket probe.
 ///
@@ -294,20 +364,29 @@ pub unsafe fn w_set_insert_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), crate::dictmultiobject::DictKeyError> {
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
-    // Single insert probe, matching `r_dict.setitem`'s one bucket scan: an
-    // `eq_w` that raises mid-probe reads as "not equal", so `insert` appends a
-    // spurious entry at the end; drop it so the add leaves the set unchanged.
-    let appended = entries.insert(key, ()).is_none();
-    if crate::dictmultiobject::take_dict_key_error() {
-        if appended {
-            entries.pop();
+    if let Some(result) = callback_free_set_op(|| {
+        let s = &mut *(obj as *mut W_SetObject);
+        let present = (*s.items).get_index_of(&key).is_some();
+        if !crate::dict_eq_hook::callback_free_probe_broken() && !present {
+            (*s.items).insert(key, ());
+            s.len = (*s.items).len();
+            s.hash = -1;
+            set_write_barrier(obj);
         }
-        return Err(crate::dictmultiobject::DictKeyError);
+    }) {
+        return result;
     }
-    if appended {
-        s.len += 1;
+
+    let (found, key) = scan_set_key_reentrant(obj, key)?;
+    if found.is_none() {
+        // The scan established inequality against every same-hash key.  Keep
+        // IndexMap's placement probe callback-free; any comparison outside
+        // the builtin ladder therefore answers false, reproducing that scan.
+        crate::dict_eq_hook::begin_callback_free_probe();
+        let s = &mut *(obj as *mut W_SetObject);
+        (*s.items).insert(key, ());
+        let _ = crate::dict_eq_hook::end_callback_free_probe();
+        s.len = (*s.items).len();
         s.hash = -1;
         set_write_barrier(obj);
     }
@@ -328,13 +407,14 @@ pub unsafe fn w_set_contains_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let s = &*(obj as *const W_SetObject);
-    let entries = &*s.items;
-    let found = entries.contains_key(&key);
-    if crate::dictmultiobject::take_dict_key_error() {
-        return Err(crate::dictmultiobject::DictKeyError);
+    if let Some(result) = callback_free_set_op(|| {
+        let s = &*(obj as *const W_SetObject);
+        (*s.items).contains_key(&key)
+    }) {
+        return result;
     }
-    Ok(found)
+    let (found, _) = scan_set_key_reentrant(obj, key)?;
+    Ok(found.is_some())
 }
 
 /// Remove a key that carries its own digest, propagating an `eq_w` raise from
@@ -347,17 +427,34 @@ pub unsafe fn w_set_discard_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
-    let removed = entries.shift_remove(&key).is_some();
-    if crate::dictmultiobject::take_dict_key_error() {
-        return Err(crate::dictmultiobject::DictKeyError);
+    if let Some(result) = callback_free_set_op(|| {
+        let s = &mut *(obj as *mut W_SetObject);
+        let index = (*s.items).get_index_of(&key);
+        if crate::dict_eq_hook::callback_free_probe_broken() {
+            return false;
+        }
+        match index {
+            Some(index) => {
+                (*s.items).shift_remove_index(index);
+                s.len = (*s.items).len();
+                s.hash = -1;
+                true
+            }
+            None => false,
+        }
+    }) {
+        return result;
     }
-    if removed {
-        s.len -= 1;
+
+    let (found, _) = scan_set_key_reentrant(obj, key)?;
+    if let Some(index) = found {
+        let s = &mut *(obj as *mut W_SetObject);
+        (*s.items).shift_remove_index(index);
+        s.len = (*s.items).len();
         s.hash = -1;
+        return Ok(true);
     }
-    Ok(removed)
+    Ok(false)
 }
 
 /// Membership test.
@@ -365,9 +462,8 @@ pub unsafe fn w_set_discard_key_checked(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_contains(obj: PyObjectRef, item: PyObjectRef) -> bool {
-    let s = &*(obj as *const W_SetObject);
-    let entries = &*s.items;
-    entries.contains_key(&crate::dictmultiobject::object_key_for(item))
+    let key = crate::dictmultiobject::object_key_for(item);
+    w_set_contains_key_checked(obj, key).unwrap_or(false)
 }
 
 /// Fallible variant of [`w_set_contains`].
@@ -391,18 +487,8 @@ pub unsafe fn w_set_contains_checked(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_discard(obj: PyObjectRef, item: PyObjectRef) -> bool {
-    let s = &mut *(obj as *mut W_SetObject);
-    let entries = &mut *s.items;
-    if entries
-        .shift_remove(&crate::dictmultiobject::object_key_for(item))
-        .is_some()
-    {
-        s.len -= 1;
-        s.hash = -1;
-        true
-    } else {
-        false
-    }
+    let key = crate::dictmultiobject::object_key_for(item);
+    w_set_discard_key_checked(obj, key).unwrap_or(false)
 }
 
 /// Fallible variant of [`w_set_discard`].

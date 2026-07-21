@@ -72,6 +72,53 @@ thread_local! {
     /// `IndexMap` access.  Presence-only, same as the hash flag; the
     /// payload travels through the interpreter pending-error slot.
     static EQ_W_ERROR: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
+    /// Set while a bucket probe runs on the callback-free fast path.
+    /// `dict_keys_equal` then answers from its builtin type ladder alone and
+    /// never enters `space.eq_w`, so no user code observes or mutates the
+    /// container mid-probe.
+    static CALLBACK_FREE_PROBE: Cell<bool> = const { Cell::new(false) };
+    /// Raised by `dict_keys_equal` when a comparison inside a callback-free
+    /// probe would have needed `space.eq_w`.  The probe's result is then
+    /// meaningless and the caller re-runs the operation on the path that
+    /// tolerates a re-entrant callback.
+    static CALLBACK_FREE_PROBE_BROKEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enter a callback-free probe.  Clears the broken flag so
+/// [`end_callback_free_probe`] reports only this probe's comparisons.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn begin_callback_free_probe() {
+    CALLBACK_FREE_PROBE.with(|cell| cell.set(true));
+    CALLBACK_FREE_PROBE_BROKEN.with(|cell| cell.set(false));
+}
+
+/// Leave a callback-free probe, returning `true` when a comparison needed
+/// `space.eq_w` and the probe's result must therefore be discarded.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn end_callback_free_probe() -> bool {
+    CALLBACK_FREE_PROBE.with(|cell| cell.set(false));
+    CALLBACK_FREE_PROBE_BROKEN.with(|cell| cell.replace(false))
+}
+
+/// True while a callback-free probe is in progress.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn callback_free_probe_active() -> bool {
+    CALLBACK_FREE_PROBE.with(|cell| cell.get())
+}
+
+/// True once a comparison in the current callback-free probe hit a key pair
+/// the builtin ladder cannot decide.  Read mid-probe by callers that mutate
+/// only after a clean lookup.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn callback_free_probe_broken() -> bool {
+    CALLBACK_FREE_PROBE_BROKEN.with(|cell| cell.get())
+}
+
+/// Record that the current callback-free probe reached a comparison the
+/// builtin ladder cannot decide.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn break_callback_free_probe() {
+    CALLBACK_FREE_PROBE_BROKEN.with(|cell| cell.set(true));
 }
 
 /// Signal that the most recent `hash_w` call failed.  Called by the

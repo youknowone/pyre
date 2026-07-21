@@ -1638,6 +1638,26 @@ pub unsafe fn w_module_dict_length(obj: PyObjectRef) -> usize {
     }
 }
 
+/// True when [`dict_keys_equal`]'s builtin ladder settles `key`'s equality
+/// on its own, without `space.eq_w`.
+///
+/// Restricted to the exact layouts the ladder reads: a subclass may override
+/// `__eq__`, a BigInt-backed `int` does not carry the `intval` the int arm
+/// reads, and a `float` has no arm at all (yet `1 == 1.0`), so all three are
+/// rejected.  The predicate is one-sided — rejecting a key only costs the
+/// caller its fast path.
+#[inline]
+unsafe fn key_equality_is_builtin(key: PyObjectRef) -> bool {
+    if crate::is_long(key) {
+        return false;
+    }
+    (crate::is_exact_type(key, &crate::INT_TYPE) && crate::is_int(key))
+        || (crate::is_exact_type(key, &crate::BOOL_TYPE) && crate::is_bool(key))
+        || (crate::is_exact_type(key, &crate::STR_TYPE) && crate::is_str(key))
+        || (crate::is_exact_type(key, &crate::bytesobject::BYTES_TYPE)
+            && crate::bytesobject::is_bytes(key))
+}
+
 /// Compare two dict keys for equality.
 ///
 /// `pypy/objspace/std/dictmultiobject.py:1209 ObjectDictStrategy` —
@@ -1666,7 +1686,17 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     if crate::dict_eq_hook::eq_error_pending() {
         return false;
     }
-    if let Some(eq) = unsafe { crate::dict_eq_hook::try_eq_w(a, b) } {
+    if crate::dict_eq_hook::callback_free_probe_active() {
+        // A callback-free probe promises that no user code runs while the
+        // container is being read, so the ladder below must answer on its
+        // own.  A pair it cannot decide breaks the probe: the caller
+        // discards this result and re-runs without holding a table borrow
+        // across the callback.
+        if !(key_equality_is_builtin(a) && key_equality_is_builtin(b)) {
+            crate::dict_eq_hook::break_callback_free_probe();
+            return false;
+        }
+    } else if let Some(eq) = unsafe { crate::dict_eq_hook::try_eq_w(a, b) } {
         // `ObjectKey::eq` already gates on `self.hash != other.hash`
         // before calling `dict_keys_equal`, so the bucket invariant
         // (same hash_w → same bucket) is enforced by the cached hash
