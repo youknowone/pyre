@@ -5255,30 +5255,46 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     // `ns_ptr` module dict.  Mirror `bh_load_global_fn`'s second leg —
     // `frame.get_builtin().getdictvalue(name)` — and fold the builtins cell
     // when the name resolves there.  Requires the live frame operand.
-    if !fbw_builtin_fold_enabled() || frame_ptr == 0 {
+    if !fbw_builtin_fold_enabled() {
         return Ok(false);
     }
-    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::PyFrame) };
-    // Faithfulness: `bh_load_global_fn` re-resolves the globals it actually
-    // consults from the LIVE frame (`frame.get_w_globals()` when the frame
-    // owns `w_code`, else the code's bound globals) and IGNORES the
-    // `namespace_ptr` operand.  The `ns_ptr` hint usually equals that live
-    // dict, but verify the name is ALSO absent from the authoritative
-    // globals before falling through to builtins — a present name there must
+    // The builtins fallback needs the module `pick_builtin(w_globals)` picks
+    // (`frame.get_builtin()`).  A live frame supplies it directly and also lets
+    // us double-check the name is absent from the frame's AUTHORITATIVE globals
+    // — `bh_load_global_fn` re-resolves the globals it consults from the LIVE
+    // frame (`frame.get_w_globals()` when the frame owns `w_code`, else the
+    // code's bound globals) and IGNORES the `namespace_ptr` operand.  The
+    // `ns_ptr` hint usually equals that live dict, but a present name there must
     // resolve from globals (residual), not the builtin, or the fold would be
-    // wrong.
-    let live_globals = if frame.pycode as usize == w_code_ptr {
-        frame.get_w_globals()
+    // wrong.  An INLINED callee has no materialised frame (`frame_ptr == 0`, its
+    // `portal_frame_reg` unseeded); derive the builtin module from the concrete
+    // globals' `__builtins__` cell instead — the same object `pick_builtin`
+    // resolves (baseobjspace.rs:9716) and the one the interpreter fallback would
+    // rebuild for the resumed callee frame.  #670 keeps `__builtins__` in every
+    // module dict, `ns_ptr` is the callee's own namespace field (so it is the
+    // authoritative globals), and guard (a) below watches the globals `version`,
+    // so a later `__builtins__` rebind fails the loop exactly as a
+    // shadowing-name insert would.
+    let w_builtin = if frame_ptr != 0 {
+        let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::PyFrame) };
+        let live_globals = if frame.pycode as usize == w_code_ptr {
+            frame.get_w_globals()
+        } else {
+            unsafe {
+                pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef)
+            }
+        };
+        if !live_globals.is_null()
+            && live_globals as usize != w_globals as usize
+            && crate::state::module_dict_cell_slot_direct(live_globals, &name).is_some()
+        {
+            return Ok(false);
+        }
+        frame.get_builtin()
     } else {
-        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+        unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }
+            .unwrap_or(pyre_object::PY_NULL)
     };
-    if !live_globals.is_null()
-        && live_globals as usize != w_globals as usize
-        && crate::state::module_dict_cell_slot_direct(live_globals, &name).is_some()
-    {
-        return Ok(false);
-    }
-    let w_builtin = frame.get_builtin();
     if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
         return Ok(false);
     }
