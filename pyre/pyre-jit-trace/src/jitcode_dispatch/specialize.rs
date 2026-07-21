@@ -2057,6 +2057,118 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
 /// Declines (`None` → generic residual) when either operand lacks a
 /// concrete shadow, or `match_type` is not a valid exception class /
 /// tuple (the residual then raises the correct `TypeError`).
+/// Pin the elements of a tuple `except` clause's match target, returning
+/// whether the target was a tuple layout this could read through.
+///
+/// `w_tuple_new` picks the layout by arity: two object elements become a
+/// `W_SpecialisedTupleObject_oo` holding them in inline immutable `value0` /
+/// `value1` slots, everything else an array-backed `W_TupleObject` behind
+/// `wrappeditems`. Both are read here with the same guarded-load shape the
+/// other tuple folds use, and each element is pinned to the class seen while
+/// tracing. The `_oo` loads are pure (immutable fields), so a tuple built from
+/// constants leaves nothing behind after optimization.
+///
+/// A match target that is neither layout — a bare class, the int/float
+/// specialisations, or a tuple subclass whose `w_class` diverges — returns
+/// `false` so the caller pins the object identity instead. That is correct for
+/// a target that is loaded rather than built, which is the only case where the
+/// identity can hold across iterations.
+fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    match_op: OpRef,
+    match_type: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    let ob_type = unsafe { (*(match_type as *const pyre_object::pyobject::PyObject)).ob_type };
+    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
+        as *const pyre_object::pyobject::PyType;
+    let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::pyobject::PyType;
+
+    let mut items: Vec<(OpRef, pyre_object::PyObjectRef)> = Vec::new();
+    if std::ptr::eq(ob_type, spec_oo) {
+        walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, spec_oo as i64)?;
+        for index in 0..2usize {
+            let descr = if index == 0 {
+                crate::descr::specialised_tuple_oo_value0_descr()
+            } else {
+                crate::descr::specialised_tuple_oo_value1_descr()
+            };
+            let item = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, match_op, descr);
+            let concrete = unsafe {
+                pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(
+                    match_type, index,
+                )
+            };
+            items.push((item, concrete));
+        }
+    } else if std::ptr::eq(ob_type, tuple_type) {
+        let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+        if !std::ptr::eq(
+            unsafe { (*(match_type as *const pyre_object::pyobject::PyObject)).w_class },
+            canonical_tuple_class,
+        ) {
+            return Ok(false);
+        }
+        walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, tuple_type as i64)?;
+        walker_guard_exact_w_class(ctx, op_pc, match_op, canonical_tuple_class)?;
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            match_op,
+            crate::descr::tuple_wrappeditems_descr(),
+        );
+        let len = unsafe { pyre_object::w_tuple_len(match_type) };
+        let length = crate::state::opimpl_arraylen_gc(
+            ctx.trace_ctx,
+            block,
+            crate::state::pyobject_gcarray_descr(),
+        );
+        let len_const = ctx.trace_ctx.const_int(len as i64);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[length, len_const])?;
+        for index in 0..len {
+            let index_op = ctx.trace_ctx.const_int(index as i64);
+            let item =
+                crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, index_op);
+            let Some(concrete) =
+                (unsafe { pyre_object::w_tuple_getitem(match_type, index as i64) })
+            else {
+                return Ok(false);
+            };
+            items.push((item, concrete));
+        }
+    } else {
+        return Ok(false);
+    }
+
+    for (item, concrete) in items {
+        if item.is_constant() {
+            continue;
+        }
+        let expected = ctx.trace_ctx.const_ref(concrete as i64);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[item, expected])?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(item, expected);
+    }
+    Ok(true)
+}
+
+/// `GuardClass` on a match target's layout, skipped when the class is already
+/// pinned.
+fn walker_guard_exc_match_tuple_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    match_op: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.heap_cache().is_class_known(match_op) {
+        return Ok(());
+    }
+    let type_const = ctx.trace_ctx.const_int(type_addr);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[match_op, type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(match_op, type_addr);
+    Ok(())
+}
+
 pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -2087,9 +2199,20 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     let matched = pyre_interpreter::eval::check_exc_match_against(exc, match_type);
 
     // --- commit to the fold: emit IR (no further declines) ---
-    // Pin `match_type` identity so a runtime divergence (a reassigned
-    // handler global) side-exits rather than running the wrong handler.
-    if !match_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(match_op) {
+    // Pin `match_type` so a runtime divergence (a reassigned handler global)
+    // side-exits rather than running the wrong handler.
+    //
+    // A tuple clause is pinned through its ELEMENTS. `except (A, B):` lowers to
+    // `BUILD_TUPLE`, which allocates a fresh tuple on every visit, so an
+    // identity guard on the container is unsatisfiable — it fails once per
+    // visit and the loop collapses into side exits and bridge churn. The
+    // elements are what the match actually reads and what a rebinding would
+    // change, so guarding them is both sound and stable across the
+    // re-allocation.
+    if !match_op.is_constant()
+        && !walker_guard_exc_match_tuple_items(ctx, op_pc, match_op, match_type)?
+        && !ctx.trace_ctx.heap_cache().is_class_known(match_op)
+    {
         let expected = ctx.trace_ctx.const_ref(match_type as i64);
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[match_op, expected], 0);
