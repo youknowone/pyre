@@ -4781,13 +4781,23 @@ fn drive_unpack_iterable_trace(
         items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
     };
 
-    // Enter the trace AT the merge point (pc `0x5c`), not the jitcode entry:
-    // the extracted body's prologue (`length_hint`/`newlist`/
-    // `iterator_greenkey`) takes `w_iterable`, which the merge-point hook does
-    // not carry, so replaying from pc 0 would run `length_hint` on the wrong
-    // red. Drive through the production resolver runtime (the same closures
-    // jd0's live dispatch uses) so any CALL_ASSEMBLER / recursive-portal op
-    // resolves against real compiled-loop / warmstate state.
+    // The `jit_merge_point` opcode byte offset in the extracted body — the
+    // single source of truth is `UnpackSym::loop_header_pc()`.
+    // `trace_jitcode_from_merge_point` seeds `code_cursor` at this pc and
+    // decodes the merge-point register lists from `header_pc + 2`, so it must
+    // be the opcode byte, not one byte into the operands.
+    let header_pc = {
+        use majit_metainterp::JitCodeSym;
+        sym.loop_header_pc()
+    };
+
+    // Enter the trace AT the merge point, not the jitcode entry: the extracted
+    // body's prologue (`length_hint`/`newlist`/`iterator_greenkey`) takes
+    // `w_iterable`, which the merge-point hook does not carry, so replaying from
+    // pc 0 would run `length_hint` on the wrong red. Drive through the
+    // production resolver runtime (the same closures jd0's live dispatch uses)
+    // so any CALL_ASSEMBLER / recursive-portal op resolves against real
+    // compiled-loop / warmstate state.
     let drove = meta.with_trace_ctx_and_token_resolver(
         |ctx,
          resolve_token,
@@ -4811,7 +4821,7 @@ fn drive_unpack_iterable_trace(
                 ctx,
                 &mut sym,
                 &jitcode,
-                JD1_LOOP_HEADER_PC,
+                header_pc,
                 &runtime,
                 green_ref,
                 &red_refs,
@@ -4843,7 +4853,7 @@ fn drive_unpack_iterable_trace(
         let trace_meta = pyre_jit_trace::unpack_state::UnpackJitState {
             greenkey: greenkey_raw,
         }
-        .build_meta(JD1_LOOP_HEADER_PC, &pyre_jit_trace::state::PyreEnv);
+        .build_meta(header_pc, &pyre_jit_trace::state::PyreEnv);
         let outcome = meta.compile_loop(&jump_args, trace_meta);
         if dbg {
             eprintln!("[jd1] compile_loop outcome={outcome:?}");
@@ -4882,11 +4892,6 @@ fn drive_unpack_iterable_trace(
         meta.abort_trace(false);
     }
 }
-
-/// The single `jit_merge_point` pc in jd1's extracted
-/// `_unpackiterable_unknown_length` body — matches `UnpackSym::loop_header_pc`
-/// (asserted in `unpack_state::jd1_build_time_descrs_resolve_through_global_pool`).
-const JD1_LOOP_HEADER_PC: usize = 0x5c;
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
