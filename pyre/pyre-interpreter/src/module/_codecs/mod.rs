@@ -988,7 +988,7 @@ fn charmap_decode_impl(
         }
     }
     Ok(w_tuple_new(vec![
-        w_str_from_wtf8(out),
+        w_str_from_wtf8_managed(out),
         w_int_new(orig_len as i64),
     ]))
 }
@@ -1334,7 +1334,7 @@ fn utf7_decode_impl(
         out.truncate(shift_out_start);
     }
     Ok(w_tuple_new(vec![
-        w_str_from_wtf8(out),
+        w_str_from_wtf8_managed(out),
         w_int_new(consumed as i64),
     ]))
 }
@@ -1604,7 +1604,7 @@ fn unicode_escape_decode_impl(
         }
     }
     Ok(w_tuple_new(vec![
-        w_str_from_wtf8(out),
+        w_str_from_wtf8_managed(out),
         w_int_new(pos as i64 + pos_delta),
     ]))
 }

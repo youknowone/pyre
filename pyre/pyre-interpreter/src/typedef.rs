@@ -17756,7 +17756,7 @@ fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
 pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
     let decoded = decode_utf8_with_errors(data, "surrogateescape")
         .expect("surrogateescape rescues every byte, so the decode never fails");
-    pyre_object::w_str_from_wtf8(decoded)
+    pyre_object::w_str_from_wtf8_managed(decoded)
 }
 
 /// unicodehelper.py:377-537 _str_decode_utf8_slowpath
@@ -17964,7 +17964,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         _ => "strict".to_string(),
     };
     let s = decode_bytes_to_wtf8(data, &encoding, errors.as_str())?;
-    Ok(pyre_object::w_str_from_wtf8(s))
+    Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
 /// Decode `data` under `encoding`/`errors` into a WTF-8 string, dispatching on
