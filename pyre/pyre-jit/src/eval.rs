@@ -190,8 +190,8 @@ impl FrameRoot {
     fn frame(&mut self) -> &mut PyFrame {
         // SAFETY: `slot` was resolved on this thread in `new` and the thread is
         // still running; no `&mut` borrow of the cell is held here.
-        let frame = unsafe { majit_gc::shadow_stack::slot_get(self.slot, self.depth) }.0
-            as *mut PyFrame;
+        let frame =
+            unsafe { majit_gc::shadow_stack::slot_get(self.slot, self.depth) }.0 as *mut PyFrame;
         unsafe { &mut *frame }
     }
 
