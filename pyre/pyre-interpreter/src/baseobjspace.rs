@@ -13691,6 +13691,20 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
                 if step == 1 {
                     w_list_delslice(obj, start.max(0) as usize, stop.max(start) as usize);
+                    // Diagnostic (#24 wasm-Linux miscompile, root cause unpinned):
+                    // a correct `del list[a:b]` removes exactly `slicelength`
+                    // elements, leaving `len - slicelength`. The null-Ref operand
+                    // class was refuted on Linux CI (eval_slice_index's is_null
+                    // assert sits on this exact path and never fired), so a
+                    // stale/moved `items` backing or a length read desynced from
+                    // the mutated backing is the surviving hypothesis; trap loudly
+                    // with the counts so a wasm Linux run pins the divergence.
+                    let after = w_list_len(obj) as i64;
+                    assert!(
+                        after == len - slicelength,
+                        "delitem_slot step-1 slice-delete count mismatch (#24): after={after} expected={} len={len} slicelength={slicelength} start={start} stop={stop} raw_start={raw_start} raw_stop={raw_stop}",
+                        len - slicelength
+                    );
                     return Ok(());
                 }
                 // Extended-slice delete: gather the selected indices, then

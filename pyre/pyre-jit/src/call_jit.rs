@@ -5152,6 +5152,15 @@ pub extern "C" fn bh_store_slice_fn(obj: i64, start: i64, stop: i64, value: i64)
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
 /// `bh_store_subscr_fn`.
 pub extern "C" fn bh_delete_subscr_fn(obj: i64, index: i64) -> i64 {
+    // Diagnostic (#24 wasm-Linux miscompile): the delete target and index Refs
+    // must be non-null at the residual boundary. A null `items` on the wasm
+    // resume path would silently mis-route — `is_list(null)` is false without a
+    // deref, so the slice branch is skipped and the operand reads guest offset 0.
+    // Trap loudly to pin a null `items`/`index` at the residual entry.
+    assert!(
+        obj != 0 && index != 0,
+        "bh_delete_subscr_fn: null residual operand (#24 wasm): obj={obj:#x} index={index:#x}"
+    );
     if let Err(mut err) = pyre_interpreter::baseobjspace::delitem(
         obj as pyre_object::PyObjectRef,
         index as pyre_object::PyObjectRef,
