@@ -2720,7 +2720,6 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
 struct CalleeAbortPermanentHit {
     callee_name: String,
     marker_jit_pc: usize,
-    marker_py_pc: usize,
 }
 
 fn collect_loop_body_referenced_roots(
@@ -2963,16 +2962,9 @@ fn loop_inlines_abort_permanent_callee(
                 } else {
                     (*raw_code).obj_name.as_str().to_owned()
                 };
-                let marker_py_pc = crate::state::pyjitcode_for_code(callee_w_code)
-                    .map(|pjc| {
-                        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, op.pc)
-                            as usize
-                    })
-                    .unwrap_or(op.pc);
                 return Some(CalleeAbortPermanentHit {
                     callee_name,
                     marker_jit_pc: op.pc,
-                    marker_py_pc,
                 });
             }
         }
@@ -3200,9 +3192,9 @@ fn full_body_walk_trace<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("FullBodyWalk::CalleeAbortPermanent");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
-                "[fbw-abort] start_pc={start_pc} callee={} abort_permanent_jit_pc={} \
-                 marker_py={}; declining callee-abort walk",
-                hit.callee_name, hit.marker_jit_pc, hit.marker_py_pc
+                "[fbw-abort] start_pc={start_pc} callee={} abort_permanent_jit_pc={}; \
+                 declining callee-abort walk",
+                hit.callee_name, hit.marker_jit_pc
             );
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
