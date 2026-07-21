@@ -2010,6 +2010,14 @@ pub(crate) fn callable_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
             "descriptor '__reduce__' requires a 'callable_iterator' object",
         ));
     }
+    // The registered arity is only a dispatch hint; surplus positional
+    // arguments must be rejected here.
+    if args.len() > 1 {
+        return Err(PyError::type_error(format!(
+            "callable_iterator.__reduce__() takes no arguments ({} given)",
+            args.len() - 1,
+        )));
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);

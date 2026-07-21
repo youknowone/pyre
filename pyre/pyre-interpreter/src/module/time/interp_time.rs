@@ -249,6 +249,17 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// used by `time.get_clock_info`.  The observable fields follow Python 3.14;
 /// all clocks exposed by pyre have nanosecond representation internally.
 pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // The registered arity is only a dispatch hint, so the positional count
+    // is enforced here rather than by the caller.
+    if args.len() != 2 {
+        let message = match args.len() {
+            0 => "_get_time_info() missing 2 required positional arguments: 'name' and 'info'"
+                .to_string(),
+            1 => "_get_time_info() missing 1 required positional argument: 'info'".to_string(),
+            n => format!("_get_time_info() takes 2 positional arguments but {n} were given"),
+        };
+        return Err(crate::PyError::type_error(message));
+    }
     let name_obj = args[0];
     let info = args[1];
     if unsafe { !pyre_object::is_str(name_obj) } {
