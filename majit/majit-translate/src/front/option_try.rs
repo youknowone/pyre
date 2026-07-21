@@ -402,14 +402,17 @@ fn verify_break_arm_is_return_none(
             "{name}: break arm block {e_block} lacks the from_residual call"
         ));
     };
-    assert_block_pure_besides(
-        graph,
-        e_block,
-        &[pos0_idx, from_residual_idx],
-        "break arm",
-        name,
-    )?;
-    verify_forwards_to_returnblock(graph, e_block, &residual_result, name)
+    // An unregistered `from_residual` returns an opaque `Ref` the MIR narrows
+    // to the concrete `Option<T>` via pure `__pyre_cast_instance` recasts (the
+    // same trailing-recast shape `front::iter_next` peels behind an
+    // unregistered `next`).  Peel them so the recognized set covers the recast
+    // ops and the None-return forwarding traces the narrowed result.
+    let (none_return_var, recast_indices) =
+        crate::front::result_exc::peel_recast_chain_from(graph, e_block, &residual_result);
+    let mut recognized = vec![pos0_idx, from_residual_idx];
+    recognized.extend(recast_indices);
+    assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;
+    verify_forwards_to_returnblock(graph, e_block, &none_return_var, name)
 }
 
 fn verify_forwards_to_returnblock(

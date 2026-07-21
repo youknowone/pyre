@@ -17630,4 +17630,41 @@ mod tests {
             );
         }
     }
+
+    /// Anchor the `?`-operator fold to the real lowered IR of
+    /// `baseobjspace::lookup` (`let w_type = type(obj)?; lookup_in_type(..)`).
+    /// The break arm (`None => return None`) narrows the `from_residual`
+    /// result through a `__pyre_cast_instance` recast; before the break-arm
+    /// purity gate peeled that recast, `option_try` declined and the residual
+    /// `Try::branch` Method-call stayed, walling ~50 heads reaching `lookup`.
+    /// After: zero residual `branch` Method-call.  Ignored by default (loads
+    /// the ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+    /// option_try_recast_break_arm_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn option_try_recast_break_arm_real_lookup() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
+        let branch_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                        if name == "branch" && args.len() == 1
+                )
+            })
+            .count();
+        assert_eq!(
+            branch_calls, 0,
+            "lookup: residual Try::branch Method-call after the recast-break-arm fold"
+        );
+    }
 }

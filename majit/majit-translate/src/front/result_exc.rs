@@ -1576,6 +1576,77 @@ pub(crate) fn assert_block_pure_besides(
     Ok(())
 }
 
+/// `true` iff `kind` is a `__pyre_cast_instance` narrow — the front-end
+/// pointer-downcast marker (`front::mir` `Rvalue::Cast` arm) the MIR emits
+/// when an opaque `Ref` result is reinterpreted as a registered struct root.
+/// It lowers to `cast_pointer` (a pure alias), so it carries no side effect
+/// and its result is bit-identical to its operand.
+pub(crate) fn is_recast_narrow(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__pyre_cast_instance")
+    )
+}
+
+/// Peel the trailing chain of pure `__pyre_cast_instance` recasts starting
+/// from `start` within `block`: an unregistered call (`from_residual`,
+/// `next`, …) returns an opaque `Ref` the MIR immediately narrows to the
+/// concrete type with one or more `__pyre_cast_instance` recasts.  Follow
+/// each contiguous recast whose sole operand is the prior result, requiring
+/// that no non-final intermediate is read by anything but the next recast or
+/// escapes on an exit link (else collapsing the chain would strand a live
+/// use).  Returns `(final_var, recast_indices)` — the value downstream reads
+/// as the narrowed result plus every recast op index (to add to the
+/// `recognized` set of [`assert_block_pure_besides`]).  With no recast the
+/// chain is empty and this returns `(start, [])`.
+pub(crate) fn peel_recast_chain_from(
+    graph: &FunctionGraph,
+    block: usize,
+    start: &Variable,
+) -> (Variable, Vec<usize>) {
+    let ops = &graph.blocks[block].operations;
+    let mut cur = start.clone();
+    let mut indices = Vec::new();
+    loop {
+        // Find a recast whose sole operand is `cur`.
+        let Some((idx, result)) = ops.iter().enumerate().find_map(|(i, op)| {
+            if !is_recast_narrow(&op.kind) {
+                return None;
+            }
+            let OpKind::Call { args, .. } = &op.kind else {
+                return None;
+            };
+            if args.first() != Some(&cur) {
+                return None;
+            }
+            op.result.clone().map(|r| (i, r))
+        }) else {
+            return (cur, indices);
+        };
+        // `cur` (a non-final intermediate) must be dead except for this
+        // recast: no other op reads it and it does not escape on an exit link.
+        let other_reads = ops
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .any(|(_, op)| op_operand_vars(&op.kind).contains(&cur));
+        let escapes = graph.blocks[block].exits.iter().any(|l| {
+            l.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == cur))
+        });
+        if other_reads || escapes {
+            return (cur, indices);
+        }
+        indices.push(idx);
+        cur = result;
+    }
+}
+
 fn verify_break_arm_is_reraise(
     graph: &FunctionGraph,
     break_link: &Link,
