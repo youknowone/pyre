@@ -4368,8 +4368,10 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
 /// matches the libc constants the subclass table keys on; translate the common
 /// kinds to their POSIX errno through `ErrorKind` (which the standard library
 /// normalises per platform), the way `winerror_to_errno` fills `OSError.errno`
-/// alongside `.winerror`.  Unrecognised kinds keep the raw code.
-pub(crate) fn io_error_posix_errno(e: &std::io::Error) -> i32 {
+/// alongside `.winerror`.  Unrecognised kinds keep the raw code, and an error
+/// carrying no OS code at all falls back to `default` (the errno each call site
+/// used before the translation existed).
+pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
     #[cfg(windows)]
     {
         use std::io::ErrorKind;
@@ -4390,7 +4392,7 @@ pub(crate) fn io_error_posix_errno(e: &std::io::Error) -> i32 {
             return errno;
         }
     }
-    e.raw_os_error().unwrap_or(0)
+    e.raw_os_error().unwrap_or(default)
 }
 
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
@@ -10025,7 +10027,7 @@ fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, 
 }
 
 fn fd_io_err(e: std::io::Error) -> crate::PyError {
-    crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(5), e.to_string())
+    crate::PyError::os_error_with_errno(io_error_posix_errno(&e, 5), e.to_string())
 }
 
 fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -10296,7 +10298,7 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             if unsafe { libc::close(fd) } < 0 {
                 let e = std::io::Error::last_os_error();
                 return Err(crate::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(0),
+                    io_error_posix_errno(&e, 0),
                     format!("close: {e}"),
                 ));
             }
@@ -10353,7 +10355,7 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
             };
             if let Err(e) = write_res {
                 return Err(crate::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(5),
+                    io_error_posix_errno(&e, 5),
                     format!("{e}: '{name_s}'"),
                 ));
             }
@@ -10592,7 +10594,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                     // bytes path a bytes object (`interp_fileio.py` wraps the raw
                     // `w_name`, not the decoded buffer).
                     return Err(crate::PyError::os_error_syscall(
-                        io_error_posix_errno(&e),
+                        io_error_posix_errno(&e, 2),
                         path_obj,
                     ));
                 }

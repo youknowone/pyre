@@ -458,7 +458,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         } else {
             pyre_object::w_str_new(path)
         };
-        crate::PyError::os_error_syscall(crate::builtins::io_error_posix_errno(&e), w_filename)
+        crate::PyError::os_error_syscall(crate::builtins::io_error_posix_errno(&e, 0), w_filename)
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──
@@ -1271,7 +1271,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Ok(make_stat_result(&m, st_flags))
                 }
                 Err(e) => {
-                    let kind = e.raw_os_error().unwrap_or(2);
+                    let kind = crate::builtins::io_error_posix_errno(&e, 2);
                     Err(crate::PyError::os_error_with_errno(
                         kind,
                         format!("{}: '{}'", e, path_str),
@@ -1566,7 +1566,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             Ok(make_stat_result(&m, st_flags))
                         }
                         Err(e) => Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(9),
+                            crate::builtins::io_error_posix_errno(&e, 9),
                             format!("{}", e),
                         )),
                     }
@@ -1895,7 +1895,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 |_| match host_posix::getlogin() {
                     Some(name) => Ok(pyre_object::w_str_new(name.to_string_lossy().as_ref())),
                     None => Err(crate::PyError::os_error_with_errno(
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        crate::builtins::io_error_posix_errno(&std::io::Error::last_os_error(), 0),
                         "getlogin",
                     )),
                 },
