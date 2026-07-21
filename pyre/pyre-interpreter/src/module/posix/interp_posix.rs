@@ -458,7 +458,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         } else {
             pyre_object::w_str_new(path)
         };
-        crate::PyError::os_error_syscall(e.raw_os_error().unwrap_or(0), w_filename)
+        crate::PyError::os_error_syscall(crate::builtins::io_error_posix_errno(&e), w_filename)
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──

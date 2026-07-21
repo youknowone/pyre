@@ -4361,6 +4361,38 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     Some(name)
 }
 
+/// The POSIX errno for a `std::io::Error`, so the errno-specific OSError
+/// subclass (`os_error_errno_subclass`) and the `.errno` slot stay consistent
+/// across platforms.  On Windows `raw_os_error()` reports a Win32 error code
+/// (e.g. `ERROR_ALREADY_EXISTS` 183), not a C errno, so the raw value never
+/// matches the libc constants the subclass table keys on; translate the common
+/// kinds to their POSIX errno through `ErrorKind` (which the standard library
+/// normalises per platform), the way `winerror_to_errno` fills `OSError.errno`
+/// alongside `.winerror`.  Unrecognised kinds keep the raw code.
+pub(crate) fn io_error_posix_errno(e: &std::io::Error) -> i32 {
+    #[cfg(windows)]
+    {
+        use std::io::ErrorKind;
+        let mapped = match e.kind() {
+            ErrorKind::NotFound => Some(libc::ENOENT),
+            ErrorKind::AlreadyExists => Some(libc::EEXIST),
+            ErrorKind::PermissionDenied => Some(libc::EACCES),
+            ErrorKind::ConnectionRefused => Some(libc::ECONNREFUSED),
+            ErrorKind::ConnectionReset => Some(libc::ECONNRESET),
+            ErrorKind::ConnectionAborted => Some(libc::ECONNABORTED),
+            ErrorKind::BrokenPipe => Some(libc::EPIPE),
+            ErrorKind::TimedOut => Some(libc::ETIMEDOUT),
+            ErrorKind::Interrupted => Some(libc::EINTR),
+            ErrorKind::WouldBlock => Some(libc::EWOULDBLOCK),
+            _ => None,
+        };
+        if let Some(errno) = mapped {
+            return errno;
+        }
+    }
+    e.raw_os_error().unwrap_or(0)
+}
+
 /// `_parse_init_args` yields an errno only for a 2..=5 argument call whose
 /// first argument is an int; map that errno to its OSError subclass name.
 fn os_error_errno_subclass_for(args: &[PyObjectRef]) -> Option<&'static str> {
@@ -10560,7 +10592,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                     // bytes path a bytes object (`interp_fileio.py` wraps the raw
                     // `w_name`, not the decoded buffer).
                     return Err(crate::PyError::os_error_syscall(
-                        e.raw_os_error().unwrap_or(2),
+                        io_error_posix_errno(&e),
                         path_obj,
                     ));
                 }
