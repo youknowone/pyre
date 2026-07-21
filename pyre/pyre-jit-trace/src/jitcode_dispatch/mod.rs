@@ -2293,7 +2293,7 @@ fn write_ref_reg<Sym: WalkSym>(
     // `get_mut` defensively to tolerate sub-walk shadows that lag the
     // OpRef bank if a future caller mis-sizes them.
     //
-    // Codex P1 (PR #89): collapse non-Ref ConcreteValue (Int / Float)
+    // collapse non-Ref ConcreteValue (Int / Float)
     // to Null before storing into the Ref shadow.  `concrete_from_
     // recorded_opref` returns whatever kind the per-OpRef concrete
     // table holds; a kind mismatch (e.g. boxed Int returned through a
@@ -2400,7 +2400,7 @@ fn write_int_reg<Sym: WalkSym>(
     // an empty `concrete_registers_i` slice; production callers
     // (Concrete shadow seeding) size it to `registers_i.len()` at dispatch entry.
     //
-    // Codex P1 (PR #89) symmetry with `write_ref_reg`: collapse
+    // Symmetry with `write_ref_reg`: collapse
     // non-Int ConcreteValue to Null before storing into the Int
     // shadow so a kind-mismatched stamp can't leak Ref/Float bits
     // into `concrete_registers_i`.

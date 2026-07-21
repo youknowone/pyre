@@ -1289,7 +1289,7 @@ fn analyze_pipeline_from_module_paths(
             },
         )
         .collect();
-    // Gated auto-population (issue #346, S2.3): with `PYRE_DYN_INDIRECT`
+    // Gated auto-population (issue #346): with `PYRE_DYN_INDIRECT`
     // on, register EVERY `>=2`-impl trait so its inline `dyn Trait`
     // receiver (lowered to `CallTarget::Indirect`) narrows to the family
     // base ClassDef.  Union with the config list (dedup by base_root),

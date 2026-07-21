@@ -2945,7 +2945,7 @@ mod tests {
         assert_eq!(unknown, None);
     }
 
-    /// S0 spike for the Option A wasm-JITFRAME refactor: prove the shared
+    /// Spike for the wasm-JITFRAME refactor: prove the shared
     /// `MiniMarkGC` forwards a JitFrame's interior Ref item through the
     /// `jf_gcmap` custom-trace when the frame is discovered via the jitframe
     /// shadow stack. This is the exact GC path the orthodox wasm loop would
@@ -2953,7 +2953,7 @@ mod tests {
     /// traced by `jf_gcmap` during a minor collection (`do_collect_nursery`
     /// Phase 1c → `trace_and_update_object` → `jitframe_custom_trace`). The
     /// wasm backend has none of the feeders yet; this confirms the collector
-    /// side works so the feeders can be built (S1–S3).
+    /// side works so the feeders can be built.
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
         use majit_backend::jitframe::{

@@ -19,9 +19,8 @@
 //! Pyre currently has additional strong references in `BaseJitCell.
 //! loop_token` and embedded `JitCellToken` values inside
 //! `pyjitpl::compiled_loops`. Achieving "alive_loops is the SOLE
-//! strong owner" requires the slicing chain in
-//! `.claude/plans/memmgr-line-by-line-parity.md` (Slices 3.5–3.6),
-//! whose tail is blocked on (Arc lift of CompiledEntry.token).
+//! strong owner" requires further slicing whose tail is blocked on an
+//! Arc lift of `CompiledEntry.token`.
 //! Today `alive_loops` is a *third* strong owner; eviction tracking
 //! works for the warmstate side, but actual token frees only happen
 //! once Slices 3.5–3.6 prune the other strong owners.

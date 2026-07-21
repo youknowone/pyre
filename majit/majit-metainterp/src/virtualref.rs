@@ -238,8 +238,7 @@ impl crate::resume::VRefInfo for VirtualRefInfo {
 // `cargo test` (RPython untranslated, pyre debug build).  Where
 // upstream uses `if not we_are_translated(): assert ...` the port is
 // `#[cfg(debug_assertions)] { assert!(...) }` (always-on under
-// debug_assertions, elided in release).  See `~/.claude/projects/.../
-// memory/feedback_rpython_assert_parity_always_on_2026_05_05.md`.
+// debug_assertions, elided in release).
 //
 // The `debug_assert!` calls below correspond to upstream `assert`
 // statements at:

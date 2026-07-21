@@ -121,8 +121,8 @@ pub struct BaseJitCell {
     /// (`lookup_chain_with_key` / `ensure_cell_for_key` below) populate
     /// this on insert so chained cells distinguish hash collisions like
     /// upstream `JitCell.get_jitcell` (warmstate.py:596-604) does.
-    /// Migration of all callers from hash-only to typed keys is the
-    /// remaining S2.2 work.
+    /// Migration of all callers from hash-only to typed keys is
+    /// unfinished.
     pub comparekey: Option<GreenKey>,
 }
 
@@ -1901,7 +1901,7 @@ impl WarmEnterState {
     ///
     /// Currently a `&self` view: `WarmEnterState`'s mutable lookup
     /// helpers (`maybe_compile`, `should_start_dont_trace_here_trace`)
-    /// keep using the legacy hash-only path until S2.2 follow-up
+    /// keep using the legacy hash-only path until a follow-up
     /// migrates them.
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<&BaseJitCell> {
         let hash = key.get_uhash();

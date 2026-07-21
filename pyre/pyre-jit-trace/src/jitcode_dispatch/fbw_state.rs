@@ -1246,7 +1246,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
     let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
     let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
-    // Narrowed decline (#73 Slice-1 payoff): the general depth-≥2 nested
+    // Narrowed decline: the general depth-≥2 nested
     // residual inline is sound now that the portal-runner ABI is correct — a
     // straight-line mutating callee inlines bit-exact.  Only two callee shapes
     // still miscompile, both masked by the old blanket decline and captured by

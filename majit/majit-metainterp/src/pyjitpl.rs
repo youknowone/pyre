@@ -13488,11 +13488,11 @@ impl<M: Clone> MetaInterp<M> {
         );
         // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs).
         //
-        // S2.4 follow-up: pull `arg_types` from `target_sd.red_args_types`
+        // Pull `arg_types` from `target_sd.red_args_types`
         // (warmspot.py:664) — the static spec is the source of truth.
         // The previous shape recomputed types from runtime arg kinds
         // every call; the consistency assert at
-        // compile.rs::compile_tmp_callback (S2.4) already locks the
+        // compile.rs::compile_tmp_callback already locks the
         // contract that the runtime kinds match jd.red_args_types in
         // declaration order, so the two derivations are observationally
         // identical. Routing through the static spec removes the
@@ -14302,8 +14302,8 @@ impl<M: Clone> MetaInterp<M> {
         pc: usize,
         assembler_call: bool,
     ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
-        // S2.1 invariant (wiggly-barto plan, mirrors `compile_tmp_callback`'s
-        // pre-check at compile.rs:2123): the recursive-call funcbox dereferences
+        // Invariant (mirrors `compile_tmp_callback`'s pre-check in
+        // compile.rs): the recursive-call funcbox dereferences
         // `portal_runner_adr` directly (line below), so a 0 address would jump
         // to NULL on the bh_call_r side. `warmspot.py:1010-1012` populates this
         // before any do_recursive_call can fire; `debug_assert!` catches a
@@ -15765,7 +15765,7 @@ impl MetaInterpStaticData {
     /// except pyre populates the table incrementally as drivers register
     /// instead of taking it wholesale from the codewriter's CallControl.
     ///
-    /// # S2.1 invariant (wiggly-barto plan)
+    /// # Invariant
     ///
     /// The caller must populate `jd.portal_runner_adr` to the host's
     /// `ll_portal_runner` address (`warmspot.py:1010-1012`) **before**
@@ -17447,7 +17447,7 @@ mod metainterp_static_data_tests {
         0xc0ffee
     }
 
-    /// S2.1 invariant (wiggly-barto plan): `do_recursive_call` requires
+    /// Invariant: `do_recursive_call` requires
     /// `portal_runner_adr != 0`. The default `with_virtualizable` /
     /// `JitDriverStaticData::new` constructor leaves the address at 0
     /// until the host runtime populates it (`warmspot.py:1010-1012`).
@@ -17475,7 +17475,7 @@ mod metainterp_static_data_tests {
             majit_ir::EffectInfo::default(),
         );
         // Deliberately do NOT set jd.portal_runner_adr — the default 0
-        // sentinel must trigger the S2.1 invariant assertion.
+        // sentinel must trigger the invariant assertion.
         let jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         let _ = meta.do_recursive_call(&jd, &[], descr_ref, &descr_view, 0, 0, false);
     }

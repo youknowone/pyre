@@ -1,8 +1,7 @@
 //! `flowspace` — Rust port of `rpython/flowspace/`.
 //!
 //! Phase 1 of the five-year roadmap landing a line-by-line port of
-//! `rpython/{flowspace,annotator,rtyper}/` into majit-translate. See
-//! `.claude/plans/majestic-forging-meteor.md` for the full plan.
+//! `rpython/{flowspace,annotator,rtyper}/` into majit-translate.
 //!
 //! RPython upstream lives at
 //! `rpython/flowspace/`. The

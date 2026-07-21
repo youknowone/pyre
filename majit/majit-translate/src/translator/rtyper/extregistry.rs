@@ -1623,7 +1623,7 @@ mod tests {
         );
     }
 
-    /// Helpers for S1.3 marker specialize_call tests — build a hop
+    /// Helpers for the marker specialize_call tests — build a hop
     /// with int-typed greens / reds and a Signed args_r so the
     /// `inputarg(r, i)` path produces real Variables.
     fn signed_arg(name: &str) -> Hlvalue {
@@ -1789,7 +1789,7 @@ mod tests {
         let kwds_i: HashMap<String, usize> = [("i_frame".to_string(), 0)].into_iter().collect();
         let err = entry
             .specialize_marker_call(&hop, &kwds_i)
-            .expect_err("dotted greenfield must defer to S1.3 follow-up");
+            .expect_err("dotted greenfield must defer to the follow-up port");
         assert!(
             err.to_string().contains("dotted greenfield"),
             "expected dotted-greenfield diagnostic: {err}"

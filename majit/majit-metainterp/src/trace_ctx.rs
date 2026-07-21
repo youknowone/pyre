@@ -142,9 +142,8 @@ fn concrete_shadow_value(value: Value) -> Option<Value> {
 /// RPython's `Box` carries type implicitly via Python class identity
 /// (`ConstInt`/`ConstFloat`/`InputArgRef` etc.).  Pyre's flat-OpRef
 /// encoding stores type as a separate `Type` tag, so `GreenBox` bundles
-/// the position + type tag into one struct — Phase A.4 step in
-/// `~/.claude/plans/ec-wiring-gentle-wave.md` folding away the
-/// previous parallel `Vec<OpRef>` + `Vec<Type>` adaptation.
+/// the position + type tag into one struct, folding away the previous
+/// parallel `Vec<OpRef>` + `Vec<Type>` adaptation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GreenBox {
     pub opref: OpRef,

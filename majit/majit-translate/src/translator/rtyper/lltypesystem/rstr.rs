@@ -29,8 +29,7 @@
 //!
 //! The full repr port (`AbstractStringRepr`/`AbstractUnicodeRepr`
 //! methods, `LLHelpers.ll_*` helpers, comparison, formatting,
-//! adtmeths) is deferred to its own follow-on slices — see
-//! `~/.claude/projects/.../memory/item3_abstractstringrepr_epic_plan.md`.
+//! adtmeths) is deferred to follow-on work.
 //!
 //! ## Why a separate module today
 //!

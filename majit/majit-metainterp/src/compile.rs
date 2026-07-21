@@ -2379,7 +2379,7 @@ pub fn compile_tmp_callback(
     greenboxes: &[Value],
     red_arg_types: &[Type],
 ) -> Result<Arc<JitCellToken>, BackendError> {
-    // S2.1 invariant (wiggly-barto plan): every `JitDriverStaticData` reaching
+    // Invariant: every `JitDriverStaticData` reaching
     // `compile_tmp_callback` must have `portal_runner_adr` AND `portal_calldescr`
     // populated. `portal_runner_adr == 0` is the "attribute absent" sentinel
     // upstream (`warmspot.py:1010-1012` sets the address before any tmp_callback
@@ -2437,14 +2437,14 @@ pub fn compile_tmp_callback(
         nb_red_args,
         "compile_tmp_callback: red_arg_types length mismatch",
     );
-    // S2.4 contract (wiggly-barto plan): caller-passed `red_arg_types`
+    // Contract: caller-passed `red_arg_types`
     // must match `jd.red_args_types` — upstream's `compile.py:1107-1124`
     // reads `redargtypes` from `jitdriver_sd.red_args_types` directly so
     // the tmp-callback signature is owned by the jd, not by the call
     // site. Pyre still threads `red_arg_types` through the parameter
     // list while runtime callers derive kinds from CALL_ASSEMBLER args
-    // (see pyjitpl.rs:10444-10451); this assertion locks the
-    // invariant so the S2.4 cutover can drop the parameter without
+    // (see pyjitpl.rs); this assertion locks the invariant so a
+    // later cutover can drop the parameter without
     // a silent semantic shift.
     debug_assert_eq!(
         red_arg_types,

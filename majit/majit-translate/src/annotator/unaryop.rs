@@ -1,8 +1,7 @@
 //! RPython `rpython/annotator/unaryop.py` — single-dispatch
 //! (`dispatch == 1`) operation handlers on the `SomeValue` lattice.
 //!
-//! Commit split (following the plan in
-//! `.claude/plans/0-warm-raccoon.md`):
+//! Commit split:
 //!
 //! * **Commit 6a (this file initial drop)** — `UNARY_OPERATIONS`
 //!   listing + `@op.type.register(SomeObject)` +

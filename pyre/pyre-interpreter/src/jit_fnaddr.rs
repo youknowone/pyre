@@ -598,7 +598,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // each binds both the qualified module path and the glob-re-exported root
     // alias. `function_new_impl` lives in this crate so it binds through
     // `crate::`. The bytes/bytearray constructors allocate a GC-managed storage
-    // box (off-GC storage epic S4) that is not phaseA-liftable, so they
+    // box (off-GC storage) that is not phaseA-liftable, so they
     // residualise like the `malloc_typed` (`NewWithVtable`) roots below.
     push_alias_pair(
         &mut entries,

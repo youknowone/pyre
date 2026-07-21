@@ -3276,7 +3276,7 @@ fn build_function(
                 // own frame was the shadow-stack top. Now that the callee is
                 // pushed, reload local 0 from the entry beneath it before
                 // resolving inputs through local-0-relative homes. The
-                // trampoline path intentionally keeps the A0-era assumption:
+                // trampoline path intentionally keeps the earlier assumption:
                 // its scratch writes themselves dereference stale local 0.
                 if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
                     emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
@@ -3380,7 +3380,7 @@ fn build_function(
                 // The recursive call or deopt helper may have collected and
                 // moved this invocation's own frame. Reload it before the pop
                 // trampoline and post-call home loads address local 0. As above,
-                // the trampoline-only configuration retains its A0-era stale-
+                // the trampoline-only configuration retains its earlier stale-
                 // local-0 limitation because its scratch writes cannot reload it
                 // safely.
                 if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {

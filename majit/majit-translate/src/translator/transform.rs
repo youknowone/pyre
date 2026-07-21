@@ -1479,7 +1479,7 @@ mod tests {
 
     #[test]
     fn transform_list_contains_skips_when_nested_list_in_tuple() {
-        // Codex P2 (round 10): `[([True],)]` carries an unhashable
+        // `[([True],)]` carries an unhashable
         // list inside a tuple. Python would `TypeError` on
         // `items[tuple] = None`, so the rewrite must bail out and
         // leave the list-iteration semantics intact.
@@ -1708,7 +1708,7 @@ mod tests {
 
     #[test]
     fn transform_list_contains_canonicalises_nested_bool_in_tuple() {
-        // Codex P2 (round 7): `(True,)` and `(1,)` must collapse to
+        // `(True,)` and `(1,)` must collapse to
         // the same bucket under `canonical_dict_key` (recursive
         // numeric tower). Direct helper check — the end-to-end path
         // also needs a matching-typed needle to survive the
@@ -1732,7 +1732,7 @@ mod tests {
 
     #[test]
     fn transform_list_contains_keeps_first_inserted_key_on_numeric_collision() {
-        // Codex P2 (round 8): Python dict keeps the FIRST inserted
+        // Python dict keeps the FIRST inserted
         // key on hash collision — `{True: 1, 1: 2}` stays `{True: 2}`
         // with key type `bool`. The Rust rewrite must preserve the
         // caller's original `ConstValue` rather than canonicalising

@@ -1072,9 +1072,8 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 // incompatible item is stored. A trace that folded
                 // `strategy == Float` at trace-time into a constant would
                 // then read from `float_items.block` (empty after the
-                // switch) and dereference garbage — spectral_norm n=10
-                // SIGSEGV root cause diagnosed in
-                // memory/spectral_norm_small_n_crash_2026_04_17.md.
+                // switch) and dereference garbage — the spectral_norm n=10
+                // SIGSEGV root cause.
                 //
                 // Upstream PyPy handles this with a quasi-immutable flag
                 // + invalidate_compiled_code hook on strategy change;

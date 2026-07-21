@@ -4872,7 +4872,7 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         // `w_bytes_from_bytes(...)` so `e.object` always holds a
         // canonical `bytes` regardless of the input shape.
         //
-        // Codex P1 (PR #89 round 2): `bytes_like_data` dispatches via
+        // `bytes_like_data` dispatches via
         // exact-type pointer identity (`is_bytes` → `py_type_check`)
         // and silently reads the operand through the `W_BytearrayObject`
         // layout for any non-exact-bytes input — including `bytes`

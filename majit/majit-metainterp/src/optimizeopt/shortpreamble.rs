@@ -1619,7 +1619,7 @@ impl ProducedShortOp {
         // phase boundary, so an eager `imported_short_aliases.push` here
         // would be a TODO dual write.
         //
-        // Path B parity (B.6.7): Heap/Array/LoopInvariant produce_* return
+        // Heap/Array/LoopInvariant produce_* return
         // `source` so successor short-op dependency args resolve through
         // `produced_results` to Phase 1 source-namespace (matching body
         // refs after `force_op_from_preamble_op` returns `preamble_source`).

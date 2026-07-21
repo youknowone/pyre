@@ -378,7 +378,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
 /// heap type. `name` is a GC-managed leaf storage box (`NameStorage`, off-GC
-/// storage epic S5) reclaimed by its own box tid's drop glue — freeing it here
+/// storage) reclaimed by its own box tid's drop glue — freeing it here
 /// too would double-free a box swept before its owner. `mro_w` is a GC-managed
 /// `FixedObjectArray` reclaimed by the collector and must not be freed here. The
 /// managed namespace object is also reclaimed by the collector, while the
@@ -464,7 +464,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let w_dict = obj_addr as pyre_object::PyObjectRef;
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
     // Keep the stable leaf storage box alive by forwarding its owning
-    // `dstorage` field slot (off-GC storage epic S2). The box has no walker
+    // `dstorage` field slot (off-GC storage). The box has no walker
     // of its own; `walk_gc_refs` below forwards the interior PyObjectRef
     // slots, matching the mapdict / set-items leaf-storage pattern. Only the
     // storage-box strategies own their `dstorage`: a MapDictStrategy
@@ -493,7 +493,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 }
 
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
-/// box (`Vec<u8>`, no inner refs, off-GC storage epic S4). Forward the field
+/// box (`Vec<u8>`, no inner refs, off-GC storage). Forward the field
 /// slot so a major GC greys the box; the box tid's own drop glue reclaims the
 /// buffer on sweep. A no-GC-hook fallback allocation is not collector-owned, so
 /// the guard skips it.
@@ -509,7 +509,7 @@ unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 }
 
 /// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
-/// `W_BytesObject` (off-GC storage epic S4).
+/// `W_BytesObject` (off-GC storage).
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -586,7 +586,7 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
 ///
 /// Each of the three is now a GC-managed non-moving storage box (off-GC
-/// storage epic S3), so this trace does two things: it forwards each
+/// storage), so this trace does two things: it forwards each
 /// box-pointer field slot to grey the box (keeping it off the sweep list,
 /// as `object_object_custom_trace` does for `storage`), then walks the box
 /// interiors to forward their movable values.  The interior walk lives in
@@ -1462,7 +1462,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // instances are the same Rust struct, so the vtable map sends
     // both PyTypes to `function_tid`. No `.with_destructor_fn`: a mortal
     // function's `name` box is reclaimed by its own tid's drop glue (off-GC
-    // storage epic S5); a holder destructor would double-free a box swept before
+    // storage); a holder destructor would double-free a box swept before
     // its owner.
     let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_interpreter::function::Function>(),
@@ -1584,7 +1584,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::typedef::W_MemberDescr as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_BytesObject (immutable byte sequence) carries `data`, a `*const Vec<u8>`
-    // GC-managed storage box (off-GC storage epic S4). The custom trace forwards
+    // GC-managed storage box (off-GC storage). The custom trace forwards
     // that field slot so the box stays live; no `.with_destructor_fn` — the box
     // tid's drop glue is the sole reclaimer, exactly as the set-items box owns
     // its reclamation. A sweep-time bytes destructor would put two reclaimers on
@@ -1626,7 +1626,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // hook so the GC updates those indirect key/value slots just as it
     // updates inline object fields.
     // No `.with_destructor_fn`: a regular dict's `dstorage` is a GC-managed
-    // storage box (off-GC storage epic S2) whose own tid drop glue
+    // storage box (off-GC storage) whose own tid drop glue
     // (`storage_box_destructor`) is the sole reclaimer, exactly as the set
     // items box owns its reclamation. A sweep-time dict destructor would race
     // that box on the destructor list — freeing `dstorage` after the box was
@@ -2111,7 +2111,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // hook so the GC walks all three indirect storages — matching
     // the W_DictObject pattern.
     // No `.with_destructor_fn`: all three storages are now GC-managed storage
-    // boxes (off-GC storage epic S3) whose own tid drop glue
+    // boxes (off-GC storage) whose own tid drop glue
     // (`storage_box_destructor`) is the sole reclaimer. A sweep-time module-dict
     // destructor would race those boxes on the destructor list and double-free —
     // exactly the regular-dict case above.
@@ -2909,7 +2909,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetItemsStorage>,
         pyre_object::setobject::set_set_items_gc_type_id,
     );
-    // Regular-dict `dstorage` storage boxes (off-GC storage epic S2).
+    // Regular-dict `dstorage` storage boxes (off-GC storage).
     // dictmultiobject.py:47 `dstorage` erases an `r_dict` = GcStruct("dicttable")
     // (rdict.py:210); each concrete strategy backs it with a native container
     // now living in a GC-managed leaf box. `dict_object_custom_trace` greys the
@@ -2966,7 +2966,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
     );
-    // bytes / bytearray `data` storage box (off-GC storage epic S4). A leaf
+    // bytes / bytearray `data` storage box (off-GC storage). A leaf
     // `Vec<u8>` (no inner refs) shared by both types; `bytes_object_custom_trace`
     // / `bytearray_object_custom_trace` grey it through the `data` field slot and
     // the box tid's drop glue reclaims the buffer on sweep. Keep this id at the
@@ -2989,7 +2989,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         pyre_object::unicodeobject::set_unicode_value_gc_type_id,
     );
     // Mortal `name` string storage box shared by heap `W_TypeObject` and user
-    // `Function` (off-GC storage epic S5). A leaf `String` (no inner refs); the
+    // `Function` (off-GC storage). A leaf `String` (no inner refs); the
     // type's `type_object_custom_trace` name-slot greying and the function's
     // `FUNCTION_NAME_OFFSET` gc-pointer edge grey it, and the box tid's drop glue
     // reclaims the buffer on sweep. Only mortal holders box their name; immortal
@@ -3746,9 +3746,9 @@ pub struct PyPyJitDriver {
     /// rlib/jit.py:690 — `should_unroll_one_iteration` hook callable.
     pub should_unroll_one_iteration: Option<fn(usize, bool, pyre_object::PyObjectRef) -> bool>,
     /// rlib/jit.py:688 — `confirm_enter_jit` hook (concrete pyre signature
-    /// is wired alongside S1.3 specialize_call; until then, `None`).
+    /// is wired alongside specialize_call; until then, `None`).
     pub confirm_enter_jit: Option<fn() -> bool>,
-    /// rlib/jit.py:689 — `can_never_inline` hook (signature ported with S1.3).
+    /// rlib/jit.py:689 — `can_never_inline` hook (signature ported).
     pub can_never_inline: Option<fn() -> bool>,
 }
 
@@ -11685,8 +11685,7 @@ result = fib(12)
                   adds a native frame per recursive compiled entry. At the low JIT \
                   threshold used here, g(9)×2 runs enough compiled invocations to \
                   overflow the 2 MiB default cargo-test thread stack. Dynasm is \
-                  unaffected (jmp trampoline). See \
-                  memory/fib_recursive_sigbus_2026_04_19.md."
+                  unaffected (jmp trampoline)."
     )]
     fn test_recursive_global_reads_do_not_reuse_force_cache_across_global_mutation() {
         let _jit_params = TestJitParamsGuard::low_threshold();

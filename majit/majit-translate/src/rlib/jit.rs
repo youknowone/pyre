@@ -94,7 +94,7 @@ pub const LOOP_HEADER_ANALYSER_NAME: &str = "rlib.jit.ExtLoopHeader.loop_header"
 /// The metadata is intentionally narrow: only fields that the
 /// annotator / codewriter pipeline reads. Runtime hooks captured on
 /// the pyre side (`PyPyJitDriver::get_*`) are mirrored as `HostObject`
-/// callables once the per-hook wiring lands in S1.3.
+/// callables once the per-hook wiring lands.
 #[derive(Clone, Debug)]
 pub struct JitDriverMeta {
     /// Identity of the driver instance — used as the
@@ -268,7 +268,7 @@ fn annotate_hooks(
 /// signature gains an `args_s_seed: &[SomeValue]` parameter without
 /// touching the variable-loop body.
 ///
-/// The dotted-green branch is held back to S1.3 alongside
+/// The dotted-green branch is held back alongside
 /// `ExtEnterLeaveMarker.specialize_call` (rlib/jit.py:965-993). Until
 /// then a dotted variable surfaces as an `AnnotatorError` so the gap
 /// fails closed instead of silently dropping the arg.
@@ -297,10 +297,10 @@ fn annotate_hook(
             // rlib/jit.py:941-948 dotted-green field path. Requires
             // `s_instance.classdef.find_attribute(fieldname)` plus
             // `bk.record_getattr(classdesc, fieldname)` — both land
-            // with `ExtEnterLeaveMarker.specialize_call` at S1.3.
+            // with `ExtEnterLeaveMarker.specialize_call`.
             return Err(AnnotatorError::new(format!(
                 "JitDriver dotted greenfield {name:?} reaches annotate_hook before \
-                 ExtEnterLeaveMarker.specialize_call port (S1.3, rlib/jit.py:965-993)",
+                 ExtEnterLeaveMarker.specialize_call port (rlib/jit.py:965-993)",
             )));
         }
         let key = format!("s_{name}");

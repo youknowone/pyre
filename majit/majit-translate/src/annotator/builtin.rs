@@ -2433,7 +2433,7 @@ mod tests {
 
     #[test]
     fn builtin_list_on_iterator_routes_through_next() {
-        // Codex P1: `list(reversed(xs))` should keep the element type
+        // `list(reversed(xs))` should keep the element type
         // instead of collapsing to SomeImpossibleValue. Upstream chains
         // `s_iterable.iter().next()` which delegates to
         // `SomeIterator.next()` for SomeIterator inputs.
@@ -2463,7 +2463,7 @@ mod tests {
 
     #[test]
     fn builtin_max_keeps_nonneg_when_any_operand_is_nonneg() {
-        // Codex P2: upstream `nonneg |= s1.nonneg` is an OR-fold —
+        // upstream `nonneg |= s1.nonneg` is an OR-fold —
         // `max(nonneg, maybe_negative)` stays nonneg.
         use crate::annotator::model::SomeInteger;
         let bk = bk();
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[test]
     fn builtin_int_rejects_out_of_range_float_constant() {
-        // Codex P2: `int(1e20)` would saturate to i64::MAX if we let the
+        // `int(1e20)` would saturate to i64::MAX if we let the
         // Rust cast do its default behaviour — upstream raises OverflowError
         // which constpropagate catches. Non-finite / out-of-range floats
         // must fall through to the conservative `s_result`.
@@ -2502,7 +2502,7 @@ mod tests {
 
     #[test]
     fn registered_class_backed_builtin_lifts_to_somebuiltin() {
-        // Codex P1: class-backed builtins (`range`, `int`, `list`, …)
+        // class-backed builtins (`range`, `int`, `list`, …)
         // are `HostObjectKind::Class` in HOST_ENV but still register
         // analysers. `immutablevalue` must route them to `SomeBuiltin`
         // so that `SomeBuiltin.call()` reaches the analyser, matching
@@ -2524,7 +2524,7 @@ mod tests {
 
     #[test]
     fn builtin_unichr_const_integer_returns_constant_unicode_cp() {
-        // Codex P2: `unichr(65)` must keep the constant via the
+        // `unichr(65)` must keep the constant via the
         // UnicodeCodePoint variant; constpropagate's re-annotation
         // through immutablevalue needs the explicit unicode tag.
         let bk = bk();
@@ -2543,7 +2543,7 @@ mod tests {
 
     #[test]
     fn builtin_unicode_const_string_returns_constant_unicode_string() {
-        // Codex P2: `unicode("abc")` must return a constant
+        // `unicode("abc")` must return a constant
         // SomeUnicodeString, not raise AnnotatorError.
         let bk = bk();
         let s_str = bk.immutablevalue(&ConstValue::byte_str("abc")).unwrap();
@@ -2561,7 +2561,7 @@ mod tests {
 
     #[test]
     fn builtin_hasattr_folds_constant_when_attr_exists_on_class() {
-        // Codex P2: for immutable constant receivers, `hasattr(C, "m")`
+        // for immutable constant receivers, `hasattr(C, "m")`
         // must fold to a constant SomeBool. The HOST_ENV `range` class
         // has no attribute members in this minimal env, so assert the
         // False branch — checks the folding mechanism regardless of
@@ -2585,7 +2585,7 @@ mod tests {
 
     #[test]
     fn builtin_bool_folds_constant_none_to_false() {
-        // Codex P2: `bool(None)` must pin `r.const = False` instead of
+        // `bool(None)` must pin `r.const = False` instead of
         // returning an unrefined SomeBool.
         let bk = bk();
         let s_none_val = bk.immutablevalue(&ConstValue::None).unwrap();
@@ -2615,7 +2615,7 @@ mod tests {
 
     #[test]
     fn call_builtin_rejects_unknown_keyword() {
-        // Codex P2: `list(xs, foo=1)` must raise instead of silently
+        // `list(xs, foo=1)` must raise instead of silently
         // ignoring `foo=1`. The dispatcher now rejects kwds outside
         // each analyser's allow-list.
         let bk = bk();
@@ -2656,7 +2656,7 @@ mod tests {
 
     #[test]
     fn builtin_int_rejects_positional_and_keyword_base() {
-        // Codex P2: `int(x, 10, base=16)` must raise the duplicate-arg
+        // `int(x, 10, base=16)` must raise the duplicate-arg
         // error that upstream's Python dispatch produces.
         let bk = bk();
         let s_str = bk.immutablevalue(&ConstValue::byte_str("1a")).unwrap();
@@ -2677,7 +2677,7 @@ mod tests {
 
     #[test]
     fn r_dict_helper_reads_force_non_null_from_keyword() {
-        // Codex P1: r_dict(eq, hash, force_non_null=True) must honour
+        // r_dict(eq, hash, force_non_null=True) must honour
         // the kwd. Previously ignored, leaving the DictDef flag false.
         //
         // Testing through call_builtin would trip
@@ -2716,7 +2716,7 @@ mod tests {
 
     #[test]
     fn builtin_enumerate_rejects_non_constant_start_keyword() {
-        // Codex P2: `enumerate(xs, start=<non-constant>)` must raise
+        // `enumerate(xs, start=<non-constant>)` must raise
         // the upstream "second argument to enumerate must be constant"
         // error instead of silently dropping the kwd.
         use crate::annotator::model::SomeInteger;
@@ -2766,7 +2766,7 @@ mod tests {
 
     #[test]
     fn builtin_hasattr_walks_class_mro_for_inherited_attr() {
-        // Codex P2: hasattr folding must resolve inherited attributes,
+        // hasattr folding must resolve inherited attributes,
         // not just the immediate class dict. Build base with `m`, then
         // subclass with empty dict — `hasattr(Subclass, "m")` must be
         // folded to True.

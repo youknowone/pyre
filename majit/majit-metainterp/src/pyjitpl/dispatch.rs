@@ -417,7 +417,7 @@ pub trait JitCodeSym {
     /// `vec![0i64; program.len()]`).
     ///
     /// Convergence path: when the macro switches to RPython
-    /// MIFrame-regs storage (orth-9 step 4 reshape), this
+    /// MIFrame-regs storage, this
     /// method's default no-op impl matches RPython's "regs already
     /// populated by dispatch" semantics and the macro override drops
     /// out.  Until then, callers with a state-field JIT pass

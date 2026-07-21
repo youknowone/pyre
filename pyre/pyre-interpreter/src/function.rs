@@ -254,7 +254,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// closure / defs_w / w_kw_defs / w_module set.
 ///
 /// `can_change_code` is a `bool` and thus non-GC. `name` points at a
-/// GC-managed leaf storage box (`NameStorage`, off-GC storage epic S5) for a
+/// GC-managed leaf storage box (`NameStorage`, off-GC storage) for a
 /// mortal (user, `PyCode`) function, so its slot is forwarded here; the box tid's
 /// drop glue reclaims it on sweep. An immortal builtin function's `malloc_raw`
 /// name is not collector-owned, so the walker's `is_managed_heap_object` guard

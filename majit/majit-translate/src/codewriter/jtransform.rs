@@ -1291,8 +1291,8 @@ impl<'a> Transformer<'a> {
             // Coverage covers all six
             // comparison ops (`eq`/`ne`/`lt`/`le`/`gt`/`ge`).  The
             // earlier "eq/ne only" restriction surfaced `int_le/r*`
-            // as unwired blackhole opnames, breaking the Task #85
-            // expected-empty snapshot.  RPython has no `ptr_lt` family,
+            // as unwired blackhole opnames, breaking the expected-empty
+            // snapshot.  RPython has no `ptr_lt` family,
             // but `cast_ptr_to_int` followed by `int_lt`/`int_le`
             // matches what `rpython/rtyper/rint.py` emits for any
             // comparison whose operands cross the ptr/int boundary —

@@ -8156,8 +8156,7 @@ impl CodeWriter {
                         // registers inside the trace-tracked range (`registers_r`
                         // + `symbolic_stack`), so guards fired across the op (e.g.
                         // `GUARD_NOT_FORCED_2` after a helper call) capture the
-                        // lhs/rhs values in fail_args. See
-                        // `memory/pyre_trace_temp_reg_tracking_gap_2026_04_19.md`.
+                        // lhs/rhs values in fail_args.
                         Instruction::BinaryOp { op } => {
                             let op_kind = op.get(op_arg);
                             let _ = binary_op_tag(op_kind)

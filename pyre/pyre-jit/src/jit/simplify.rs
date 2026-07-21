@@ -1312,8 +1312,7 @@ mod tests {
 
     /// The faithful (operations-based) eliminate_empty_blocks collapses a
     /// NON-dead empty forwarding block that carries args — the shape
-    /// `remove_trivial_links` cannot (its incoming link has args).  Codex P2,
-    /// PR #127.
+    /// `remove_trivial_links` cannot (its incoming link has args).
     #[test]
     fn eliminate_empty_blocks_collapses_empty_forwarder_with_args() {
         // start -> empty(ve) -> next(vn);  empty has no operations and forwards

@@ -894,7 +894,7 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
 // the live value through `plain_direct_read` on every hit. The one movable
 // reference is the LOAD_METHOD `w_method` slot (mapdict.py:1418), forwarded
 // during collection by `pycode::walk_mapdict_method_cache_gc`. (Contingency:
-// were map nodes ever made movable — Task #197 — the raw pointers would
+// were map nodes ever made movable, the raw pointers would
 // dangle and the whole entry would have to switch to that forwarded design.)
 
 /// mapdict.py:1416-1422 `CacheEntry`. PyPy's shared `INVALID_CACHE_ENTRY`

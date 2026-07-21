@@ -5061,7 +5061,7 @@ impl Optimizer {
         // copy here leaves the shared guard with `fail_arg_types=None`,
         // the bridge code falls back to the bridge tracer's (unboxed)
         // inputarg types, and the Ref count disagrees with the serializer
-        // → rd_numb over-read. See memory/fannkuch_reg20_root_cause.md.
+        // → rd_numb over-read.
         if let Some(types) = last.get_fail_arg_types() {
             op.set_fail_arg_types(types.to_vec());
         } else {

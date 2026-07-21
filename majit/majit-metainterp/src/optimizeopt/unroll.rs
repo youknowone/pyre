@@ -4351,7 +4351,7 @@ impl OptUnroll {
         //
         // `produced_results` accumulates `source pos -> replay identity` so
         // successor entries can resolve `Produced` arg classifications. After
-        // Path B (B.6.7) the producer-side `produce_*` methods return
+        // The producer-side `produce_*` methods return
         // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
         // value is the body-visible OpRef per `replay_pos` in
         // `initialize_imported_short_preamble_builder_from_short_boxes`.
@@ -7319,7 +7319,7 @@ mod tests {
 
         import_short_preamble_state(&[OpRef::int_op(0)], &[phase2_result], &exported, &mut ctx);
 
-        // Path B (B.6.7-loopinv): imported_loop_invariant_results stores the
+        // imported_loop_invariant_results stores the
         // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
         let _ = phase2_result;
         assert_eq!(
@@ -7462,7 +7462,7 @@ mod tests {
             .unwrap()
             .produced_short_op(&src19)
             .unwrap();
-        // Path B (B.6.7-heap-field): produce_heap_field no longer installs
+        // produce_heap_field no longer installs
         // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.

@@ -626,7 +626,7 @@ assert result == 300, result
 }
 
 /// A `bytes` / `bytearray` object's `data` buffer is a GC-managed leaf storage
-/// box (off-GC storage epic S4): `bytes_object_custom_trace` /
+/// box (off-GC storage): `bytes_object_custom_trace` /
 /// `bytearray_object_custom_trace` grey it through the `data` field slot, and
 /// the box tid's drop glue reclaims it on sweep. Regression for two failure
 /// modes the migration off `malloc_typed`-immortal holders could introduce: a
@@ -692,7 +692,7 @@ assert result == 2325, result
 }
 
 /// A `str` SUBCLASS instance's WTF-8 `value` buffer is a GC-managed leaf storage
-/// box (off-GC storage epic S5): the mortal subclass holder is GC-swept and its
+/// box (off-GC storage): the mortal subclass holder is GC-swept and its
 /// `value` gc-pointer edge greys the box, whose tid drop glue reclaims the
 /// buffer on sweep. Regression for the migration off the per-type
 /// `unicode_object_destructor`: a subclass string reachable only through a list
@@ -747,7 +747,7 @@ assert result == 1428, result
 
 /// A mortal (user) `Function`'s `name` string and a heap `W_TypeObject`'s `name`
 /// string are GC-managed leaf storage boxes shared under one `NameStorage` tid
-/// (off-GC storage epic S5): the function's `FUNCTION_NAME_OFFSET` gc-pointer
+/// (off-GC storage): the function's `FUNCTION_NAME_OFFSET` gc-pointer
 /// edge and the type's `type_object_custom_trace` name-slot greying keep the box
 /// live, and the box tid's drop glue is the sole reclaimer. Regression for the
 /// migration off `function_object_destructor` / the type destructor's name-free:

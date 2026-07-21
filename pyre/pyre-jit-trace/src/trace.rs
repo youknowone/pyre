@@ -706,8 +706,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
 /// this surfaces the next blocker for the full-body walk — the Path A
 /// payload-seeding gap (an op reading a register slot the entry never
 /// seeded, e.g. a `goto_if_not` over a non-concrete Int produced by an
-/// unfolded `residual_call`).  See
-/// `project_issue73_architecture_walker_as_tracer_2026_05_28`.
+/// unfolded `residual_call`).
 ///
 /// Decode the loop-header `jit_merge_point` that governs a bridge resume
 /// coordinate and return its green-ref (`gr`) and red (`rr`) register lists.

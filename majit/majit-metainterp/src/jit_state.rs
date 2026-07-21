@@ -636,7 +636,7 @@ pub trait JitState: Sized {
     /// `merge_point` / `force_finish_trace` where the generic `S::Sym`
     /// is not constrained to implement `JitCodeSym`.  Once
     /// `JitState::Sym: JitCodeSym` becomes the universal contract
-    /// (orth-9 step 4 reshape), this hook collapses into the
+    /// this hook collapses into the
     /// `JitCodeSym` method directly.
     fn populate_frame_for_guard(
         _sym: &Self::Sym,

@@ -1027,10 +1027,10 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
     let ca_result = if fbw_vable_scalar_ca_enabled() {
-        // S1-S3 (`PYRE_FBW_VABLE_SCALAR_CA`): route through the vable-scalar
+        // `PYRE_FBW_VABLE_SCALAR_CA`: route through the vable-scalar
         // emitter so loop-carried locals become scalar CALL_ASSEMBLER args +
         // `VableExpansion` arg_overrides, letting the optimizer elide the
-        // per-call frame-array build. S0 scaffolding: the emitter currently
+        // per-call frame-array build. Scaffolding only: the emitter currently
         // produces the identical red-only CA; the vable_expansion routing lands
         // in S2.
         emit_loop_callee_ca_vable_scalar(ctx, callee_frame, callee_ec, token)
@@ -1107,16 +1107,16 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
-/// `PYRE_FBW_VABLE_SCALAR_CA` emission seam (S0 scaffolding).
+/// `PYRE_FBW_VABLE_SCALAR_CA` emission seam (scaffolding only).
 ///
 /// Emits the loop-callee CALL_ASSEMBLER when the vable-scalar mode is
-/// on. S0: produces the identical red-only `[callee_frame, callee_ec]` CA as
-/// the default path, so flag-ON is byte-identical to flag-OFF. S2 replaces the
-/// body with `call_assembler_with_vable_expansion` — passing the callee's
+/// on. Today it produces the identical red-only `[callee_frame, callee_ec]` CA
+/// as the default path, so flag-ON is byte-identical to flag-OFF. Wiring the
+/// body to `call_assembler_with_vable_expansion` — passing the callee's
 /// loop-carried locals as scalar args plus a `VableExpansion` whose
 /// `arg_overrides` map each scalar to a callee jitframe slot
-/// (`rewrite.py:665-695` handle_call_assembler parity) — so the optimizer can
-/// elide the per-call frame-array build.
+/// (`rewrite.py:665-695` handle_call_assembler parity) — would let the
+/// optimizer elide the per-call frame-array build.
 pub(crate) fn emit_loop_callee_ca_vable_scalar<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     callee_frame: OpRef,

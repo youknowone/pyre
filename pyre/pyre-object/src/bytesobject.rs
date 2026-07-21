@@ -35,7 +35,7 @@ pub fn bytes_data_gc_type_id() -> u32 {
 ///
 /// PyPy: W_BytesObject stores `_value` (RPython string).
 /// pyre: stores a heap-allocated `Vec<u8>` in a GC-managed non-moving storage
-/// box (off-GC storage epic S4), same layout as W_BytearrayObject but without
+/// box (off-GC storage), same layout as W_BytearrayObject but without
 /// setitem/extend.
 #[repr(C)]
 pub struct W_BytesObject {

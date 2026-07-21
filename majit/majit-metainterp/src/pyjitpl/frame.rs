@@ -407,7 +407,7 @@ impl MIFrame {
     /// must satisfy [`OpRef::is_constant`] — the constant-namespace
     /// flag set by `OpRef::const_int` / `const_ptr` / `const_float`.
     ///
-    /// Production callers land with S2.3 follow-up (the metainterp-side
+    /// Production callers land with a follow-up (the metainterp-side
     /// `opimpl_jit_merge_point` port). For now the helper is dead code
     /// outside tests; it locks the contract upstream relies on so a
     /// future caller cannot silently accept a non-Const green.

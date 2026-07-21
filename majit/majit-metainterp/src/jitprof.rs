@@ -1143,7 +1143,7 @@ mod tests {
         // writes to that Arc must be visible to the profiler's
         // `get_counter` and freed-bump helpers.  Two independent
         // profilers bound to separate trackers must NOT share state —
-        // this is the regression Codex P2 flagged.
+        // this is the regression under test.
         let prof_a = JitProfiler::default();
         let prof_b = JitProfiler::default();
         let tracker_a = Arc::new(CpuTotalTracker::default());

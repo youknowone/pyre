@@ -491,7 +491,7 @@ pub struct JitDriverStaticData {
     /// `propagate_exception` post-loop branch.
     ///
     /// `0` mirrors upstream's "attribute absent" / "not yet wired" state
-    /// — populated by S2.1 alongside `portal_runner_adr`.
+    /// — populated alongside `portal_runner_adr`.
     pub assembler_helper_adr: i64,
     /// jitdriver.py:29 `self.vable_token_descr` (CALL_ASSEMBLER).
     ///
@@ -723,7 +723,7 @@ impl JitDriverStaticData {
     /// Pyre stores `red_args_types: Vec<char>` to mirror upstream's
     /// `'i' / 'r' / 'f'` representation; this helper bridges to the IR
     /// `Type` enum without the caller having to re-implement the
-    /// mapping. The S2.4 cutover will drop the explicit `red_arg_types`
+    /// mapping. A later cutover will drop the explicit `red_arg_types`
     /// argument from `compile_tmp_callback` and read from the jd
     /// directly via this helper.
     ///
@@ -1088,8 +1088,7 @@ impl<S: JitState> JitDriver<S> {
     /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
     /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
     /// slice — full `finish_setup` requires `CodeWriter` /
-    /// `CallControl` construction (orth-9 plan step 4) which
-    /// is not yet wired.
+    /// `CallControl` construction, which is not yet wired.
     ///
     /// Caller responsibility: build a fresh
     /// `majit_translate::codewriter::assembler::Assembler`,

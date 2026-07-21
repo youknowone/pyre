@@ -15,8 +15,7 @@
 //! graphs registered directly through `register_function_graph` can
 //! take the Skip arm and bypass that fold.
 //! The residual `Call` op then survives into jtransform and is emitted
-//! as a `residual_call_r/d>r` wrapper, which blocks the JitCode walker
-//! (Task #333).
+//! as a `residual_call_r/d>r` wrapper, which blocks the JitCode walker.
 //!
 //! This pass operates directly on `model::FunctionGraph` after
 //! `lower_indirect_calls` and before `Transformer::transform`, so it

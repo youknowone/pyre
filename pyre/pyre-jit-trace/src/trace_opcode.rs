@@ -2931,8 +2931,7 @@ impl MIFrame {
         // dual-write. Any divergence here means a code path updated one
         // shadow without the other — most likely load_local_value's lazy
         // fallback (trace_opcode.rs) which writes registers_r
-        // but does NOT call set_virtualizable_box_at. See
-        // memory/phase_1_4_cand_a_landed_raise_catch_diagnostic_2026_04_26.md.
+        // but does NOT call set_virtualizable_box_at.
         if std::env::var("PYRE_PROBE_SNAPSHOT").ok().as_deref() == Some("1") {
             let num_static = ctx
                 .virtualizable_info()

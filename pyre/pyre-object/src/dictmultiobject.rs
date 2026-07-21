@@ -1035,13 +1035,13 @@ pub static MODULE_DICT_TYPE: PyType = new_pytype("dict");
 pub struct W_ModuleDictObject {
     pub ob_header: PyObject,
     /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py:47`).
-    /// A GC-managed non-moving storage box (off-GC storage epic S3);
+    /// A GC-managed non-moving storage box (off-GC storage);
     /// reassignment is a `setfield_gc`.  Authoritative while
     /// `object_storage` is null (ModuleDictStrategy mode); after
     /// `switch_to_object_strategy` it is cleared and not consulted.
     pub dstorage: *mut crate::celldict::ModuleDictStorage,
     /// `mstrategy` from `W_ModuleDictObject.__slots__` (`:331`).
-    /// A GC-managed non-moving storage box (off-GC storage epic S3).
+    /// A GC-managed non-moving storage box (off-GC storage).
     pub mstrategy: *mut crate::celldict::ModuleDictStrategy,
     /// `dstorage` after a `switch_to_object_strategy`
     /// (`celldict.py:173-186`).  Null while the dict is in

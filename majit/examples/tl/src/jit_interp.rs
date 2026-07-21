@@ -8,7 +8,7 @@
 /// Reds:   [inputarg, stackpos, stack]  (inputarg is a function parameter — red by nature)
 use majit_metainterp::jit::promote;
 
-// [SPIKE-S0/FR] throwaway compile counter to measure portal-call compile-through.
+// Throwaway compile counter to measure portal-call compile-through.
 pub static SPIKE_COMPILES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
@@ -117,7 +117,7 @@ const PUSHARG: u8 = 22;
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlState> =
         majit_metainterp::JitDriver::new(threshold);
-    // [SPIKE-S0/FR] count compiled loops.
+    // Count compiled loops.
     driver.set_on_compile_loop(|_gk, _b, _a| {
         SPIKE_COMPILES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     });
@@ -470,7 +470,7 @@ mod tests {
         ]
     }
 
-    /// [SPIKE-S0/FR] Measure whether a portal call inside a hot loop compiles
+    /// Measure whether a portal call inside a hot loop compiles
     /// through. Control = pure loop (no call). Probe = leaf call in loop body.
     #[test]
     fn spike_portal_call_compile_through() {
