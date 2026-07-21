@@ -124,6 +124,13 @@ jobs:
     # unchanged crates restore while only the changed crate re-extracts; the
     # Extract step below refills any missed crate, so the downstream artefact
     # always carries all three ullbc files.
+    #
+    # Each crate's entry also carries its `*.layouts.ullbc` sidecars — the
+    # same crate re-extracted for a cross target and reduced to its type
+    # declarations, so a wasm32 build reads wasm32 field offsets rather than
+    # the extraction host's. They must restore alongside the artefact they
+    # accompany: a cache hit skips extraction, and `pyre-jit-trace`'s build
+    # script refuses a cross-target build whose sidecars are absent.
     - name: Cache LLBC (pyre-object)
       id: llbc-cache-object
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -131,6 +138,7 @@ jobs:
         path: |
           build/llbc/pyre-object.ullbc
           build/llbc/pyre-object.ullbc.fingerprint
+          build/llbc/pyre-object.*.layouts.ullbc
         key: llbc-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
     - name: Cache LLBC (pyre-interpreter)
       id: llbc-cache-interpreter
@@ -139,6 +147,7 @@ jobs:
         path: |
           build/llbc/pyre-interpreter.ullbc
           build/llbc/pyre-interpreter.ullbc.fingerprint
+          build/llbc/pyre-interpreter.*.layouts.ullbc
         key: llbc-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
     - name: Cache LLBC (pyre-jit)
       id: llbc-cache-jit

@@ -144,11 +144,21 @@ fn preflight_llbc_or_fail() {
         "pyre-interpreter.ullbc",
         "pyre-jit.ullbc",
     ];
-    let missing: Vec<&str> = REQUIRED
+    let mut missing: Vec<String> = REQUIRED
         .iter()
-        .copied()
         .filter(|name| !llbc_dir.join(name).exists())
+        .map(|name| (*name).to_string())
         .collect();
+    // Cross-compiling additionally needs this target's layout sidecars:
+    // Charon resolves struct layouts per target, and the artefacts above
+    // carry the extraction host's.  Without them every descr field past the
+    // first pointer names the wrong bytes on a target whose pointers are a
+    // different width, which corrupts reads instead of failing.
+    for name in llbc_layout_sidecars() {
+        if !llbc_dir.join(&name).exists() {
+            missing.push(name);
+        }
+    }
     if missing.is_empty() {
         return;
     }
@@ -592,6 +602,29 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     ] {
         println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
     }
+    for sidecar in llbc_layout_sidecars() {
+        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{sidecar}");
+    }
+}
+
+/// Layout-sidecar artefact names this build consumes, empty for a native
+/// build.
+///
+/// `scripts/extract-llbc.py` re-extracts each crate for every cross target
+/// and reduces the result to its `type_decls`; `majit-translate`'s
+/// `auto_discover_workspace_llbc_paths` merges them ahead of the host
+/// artefacts so their Charon-resolved field offsets win.
+fn llbc_layout_sidecars() -> Vec<String> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.is_empty() || target == std::env::var("HOST").unwrap_or_default() {
+        return Vec::new();
+    }
+    // `pyre-jit` is absent: it has no sidecar (see the extraction driver's
+    // spec for why), so only the object model gets cross-target layouts.
+    ["pyre-object", "pyre-interpreter"]
+        .iter()
+        .map(|crate_name| format!("{crate_name}.{target}.layouts.ullbc"))
+        .collect()
 }
 
 fn codegen_cache_dir(repo_root: &str, cache_key: &str) -> std::path::PathBuf {

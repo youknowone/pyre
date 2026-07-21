@@ -3317,20 +3317,21 @@ unsafe fn orthodox_list_append_recognize(
 /// Returns `None` (decline — no IR emitted yet) when the body jitcode is not
 /// compiled or the snapshot sym is absent.  The returned `sym_ptr` is
 /// non-null with a set `jitcode` field.
+/// 32-bit targets additionally decline: the sub-walk still miscompiles
+/// there.  Its `d` operands now resolve through a descr pool built from the
+/// target's own Charon layouts (`jitcode_runtime::build_time_field_offset`),
+/// so the reads land on the right bytes — but with the walk reaching the end
+/// instead of aborting, six `bench/synth` list programs
+/// (`list_ops`, `list_reverse`, `list_bound_method_mutation`,
+/// `list_append_funcentry_helper`, `inlined_helper_mutation`,
+/// `inlined_mutation_before_abort`) produce wrong output under the wasm
+/// backend while every native backend stays green.  The remaining defect is
+/// in the fold, not in the layouts; until it is found, the generic residual
+/// append handles the call on a 32-bit target.
 pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(SubJitCodeBody, *const Sym)> {
-    // The sub-walk resolves `w_list_append`'s `d`/`j` operands through the
-    // build-time global descr pool, whose field offsets assume 8-byte pointers
-    // (`build_descr_layout_matches_target`).  On a 32-bit target they name the
-    // wrong bytes, so the body's `is_plain_int1` subclass test folds on
-    // garbage, the walk descends the dead `switch_to_object_strategy` leg and
-    // concretely executes its residuals against the live list before declining
-    // at the leg's un-lowered `ListStrategy::Object` ctor.  That abort leaves an
-    // unrollbackable body effect, which makes `fbw_foriter_inflight_take` refuse
-    // delivery and drop the in-flight FOR_ITER iteration.  Decline here instead,
-    // before any IR or side effect: the generic residual append handles the call.
-    if !crate::jitcode_runtime::build_descr_layout_matches_target() {
+    if std::mem::size_of::<usize>() != 8 {
         return None;
     }
     let jc_arc = crate::jitcode_runtime::list_append_jitcode()?;

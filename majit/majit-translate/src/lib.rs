@@ -294,7 +294,26 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
     // Pyre build requires all three artifacts; generic consumers whose portal
     // lives in the mandatory pair may still use the two-artifact result.
     const MANDATORY: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    // Cross-target layout sidecars first.  Charon resolves struct layouts
+    // per target, and the artefacts above carry the extraction host's;
+    // building for a target with a different pointer width would otherwise
+    // read every field past the first pointer at the wrong offset.  A
+    // sidecar is the same crate re-extracted for that target and reduced to
+    // its `type_decls`, so it contributes layouts and nothing else — and
+    // because `build_semantic_program_from_llbcs` merges `exact_layouts`
+    // first-writer-wins, being first is what makes those layouts the ones
+    // that apply.
+    let target = std::env::var("TARGET").unwrap_or_default();
     let mut paths = Vec::with_capacity(3);
+    if !target.is_empty() && target != std::env::var("HOST").unwrap_or_default() {
+        for name in MANDATORY {
+            let stem = name.trim_end_matches(".ullbc");
+            let sidecar = llbc_dir.join(format!("{stem}.{target}.layouts.ullbc"));
+            if sidecar.exists() {
+                paths.push(sidecar.to_string_lossy().into_owned());
+            }
+        }
+    }
     for name in MANDATORY {
         let p = llbc_dir.join(name);
         if !p.exists() {

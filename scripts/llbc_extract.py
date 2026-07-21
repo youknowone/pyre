@@ -40,6 +40,14 @@ class CrateSpec:
     - `excluded_deps`: path-dependency package names dropped from this crate's
       fingerprint because the artefact holds zero references to them; the
       extraction guard re-checks the artefact and fails loud if that drifts.
+    - `layout_targets`: target triples, besides the extraction host, this
+      crate also emits a layout sidecar for (see `layout_sidecar_name`).
+      `None` takes the driver's default; `()` opts out. Every listed target
+      must compile under `layout_cargo_args`.
+    - `layout_cargo_args`: `cargo_args` replacement for the sidecar passes.
+      A cross target usually needs a different feature set than the host
+      (a native code generator does not build for wasm32). `None` reuses
+      `cargo_args`.
     """
 
     name: str
@@ -49,6 +57,12 @@ class CrateSpec:
     charon_args: list[str] = field(default_factory=list)
     fingerprint_pathspecs: list[str] | None = None
     excluded_deps: set[str] = field(default_factory=set)
+    layout_targets: tuple[str, ...] | None = None
+    layout_cargo_args: list[str] | None = None
+
+    def layout_sidecar_name(self, target: str) -> str:
+        """Artefact name of this crate's `target` layout sidecar."""
+        return f"{Path(self.output_name).stem}.{target}.layouts.ullbc"
 
 
 @dataclass
@@ -63,6 +77,8 @@ class Engine:
     charon_root: Path
     cargo_features: str
     metadata_feature_crates: tuple[str, ...] = ()
+    layout_targets: tuple[str, ...] = ()
+    layout_target_rustflags: str = ""
 
     def spec(self, crate: str) -> CrateSpec:
         try:
@@ -342,6 +358,7 @@ def stamp_for(
     cargo_features: str,
     flags: list[str],
     charon_flags: list[str],
+    layout_targets: list[str],
 ) -> str:
     return "\n".join(
         [
@@ -351,9 +368,84 @@ def stamp_for(
             f"features={cargo_features}",
             f"flags={' '.join(flags)}",
             f"charon_flags={' '.join(charon_flags)}",
+            f"layout_targets={' '.join(layout_targets)}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
         ]
     )
+
+
+def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
+    """Cross targets this crate emits a layout sidecar for.
+
+    The extraction host is never in the list: its layouts already live in
+    the crate's own artefact.
+    """
+    extra = eng.layout_targets if spec.layout_targets is None else spec.layout_targets
+    host = host_triple(eng.root)
+    return [t for t in extra if t != host]
+
+
+def write_layout_sidecar(source: Path, dest: Path) -> None:
+    """Reduce a full `.ullbc` to its type declarations.
+
+    A cross-target extraction is only wanted for the struct layouts Charon
+    resolved for that target; its function bodies are compiled under
+    different `cfg`s and must not displace the host's. Dropping every
+    declaration list but `type_decls` keeps the artefact a loadable
+    `.ullbc` — the reader needs no special case, and the consumer merges
+    it ahead of the host artefacts so its layouts win.
+
+    Only the fields kept are decoded, not the whole file: bodies dominate
+    the input (the interpreter's are ~94% of it), and parsing them costs an
+    order of magnitude more memory than the text itself.
+    """
+    text = source.read_text(encoding="utf-8")
+    decoder = json.JSONDecoder()
+
+    def field(name: str):
+        key = f'"{name}":'
+        at = text.find(key)
+        if at < 0:
+            raise SystemExit(f"extract-llbc.py: {source.name} has no `{name}` field")
+        # `raw_decode` does not skip leading whitespace of its own.
+        start = at + len(key)
+        while text[start] in " \t\r\n":
+            start += 1
+        value, _ = decoder.raw_decode(text, start)
+        return value
+
+    slim = {
+        "charon_version": field("charon_version"),
+        "has_errors": field("has_errors"),
+        "translated": {
+            "crate_name": field("crate_name"),
+            "type_decls": field("type_decls"),
+            "fun_decls": [],
+        },
+    }
+    del text
+    dest.write_text(json.dumps(slim), encoding="utf-8")
+
+
+def ensure_charon_std(charon_bin: Path, targets: list[str], root: Path) -> None:
+    """Install the target `std` Charon's pinned toolchain needs.
+
+    Charon drives its own nightly rustc, so a target installed for the
+    build toolchain is not necessarily installed for Charon's. Adding it is
+    idempotent and fast when already present.
+    """
+    toolchain_name = Path(run_capture([str(charon_bin), "toolchain-path"], cwd=root).strip()).name
+    for target in targets:
+        command = ["rustup", "target", "add", target, "--toolchain", toolchain_name]
+        if subprocess.run(command).returncode != 0:
+            raise SystemExit(
+                f"extract-llbc.py: could not install '{target}' std for Charon's "
+                f"toolchain '{toolchain_name}'.\n"
+                f"  run: {' '.join(command)}\n"
+                "  or drop the target from LLBC_LAYOUT_TARGETS to extract host "
+                "layouts only (a cross-target build then reads the host's field "
+                "offsets)."
+            )
 
 
 def extract(eng: Engine, args: argparse.Namespace) -> None:
@@ -381,8 +473,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     # rustc), so this never thrashes the runtime build's cache, and the LLBC is
     # independent of debuginfo so the artefact is byte-identical.
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
-    env["CARGO_UNSTABLE_HOST_CONFIG"] = "true"
-    env["CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST"] = "true"
     # Dependency build scripts run while Charon extracts a target crate. They
     # must not recursively demand the very LLBC artefact currently being
     # produced (pyre-jit -> pyre-jit-trace -> pyre-jit.ullbc). Consumers may
@@ -390,12 +480,18 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     # `rerun-if-env-changed` ensures the following normal build regenerates
     # production artifacts from the completed LLBC set.
     env["MAJIT_LLBC_EXTRACTION"] = "1"
+    host_config_env = {
+        "CARGO_UNSTABLE_HOST_CONFIG": "true",
+        "CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST": "true",
+    }
     host_config = [
         "--config",
         "target-applies-to-host=false",
         "--config",
         f'host.rustflags=["{crate_attr}"]',
     ]
+
+    prepared_std: set[str] = set()
 
     for crate in args.crates or eng.default_crates:
         spec = eng.spec(crate)
@@ -415,12 +511,17 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             cargo_features=cargo_features,
             flags=flags,
             charon_flags=charon_flags,
+            layout_targets=crate_layout_targets(eng, spec),
         )
 
+        sidecars = [
+            dest_dir / spec.layout_sidecar_name(t) for t in crate_layout_targets(eng, spec)
+        ]
         if (
             not args.force
             and dest.exists()
             and dest.stat().st_size > 0
+            and all(s.exists() and s.stat().st_size > 0 for s in sidecars)
             and stamp_path.exists()
             and stamp_path.read_text() == stamp + "\n"
         ):
@@ -442,6 +543,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             crate_root = path / "src" / "main.rs"
         crate_root.touch()
 
+        host_env = {**env, **host_config_env}
         command = [
             str(charon_bin),
             "cargo",
@@ -453,7 +555,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             *flags,
             *host_config,
         ]
-        subprocess.run(command, cwd=path, env=env, check=True)
+        subprocess.run(command, cwd=path, env=host_env, check=True)
         # Fail loud rather than letting a missing artefact surface later
         # as an opaque build.rs panic ("build/llbc/ is missing …").
         if not dest.exists() or dest.stat().st_size == 0:
@@ -462,6 +564,58 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 "  the crate compiled but produced no MIR — "
                 "inspect the Charon output above"
             )
+
+        # One extra extraction per cross target, reduced to its type
+        # declarations. Charon's own `--targets` aggregation would fold
+        # every target's layouts into this one artefact, but it aggregates
+        # the *bodies* too: a `cfg`-differing function lands two or three
+        # times over, and a portal that must resolve to an exact graph no
+        # longer does. Extracting each target separately keeps the host
+        # artefact's bodies untouched, and dropping everything but
+        # `type_decls` from the cross-target one leaves only what a
+        # cross-target build actually lacks — its own field offsets.
+        for target in crate_layout_targets(eng, spec):
+            if target not in prepared_std:
+                ensure_charon_std(charon_bin, [target], eng.root)
+                prepared_std.add(target)
+            sidecar = dest_dir / spec.layout_sidecar_name(target)
+            print(f"=== extracting {crate} layouts for {target} -> {sidecar} ===")
+            layout_flags = (
+                flags
+                if spec.layout_cargo_args is None
+                else [expand_features(arg, cargo_features) for arg in spec.layout_cargo_args]
+            )
+            layout_env = dict(env)
+            if eng.layout_target_rustflags:
+                layout_env["RUSTFLAGS"] = (
+                    layout_env.get("RUSTFLAGS", "") + " " + eng.layout_target_rustflags
+                ).strip()
+            full = sidecar.with_suffix(sidecar.suffix + ".full")
+            crate_root.touch()
+            subprocess.run(
+                [
+                    str(charon_bin),
+                    "cargo",
+                    "--ullbc",
+                    "--dest-file",
+                    str(full),
+                    "--targets",
+                    target,
+                    *charon_flags,
+                    "--",
+                    *layout_flags,
+                ],
+                cwd=path,
+                env=layout_env,
+                check=True,
+            )
+            if not full.exists() or full.stat().st_size == 0:
+                raise SystemExit(
+                    f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
+                )
+            write_layout_sidecar(full, sidecar)
+            full.unlink()
+            print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
         # Guard the fingerprint exclusion (CrateSpec.excluded_deps): a package
         # dropped from this crate's fingerprint must not appear in its artefact,
         # else a later edit to that package would silently serve a stale cache.
@@ -492,6 +646,8 @@ def run_cli(
     base_pathspecs: list[str] | None = None,
     charon_root: Path | None = None,
     metadata_feature_crates: tuple[str, ...] = (),
+    layout_targets: tuple[str, ...] = (),
+    layout_target_rustflags: str = "",
 ) -> None:
     """Argparse UX shared by every driver (positional crates, --force, …)."""
     all_crates = " ".join(specs)
@@ -515,6 +671,11 @@ def run_cli(
     # the dynasm build never needs. A driver whose crates ignore `{features}`
     # is unaffected by this default. Override with `CARGO_FEATURES`.
     cargo_features = os.environ.get("CARGO_FEATURES", "dynasm")
+    # `LLBC_LAYOUT_TARGETS` overrides the driver's cross-target layout set
+    # (comma-separated); the empty string extracts host layouts only.
+    layout_override = os.environ.get("LLBC_LAYOUT_TARGETS")
+    if layout_override is not None:
+        layout_targets = tuple(t.strip() for t in layout_override.split(",") if t.strip())
     eng = Engine(
         specs=specs,
         default_crates=default_crates,
@@ -524,6 +685,8 @@ def run_cli(
         charon_root=charon_root or root,
         cargo_features=cargo_features,
         metadata_feature_crates=metadata_feature_crates,
+        layout_targets=layout_targets,
+        layout_target_rustflags=layout_target_rustflags,
     )
 
     crates = args.crates or default_crates

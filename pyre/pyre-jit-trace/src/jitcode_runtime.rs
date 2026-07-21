@@ -455,24 +455,25 @@ pub fn all_descr_refs() -> &'static [DescrRef] {
     &ALL_DESCR_REFS
 }
 
-/// Whether the build-time descr pool's field offsets describe the struct
-/// layout this binary actually runs on.
+/// Byte offset the build-time descr pool records for `{owner}.{name}`, or
+/// `None` when no `Field` slot names that field.
 ///
-/// [`all_descrs`] is serialised by `build.rs` from the layout model in
-/// `majit-translate` (`codewriter::call::StructLayout::from_type_strings` /
-/// `get_type_flag`), which sizes every pointer-typed field at 8 bytes and
-/// aligns to an 8-byte word.  The exact per-field offsets the Charon LLBC
-/// carries (`front::semantic`'s `field_offsets`) come from the same 64-bit
-/// extraction.  On a 32-bit target the real structs pack pointers at 4
-/// (`PyObject.w_class` sits at 4, not 8; `PyType.instantiate` at 24, not 32),
-/// so every offset past the first pointer field names the wrong bytes and a
-/// concrete read through one of those descrs returns garbage.
-///
-/// The per-site descrs the walker builds itself (`crate::descr`) use
-/// `offset_of!` and are always right, so only consumers that resolve their
-/// `d` operands through the build-time pool need this gate.
-pub fn build_descr_layout_matches_target() -> bool {
-    std::mem::size_of::<usize>() == 8
+/// [`all_descrs`] is serialised by `build.rs` from `majit-translate`'s layout
+/// model, whose word size and Charon-resolved field offsets both follow the
+/// target being compiled. A consumer that resolves `d` operands through this
+/// pool therefore reads the same bytes `offset_of!` names — the
+/// `build_time_offset_matches_runtime_layout` test pins that agreement for the
+/// structs the orthodox sub-walk reads.
+pub fn build_time_field_offset(owner: &str, name: &str) -> Option<usize> {
+    all_descrs().iter().find_map(|d| match d {
+        BhDescr::Field {
+            owner: o,
+            name: n,
+            offset,
+            ..
+        } if o == owner && n == name => Some(*offset),
+        _ => None,
+    })
 }
 
 /// Build the metainterp-side `RuntimeBhDescr` pool from the shared
@@ -984,6 +985,48 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The build-time descr pool must name the same bytes `offset_of!` does.
+    ///
+    /// The pool is serialised by `build.rs` from `majit-translate`'s layout
+    /// model, which sizes a pointer from `CARGO_CFG_TARGET_POINTER_WIDTH` and
+    /// takes exact offsets from the Charon layout Charon resolved for the
+    /// build's `TARGET`.  Both used to be fixed to the extraction host's
+    /// 64-bit layout, so on a 32-bit target every offset past the first
+    /// pointer field named the wrong bytes: the orthodox `w_list_append`
+    /// sub-walk, the one production consumer that resolves its `d` operands
+    /// through this pool, folded its subclass test on garbage, walked the
+    /// dead `switch_to_object_strategy` leg, executed that leg's residuals
+    /// against the live list, and aborted — dropping the in-flight `FOR_ITER`
+    /// item with it (`bench/synth/delete_negative_open_slice_hot.py` then
+    /// ran one loop iteration short).
+    ///
+    /// These two fields are exactly the ones that sub-walk reads, and both
+    /// sit past a pointer, so they move between 64- and 32-bit targets.
+    #[test]
+    fn build_time_offset_matches_runtime_layout() {
+        for (owner, name, runtime) in [
+            (
+                "PyObject",
+                "w_class",
+                std::mem::offset_of!(pyre_object::pyobject::PyObject, w_class),
+            ),
+            (
+                "PyType",
+                "instantiate",
+                std::mem::offset_of!(pyre_object::pyobject::PyType, instantiate),
+            ),
+        ] {
+            let Some(built) = build_time_field_offset(owner, name) else {
+                panic!("build-time descr pool carries no `{owner}.{name}` field slot");
+            };
+            assert_eq!(
+                built, runtime,
+                "build-time descr pool places `{owner}.{name}` at {built}, \
+                 but this target's layout puts it at {runtime}",
+            );
+        }
+    }
 
     /// Every key in build-observed `pipeline.insns` that ALSO appears in
     /// the canonical universe (`majit_translate::insns::

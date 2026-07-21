@@ -1715,15 +1715,14 @@ impl Optimization for OptIntBounds {
             }
 
             // ── Field accesses ──
-            OpCode::GetfieldRawI
-            | OpCode::GetfieldGcI
-            | OpCode::GetinteriorfieldGcI
-            | OpCode::GetfieldRawR
-            | OpCode::GetfieldGcR
-            | OpCode::GetinteriorfieldGcR
-            | OpCode::GetfieldRawF
-            | OpCode::GetfieldGcF
-            | OpCode::GetinteriorfieldGcF => {
+            // `postprocess_GETFIELD_GC_I` and friends: only the int-typed
+            // reads narrow, because the bound this installs is an integer
+            // range and `setintbound` asserts an `'i'` operand.  The `_R` /
+            // `_F` variants have no postprocess of their own.  Their absence
+            // matters on a 32-bit target: a pointer field is 4 bytes wide
+            // there, so it satisfies the sub-word test below and would ask
+            // for an integer bound on a `Ref` box.
+            OpCode::GetfieldRawI | OpCode::GetfieldGcI | OpCode::GetinteriorfieldGcI => {
                 let __descr_arc_d = op.getdescr();
                 if let Some(ref d) = __descr_arc_d.as_ref() {
                     let (field_size, signed) = d.field_size_and_sign();

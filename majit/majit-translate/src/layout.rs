@@ -16,6 +16,28 @@ use std::collections::{HashMap, HashSet};
 use crate::call::StructLayout;
 use crate::model::ImmutableRank;
 
+/// Byte width of a pointer on the target these layouts describe — RPython's
+/// `WORD`.
+///
+/// The layouts computed here are baked into build-time artefacts (the descr
+/// pool `pyre-jit-trace/build.rs` serialises) that the *target* binary reads
+/// back, so they must describe the target's structs, not the build host's.
+/// Cargo exports the target's pointer width to build scripts as
+/// `CARGO_CFG_TARGET_POINTER_WIDTH`; the layout model also runs in-process
+/// (where the host *is* the target), and there the host width applies.
+///
+/// Read once: neither the environment nor the target changes within a run.
+pub fn target_word_size() -> usize {
+    static WORD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORD.get_or_init(|| {
+        std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
+            .ok()
+            .and_then(|bits| bits.parse::<usize>().ok())
+            .map(|bits| bits / 8)
+            .unwrap_or(std::mem::size_of::<usize>())
+    })
+}
+
 /// RPython: `symbolic.get_field_token` + `symbolic.get_size` provider.
 ///
 /// Supplies struct layouts for the codewriter pipeline. Each struct is
