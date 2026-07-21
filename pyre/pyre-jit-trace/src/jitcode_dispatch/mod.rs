@@ -7161,6 +7161,81 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
     goto_if_not_branch_on(code, op, ctx, condbox, switchcase, target)
 }
 
+/// RPython `pyjitpl.py _establish_nullity(box, orgpc)` — the shared body
+/// behind `opimpl_goto_if_not_ptr_nonzero` / `opimpl_goto_if_not_ptr_iszero`:
+///
+///   value = box.nonnull()
+///   if heapcache.is_nullity_known(box):
+///       profiler.count_ops(rop.GUARD_NONNULL, HEAPCACHED_OPS)
+///       return value
+///   if value:
+///       if not heapcache.is_class_known(box):
+///           generate_guard(rop.GUARD_NONNULL, box, resumepc=orgpc)
+///   else:
+///       if not isinstance(box, Const):
+///           generate_guard(rop.GUARD_ISNULL, box, resumepc=orgpc)
+///           promoted_box = executor.constant_from_op(box)
+///           replace_box(box, promoted_box)
+///   heapcache.nullity_now_known(box)
+///   return value
+///
+/// Unlike the compare-fused gotos this records no condition and emits no
+/// GuardTrue/GuardFalse: the nullity guard *is* the guard, and the branch
+/// direction comes from the pointer the walk observed. The guard emission
+/// stays walker-side because resume snapshots are —
+/// `walker_emit_guard_with_snapshot` is the walk's `generate_guard`.
+///
+/// Returns `box.nonnull()`.
+fn establish_nullity<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    boxref: OpRef,
+) -> Result<bool, DispatchError> {
+    // `box.nonnull()` reads the pointer itself. The walker knows it only
+    // through the concrete shadow, and an absent shadow is not evidence of
+    // either nullity, so decline rather than guess the branch direction.
+    let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: op.key,
+        });
+    };
+    let value = !ptr.is_null();
+    // Pyre's `is_nullity_known` splits upstream's boolean into which side is
+    // known (`Some(true)` non-null, `Some(false)` null, `None` unknown), so
+    // upstream's "is it known at all" test is `is_some`.
+    let known = ctx.trace_ctx.heap_cache().is_nullity_known(boxref, |op| {
+        op.inline_const_to_value().and_then(|v| match v {
+            Value::Int(n) => Some(n),
+            Value::Ref(gc) => Some(gc.0 as i64),
+            _ => None,
+        })
+    });
+    if known.is_some() {
+        ctx.trace_ctx.profiler().count_ops(
+            OpCode::GuardNonnull,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+        return Ok(value);
+    }
+    if value {
+        // A known class already implies non-null, so the guard is redundant.
+        if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[boxref])?;
+        }
+    } else if !boxref.is_constant() {
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[boxref])?;
+        // `constant_from_op` of a proven-null ref is the null constant.
+        let promoted = ctx.trace_ctx.const_ref(0);
+        ctx.trace_ctx.replace_box(boxref, promoted);
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .nullity_now_known(boxref, value);
+    Ok(value)
+}
+
 /// The unary member of the fused-goto family. `pyjitpl.py`
 /// `opimpl_goto_if_not_int_is_zero` records the condition and hands it to
 /// `opimpl_goto_if_not` with `replace=False`:
@@ -7357,6 +7432,32 @@ fn handle<Sym: WalkSym>(
         // `condbox = self.execute(rop.<CMP>, b1, b2); self.opimpl_goto_if_not(
         // condbox, target, orgpc, replace=False)`. The fused arm records the
         // same compare and reuses `goto_if_not_branch_on`.
+        // The pointer pair reads its branch direction straight out of
+        // `_establish_nullity` — no condition op, no GuardTrue/GuardFalse:
+        //
+        //   def opimpl_goto_if_not_ptr_nonzero(self, box, target, orgpc):
+        //       if not self._establish_nullity(box, orgpc):
+        //           self.pc = target
+        //
+        //   def opimpl_goto_if_not_ptr_iszero(self, box, target, orgpc):
+        //       if self._establish_nullity(box, orgpc):
+        //           self.pc = target
+        //
+        // Operand layout `rL`: 1B ref reg + 2B label.
+        "goto_if_not_ptr_nonzero/rL" | "goto_if_not_ptr_iszero/rL" => {
+            let boxref = read_ref_reg(code, op, 0, ctx)?;
+            let nonnull = establish_nullity(code, op, ctx, boxref)?;
+            let jump = if op.key == "goto_if_not_ptr_nonzero/rL" {
+                !nonnull
+            } else {
+                nonnull
+            };
+            let target = read_label(code, op, 1);
+            Ok((
+                DispatchOutcome::Continue,
+                if jump { target } else { op.next_pc },
+            ))
+        }
         // Same shape with one operand; `goto_if_not_int_is_true` has no arm
         // because the assembler spells that condition as plain `goto_if_not`,
         // matching the class-attribute alias upstream gives it.

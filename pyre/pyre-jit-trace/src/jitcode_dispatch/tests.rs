@@ -819,6 +819,9 @@ fn run_hint_step_with_descrs(
     regs_i: &mut [OpRef],
     descr_pool: &[DescrRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Guard-emitting arms need a resolvable outer resume coordinate for the
+    // snapshot; record-only arms ignore these two fields.
+    let outer_jitcode_index = test_outer_resume_jitcode_index();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         callee_shadow: None,
@@ -845,8 +848,8 @@ fn run_hint_step_with_descrs(
         last_exc_value: None,
         last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index,
         outer_active_boxes: Vec::new(),
         store_subscr_fn_addr: None,
         pending_guard_snapshot_error: None,
@@ -916,6 +919,100 @@ fn assert_not_none_declines_when_the_operand_has_no_concrete() {
         ops_before,
         "a declined step must not leave a recorded op behind"
     );
+}
+
+#[test]
+fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    // `rL`: 1B ref reg + 2B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`goto_if_not_ptr_nonzero/rL` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 4,
+        "a non-null pointer falls through past the 3 operand bytes"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(
+        last.opcode,
+        majit_ir::OpCode::GuardNonnull,
+        "`_establish_nullity` guards the observed non-nullness"
+    );
+    assert!(
+        tc.heap_cache()
+            .is_nullity_known(operand, |_| None)
+            .is_some(),
+        "the nullity must be stamped into the heapcache"
+    );
+}
+
+#[test]
+fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_iszero/rL")
+        .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`goto_if_not_ptr_iszero/rL` must dispatch");
+    assert_eq!(
+        next_pc, 9,
+        "iszero jumps exactly where nonzero falls through"
+    );
+}
+
+#[test]
+fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(std::ptr::null_mut())];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`goto_if_not_ptr_nonzero/rL` must dispatch");
+    assert_eq!(next_pc, 9, "a null pointer takes the branch");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::GuardIsnull);
+}
+
+#[test]
+fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Null];
+    let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect_err("an unobserved pointer must decline, not pick a direction");
+    assert_eq!(
+        err,
+        DispatchError::UnsupportedOpname {
+            pc: 0,
+            key: "goto_if_not_ptr_nonzero/rL",
+        },
+    );
+    assert_eq!(tc.num_ops(), ops_before, "a declined step records nothing");
 }
 
 #[test]
