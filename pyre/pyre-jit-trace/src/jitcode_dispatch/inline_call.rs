@@ -1378,7 +1378,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // The primary loop still inlines the callee, and non-integer/user-
     // overridable calls continue through the ordinary inline/abort policy.
     //
-    // Exception (`PYRE_FBW_BRIDGE_REC_INLINE`, default off): a plain ROOT bridge
+    // Exception (`PYRE_FBW_BRIDGE_REC_INLINE`, default on): a plain ROOT bridge
     // walk — no carrier resume, not an inline sub-walk, an empty framestack, and
     // a live root portal — is uniform with a primary trace, so its second
     // virtual frame is seeded and snapshot-covered exactly as the loop's is.
