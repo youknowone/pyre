@@ -16394,6 +16394,15 @@ pub(crate) fn buffer_as_bytes_like(
     if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes(obj) {
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
+    // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own
+    // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
+    // through to the iterable path.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+        let (address, length, _readonly) = view?;
+        let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
+    }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
         return Ok(Some(obj));
     }

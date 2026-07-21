@@ -612,6 +612,15 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
         if bytearrayobject::is_bytearray(obj) {
             return Ok(bytearrayobject::w_bytearray_data_mut(obj));
         }
+        // `W_MMap.writebuf_w` — the live mapping, unless it was opened
+        // read-only.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+            let (address, length, readonly) = view?;
+            if !readonly {
+                return Ok(std::slice::from_raw_parts_mut(address as *mut u8, length));
+            }
+        }
         if memoryview::is_w_memoryview(obj) {
             crate::builtins::memoryview_check_released(obj)?;
             if memoryview::w_memoryview_readonly(obj) {
@@ -652,6 +661,11 @@ impl PackIntoExport {
             } else if memoryview::is_w_memoryview(obj) {
                 memoryview::w_memoryview_exports_incref(obj);
             } else {
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                if crate::module::mmap::interp_mmap::is_mmap(obj) {
+                    crate::module::mmap::interp_mmap::mmap_exports_incref(obj);
+                    return Some(Self(obj));
+                }
                 return None;
             }
         }
@@ -664,8 +678,11 @@ impl Drop for PackIntoExport {
         unsafe {
             if bytearrayobject::is_bytearray(self.0) {
                 bytearrayobject::w_bytearray_exports_decref(self.0);
-            } else {
+            } else if memoryview::is_w_memoryview(self.0) {
                 memoryview::w_memoryview_exports_decref(self.0);
+            } else {
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                crate::module::mmap::interp_mmap::mmap_exports_decref(self.0);
             }
         }
     }
@@ -1216,6 +1233,12 @@ unsafe fn readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
         if bytesobject::is_bytes_like(obj) {
             return Ok(bytesobject::bytes_like_data(obj));
+        }
+        // `W_MMap.readbuf_w` — the live mapping.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+            let (address, length, _readonly) = view?;
+            return Ok(std::slice::from_raw_parts(address as *const u8, length));
         }
         if interp_array::is_array(obj) {
             return Ok(interp_array::w_array_bytes(obj));
