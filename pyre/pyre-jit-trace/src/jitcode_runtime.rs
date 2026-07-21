@@ -384,6 +384,32 @@ pub fn all_descrs() -> &'static [BhDescr] {
     &ALL_DESCRS
 }
 
+/// Deserialized `pipeline.all_liveness` — RPython `Assembler.all_liveness`
+/// (assembler.py), the target of `pyjitpl.py:2264 self.liveness_info =
+/// "".join(asm.all_liveness)`.
+///
+/// The build-time codewriter dedups every `(live_i, live_r, live_f)` triple
+/// into this single byte stream and bakes each `BC_LIVE` op's 2-byte offset
+/// into `JitCode.code`.  A runtime consumer re-tracing a build-time jitcode
+/// (jd1's `_unpackiterable_unknown_length` merge-point walk) resolves those
+/// baked offsets by installing this table into `metainterp_sd.liveness_info`.
+static ALL_LIVENESS: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/liveness.bin"));
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize liveness.bin \
+             ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+});
+
+/// RPython: `metainterp_sd.liveness_info` — full shared `all_liveness`
+/// byte stream (see [`ALL_LIVENESS`]).
+pub fn all_liveness() -> &'static [u8] {
+    &ALL_LIVENESS
+}
+
 /// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
 /// trace-side jitcode walker
 /// ([`crate::jitcode_dispatch::dispatch_via_miframe`]) can resolve each

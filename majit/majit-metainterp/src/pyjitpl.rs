@@ -2544,6 +2544,30 @@ impl<M: Clone> MetaInterp<M> {
         staticdata.liveness_info = all_liveness.to_vec();
     }
 
+    /// Parts form of [`install_canonical_liveness`](Self::install_canonical_liveness)
+    /// for a driver whose jitcode carries build-time-baked `BC_LIVE`
+    /// offsets rather than a runtime-encoded `Assembler`.
+    ///
+    /// Installs the opcode-id table (`setup_insns` → `op_live`) and the
+    /// pre-built `all_liveness` byte stream directly, mirroring the
+    /// asm-derived slice of `finish_setup(codewriter)` (`setup_insns(asm.insns)`
+    /// at `pyjitpl.py:2260` + `liveness_info = "".join(asm.all_liveness)` at
+    /// `pyjitpl.py:2264`).  The same single-owner `Arc::get_mut` invariant
+    /// applies — call before any tracing path clones `staticdata`.
+    pub fn install_liveness_from_build_parts(
+        &mut self,
+        insns: &indexmap::IndexMap<String, u8>,
+        all_liveness: &[u8],
+    ) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::install_liveness_from_build_parts called after `staticdata` was \
+             cloned; RPython warmspot.py:289 invariant requires a single owner at \
+             finish_setup time",
+        );
+        staticdata.setup_insns(insns);
+        staticdata.liveness_info = all_liveness.to_vec();
+    }
+
     /// Install a fresh [`ActiveTraceSession`] seeded with the frontend
     /// trace metadata.  Called from `force_start_tracing` /
     /// `bound_reached` / `on_back_edge_typed` and the bridge-resume

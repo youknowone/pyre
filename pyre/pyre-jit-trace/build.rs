@@ -13,6 +13,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_drivers.bin",
     "insns.bin",
     "descrs.bin",
+    "liveness.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
@@ -88,6 +89,11 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(
         format!("{out_dir}/descrs.bin"),
         bincode::serialize(&Vec::<majit_translate::jitcode::BhDescr>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/liveness.bin"),
+        bincode::serialize(&Vec::<u8>::new()).unwrap(),
     )
     .unwrap();
     for name in [
@@ -461,6 +467,14 @@ fn real_main() {
     // by `acquire_interp`).
     let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
     std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
+
+    // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
+    // Persist the build-time assembler's shared `all_liveness` byte stream so a
+    // runtime consumer re-tracing a build-time jitcode (whose `BC_LIVE` ops
+    // carry offsets baked against this table) can install it into
+    // `metainterp_sd.liveness_info` and resolve those offsets.
+    let liveness_bin = bincode::serialize(&pipeline.all_liveness).unwrap();
+    std::fs::write(format!("{out_dir}/liveness.bin"), &liveness_bin).unwrap();
 
     // RPython's translator AOT-compiles every helper into a single binary, so
     // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved and stable

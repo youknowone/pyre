@@ -147,6 +147,17 @@ pub struct ProgramPipelineResult {
     /// single-store descr model.
     #[serde(default)]
     pub descrs: Vec<crate::jitcode::BhDescr>,
+    /// RPython: `Assembler.all_liveness` (assembler.py) — the shared,
+    /// deduplicated `(live_i, live_r, live_f)` byte stream that every
+    /// `BC_LIVE` op's baked 2-byte offset (in `JitCode.code`) indexes into.
+    ///
+    /// Persisted alongside `insns`/`descrs` so a runtime consumer re-tracing
+    /// a build-time jitcode (whose `BC_LIVE` liveness offsets are baked at
+    /// build time) can resolve those offsets through
+    /// `metainterp_sd.liveness_info` — the target of `pyjitpl.py:2264
+    /// self.liveness_info = "".join(asm.all_liveness)`.
+    #[serde(default)]
+    pub all_liveness: Vec<u8>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,

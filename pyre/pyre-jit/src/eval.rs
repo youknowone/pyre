@@ -3412,6 +3412,24 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // is traced in a later slice.
     let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
     d.meta_interp_mut().register_jitdriver_sd(jd1);
+    // jd1's merge-point walk (`drive_unpack_iterable_trace`) re-traces the
+    // build-time `_unpackiterable_unknown_length` jitcode, whose `BC_LIVE` ops
+    // carry offsets baked against the build-time assembler's `all_liveness`
+    // table.  jd0 traces Python bytecode (PyFrame resume path) and never reads
+    // `metainterp_sd.op_live` / `liveness_info`, so pyre otherwise leaves them
+    // unset (`op_live = 255`).  Install the build-time opcode-id table
+    // (`op_live = insns["live/"]`) + `all_liveness` byte stream into the shared
+    // `staticdata` so the jd1 walk resolves its guard snapshots
+    // (`get_list_of_active_snapshot_boxes`).  Gated on the jd1 experiment so
+    // the default build leaves jd0's staticdata byte-identical; runs here,
+    // before any trace clones the `staticdata` Arc, to satisfy the single-owner
+    // `Arc::get_mut` invariant.
+    if jd1_experiment_enabled() {
+        d.meta_interp_mut().install_liveness_from_build_parts(
+            pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
+            pyre_jit_trace::jitcode_runtime::all_liveness(),
+        );
+    }
     // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -4797,17 +4815,72 @@ fn drive_unpack_iterable_trace(
                 &runtime,
                 green_ref,
                 &red_refs,
-            );
+            )
         },
     );
     if dbg {
-        eprintln!("[jd1] trace_jitcode drove={}", drove.is_some());
+        eprintln!("[jd1] trace_jitcode action={drove:?}");
     }
 
-    // The residual side effects already landed on the shared reds; drop the
-    // recorded trace (non-permanent so the cell's abort budget self-limits
-    // retrace storms) without compiling.
-    meta.abort_trace(false);
+    // P1 (compile): when the walk back-edges to the merge point it returns
+    // `CloseLoop`; assemble the recorded unpack loop and register it under the
+    // jd1 green key instead of dropping the trace.  jd1 is novable, so there
+    // are no virtualizable boxes and the jump args are the two loop-carried
+    // reds (`w_iterator`, `items`) in `collect_jump_args` order.  `PyreMeta`
+    // for the novable driver is fully static (no interpreter-frame
+    // projection).  No enter path yet: the loop is compiled and registered but
+    // the caller still drains it, so this only proves the recorded trace is
+    // compilable — the double-consumption fix is the later enter slice.
+    use majit_metainterp::{JitState, TraceAction};
+    let jump_args = match &drove {
+        Some(TraceAction::CloseLoop) => {
+            Some(pyre_jit_trace::unpack_state::UnpackJitState::collect_jump_args(&sym))
+        }
+        Some(TraceAction::CloseLoopWithArgs { jump_args, .. }) => Some(jump_args.clone()),
+        _ => None,
+    };
+    if let Some(jump_args) = jump_args {
+        let trace_meta = pyre_jit_trace::unpack_state::UnpackJitState {
+            greenkey: greenkey_raw,
+        }
+        .build_meta(JD1_LOOP_HEADER_PC, &pyre_jit_trace::state::PyreEnv);
+        let outcome = meta.compile_loop(&jump_args, trace_meta);
+        if dbg {
+            eprintln!("[jd1] compile_loop outcome={outcome:?}");
+        }
+    } else if let Some(TraceAction::Finish {
+        finish_args,
+        finish_arg_types,
+        exit_with_exception,
+    }) = drove
+    {
+        // A straight-line trace that closes by finishing rather than
+        // back-edging (the unpack loop's `StopIteration` exit reached before a
+        // full body + back-edge): route through the same finish-compile path
+        // jd0 uses so P1 still proves the recorded trace is assemblable.
+        match meta.compile_finish_from_active_session(
+            &finish_args,
+            finish_arg_types,
+            exit_with_exception,
+        ) {
+            Ok(()) => {
+                if dbg {
+                    eprintln!("[jd1] compile_finish ok exit_with_exception={exit_with_exception}");
+                }
+            }
+            Err(stb) => {
+                if dbg {
+                    eprintln!("[jd1] compile_finish aborted reason={}", stb.reason);
+                }
+                meta.aborted_tracing(stb.reason);
+            }
+        }
+    } else {
+        // The trace neither closed a loop nor reached a finish (aborted or
+        // still open); drop it non-permanently so the cell's abort budget
+        // self-limits retrace storms.
+        meta.abort_trace(false);
+    }
 }
 
 /// The single `jit_merge_point` pc in jd1's extracted

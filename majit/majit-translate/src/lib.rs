@@ -1579,13 +1579,15 @@ fn analyze_pipeline_from_module_paths(
         jitcodes_by_path: indexmap::IndexMap::new(),
         insns: indexmap::IndexMap::new(),
         descrs: Vec::new(),
+        all_liveness: Vec::new(),
         total_blocks: 0,
         total_ops: 0,
         total_vable_rewrites: 0,
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (jitcodes, insns, descrs) = make_jitcodes(&config.pipeline, &mut call_control);
+    let (jitcodes, insns, descrs, all_liveness) =
+        make_jitcodes(&config.pipeline, &mut call_control);
     mark_phase!("make_jitcodes");
     pipeline.jit_drivers = call_control
         .jitdrivers_sd()
@@ -1607,6 +1609,11 @@ fn analyze_pipeline_from_module_paths(
     pipeline.jitcodes_by_path = call_control.jitcodes().clone();
     pipeline.insns = insns;
     pipeline.descrs = descrs;
+    // Snapshotted in `make_jitcodes` from the assembler's shared `all_liveness`
+    // table (the target of `pyjitpl.py:2264 self.liveness_info =
+    // "".join(asm.all_liveness)`) so the runtime can resolve the `BC_LIVE`
+    // offsets baked into `JitCode.code`.
+    pipeline.all_liveness = all_liveness;
 
     pipeline
 }
@@ -1683,6 +1690,7 @@ fn make_jitcodes(
     Vec<std::sync::Arc<jitcode::JitCode>>,
     indexmap::IndexMap<String, u8>,
     Vec<jitcode::BhDescr>,
+    Vec<u8>,
 ) {
     // RPython codewriter.py:74-89: make_jitcodes().
     //
@@ -1741,7 +1749,12 @@ fn make_jitcodes(
     // `insns`, mirroring RPython's single-store model.
     let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.snapshot_descrs();
 
-    (jitcodes, insns, descrs)
+    // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
+    // Snapshot the assembler's shared `all_liveness` byte stream so the runtime
+    // can resolve the `BC_LIVE` offsets baked into `JitCode.code`.
+    let all_liveness = codewriter.assembler.all_liveness().to_vec();
+
+    (jitcodes, insns, descrs, all_liveness)
 }
 
 /// Generate tracing code directly from the canonical pipeline result.
