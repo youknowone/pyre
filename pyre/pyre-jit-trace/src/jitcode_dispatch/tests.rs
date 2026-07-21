@@ -10823,3 +10823,102 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         "the pop must overwrite the destination's stale concrete shadow",
     );
 }
+
+/// `FASTPATHS_SAME_BOXES` membership, on the non-fused (macro-table) arms.
+/// The generated loop that carries `if b1 is b2: return <const>` spells only
+/// the six signed int compares plus the four ref compares; the unsigned
+/// compares live in the other loop and must still record their op.
+#[test]
+fn same_box_fastpath_covers_exactly_the_generated_fastpath_list() {
+    // (opname, expected folded value) for every FASTPATHS_SAME_BOXES member
+    // reachable through `binop_int_record` / `binop_ref_to_int_record`.
+    let int_cases: &[(&str, i64)] = &[
+        ("int_eq/ii>i", 1),
+        ("int_le/ii>i", 1),
+        ("int_ge/ii>i", 1),
+        ("int_ne/ii>i", 0),
+        ("int_lt/ii>i", 0),
+        ("int_gt/ii>i", 0),
+    ];
+    for (opname, expected) in int_cases {
+        let byte = *insns_opname_to_byte()
+            .get(*opname)
+            .unwrap_or_else(|| panic!("{opname} must be in the runtime instruction table"));
+        // Same register for both operands: `b1 is b2`.
+        let code = [byte, 0, 0, 1];
+        let mut tc = TraceCtx::for_test_types(&[Type::Int]);
+        let same = OpRef::input_arg_int(0);
+        let mut regs_i = vec![same, OpRef::NONE];
+        let (outcome, _) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+            .unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert!(
+            tc.ops().is_empty(),
+            "`{opname}` on identical boxes must answer without recording an op",
+        );
+        assert_eq!(
+            tc.constant_value(regs_i[1]),
+            Some(*expected),
+            "`{opname}` on identical boxes must fold to {expected}",
+        );
+    }
+    // The unsigned compares share the `ii>i` shape but are NOT fast-path
+    // members: they must still record.
+    for opname in [
+        "uint_lt/ii>i",
+        "uint_le/ii>i",
+        "uint_gt/ii>i",
+        "uint_ge/ii>i",
+    ] {
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("{opname} must be in the runtime instruction table"));
+        let code = [byte, 0, 0, 1];
+        let mut tc = TraceCtx::for_test_types(&[Type::Int]);
+        let same = OpRef::input_arg_int(0);
+        let mut regs_i = vec![same, OpRef::NONE];
+        let (outcome, _) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+            .unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            tc.ops().len(),
+            1,
+            "`{opname}` is not a same-boxes fast-path member and must record",
+        );
+    }
+}
+
+/// The four ref compares are all `FASTPATHS_SAME_BOXES` members, including
+/// `instance_ptr_eq` / `instance_ptr_ne`.
+#[test]
+fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
+    let cases: &[(&str, i64)] = &[
+        ("ptr_eq/rr>i", 1),
+        ("ptr_ne/rr>i", 0),
+        ("instance_ptr_eq/rr>i", 1),
+        ("instance_ptr_ne/rr>i", 0),
+    ];
+    for (opname, expected) in cases {
+        let byte = *insns_opname_to_byte()
+            .get(*opname)
+            .unwrap_or_else(|| panic!("{opname} must be in the runtime instruction table"));
+        let code = [byte, 0, 0, 0];
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let same = OpRef::input_arg_ref(0);
+        let mut regs_r = vec![same];
+        let mut concrete_r = vec![ConcreteValue::Null];
+        let mut regs_i = vec![OpRef::NONE];
+        let (outcome, _) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+            .unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert!(
+            tc.ops().is_empty(),
+            "`{opname}` on identical boxes must answer without recording an op",
+        );
+        assert_eq!(
+            tc.constant_value(regs_i[0]),
+            Some(*expected),
+            "`{opname}` on identical boxes must fold to {expected}",
+        );
+    }
+}

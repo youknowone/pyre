@@ -31,6 +31,19 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let b = read_int_reg(code, op, 1, ctx)?;
+    // This handler serves both generated loops: the plain binops (`int_add`,
+    // `uint_lt`, …) and the `int_eq`..`int_ge` compares.  Only the latter
+    // carry `if b1 is b2: return <const>`, so gate on membership rather than
+    // on "looks like a comparison" — `uint_lt` and friends compare too and
+    // must still record.
+    if a == b {
+        if let Some(folded) = fastpath_same_boxes(opcode) {
+            let result = ctx.trace_ctx.const_int(folded);
+            let dst = code[op.pc + 3] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
@@ -52,6 +65,27 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `pyjitpl.py FASTPATHS_SAME_BOXES`, applied by the exec-generated
+/// `opimpl_%s(b1, b2): if b1 is b2: return <const>` loop.
+///
+/// Membership is the whole point: the loop that carries this fast path spells
+/// exactly `int_eq`, `int_ne`, `int_lt`, `int_le`, `int_gt`, `int_ge`,
+/// `ptr_eq`, `ptr_ne`, `instance_ptr_eq`, `instance_ptr_ne`. The unsigned
+/// compares (`uint_lt`/`uint_le`/`uint_gt`/`uint_ge`) sit in the *other*
+/// generated loop and get no fast path, so this must not be widened to "any
+/// comparison opcode".
+///
+/// `None` means the opcode is not a same-boxes fast-path member.
+pub(crate) fn fastpath_same_boxes(opcode: OpCode) -> Option<i64> {
+    match opcode {
+        OpCode::IntEq | OpCode::IntLe | OpCode::IntGe => Some(1),
+        OpCode::IntNe | OpCode::IntLt | OpCode::IntGt => Some(0),
+        OpCode::PtrEq | OpCode::InstancePtrEq => Some(1),
+        OpCode::PtrNe | OpCode::InstancePtrNe => Some(0),
+        _ => None,
+    }
+}
+
 pub(crate) fn record_int_cmp<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
@@ -59,11 +93,9 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     b: OpRef,
 ) -> OpRef {
     if a == b {
-        let folded = match opcode {
-            OpCode::IntEq | OpCode::IntLe | OpCode::IntGe => 1,
-            OpCode::IntNe | OpCode::IntLt | OpCode::IntGt => 0,
-            _ => unreachable!("record_int_cmp requires an integer comparison opcode"),
-        };
+        let folded = fastpath_same_boxes(opcode).unwrap_or_else(|| {
+            unreachable!("record_int_cmp requires an integer comparison opcode")
+        });
         return ctx.trace_ctx.const_int(folded);
     }
     if let (Some(Value::Int(la)), Some(Value::Int(rb))) =
@@ -289,6 +321,18 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_ref_reg(code, op, 0, ctx)?;
     let b = read_ref_reg(code, op, 1, ctx)?;
+    // `if b1 is b2: return <const>` — all four ref compares this handler
+    // serves are `FASTPATHS_SAME_BOXES` members, so an identical operand pair
+    // answers without recording.
+    if a == b {
+        let folded = fastpath_same_boxes(opcode).unwrap_or_else(|| {
+            unreachable!("binop_ref_to_int_record: unsupported opcode {opcode:?}")
+        });
+        let result = ctx.trace_ctx.const_int(folded);
+        let dst = code[op.pc + 3] as usize;
+        write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (matches dispatch.rs trace_binop_r_to_i).
@@ -318,11 +362,9 @@ pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
     b_concrete: ConcreteValue,
 ) -> OpRef {
     if a == b {
-        return ctx.trace_ctx.const_int(match opcode {
-            OpCode::PtrEq => 1,
-            OpCode::PtrNe => 0,
-            _ => unreachable!("record_ptr_cmp requires PtrEq or PtrNe"),
-        });
+        let folded = fastpath_same_boxes(opcode)
+            .unwrap_or_else(|| unreachable!("record_ptr_cmp requires PtrEq or PtrNe"));
+        return ctx.trace_ctx.const_int(folded);
     }
     if let (Some(Value::Ref(la)), Some(Value::Ref(rb))) =
         (a.inline_const_to_value(), b.inline_const_to_value())
