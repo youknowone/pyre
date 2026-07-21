@@ -4818,13 +4818,7 @@ fn drive_unpack_iterable_trace(
                 recursive_exec_void,
             );
             majit_metainterp::trace_jitcode_from_merge_point(
-                ctx,
-                &mut sym,
-                &jitcode,
-                header_pc,
-                &runtime,
-                green_ref,
-                &red_refs,
+                ctx, &mut sym, &jitcode, header_pc, &runtime, green_ref, &red_refs,
             )
         },
     );

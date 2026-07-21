@@ -74,10 +74,19 @@ impl UnpackJitState {
     /// `elect_active_jitdriver_sd`'s vinfo-scan keeps electing jd0. The driver
     /// yields the grown `items` list → `Type::Ref` (the `new` default).
     pub fn unpackiterable_driver_descriptor() -> JitDriverStaticData {
-        JitDriverStaticData::new(
+        let mut sd = JitDriverStaticData::new(
             vec![("greenkey", Type::Ref)],
             vec![("w_iterator", Type::Ref), ("items", Type::Ref)],
-        )
+        );
+        // baseobjspace.py:29-31 `unpackiterable_driver` = reds='auto', only a
+        // `jit_merge_point` in the `while True` drain (no `can_enter_jit`, no
+        // `loop_header`). warmspot.py:762-790 leaves `no_loop_header` at its
+        // `True` default for such a driver, so `opimpl_jit_merge_point`
+        // (pyjitpl.py:1550) auto-adds the loop header unconditionally — the
+        // first trace closes the loop on the `goto` back-edge instead of
+        // unrolling the whole drain to the StopIteration finish.
+        sd.no_loop_header = true;
+        sd
     }
 }
 
