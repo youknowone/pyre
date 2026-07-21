@@ -1476,7 +1476,7 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// `memoryview.release` — drop the view; subsequent access raises ValueError.
 /// Idempotent (a second `release` on an already-released view is a no-op),
 /// matching `descr_release`.
-fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         if !pyre_object::memoryview::w_memoryview_released(mv) {

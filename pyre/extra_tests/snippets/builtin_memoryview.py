@@ -196,6 +196,34 @@ def test_pickle_buffer_holds_export():
     gc.collect()
     assert wrapped_ref() is None
 
+    class Exporter:
+        def __init__(self):
+            self.data = bytearray(b"pep688")
+            self.flags = []
+            self.released = []
+
+        def __buffer__(self, flags):
+            self.flags.append(flags)
+            return memoryview(self.data)
+
+        def __release_buffer__(self, view):
+            self.released.append(view)
+
+    exporter = Exporter()
+    wrapped = pickle.PickleBuffer(exporter)
+    assert exporter.flags == [0x011C]  # PyBUF_FULL_RO
+    assert bytes(wrapped) == b"pep688"
+    assert_raises(BufferError, lambda: exporter.data.append(0))
+    wrapped.release()
+    assert len(exporter.released) == 1
+    exporter.data.append(0)
+
+    class BadExporter:
+        def __buffer__(self, flags):
+            return b"not a memoryview"
+
+    assert_raises(TypeError, lambda: pickle.PickleBuffer(BadExporter()))
+
 
 test_pickle_buffer_holds_export()
 
