@@ -757,69 +757,83 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ),
     );
 
-    // ── posix.rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None) ──
+    // ── posix.rename / posix.replace(src, dst, *, src_dir_fd=None,
+    //    dst_dir_fd=None) ──
     // A non-None `src_dir_fd` / `dst_dir_fd` resolves the path relative to the
     // open directory descriptor (`renameat`); the descriptors are only usable
     // where `renameat` exists (unix).
+    //
+    // The two entry points take the same arguments and differ only in what a
+    // pre-existing `dst` does: `replace` overwrites it on every platform,
+    // `rename` leaves that to the platform call. The host layer renames
+    // through `std::fs::rename`, which overwrites on both, so one body serves
+    // both and `name` only selects the text of the argument errors.
+    fn rename_impl(
+        args: &[PyObjectRef],
+        name: &'static str,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        if pos.len() < 2 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() requires 2 arguments"
+            )));
+        }
+        if pos.len() > 2 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes exactly 2 positional arguments ({} given)",
+                pos.len()
+            )));
+        }
+        crate::builtins::kwarg_reject_unknown(kwargs, &["src_dir_fd", "dst_dir_fd"], name)?;
+        let src = extract_path(pos[0])?;
+        let dst = extract_path(pos[1])?;
+        let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
+            match crate::builtins::kwarg_get(kwargs, name) {
+                Some(v) if !unsafe { pyre_object::is_none(v) } => {
+                    if !unsafe { pyre_object::is_int(v) } {
+                        let type_name = crate::typedef::r#type(v)
+                            .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t) })
+                            .unwrap_or("object");
+                        return Err(crate::PyError::type_error(format!(
+                            "argument should be integer or None, not {type_name}"
+                        )));
+                    }
+                    Ok(Some((unsafe { pyre_object::w_int_get_value(v) }) as i32))
+                }
+                _ => Ok(None),
+            }
+        };
+        let src_fd = dir_fd("src_dir_fd")?;
+        let dst_fd = dir_fd("dst_dir_fd")?;
+        #[cfg(unix)]
+        let (src_b, dst_b) = {
+            use rustpython_host_env::crt_fd::Borrowed;
+            (
+                src_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
+                dst_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
+            )
+        };
+        #[cfg(not(unix))]
+        let (src_b, dst_b) = {
+            if src_fd.is_some() || dst_fd.is_some() {
+                return Err(crate::PyError::not_implemented(
+                    "dir_fd unavailable on this platform",
+                ));
+            }
+            (None, None)
+        };
+        host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
+        Ok(pyre_object::w_none())
+    }
     crate::module_ns_store(
         ns,
         "rename",
-        crate::make_builtin_function("rename", |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if pos.len() < 2 {
-                return Err(crate::PyError::type_error("rename() requires 2 arguments"));
-            }
-            if pos.len() > 2 {
-                return Err(crate::PyError::type_error(format!(
-                    "rename() takes exactly 2 positional arguments ({} given)",
-                    pos.len()
-                )));
-            }
-            crate::builtins::kwarg_reject_unknown(
-                kwargs,
-                &["src_dir_fd", "dst_dir_fd"],
-                "rename",
-            )?;
-            let src = extract_path(pos[0])?;
-            let dst = extract_path(pos[1])?;
-            let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
-                match crate::builtins::kwarg_get(kwargs, name) {
-                    Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                        if !unsafe { pyre_object::is_int(v) } {
-                            let type_name = crate::typedef::r#type(v)
-                                .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t) })
-                                .unwrap_or("object");
-                            return Err(crate::PyError::type_error(format!(
-                                "argument should be integer or None, not {type_name}"
-                            )));
-                        }
-                        Ok(Some((unsafe { pyre_object::w_int_get_value(v) }) as i32))
-                    }
-                    _ => Ok(None),
-                }
-            };
-            let src_fd = dir_fd("src_dir_fd")?;
-            let dst_fd = dir_fd("dst_dir_fd")?;
-            #[cfg(unix)]
-            let (src_b, dst_b) = {
-                use rustpython_host_env::crt_fd::Borrowed;
-                (
-                    src_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
-                    dst_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
-                )
-            };
-            #[cfg(not(unix))]
-            let (src_b, dst_b) = {
-                if src_fd.is_some() || dst_fd.is_some() {
-                    return Err(crate::PyError::not_implemented(
-                        "dir_fd unavailable on this platform",
-                    ));
-                }
-                (None, None)
-            };
-            host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
-            Ok(pyre_object::w_none())
-        }),
+        crate::make_builtin_function("rename", |args| rename_impl(args, "rename")),
+    );
+    crate::module_ns_store(
+        ns,
+        "replace",
+        crate::make_builtin_function("replace", |args| rename_impl(args, "replace")),
     );
 
     // ── posix.listdir(path=".") → list of str ──
@@ -3375,7 +3389,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // host filesystem mutation that bypasses the controller
             "chmod", "fchmod", "lchmod", "chown", "fchown", "lchown", "chroot",
             "chdir", "fchdir", "link", "symlink", "truncate", "ftruncate",
-            "rename", "rmdir", "mkfifo", "mknod",
+            "rename", "replace", "rmdir", "mkfifo", "mknod",
             // privilege / scheduling
             "setuid", "setgid", "setreuid", "setregid", "setresuid", "setresgid",
             "setgroups", "initgroups", "setsid", "setpgid", "setpgrp", "nice",

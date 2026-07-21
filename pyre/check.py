@@ -1741,6 +1741,13 @@ def main():
             15,
             skip_backends=("wasm",),
         )
+        # Skipped on wasm for the same reason: os.replace needs a filesystem.
+        chk.run_selfcheck(
+            "posix_replace",
+            f"{B}/posix_replace_regression.py",
+            15,
+            skip_backends=("wasm",),
+        )
 
     if not args.no_synthetic:
         print()
