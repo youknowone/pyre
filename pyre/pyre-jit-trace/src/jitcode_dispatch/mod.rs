@@ -8441,7 +8441,11 @@ fn handle<Sym: WalkSym>(
                 ))
             }
         }
-        "jit_merge_point/cIRFIRF" => {
+        // The `i` spelling is what the assembler emits once the jitdriver
+        // index outstrips a signed byte; it still occupies exactly one
+        // operand byte (a patched const-pool index instead of the literal),
+        // and the body below only skips that byte, so both forms share it.
+        "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.
