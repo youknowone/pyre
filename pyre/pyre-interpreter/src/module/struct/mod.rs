@@ -550,21 +550,26 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                 let arg = values[ai];
                 ai += 1;
                 let data = unsafe { accept_bytes(arg, "argument for 'p' must be a bytes object")? };
+                // CPython 3.14 accepts `0p`: it still consumes one argument,
+                // but the zero-width field has no prefix or payload bytes.
+                // Older PyPy raises `bad '0p'`; pyre follows the 3.14 target.
+                if rep == 0 {
+                    continue;
+                }
                 // `pack_pascal` — length prefix byte (clamped to count-1 and
-                // 255) then the string, padded to `count` bytes total.  A
-                // `0p` field has no room for even the length byte.
+                // 255) then the string, padded to `count` bytes total.
                 let mut prefix = data.len();
                 if prefix >= rep {
-                    if rep == 0 {
-                        return Err(struct_error("bad '0p' in struct format"));
-                    }
                     prefix = rep - 1;
                 }
                 if prefix > 255 {
                     prefix = 255;
                 }
                 out.push(prefix as u8);
-                pack_string_bytes(&mut out, &data[..prefix], rep - 1);
+                // PyPy `_pack_string(fmtiter, string, count-1)`: only the
+                // one-byte length prefix is capped at 255.  The field still
+                // stores as much payload as its full `count - 1` width.
+                pack_string_bytes(&mut out, data, rep - 1);
             }
             Code::Bool => {
                 for _ in 0..rep {
@@ -801,9 +806,11 @@ fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyErr
             }
             Code::Pascal => {
                 // `unpack_pascal` — first byte is the length, clamped to the
-                // field width; the value is the following bytes.
+                // field width; the value is the following bytes.  CPython
+                // 3.14's zero-width form contributes one empty bytes value.
                 if rep == 0 {
-                    return Err(struct_error("bad '0p' in struct format"));
+                    out.push(w_bytes_from_bytes(&[]));
+                    continue;
                 }
                 let data = &buf[pos..pos + rep];
                 let end = (1 + data[0] as usize).min(rep);
@@ -1173,7 +1180,9 @@ pub mod unpack_iter {
             };
             w_int_new(remaining)
         }
+    }
 
+    impl W_UnpackIter {
         /// `_finalize_` / the exhausted branch share `_release_buf`'s
         /// idempotent take-then-release shape.
         pub(crate) fn release_export(&mut self) {
@@ -1200,7 +1209,14 @@ pub mod unpack_iter {
         // Force the type's method table to be built before allocating (the
         // `unpack_iterator` type is not exposed as a module attribute, so
         // nothing else triggers `type_object()`).
-        let _ = type_object();
+        let iter_type = type_object();
+        // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
+        // TypeDef shape: the implementation type is returned by `type(it)`
+        // but cannot be instantiated or used as a base class.
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(iter_type, false);
+            pyre_object::w_type_set_disallow_instantiation(iter_type);
+        }
         let buf = unsafe { readbuf(buffer)? };
         if size <= 0 {
             return Err(struct_error(format!(

@@ -92,3 +92,13 @@ with assert_raises(UnicodeEncodeError):
 
 with assert_raises(struct.error):
     struct.Struct(b"\xff")
+
+# CPython 3.14 accepts a zero-width Pascal field.  It consumes one pack
+# argument and contributes one empty bytes result while occupying no bytes.
+assert struct.calcsize("0p") == 0
+assert struct.pack("0p", b"payload") == b""
+assert struct.unpack("0p", b"") == (b"",)
+
+unpack_iterator_type = type(struct.iter_unpack("B", b""))
+with assert_raises(TypeError):
+    unpack_iterator_type()
