@@ -11,10 +11,13 @@ pub use rustpython_compiler_core::bytecode::{
 
 /// Compile Python source code to a RustPython CodeObject.
 ///
+/// The filename is the one `exec`/`eval` report for a str source, surfacing
+/// as `co_filename` and as the `SyntaxError.filename` of a failed compile.
+///
 /// The `CompileError` is returned unflattened so the SyntaxError builders
 /// can read its `python_location` / `python_end_location` / `source_path`.
 pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileError> {
-    rp_compile(source, mode, "<pyre>".into(), Default::default())
+    rp_compile(source, mode, "<string>".into(), Default::default())
 }
 
 /// Compile Python source code with a custom filename.
