@@ -5476,26 +5476,38 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // note above), so this is a walkable safepoint.
         majit_gc::gc_sync::safepoint_poll();
 
-        if frame_root.frame().next_instr() >= code.instructions.len() {
+        // Seed the frame pointer once after the two top-of-loop safepoints.
+        // The frame is GC-managed and can move only at a collection point; this
+        // pointer stays valid until the next such point, so the reads below reuse
+        // it instead of re-resolving the shadow-stack slot each time. Re-seeded
+        // after every collection-point call in this loop (bytecode_trace,
+        // perform_actions, execute_opcode_step, handle_exception, can_enter_jit /
+        // maybe_compile_and_run, jit_merge_point).
+        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+
+        if unsafe { &*f }.next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }
 
-        let pc = frame_root.frame().next_instr();
+        let pc = unsafe { &*f }.next_instr();
 
         // interp_jit.py:85-87 — source-level marker declaration.  Its
         // untranslated body is a no-op; source translation
         // recognizes this method call and lowers it to JitCode
         // `jit_merge_point` rather than leaving a residual call.
-        let marker_ec = frame_root.frame().execution_context as *const PyExecutionContext;
-        let marker_pycode = frame_root.frame().pycode as pyre_object::PyObjectRef;
-        let marker_profiled = frame_root.frame().get_is_being_profiled();
+        let marker_ec = unsafe { &*f }.execution_context as *const PyExecutionContext;
+        let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
+        let marker_profiled = unsafe { &*f }.get_is_being_profiled();
         pypyjitdriver.jit_merge_point(
-            frame_root.frame(),
+            unsafe { &mut *f },
             marker_ec,
             pc,
             marker_pycode,
             marker_profiled,
         );
+        // jit_merge_point is a lowered no-op / merge point and does not itself
+        // collect, but is treated as a collection boundary conservatively.
+        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
 
         let (opcode_pc, instruction, op_arg) = match decode_instruction_forward(code, pc) {
             Ok(decoded) => decoded,
@@ -5504,10 +5516,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         trace_jit_bytecode(pc, "");
-        frame_root.frame().last_instr = pc as isize;
-        frame_root
-            .frame()
-            .set_last_instr_from_next_instr(opcode_pc + 1);
+        unsafe { &mut *f }.last_instr = pc as isize;
+        unsafe { &mut *f }.set_last_instr_from_next_instr(opcode_pc + 1);
         // pyopcode.py:170-176 dispatch_bytecode parity: fire
         // `ec.bytecode_trace(self)` each opcode while warming up,
         // with the default `TICK_COUNTER_STEP` decrement.  This is
@@ -5528,7 +5538,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // PyPy's `actionflag.decrement_ticker(decr_by)` invariant);
         // the `action_dispatcher` slow path itself is still a stub
         // pending the actionflag port.
-        let ec_ptr = frame_root.frame().execution_context as *mut PyExecutionContext;
+        let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             if needs_trace {
