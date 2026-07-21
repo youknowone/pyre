@@ -2744,15 +2744,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_iterator_tid);
     }
-    // `collections.deque` W_Deque — AUTO-ID typed payload allocated via
-    // `allocate_stable` (GC-managed old-gen).  Managed only means the marker
-    // *scans* it; tracing its `data` backing list still needs a registered tid
-    // + offsets.  Unregistered, its cell stays UNASSIGNED and
-    // `malloc_typed_stable` stamps tid 0 (= `object`: empty offsets, no custom
-    // trace), so the marker forwards none of its children and `data` is swept
-    // while the deque is live — use-after-free on the next `len`/index/iterate.
-    // Register at the absolute tail like the auto-id iterators above so no
-    // earlier fixed slot shifts.
+    // `interp_deque.py Block` and `W_Deque` — AUTO-ID typed payloads allocated
+    // via `allocate_stable` (GC-managed old-gen).  The block marker follows
+    // both links and its 62-slot list; the deque marker follows its two
+    // endpoint blocks.  Register at the absolute tail like the auto-id
+    // iterators above so no earlier fixed slot shifts.
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -2852,6 +2848,19 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
+    // Python-visible vtable.  Registering it through `register_pyre_class`
+    // would add a spurious subclass-range alias and shift W_Deque's canonical
+    // object type id.  PyPy likewise treats Block as the deque's internal
+    // storage node, not as an exposed Python class.
+    let deque_block_descr =
+        <pyre_interpreter::module::_collections::deque_block::W_DequeBlock
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let deque_block_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        deque_block_descr.object_size,
+        deque_block_descr.ptr_offsets.to_vec(),
+    ));
+    deque_block_descr.gc_type_id.set(deque_block_tid);
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
