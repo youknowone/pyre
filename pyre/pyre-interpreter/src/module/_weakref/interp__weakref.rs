@@ -2030,6 +2030,21 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
     }
 }
 
+/// Serialize the proxy-delegation tests. They resolve attributes and methods
+/// through the process-global proxy typedefs, whose shared map-node
+/// `cache_attrs` RefCell (mapdict `find_branch_to_move_into`) is not `Sync`;
+/// under cargo's parallel test threads two proxy tests otherwise borrow it at
+/// once and panic. Both this module's and `builtins`'s proxy tests take it.
+#[cfg(test)]
+pub(crate) static PROXY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`PROXY_TEST_LOCK`], tolerating poisoning so one test's panic does
+/// not cascade into every follow-up.
+#[cfg(test)]
+pub(crate) fn lock_proxy_tests() -> std::sync::MutexGuard<'static, ()> {
+    PROXY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2038,6 +2053,7 @@ mod tests {
     /// dead proxy must raise ReferenceError, not RuntimeError.
     #[test]
     fn test_force_dead_proxy_raises_reference_error() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let proxy = W_Proxy_new(pyre_object::w_none(), PY_NULL);
         // Simulate a dead referent by setting the weak slot back to None.
@@ -2051,6 +2067,7 @@ mod tests {
     /// which forces the receiver and calls `space.len(referent)`.
     #[test]
     fn test_proxy_len_delegates_to_referent() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let referent = pyre_object::w_list_new(vec![
             pyre_object::w_int_new(1),
@@ -2066,6 +2083,7 @@ mod tests {
     /// every operand and dispatches to `space.add(referent, x)`.
     #[test]
     fn test_proxy_add_delegates_to_referent() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let referent = pyre_object::w_int_new(40);
         let proxy = W_Proxy_new(referent, PY_NULL);
@@ -2077,6 +2095,7 @@ mod tests {
     /// the receiver and reads the attribute off the referent.
     #[test]
     fn test_proxy_getattr_delegates_to_referent() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         // Use a hasdict instance so the underlying object stores
         // attributes in INSTANCE_DICT.
@@ -2093,6 +2112,7 @@ mod tests {
     /// `proxy.attr = value` must delegate to the referent's dict.
     #[test]
     fn test_proxy_setattr_delegates_to_referent() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("ProxyTarget2", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
@@ -2125,6 +2145,7 @@ mod tests {
     /// referent's `__getitem__` unchanged so identity-keyed dicts work.
     #[test]
     fn test_proxy_getitem_does_not_force_index() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         // Build a list referent so getitem accepts an int index.
         let referent = pyre_object::w_list_new(vec![
@@ -2143,6 +2164,7 @@ mod tests {
     /// unchanged — PyPy's `forcing_count = len(special_methods) = 2`.
     #[test]
     fn test_proxy_pow_two_arg_form() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let referent = pyre_object::w_int_new(2);
         let proxy = W_Proxy_new(referent, PY_NULL);
@@ -2157,6 +2179,7 @@ mod tests {
     /// both `__divmod__` and `__rdivmod__`.
     #[test]
     fn test_proxy_typedef_dict_includes_metaclass_and_divmod_rows() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let weakproxy = proxy_type();
         let callable = callable_proxy_type();
@@ -2177,6 +2200,7 @@ mod tests {
     /// the same entry point as the builtin and the proxy wrapper.
     #[test]
     fn test_isinstance_through_proxy() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
         let proxy = W_Proxy_new(int_type, PY_NULL);
@@ -2192,6 +2216,7 @@ mod tests {
     /// path as `isinstance`, but via `__subclasscheck__`.
     #[test]
     fn test_issubclass_through_proxy() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
         let str_type = crate::typedef::r#type(pyre_object::w_str_new("")).unwrap();
@@ -2253,6 +2278,7 @@ mod tests {
     /// NotImplemented sentinel.
     #[test]
     fn test_proxy_pow_falls_through_to_rpow() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
             unsafe {
@@ -2291,6 +2317,7 @@ mod tests {
     /// through to the right operand's `__rpow__`.
     #[test]
     fn test_proxy_pow_three_arg_does_not_use_rpow() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
             unsafe {
@@ -2328,6 +2355,7 @@ mod tests {
     /// `proxy_pow`.
     #[test]
     fn test_proxy_divmod_falls_through_to_rdivmod() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("DivmodLhsNI", |ns| {
             unsafe {
@@ -2366,6 +2394,7 @@ mod tests {
     /// callable proxy reaches `object`'s NotImplemented operation.
     #[test]
     fn test_comparison_ops_only_on_weakproxy() {
+        let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let weakproxy = proxy_type();
         let callable = callable_proxy_type();
