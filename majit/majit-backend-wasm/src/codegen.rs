@@ -2939,7 +2939,7 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.i64_load(mem64(vtable_off as u64));
                     sink.i32_wrap_i64();
-                    sink.i64_load(mem64(offset2 as u64));
+                    emit_sized_int_load(&mut sink, offset2 as u64, std::mem::size_of::<usize>(), true);
                 } else {
                     // assembler.py:1957-1969 gcremovetypeptr path.
                     //     MOV32 loc_tmp, mem(loc_object, 0)
@@ -2963,7 +2963,7 @@ fn build_function(
                     sink.i64_const((guard_gc_type_info.sizeof_ti + offset2) as i64);
                     sink.i64_add();
                     sink.i32_wrap_i64();
-                    sink.i64_load(mem64(0));
+                    emit_sized_int_load(&mut sink, 0, std::mem::size_of::<usize>(), true);
                 }
                 // Stack: [..., loc_tmp (i64)]
 
