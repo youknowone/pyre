@@ -740,12 +740,13 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             tp,
             &pyre_object::dictmultiobject::DICT_ITEMS_TYPE as *const PyType,
         ) {
-            // `pypy/objspace/std/dictmultiobject.py`
-            // `W_DictViewKeysObject.descr_repr` →
-            // `"dict_keys([k1, k2, ...])"` (and the same shape for
-            // values / items).  Pyre snapshots the source dict via
-            // `dict_view_snapshot` so the rendered list matches what
-            // the iter dispatch would produce.
+            // `dictmultiobject.py viewrepr`: the view itself participates in
+            // the shared identity recursion set and emits `...` on re-entry.
+            // This is distinct from the owning dict's `{...}` placeholder: a
+            // dict may contain one of its own values/items views.
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return Ok("...".to_string());
+            };
             let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
             let label = match kind {
                 pyre_object::dictmultiobject::DictViewKind::Keys => "dict_keys",

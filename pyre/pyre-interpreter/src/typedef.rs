@@ -431,40 +431,43 @@ pub fn init_typeobjects() {
             &pyre_object::MODULE_TYPE as *const PyType as usize,
             module_type as usize,
         );
-        // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
-        // dict_keys / dict_values / dict_items.  PyPy registers
-        // each as a distinct TypeDef but they share the
-        // _iter_keys/_iter_values/_iter_items dispatch.  Pyre's
-        // baseobjspace iter/len/contains arms cover the runtime
-        // semantics, so the per-typedef init body stays empty for
-        // now — what matters is that `type(d.keys())` resolves to
-        // the right W_TypeObject (otherwise `builtin_type` falls
-        // back to a str return).  All three view typedefs carry
-        // `__new__ = interp2app(new_dict_*)`, so `acceptable_as_base_class`
-        // is True (`'__new__' in rawdict`): `class Sub(dict_keys)` is
-        // allowed, which `collections.OrderedDict`'s reversed-view
-        // classes rely on.
+        // `pypy/objspace/std/dictmultiobject.py` dict_keys / dict_values /
+        // dict_items TypeDefs, with the Python 3.14 type flags.  PyPy's
+        // current TypeDefs expose `new_dict_*` and permit subclassing for its
+        // app-level OrderedDict views.  Python 3.14 instead gives all three
+        // types a null `tp_new` and clears BASETYPE; pyre targets that newer
+        // public contract.  Its OrderedDict views therefore use the 3.14
+        // `_collections_abc` bases in `app_odict.py`.
         // dict_keys / dict_items get the SetLikeDictView surface
         // per dictmultiobject.py:1802-1829 / 1773-1800; dict_values
         // stops at the common slots per dictmultiobject.py:1831-1840
         // (values views are intentionally NOT set-like).
         let dict_keys_type =
-            new_typeobject_with_base("dict_keys", init_dict_keys_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, true) };
+            new_typeobject_with_base("dict_keys", init_dict_view_keys_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, false);
+            pyre_object::w_type_set_disallow_instantiation(dict_keys_type);
+        }
         reg.insert(
             &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType as usize,
             dict_keys_type as usize,
         );
         let dict_values_type =
-            new_typeobject_with_base("dict_values", init_dict_values_type_with_new, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_values_type, true) };
+            new_typeobject_with_base("dict_values", init_dict_view_values_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(dict_values_type, false);
+            pyre_object::w_type_set_disallow_instantiation(dict_values_type);
+        }
         reg.insert(
             &pyre_object::dictmultiobject::DICT_VALUES_TYPE as *const PyType as usize,
             dict_values_type as usize,
         );
         let dict_items_type =
-            new_typeobject_with_base("dict_items", init_dict_items_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, true) };
+            new_typeobject_with_base("dict_items", init_dict_view_items_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, false);
+            pyre_object::w_type_set_disallow_instantiation(dict_items_type);
+        }
         reg.insert(
             &pyre_object::dictmultiobject::DICT_ITEMS_TYPE as *const PyType as usize,
             dict_items_type as usize,
@@ -5804,151 +5807,6 @@ fn init_dict_view_common_slots(
             ),
         )
     };
-    // `_dict = interp_attrproperty_w('w_dict')` — the underlying dict.
-    // `collections.OrderedDict`'s reversed-view classes read `self._dict`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "_dict",
-            make_getset_property_named_doc(
-                make_builtin_function_with_arity(
-                    "_dict",
-                    |args| {
-                        let view = args[1];
-                        if view.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        let dict =
-                            unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
-                        if dict.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        Ok(dict)
-                    },
-                    2,
-                ),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-                "the dict this view refers to",
-                "_dict",
-            ),
-        )
-    };
-}
-
-/// Shared `__new__` for the three dict views — `new_dict_keys` /
-/// `new_dict_items` / `new_dict_values` (`dictmultiobject.py`).  Each
-/// takes the dict positionally and allocates a view over it; the
-/// Python-visible class is re-pointed to the caller's subtype so
-/// `class _OrderedDictKeysView(dict_keys)` instances see themselves.
-fn dict_view_descr_new(
-    args: &[PyObjectRef],
-    kind: pyre_object::dictmultiobject::DictViewKind,
-    static_tp: &'static pyre_object::PyType,
-    name: &str,
-) -> Result<PyObjectRef, crate::PyError> {
-    // `interp2app(new_dict_*)` binds exactly `(w_type, w_dict)`; the arity
-    // is enforced before the body runs.
-    match args.len() {
-        0 => {
-            return Err(crate::PyError::type_error(format!(
-                "{name}.__new__() missing 2 required positional arguments: 'type' and 'dict'"
-            )));
-        }
-        1 => {
-            return Err(crate::PyError::type_error(format!(
-                "{name}.__new__() missing 1 required positional argument: 'dict'"
-            )));
-        }
-        2 => {}
-        n => {
-            return Err(crate::PyError::type_error(format!(
-                "{name}.__new__() takes 2 positional arguments but {n} were given"
-            )));
-        }
-    }
-    let cls = args[0];
-    // `interp_w(W_DictMultiObject, w_dict)` — accept a dict or any dict
-    // subclass (e.g. an `OrderedDict` passing itself to the view).
-    let dict_type = gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-    if !unsafe { crate::baseobjspace::isinstance_w(args[1], dict_type) } {
-        return Err(crate::PyError::type_error(format!(
-            "'dict' object expected, got '{}' instead",
-            crate::baseobjspace::object_functionstr_type_name(args[1])
-        )));
-    }
-    // `allocate_instance(W_DictView*Object, w_type)` validates the target:
-    // a non-type, a non-subtype, or a foreign-layout subtype is rejected
-    // before the view is allocated.
-    let static_obj = gettypeobject(static_tp);
-    check_user_subclass(static_obj, cls)?;
-    // A dict subclass keeps its entries in a native backing dict; the view
-    // binds to that, exactly as `dict.keys()`/`values()`/`items()` do.
-    let w_dict = crate::type_methods::resolve_dict_backing(args[1]);
-    let view = pyre_object::dictmultiobject::w_dict_view_new(w_dict, kind);
-    // Re-point the Python-visible class to the validated subtype.
-    if !std::ptr::eq(cls, static_obj) {
-        unsafe { (*view).w_class = cls };
-    }
-    Ok(view)
-}
-
-fn dict_keys_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    dict_view_descr_new(
-        args,
-        pyre_object::dictmultiobject::DictViewKind::Keys,
-        &pyre_object::dictmultiobject::DICT_KEYS_TYPE,
-        "dict_keys",
-    )
-}
-
-fn dict_values_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    dict_view_descr_new(
-        args,
-        pyre_object::dictmultiobject::DictViewKind::Values,
-        &pyre_object::dictmultiobject::DICT_VALUES_TYPE,
-        "dict_values",
-    )
-}
-
-fn dict_items_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    dict_view_descr_new(
-        args,
-        pyre_object::dictmultiobject::DictViewKind::Items,
-        &pyre_object::dictmultiobject::DICT_ITEMS_TYPE,
-        "dict_items",
-    )
-}
-
-fn register_dict_view_new(
-    ns: PyObjectRef,
-    new_fn: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_object::w_staticmethod_new(make_builtin_function("__new__", new_fn)),
-        )
-    };
-}
-
-/// `dict_keys` typedef body — set-like surface plus `__new__`.
-fn init_dict_keys_type(ns: PyObjectRef) {
-    init_dict_view_keys_type(ns);
-    register_dict_view_new(ns, dict_keys_descr_new);
-}
-
-/// `dict_items` typedef body — set-like surface plus `__new__`.
-fn init_dict_items_type(ns: PyObjectRef) {
-    init_dict_view_items_type(ns);
-    register_dict_view_new(ns, dict_items_descr_new);
-}
-
-/// `dict_values` typedef body — common slots plus `__new__`.
-fn init_dict_values_type_with_new(ns: PyObjectRef) {
-    init_dict_view_values_type(ns);
-    register_dict_view_new(ns, dict_values_descr_new);
 }
 
 /// `dictmultiobject.py` `W_DictViewKeysObject` /

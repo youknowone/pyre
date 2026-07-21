@@ -503,6 +503,34 @@ assert cm.exception.__notes__ == [
 ]
 
 
+# Python 3.14 makes the concrete dict view types non-instantiable and final.
+for dict_view_type in (
+    type({}.keys()),
+    type({}.values()),
+    type({}.items()),
+):
+    assert "__new__" not in dict_view_type.__dict__
+    assert_raises(TypeError, dict_view_type)
+    assert_raises(TypeError, dict_view_type, {})
+    assert_raises(TypeError, type, "DictViewSubclass", (dict_view_type,), {})
+
+
+recursive_view_dict = {}
+recursive_view_dict[42] = recursive_view_dict.values()
+assert isinstance(repr(recursive_view_dict), str)
+recursive_view_dict[42] = recursive_view_dict.items()
+assert isinstance(repr(recursive_view_dict), str)
+
+
+# OrderedDict uses the Python 3.14 collections ABC view classes now that the
+# concrete dict view types are final.
+ordered_view_dict = collections.OrderedDict((("a", 1), ("b", 2)))
+assert list(ordered_view_dict.keys()) == ["a", "b"]
+assert list(reversed(ordered_view_dict.keys())) == ["b", "a"]
+assert list(reversed(ordered_view_dict.items())) == [("b", 2), ("a", 1)]
+assert list(reversed(ordered_view_dict.values())) == [2, 1]
+
+
 def failing_dict_pair():
     yield "key"
     raise TypeError("pair iteration failed")

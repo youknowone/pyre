@@ -1,4 +1,5 @@
 from __pypy__ import reversed_dict, move_to_end, objects_in_repr
+from _collections_abc import KeysView, ItemsView, ValuesView
 from _operator import eq as _eq
 
 
@@ -149,20 +150,16 @@ class OrderedDict(dict):
         "D.values() -> an object providing a view on D's values"
         return _OrderedDictValuesView(self)
 
-dict_keys = type({}.keys())
-dict_values = type({}.values())
-dict_items = type({}.items())
-
-class _OrderedDictKeysView(dict_keys):
+class _OrderedDictKeysView(KeysView):
     def __reversed__(self):
-        yield from reversed_dict(self._dict)
+        yield from reversed_dict(self._mapping)
 
-class _OrderedDictItemsView(dict_items):
+class _OrderedDictItemsView(ItemsView):
     def __reversed__(self):
-        for key in reversed_dict(self._dict):
-            yield (key, self._dict[key])
+        for key in reversed_dict(self._mapping):
+            yield (key, self._mapping[key])
 
-class _OrderedDictValuesView(dict_values):
+class _OrderedDictValuesView(ValuesView):
     def __reversed__(self):
-        for key in reversed_dict(self._dict):
-            yield self._dict[key]
+        for key in reversed_dict(self._mapping):
+            yield self._mapping[key]
