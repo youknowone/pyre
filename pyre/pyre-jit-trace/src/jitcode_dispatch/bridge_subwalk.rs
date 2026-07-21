@@ -426,9 +426,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
     // point — the slot the inner frame's result lands in — so its Python
     // coordinate is a direct backtranslation (no `semantic_fallthrough_pc`).
-    // This local remains needed by the outer-active-box collector; the paused
-    // parent frame itself carries `ParentResumeCoord::Backxlat(root_pc)`.
-    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as u32;
     // Null the not-yet-produced call-result slot before collecting the active
     // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
     // `compute_inline_caller_frame`.  Operate on a clone so `root_sym` stays a
@@ -470,8 +467,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         &regs_r,
         root_sym.registers_f(),
         jitcode_index,
-        root_py_pc,
-        None,
+        false,
         // Key the query off the same carried root-frame word the snapshot and
         // decode side read from `frames[0].jitcode_pc`, so both resolve the
         // identical liveness window.

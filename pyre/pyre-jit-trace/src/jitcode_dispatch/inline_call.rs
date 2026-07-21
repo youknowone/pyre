@@ -1983,8 +1983,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     let jc_index = jc.index as u32;
                     (jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
                 };
-                let call_site_py_pc =
-                    crate::state::backxlat_py_pc(call_site_jc_index as i32, op.pc as i32) as u32;
                 let call_site_word = match call_site_marker {
                     Some(m) => m as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
@@ -1996,8 +1994,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     ctx.registers_r,
                     ctx.registers_f,
                     call_site_jc_index,
-                    call_site_py_pc,
-                    None,
+                    false,
                     call_site_word,
                     // Keep the marker for the liveness-bank query, but key
                     // entry metadata to the raw CALL offset that produced the

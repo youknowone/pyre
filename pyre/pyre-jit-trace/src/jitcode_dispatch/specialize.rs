@@ -3549,8 +3549,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         ctx.registers_r,
         ctx.registers_f,
         outer_jitcode_index,
-        call_site_py_pc,
-        None,
+        false,
         call_site_word,
         // As above, entry metadata is keyed by the append op itself; its
         // liveness-bank query remains keyed by the resume marker.

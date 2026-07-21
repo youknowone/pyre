@@ -3435,8 +3435,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     regs_r: &[OpRef],
     regs_f: &[OpRef],
     outer_jitcode_index: u32,
-    entry_py_pc: u32,
-    guard_py_pc: Option<u32>,
+    guard_present: bool,
     // The resume-carried coordinate remains the bank-liveness source. Entry
     // metadata can be derived from an earlier raw operation coordinate, so it
     // must travel independently rather than inheriting that marker word.
@@ -3523,7 +3522,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // #348: per-snapshot-coordinate color→slot entries — the color→slot source
     // the inversions below consult for every drained (non-portal) jitcode, the
     // per-program-point color space the `-live-` markers carry. Branch-guard
-    // resumes (`guard_py_pc.is_some()`) are fully covered here; a per-opcode-entry
+    // resumes (`guard_present`) are fully covered here; a per-opcode-entry
     // resume whose live Ref colors are all constants/leaked carries no entry (the
     // resume snapshot records Variables only), so `semantic_ref_slot_for_reg_color`
     // returns `None` and the live color falls to the `regs_r[color]` walk-bank
@@ -3556,7 +3555,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
     let stack_livereg_gate = fbw_stack_livereg_enabled();
     let (guard_pcdep_entries, guard_stack_only) = if stack_livereg_gate {
-        if let Some(gpc) = guard_py_pc {
+        if guard_present {
             if sym.jitcode().is_null() {
                 (Vec::new(), 0usize)
             } else {
@@ -3619,7 +3618,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         format!(
             "collect_outer_active_boxes: liveness-active {bank} \
              register {reg_idx} holds OpRef::NONE \
-             (outer_jitcode_index={outer_jitcode_index}, entry_py_pc={entry_py_pc}, \
+             (outer_jitcode_index={outer_jitcode_index}, entry_jitcode_pc={entry_jitcode_pc}, \
               nlocals={nlocals}, owns_vable={owns_vable}, \
               vable_len={vable_len}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
@@ -3651,11 +3650,11 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // the stale `registers_r[merge_color]` / edge-recovery color heuristics
     // below, which read a color the regalloc reused between the guard pc and
     // the resume pc (the #424 merge-color-staleness corruption).  Scoped to
-    // the branch-guard reconstruction (`guard_py_pc`); the merge-color
+    // the branch-guard reconstruction (`guard_present`); the merge-color
     // heuristics below remain only as the fallback for slots the mirror does
     // not cover (mirror invalid, or an Int-bank temp the Ref-only mirror does
     // not hold).
-    let vstack_mirror: Option<&[OpRef]> = vstack.filter(|_| guard_py_pc.is_some());
+    let vstack_mirror: Option<&[OpRef]> = vstack.filter(|_| guard_present);
     for &idx in &banks.ref_ {
         let color = idx as usize;
         if let Some(mirror) = vstack_mirror {
@@ -3791,7 +3790,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
                         let guard_pc_proves_slot = stack_livereg_gate
-                            && guard_py_pc.is_some()
+                            && guard_present
                             && crate::state::semantic_ref_slot_for_reg_color(
                                 nlocals,
                                 guard_stack_only,
@@ -3817,7 +3816,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         let walk_is_real = walk_box
                             .is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
-                        if guard_py_pc.is_some() && walk_is_real {
+                        if guard_present && walk_is_real {
                             walk_box.unwrap_or_else(fallback)
                         } else if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
