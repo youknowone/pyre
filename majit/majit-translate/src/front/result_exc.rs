@@ -1463,11 +1463,7 @@ fn verify_drain_reraise_returns_err_payload(
 /// leaves the graph byte-identical.  Detach-only: the bypassed
 /// discriminant / Err-arm / bool-switch / reraise blocks are left
 /// byte-intact for the post-rewrite `clear_unreachable_blocks` sweep.
-fn try_fuse_drain_match(
-    graph: &mut FunctionGraph,
-    a: usize,
-    r: &Variable,
-) -> Result<(), String> {
+fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result<(), String> {
     use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{BlockId, ExitCase};
     let name = graph.name.clone();
@@ -1475,11 +1471,14 @@ fn try_fuse_drain_match(
     // --- (1) A: `r = next(iter)` is A's last op, closed by lower_call with
     // a single no-exitcase forwarding exit.
     let a_ops = &graph.blocks[a].operations;
-    let call_idx = a_ops.len().checked_sub(1).ok_or_else(|| {
-        format!("{name}: drain fuse: call block {a} is empty")
-    })?;
+    let call_idx = a_ops
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| format!("{name}: drain fuse: call block {a} is empty"))?;
     if a_ops[call_idx].result.as_ref() != Some(r) {
-        return Err(format!("{name}: drain fuse: next() is not the last op of block {a}"));
+        return Err(format!(
+            "{name}: drain fuse: next() is not the last op of block {a}"
+        ));
     }
     if graph.blocks[a].exitswitch.is_some() || graph.blocks[a].exits.len() != 1 {
         return Err(format!(
@@ -1487,7 +1486,9 @@ fn try_fuse_drain_match(
         ));
     }
     if graph.blocks[a].exits[0].exitcase.is_some() {
-        return Err(format!("{name}: drain fuse: call block {a} exit carries an exitcase"));
+        return Err(format!(
+            "{name}: drain fuse: call block {a} exit carries an exitcase"
+        ));
     }
 
     // --- (2) A→B single exit; B holds `d = r.__discriminant[Result<..,PyError>]`,
@@ -1503,13 +1504,18 @@ fn try_fuse_drain_match(
             OpKind::FieldRead { base, field, .. }
                 if *base == r_b
                     && field.name == "__discriminant"
-                    && field.owner_root.as_deref().is_some_and(owner_is_result_of_pyerror) =>
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(owner_is_result_of_pyerror) =>
             {
                 op.result.clone().map(|d| (i, d))
             }
             _ => None,
         })
-        .ok_or_else(|| format!("{name}: drain fuse: block {b} lacks the Result __discriminant read"))?;
+        .ok_or_else(|| {
+            format!("{name}: drain fuse: block {b} lacks the Result __discriminant read")
+        })?;
     match &graph.blocks[b].exitswitch {
         Some(ExitSwitch::Value(v)) if *v == disc_var => {}
         other => {
@@ -1531,21 +1537,20 @@ fn try_fuse_drain_match(
                         && field.owner_root.as_deref().is_some_and(|o| owner_is_result_variant(o, variant)))
         })
     };
-    let (ok_link, err_link) = if reads_variant(case0.target.0, "Ok")
-        && reads_variant(case1.target.0, "Err")
-    {
-        (case0, case1)
-    } else if reads_variant(case1.target.0, "Ok") && reads_variant(case0.target.0, "Err") {
-        // The Ok arm must be the discriminant-0 case (Result: Ok = 0); an
-        // inverted pairing is an unrecognised shape.
-        return Err(format!(
-            "{name}: drain fuse: Ok/Err arms inverted vs discriminant 0/1"
-        ));
-    } else {
-        return Err(format!(
-            "{name}: drain fuse: block {b} arms are not a Result Ok/Err __pos_0 pair"
-        ));
-    };
+    let (ok_link, err_link) =
+        if reads_variant(case0.target.0, "Ok") && reads_variant(case1.target.0, "Err") {
+            (case0, case1)
+        } else if reads_variant(case1.target.0, "Ok") && reads_variant(case0.target.0, "Err") {
+            // The Ok arm must be the discriminant-0 case (Result: Ok = 0); an
+            // inverted pairing is an unrecognised shape.
+            return Err(format!(
+                "{name}: drain fuse: Ok/Err arms inverted vs discriminant 0/1"
+            ));
+        } else {
+            return Err(format!(
+                "{name}: drain fuse: block {b} arms are not a Result Ok/Err __pos_0 pair"
+            ));
+        };
     let ok_target = ok_link.target.0;
     let err_target = err_link.target.0;
 
@@ -1566,9 +1571,10 @@ fn try_fuse_drain_match(
             OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name: n, owner_path }, .. }
                 if n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind")))
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the StopIteration ctor"))?;
-    let sc = err_ops[ctor_idx].result.clone().ok_or_else(|| {
-        format!("{name}: drain fuse: StopIteration ctor without result")
-    })?;
+    let sc = err_ops[ctor_idx]
+        .result
+        .clone()
+        .ok_or_else(|| format!("{name}: drain fuse: StopIteration ctor without result"))?;
     let (errpay_idx, err_payload) = err_ops
         .iter()
         .enumerate()
@@ -1576,7 +1582,10 @@ fn try_fuse_drain_match(
             OpKind::FieldRead { base, field, .. }
                 if *base == r_err
                     && field.name == "__pos_0"
-                    && field.owner_root.as_deref().is_some_and(|o| owner_is_result_variant(o, "Err")) =>
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|o| owner_is_result_variant(o, "Err")) =>
             {
                 op.result.clone().map(|e| (i, e))
             }
@@ -1601,12 +1610,20 @@ fn try_fuse_drain_match(
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
-            OpKind::Call { target: CallTarget::Method { name: m, receiver_root, .. }, args, .. }
-                if m == "eq"
-                    && receiver_root.as_deref() == Some("PyErrorKind")
-                    && args.len() == 2
-                    && args.contains(&kind_var)
-                    && args.contains(&sc) =>
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name: m,
+                        receiver_root,
+                        ..
+                    },
+                args,
+                ..
+            } if m == "eq"
+                && receiver_root.as_deref() == Some("PyErrorKind")
+                && args.len() == 2
+                && args.contains(&kind_var)
+                && args.contains(&sc) =>
             {
                 op.result.clone().map(|m| (i, m))
             }
@@ -1668,7 +1685,9 @@ fn try_fuse_drain_match(
         }
     }
     let (Some(break_link), Some(reraise_link)) = (break_link, reraise_link) else {
-        return Err(format!("{name}: drain fuse: bool switch lacks the true/false pair"));
+        return Err(format!(
+            "{name}: drain fuse: bool switch lacks the true/false pair"
+        ));
     };
     let break_target = break_link.target.0;
     let reraise_target = reraise_link.target.0;
@@ -1794,25 +1813,35 @@ fn try_fuse_drain_match(
         // bswitch-defined value; the break arm never carries it, but guard
         // it just in case (matched arm ⟹ eq true).
         if *x == bool_temp {
-            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(ConstValue::Bool(true)))));
+            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
+                ConstValue::Bool(true),
+            ))));
         }
         let pos = graph.blocks[bswitch]
             .inputargs
             .iter()
             .position(|v| v == x)
-            .ok_or_else(|| format!("{name}: drain fuse: break value defined in bool-switch block"))?;
-        let LinkArg::Value(y) = err_to_bswitch.args.get(pos).ok_or_else(|| {
-            format!("{name}: drain fuse: Err→bool-switch link lacks arg {pos}")
-        })? else {
+            .ok_or_else(|| {
+                format!("{name}: drain fuse: break value defined in bool-switch block")
+            })?;
+        let LinkArg::Value(y) = err_to_bswitch
+            .args
+            .get(pos)
+            .ok_or_else(|| format!("{name}: drain fuse: Err→bool-switch link lacks arg {pos}"))?
+        else {
             // A const threaded through the bswitch inputarg.
-            let Some(LinkArg::Const(c)) = err_to_bswitch.args.get(pos) else { unreachable!() };
+            let Some(LinkArg::Const(c)) = err_to_bswitch.args.get(pos) else {
+                unreachable!()
+            };
             return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
         };
         let y = y.clone();
         // Hop Err-arm → B.  Err-arm-defined values (the four guard ops)
         // decline, except the eq bool (matched arm ⟹ true).
         if y == eq_result {
-            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(ConstValue::Bool(true)))));
+            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
+                ConstValue::Bool(true),
+            ))));
         }
         if y == sc || y == err_payload || y == kind_var {
             return Err(format!(
@@ -1824,10 +1853,14 @@ fn try_fuse_drain_match(
             .iter()
             .position(|v| *v == y)
             .ok_or_else(|| format!("{name}: drain fuse: break value defined in Err-arm block"))?;
-        let LinkArg::Value(z) = err_link.args.get(pos).ok_or_else(|| {
-            format!("{name}: drain fuse: B→Err link lacks arg {pos}")
-        })? else {
-            let Some(LinkArg::Const(c)) = err_link.args.get(pos) else { unreachable!() };
+        let LinkArg::Value(z) = err_link
+            .args
+            .get(pos)
+            .ok_or_else(|| format!("{name}: drain fuse: B→Err link lacks arg {pos}"))?
+        else {
+            let Some(LinkArg::Const(c)) = err_link.args.get(pos) else {
+                unreachable!()
+            };
             return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
         };
         let z = z.clone();
@@ -1840,13 +1873,17 @@ fn try_fuse_drain_match(
             ));
         }
         if z == disc_var {
-            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(ConstValue::Int(1)))));
+            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
+                ConstValue::Int(1),
+            ))));
         }
         let pos = graph.blocks[b]
             .inputargs
             .iter()
             .position(|v| *v == z)
-            .ok_or_else(|| format!("{name}: drain fuse: break value defined in discriminant block"))?;
+            .ok_or_else(|| {
+                format!("{name}: drain fuse: break value defined in discriminant block")
+            })?;
         match graph.blocks[a].exits[0].args.get(pos) {
             Some(LinkArg::Const(c)) => Ok(BreakArg::Const(LinkArg::Const(c.clone()))),
             Some(LinkArg::Value(av)) if *av == *r => Err(format!(
@@ -1926,7 +1963,10 @@ fn try_fuse_drain_match(
     let h_vb = h_inputs[forwarded.len() + 1].clone();
     // Map each forwarded A-scope var to its H inputarg.
     let h_of = |av: &Variable| -> Variable {
-        let idx = forwarded.iter().position(|v| v == av).expect("forwarded contains av");
+        let idx = forwarded
+            .iter()
+            .position(|v| v == av)
+            .expect("forwarded contains av");
         h_inputs[idx].clone()
     };
     // Block R's inputarg: [vb].
@@ -2040,8 +2080,12 @@ fn try_fuse_drain_match(
         .cloned()
         .chain([va.clone(), vb.clone()])
         .collect();
-    let mut exc_link =
-        Link::from_variables(graph, exc_vars, h_id, Some(crate::model::exception_exitcase()));
+    let mut exc_link = Link::from_variables(
+        graph,
+        exc_vars,
+        h_id,
+        Some(crate::model::exception_exitcase()),
+    );
     exc_link.last_exception = Some(LinkArg::Value(va));
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
     assert_eq!(
