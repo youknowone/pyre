@@ -2349,15 +2349,19 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    // num_bytes is arg(1), typically a constant
+                    // num_bytes (arg(1)) is always a compile-time constant;
+                    // resolve it like every other emit-time const so a genuine
+                    // pool miss panics via missing_emit_const instead of silently
+                    // defaulting to 8 (which zeroes the shift and skips the
+                    // narrowing, passing an un-truncated integer through).
                     let arg1 = op.arg(1).to_opref();
-                    let num_bytes = if arg1.is_constant() {
-                        arg1.inline_const_bits()
-                            .or_else(|| constants.get(&arg1.raw()).copied())
-                            .unwrap_or(8)
-                    } else {
-                        8 // default to no-op
-                    };
+                    let num_bytes = const_operand_value(constants, arg1).unwrap_or_else(|| {
+                        panic!(
+                            "wasm int_signext: num_bytes operand (raw={}) is not a \
+                             resolvable compile-time constant",
+                            arg1.raw()
+                        )
+                    });
                     let shift = 64 - num_bytes * 8;
                     if shift > 0 && shift < 64 {
                         sink.i64_const(shift);
@@ -2637,61 +2641,23 @@ fn build_function(
             }
 
             // ── Interior field access ──
-            OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    // getinteriorfield(array, index, offset)
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
-                    sink.i32_wrap_i64();
-                    let field_offset = field_offset_from_descr(op);
-                    // Simplified: use field_offset directly (RPython computes base+index*itemsize+offset)
-                    let (size, signed) = field_size_sign_from_descr(op);
-                    emit_sized_int_load(&mut sink, field_offset, size, signed);
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::GetinteriorfieldGcF => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
-                    sink.i32_wrap_i64();
-                    let field_offset = field_offset_from_descr(op);
-                    sink.f64_load(MemArg {
-                        offset: field_offset,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::SetinteriorfieldGc => {
-                if let Some(base) = write_barrier_base(op, ref_values) {
-                    emit_write_barrier(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        jit_call_idx,
-                        residual_type_base,
-                        wb_fn_ptr,
-                        base,
-                        frame,
-                    );
-                }
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i32_wrap_i64();
-                let field_offset = field_offset_from_descr(op);
-                if field_is_float_from_descr(op) {
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    sink.f64_store(MemArg {
-                        offset: field_offset,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref()); // value
-                    let (size, _signed) = field_size_sign_from_descr(op);
-                    emit_sized_int_store(&mut sink, field_offset, size);
-                }
+            // getinteriorfield/setinteriorfield address an interior field of an
+            // array element at `base + base_size + index*item_size + offset`. The
+            // prior lowering resolved only arg(0) (the array ptr) and applied
+            // field_offset_from_descr (which returns 0 for an InteriorFieldDescr),
+            // dropping arg(1) (the index) entirely, so it read/wrote element 0's
+            // field regardless of index — a silent wrong-memory access (wasm
+            // offset 0 is valid linear memory, so it does not trap). Decline and
+            // let the metainterp fall back to the interpreter, which addresses the
+            // interior field correctly.
+            OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF
+            | OpCode::SetinteriorfieldGc => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: interior-field op {:?} (index-aware addressing unimplemented)",
+                    op.opcode
+                )));
             }
 
             // ── String/Unicode ops (direct memory access) ──
@@ -2726,37 +2692,27 @@ fn build_function(
             }
 
             // ── GC memory ops ──
-            OpCode::GcLoadI => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    let offset = field_offset_from_descr(op);
-                    sink.i64_load(mem64(offset));
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::GcLoadR => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    let offset = field_offset_from_descr(op);
-                    sink.i32_load(MemArg {
-                        offset,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::GcStore => {
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i32_wrap_i64();
-                let offset = field_offset_from_descr(op);
-                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                sink.i64_store(mem64(offset));
+            // GC_LOAD/GC_STORE and their indexed forms are produced only by the
+            // GC rewrite (majit-gc/src/rewrite.rs): the true semantics are
+            // offset=arg1, size=arg2 (load) / value=arg2, size=arg3 (store), with
+            // no FieldDescr attached. The wasm backend does not run the GC rewrite,
+            // so these never reach here. The prior lowering read a nonexistent
+            // field_offset_from_descr (→ 0) and, for GcStore, stored arg(1) (the
+            // offset operand) as the value — a silent miscompile. Panic loudly like
+            // LoadFromGcTable rather than emit a wrong memory access.
+            OpCode::GcLoadI
+            | OpCode::GcLoadR
+            | OpCode::GcLoadF
+            | OpCode::GcLoadIndexedI
+            | OpCode::GcLoadIndexedR
+            | OpCode::GcLoadIndexedF
+            | OpCode::GcStore
+            | OpCode::GcStoreIndexed => {
+                panic!(
+                    "wasm backend: {:?} is unsupported (GC_LOAD/GC_STORE); \
+                     the GC rewrite must not run for wasm",
+                    op.opcode
+                );
             }
 
             // ── Raw memory access ──
