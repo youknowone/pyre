@@ -3461,7 +3461,14 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 driver.meta_interp_mut().force_virtualizable_token(token);
             });
         };
-        if let Some(ptr) = tracing_frame.filter(|ptr| *ptr != frame.cast()) {
+        // Force the traced frame even when it IS the escaping one: clearing
+        // TOKEN_TRACING_RESCALL is what `tracing_after_residual_call` reads as
+        // "the callee forced the virtualizable", which raises
+        // `VableEscapedDuringResidualCall` and lets the walk resume forward
+        // from the pc `flush_active_frame_escape` just committed.  Skipping it
+        // would leave the walk tracing against a shadow whose frame has already
+        // been handed to Python code.
+        if let Some(ptr) = tracing_frame {
             force(ptr);
         }
         if live_frame_armed {
