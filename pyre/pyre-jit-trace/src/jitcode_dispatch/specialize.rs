@@ -3367,8 +3367,19 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         } else {
             let codeobj = &*jc.payload.code_ptr;
             py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-            let vsd = match lv.depth_at_py_pc().get(py as usize).copied() {
+            // Read the depth off the jitcode-pc-keyed trivia twin, which equals
+            // `depth_at_py_pc()[skip_python_trivia_forward(python_pc_for_jitcode_pc(op.pc))]`
+            // by construction; fall back to the py_pc-keyed static-liveness read
+            // where the twin is unpopulated (skeleton / fixture install).
+            let depth = if jc.payload.depth_trivia_populated() {
+                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+            } else {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(py as usize)
+                    .copied()
+            };
+            let vsd = match depth {
                 Some(d) => (sym.nlocals() + d as usize) as i64,
                 None => sym.valuestackdepth() as i64,
             };
