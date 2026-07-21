@@ -28,22 +28,25 @@ def cmp_to_key(mycmp):
         __hash__ = None
     return K
 
+# `_functools.cmp_to_key` is an interp-level builtin in CPython.  Unlike an
+# app-level function, it therefore does not acquire an instance when a caller
+# stores it on a class (the CPython functools tests do exactly that).  A
+# callable staticmethod preserves the app-level implementation while giving
+# the exported object the same non-binding descriptor behavior.
+cmp_to_key = staticmethod(cmp_to_key)
 
-def reduce(*args):
+
+_initial_missing = object()
+
+
+def reduce(function, sequence, initial=_initial_missing):
     # _functoolsmodule.c functools_reduce — reduce(function, iterable[, initial]).
-    if len(args) < 2:
-        raise TypeError(
-            "reduce() takes at least 2 positional arguments (%d given)" % len(args))
-    if len(args) > 3:
-        raise TypeError(
-            "reduce() takes at most 3 arguments (%d given)" % len(args))
-    function = args[0]
     try:
-        it = iter(args[1])
+        it = iter(sequence)
     except TypeError:
         raise TypeError("reduce() arg 2 must support iteration") from None
-    if len(args) == 3:
-        accum = args[2]
+    if initial is not _initial_missing:
+        accum = initial
     else:
         try:
             accum = next(it)
@@ -53,6 +56,10 @@ def reduce(*args):
     for element in it:
         accum = function(accum, element)
     return accum
+
+
+# Same descriptor-neutral accelerator surface as cmp_to_key above.
+reduce = staticmethod(reduce)
 "# => ["cmp_to_key", "reduce"],
     },
 }

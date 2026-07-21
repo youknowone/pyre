@@ -360,9 +360,14 @@ def _partial_repr(self):
     cls = type(self)
     module = cls.__module__
     qualname = cls.__qualname__
-    args = [repr(self.func)]
-    args.extend(map(repr, self.args))
-    args.extend(f"{k}={v!r}" for k, v in self.keywords.items())
+    # Snapshot the complete state before invoking any user repr.  A repr may
+    # re-enter __setstate__ and replace all three fields; mixing the old func
+    # and args with the new keywords produces a representation that never
+    # described the partial at any instant.
+    func, p_args, keywords = self.func, self.args, self.keywords
+    args = [repr(func)]
+    args.extend(map(repr, p_args))
+    args.extend(f"{k}={v!r}" for k, v in keywords.items())
     return f"{module}.{qualname}({', '.join(args)})"
 
 # Purely functional, no descriptor behaviour

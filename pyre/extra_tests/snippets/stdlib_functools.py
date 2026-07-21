@@ -27,6 +27,7 @@ def add(a, b):
 
 assert reduce(add, ["a", "b", "c"]) == "abc"
 assert reduce(add, ["a", "b", "c"], str(42)) == "42abc"
+assert reduce(add, ["a", "b", "c"], initial="") == "abc"
 assert reduce(add, [["a", "c"], [], ["d", "w"]], []) == ["a", "c", "d", "w"]
 assert reduce(add, [["a", "c"], [], ["d", "w"]], []) == ["a", "c", "d", "w"]
 assert reduce(lambda x, y: x * y, range(2, 21), 1) == 2432902008176640000
@@ -91,7 +92,16 @@ assert reduce(add, SequenceClass(1), 42) == 42
 d = {"one": 1, "two": 2, "three": 3}
 assert reduce(add, d) == "".join(d.keys())
 
+
+class ReduceOwner:
+    reduce = reduce
+
+
+assert ReduceOwner().reduce(add, [1, 2, 3]) == 6
+
 p = partial(add)
+keyword_partial = partial(lambda *args, **kwargs: (args, kwargs), 1, a=2)
+assert keyword_partial(3, a=4, b=5) == ((1, 3), {"a": 4, "b": 5})
 try:
     del p.__dict__
     assert False, "TypeError expected for partial dict deletion"

@@ -962,6 +962,35 @@ pub fn call_kw(
         return call_callable(frame, callable_unwrapped, &args);
     }
 
+    // `descroperation.py descr_call` binds an instance's `__call__` and
+    // forwards the original Arguments object with its keyword names intact.
+    // `resolve_kwargs` only understands Function signatures; running a
+    // callable instance through it turns the trailing keyword values into
+    // positional arguments before `call_callable` eventually finds
+    // `__call__`.  Preserve the Arguments shape by splitting the CALL_KW tail
+    // here and letting `call_with_kwargs` perform descriptor binding.
+    if !unsafe { crate::is_function(callable_unwrapped) } {
+        let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+            unsafe { pyre_object::w_tuple_len(kwarg_names) }
+        } else {
+            0
+        };
+        if nkw > 0 {
+            let n_pos = args.len().saturating_sub(nkw);
+            let pos_args = args[..n_pos].to_vec();
+            let mut kw_entries = Vec::with_capacity(nkw);
+            for ki in 0..nkw {
+                if let Some(name_obj) =
+                    unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
+                {
+                    let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
+                    kw_entries.push((key, args[n_pos + ki]));
+                }
+            }
+            return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+        }
+    }
+
     // pypy/interpreter/function.py Method.call_args parity: unwrap
     // bound method by prepending the receiver, then run resolve_kwargs
     // against the underlying function. This matches
