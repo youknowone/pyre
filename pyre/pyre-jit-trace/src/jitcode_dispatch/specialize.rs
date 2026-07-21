@@ -3509,7 +3509,9 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
 /// gate and descends the same `w_list_append` body as the method-call form
 /// ([`try_walker_orthodox_list_append`]).  Returns `None` (fall through to the
 /// generic residual, SAFE — identical to the retired MIFrame tracer's `jit_list_append`)
-/// for any non-matching shape; the residual is void so no result is written.
+/// for any non-matching shape, and likewise after rolling the tentative IR back
+/// when the body sub-walk hits an un-lowered helper; the residual is void so no
+/// result is written.
 pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -3546,11 +3548,31 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     // resolver) and stays live for the enclosing full-body walk.
     let sym = unsafe { &*sym_ptr };
 
-    // ── commit (record IR; no further declines) ──
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Mirror the commit's own promotion predicate exactly: a rollback must
+    // undo a promotion only when one was performed, or it would pop another
+    // list's journal entry.
+    let promoted_empty =
+        empty_append_virt_enabled() && unsafe { pyre_object::w_list_uses_empty_storage(list) };
+
+    // ── tentative commit ──
     // The receiver list OpRef + value OpRef are the residual's Ref operands.
-    orthodox_list_append_commit(
+    let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, r_args[0], r_args[1], list, value, len_before,
-    )?;
+    );
+    match commit_result {
+        Ok(()) => {}
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            bool_box_truth_reset();
+            if promoted_empty {
+                fbw_append_promote_journal_rollback_last(list);
+            }
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
     Ok(Some(()))
 }
 
