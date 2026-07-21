@@ -11,13 +11,13 @@ assert not myobj != myobj
 object.__subclasshook__(1) == NotImplemented
 
 
-def assert_type_error(callable, *args):
+def assert_type_error(func, *args):
     try:
-        callable(*args)
+        func(*args)
     except TypeError:
         pass
     else:
-        assert False, "TypeError expected"
+        raise AssertionError("TypeError expected")
 
 
 # PyPy's interp2app gateway enforces these descriptor signatures.  The Rust

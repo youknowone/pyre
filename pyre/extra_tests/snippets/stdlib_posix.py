@@ -1,9 +1,12 @@
 import os
+import posix
 
 from testutils import assert_raises
 
 
-if hasattr(os, "ftruncate"):
+# Sandbox builds still expose a raising `ftruncate` stub, so the capability
+# bit is the check that tracks the real fd mutation.
+if "HAVE_FTRUNCATE" in posix._have_functions:
     class Index:
         def __init__(self, value):
             self.value = value
