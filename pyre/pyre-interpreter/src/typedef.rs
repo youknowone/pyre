@@ -9425,7 +9425,7 @@ fn init_function_type_common(ns: PyObjectRef) {
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
             "__annotations__",
         )?;
-        Ok(unsafe { crate::function::function_get_annotations(func) })
+        unsafe { crate::function::function_get_annotations(func) }
     });
     let ann_setter = make_builtin_function("__annotations__", |args| {
         let func = function_receiver(
@@ -10007,6 +10007,11 @@ fn init_function_type(ns: PyObjectRef) {
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
             "__annotate__",
         )?;
+        if unsafe { crate::function::function_has_builtin_code(function) } {
+            return Err(crate::PyError::attribute_error(
+                "builtin function has no attribute '__annotate__'",
+            ));
+        }
         Ok(unsafe { crate::function::function_get_annotate(function) })
     });
     let annotate_setter = make_builtin_function("__annotate__", |args| {

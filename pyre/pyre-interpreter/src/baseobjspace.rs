@@ -5930,12 +5930,17 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     // helper resolves both forms and stamps `w_ann`
                     // so `f.__annotations__ is f.__annotations__`
                     // identity holds across reads.
-                    return Ok(unsafe { crate::function::function_get_annotations(obj) });
+                    return unsafe { crate::function::function_get_annotations(obj) };
                 }
                 "__annotate__" => {
                     // PEP 649 `func_annotate` surface: the stored
                     // callable, or None when annotations were eager or
                     // absent.
+                    if unsafe { crate::function::function_has_builtin_code(obj) } {
+                        return Err(PyError::attribute_error(
+                            "builtin function has no attribute '__annotate__'",
+                        ));
+                    }
                     let annotate_fn =
                         unsafe { (*(obj as *mut crate::function::Function)).w_annotate };
                     if !annotate_fn.is_null() {

@@ -72,3 +72,23 @@ stringifying_globals = StringifyingGlobals(resolve_from_globals.__globals__)
 cloned_resolver = types.FunctionType(resolve_from_globals.__code__, stringifying_globals)
 assert cloned_resolver.__globals__ is stringifying_globals
 assert cloned_resolver() == "missing:unresolved_annotation_name"
+
+
+# Generated dataclass methods copy lazy class annotations.  A VALUE lookup
+# may raise NameError; the function getter must leave that error intact so
+# annotationlib can retry in FORWARDREF format.
+import annotationlib
+from dataclasses import dataclass
+
+
+@dataclass
+class DeferredDataclass:
+    value: DeferredValue
+
+
+deferred_init_annotations = annotationlib.get_annotations(
+    DeferredDataclass.__init__, format=annotationlib.Format.FORWARDREF
+)
+assert isinstance(deferred_init_annotations["value"], annotationlib.ForwardRef)
+assert deferred_init_annotations["value"].__forward_arg__ == "DeferredValue"
+assert DeferredDataclass.__doc__ == "DeferredDataclass(value: DeferredValue)"

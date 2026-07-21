@@ -561,6 +561,19 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
 }
 
+/// Whether this Function carrier wraps an interp-level BuiltinCode rather
+/// than Python bytecode.  PyPy uses FunctionWithFixedCode for these objects,
+/// but CPython-only function metadata such as PEP 649 `__annotate__` must not
+/// leak onto their public surface.
+#[inline]
+pub unsafe fn function_has_builtin_code(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let code = unsafe { (*(obj as *const Function)).code } as PyObjectRef;
+    !code.is_null() && unsafe { crate::gateway::is_builtin_code(code) }
+}
+
 /// Stamp a module-level builtin function's `__module__` with its
 /// containing module at install time — `MixedModule` registration sets
 /// `func.w_module = w(modulename)` for each interp-level definition.
@@ -1161,32 +1174,45 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 /// stamp the resulting dict, mirroring CPython 3.14
 /// `func_get_annotations`.
 ///
+/// Errors raised by the annotation thunk propagate without caching.  This is
+/// required by annotationlib's FORWARDREF path, which retries a VALUE
+/// `NameError` in a Stringifier globals environment.
+///
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
-pub unsafe fn function_get_annotations(obj: PyObjectRef) -> PyObjectRef {
+pub unsafe fn function_get_annotations(
+    obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if obj.is_null() {
-            return pyre_object::w_dict_new();
+            return Ok(pyre_object::w_dict_new());
         }
         let func = obj as *mut Function;
         let cached = (*func).w_ann;
         if !cached.is_null() {
-            return cached;
+            return Ok(cached);
         }
         let annotate_fn = (*func).w_annotate;
         if !annotate_fn.is_null() && !pyre_object::is_none(annotate_fn) {
-            let dict = crate::call_function(annotate_fn, &[pyre_object::w_int_new(1)]);
-            if !dict.is_null() {
-                function_write_barrier(obj);
-                (*func).w_ann = dict;
-                return dict;
+            let dict = crate::call::call_function_impl_result(
+                annotate_fn,
+                &[pyre_object::w_int_new(1)],
+            )?;
+            if !pyre_object::is_dict(dict) {
+                return Err(crate::PyError::type_error(format!(
+                    "__annotate__ returned non-dict of type '{}'",
+                    crate::baseobjspace::object_functionstr_type_name(dict),
+                )));
             }
+            function_write_barrier(obj);
+            (*func).w_ann = dict;
+            return Ok(dict);
         }
         let fresh = pyre_object::w_dict_new();
         function_write_barrier(obj);
         (*func).w_ann = fresh;
-        fresh
+        Ok(fresh)
     }
 }
 
