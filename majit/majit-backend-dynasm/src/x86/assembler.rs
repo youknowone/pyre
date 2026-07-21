@@ -6048,10 +6048,17 @@ impl<'a> Assembler386<'a> {
         self.pending_force_cell = Some(cell);
 
         // x86/assembler.py:2210-2222: store descr to jf_force_descr,
-        // zero jf_descr.
+        // zero jf_descr.  The 64-bit descr pointer needs a register to reach
+        // memory; route it through `X86_64_SCRATCH_REG` as
+        // assembler.py:2219-2223 does, never through an allocatable one.
+        // This runs just before the call it guards, and that call's arguments
+        // are still sitting in their allocated registers — EAX is in
+        // `ALL_CORE_REGS`, so materializing the pointer there would overwrite
+        // an argument.  R11 is reserved as the scratch and holds nothing live.
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         dynasm!(self.mc ; .arch x64
-            ; mov rax, QWORD descr_ptr
-            ; mov QWORD [rbp + JF_FORCE_DESCR_OFS], rax
+            ; mov Rq(scratch), QWORD descr_ptr
+            ; mov QWORD [rbp + JF_FORCE_DESCR_OFS], Rq(scratch)
             ; mov QWORD [rbp + JF_DESCR_OFS], 0
         );
     }
