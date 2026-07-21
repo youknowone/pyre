@@ -2072,6 +2072,26 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
     None
 }
 
+/// Byte offset of the 2-byte label operand inside an op's operand block,
+/// derived from the operand signature in `key` (the part after `/`, up to the
+/// `>` that introduces the result). Register operands (`i` / `r` / `f`) are one
+/// byte each, so the offset is the number of them preceding the `L`.
+///
+/// `None` when the op carries no label, or when an operand whose width this
+/// decode does not model (a var-list, a descr) sits in front of it.
+fn label_operand_offset(key: &str) -> Option<usize> {
+    let signature = key.split('/').nth(1)?.split('>').next()?;
+    let mut offset = 0usize;
+    for operand in signature.chars() {
+        match operand {
+            'L' => return Some(offset),
+            'i' | 'r' | 'f' => offset += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Does the `except` handler at `catch_target` flow back into this frame's loop
 /// (reaching a `jit_merge_point` back-edge), rather than returning out of the
 /// frame (`*_return`)?
@@ -2147,18 +2167,20 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
 /// clearing `last_exc_value`, so the read then finds no active exception and
 /// the walk aborts (`LastExcValueWithoutActiveException`) for the whole run.
 ///
-/// Labels are followed instead: `goto/L` continues at its target,
-/// `goto_if_not/iL` queues its taken arm and continues on the fall-through, and
-/// ops that end a path stop it — `catch_exception/L` because the handler it
-/// introduces installs a fresh exception, `raise`/`reraise` because they
-/// replace the current one, and the `*_return` family because the frame is
-/// gone. Targets are visited once, which bounds the walk across back edges.
+/// Labels are followed instead: `goto/L` continues at its target, a
+/// conditional branch queues its taken arm and continues on the fall-through,
+/// and ops that end a path stop it — `catch_exception/L` because the handler it
+/// introduces installs a fresh exception, `raise/r` because it replaces the
+/// current one, `unreachable/` because it has no successor, and the `*_return`
+/// family because the frame is gone. Targets are visited once, which bounds the
+/// walk across back edges.
 ///
-/// Both answers are recoverable: a spurious `false` clears an exception a later
-/// read wants, a spurious `true` leaves one live for a later
-/// `catch_exception/L` to reject. Each ends the walk in a typed
-/// [`DispatchError`] and falls back to the interpreter, so neither can produce
-/// a wrong result.
+/// The answer is an over-approximation of the reads: whenever the successor set
+/// is not decodable — `switch/id`, whose targets live in a descr this scan
+/// cannot read, or any other label-carrying op whose shape is not modelled —
+/// the exception is reported as read. Over-reporting only leaves a recorded
+/// exception standing for the caller, whereas under-reporting drops one a later
+/// read still needs.
 fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
     // Arms queued by a conditional branch, and the jump targets already
     // started from. Both stay empty on a straight-line answer.
@@ -2169,9 +2191,11 @@ fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
         let path_continues = match decode_op_at(code, pc) {
             None => false,
             Some(op) => match op.key {
-                "last_exception/>i" | "last_exc_value/>r" => return true,
-                "catch_exception/L" | "raise/r" | "reraise/" | "int_return/i" | "int_return/c"
-                | "ref_return/r" | "float_return/f" | "void_return/" => false,
+                // `opimpl_reraise` re-raises `last_exc_value`, so it reads the
+                // exception exactly like `last_exc_value/>r`.
+                "last_exception/>i" | "last_exc_value/>r" | "reraise/" => return true,
+                "catch_exception/L" | "raise/r" | "unreachable/" | "int_return/i"
+                | "int_return/c" | "ref_return/r" | "float_return/f" | "void_return/" => false,
                 "goto/L" => {
                     let target = read_label(code, &op, 0);
                     let fresh = !started.contains(&target);
@@ -2181,10 +2205,11 @@ fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
                     }
                     fresh
                 }
-                "goto_if_not/iL" => {
-                    // Operand layout `iL`: the label sits after the 1-byte
-                    // Int register.
-                    let target = read_label(code, &op, 1);
+                key if key.starts_with("goto_if") || key.contains("jump_if_ovf") => {
+                    let Some(offset) = label_operand_offset(key) else {
+                        return true;
+                    };
+                    let target = read_label(code, &op, offset);
                     if !started.contains(&target) {
                         started.push(target);
                         pending.push(target);
@@ -2192,7 +2217,10 @@ fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
                     pc = op.next_pc;
                     true
                 }
-                _ => {
+                key => {
+                    if key == "switch/id" || label_operand_offset(key).is_some() {
+                        return true;
+                    }
                     pc = op.next_pc;
                     true
                 }
