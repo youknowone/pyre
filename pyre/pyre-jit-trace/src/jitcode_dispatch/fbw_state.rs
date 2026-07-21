@@ -124,6 +124,29 @@ pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_BRIDGE_REC_INLINE` (default OFF) — on a plain root bridge walk,
+/// lift the bridge-trace decline that keeps an exact-integer arithmetic callee a
+/// single residual call, letting the bridge inline one self-recursive level
+/// exactly as a primary trace does: the call falls through to the self-recursive
+/// unroll gate and the multiframe seed instead of returning a residual.
+/// Experimental de-risk lever for bridge-served self-recursive inline;
+/// default-off pending A/B measurement and badness-floor gating.  The miscompile
+/// hazard it admits — a bridge-inlined int-binop callee's second virtual frame
+/// operand stack has no red bridge input, so an overflow/exception resume path
+/// can leave a NULL vable stack slot — is contained by the seed-success
+/// precondition plus the `n_parents == n_callees` snapshot valve fallbacks.
+/// `=1`/`true` turns it on.
+pub(crate) fn fbw_bridge_rec_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BRIDGE_REC_INLINE") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// Full-portal recursive-call cutover (`PYRE_FBW_REC_MUTUAL_CUTOVER`): at the
 /// inline-unroll cap, route a recursive callee (self OR mutual) through
 /// `get_assembler_token` → `compile_tmp_callback` (warmstate.py,

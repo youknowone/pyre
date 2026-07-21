@@ -1377,11 +1377,24 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // overflow path can then compile NULL vable stack slots into the bridge.
     // The primary loop still inlines the callee, and non-integer/user-
     // overridable calls continue through the ordinary inline/abort policy.
+    //
+    // Exception (`PYRE_FBW_BRIDGE_REC_INLINE`, default off): a plain ROOT bridge
+    // walk — no carrier resume, not an inline sub-walk, an empty framestack, and
+    // a live root portal — is uniform with a primary trace, so its second
+    // virtual frame is seeded and snapshot-covered exactly as the loop's is.
+    // There the decline is lifted: the call falls through to the self-recursive
+    // unroll gate and multiframe seed as if walked from a primary trace.
     if ctx.trace_ctx.is_bridge_trace
         && args_all_builtin_integer
         && fbw_callee_body_has_binary_op_residual(body.code, callee_descr_refs)
     {
-        return Ok(None);
+        let safe_root_bridge = !ctx.fbw_mode.carrier_resume
+            && !ctx.fbw_mode.inline_subwalk
+            && !ctx.fbw_mode.snapshot_sym.is_null()
+            && ctx.session.borrow().framestack.is_empty();
+        if !(fbw_bridge_rec_inline_enabled() && safe_root_bridge) {
+            return Ok(None);
+        }
     }
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
