@@ -39,7 +39,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
-    // #68/gap-10: inside an inlined-callee sub-walk, a scalar getfield_vable_r
+    // Inside an inlined-callee sub-walk, a scalar getfield_vable_r
     // of the callee's namespace(idx5)/pycode(idx1) must resolve to the callee's
     // compile-time `InlineCalleeConsts` whether the callee frame is unseeded
     // (strict path, handled by the `obj.is_none()` branch below) OR a seeded

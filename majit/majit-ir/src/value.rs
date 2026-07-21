@@ -1152,7 +1152,7 @@ mod tests {
     /// the typed `GreenKey([pc, profiled, code], [Int, Int, Ref])` and
     /// calling `get_uhash` — that equivalence is what lets the legacy
     /// `make_green_key` u64 flow and the typed marker path agree on the
-    /// same cell (issue #203 gap-7 hash unification).
+    /// same cell.
     #[test]
     fn test_pypyjit_greenkey_uhash_matches_get_uhash() {
         let cases: &[(usize, bool, u64)] = &[

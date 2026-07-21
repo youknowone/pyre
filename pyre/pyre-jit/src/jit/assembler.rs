@@ -1630,14 +1630,14 @@ fn dispatch_residual_call(
     // `check_forces_virtual_or_virtualizable()` /
     // `extraeffect == LoopInvariant`.
     //
-    // Parity #14 Slice C.2+C.3: `CallFlavor::Pure*` now flows through
+    // `CallFlavor::Pure*` flows through
     // the canonical `residual_call_*_canonical_via_target_with_effect_info`
     // catchalls below.  `effect_info_for_call_flavor(Pure*)`
     // (`flatten.rs`) returns the matching `EF_ELIDABLE_*` per
     // `call.py:292-299`'s 3-way pick, which lands on the
     // calldescr's `extra_info`; the canonical
     // `BC_RESIDUAL_CALL_*_{I,R,F}` walker
-    // (`majit-metainterp/src/pyjitpl/dispatch.rs` Slice C.1) reads
+    // (`majit-metainterp/src/pyjitpl/dispatch.rs`) reads
     // `effectinfo.check_is_elidable()` and routes the result through
     // `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115`.
     // ReleaseGil + Ref still panics per `resoperation.py:1243-1244 # no
@@ -2727,10 +2727,10 @@ mod tests {
 
     #[test]
     fn assemble_residual_call_irf_f_supports_pure_float_flavor() {
-        // Parity #14 Slice C.2+C.3: CallFlavor::Pure now routes through
+        // CallFlavor::Pure routes through
         // the canonical `BC_RESIDUAL_CALL_IRF_F` (=161) with the
         // calldescr carrying ElidableCanRaise.  The walker
-        // (`pyjitpl/dispatch.rs` Slice C.1) reads
+        // (`pyjitpl/dispatch.rs`) reads
         // `effectinfo.check_is_elidable()` and runs
         // `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2121`.
         let mut ssarepr = SSARepr::new("residual_call_irf_f");

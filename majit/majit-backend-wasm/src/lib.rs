@@ -598,7 +598,7 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
     assert!(frame_bytes >= 0);
     assert_eq!(frame_bytes as usize % std::mem::size_of::<isize>(), 0);
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
-    // Slice A1: collecting nursery allocation, matching rewrite.py's
+    // Collecting nursery allocation, matching rewrite.py's
     // `gen_malloc_nursery_varsize_frame`. The caller frame remains rooted at
     // the shadow-stack top during a collection; wasm reloads it from there
     // after this call, then this freshly allocated callee is pushed below its
@@ -1344,7 +1344,7 @@ fn transfer_call_assembler_target_activity(
 /// Mark a CA target whose callee guard was structurally declined.  The host
 /// deopt helper calls this only after `MetaInterp` recorded the exact guard in
 /// `declined_bridge_guards`; invalidating the callers forces a retrace whose
-/// admission check above restores the pre-Slice-A call path.
+/// admission check above restores the plain call path.
 pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
     unsafe {
         let Some(loop_) = (compiled_ptr as *const CompiledWasmLoop).as_ref() else {

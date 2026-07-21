@@ -3098,7 +3098,7 @@ where
                     Some(Value::Float(f64::from_bits(concrete as u64))),
                 );
             }
-            // ── BC_GETARRAYITEM_GC_I (Slice C.2) ──
+            // ── BC_GETARRAYITEM_GC_I ──
             //
             // RPython parity: pyjitpl.py:1183-1199 `_opimpl_getarrayitem_gc_any`:
             //
@@ -4786,7 +4786,7 @@ where
                     action => return action,
                 }
             }
-            // ── Typed return arms (Slice C.1) ──
+            // ── Typed return arms ──
             //
             // RPython parity: pyjitpl.py:1620-1646 opimpl_int_return /
             // ref_return / float_return / void_return → MetaInterp.finishframe.
@@ -6342,9 +6342,8 @@ where
                 };
                 self.set_int_reg(dst, Some(OpRef::ConstInt(value)), Some(value));
             }
-            // Parity #14 Slice C.5 retired the Pure half of this arm —
-            // every Pure call site now emits canonical BC_RESIDUAL_CALL_*_I
-            // (Slices C.2/C.3/C.4); the canonical walker reads the
+            // The Pure half of this arm is retired — every Pure call site
+            // emits canonical BC_RESIDUAL_CALL_*_I; the canonical walker reads the
             // calldescr's `check_is_elidable()` and routes through
             // `record_result_of_call_pure`.  Only BC_CALL_ASSEMBLER_INT
             // survives here.
@@ -6417,7 +6416,7 @@ where
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
             }
-            // Parity #14 Slice C.5 retired the Pure half — see the Int
+            // The Pure half is retired — see the Int
             // sibling above for the full rationale.
             // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
             // with tp == 'r'. See BC_CALL_ASSEMBLER_VOID for citation.
@@ -6487,7 +6486,7 @@ where
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
             }
-            // Parity #14 Slice C.5 retired the Pure half — see the Int
+            // The Pure half is retired — see the Int
             // sibling above for the full rationale.
             // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
             // with tp == 'f'. See BC_CALL_ASSEMBLER_VOID for citation.

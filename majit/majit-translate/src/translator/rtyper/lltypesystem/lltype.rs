@@ -1099,8 +1099,8 @@ impl _func {
 /// `_struct.clone()` → `_fields.clone()` (owned `Vec`), so two clones
 /// of the same prebuilt instance carry independent field storage and
 /// intra-class circular prebuilt instances (`a.b.back == a`) wire
-/// `back` to a stale snapshot rather than the in-progress `a`. See
-/// task #157 — this is the structural pre-requisite for
+/// `back` to a stale snapshot rather than the in-progress `a`. This
+/// is the structural pre-requisite for
 /// `InstanceRepr::convert_const_exact` byte-for-byte parity with
 /// `rclass.py:794-802`.
 ///
@@ -1150,7 +1150,7 @@ impl _struct {
 
 /// `_array.items` is wrapped in `Arc<Mutex<...>>` for the same shared-
 /// storage discipline as `_struct._fields` — see the `_struct` doc
-/// above for the parity rationale (task #157).
+/// above for the parity rationale.
 #[derive(Debug)]
 pub struct ArrayCore {
     pub TYPE: ArrayContainer,
@@ -3780,8 +3780,8 @@ impl _interior_ptr {
 
     /// Walks `_parent` by `_offsets` and returns the terminal element
     /// as an owned `LowLevelValue`. The shared-storage discipline of
-    /// `_struct._fields` and `_array.items` (`Arc<Mutex<...>>`, see
-    /// task #157) means owned clones still alias the underlying
+    /// `_struct._fields` and `_array.items` (`Arc<Mutex<...>>`) means
+    /// owned clones still alias the underlying
     /// container, so subsequent `_setattr` / `setitem` calls on the
     /// returned owned value mutate the same backing storage as the
     /// original `_parent` chain.

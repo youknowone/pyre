@@ -925,7 +925,7 @@ impl UnrollOptimizer {
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cpu = self.cpu.clone();
-        // #217 Slice 3 — Phase 2 (peeled-loop pass) runtime value seed.
+        // Phase 2 (peeled-loop pass) runtime value seed.
         // The remap is deferred until after the Phase 2 `TraceIterator`
         // builds its `_cache`, because both inputargs AND body op results
         // are reminted to fresh OpRefs (opencoder.py:259-267 / :399-401).

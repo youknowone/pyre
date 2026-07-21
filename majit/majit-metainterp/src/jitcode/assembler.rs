@@ -3771,12 +3771,12 @@ impl JitCodeBuilder {
         );
     }
 
-    /// Parity #14 Slice C.4: Pure sibling of
+    /// Pure sibling of
     /// [`Self::residual_call_int_canonical_via_target`].  Emits the
     /// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_I` opcode with the
     /// calldescr's `extra_info` set to `ELIDABLE_CAN_RAISE`
     /// (`call_descr::ELIDABLE_EFFECT_INFO`).  The canonical walker
-    /// (`majit-metainterp/src/pyjitpl/dispatch.rs` Slice C.1) reads
+    /// (`majit-metainterp/src/pyjitpl/dispatch.rs`) reads
     /// `effectinfo.check_is_elidable()` and routes the result through
     /// `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115`,
     /// retiring the legacy `BC_CALL_PURE_INT`-specific code path.
@@ -4072,7 +4072,7 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// Parity #14 Slice C.4: see
+    /// See
     /// [`Self::call_pure_int_canonical_via_target`] for the rationale.
     pub fn call_pure_ref_canonical_via_target(
         &mut self,
@@ -4185,7 +4185,7 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// Parity #14 Slice C.4: see
+    /// See
     /// [`Self::call_pure_int_canonical_via_target`] for the rationale.
     pub fn call_pure_float_canonical_via_target(
         &mut self,

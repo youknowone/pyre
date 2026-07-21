@@ -70,7 +70,7 @@ pub(crate) fn resolve_branch_target_through_trampoline(code: &[u8], target: usiz
     resume
 }
 
-/// #73 S3.1 (approach C): re-derive a branch guard's resume `other_target` from
+/// Re-derive a branch guard's resume `other_target` from
 /// the guard's OWN `-live-` BEFORE anchor `orgpc` (== ctx.live_before_jit_pc at
 /// the goto_if_not) + the recorded flavor (GuardTrue/GuardFalse), WITHOUT the
 /// runtime condbox — mirroring PyPy generate_guard(resumepc=orgpc) (pyjitpl.py:520),
@@ -109,7 +109,7 @@ pub(crate) fn decode_side_other_target(
     Ok(resolve_branch_target_through_trampoline(code, raw))
 }
 
-/// #73 S4 decode: if `carried` is a tagged branch `orgpc` (negative-space
+/// Decode: if `carried` is a tagged branch `orgpc` (negative-space
 /// encoding, [`majit_ir::resumedata::encode_branch_orgpc`]), expand it to the
 /// genuine not-taken-arm jitcode offset (`derived` / other_target) DIRECTLY:
 /// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor and
@@ -223,11 +223,11 @@ pub(crate) fn branch_resume_target_stack_depth(
     if pjc.code_ptr.is_null() {
         return None;
     }
-    // #73 family(ii) Slice B: source the not-taken-arm depth off the genuine
-    // jitcode `target` through the compile-time `depth_trivia` twin, retiring
-    // the `python_pc_for_jitcode_pc` inversion + runtime
+    // Source the not-taken-arm depth off the genuine jitcode `target` through
+    // the compile-time `depth_trivia` twin, retiring the
+    // `python_pc_for_jitcode_pc` inversion + runtime
     // `skip_python_trivia_forward` + static-liveness read. The twin is built for
-    // every drained real-code jitcode (codewriter.rs), and the Slice A census
+    // every drained real-code jitcode (codewriter.rs), and the encode census
     // (`PYRE_M73_ENCODE_AUDIT`) proved the empty-twin fallback is never reached
     // here (0 fallback trips / 162 programs; this reader 1181 hits, all
     // populated). The `debug_assert` re-certifies the invariant in test builds.
@@ -541,8 +541,8 @@ pub(crate) fn branch_resume_target_stack_depth_any_leg(
     if pjc.code_ptr.is_null() {
         return None;
     }
-    // #73 family(ii) Slice B: twin-sourced leg-independent depth, py_pc inversion
-    // retired (see `branch_resume_target_stack_depth`). Slice A census: this
+    // Twin-sourced leg-independent depth, py_pc inversion retired (see
+    // `branch_resume_target_stack_depth`). Encode census: this
     // reader 1178 hits, all populated, 0 fallback trips — including at the
     // `outer_jitcode_index==0` coincidence that reads `jitcodes[0]`.
     debug_assert!(

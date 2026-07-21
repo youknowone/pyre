@@ -8,8 +8,7 @@
 //! `pyjitpl.py:1640-1660`). This module is the sole production tracer:
 //! it consumes the codewriter-emitted jitcode bytes directly, executing
 //! as it records (`is_authoritative_executor`). The trait-driven
-//! `MIFrame::execute_opcode_step` interpret loop is retired
-//! (#203 gap 10 / #73 Phase 6).
+//! `MIFrame::execute_opcode_step` interpret loop is retired.
 //!
 //! Module layout vs. RPython: because this FBW walker has no single
 //! `rpython/jit/metainterp/` file counterpart (the file-for-file parity
@@ -868,7 +867,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// surfaces the `DispatchError` so a guard recorded without a resume
     /// snapshot aborts the walk instead of compiling.
     pub pending_guard_snapshot_error: Option<DispatchError>,
-    /// #73 PyPy-faithful kept-operand-stack snapshot: the walk-level
+    /// PyPy-faithful kept-operand-stack snapshot: the walk-level
     /// symbolic operand stack, indexed by ABSOLUTE operand-stack depth
     /// (slot `s`, `s in 0..vstack_depth`).  The Python operand stack is
     /// all-Ref (`W_Root`), so a single `Vec<OpRef>` (Ref bank) suffices.
@@ -1430,7 +1429,7 @@ pub enum DispatchError {
     /// `OpRef::ty()` invariant. The full-body walk surfaces a typed abort so
     /// the driver maps it to `TraceAction::Abort` and interpretation instead
     /// of panicking the tracer. Resuming such a guard needs the multi-frame
-    /// vable snapshot machinery (task #124).
+    /// vable snapshot machinery.
     GuardSnapshotVableUntyped { pc: usize },
     /// A guard capture had no decodable carried JitCode coordinate. Publishing
     /// a Python pc here would make a later side exit resume at a guessed
@@ -1496,7 +1495,7 @@ pub enum DispatchError {
     /// cyclic `*_push`/`*_pop` move, a truncated/under-sized color map, or a
     /// source that resolves to `OpRef::NONE` — i.e. when the deopt re-entry
     /// would otherwise restore a wrong value into a loop-carried slot
-    /// (task #124/#281 per-PC resume-value precision).  Plain `while` / `if`
+    /// (per-PC resume-value precision).  Plain `while` / `if`
     /// branches resume at depth 0 and are unaffected.  The walker surfaces a
     /// typed abort so the driver maps it to `TraceAction::Abort` →
     /// interpreter fallback (correct, untraced) instead of compiling a trace
@@ -1537,10 +1536,9 @@ pub enum DispatchError {
     /// callees via `push_inline_frame` + the `recursive-call-assembler` loop back-edge
     /// (`pyjitpl.rs` opimpl_recursive_call_assembler).  Surface a typed
     /// abort so the key interprets without JIT (`FBW_DECLINED_KEYS`) until
-    /// the walker itself covers loop-callee inlining (task #62, the Phase-6
-    /// convergence).
+    /// the walker itself covers loop-callee inlining.
     LoopBearingCalleeInlineUnsupported { pc: usize },
-    /// #57 (Finding #1): an in-flight FOR_ITER body executed a non-journalable
+    /// An in-flight FOR_ITER body executed a non-journalable
     /// in-place builtin-container mutation (`acc += delta` for an object-/float-
     /// strategy list, `bytearray`, `set`, `dict`, …).  The abort rollback cannot
     /// rewind it and a deliver re-run would double it, so the walk declines BEFORE
@@ -1781,7 +1779,7 @@ pub fn walk<Sym: WalkSym>(
             | DispatchOutcome::SwitchToBlackhole { .. }
             | DispatchOutcome::CloseLoop { .. }
             | DispatchOutcome::CompileTracePending { .. }
-            // gap-10: a multi-frame inlined callee reached its own loop
+            // A multi-frame inlined callee reached its own loop
             // header; propagate up to `try_walker_inline_user_call`, which
             // emits the recursive CALL_ASSEMBLER at the call boundary.
             | DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
@@ -3105,7 +3103,7 @@ pub fn bool_box_truth_reset() {
 /// non-elidable `residual_call_*` (`store_subscr_fn` /
 /// `set_current_exception` / etc.), the helper is never invoked → heap
 /// mutation never happens → next read derefs stale container → SIGBUS
-/// (M4 walker unactivated taxonomy: 5 STORE_SUBSCR-hot benches).  The
+/// (5 STORE_SUBSCR-hot benches).  The
 /// orthodox fix is to widen this function across `Call*` /
 /// `CallLoopinvariant*` / `CallMayForce*` shapes, mirroring PyPy's
 /// `_opimpl_residual_call*` which concrete-executes *every* residual
@@ -3120,8 +3118,7 @@ pub fn bool_box_truth_reset() {
 ///   * `CallPure*` is excluded — that's [`try_fold_pure_call_via_executor`]'s
 ///     job.
 ///   * `CallReleaseGil*` / `CallAssembler*` are excluded from THIS
-///     function's direct opcode set, but for distinct reasons (sub-slice 4
-///     audit outcome):
+///     function's direct opcode set, but for distinct reasons:
 ///     - `CallReleaseGil*` IS concrete-executed — `do_residual_call`
 ///       (`pyjitpl.py:2019-2044`) runs step 2 with `opnum1 =
 ///       CALL_MAY_FORCE_*` for the *whole* forces branch, and release-gil
@@ -3188,7 +3185,7 @@ pub fn bool_box_truth_reset() {
 ///   (pyjitpl.py:3365 ABORT_ESCAPE parity, see the token-protocol bullet
 ///   above).
 ///
-/// **Wire status** (Task #390 sub-slice 2.3): invoked from all three
+/// **Wire status**: invoked from all three
 /// dispatch entry points (`dispatch_residual_call_iRd_kind`,
 /// `dispatch_residual_call_iIRd_kind`, `dispatch_residual_call_iIRFd_kind`)
 /// alongside [`try_fold_pure_call_via_executor`].  The may-force /
@@ -3518,7 +3515,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         .iter()
         .map(|&(dst, v)| (dst as u32, v))
         .collect();
-    // #73 mirror-sourced kept operand-stack slots: at a branch guard the
+    // Mirror-sourced kept operand-stack slots: at a branch guard the
     // not-taken arm preserves the operand-stack bottom, so the live walk-level
     // box mirror (`ctx.vstack_boxes`, indexed by absolute operand-stack depth)
     // holds the exact kept value for resume operand slot `s`.  This replaces
@@ -4848,10 +4845,10 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // branch, so it is executed identically to a `CALL_MAY_FORCE_*` — on
     // the **original** `allboxes` (`allboxes[0]` is the wrapper funcbox;
     // the recorded op above used the re-shaped `[savebox, funcbox_real,
-    // …]`).  Task #390 sub-slice 4: this removes the asymmetry where
-    // release-gil was the only forces sub-case that recorded without
-    // executing — the same un-executed-side-effect SIGBUS class sub-slice
-    // 3 closed for the may-force branch.
+    // …]`).  This removes the asymmetry where release-gil was the only
+    // forces sub-case that recorded without executing — the same
+    // un-executed-side-effect SIGBUS class already closed for the
+    // may-force branch.
     // `try_execute_residual_call_via_executor` self-gates (authoritative-
     // executor flag, const-funcbox, fnaddr ≥47-bit sanity) and degrades to
     // recording-only on decline; on success it stamps `recorded` with the
@@ -6884,7 +6881,7 @@ fn handle<Sym: WalkSym>(
                 };
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
-                // #73 mirror-sourced kept-stack compile: a kept-stack guard
+                // Mirror-sourced kept-stack compile: a kept-stack guard
                 // COMPILES whenever the walk-level operand-stack mirror
                 // (`ctx.vstack_boxes`) covers EVERY kept resume slot
                 // `0..resume_depth` with a non-NONE, non-NULL box — i.e. the
@@ -7054,7 +7051,7 @@ fn handle<Sym: WalkSym>(
                     // `(dst, src)` trampoline against the guard-pc register file
                     // (`resolved_recovered`) — verified byte-exact against the
                     // declined-interpreter oracle across the 599-program
-                    // adversarial corpus (#73 kept-stack census, incl. the
+                    // adversarial corpus (kept-stack census, incl. the
                     // heap-int short-circuit / conditional-expression repros).
                     // The hazard remains only for an UNDERMODELED walk (invalid
                     // mirror: inline sub-walk / Unmodeled opcode), where those
@@ -8236,7 +8233,7 @@ fn handle<Sym: WalkSym>(
                 Some(Value::Int(v)) => v as usize,
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
-            // gap-10 (PYRE_FBW_LOOP_CALLEE_CA): an inlined callee's own loop
+            // `PYRE_FBW_LOOP_CALLEE_CA`: an inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop
             // token EVEN WHEN its pycode green resolves.  nbody's `advance` has a
             // const-Ref code_green (resolves) plus an existing loop token, so the
@@ -8318,7 +8315,7 @@ fn handle<Sym: WalkSym>(
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
                 _ => {
-                    // gap-10 (PYRE_FBW_LOOP_CALLEE_CA, default-ON): inside a
+                    // `PYRE_FBW_LOOP_CALLEE_CA` (default-ON): inside a
                     // multi-frame inline sub-walk the callee's own
                     // `jit_merge_point` (its loop header) carries a pycode green
                     // with no live Ref shadow, so this resolution fails and the

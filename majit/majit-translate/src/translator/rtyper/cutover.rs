@@ -1439,7 +1439,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // and proceed; every other key repr (str, instance) hits this
         // TyperError instead of silently miscompiling dict getitem/contains
         // to pointer-identity comparison. Skip-classify until the
-        // call-based keyeq branch is ported (#140 DictRepr epic, Slice 2+).
+        // call-based keyeq branch is ported (#140 DictRepr epic).
         || msg.contains("dict key eq function not wired")
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through

@@ -1471,8 +1471,8 @@ impl TraceCtx {
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
     /// history.py:314 `ConstPtr.value` is inline on the Box; pyre
-    /// mirrors with `OpRef::ConstPtr(GcRef)`. The Slice 7b
-    /// op-graph walker forwards these slots across minor collection.
+    /// mirrors with `OpRef::ConstPtr(GcRef)`. The op-graph walker
+    /// forwards these slots across minor collection.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
         OpRef::const_ptr(majit_ir::GcRef(value as usize))
     }

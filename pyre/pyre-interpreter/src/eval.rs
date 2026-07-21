@@ -1450,7 +1450,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
 
 /// Execute a frame — pure interpreter, no JIT.
 ///
-/// Crate-private since Slice C.3 (PyFrame Heap-Allocation Epic): canonical
+/// Crate-private: the canonical
 /// surface is `PyFrame::run` / `PyFrame::execute_frame` (PyPy
 /// `pyframe.py:268 run` / `pyframe.py:331 execute_frame`).  Retained as a
 /// free function because pyre's JIT override mechanism (call.rs

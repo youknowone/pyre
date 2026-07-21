@@ -78,7 +78,7 @@ mod find_dispatch_loop_body_tests {
 /// suppression set so subsequent `x` references in the same arm are NOT
 /// reported as caller-locals (the local shadows the caller scope).
 /// Scope tracking is intentionally flat — over-suppression in nested
-/// blocks is acceptable since the consumer (slice 2) just gets fewer
+/// blocks is acceptable since the consumer just gets fewer
 /// args, which is safe.  Under-suppression (let in inner block missed
 /// by outer scope) is fine — sub-Lowerer ignores extra portal inputs.
 /// Collect every identifier the pattern would bind, recursing into

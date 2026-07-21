@@ -4792,7 +4792,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[continues])?;
 
     // The continue guard establishes `continues == 1` on the trace path. Keep
-    // Slice-1's wrapping IntAdd and live-iterator SetfieldGc updates intact.
+    // the wrapping IntAdd and live-iterator SetfieldGc updates intact.
     let delta = ctx.trace_ctx.record_op(OpCode::IntMul, &[step, continues]);
     ctx.trace_ctx.set_opref_concrete(
         delta,
@@ -5036,8 +5036,8 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         .replace_box(src_len_box, src_len_const);
 
     // items[start + j] = source.items[j] for j in 0..slice_len, through the
-    // int_items blocks (`list_int_items_block_descr`, matching slice-1's
-    // `emit_typed_list_inline` `SetfieldGc`), so a virtual source temp's
+    // int_items blocks (`list_int_items_block_descr`, matching
+    // `emit_typed_list_inline`'s `SetfieldGc`), so a virtual source temp's
     // `SetarrayitemGc` stores fold against these reads.
     let src_block = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,

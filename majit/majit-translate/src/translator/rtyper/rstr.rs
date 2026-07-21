@@ -27,12 +27,11 @@
 //!   / `rtype_add` / `rtype_getitem`, `rtype_int` / `rtype_float`,
 //!   etc., rstr.py:119-449 + 651-737). The struct skeletons and
 //!   module-global singletons land here today; method bodies arrive
-//!   slice-by-slice — see the epic plan in
-//!   `~/.claude/projects/.../memory/item3_abstractstringrepr_epic_plan.md`.
+//!   incrementally.
 //! * `LLHelpers.ll_*` helper graphs (`ll_str2int` / `ll_str2float`,
 //!   `ll_startswith` / `ll_endswith` / `ll_find` / `ll_strip` /
 //!   `ll_lower` / `ll_upper` / `ll_split` / `ll_join` / `ll_replace`)
-//!   live in `lltypesystem/rstr.rs` and land slice-by-slice.
+//!   live in `lltypesystem/rstr.rs` and land incrementally.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -148,11 +147,11 @@ impl AbstractLLHelpers {
 ///
 /// The `basetype` / `base` / `CACHE` attributes only matter for
 /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`)
-/// which lands in a follow-up slice. Today the struct just carries
+/// which lands later. Today the struct just carries
 /// `lowleveltype = Ptr(STR)` so [`super::rmodel::rtyper_makerepr`]
 /// can return the singleton when `SomeString` shows up. Per-method
 /// `rtype_*` calls fall through `Repr`'s default `MissingRTypeOperation`
-/// stubs until each slice 4-12 method body lands.
+/// stubs until each method body lands.
 #[derive(Debug)]
 pub struct AbstractStringRepr {
     state: ReprState,
@@ -269,7 +268,7 @@ impl Repr for StringRepr {
     }
 
     /// RPython `AbstractStringRepr.rtype_method_*` dispatch table
-    /// (`rstr.py:134-449`). Pyre lands methods slice-by-slice; today
+    /// (`rstr.py:134-449`). Pyre lands methods incrementally; today
     /// `startswith` (rstr.py:134-145) and `endswith` (rstr.py:147-158)
     /// lower.
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
@@ -563,7 +562,7 @@ impl Repr for UnicodeRepr {
 
     /// RPython `AbstractUnicodeRepr.rtype_method_*` dispatch table
     /// (`rstr.py:134-449` inherited via `AbstractUnicodeRepr(AbstractStringRepr)`).
-    /// Pyre lands methods slice-by-slice; today `startswith` and
+    /// Pyre lands methods incrementally; today `startswith` and
     /// `endswith` lower with helper-graph identities
     /// `ll_unicode_startswith` / `ll_unicode_endswith` (Ptr(UNICODE)).
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
@@ -2457,7 +2456,7 @@ fn rtype_abstract_string_method_replace(
 
 // ____________________________________________________________
 // AbstractStringRepr / AbstractUnicodeRepr method dispatch
-// (`rstr.py:134-449`). Pyre lands the methods slice-by-slice; today
+// (`rstr.py:134-449`). Pyre lands the methods incrementally; today
 // only `startswith` (rstr.py:134-145) lowers in the
 // `args_r[1]` is-a-String/Unicode branch. The Char-side branch
 // (`ll_startswith_char` for char-keyed startswith) is deferred since

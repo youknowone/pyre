@@ -57,7 +57,7 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// `GUARD_NOT_FORCED` from the forces branch (`pyjitpl.py:2079`)
 /// should fire.
 ///
-/// ★ Task #390 sub-slice 1 — non-elidable concrete-execute inventory.
+/// Non-elidable concrete-execute inventory.
 ///
 /// PyPy `do_residual_call` (pyjitpl.py:1995-2126) concrete-executes
 /// the helper at trace-record time across the **forces** /
@@ -77,14 +77,14 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// skipped via the two narrow branches above) before the trace op
 /// hits the recorder.
 ///
-/// Per-branch concrete-execute status (sub-slices 3 + 4 landed — every
-/// non-pure residual call now concrete-executes during the walk, matching
+/// Per-branch concrete-execute status (every non-pure residual call
+/// concrete-executes during the walk, matching
 /// PyPy `do_residual_call` which runs `executor.execute_varargs` for the
 /// whole forces branch regardless of EI):
 ///
 /// | EI branch | Selected op | Pyre walker concrete-execute |
 /// |---|---|---|
-/// | `is_call_release_gil()` | (early-routed to [`direct_call_release_gil`], records `CALL_RELEASE_GIL_*`) | executed as `CallMayForce*` on the **original** `allboxes` via [`try_execute_residual_call_via_executor`] (sub-slice 4) |
+/// | `is_call_release_gil()` | (early-routed to [`direct_call_release_gil`], records `CALL_RELEASE_GIL_*`) | executed as `CallMayForce*` on the **original** `allboxes` via [`try_execute_residual_call_via_executor`] |
 /// | `check_forces_virtual_or_virtualizable()` | `CallMayForce*` + `GuardNotForced` | executed via [`try_execute_residual_call_via_executor`] (active vable bracketed by the token protocol) |
 /// | `extraeffect == LoopInvariant` | `CallLoopinvariant*` | executed on cache miss; [`loopinvariant_lookup`] reuses the cached OpRef on hit (no execute, no record) |
 /// | `check_is_elidable()` | `CallPure*` | executed + cached via [`try_fold_pure_call_via_executor`] (elidable_cannot_raise only — see its caveats) |
@@ -99,11 +99,6 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// self-gates and degrades to recording-only when a precondition fails
 /// (non-authoritative walk, non-const funcbox, unpatched symbolic fnaddr).
 ///
-/// **Priority order for sub-slice 2 (widen):** Call* (default — the
-/// store_subscr_fn / set_current_exception class, smallest blast
-/// radius, root cause of M4 SIGBUS) → CallLoopinvariant* (`pure=False
-/// exc=False` is safest) → CallMayForce* (riskiest — force-virtual
-/// audit precondition).
 pub(crate) fn select_residual_call_opcode(
     ei: &majit_ir::EffectInfo,
     dst_bank: char,
@@ -633,12 +628,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         Some(majit_ir::Value::Int(addr)) => addr,
         _ => return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic)),
     };
-    // Sub-slice 4 safety gate — reject `symbolic_fnaddr_for_path`
+    // Safety gate — reject `symbolic_fnaddr_for_path`
     // placeholder values that escaped runtime patching.  Pyre's
     // codewriter mints a 64-bit hash of the helper's `CallPath` when
     // the build-time `pyre_interpreter::jit_trace_fnaddrs()` snapshot
-    // has no entry for it (`majit-translate/src/codewriter/call.rs:
-    // 4926 symbolic_fnaddr_for_path`).  `runtime_fnaddr_patch` rewrites
+    // has no entry for it (`symbolic_fnaddr_for_path` in
+    // `majit-translate/src/codewriter/call.rs`).  `runtime_fnaddr_patch` rewrites
     // these to real runtime addresses only when the path appears in
     // both the build-time and runtime registries; helpers absent from
     // the runtime registry retain the hash and dereferencing it as a
@@ -2189,17 +2184,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
         // pyjitpl.py:1346/1349/1354 `_opimpl_residual_call{1,2,3}` parity
-        // for the non-elidable shapes (Task #390 sub-slice 3).  PyPy
+        // for the non-elidable shapes.  PyPy
         // concrete-executes EVERY residual call regardless of EI — the
         // `exc` flag only selects the *guard* shape downstream
         // (`handle_possible_exception` → `GUARD_EXCEPTION` vs
         // `GUARD_NO_EXCEPTION`), not whether the helper runs.  Without
         // this, walker-recorded non-elidable helpers
         // (`store_subscr_fn`, `set_current_exception`, …) would skip
-        // their heap mutation because `eval.rs:3285-3308`'s walker-skip
+        // their heap mutation because `eval.rs`'s walker-skip
         // path bypasses `execute_opcode_step` → SIGBUS on the next read
-        // of the un-mutated container (M4 walker unactivated taxonomy).
-        // Task #390 sub-slice 4: PyPy-orthodox activation.  PyPy's
+        // of the un-mutated container.
+        // PyPy-orthodox activation.  PyPy's
         // `_opimpl_residual_call*` concrete-executes EVERY residual
         // call regardless of EI; the `exc` flag only selects the
         // post-call guard shape (`GUARD_EXCEPTION` vs `GUARD_NO_EXCEPTION`)
@@ -2991,9 +2986,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
-        // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
-        // — see `dispatch_residual_call_iRd_kind` for the full citation.
-        // Task #390 sub-slice 4: PyPy-orthodox activation.  PyPy's
+        // Non-elidable concrete-execute parity — see
+        // `dispatch_residual_call_iRd_kind` for the full citation.
+        // PyPy-orthodox activation.  PyPy's
         // `_opimpl_residual_call*` concrete-executes EVERY residual
         // call regardless of EI; the `exc` flag only selects the
         // post-call guard shape (`GUARD_EXCEPTION` vs `GUARD_NO_EXCEPTION`)
@@ -3211,9 +3206,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // `result_type() == Void` arm and deferred (#61), so the compiled
         // loop's re-run does not double-apply the store.
 
-        // Non-elidable concrete-execute parity (Task #390 sub-slice 3)
-        // — see `dispatch_residual_call_iRd_kind` for the full citation.
-        // Task #390 sub-slice 4: PyPy-orthodox activation.  PyPy's
+        // Non-elidable concrete-execute parity — see
+        // `dispatch_residual_call_iRd_kind` for the full citation.
+        // PyPy-orthodox activation.  PyPy's
         // `_opimpl_residual_call*` concrete-executes EVERY residual
         // call regardless of EI; the `exc` flag only selects the
         // post-call guard shape (`GUARD_EXCEPTION` vs `GUARD_NO_EXCEPTION`)

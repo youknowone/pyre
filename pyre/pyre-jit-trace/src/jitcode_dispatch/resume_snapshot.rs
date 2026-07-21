@@ -191,7 +191,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // box (including the identity at `[-1]`) to carry `OpRef::ty()`; a
     // deeper inlined / recursive frame can leave the identity untyped.
     // Surface a typed abort rather than tripping the
-    // invariant panic (the multi-frame vable snapshot is task #124).
+    // invariant panic (the multi-frame vable snapshot is unported).
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
@@ -729,8 +729,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         .payload
                         .resume_marker_for_jitcode_pc(op_pc)
                 };
-                // #73 S2: a
-                // specialization guard (`GuardValue`/`GuardClass`) sources its
+                // A specialization guard (`GuardValue`/`GuardClass`) sources its
                 // resume coordinate from the walk cursor's per-op `-live-`
                 // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py:198`)
                 // directly, dropping the py_pc-keyed block-head lookup.
@@ -740,8 +739,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // decode identically for every consumer (banks + bridge maps +
                 // const refill) where the anchor coincides, and flags the
                 // divergent minority for the check.py output-equality gate.
-                // #73 S3.5: a depth-0
-                // branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
+                // A depth-0 branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
                 // arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
                 // `orgpc`) TAGGED into the negative space of the word plus the
                 // guard flavor, instead of the py_pc-keyed block-head `marker`.
@@ -840,7 +838,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
             } else {
-                // #73 S5 p3-s1: the remaining nonbranch guards (outside the
+                // The remaining nonbranch guards (outside the
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
                 // twin at the guard's own `op_pc`.

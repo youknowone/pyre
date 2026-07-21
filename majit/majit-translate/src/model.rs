@@ -1161,7 +1161,7 @@ pub enum OpKind {
     /// fully-qualified path (`["module_path", "STATIC_NAME"]`)
     /// matching the upstream lookup key shape.
     ///
-    /// Slice C — `value` carries the literal-evaluated initializer
+    /// `value` carries the literal-evaluated initializer
     /// when `extract_static_decls` could fold the RHS to a
     /// `ConstValue` (bool/int/float/string literals, including the
     /// `-LIT` unary-neg shape and the `thread_local!` `const { LIT }`
@@ -4892,8 +4892,7 @@ impl FunctionGraph {
         // back through the predecessor chain to add `cond` as a
         // `block.inputargs` entry restores the
         // `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
-        // shape that the AST walker doesn't produce eagerly (task #91
-        // prereq).
+        // shape that the AST walker doesn't produce eagerly.
         for arg in &outputargs {
             if let LinkArg::Value(var) = arg {
                 self.ensure_variable_at_block(block, var);
@@ -5000,7 +4999,7 @@ impl FunctionGraph {
     /// `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
     /// populates `block.inputargs` with all carry-through Variables at
     /// block entry by walking top-down.  Pyre's AST walker doesn't do
-    /// this eagerly (task #91), so when a framestate-driven merge
+    /// this eagerly, so when a framestate-driven merge
     /// (`create_block_from_framestate`) surfaces an ancestor-defined
     /// Variable in `block.inputargs`, this helper backfills the
     /// predecessor chain bottom-up to the same final graph shape.
@@ -8016,7 +8015,7 @@ mod tests {
         assert_eq!(out, vec![LinkArg::Value(v_self)]);
     }
 
-    // ── annotator-monomorphization Slice C2 — CallTarget::Method ──
+    // ── annotator-monomorphization — CallTarget::Method ──
     // transient ClassDefKey transport invariants.
 
     #[test]

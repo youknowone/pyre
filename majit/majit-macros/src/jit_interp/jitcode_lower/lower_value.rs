@@ -761,7 +761,7 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ElidableInt
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
-                    // Parity #14 Slice C.4 + Parity #20: see the stmt-form
+                    // See the stmt-form
                     // ElidableInt arm earlier in this file for the
                     // canonical migration rationale and the 3-way
                     // `_canraise(op)` pick from `call.py:292-299`.

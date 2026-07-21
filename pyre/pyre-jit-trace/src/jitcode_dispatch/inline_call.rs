@@ -971,8 +971,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
-/// gap-10 walker mirror of `opimpl_recursive_call_assembler`
-/// (`metainterp.rs:768`): a multi-frame inlined callee sub-walk reached its
+/// Walker mirror of `opimpl_recursive_call_assembler`
+/// (`metainterp.rs`): a multi-frame inlined callee sub-walk reached its
 /// OWN loop header (surfaced as `SubLoopCalleeCallAssembler`) and a compiled
 /// loop token already exists for it. The inlined prologue already populated
 /// the seeded virtual callee frame's locals via `setarrayitem_vable`, so this
@@ -1109,7 +1109,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 
 /// `PYRE_FBW_VABLE_SCALAR_CA` emission seam (S0 scaffolding).
 ///
-/// Emits the gap-10 loop-callee CALL_ASSEMBLER when the vable-scalar mode is
+/// Emits the loop-callee CALL_ASSEMBLER when the vable-scalar mode is
 /// on. S0: produces the identical red-only `[callee_frame, callee_ec]` CA as
 /// the default path, so flag-ON is byte-identical to flag-OFF. S2 replaces the
 /// body with `call_assembler_with_vable_expansion` — passing the callee's
@@ -1656,7 +1656,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // an un-seedable strict shape never loses its inline.  Every bail below
     // precedes any IR recording, so a strict fall-through records no dead op.
     //
-    // gap-10 (`PYRE_FBW_LOOP_CALLEE_CA`): the seeded virtual callee frame /
+    // `PYRE_FBW_LOOP_CALLEE_CA`: the seeded virtual callee frame /
     // shared ec / local count are hoisted so the sub-walk return site can
     // emit a `CALL_ASSEMBLER` into the callee loop token when the sub-walk
     // surfaces `SubLoopCalleeCallAssembler` (the callee reached its own loop
@@ -1669,7 +1669,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // way, so its in-callee guards route through the multi-frame snapshot.  A
     // deeper strict callee (`inline_depth >= fbw_max_multiframe_depth()`) keeps the
     // single-frame collapse — a 3-frame snapshot the resume path is sound for
-    // only one paused caller frame (task #126 multiframe depth).
+    // only one paused caller frame.
     let strict_seed = strict_inlinable && inline_depth < fbw_max_multiframe_depth();
     // True once the callee frame reds are actually seeded (all preconditions
     // below met).  For a strict callee this gates routing its guards through the
@@ -1785,7 +1785,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             callee_regs_r[ec_reg as usize] = callee_ec;
             callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
 
-            // gap-10: retain for a possible `SubLoopCalleeCallAssembler` emit.
+            // Retain for a possible `SubLoopCalleeCallAssembler` emit.
             ca_callee_frame = callee_frame;
             ca_callee_ec = callee_ec;
             ca_nlocals = nlocals;
@@ -1875,7 +1875,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     } else {
         // Single-frame collapse (resume at the CALL boundary, re-execute the
         // whole call on deopt): a nested strict callee
-        // (`inline_depth >= fbw_max_multiframe_depth()`, task #126), an un-seedable
+        // (`inline_depth >= fbw_max_multiframe_depth()`), an un-seedable
         // strict callee, or a callee neither seed served.  Sound for a pure
         // value-returning leaf (idempotent re-execute) and for a nested
         // straight-line callee (its pre-multiframe behavior).

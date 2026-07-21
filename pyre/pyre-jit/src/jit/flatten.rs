@@ -3668,11 +3668,11 @@ where
 }
 
 /// Construct the BINARY_OP-family `residual_call_ir_r` Insn from
-/// raw register indices.  Production codewriter callsite (Slice
-/// micro-slice 3) bypasses the SpaceOperation→Insn round-trip and
+/// raw register indices.  The production codewriter callsite bypasses
+/// the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(binary_op_fn_idx, ...)` + matching graph
-/// dual-write at codewriter.rs:5335-5378.
+/// dual-write in codewriter.rs.
 ///
 /// Mirrors [`lower_binary_op_hlop_to_insn`]'s output shape: the
 /// post-walker dispatcher and the walker-time direct push both produce
@@ -4937,12 +4937,12 @@ fn build_residual_call_r_i_insn_from_operands(
 /// Single HLOp opname `setitem`.  Returns `None` for non-`setitem`
 /// opnames or non-void-result HLOps.
 ///
-/// SETITEM retirement: same per-family
-/// pattern as micro-slices 3-5.  Differences vs the prior shapes:
+/// SETITEM retirement: same per-family pattern as the earlier
+/// families.  Differences vs the prior shapes:
 ///   * void Insn (no result Register).
 ///   * 3-element ListR (vs 2 for BINARY_OP/COMPARE_OP, 1 for BOOL).
 ///   * MayForce flavor (matches the prior dual-write at
-///     codewriter.rs:5274).
+///     codewriter.rs).
 pub fn lower_setitem_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -8902,8 +8902,7 @@ mod tests {
         // the Insn produced by feeding the equivalent dual-write
         // `residual_call_ir_r` SpaceOperation through
         // `flatten_op_to_insn`.  This is the foundational invariant
-        // for retiring the dual-write + inline emit in micro-slice 3
-        // of the epic.
+        // for retiring the dual-write + inline emit.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);

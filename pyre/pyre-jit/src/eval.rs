@@ -4599,8 +4599,8 @@ fn unpack_merge_point_jit(
 /// each residual (`self.next`, `items.append`) concretely on the shared reds,
 /// so this advances the live iterator and grows the live list in place; the
 /// Rust caller loop then resumes from the advanced state (cooperative drain).
-/// Slice-1 discards the recorded trace — compiled-loop reuse and blackhole
-/// entry are later activation slices.
+/// The recorded trace is discarded — compiled-loop reuse and blackhole
+/// entry are not wired.
 fn drive_unpack_iterable_trace(
     green_key: u64,
     greenkey_raw: pyre_object::PyObjectRef,

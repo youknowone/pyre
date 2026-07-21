@@ -774,7 +774,7 @@ impl<'a> ByteTraceIter<'a> {
             }
             TAGCONSTPTR => {
                 // opencoder.py:328-329 ConstPtr(self.trace._refs[v]) —
-                // history.py:314 `ConstPtr.value` inline. Slice 7b
+                // history.py:314 `ConstPtr.value` inline. The
                 // op-graph walker forwards `OpRef::ConstPtr(GcRef)`
                 // slots across minor collection.
                 let addr = self.trace._refs[v as usize];
@@ -3402,7 +3402,7 @@ mod tests {
         assert!(it.done());
     }
 
-    /// M4 (post-Slice-7b): all `TAG{INT,CONSTPTR,CONSTOTHER}` args mint
+    /// All `TAG{INT,CONSTPTR,CONSTOTHER}` args mint
     /// inline-Const OpRefs (`history.py:227/268/314 Const{Int,Float,Ptr}.value`
     /// are inline) so the byte iterator no longer requires a
     /// ConstantPool to decode constant arguments. The op-graph GC walker

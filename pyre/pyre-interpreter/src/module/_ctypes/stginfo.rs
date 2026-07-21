@@ -210,7 +210,7 @@ pub(super) fn stginfo_set_pointer_type(info: PyObjectRef, ty: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem_str(dict_of(info), K_POINTER_TYPE, ty) };
 }
 
-// ── field size/align with the slice-1 `_type_` fallback ────────────────
+// ── field size/align with the `_type_` fallback ───────────────────────
 
 /// Byte size of a ctypes type `t`: its `StgInfo` size, else the simple-type
 /// size derived from `_type_`.

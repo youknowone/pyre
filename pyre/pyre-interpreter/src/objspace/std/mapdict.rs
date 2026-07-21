@@ -264,7 +264,7 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 ///
 /// # Safety
 /// `obj` must be a live `W_ObjectObject` (the caller guards with
-/// `is_instance`). The instance is an immortal `Box` in Slice C, so the raw
+/// `is_instance`). The instance is an immortal `Box`, so the raw
 /// pointer is stable across this call.
 pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) {
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
@@ -1717,7 +1717,7 @@ unsafe fn store_attr_slowpath(
 //
 // The map-node layer reads and writes attribute values through this trait.
 // PyPy mixes `MapdictStorageMixin` into the instance class; pyre's instance
-// (W_ObjectObject) implements this trait instead (Slice 2). Storage holds
+// (W_ObjectObject) implements this trait instead. Storage holds
 // `PyObjectRef`, so PyPy's `erase_item`/`unerase_item` (rerased boxing of a
 // W_Root into the untyped storage list) are the identity here.
 
@@ -3046,8 +3046,8 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
 /// mapdict.py:1123-1279 `MapDictStrategy` — the dict strategy a user instance's
 /// `__dict__` adopts. `dstorage` erases the backing `W_ObjectObject`
 /// (mapdict.py:1502), so every routed get/set/del/iter funnels into the
-/// instance's mapdict map+storage. Unwired in Slice C — the C5 `_obj_getdict`
-/// flip installs it; defined now so that flip is a one-line strategy swap.
+/// instance's mapdict map+storage. Unwired — the `_obj_getdict` flip
+/// installs it; defined now so that flip is a one-line strategy swap.
 pub struct MapDictStrategy;
 
 /// `space.fromcache(MapDictStrategy)` process-wide singleton — same `&'static`
@@ -4206,7 +4206,7 @@ mod tests {
     #[test]
     fn instance_dict_wrapper_in_special_slot_not_instance_dict() {
         use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
-        // Phase G slice 2: an instance's `__dict__` wrapper is stored in the
+        // An instance's `__dict__` wrapper is stored in the
         // mapdict "dict" SPECIAL slot (mapdict.py:826-840 _obj_getdict), not in
         // the INSTANCE_DICT side table. Repeated access returns the same wrapper,
         // and the SPECIAL slot is excluded from the `__dict__` view.

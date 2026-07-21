@@ -3149,7 +3149,7 @@ impl InstanceRepr {
         // Pyre clones `result` into the cache; both the cached clone
         // and the init target (`local`, the moved original) share
         // `_struct._fields` / `_array.items` via `Arc<Mutex<...>>`
-        // (lltype.rs:711-748, task #157), preserving the same
+        // (lltype.rs), preserving the same
         // mid-init aliasing semantics. The cache `borrow_mut` is
         // dropped before init runs so a recursive `convert_const_exact`
         // cache probe at the top of this function can re-acquire
@@ -3200,7 +3200,7 @@ impl InstanceRepr {
         // Pyre clones `result` into the cache; the cached clone and the
         // init target (`local`, the moved original) share
         // `_struct._fields` / `_array.items` via `Arc<Mutex<...>>`
-        // (lltype.rs:711-748, task #157), so mutations applied by
+        // (lltype.rs), so mutations applied by
         // `initialize_prebuilt_data` are visible through
         // `_reusable_prebuilt_instance` for the no-recursion case
         // (`get_standard_ll_exc_instance`). The cache `borrow_mut` is

@@ -650,7 +650,7 @@ fn helper_policy_tokens_for_fn(
     // func._call_aroundstate_target_` — destructure the 2-tuple under
     // the upstream attribute name.  Pyre's `expand_call_surface_attr`
     // emits this const at module scope for `#[jit_release_gil]` callees
-    // (see slice 1); the policy fn body below mirrors the upstream
+    // the policy fn body below mirrors the upstream
     // destructure verbatim instead of threading the concrete target /
     // save_err through opaque tuple slots.
     let aroundstate_path = format_ident!("_call_aroundstate_target_{}", func.sig.ident);

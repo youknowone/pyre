@@ -7,9 +7,9 @@
 //! Upstream's consumer is the JIT codewriter's `EffectInfo` construction
 //! (`jit/codewriter/call.py:38` builds a `ReadWriteAnalyzer`; `:320`
 //! `getcalldescr` queries it). Pyre's `getcalldescr` still uses the flat
-//! `analyze_readwrite` scanner at `codewriter/call.rs:4771`; wiring
-//! this flowspace analyzer in its place is the EffectInfo-analyzer epic
-//! (task #64). Until then this module is published as a parity sibling
+//! `analyze_readwrite` scanner in `codewriter/call.rs`; wiring this
+//! flowspace analyzer in its place is unported. Until then this module
+//! is published as a parity sibling
 //! alongside [`super::canraise`], [`super::collectanalyze`] and
 //! [`super::gilanalysis`].
 //!

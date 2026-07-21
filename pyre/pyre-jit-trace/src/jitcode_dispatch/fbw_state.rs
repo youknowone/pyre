@@ -142,7 +142,7 @@ pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →
+/// `PYRE_FBW_LOOP_CALLEE_CA` (general loop-bearing-callee →
 /// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
 /// callee's own `jit_merge_point` and a compiled loop token already exists
 /// for that green key, emit a `CALL_ASSEMBLER` into it (mirror of
@@ -182,7 +182,7 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
 }
 
 /// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of
-/// [`fbw_loop_callee_ca_enabled`]. When on, the gap-10 loop-callee
+/// [`fbw_loop_callee_ca_enabled`]. When on, the loop-callee
 /// CALL_ASSEMBLER passes the callee's loop-carried locals as scalar
 /// CALL_ASSEMBLER args plus a `VableExpansion` (`arg_overrides` mapping each
 /// scalar to a callee jitframe slot), so the optimizer can elide the per-call
@@ -206,7 +206,7 @@ pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
 /// `PYRE_FBW_RAISE` (default ON) — the FBW walker owns the Python raise/except
 /// loop.  The twin NULL-ref guards exempt the trailing `cause` sentinel of a
 /// [`PyreHelperKind::RaiseVarargs`] residual so the walker records the raise.
-/// Now that the trait tracer is retired (gap-10), declining instead
+/// Now that the trait tracer is retired, declining instead
 /// re-interprets without JIT (a hot raise/except loop would time out), so the
 /// walker must own the raise path; `PYRE_FBW_RAISE=0` opts back to declining.
 pub(crate) fn fbw_raise_enabled() -> bool {
@@ -438,10 +438,10 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Whether the slice-b Finish-portal compile route is enabled.  Cached so
+/// Whether the Finish-portal compile route is enabled.  Cached so
 /// the per-`*_return` read and the `full_body_walk_trace` read see a
-/// single consistent value.  Default ON since the Phase 5 production flip;
-/// `PYRE_FBW_CALL_ASSEMBLER=0` opts back into the pre-slice-b path (bare
+/// single consistent value.  Default ON; `PYRE_FBW_CALL_ASSEMBLER=0` opts
+/// back into the pre-Finish-portal path (bare
 /// `Terminate` -> `Abort`) as a transition escape hatch.
 pub(crate) fn fbw_call_assembler_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1407,12 +1407,12 @@ pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
     Ok(())
 }
 
-/// Shared slice-b top-level finish path for the three value-returning arms
+/// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
 /// `Type::Ref`, records the vable store-back + `GUARD_NOT_FORCED_2`, and
 /// stashes the finish payload for `full_body_walk_trace`.  Deliberately
 /// does NOT record the `FINISH` op: under the gate the compile consumer
-/// (`finish_and_compile` -> `recorder.finish`, mod.rs:6427) records it from
+/// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
 /// `finish_args`, so recording it here too would double it.
 pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,

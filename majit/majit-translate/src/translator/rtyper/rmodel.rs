@@ -3099,8 +3099,7 @@ pub fn rtyper_makerepr(
         // `SomeUnicodeString.rtyper_makerepr` return the module-global
         // `string_repr` / `unicode_repr` (`lltypesystem/rstr.py:1255` /
         // `:1260`) unconditionally. Pyre's per-method `rtype_*` /
-        // `convert_const` overrides land slice-by-slice in the Item 3
-        // epic (`memory/item3_abstractstringrepr_epic_plan.md`). Until
+        // `convert_const` overrides land incrementally. Until
         // each one lands, `Repr`'s default impls surface a typed
         // `TyperError` from the per-method dispatch — same upstream
         // surface as `AbstractStringRepr` not yet defining the method.

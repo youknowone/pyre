@@ -536,7 +536,7 @@ mod branch_orgpc_tag_tests {
 
     #[test]
     fn roundtrips_across_orgpc_and_flavor() {
-        // #73 S3.5: every (orgpc, flavor) in range tags into the negative space
+        // Every (orgpc, flavor) in range tags into the negative space
         // and decodes back exactly, including the two endpoints.
         for orgpc in [
             0usize,

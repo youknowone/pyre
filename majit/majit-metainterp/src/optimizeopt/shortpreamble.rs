@@ -1325,7 +1325,7 @@ fn imported_const_opref(
     }
     // history.py:227/268/314 Const{Int,Float,Ptr}.value inline — fresh
     // imported short-preamble constant lands inline in `op.args` rather
-    // than indexing the legacy pool. Slice 7b op-graph walker covers
+    // than indexing the legacy pool. The op-graph walker covers
     // ConstPtr slots across minor collection.
     let opref = match value {
         majit_ir::Value::Int(v) => OpRef::const_int(*v),

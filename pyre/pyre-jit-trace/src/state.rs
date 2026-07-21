@@ -1449,7 +1449,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             };
         };
         let payload = &jc.payload;
-        // #73 S3.5: expand a tagged branch `orgpc` word to the block-head marker
+        // Expand a tagged branch `orgpc` word to the block-head marker
         // BEFORE the `>= 0` / offset uses below — a tagged NEGATIVE word cast to
         // usize would otherwise be a huge OOB index. No-op for offsets /
         // NO_JITCODE_PC (flip-off), so byte-identical when off.
@@ -1529,14 +1529,14 @@ pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> V
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return Vec::new();
         };
-        // #73 S3.5: expand a tagged branch `orgpc` word to the block-head marker
+        // Expand a tagged branch `orgpc` word to the block-head marker
         // before the `>= 0` / offset uses below. No-op for offsets /
         // NO_JITCODE_PC (flip-off), so byte-identical when off.
         let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(&jc.payload, jitcode_pc);
         if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                // gh#73 S3.2: source the const slots directly from the carried
+                // Source the const slots directly from the carried
                 // genuine `jitcode_pc` via the predecessor-keyed twin — the same
                 // decode-identity shape the pcdep/depth twins use at
                 // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
@@ -8569,7 +8569,7 @@ impl JitState for PyreJitState {
             frame0.values.len(),
             frame0.pc,
         );
-        // gap-10 GotoIfNotValueNotConcrete (bridge sub-class): the resume
+        // GotoIfNotValueNotConcrete (bridge sub-class): the resume
         // data carries the concrete runtime value for every live frame
         // register, but the consume_boxes loops below keep only the OpRef
         // and DROP the concrete — so a bridge resume leaves loop-carried
@@ -8584,7 +8584,7 @@ impl JitState for PyreJitState {
         // the concrete is a trace-time shadow only, so the optimizer does
         // NOT const-fold the loop-variant value).  Default-ON (`=0` opts
         // out) once validated, mirroring the LoadGlobal-fold / multiframe
-        // gap-10 flips; the opt-out keeps the prior symbolic-bridge
+        // flips; the opt-out keeps the prior symbolic-bridge
         // behavior available for A/B.
         let seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
         // For kept-stack branch guards the body-internal marker's
@@ -8762,7 +8762,7 @@ impl JitState for PyreJitState {
                         // (`live_local_values`, not the off-heap decoded
                         // array) so the seeded bridge walk can fold a branch
                         // derived from it without risking a moved-pointer
-                        // stamp (gap-10 bridge sub-class; see seed note above).
+                        // stamp (bridge sub-class; see seed note above).
                         // Skip a NULL (`GcRef(0)`) source, matching the
                         // deferred-overlay seed below: a loop-carried local
                         // held in a register at an interior guard reads NULL

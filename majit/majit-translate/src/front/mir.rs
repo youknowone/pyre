@@ -6110,7 +6110,7 @@ impl<'a> Lowering<'a> {
                 // `newlist/r>r` — an opname with no blackhole handler —
                 // breaking `default_bh_builder_unwired_set_matches_task_85_snapshot`.
                 //
-                // Slice-C 7/18 measurement (base 4d3d6e290f6, assembler
+                // Measured (base 4d3d6e290f6, assembler
                 // `[ASM newlist DIAG]`): EXACTLY TWO graphs carry a vec! and
                 // still drop to the legacy walker, each behind an INDEPENDENT
                 // non-vec! wall the recognizer does not touch —

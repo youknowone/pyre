@@ -58,7 +58,7 @@ pub(crate) struct CallerLocalLayout {
 ///
 /// Dispatch-arm lowering entry that pre-binds a list of caller-locals as
 /// portal-input bindings on the sub-Lowerer before lowering the body.
-/// The caller (slice 1.3 — dispatch arm emit at `lower_dispatch_chain`)
+/// The caller (dispatch arm emit at `lower_dispatch_chain`)
 /// collects them via
 /// [`collect_arm_caller_locals`] and threads the same list through
 /// `inline_call_<types>_v` as `(parent_reg, callee_reg)` pairs.

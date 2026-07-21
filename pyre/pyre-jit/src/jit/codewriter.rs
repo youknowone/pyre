@@ -4291,7 +4291,7 @@ fn filter_liveness_in_place(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
              entry per Python PC since label retirement retired per-PC label emission",
         );
-    // FOR_ITER body PCs: used to scope Slice B's per-PC frame-live
+    // FOR_ITER body PCs: used to scope the per-PC frame-live
     // re-add below. While-loop body PCs are excluded to prevent
     // perf regressions (wider liveness → more live-across-loop colors
     // → more spills).
@@ -13449,7 +13449,7 @@ impl CodeWriter {
             py_floor_by_jit_pc.insert(0, (0, 0));
         }
 
-        // task#50 sparse carry-forward sidecar: capture ONLY the py_pcs whose
+        // Sparse carry-forward sidecar: capture ONLY the py_pcs whose
         // dense marker the on-demand `derive_resume_marker` derivation cannot
         // reproduce from `first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`.
         // The derivation covers a py's own first op AND the trivia / next-op
@@ -13503,7 +13503,7 @@ impl CodeWriter {
             })
             .collect();
 
-        // task#50 phase-1: predecessor-keyed jitcode-pc twins of
+        // Predecessor-keyed jitcode-pc twins of
         // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
         // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
         // match first, else the largest `first_jit_pc_by_py_pc[py]` at-or-before
@@ -13521,9 +13521,9 @@ impl CodeWriter {
         let mut pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
         let mut const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
-        // task#50 #73-core: trivia-aware predecessor twin of the STATIC dense
+        // Trivia-aware predecessor twin of the STATIC dense
         // liveness depth.  The ENCODE-side branch-resume depth reader
-        // (`branch_resume_target_stack_depth`, jitcode_dispatch.rs:9329) does NOT
+        // (`branch_resume_target_stack_depth`) does NOT
         // read `depth_at_py_pc[inv(target)]` directly — it advances the inverted
         // py through `skip_python_trivia_forward` (a not-taken branch coordinate
         // can land on a `NOT_TAKEN`/`Cache` trivia op) BEFORE indexing the
@@ -13535,7 +13535,7 @@ impl CodeWriter {
         // `ExtendedArg`/`Resume`/`Nop`/`Cache`/`NotTaken` then record that opcode's
         // static depth.  A predecessor lookup then equals
         // `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(inv(jit_pc))]`.
-        // task#50 #73-core: the trivia twin is split into the SAME two tiers as
+        // The trivia twin is split into the SAME two tiers as
         // `python_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
         // -head precedence tier, `block_head_py_by_jit_pc`'s depth analog) and an
         // op-start table matched by PREDECESSOR (`first_jit_pc_by_py_pc`'s depth

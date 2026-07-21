@@ -2437,7 +2437,7 @@ impl Assembler {
     /// this because `rtyper` guarantees that every `Variable`'s
     /// `concretetype` produces exactly one `(kind, color)` via
     /// `getkind()` + `regalloc.py`.  Pyre's annotator / rtyper still
-    /// has known coverage gaps (tracked as task #71 / #74), and the
+    /// has known coverage gaps, and the
     /// `lookup_reg_with_kind` fallback silently emits a `(0, 'r')`
     /// default at write time — which masks how many distinct gaps
     /// exist per graph.  `MAJIT_COVERAGE_PANIC=1` aborts at the first

@@ -16,8 +16,7 @@
 //! — frames are heap-allocated outside the nursery and walked by a
 //! custom GC walker).  Until `PyFrame` grows a W_Root header (which is
 //! itself a multi-file change), the descriptor `tb_frame` cannot
-//! return a Python-visible object directly; that gap is the
-//! convergence path documented at slice 3.
+//! return a Python-visible object directly.
 
 use pyre_object::pyobject::*;
 
@@ -34,7 +33,7 @@ pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
 ///
 /// Only `w_next` is GC-traced.  `frame` is a raw pointer to a
 /// custom-walked `PyFrame` allocation; the frame walker scans the
-/// traceback chain separately when wired up at slice 2.
+/// traceback chain separately once wired up.
 #[repr(C)]
 pub struct PyTraceback {
     pub ob_header: PyObject,

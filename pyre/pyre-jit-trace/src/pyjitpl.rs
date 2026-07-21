@@ -1,7 +1,7 @@
 //! `semantic_fallthrough_pc` — the tracer's auto-advance PC rule.
 //!
 //! The trait meta-interpreter (`PyreMetaInterp`, RPython MetaInterp
-//! pyjitpl.py:2371) is retired (gap-10 of issue #73 Phase 6); the FBW walker
+//! pyjitpl.py) is retired; the FBW walker
 //! (`jitcode_dispatch`) is the sole tracer.  Only the shared fallthrough-PC
 //! rule the codewriter and runtime both key off survives in this module.
 

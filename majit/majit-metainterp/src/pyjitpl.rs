@@ -1887,7 +1887,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|trace| (trace_id, trace))
     }
 
-    /// gh#73 S3.3: the OpCode of the guard op that produced this exit, resolved
+    /// The OpCode of the guard op that produced this exit, resolved
     /// from the `source_op_index` the fail descriptor / exit layout carries.
     /// Pure read of the retained compiled trace ops; None if the loop/trace is
     /// gone or the index is out of range.
@@ -6915,7 +6915,7 @@ impl<M: Clone> MetaInterp<M> {
         combined_ops.extend(body_ops);
         // history.py:227/268/314 parity: `op.args[j]` carries inline
         // `ConstX.value` directly; the retrace boundary no longer needs
-        // a separate `constants` side-table merge (Slice 7a).
+        // a separate `constants` side-table merge.
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
         // compile_trace already owns the bridge inputarg contract
@@ -10003,7 +10003,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
-        // #217 Slice 4 — bridge inputarg `InputArg*.value` stamp.
+        // Bridge inputarg `InputArg*.value` stamp.
         //
         // bridgeopt.py:124 `deserialize_optimizer_knowledge` receives
         // `frontend_boxes` (the source guard's live boxes) alongside
@@ -19035,7 +19035,7 @@ mod tests {
     fn walk_partial_trace_refs_forwards_inline_const_ptr_in_op_args() {
         // history.py:314 `ConstPtr.value` parity: an inline-Const Ref
         // stored in `op.args[j]` is the canonical forwardable Ref site
-        // after Slice 2 producer cutover. A minor collection between
+        // after the producer cutover. A minor collection between
         // a failed bridge compile and `compile_retrace` must forward
         // it through the op-graph walker.
         let mut meta = MetaInterp::<()>::new(0);
@@ -19067,7 +19067,7 @@ mod tests {
     fn walk_partial_trace_refs_forwards_inline_const_ptr_in_fail_args() {
         // history.py:314 + resoperation.py guard fail_args parity:
         // guard ops carry `fail_args` (the resume-side live values).
-        // After Slice 2 cutover, an inline ConstPtr in fail_args must
+        // After the cutover, an inline ConstPtr in fail_args must
         // also forward across minor collection.
         let mut meta = MetaInterp::<()>::new(0);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 11);
@@ -21196,7 +21196,7 @@ mod tests {
 
     #[test]
     fn on_back_edge_typed_installs_cell_with_typed_comparekey() {
-        // #203 gap-7 step-a cutover: a hot back-edge carrying a real
+        // A hot back-edge carrying a real
         // (code, pc) must install a warm-state cell with a typed
         // `comparekey`, so the marker-path lookup (`lookup_chain_with_key`)
         // resolves to the same cell as the legacy u64 hash flow. The cell
@@ -21229,7 +21229,7 @@ mod tests {
 
     #[test]
     fn bound_reached_force_starts_cell_with_typed_comparekey() {
-        // #203 gap-7 step-a: the can_enter_jit force-start path
+        // The can_enter_jit force-start path
         // (`bound_reached` → `force_start_tracing_for_key`) must also
         // install a cell with a typed comparekey, bypassing the counter.
         let mut meta = MetaInterp::<()>::new(1);

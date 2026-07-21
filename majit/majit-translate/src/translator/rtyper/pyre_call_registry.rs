@@ -127,7 +127,7 @@ impl PyreFunctionEntry {
     /// (`description.rs:1147-1169`) is skipped — pyre's synthetic
     /// `GraphFunc` has no `HostCode` and would fail there.
     ///
-    /// The producer (Slice A.4 follow-on, or a test fixture) is
+    /// The producer (a later follow-on, or a test fixture) is
     /// responsible for constructing `pygraph` from pyre's
     /// `model::FunctionGraph` for this callee — see
     /// `cutover::lift_callee_to_pygraph`.

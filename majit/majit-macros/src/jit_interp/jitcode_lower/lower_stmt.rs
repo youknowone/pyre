@@ -1324,11 +1324,11 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ElidableInt
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
-                    // Parity #14 Slice C.4 + Parity #20: Pure flows through
+                    // Pure flows through
                     // the canonical `BC_RESIDUAL_CALL_*_I` family with the
                     // calldescr's `extra_info` set per `call.py:292-299
                     // _canraise(op)`'s 3-way pick.  The walker
-                    // (`pyjitpl/dispatch.rs` Slice C.1) reads
+                    // (`pyjitpl/dispatch.rs`) reads
                     // `effectinfo.check_is_elidable()` and routes through
                     // `record_result_of_call_pure` mirroring
                     // `pyjitpl.py:2111-2115`; the trailing

@@ -153,7 +153,7 @@ impl<'c> Lowerer<'c> {
 
     /// Emit an op token plus its parallel `OpMeta` entry, keeping
     /// `statements` and `op_metadata` index-aligned for the backward
-    /// liveness walker (Slice B.2.B).
+    /// liveness walker.
     pub(super) fn emit_op(&mut self, meta: OpMeta, tokens: TokenStream) {
         self.statements.push(tokens);
         self.op_metadata.push(meta);

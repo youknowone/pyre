@@ -405,7 +405,7 @@ impl OrderedDictRepr {
         let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
 
         // _ll_write_indexes(d, i, value) (rordereddict.py:558-563) — the real
-        // helper landed in Slice 2 for `build_ll_dict_lookup_helper_graph`'s
+        // helper exists for `build_ll_dict_lookup_helper_graph`'s
         // inlined store path; mint it here as a callable funcptr for the
         // non-inlined callers (`ll_dict_store_clean`).
         let write_indexes_fn = {
@@ -445,7 +445,7 @@ impl OrderedDictRepr {
 
         // ll_call_insert_clean_function(d, hash, i) (rordereddict.py:565-580)
         // — FUNC_* dispatch collapses to a single `ll_dict_store_clean` call,
-        // same shape as `ll_call_lookup_function` (Slice 2).
+        // same shape as `ll_call_lookup_function`.
         let insert_clean_fn = {
             let dict_ptr = dict_ptr.clone();
             let store_clean_const = store_clean_const.clone();
@@ -3048,7 +3048,7 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
 /// selector instead, and `ll_dict_remove_deleted_items` only clears the high
 /// bits (`&= FUNC_MASK`). So `ll_ensure_indexes` reaches this helper only while
 /// `num_live_items == 0`; the `num_live_items != 0` else arm stays unreachable.
-/// Re-verified after the Slice 3/4 write + delete paths landed. This builder
+/// Re-verified after the write + delete paths landed. This builder
 /// ports only the reachable `num_live_items == 0` branch straight-line (no
 /// runtime check), matching the "statically dead branch" precedent in
 /// [`build_ll_dict_lookup_helper_graph`]'s doc comment.
@@ -3602,7 +3602,7 @@ pub fn pair_ordereddict_repr_rtype_contains(
 /// (`i`/`perturb` are `r_uint`; the perturb shift is the *logical*
 /// `uint_rshift`). All `DICTINDEX_*` widths collapse to
 /// `Ptr(GcArray(Unsigned))` locally, so `T` is inert — this one graph serves
-/// every `FUNC_*` width (same collapse as `ll_call_lookup_function`, Slice 2).
+/// every `FUNC_*` width (same collapse as `ll_call_lookup_function`).
 /// Calls the real [`build_ll_write_indexes_helper_graph`] helper for the
 /// final store (not inlined) — that helper's own doc note already flagged
 /// it as reserved for "the non-inlined callers (`ll_dict_store_clean`,
@@ -3882,7 +3882,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
 /// ```
 ///
 /// Same width-collapse rationale as `ll_call_lookup_function`'s FUNC_*
-/// dispatch (Slice 2): every `TYPE_*`/`DICTINDEX_*` width aliases the same
+/// dispatch: every `TYPE_*`/`DICTINDEX_*` width aliases the same
 /// `Ptr(GcArray(Unsigned))` shape locally, so the 4-way dispatch collapses
 /// to a single unconditional `ll_dict_store_clean` call. The `ll_assert`
 /// dead-fallthrough is debug-only and not modelled.
@@ -9926,7 +9926,7 @@ mod tests {
     }
 
     /// The eq-gate lets plain (non-`custom_eq_hash`) str keys through: the
-    /// direct-compare `ptr_eq` landmine from Slice 0 is now covered by the
+    /// direct-compare `ptr_eq` landmine is now covered by the
     /// `d.keyeq`-fallback wiring in `build_ll_dict_lookup_helper_graph`
     /// (`ll_streq`, via `key_repr.get_ll_eq_function()`), so
     /// `OrderedDictRepr::rtype_getitem` succeeds like the int-key case.

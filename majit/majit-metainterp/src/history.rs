@@ -2836,7 +2836,7 @@ impl TraceCtx {
     /// `build_state_field_snapshot(frames, …, virtualizable_boxes,
     /// virtualref_boxes)` for the state-field JIT guards.
     ///
-    /// Convergence (task #208): the only callers of this path are the
+    /// Convergence: the only callers of this path are the
     /// interpreter-side vable promotes — `get_arrayitem_vable_index`
     /// (`trace_ctx.rs`) and the `is_nonstandard_virtualizable` `isstandard`
     /// PTR_EQ (`trace_ctx.rs`, `pyjitpl.rs`). Both emit a `GUARD_VALUE`
@@ -2853,7 +2853,7 @@ impl TraceCtx {
     /// (`pyjitpl/dispatch.rs`), the full-framestack capture already at parity
     /// with `generate_guard`. Threading the live framestack into this recorder
     /// would only matter at framestack depth > 1 (inlined frames), which
-    /// cannot arise until the trace-into machinery (task #184) exists; a
+    /// cannot arise until the trace-into machinery exists; a
     /// partial box list would otherwise positionally misalign the resume
     /// reader's per-frame register layout, so the snapshot stays minimal.
     fn record_guard_with_snapshot(
@@ -3454,7 +3454,7 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        // history.py:314 ConstPtr.value inline (Slice 7b op-graph walker
+        // history.py:314 ConstPtr.value inline (the op-graph walker
         // forwards `OpRef::ConstPtr(GcRef)` slots in `op.args`).
         let value_ref = OpRef::const_ptr(majit_ir::GcRef(value as usize));
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
@@ -3513,7 +3513,7 @@ impl TraceCtx {
         // matching `history.py:307 ConstPtr` and preventing alias with
         // `ConstInt` slots of the same raw value.
         // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
-        // Slice 7b op-graph walker forwards Ref slots.
+        // The op-graph walker forwards Ref slots.
         let result_ref = match result_type {
             Type::Int => OpRef::const_int(result_value),
             Type::Float => OpRef::const_float(f64::from_bits(result_value as u64)),
