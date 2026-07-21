@@ -4460,7 +4460,6 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
     if !ctx.is_authoritative_executor
-        || !ctx.is_full_body_walk
         || dst_bank != 'r'
         || r_args.len() != 1
         || ctx.fbw_mode.inline_subwalk
