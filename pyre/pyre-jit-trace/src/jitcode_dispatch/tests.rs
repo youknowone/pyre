@@ -4389,6 +4389,40 @@ fn int_rshift_records_intrshift() {
     drive_int_binop("int_rshift/ii>i", majit_ir::OpCode::IntRshift);
 }
 
+// The unsigned members of the same generated binop loop. They reach the
+// walker through `record_binop_i`, which the legacy dispatcher also feeds
+// from `BC_UINT_*`; the shape is identical to the signed arms, so the
+// driver covers them unchanged.
+#[test]
+fn uint_rshift_records_uintrshift() {
+    drive_int_binop("uint_rshift/ii>i", majit_ir::OpCode::UintRshift);
+}
+
+#[test]
+fn uint_mul_high_records_uintmulhigh() {
+    drive_int_binop("uint_mul_high/ii>i", majit_ir::OpCode::UintMulHigh);
+}
+
+#[test]
+fn uint_lt_records_uintlt() {
+    drive_int_binop("uint_lt/ii>i", majit_ir::OpCode::UintLt);
+}
+
+#[test]
+fn uint_le_records_uintle() {
+    drive_int_binop("uint_le/ii>i", majit_ir::OpCode::UintLe);
+}
+
+#[test]
+fn uint_gt_records_uintgt() {
+    drive_int_binop("uint_gt/ii>i", majit_ir::OpCode::UintGt);
+}
+
+#[test]
+fn uint_ge_records_uintge() {
+    drive_int_binop("uint_ge/ii>i", majit_ir::OpCode::UintGe);
+}
+
 #[test]
 fn int_eq_records_inteq() {
     drive_int_binop("int_eq/ii>i", majit_ir::OpCode::IntEq);
@@ -4690,12 +4724,13 @@ fn float_truediv_records_floattruediv() {
     drive_float_binop("float_truediv/ff>f", majit_ir::OpCode::FloatTrueDiv);
 }
 
-#[test]
-fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
+/// Drive a single `float_<unop>/f>f` handler. Same shape pattern as
+/// `drive_float_binop` minus one read.
+fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     // `f>f` shape: 1B src + 1B dst = 2 operand bytes after opcode.
     let byte = *insns_opname_to_byte()
-        .get("float_neg/f>f")
-        .expect("`float_neg/f>f` must be in insns table");
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
     let mut regs_f = distinct_const_refs(&mut tc, 8);
@@ -4742,24 +4777,35 @@ fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 3, "float_neg/f>f operand layout `f>f` = 2 bytes");
+    assert_eq!(next_pc, 3, "`{opname}` operand layout `f>f` = 2 bytes");
     let dst_post = wc.registers_f[5];
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
     let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::FloatNeg);
+    assert_eq!(last.opcode, expected_opcode);
     assert_eq!(
         last.getarglist()
             .iter()
             .map(|a| a.to_opref())
             .collect::<Vec<_>>(),
         vec![arg],
-        "FloatNeg args must be [registers_f[src]]",
+        "`{opname}` args must be [registers_f[src]]",
     );
     assert_eq!(dst_post, last.pos.get());
+}
+
+#[test]
+fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
+    drive_float_unop("float_neg/f>f", majit_ir::OpCode::FloatNeg);
+}
+
+#[test]
+fn float_abs_records_floatabs() {
+    drive_float_unop("float_abs/f>f", majit_ir::OpCode::FloatAbs);
 }
 
 /// Drive a single `int_<unop>/i>i` handler. Same shape pattern as
@@ -4939,6 +4985,16 @@ fn ptr_eq_records_ptreq_with_two_ref_operands_into_int_dst() {
 #[test]
 fn ptr_ne_records_ptrne() {
     drive_ptr_compare("ptr_ne/rr>i", majit_ir::OpCode::PtrNe);
+}
+
+#[test]
+fn instance_ptr_eq_records_instanceptreq() {
+    drive_ptr_compare("instance_ptr_eq/rr>i", majit_ir::OpCode::InstancePtrEq);
+}
+
+#[test]
+fn instance_ptr_ne_records_instanceptrne() {
+    drive_ptr_compare("instance_ptr_ne/rr>i", majit_ir::OpCode::InstancePtrNe);
 }
 
 #[test]

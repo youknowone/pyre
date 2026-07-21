@@ -707,6 +707,16 @@ regular_record_table! {
         "int_le/ii>i" => IntLe,
         "int_gt/ii>i" => IntGt,
         "int_ge/ii>i" => IntGe,
+        // The same generated loop also spells the unsigned members. They
+        // share the `ii>i` shape and differ only in how the recorded
+        // opcode reinterprets the operands, so they need no separate
+        // helper — `eval_binop_i` already folds each with u64 semantics.
+        "uint_rshift/ii>i" => UintRshift,
+        "uint_mul_high/ii>i" => UintMulHigh,
+        "uint_lt/ii>i" => UintLt,
+        "uint_le/ii>i" => UintLe,
+        "uint_gt/ii>i" => UintGt,
+        "uint_ge/ii>i" => UintGe,
     }
     // Float arithmetic — same `pyjitpl.py` loop on the `f` bank.
     // Codewriter today emits only float_add/float_sub/float_truediv
@@ -744,6 +754,9 @@ regular_record_table! {
     }
     unop_float_record {
         "float_neg/f>f" => FloatNeg,
+        // `float_abs` sits beside `float_neg` in the generated unary loop
+        // and `eval_unary_f` already folds it.
+        "float_abs/f>f" => FloatAbs,
     }
     // Bank-crossing unary casts from the same `pyjitpl.py`
     // generated unary loop; `unop_cast_record` selects the src/dst bank
@@ -754,9 +767,15 @@ regular_record_table! {
         "cast_int_to_ptr/i>r" => CastIntToPtr,
         "cast_ptr_to_int/r>i" => CastPtrToInt,
     }
-    // `ptr_eq` / `ptr_ne` (`pyjitpl.py`): Ref operands, int result.
+    // `ptr_eq` / `ptr_ne` (`pyjitpl.py`): Ref operands, int result. The
+    // `instance_ptr_*` pair shares that generated compare loop —
+    // `jtransform.py` rewrites a pointer comparison whose operands are
+    // known instances into the `instance_ptr_*` spelling, which carries
+    // the same operand shape and the same fold.
     binop_ref_to_int_record {
         "ptr_eq/rr>i" => PtrEq,
         "ptr_ne/rr>i" => PtrNe,
+        "instance_ptr_eq/rr>i" => InstancePtrEq,
+        "instance_ptr_ne/rr>i" => InstancePtrNe,
     }
 }
