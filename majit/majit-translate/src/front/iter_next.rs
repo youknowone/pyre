@@ -168,7 +168,7 @@ fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
 /// prunable along its whole forward chain; removing a never-read inputarg
 /// slot drops only dead arguments from each predecessor link (the values
 /// stay defined and used wherever else they are live).
-fn collect_transitive_dead_slots(
+pub(crate) fn collect_transitive_dead_slots(
     graph: &FunctionGraph,
     start_block: usize,
     start_slot: usize,

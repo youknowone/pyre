@@ -931,6 +931,12 @@ pub(crate) struct RewireOutcome {
     /// value-encoded `Result` the untouched downstream `match` keeps
     /// consuming.
     pub rewrapped: usize,
+    /// Drain-loop `match next()` sites fused by [`try_fuse_drain_match`]
+    /// into an exception-edge handler with a guest-KIND test, eliminating
+    /// the `Result` shell's `Ok`/`StopIteration` ctors + `PyErrorKind::eq`
+    /// residuals.  Counted separately from `rewrapped` and independent of
+    /// `tail_forwards` (which feeds `lower_result_exc_returns`).
+    pub fused: usize,
 }
 
 /// Per-site disposition for [`rewire_one_call_site`].
@@ -938,6 +944,7 @@ enum SiteOutcome {
     Diamond,
     TailForward,
     Rewrapped,
+    Fused,
 }
 
 /// Caller rule.  `results` are the result `Variable`s of calls to
@@ -954,12 +961,14 @@ pub(crate) fn rewire_result_exc_call_sites(
         diamonds: 0,
         tail_forwards: 0,
         rewrapped: 0,
+        fused: 0,
     };
     for (r, suffix) in results {
         match rewire_one_call_site(graph, r, suffix.as_deref().unwrap_or(""), enclosing_scoped)? {
             SiteOutcome::Diamond => outcome.diamonds += 1,
             SiteOutcome::TailForward => outcome.tail_forwards += 1,
             SiteOutcome::Rewrapped => outcome.rewrapped += 1,
+            SiteOutcome::Fused => outcome.fused += 1,
         }
     }
     Ok(outcome)
@@ -1004,6 +1013,17 @@ fn rewire_one_call_site(
         )
     });
     let Some(branch_op_idx) = branch_op_idx else {
+        // No `Result::branch` op → a hand-written `match` consumer.  The
+        // drain-loop `match next()` fusion recognises its exact shape and
+        // rewrites it into an exception-edge handler with a guest-KIND test;
+        // every other custom-match shape (and the drain shape when any
+        // hazard guard trips) falls through to `catch_and_rewrap`.  The
+        // fusion is fail-safe: an `Err` from `try_fuse_drain_match` MUST NOT
+        // propagate (that would decline the whole graph); it converts here
+        // into the existing rewrap path.
+        if try_fuse_drain_match(graph, a, r).is_ok() {
+            return Ok(SiteOutcome::Fused);
+        }
         catch_and_rewrap(graph, a, r, suffix)?;
         return Ok(SiteOutcome::Rewrapped);
     };
@@ -1312,6 +1332,736 @@ fn catch_and_rewrap(
         Some(ExitSwitch::LastException),
         vec![Link::new_mixed(value_args, n_id, None), exc_link],
     );
+    Ok(())
+}
+
+/// True iff `owner` names a `Result<T, PyError>` — the discriminant read's
+/// field owner for the drain loop's `next()` result (`result::Result<*mut
+/// PyObject,PyError>`).  Matched structurally (any `T` instantiation) so
+/// the recognizer keys on the exception carrier, not the payload type.
+fn owner_is_result_of_pyerror(owner: &str) -> bool {
+    owner.contains("Result<") && owner.ends_with(",PyError>")
+}
+
+/// True iff `owner` is the short `Result::Ok` / `Result::Err` variant owner
+/// a `__pos_0` payload read carries (`variant` = "Ok" / "Err").  Requires
+/// the `Result` qualifier so a `ControlFlow::Continue`/`Break` (the `?`
+/// diamond's ADT) is never mistaken for a `Result` arm.
+fn owner_is_result_variant(owner: &str, variant: &str) -> bool {
+    owner.contains("Result") && owner.ends_with(format!("::{variant}").as_str())
+}
+
+/// Follow `var` across one `link` (from `link`'s source block into
+/// `link.target`): the position `var` occupies among the link's `Value`
+/// args maps to `link.target`'s inputarg at that position.  `None` when the
+/// link does not carry `var` or the target lacks that inputarg slot — the
+/// single-successor alias hop the framestate-threaded lowering installs
+/// (a value binds to a fresh inputarg name per block).
+fn forward_alias(graph: &FunctionGraph, var: &Variable, link: &Link) -> Option<Variable> {
+    let pos = link
+        .args
+        .iter()
+        .position(|a| matches!(a, LinkArg::Value(v) if v == var))?;
+    graph.blocks[link.target.0].inputargs.get(pos).cloned()
+}
+
+/// The reraise (`else`) arm must be exactly `return Err(e)` reusing the
+/// payload `e` the Err arm already bound via `__pos_0[Result::Err]` — the
+/// RPython handler form `except OperationError as e: … raise` where `e` is
+/// bound once and consumed only on the re-raise path (NOT a fresh re-read in
+/// this block).  `e_payload` is that already-bound payload traced through the
+/// bool-switch and reraise links into this block; the block must build an
+/// `Err` shell, write `e_payload` into it, forward to the return block, and do
+/// nothing else.  Verifying this licenses block `R`'s `raise vb` substitution:
+/// `to_exc_object(e) == vb` (the caught exception value), so `raise vb`
+/// reproduces `return Err(e)` exactly.  Any extra effect fails loud → decline.
+fn verify_drain_reraise_returns_err_payload(
+    graph: &FunctionGraph,
+    reraise_target: usize,
+    e_payload: &Variable,
+    name: &str,
+) -> Result<(), String> {
+    let ops = &graph.blocks[reraise_target].operations;
+    // `outer = Result::Err()` shell ctor.
+    let ctor = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::Call { target, .. } if result_ctor_kind(target) == Some(true) => {
+            op.result.clone().map(|outer| (i, outer))
+        }
+        _ => None,
+    });
+    let Some((ctor_idx, outer)) = ctor else {
+        return Err(format!(
+            "{name}: reraise arm block {reraise_target} lacks the Err shell ctor"
+        ));
+    };
+    // `outer.__pos_0 = e_payload` — the write must consume the exact
+    // already-bound Err payload, not some other value.
+    let write_idx = ops.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { base, field, value, .. }
+                if *base == outer
+                    && field.name == "__pos_0"
+                    && matches!(value, LinkArg::Value(v) if v == e_payload)
+        )
+    });
+    let Some(write_idx) = write_idx else {
+        return Err(format!(
+            "{name}: reraise arm block {reraise_target} does not write the already-bound Err payload"
+        ));
+    };
+    // Only these two ops may carry an effect; any other side-effecting op
+    // would be dropped when block `R` replaces this tail.
+    assert_block_pure_besides(
+        graph,
+        reraise_target,
+        &[ctor_idx, write_idx],
+        "reraise",
+        name,
+    )?;
+    // The shell flows to `returnblock` by a STRICT tail forward: block `R`
+    // deletes this whole reraise tail and substitutes an unconditional
+    // `raise vb`, so the arm must be an unconditional `return Err(e)` — a single
+    // exit, no exitswitch, only empty alias-hop blocks en route.  The tolerant
+    // forwarder would license a conditional tail (`if flag { return Err(e) }
+    // else { … }`) whose non-reraise branch the substitution silently drops.
+    if forwards_to_returnblock(graph, reraise_target, &outer) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: reraise arm block {reraise_target} does not forward the Err shell \
+             unconditionally to returnblock"
+        ))
+    }
+}
+
+/// Drain-loop `match next()` fusion — the hand-written `match` at
+/// `_unpackiterable_unknown_length`'s core:
+/// ```text
+///     match next(w_iterator) {
+///         Ok(w_item) => append(items, w_item),
+///         Err(e) if e.kind == PyErrorKind::StopIteration => break,
+///         Err(e) => return Err(e),
+///     }
+/// ```
+/// which lowers to a materialised `Result<*mut PyObject, PyError>` shell:
+/// a `__discriminant` switch whose arms build a `StopIteration`
+/// `SyntheticTransparentCtor`, read `__pos_0[Result::Err]`, and call
+/// `PyErrorKind::eq` — niladic ctors with no host symbol the jd1 walker
+/// SIGBUSes on.  This rewrites the `next()` block into `LastException`
+/// exits (normal → the `Ok` arm; exception → a handler `H`) whose handler
+/// runs the **guest-KIND** test `w_exception_get_kind(evalue) == 10`
+/// (`ExcKind::StopIteration`) — the exact source semantics
+/// `e.kind == PyErrorKind::StopIteration` through the
+/// `ExcKind ↔ PyErrorKind` bijection, NOT an MRO/subclass match.
+///
+/// Fail-safe: returns `Err` on ANY structural mismatch or hazard, and the
+/// caller ([`rewire_one_call_site`]) converts that into `catch_and_rewrap`
+/// — an `Err` must never propagate out (that would decline the whole
+/// graph).  Validate-before-mutate: every precondition and every rewired
+/// link arg is computed before the first graph mutation, so a decline
+/// leaves the graph byte-identical.  Detach-only: the bypassed
+/// discriminant / Err-arm / bool-switch / reraise blocks are left
+/// byte-intact for the post-rewrite `clear_unreachable_blocks` sweep.
+fn try_fuse_drain_match(
+    graph: &mut FunctionGraph,
+    a: usize,
+    r: &Variable,
+) -> Result<(), String> {
+    use crate::flowspace::model::{ConstValue, Constant};
+    use crate::model::{BlockId, ExitCase};
+    let name = graph.name.clone();
+
+    // --- (1) A: `r = next(iter)` is A's last op, closed by lower_call with
+    // a single no-exitcase forwarding exit.
+    let a_ops = &graph.blocks[a].operations;
+    let call_idx = a_ops.len().checked_sub(1).ok_or_else(|| {
+        format!("{name}: drain fuse: call block {a} is empty")
+    })?;
+    if a_ops[call_idx].result.as_ref() != Some(r) {
+        return Err(format!("{name}: drain fuse: next() is not the last op of block {a}"));
+    }
+    if graph.blocks[a].exitswitch.is_some() || graph.blocks[a].exits.len() != 1 {
+        return Err(format!(
+            "{name}: drain fuse: call block {a} is not the single forwarding-exit shape"
+        ));
+    }
+    if graph.blocks[a].exits[0].exitcase.is_some() {
+        return Err(format!("{name}: drain fuse: call block {a} exit carries an exitcase"));
+    }
+
+    // --- (2) A→B single exit; B holds `d = r.__discriminant[Result<..,PyError>]`,
+    // `exitswitch == Value(d)`, pure besides the read, single predecessor.
+    let (b, r_b) =
+        follow_single_exit(graph, a, r).map_err(|e| format!("{name}: drain fuse: {e}"))?;
+    assert_single_pred(graph, b, &name)?;
+    let (disc_idx, disc_var) = graph.blocks[b]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if *base == r_b
+                    && field.name == "__discriminant"
+                    && field.owner_root.as_deref().is_some_and(owner_is_result_of_pyerror) =>
+            {
+                op.result.clone().map(|d| (i, d))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: drain fuse: block {b} lacks the Result __discriminant read"))?;
+    match &graph.blocks[b].exitswitch {
+        Some(ExitSwitch::Value(v)) if *v == disc_var => {}
+        other => {
+            return Err(format!(
+                "{name}: drain fuse: block {b} exitswitch {other:?} is not the Result discriminant"
+            ));
+        }
+    }
+    assert_block_pure_besides(graph, b, &[disc_idx], "discriminant", &name)?;
+
+    // --- (3) Split B's diamond; identify Ok/Err arms by the `__pos_0` owner
+    // of the read in each arm's target — NOT by discriminant 0/1.
+    let (case0, case1) = split_diamond_exits(&graph.blocks[b].exits, &name)?;
+    let reads_variant = |target: usize, variant: &str| -> bool {
+        graph.blocks[target].operations.iter().any(|op| {
+            matches!(&op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref().is_some_and(|o| owner_is_result_variant(o, variant)))
+        })
+    };
+    let (ok_link, err_link) = if reads_variant(case0.target.0, "Ok")
+        && reads_variant(case1.target.0, "Err")
+    {
+        (case0, case1)
+    } else if reads_variant(case1.target.0, "Ok") && reads_variant(case0.target.0, "Err") {
+        // The Ok arm must be the discriminant-0 case (Result: Ok = 0); an
+        // inverted pairing is an unrecognised shape.
+        return Err(format!(
+            "{name}: drain fuse: Ok/Err arms inverted vs discriminant 0/1"
+        ));
+    } else {
+        return Err(format!(
+            "{name}: drain fuse: block {b} arms are not a Result Ok/Err __pos_0 pair"
+        ));
+    };
+    let ok_target = ok_link.target.0;
+    let err_target = err_link.target.0;
+
+    // --- (4) Ok arm: single predecessor; the `__pos_0[Result::Ok]` read is
+    // collapsed to `r` (the LastException normal edge carries the unwrapped
+    // payload directly).  Record its payload position on the Ok link.
+    assert_single_pred(graph, ok_target, &name)?;
+
+    // --- (5) Err arm: single predecessor, EXACTLY the four guard ops
+    // (StopIteration ctor, Err payload read, kind read, PyErrorKind::eq).
+    assert_single_pred(graph, err_target, &name)?;
+    let r_err = forward_alias(graph, &r_b, &err_link)
+        .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
+    let err_ops = &graph.blocks[err_target].operations;
+    let ctor_idx = err_ops
+        .iter()
+        .position(|op| matches!(&op.kind,
+            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name: n, owner_path }, .. }
+                if n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind")))
+        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the StopIteration ctor"))?;
+    let sc = err_ops[ctor_idx].result.clone().ok_or_else(|| {
+        format!("{name}: drain fuse: StopIteration ctor without result")
+    })?;
+    let (errpay_idx, err_payload) = err_ops
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if *base == r_err
+                    && field.name == "__pos_0"
+                    && field.owner_root.as_deref().is_some_and(|o| owner_is_result_variant(o, "Err")) =>
+            {
+                op.result.clone().map(|e| (i, e))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
+    let (kind_idx, kind_var) = err_ops
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if *base == err_payload
+                    && field.name == "kind"
+                    && field.owner_root.as_deref() == Some("PyError") =>
+            {
+                op.result.clone().map(|k| (i, k))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the PyError.kind read"))?;
+    let (eq_idx, eq_result) = err_ops
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::Call { target: CallTarget::Method { name: m, receiver_root, .. }, args, .. }
+                if m == "eq"
+                    && receiver_root.as_deref() == Some("PyErrorKind")
+                    && args.len() == 2
+                    && args.contains(&kind_var)
+                    && args.contains(&sc) =>
+            {
+                op.result.clone().map(|m| (i, m))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the PyErrorKind::eq call"))?;
+    // The ctor and eq are Calls (not `is_pure_op`), so they must be among
+    // the recognized indices, not merely tolerated.
+    assert_block_pure_besides(
+        graph,
+        err_target,
+        &[ctor_idx, errpay_idx, kind_idx, eq_idx],
+        "Err arm",
+        &name,
+    )?;
+
+    // --- (6) Err arm → bool-switch block: `m2 = bool(eq)`, `exitswitch ==
+    // Value(m2)`, pure besides, single predecessor.
+    let (bswitch, eq_bs) = follow_single_exit(graph, err_target, &eq_result)
+        .map_err(|e| format!("{name}: drain fuse: Err arm exit: {e}"))?;
+    assert_single_pred(graph, bswitch, &name)?;
+    let (bool_idx, bool_temp) = graph.blocks[bswitch]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::UnaryOp { op: o, operand, .. } if o == "bool" && *operand == eq_bs => {
+                op.result.clone().map(|m| (i, m))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: drain fuse: bool-switch block {bswitch} lacks bool(eq)"))?;
+    match &graph.blocks[bswitch].exitswitch {
+        Some(ExitSwitch::Value(v)) if *v == bool_temp => {}
+        other => {
+            return Err(format!(
+                "{name}: drain fuse: block {bswitch} exitswitch {other:?} is not the eq bool switch"
+            ));
+        }
+    }
+    assert_block_pure_besides(graph, bswitch, &[bool_idx], "bool switch", &name)?;
+
+    // --- (7) Split the bool switch by exitcase: true → break arm, false →
+    // reraise arm.  Verify the reraise arm is a pure `return Err(e)` tail.
+    if graph.blocks[bswitch].exits.len() != 2 {
+        return Err(format!("{name}: drain fuse: bool switch has != 2 exits"));
+    }
+    let mut break_link: Option<Link> = None;
+    let mut reraise_link: Option<Link> = None;
+    for l in &graph.blocks[bswitch].exits {
+        match &l.exitcase {
+            Some(ExitCase::Bool(true)) => break_link = Some(l.clone()),
+            Some(ExitCase::Bool(false)) => reraise_link = Some(l.clone()),
+            other => {
+                return Err(format!(
+                    "{name}: drain fuse: bool switch exit case {other:?} is not Bool(true/false)"
+                ));
+            }
+        }
+    }
+    let (Some(break_link), Some(reraise_link)) = (break_link, reraise_link) else {
+        return Err(format!("{name}: drain fuse: bool switch lacks the true/false pair"));
+    };
+    let break_target = break_link.target.0;
+    let reraise_target = reraise_link.target.0;
+
+    // Err arm → bool-switch link (the Err arm's single exit, validated in
+    // step 6).  Used to trace the Result alias into the reraise block and to
+    // resolve break-edge args back through the Err arm.
+    let err_to_bswitch = graph.blocks[err_target].exits[0].clone();
+
+    // The already-bound Err payload `e` flowing into the reraise block.  The
+    // handler binds `e` once in the Err arm (`e = r.__pos_0[Result::Err]`) and
+    // the reraise arm re-emits `Err(e)` reusing that exact value — so trace
+    // `err_payload` (not the Result value) through the bool-switch into the
+    // reraise block and require the block to write it back into a fresh `Err`.
+    let e_bswitch = forward_alias(graph, &err_payload, &err_to_bswitch)
+        .ok_or_else(|| format!("{name}: drain fuse: bool-switch drops the Err payload"))?;
+    let e_reraise = forward_alias(graph, &e_bswitch, &reraise_link)
+        .ok_or_else(|| format!("{name}: drain fuse: reraise link drops the Err payload"))?;
+    verify_drain_reraise_returns_err_payload(graph, reraise_target, &e_reraise, &name)?;
+
+    // --- Build the normal (Ok) edge args (A scope), no mutation yet.
+    // Mirrors `rewire_one_call_site`'s continue-arm handling: r → payload,
+    // the Ok arm's discriminant temp → Const(0), loop-carried values
+    // back-substituted across the single A→B edge.
+    let mut normal_args: Vec<LinkArg> = Vec::with_capacity(ok_link.args.len());
+    let mut payload_positions: Vec<usize> = Vec::new();
+    for (i, arg) in ok_link.args.iter().enumerate() {
+        match arg {
+            LinkArg::Const(c) => normal_args.push(LinkArg::Const(c.clone())),
+            LinkArg::Value(v) if *v == r_b => {
+                normal_args.push(LinkArg::Value(r.clone()));
+                payload_positions.push(i);
+            }
+            LinkArg::Value(v) if *v == disc_var => {
+                normal_args.push(LinkArg::Const(Constant::new(ConstValue::Int(0))));
+            }
+            LinkArg::Value(v) => {
+                let v_a = back_substitute(graph, &[(a, b)], v, &name)?;
+                normal_args.push(LinkArg::Value(v_a));
+            }
+        }
+    }
+    if payload_positions.len() > 1 {
+        return Err(format!(
+            "{name}: drain fuse: Result threaded into {} Ok-arm slots — multi-slot collapse unsafe",
+            payload_positions.len()
+        ));
+    }
+
+    // GAP#3 + collapse precondition (hoisted pre-mutation).  The Ok arm's
+    // `__pos_0[Result::Ok]` read is rewritten to the raw element by the
+    // post-mutation `collapse_pos0_read` at the tail; that call is fallible, so
+    // its precondition is validated HERE, before any mutation, keeping a decline
+    // byte-identical.  The Result carrier must be consumed by EXACTLY the single
+    // `__pos_0[Result::Ok]` read (which must produce a value) and nothing else —
+    // a `__discriminant` read, a second `__pos_0` read, or an exit/switch that
+    // forwards the carrier would all survive the collapse pointing at the raw
+    // element read back as a Result (garbage).
+    if let Some(ok_carrier) = forward_alias(graph, &r_b, &ok_link) {
+        let op_uses: Vec<usize> = graph.blocks[ok_target]
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op_operand_vars(&op.kind).contains(&ok_carrier))
+            .map(|(i, _)| i)
+            .collect();
+        let [read_only] = op_uses.as_slice() else {
+            return Err(format!(
+                "{name}: drain fuse: Ok arm uses the Result carrier in {} ops — \
+                 collapse requires exactly the __pos_0[Result::Ok] read",
+                op_uses.len()
+            ));
+        };
+        let read_op = &graph.blocks[ok_target].operations[*read_only];
+        let is_pos0_read = matches!(&read_op.kind,
+            OpKind::FieldRead { base, field, .. }
+                if *base == ok_carrier
+                    && field.name == "__pos_0"
+                    && field.owner_root.as_deref().is_some_and(|o| owner_is_result_variant(o, "Ok")))
+            && read_op.result.is_some();
+        if !is_pos0_read {
+            return Err(format!(
+                "{name}: drain fuse: Ok arm carrier's sole use is not a value-producing \
+                 __pos_0[Result::Ok] read"
+            ));
+        }
+        // The collapse only rewrites the __pos_0 read; a carrier that also
+        // escapes on an exit or drives the exitswitch would keep pointing at the
+        // now-raw-element inputarg post-fusion.
+        let escapes = graph.blocks[ok_target].exits.iter().any(|l| {
+            l.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == ok_carrier))
+        }) || matches!(&graph.blocks[ok_target].exitswitch,
+            Some(ExitSwitch::Value(v)) if *v == ok_carrier);
+        if escapes {
+            return Err(format!(
+                "{name}: drain fuse: Ok arm forwards the Result carrier past the __pos_0 read"
+            ));
+        }
+    }
+
+    // --- Build the break edge (H → break-target) args, resolving each
+    // original break-link value back toward A scope.  Values defined in the
+    // detached B / Err-arm / bool-switch blocks decline unless they are a
+    // const-justifiable temp: the eq bool (true on the matched arm) and the
+    // Err-arm discriminant (1).  The Result value `r` and any other detached
+    // temp decline — they are not available on the exception edge.
+    // `forwarded` collects the DISTINCT A-scope loop-carried vars the break
+    // edge needs; each becomes a forwarded inputarg of H.
+    // A break-arg resolution: either a constant, or an A-scope var to forward.
+    enum BreakArg {
+        Const(LinkArg),
+        Forward(Variable),
+    }
+    let resolve_break = |x: &LinkArg| -> Result<BreakArg, String> {
+        // Constants ride through unchanged.
+        let LinkArg::Value(x) = x else {
+            let LinkArg::Const(c) = x else { unreachable!() };
+            return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
+        };
+        // Hop bswitch → Err-arm.  The exitswitch bool temp is the only
+        // bswitch-defined value; the break arm never carries it, but guard
+        // it just in case (matched arm ⟹ eq true).
+        if *x == bool_temp {
+            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(ConstValue::Bool(true)))));
+        }
+        let pos = graph.blocks[bswitch]
+            .inputargs
+            .iter()
+            .position(|v| v == x)
+            .ok_or_else(|| format!("{name}: drain fuse: break value defined in bool-switch block"))?;
+        let LinkArg::Value(y) = err_to_bswitch.args.get(pos).ok_or_else(|| {
+            format!("{name}: drain fuse: Err→bool-switch link lacks arg {pos}")
+        })? else {
+            // A const threaded through the bswitch inputarg.
+            let Some(LinkArg::Const(c)) = err_to_bswitch.args.get(pos) else { unreachable!() };
+            return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
+        };
+        let y = y.clone();
+        // Hop Err-arm → B.  Err-arm-defined values (the four guard ops)
+        // decline, except the eq bool (matched arm ⟹ true).
+        if y == eq_result {
+            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(ConstValue::Bool(true)))));
+        }
+        if y == sc || y == err_payload || y == kind_var {
+            return Err(format!(
+                "{name}: drain fuse: break edge carries a detached Err-arm temp (dead `Err(e)` re-bind)"
+            ));
+        }
+        let pos = graph.blocks[err_target]
+            .inputargs
+            .iter()
+            .position(|v| *v == y)
+            .ok_or_else(|| format!("{name}: drain fuse: break value defined in Err-arm block"))?;
+        let LinkArg::Value(z) = err_link.args.get(pos).ok_or_else(|| {
+            format!("{name}: drain fuse: B→Err link lacks arg {pos}")
+        })? else {
+            let Some(LinkArg::Const(c)) = err_link.args.get(pos) else { unreachable!() };
+            return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
+        };
+        let z = z.clone();
+        // Hop B → A.  The Result value declines (invalid on the exception
+        // edge); the discriminant temp is Const(1) on the Err arm; a B
+        // inputarg forwards from the single A→B edge to an A-scope value.
+        if z == r_b {
+            return Err(format!(
+                "{name}: drain fuse: break edge needs the Result value (dead `Err(e)` re-bind reads it)"
+            ));
+        }
+        if z == disc_var {
+            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(ConstValue::Int(1)))));
+        }
+        let pos = graph.blocks[b]
+            .inputargs
+            .iter()
+            .position(|v| *v == z)
+            .ok_or_else(|| format!("{name}: drain fuse: break value defined in discriminant block"))?;
+        match graph.blocks[a].exits[0].args.get(pos) {
+            Some(LinkArg::Const(c)) => Ok(BreakArg::Const(LinkArg::Const(c.clone()))),
+            Some(LinkArg::Value(av)) if *av == *r => Err(format!(
+                "{name}: drain fuse: break edge needs the Result value from A scope"
+            )),
+            Some(LinkArg::Value(av)) => Ok(BreakArg::Forward(av.clone())),
+            None => Err(format!("{name}: drain fuse: A→B link lacks arg {pos}")),
+        }
+    };
+    // --- Classify each break-target slot (MUST-ADD#1).  A transitively-dead
+    // slot — the loop's SSA merge-threads for the Result value, its
+    // discriminant, the caught `e` payload and the guard temps, none read past
+    // the break — is pruned from `break_target` and every predecessor link.  A
+    // live slot (the accumulator carried out of the loop) is resolved back to
+    // an A-scope loop var and forwarded onto the exception edge.
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut dead: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    let mut live_slots: Vec<usize> = Vec::new();
+    for slot in 0..graph.blocks[break_target].inputargs.len() {
+        match crate::front::iter_next::collect_transitive_dead_slots(graph, break_target, slot) {
+            Ok(set) => {
+                for (bb, ss) in set {
+                    dead.entry(bb).or_default().insert(ss);
+                }
+            }
+            Err(_) => live_slots.push(slot),
+        }
+    }
+
+    // Arity guard: removing slot `s` from a block also drops arg `s` from every
+    // predecessor link, so every such link must carry the block's full
+    // pre-removal inputarg arity (mirrors the iter_next transitive prune).
+    for &bb in dead.keys() {
+        let arity = graph.blocks[bb].inputargs.len();
+        for blk in &graph.blocks {
+            for l in &blk.exits {
+                if l.target.0 == bb && l.args.len() != arity {
+                    return Err(format!(
+                        "{name}: drain fuse: predecessor link to block {bb} has arity {} != {arity} \
+                         — unsafe to prune the dead break-edge threads",
+                        l.args.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    // Resolve the surviving (live) break slots back to A scope.  `forwarded`
+    // collects the DISTINCT A-scope loop vars the break edge still needs; each
+    // becomes a forwarded inputarg of H, carried on the exception edge.  A live
+    // const slot cannot be threaded as a Variable through `set_branch`'s
+    // arity-checked link, so decline it.
+    let mut forwarded: Vec<Variable> = Vec::new();
+    let mut break_vars_src: Vec<Variable> = Vec::with_capacity(live_slots.len());
+    for &slot in &live_slots {
+        match resolve_break(&break_link.args[slot])? {
+            BreakArg::Forward(av) => {
+                if !forwarded.contains(&av) {
+                    forwarded.push(av.clone());
+                }
+                break_vars_src.push(av);
+            }
+            BreakArg::Const(c) => {
+                return Err(format!(
+                    "{name}: drain fuse: live break slot carries a const {c:?} — cannot forward via set_branch"
+                ));
+            }
+        }
+    }
+
+    // --- All validation + arg-building passed; mutate. -----------------
+    // Block H's inputargs: [forwarded loop vars..., va(etype,unused), vb(evalue)].
+    let (h_id, h_inputs) = graph.create_block_with_arg_vars(forwarded.len() + 2);
+    // H's `etype` inputarg (slot `forwarded.len()`) is the int-kinded caught
+    // type — unused by the kind test; only `vb` (the evalue) is read.
+    let va_slot = h_inputs[forwarded.len()].clone();
+    let h_vb = h_inputs[forwarded.len() + 1].clone();
+    // Map each forwarded A-scope var to its H inputarg.
+    let h_of = |av: &Variable| -> Variable {
+        let idx = forwarded.iter().position(|v| v == av).expect("forwarded contains av");
+        h_inputs[idx].clone()
+    };
+    // Block R's inputarg: [vb].
+    let (r_id, r_inputs) = graph.create_block_with_arg_vars(1);
+    let r_vb = r_inputs[0].clone();
+
+    // H: `k = exc_kind_discriminant(vb)`; `cmp = (k == 10)`.  `set_branch`
+    // below wraps `cmp` in the `bool` hop the switch condition expects.
+    let k = graph
+        .push_op_var(
+            h_id,
+            OpKind::Call {
+                target: CallTarget::function_path([
+                    "pyre_object",
+                    "interp_exceptions",
+                    "exc_kind_discriminant",
+                ]),
+                args: vec![h_vb.clone()],
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .expect("exc_kind_discriminant produces a value");
+    // 10 == `ExcKind::StopIteration` (pyre-object interp_exceptions.rs); the two
+    // are coupled — renumbering that discriminant silently breaks this test.
+    let c10 = graph
+        .push_op_var(h_id, OpKind::ConstInt(10), true)
+        .expect("ConstInt produces a value");
+    let cmp = graph
+        .push_op_var(
+            h_id,
+            OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: k,
+                rhs: c10,
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .expect("BinOp eq produces a value");
+    // GAP#4: the kind test reads only `vb`; the `etype` slot must stay unused
+    // so the exception edge may thread the caught type in without a live
+    // consumer (H is freshly built here, so this is a construction invariant).
+    debug_assert!(
+        !graph.blocks[h_id.0]
+            .operations
+            .iter()
+            .any(|op| op_operand_vars(&op.kind).contains(&va_slot)),
+        "drain fuse: H references its unused etype inputarg"
+    );
+
+    // R: `v_type = type(vb)`; `goto exceptblock [v_type, vb]`.  DO NOT reuse
+    // `va` (the int-kinded etype); `type(evalue)` recomputes the ref-kind
+    // class the raise tail needs.
+    let v_type = graph
+        .push_op_var(
+            r_id,
+            OpKind::Call {
+                target: CallTarget::function_path(["type"]),
+                args: vec![r_vb.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .expect("type(evalue) produces a value");
+    graph.set_raise_values(r_id, v_type, r_vb);
+
+    // Break edge args in H scope (all forwarded Variables; the dead threads
+    // were pruned, so no const rides the surviving edge).
+    let break_vars: Vec<Variable> = break_vars_src.iter().map(|av| h_of(av)).collect();
+
+    // Drop every dead slot in the transitive chain from its block's inputargs
+    // and from every predecessor link feeding that block (descending indices so
+    // earlier positions stay valid), keeping link arity == target inputarg
+    // arity across the whole graph.  The old bswitch→break_target link is
+    // trimmed here too; H's fresh reduced-arity link is installed below.
+    for (&bb, slots) in dead.iter().rev() {
+        for &s in slots.iter().rev() {
+            graph.blocks[bb].inputargs.remove(s);
+            for blk in &mut graph.blocks {
+                for l in &mut blk.exits {
+                    if l.target.0 == bb {
+                        l.args.remove(s);
+                    }
+                }
+            }
+        }
+    }
+
+    // H: branch on the kind test — `cmp` true (kind == StopIteration) → break
+    // target; false → R (reraise `raise vb`).  `set_branch` wraps `cmp` in
+    // `bool` and installs arity-checked links (MUST-ADD#2).
+    graph.set_branch(
+        h_id,
+        cmp,
+        BlockId(break_target),
+        break_vars,
+        r_id,
+        vec![h_vb.clone()],
+    );
+
+    // A: LastException exits — normal → Ok arm; exception → H (catch-all).
+    // The exc link carries the loop-carried vars H's break edge needs (filling
+    // H's leading inputargs), then the caught `(va, vb)` pair into H's trailing
+    // `(etype, evalue)` slots, naming them as the `last_exception` /
+    // `last_exc_value` extravars (the `?`-diamond shape).
+    let va = graph.alloc_value_var();
+    let vb = graph.alloc_value_var();
+    let exc_vars: Vec<Variable> = forwarded
+        .iter()
+        .cloned()
+        .chain([va.clone(), vb.clone()])
+        .collect();
+    let mut exc_link =
+        Link::from_variables(graph, exc_vars, h_id, Some(crate::model::exception_exitcase()));
+    exc_link.last_exception = Some(LinkArg::Value(va));
+    exc_link.last_exc_value = Some(LinkArg::Value(vb));
+    assert_eq!(
+        normal_args.len(),
+        graph.block(ok_link.target).inputargs.len(),
+        "drain fuse: normal edge arity mismatch"
+    );
+    let normal_link = Link::new_mixed(normal_args, ok_link.target, None);
+    graph.set_control_flow_metadata(
+        BlockId(a),
+        Some(ExitSwitch::LastException),
+        vec![normal_link, exc_link],
+    );
+
+    // The Ok arm reads the payload via `r.__pos_0[Result::Ok]`; with the native
+    // call result flowing directly, that read collapses to `r`.
+    for pos in payload_positions {
+        collapse_pos0_read(graph, ok_link.target, pos, &name)?;
+    }
+
     Ok(())
 }
 

@@ -9853,8 +9853,16 @@ fn _unpackiterable_unknown_length(
         unpackiterable_driver.jit_merge_point(greenkey, w_iterator, items);
         match next(w_iterator) {
             Ok(w_item) => unsafe { pyre_object::listobject::w_list_append(items, w_item) },
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-            Err(e) => return Err(e),
+            // `except OperationError as e: if not e.match(space,
+            // w_StopIteration): raise; break` — the StopIteration test rides
+            // inside the handler (`e` is bound once, consumed only on the
+            // re-raise path), not as a match guard.
+            Err(e) => {
+                if e.kind == crate::PyErrorKind::StopIteration {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     let n = unsafe { pyre_object::listobject::w_list_len(items) };

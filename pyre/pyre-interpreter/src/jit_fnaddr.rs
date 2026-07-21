@@ -538,6 +538,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::lookup_exc_class_for_kind",
         crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
     );
+    // `exc_kind_discriminant` reads the caught exception object's `kind`
+    // discriminant; its residual call rides a C-ABI bridge that returns the
+    // `ExcKind` discriminant in the integer result slot a residual result
+    // register wants.  Emitted by the `try_fuse_drain_match` recognizer
+    // (`front::result_exc`) for the drain loop's exception-edge kind test.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::interp_exceptions::exc_kind_discriminant",
+        "pyre_object::exc_kind_discriminant",
+        crate::opcode_ops::bh_w_exception_get_kind as *const (),
+    );
     // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
     // twin), `dereference` reads the weakref `w_obj_weak` slot
     // (`@jit.dont_look_inside` upstream, the `proxy_type` twin), and

@@ -766,6 +766,13 @@ pub extern "C" fn bh_lookup_exc_class_for_kind(kind_disc: i64) -> i64 {
     lookup_exc_class_for_kind(kind) as i64
 }
 
+/// C-ABI residual bridge for `exc_kind_discriminant`: the caught exception
+/// value rides in as a `PyObjectRef`; its `kind` discriminant rides back as `i64`.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_w_exception_get_kind(evalue: pyre_object::PyObjectRef) -> i64 {
+    pyre_object::interp_exceptions::exc_kind_discriminant(evalue)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

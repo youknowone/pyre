@@ -130,6 +130,9 @@ pub enum ExcKind {
     KeyError = 7,
     AttributeError = 8,
     RuntimeError = 9,
+    // The jd1 drain-match fusion bakes this discriminant as a literal
+    // `ConstInt(10)` kind test (majit-translate front/result_exc.rs); keep the
+    // two in sync — renumbering silently miscompiles the fused break test.
     StopIteration = 10,
     OverflowError = 11,
     ArithmeticError = 12,
@@ -1316,6 +1319,18 @@ pub unsafe fn is_exception(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_exception_get_kind(obj: PyObjectRef) -> ExcKind {
     unsafe { (*(obj as *const W_BaseException)).kind }
+}
+
+/// Reads the caught exception's `kind` discriminant as an integer, the
+/// residual-callable twin of `w_exception_get_kind`.  The tracer cannot
+/// model the raw pointer read, so the JIT residualises the call rather than
+/// tracing into it (`@dont_look_inside`); the residual resolves its address
+/// by qualified path in `jit_trace_fnaddrs`.  A non-inline standalone graph
+/// (unlike the `#[inline]` accessor) is what the census residualises.
+#[majit_macros::dont_look_inside]
+pub fn exc_kind_discriminant(evalue: PyObjectRef) -> i64 {
+    // Safety: `evalue` is a valid `W_BaseException` (the caught exception).
+    unsafe { w_exception_get_kind(evalue) as i64 }
 }
 
 /// Get the Python type name string for an ExcKind.
