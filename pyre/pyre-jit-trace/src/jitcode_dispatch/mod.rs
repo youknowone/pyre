@@ -7161,6 +7161,35 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
     goto_if_not_branch_on(code, op, ctx, condbox, switchcase, target)
 }
 
+/// The unary member of the fused-goto family. `pyjitpl.py`
+/// `opimpl_goto_if_not_int_is_zero` records the condition and hands it to
+/// `opimpl_goto_if_not` with `replace=False`:
+///
+///   condbox = self.execute(rop.INT_IS_ZERO, box)
+///   self.opimpl_goto_if_not(condbox, target, orgpc, replace=False)
+///
+/// Operand layout `iL`: 1B int reg + 2B label.
+fn fused_goto_if_not_int_unary<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_int_reg(code, op, 0, ctx)?;
+    let condbox = record_int_unary(ctx, opcode, a);
+    let switchcase = match ctx.trace_ctx.concrete_of_opref(condbox) {
+        Some(Value::Int(v)) => v,
+        _ => {
+            return Err(DispatchError::GotoIfNotValueNotConcrete {
+                pc: op.pc,
+                value: condbox,
+            });
+        }
+    };
+    let target = read_label(code, op, 1);
+    goto_if_not_branch_on(code, op, ctx, condbox, switchcase, target)
+}
+
 fn fused_goto_if_not_float<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -7328,6 +7357,12 @@ fn handle<Sym: WalkSym>(
         // `condbox = self.execute(rop.<CMP>, b1, b2); self.opimpl_goto_if_not(
         // condbox, target, orgpc, replace=False)`. The fused arm records the
         // same compare and reuses `goto_if_not_branch_on`.
+        // Same shape with one operand; `goto_if_not_int_is_true` has no arm
+        // because the assembler spells that condition as plain `goto_if_not`,
+        // matching the class-attribute alias upstream gives it.
+        "goto_if_not_int_is_zero/iL" => {
+            fused_goto_if_not_int_unary(code, op, ctx, OpCode::IntIsZero)
+        }
         "goto_if_not_int_lt/iiL" => fused_goto_if_not_int(code, op, ctx, OpCode::IntLt),
         "goto_if_not_int_le/iiL" => fused_goto_if_not_int(code, op, ctx, OpCode::IntLe),
         "goto_if_not_int_eq/iiL" => fused_goto_if_not_int(code, op, ctx, OpCode::IntEq),

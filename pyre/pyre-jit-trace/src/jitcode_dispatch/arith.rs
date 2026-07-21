@@ -72,6 +72,23 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     result
 }
 
+/// Record a one-operand integer op and its concrete result. The unary
+/// counterpart of [`record_int_cmp`], for the fused `goto_if_not_int_is_*`
+/// handlers whose condbox comes from `self.execute(rop.INT_IS_*, box)`.
+pub(crate) fn record_int_unary<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    a: OpRef,
+) -> OpRef {
+    let result = ctx.trace_ctx.record_op(opcode, &[a]);
+    if let Some(majit_ir::Value::Int(la)) = ctx.trace_ctx.box_value(a) {
+        let folded = majit_metainterp::eval_unary_i(opcode, la);
+        ctx.trace_ctx
+            .set_opref_concrete(result, majit_ir::Value::Int(folded));
+    }
+    result
+}
+
 /// Record an overflow-checking integer operation and its concrete result.
 ///
 /// RPython parity: `pyjitpl.py opimpl_int_add_jump_if_ovf` records the
