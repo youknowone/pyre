@@ -240,14 +240,15 @@ fn emit_sized_int_store(sink: &mut InstructionSink<'_>, offset: u64, size: usize
     }
 }
 
-/// `(field_size, is_signed)` from an op's FieldDescr; defaults to word-sized
-/// signed when the descr is absent.
+/// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
+/// a FieldDescr; a missing one is an invariant violation, so panic rather than
+/// emit a silently-wrong width.
 fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
     let descr = op.getdescr();
     if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
         return (fd.field_size(), fd.is_field_signed());
     }
-    (std::mem::size_of::<usize>(), true)
+    missing_layout_descr("field descr (size/sign)", op)
 }
 
 /// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
@@ -264,26 +265,27 @@ fn setfield_store_size_from_descr(op: &Op) -> usize {
         }
         return fd.field_size();
     }
-    std::mem::size_of::<usize>()
+    missing_layout_descr("field descr (store size)", op)
 }
 
 fn field_is_float_from_descr(op: &Op) -> bool {
-    op.getdescr()
-        .as_ref()
-        .and_then(|d| d.as_field_descr())
-        .is_some_and(|fd| fd.is_float_field())
+    let descr = op.getdescr();
+    match descr.as_ref().and_then(|d| d.as_field_descr()) {
+        Some(fd) => fd.is_float_field(),
+        None => missing_layout_descr("field descr (is_float)", op),
+    }
 }
 
-/// `(item_size, is_signed)` from an op's ArrayDescr; defaults to 8-byte
-/// signed when the descr is absent.
+/// `(item_size, is_signed)` from an op's ArrayDescr. An array op always carries
+/// an ArrayDescr; a missing one is an invariant violation, so panic.
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
     op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
-        .unwrap_or((8, true))
+        .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
 }
 
 fn array_item_is_float_from_descr(op: &Op) -> bool {
     op.with_array_descr(|ad| ad.item_type() == Type::Float)
-        .unwrap_or(false)
+        .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
 }
 
 /// Dense census of every non-constant Ref-typed value (input arg / op result),
@@ -3638,9 +3640,10 @@ fn build_function(
                 // llmodel.py:778-782: size, type_id, vtable from the size descr.
                 let descr = op.getdescr();
                 let sd = descr.as_ref().and_then(|d| d.as_size_descr());
-                let (size, type_id, vtable) = sd.map_or((16i64, 0i64, 0usize), |sd| {
-                    (sd.size() as i64, sd.type_id() as i64, sd.vtable())
-                });
+                let (size, type_id, vtable) = sd.map_or_else(
+                    || missing_layout_descr("size descr", op),
+                    |sd| (sd.size() as i64, sd.type_id() as i64, sd.vtable()),
+                );
 
                 // Inline nursery bump (rewrite.py malloc fast path, x86
                 // `malloc_cond`): total = align8(max(header+size, MIN)); if
@@ -3817,14 +3820,13 @@ fn build_function(
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos.get().raw();
                 let descr = op.getdescr();
-                let ad = descr.as_ref().and_then(|d| d.as_array_descr());
-                let (base_size, item_size) = ad.map_or((16i64, 8i64), |ad| {
-                    (ad.base_size() as i64, ad.item_size() as i64)
-                });
-                let len_offset = ad
-                    .and_then(|ad| ad.len_descr())
-                    .map_or(0i64, |ld| ld.offset() as i64);
-                let type_id = ad.map_or(0i64, |ad| ad.type_id() as i64);
+                let ad = descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .unwrap_or_else(|| missing_layout_descr("array descr", op));
+                let (base_size, item_size) = (ad.base_size() as i64, ad.item_size() as i64);
+                let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
+                let type_id = ad.type_id() as i64;
 
                 // Inline nursery bump for arrays of a plain type under the
                 // large-object threshold (same fast path as the `New` arm).
@@ -4451,6 +4453,23 @@ fn missing_emit_const(opref: OpRef) -> ! {
     );
 }
 
+/// A memory-access or allocation op reached codegen without the layout descr it
+/// must carry (Field/Array/Size). Emitting a default offset/size/type_id would
+/// silently miscompile — on wasm, offset 0 is valid linear memory, so a bogus
+/// address reads/writes garbage instead of trapping. Fail loud instead. Dead on
+/// valid traces: every such op carries its descr (RPython invariant), and the
+/// native x86 backend defaults identically without ever hitting the default.
+#[cold]
+#[inline(never)]
+fn missing_layout_descr(what: &str, op: &Op) -> ! {
+    panic!(
+        "wasm codegen: {what} is absent for {:?} — a memory-access/allocation op \
+         must carry its layout descr; a default offset/size/type_id would \
+         silently miscompile.",
+        op.opcode
+    );
+}
+
 /// Resolve a constant operand's i64 bits: the inline `Const` value if the
 /// variant carries one (`history.py:227/268/314`), else the legacy pool entry.
 /// A pool miss panics via [`missing_emit_const`] rather than falling back to a
@@ -4515,7 +4534,7 @@ fn field_offset_from_descr(op: &Op) -> u64 {
             return fd.offset() as u64;
         }
     }
-    0
+    missing_layout_descr("field descr (offset)", op)
 }
 
 /// `(length-field offset, length-field size)` from an op's ArrayDescr length
@@ -4532,7 +4551,7 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
             .map(|ld| (ld.offset() as u64, ld.field_size()))
     })
     .flatten()
-    .unwrap_or((8, std::mem::size_of::<usize>()))
+    .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
 }
 
 /// Compute array element address: base + base_size + index * item_size.
@@ -4545,7 +4564,7 @@ fn emit_array_addr(
 ) {
     let (base_size, item_size) = op
         .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
-        .unwrap_or((16, 8));
+        .unwrap_or_else(|| missing_layout_descr("array descr (base/item size)", op));
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref()); // array ptr
     sink.i32_wrap_i64();
     // base + base_size + index * item_size
