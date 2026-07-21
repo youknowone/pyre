@@ -7,8 +7,9 @@ mirrors ``_collectionsmodule.c``'s ``defaultdict``:
 
 * ``__init__`` takes the ``default_factory`` (``None`` or a callable) as the
   first positional argument and forwards the rest to ``dict.__init__``.
-* ``__missing__`` stores and returns ``default_factory()`` for an absent key,
-  or raises ``KeyError(key)`` when there is no factory.
+* ``__missing__`` calls ``default_factory()`` and atomically inserts its value
+  only if the key is still absent, or raises ``KeyError(key)`` when there is
+  no factory.
 * ``__reduce__`` returns ``(type, args, None, None, iter(items))`` where
   ``args`` is ``()`` for a ``None`` factory and ``(factory,)`` otherwise.
 * ``copy``/``__copy__``, ``__or__``/``__ror__`` and ``__repr__`` preserve the
@@ -44,8 +45,10 @@ class defaultdict(dict):
         factory = self.default_factory
         if factory is None:
             raise KeyError(key)
-        self[key] = value = factory()
-        return value
+        # CPython 3.14 `defdict_missing` uses `PyDict_SetDefaultRef`, not an
+        # unconditional assignment.  The factory can re-enter this mapping
+        # and populate the same key; in that case the inner value wins.
+        return dict.setdefault(self, key, factory())
 
     def __reduce__(self):
         if self.default_factory is None:

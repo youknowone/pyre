@@ -1,4 +1,33 @@
-from collections import deque
+from collections import defaultdict, deque
+
+
+# Python 3.14's defaultdict.__missing__ preserves a value installed by a
+# re-entrant factory call instead of overwriting it with the outer result.
+defaultdict_key = "conflict"
+defaultdict_calls = 0
+
+
+def reentrant_default_factory():
+    global defaultdict_calls
+    defaultdict_calls += 1
+    call = defaultdict_calls
+    if call == 1:
+        reentrant_defaultdict[defaultdict_key]
+    return call
+
+
+reentrant_defaultdict = defaultdict(reentrant_default_factory)
+assert reentrant_defaultdict[defaultdict_key] == 2
+assert defaultdict_calls == 2
+
+
+class DefaultDictSetDefaultOverride(defaultdict):
+    def setdefault(self, *args):
+        raise AssertionError("defaultdict.__missing__ called overridden setdefault")
+
+
+setdefault_override = DefaultDictSetDefaultOverride(lambda: 3)
+assert setdefault_override["key"] == 3
 
 d = deque([0, 1, 2])
 
