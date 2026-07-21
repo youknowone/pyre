@@ -2134,18 +2134,77 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
     false
 }
 
+/// True when a path reachable from `position` reads the walker's active
+/// exception (`last_exception/>i` / `last_exc_value/>r`) before reaching the
+/// `catch_exception/L` that would replace it.
+///
+/// The jitcode is one flat byte stream whose blocks are stitched together by
+/// `goto/L` labels, so the block that physically follows an op is frequently
+/// not its successor. Advancing by `op.next_pc` alone therefore walks out of
+/// the current block and answers from whatever block the assembler happened to
+/// place next — reporting that block's `catch_exception/L` while the real
+/// successor reads the exception. The residual-call sites act on that answer by
+/// clearing `last_exc_value`, so the read then finds no active exception and
+/// the walk aborts (`LastExcValueWithoutActiveException`) for the whole run.
+///
+/// Labels are followed instead: `goto/L` continues at its target,
+/// `goto_if_not/iL` queues its taken arm and continues on the fall-through, and
+/// ops that end a path stop it — `catch_exception/L` because the handler it
+/// introduces installs a fresh exception, `raise`/`reraise` because they
+/// replace the current one, and the `*_return` family because the frame is
+/// gone. Targets are visited once, which bounds the walk across back edges.
+///
+/// Both answers are recoverable: a spurious `false` clears an exception a later
+/// read wants, a spurious `true` leaves one live for a later
+/// `catch_exception/L` to reject. Each ends the walk in a typed
+/// [`DispatchError`] and falls back to the interpreter, so neither can produce
+/// a wrong result.
 fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
+    // Arms queued by a conditional branch, and the jump targets already
+    // started from. Both stay empty on a straight-line answer.
+    let mut pending: Vec<usize> = Vec::new();
+    let mut started: Vec<usize> = Vec::new();
     let mut pc = position;
-    while let Some(op) = decode_op_at(code, pc) {
-        if op.key == "catch_exception/L" {
-            return false;
+    loop {
+        let path_continues = match decode_op_at(code, pc) {
+            None => false,
+            Some(op) => match op.key {
+                "last_exception/>i" | "last_exc_value/>r" => return true,
+                "catch_exception/L" | "raise/r" | "reraise/" | "int_return/i" | "int_return/c"
+                | "ref_return/r" | "float_return/f" | "void_return/" => false,
+                "goto/L" => {
+                    let target = read_label(code, &op, 0);
+                    let fresh = !started.contains(&target);
+                    if fresh {
+                        started.push(target);
+                        pc = target;
+                    }
+                    fresh
+                }
+                "goto_if_not/iL" => {
+                    // Operand layout `iL`: the label sits after the 1-byte
+                    // Int register.
+                    let target = read_label(code, &op, 1);
+                    if !started.contains(&target) {
+                        started.push(target);
+                        pending.push(target);
+                    }
+                    pc = op.next_pc;
+                    true
+                }
+                _ => {
+                    pc = op.next_pc;
+                    true
+                }
+            },
+        };
+        if !path_continues {
+            match pending.pop() {
+                Some(next) => pc = next,
+                None => return false,
+            }
         }
-        if matches!(op.key, "last_exception/>i" | "last_exc_value/>r") {
-            return true;
-        }
-        pc = op.next_pc;
     }
-    false
 }
 
 /// Read a 2-byte little-endian descr index operand and resolve to
