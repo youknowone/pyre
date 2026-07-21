@@ -935,9 +935,30 @@ pub(crate) unsafe fn normalize_slice(
     index: PyObjectRef,
     length: i64,
 ) -> Result<(i64, i64, i64), PyError> {
+    // A null Ref for a slice operand is silently misread on wasm: `is_none(null)`
+    // is false (no deref), so the null flows into `eval_slice_index` ->
+    // `getindex_w`, which reads `ob_type` at guest offset 0 (valid linear memory
+    // on wasm) and returns garbage instead of trapping. Trap loudly and name the
+    // operand so a wasm run pins which Ref is null.
+    assert!(
+        !index.is_null(),
+        "normalize_slice: slice object Ref is null (wasm offset-0 silent-null); length={length}"
+    );
     let start_obj = w_slice_get_start(index);
     let stop_obj = w_slice_get_stop(index);
     let step_obj = w_slice_get_step(index);
+    assert!(
+        !start_obj.is_null(),
+        "normalize_slice: slice.start Ref is null (wasm offset-0 silent-null); length={length}"
+    );
+    assert!(
+        !stop_obj.is_null(),
+        "normalize_slice: slice.stop Ref is null (wasm offset-0 silent-null); length={length}"
+    );
+    assert!(
+        !step_obj.is_null(),
+        "normalize_slice: slice.step Ref is null (wasm offset-0 silent-null); length={length}"
+    );
     let step = if is_none(step_obj) {
         1
     } else {
