@@ -4478,6 +4478,36 @@ fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
     Vec::new()
 }
 
+/// A legacy pool-indexed const that is absent from the constants pool at emit
+/// time is an optimizer-seeding invariant violation — panic loudly, matching
+/// `collect_constants_from_ops`' `missing_legacy_const`, instead of emitting a
+/// silent `0`. On native a null Ref traps on the first dereference; wasm's
+/// offset 0 is valid linear memory, so a silent `0` is read as garbage and
+/// miscompiles quietly rather than crashing.
+#[cold]
+#[inline(never)]
+fn missing_emit_const(opref: OpRef) -> ! {
+    panic!(
+        "wasm emit_resolve: legacy pool-indexed const OpRef (raw={}) is absent \
+         from the constants pool — the optimizer producer must seed it (or mint \
+         an inline Const) instead of emitting a silent 0.",
+        opref.raw()
+    );
+}
+
+/// Resolve a constant operand's i64 bits: the inline `Const` value if the
+/// variant carries one (`history.py:227/268/314`), else the legacy pool entry.
+/// A pool miss panics via [`missing_emit_const`] rather than falling back to a
+/// silent `0`.
+fn resolve_const_bits(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> i64 {
+    opref.inline_const_bits().unwrap_or_else(|| {
+        constants
+            .get(&opref.raw())
+            .copied()
+            .unwrap_or_else(|| missing_emit_const(opref))
+    })
+}
+
 fn emit_resolve(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -4485,10 +4515,7 @@ fn emit_resolve(
     opref: OpRef,
 ) {
     if opref.is_constant() {
-        // history.py:227/268/314 — inline-Const variants carry value inline.
-        let val = opref
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
+        let val = resolve_const_bits(constants, opref);
         sink.i64_const(val);
     } else {
         sink.local_get(1 + opref.raw());
@@ -4507,9 +4534,7 @@ fn emit_resolve_f64(
     opref: OpRef,
 ) {
     if opref.is_constant() {
-        let val = opref
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
+        let val = resolve_const_bits(constants, opref);
         sink.i64_const(val);
         sink.f64_reinterpret_i64();
     } else {
@@ -4521,11 +4546,9 @@ fn emit_resolve_f64(
 /// Compile-time value of a constant operand (what `emit_resolve` would push
 /// as `i64.const`), or `None` for a runtime value.
 fn const_operand_value(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> Option<i64> {
-    opref.is_constant().then(|| {
-        opref
-            .inline_const_bits()
-            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0))
-    })
+    opref
+        .is_constant()
+        .then(|| resolve_const_bits(constants, opref))
 }
 
 /// Extract field offset from op's descr (FieldDescr).
