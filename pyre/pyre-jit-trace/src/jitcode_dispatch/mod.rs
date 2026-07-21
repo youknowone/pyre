@@ -478,9 +478,16 @@ pub struct WalkSession {
     /// `ref_pop/>r` reads it back into a dst register.  Persisted on the
     /// per-walk session because a push and its matching pop straddle
     /// intervening `*_copy` ops within one trampoline.
+    ///
+    /// The Ref and Int banks carry their concrete shadow alongside the OpRef,
+    /// because those shadows live in the `concrete_registers_{r,i}` side
+    /// tables: moving the OpRef alone would leave the destination slot's
+    /// shadow describing whatever value the move overwrote.  The Float bank
+    /// resolves concretes from the OpRef itself, so it needs no companion.
     pub tmpreg_r: OpRef,
     pub tmpreg_r_concrete: ConcreteValue,
     pub tmpreg_i: OpRef,
+    pub tmpreg_i_concrete: ConcreteValue,
     pub tmpreg_f: OpRef,
 }
 
@@ -492,6 +499,7 @@ impl Default for WalkSession {
             tmpreg_r: OpRef::NONE,
             tmpreg_r_concrete: ConcreteValue::Null,
             tmpreg_i: OpRef::NONE,
+            tmpreg_i_concrete: ConcreteValue::Null,
             tmpreg_f: OpRef::NONE,
         }
     }
@@ -8078,28 +8086,29 @@ fn handle<Sym: WalkSym>(
         }
         "int_push/i" => {
             // Blackhole `bhimpl_int_push` (`blackhole.py`):
-            // `self.tmpreg_i = a`.  Int-bank sibling of `ref_push/r`.
+            // `self.tmpreg_i = a`.  Int-bank sibling of `ref_push/r`,
+            // stashing the concrete shadow alongside the OpRef.
             // Operand layout `i`: 1B src.
             let src_val = read_int_reg(code, op, 0, ctx)?;
-            ctx.session.borrow_mut().tmpreg_i = src_val;
+            let src_concrete = read_int_reg_concrete(code, op, 0, ctx);
+            {
+                let mut sess = ctx.session.borrow_mut();
+                sess.tmpreg_i = src_val;
+                sess.tmpreg_i_concrete = src_concrete;
+            }
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "int_pop/>i" => {
-            // Blackhole `bhimpl_int_pop` (`blackhole.py`).
+            // Blackhole `bhimpl_int_pop` (`blackhole.py`).  Writes through
+            // `write_int_reg` so `concrete_registers_i[dst]` tracks the value
+            // the move restores instead of the one it overwrote.
             // Operand layout `>i`: 1B dst.
-            let val = ctx.session.borrow().tmpreg_i;
+            let (val, concrete) = {
+                let sess = ctx.session.borrow();
+                (sess.tmpreg_i, sess.tmpreg_i_concrete)
+            };
             let dst = code[op.pc + 1] as usize;
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = val;
+            write_int_reg(ctx, op.pc, dst, val, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "float_push/f" => {
@@ -8110,7 +8119,10 @@ fn handle<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "float_pop/>f" => {
-            // Blackhole `bhimpl_float_pop` (`blackhole.py`).
+            // Blackhole `bhimpl_float_pop` (`blackhole.py`).  The Float bank
+            // resolves concretes from the OpRef itself
+            // (`read_float_reg_concrete`) rather than a side table, so moving
+            // the OpRef carries the concrete with it.
             // Operand layout `>f`: 1B dst.
             let val = ctx.session.borrow().tmpreg_f;
             let dst = code[op.pc + 1] as usize;

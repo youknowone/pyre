@@ -10748,3 +10748,78 @@ fn callee_vable_ref_gates_on_frame_register_identity() {
     assert_eq!(super::callee_vable_ref_at(Some(&shadow), u16::MAX, 3), None);
     assert_eq!(super::callee_vable_ref_at(None, 1, 3), None);
 }
+
+/// `insert_renamings` routes a cyclic parallel move through the Int scratch
+/// (`int_push/i` then `int_pop/>i`).  The pop must land the source's concrete
+/// shadow in `concrete_registers_i[dst]`; leaving the destination slot's old
+/// shadow behind makes every later `read_int_reg_concrete` on that register
+/// report the value the move overwrote.
+#[test]
+fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
+    let push_byte = *insns_opname_to_byte()
+        .get("int_push/i")
+        .expect("int_push must be in the runtime instruction table");
+    let pop_byte = *insns_opname_to_byte()
+        .get("int_pop/>i")
+        .expect("int_pop must be in the runtime instruction table");
+    // Push r0, pop into r1: r1's pre-existing shadow must not survive.
+    let code = [push_byte, 0, pop_byte, 1];
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let src = OpRef::input_arg_int(0);
+    let dst_before = OpRef::input_arg_int(1);
+    tc.set_opref_concrete(src, Value::Int(7));
+    tc.set_opref_concrete(dst_before, Value::Int(99));
+    let mut regs_i = vec![src, dst_before];
+    let mut concrete_i = vec![ConcreteValue::Int(7), ConcreteValue::Int(99)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("`int_push/i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2);
+    let (outcome, next_pc) = step(&code, next_pc, &mut wc).expect("`int_pop/>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 4);
+    assert_eq!(wc.registers_i[1], src, "the pop moves the source OpRef");
+    assert_eq!(
+        wc.concrete_registers_i[1],
+        ConcreteValue::Int(7),
+        "the pop must overwrite the destination's stale concrete shadow",
+    );
+}
