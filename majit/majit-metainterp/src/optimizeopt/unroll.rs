@@ -956,7 +956,8 @@ impl UnrollOptimizer {
         opt_p2.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
         opt_p2.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
         opt_p2.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
-        opt_p2.snapshot_extra_virtual_roots = std::mem::take(&mut self.snapshot_extra_virtual_roots);
+        opt_p2.snapshot_extra_virtual_roots =
+            std::mem::take(&mut self.snapshot_extra_virtual_roots);
         opt_p2.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
         opt_p2.call_pure_results = std::mem::take(&mut self.call_pure_results);
         // RPython: same Optimizer instance keeps patchguardop across phases.

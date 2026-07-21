@@ -10072,7 +10072,11 @@ mod tests {
         // or an empty nested container is admitted: an Object-strategy append's
         // only residual is the idempotent `list_write_barrier`, exempt from the
         // FBW body-effect gate. An empty `[]` element is Empty-strategy (no
-        // backing block), so it does not hit the nested-backing-block gap below.
+        // backing block). A non-empty nested `BUILD_LIST` element (`[[i] …]`) is
+        // also admitted (`nested_list_fold_virt_enabled`, default-on): with the
+        // trace-time single-executor forks retired the inner list's separately
+        // allocated backing block is bound at every guard-exit deopt without an
+        // extra resume-data root.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [i + 1 for i in range(n)]\n",
@@ -10083,33 +10087,13 @@ mod tests {
             "def f(n):\n    return [{i: i} for i in range(n)]\n",
             "def f(n):\n    return [f'{i}' for i in range(n)]\n",
             "def f(n):\n    return [[] for i in range(n)]\n",
-        ] {
-            let module = compile_exec(source).expect("test code should compile");
-            let code = function_code_from_module(&module, "f");
-            assert!(for_iter_bodies_all_jit_safe(&code));
-            assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
-        }
-    }
-
-    #[test]
-    fn for_iter_nonempty_nested_list_comprehension_body_declines() {
-        // A non-empty nested `BUILD_LIST` element (`[[i] …]`) declines: the fold
-        // virtualizes the inner list but leaves its separately allocated backing
-        // block unthreaded into the append commit sub-walk's guard-exit resume
-        // data, so a deopt crashes on a null OpRef. Held back until the orthodox
-        // recursive virtual-list forcing lands.
-        use pyre_interpreter::compile_exec;
-        for source in [
             "def f(n):\n    return [[i] for i in range(n)]\n",
             "def f(n):\n    return [[i, i + 1] for i in range(n)]\n",
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(!for_iter_bodies_all_jit_safe(&code));
-            assert_eq!(
-                unsupported_jit_shape(&code),
-                UnsupportedJitShape::CurrentFrameOnly
-            );
+            assert!(for_iter_bodies_all_jit_safe(&code));
+            assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
         }
     }
 

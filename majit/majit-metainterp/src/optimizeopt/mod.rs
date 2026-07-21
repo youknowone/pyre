@@ -6346,10 +6346,12 @@ impl OptContext {
         // (empty except behind PYRE_NESTED_LIST_FOLD_VIRT). Stored as untyped
         // SnapshotBoxes so they ride the same unroll/bridge OpRef remap as the
         // vable/vref sections; finish() only reads their position OpRef.
-        let extra_virtual_roots: Vec<OpRef> =
-            snapshot_get(&self.snapshot_extra_virtual_roots, op.rd_resume_position.get())
-                .map(|boxes| boxes.iter().map(|b| b.opref()).collect())
-                .unwrap_or_default();
+        let extra_virtual_roots: Vec<OpRef> = snapshot_get(
+            &self.snapshot_extra_virtual_roots,
+            op.rd_resume_position.get(),
+        )
+        .map(|boxes| boxes.iter().map(|b| b.opref()).collect())
+        .unwrap_or_default();
 
         // resume.py:428-445, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
