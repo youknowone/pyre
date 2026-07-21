@@ -144,6 +144,70 @@ fn times_result_seq_type() -> PyObjectRef {
     })
 }
 
+/// Split `path` into the root and everything after it, the way
+/// `ntpath.splitroot` splits it three ways with the drive and the root joined
+/// back together.
+///
+/// `_bootstrap_external._path_join` maps this over its parts and classifies
+/// each result: a root that starts or ends with a separator is absolute, one
+/// ending in `:` is drive-relative, anything else is a plain relative part.
+///
+/// Both separators count, so the tests are taken on a copy with `/` rewritten
+/// to `\`; that rewrite is character-for-character, so an offset into it
+/// addresses the same character of the original. The offsets are per
+/// character rather than per byte, which is what makes `"ä:\x"` take the
+/// drive branch — at byte 1 it would be a continuation byte and take none.
+///
+/// Compiled everywhere so the tests run on every platform; only the Windows
+/// build has a caller.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn split_root(path: &str) -> (&str, &str) {
+    const SEP: char = '\\';
+    const UNC_PREFIX: &str = "\\\\?\\UNC\\";
+
+    let norm: Vec<char> = path
+        .chars()
+        .map(|c| if c == '/' { SEP } else { c })
+        .collect();
+    let byte_at = |index: usize| {
+        path.char_indices()
+            .nth(index)
+            .map_or(path.len(), |(offset, _)| offset)
+    };
+    let sep_from = |start: usize| {
+        norm.get(start..)
+            .and_then(|rest| rest.iter().position(|&c| c == SEP))
+            .map(|offset| offset + start)
+    };
+
+    if norm.first() != Some(&SEP) {
+        if norm.get(1) == Some(&':') {
+            // `X:\Windows` keeps the separator in the root; `X:Windows` names
+            // a location on the drive's own cursor and has no root at all.
+            let split = if norm.get(2) == Some(&SEP) { 3 } else { 2 };
+            return path.split_at(byte_at(split));
+        }
+        return ("", path);
+    }
+    if norm.get(1) != Some(&SEP) {
+        // A path rooted on the current drive, e.g. `\Windows`.
+        return path.split_at(byte_at(1));
+    }
+    // A UNC share (`\\server\share`, `\\?\UNC\server\share`) or a device
+    // (`\\.\device`): the root runs to the separator after the share name,
+    // and a path that never reaches a second separator is all root.
+    let unc = norm.len() >= 8
+        && norm[..8]
+            .iter()
+            .map(|c| c.to_ascii_uppercase())
+            .eq(UNC_PREFIX.chars());
+    let start = if unc { 8 } else { 2 };
+    match sep_from(start).and_then(|index| sep_from(index + 1)) {
+        Some(index) => path.split_at(byte_at(index + 1)),
+        None => (path, ""),
+    }
+}
+
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
@@ -834,6 +898,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "replace",
         crate::make_builtin_function("replace", |args| rename_impl(args, "replace")),
+    );
+
+    // ── posix._path_splitroot(path) → (root, tail) ──
+    // Registered only where `sys.platform` is `win32`, the same condition
+    // `_bootstrap_external` gates its use on.
+    #[cfg(windows)]
+    crate::module_ns_store(
+        ns,
+        "_path_splitroot",
+        crate::make_builtin_function_with_arity(
+            "_path_splitroot",
+            |args| {
+                let Some(&arg) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "_path_splitroot() missing required argument 'path'",
+                    ));
+                };
+                let path = extract_path(arg)?;
+                let (root, tail) = split_root(&path);
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_str_new(root),
+                    pyre_object::w_str_new(tail),
+                ]))
+            },
+            1,
+        ),
     );
 
     // ── posix.listdir(path=".") → list of str ──
@@ -3420,4 +3510,59 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     crate::module_ns_store(ns, "error", crate::typedef::w_object());
+}
+
+#[cfg(test)]
+mod split_root_tests {
+    use super::split_root;
+
+    /// Expectations taken from `ntpath.splitroot`, whose three-way split
+    /// joins drive and root into the root this returns.
+    #[test]
+    fn matches_ntpath_splitroot() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("", "", ""),
+            ("Windows", "", "Windows"),
+            ("a/b", "", "a/b"),
+            ("\\", "\\", ""),
+            ("/", "/", ""),
+            ("\\Windows", "\\", "Windows"),
+            ("/Windows", "/", "Windows"),
+            ("C:", "C:", ""),
+            ("C:a", "C:", "a"),
+            ("C:\\", "C:\\", ""),
+            ("C:/Windows", "C:/", "Windows"),
+            (":a", "", ":a"),
+            ("\\\\server", "\\\\server", ""),
+            ("\\\\server\\share", "\\\\server\\share", ""),
+            ("\\\\server\\share\\", "\\\\server\\share\\", ""),
+            ("\\\\server\\share\\dir", "\\\\server\\share\\", "dir"),
+            ("//server/share/dir", "//server/share/", "dir"),
+            ("\\\\.\\device\\x", "\\\\.\\device\\", "x"),
+            ("\\\\?\\C:\\x", "\\\\?\\C:\\", "x"),
+            (
+                "\\\\?\\UNC\\server\\share\\dir",
+                "\\\\?\\UNC\\server\\share\\",
+                "dir",
+            ),
+            ("//?/unc/server/share/dir", "//?/unc/server/share/", "dir"),
+            // No separator after the share name, so the whole path is root.
+            ("\\\\\\a", "\\\\\\a", ""),
+            // Offsets address characters: the drive branch is taken here.
+            ("\u{e4}:\\x", "\u{e4}:\\", "x"),
+            (
+                "\\\\s\u{e4}rver\\share\\dir",
+                "\\\\s\u{e4}rver\\share\\",
+                "dir",
+            ),
+        ];
+        for &(path, root, tail) in cases {
+            assert_eq!(split_root(path), (root, tail), "split_root({path:?})");
+            assert_eq!(
+                format!("{root}{tail}"),
+                path,
+                "split_root({path:?}) lost characters"
+            );
+        }
+    }
 }
