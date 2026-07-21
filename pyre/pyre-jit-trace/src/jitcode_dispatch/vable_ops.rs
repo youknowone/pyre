@@ -173,7 +173,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 /// full `_nonstandard_virtualizable` -> SETFIELD_GC fallback +
 /// `virtualizable_boxes[index] = valuebox` write + `synchronize_virtualizable`
 /// mirror.  The concrete `Value` is reconstructed via
-/// `TraceCtx::concrete_of_opref` (matches the trait-leg's
+/// `TraceCtx::concrete_of_opref` (matching the
 /// `pyjitpl/dispatch.rs:1608-1609` shape `let (value, concrete) =
 /// self.read_<bank>_reg(src); ctx.vable_setfield(...)`).
 ///

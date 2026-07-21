@@ -91,8 +91,8 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
         // store-back are not yet wired with a resume snapshot / FieldDescr
         // for the own-portal compile (only the inline sub-walk path below
         // is), so the optimizer's `store_final_boxes_in_guard` /
-        // `optimize_setfield_gc` would trip. Abort to the trait interpreter
-        // rather than compile a trace that cannot be finalized.
+        // `optimize_setfield_gc` would trip. Abort to the interpreter rather
+        // than compile a trace that cannot be finalized.
         return Err(DispatchError::NonStandardVableFinishPortalUnsupported { pc: op_pc });
     }
     // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
@@ -281,7 +281,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // The jitcode-pc→py-pc inversion can land on a Python trivia
                 // instruction's jitcode region (e.g. a branch target
                 // whose block lowers `NOT_TAKEN`).  A resume coordinate
-                // must be a real opcode: the trait path resumes branches
+                // must be a real opcode: the interpreter resumes branches
                 // at `semantic_fallthrough_pc` / `jump_target_forward`,
                 // both of which forward-skip trivia.  Advance to the same
                 // real opcode so the resume reader's BACKWARD trivia
@@ -553,7 +553,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // resume boxes from `registers_r[index]` via the per-PC `-live-`
             // set.
             // Capture-only: writes the transient snapshot overlay, never the live
-            // shadow (the trace_opcode.rs:2218 bridge-NULL constraint holds).
+            // shadow (the trace_opcode.rs bridge-NULL constraint holds).
             let mut stack_sync: Vec<(usize, OpRef)> = if guard_py_pc.is_some()
                 && sym.owns_virtualizable_shadow()
                 && !sym.jitcode().is_null()
@@ -989,7 +989,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
 ///
 /// The caller resumes at the CALL's return point (fallthrough) with the
 /// not-yet-produced call-result slot nulled — `get_list_of_active_boxes(
-/// in_a_call=true)` parity (`trace_opcode.rs:1779`).  Reuses
+/// in_a_call=true)` parity (`trace_opcode.rs`). Reuses
 /// [`collect_outer_active_boxes`] (the caller owns the portal virtualizable)
 /// after temporarily nulling the result slot's register.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

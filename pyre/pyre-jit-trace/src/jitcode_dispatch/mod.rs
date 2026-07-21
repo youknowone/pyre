@@ -705,8 +705,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// Whether this walk is the SOLE concrete-execution leg.
     ///
     /// `false` (shadow validation, the diagnostic full-body probe,
-    /// tests): a separate concrete interpreter (the Python interpreter
-    /// on the trait path, or none for the discard-the-trace probe) is
+    /// tests): a separate concrete interpreter (the Python interpreter,
+    /// or none for the discard-the-trace probe) is
     /// authoritative, so the walker must NOT re-execute may-force
     /// residual calls — doing so would double their side effects /
     /// corrupt the live heap (`cut_trace` rolls back only the IR
@@ -796,12 +796,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// Set by `raise/r` (walker side) alongside `last_exc_value`, by
     /// the `inline_call` SubRaise arm when it catches at
     /// `catch_exception/L`, and by `dispatch_via_miframe`'s entry
-    /// from `sym.last_exc_value` when the trait path seeded the
-    /// exception via the retired trait-side raise path.
+    /// from `sym.last_exc_value` when an adapter caller seeded the exception.
     ///
     /// `ConcreteValue::Null` means "no active exception concrete
     /// known" — matches `last_exc_value == None` for the common case,
-    /// or means the trait-path seeded only the symbolic OpRef without
+    /// or means an adapter caller seeded only the symbolic OpRef without
     /// a concrete (e.g. a synthetic test fixture).
     pub last_exc_value_concrete: ConcreteValue,
     /// Outer snapshot coordinate. Root entries keep `MIFrame.orgpc`; every
@@ -1035,10 +1034,7 @@ pub enum DispatchOutcome {
     /// `self.compile_trace(live_arg_boxes, ptoken)`; "raises in case it
     /// works"). The tracing session was consumed by `compile_trace`;
     /// the walk must stop without compiling or aborting again. The
-    /// driver maps this to `TraceAction::CompileTrace` — the same
-    /// action the trait leg produces via
-    /// `driver.compile_trace_success_pending()`
-    /// (`trace_opcode.rs trace_step_result_to_action`).
+    /// driver maps this to `TraceAction::CompileTrace`.
     ///
     /// `loop_header_pc` is the merge point's python pc (the
     /// `jit_merge_point` `next_instr`), carried so the walk driver can
@@ -1352,8 +1348,8 @@ pub enum DispatchError {
     /// `heapcache.nonstandard_virtualizables_now_known(box)`, which would
     /// feed `OpRef::None` (`raw() == u32::MAX`) into the dense heapcache
     /// flag `Vec<u32>`, resizing it to `u32::MAX + 1` (16 GiB). Surface as
-    /// a trace abort so production falls back to trait dispatch rather
-    /// than allocating.
+    /// a trace abort so production resumes in the interpreter rather than
+    /// allocating; no compiled trace is produced.
     VableBoxNotSeeded { pc: usize },
     /// `{get,set}arrayitem_vable_*` / `arraylen_vable` decoded its
     /// `(VableArray, Array)` descr-pool pair but one of the two slots
@@ -1526,7 +1522,7 @@ pub enum DispatchError {
     /// `FieldDescr` for those internal ops (only the inline sub-walk path
     /// does), so compiling the trace trips the optimizer's
     /// `store_final_boxes_in_guard` / `optimize_setfield_gc` invariants.
-    /// Abort to the trait interpreter; the method runs interpreted until the
+    /// Abort to the interpreter; the method runs interpreted until the
     /// own-portal callee frame is registered as the standard virtualizable
     /// (a perf follow-up).
     NonStandardVableFinishPortalUnsupported { pc: usize },
@@ -1537,8 +1533,8 @@ pub enum DispatchError {
     /// the fast-path register-seeding inline (`try_walker_inline_user_call`)
     /// declines.  Emitting the residual leaves the callee re-interpreted per
     /// iteration (and its short inner loops compile + deopt-storm), strictly
-    /// slower than interpreting.  The trait tracer inlines such callees via
-    /// `push_inline_frame` + the `recursive-call-assembler` loop back-edge
+    /// slower than interpreting. The retired MIFrame tracer inlined such
+    /// callees via `push_inline_frame` + the `recursive-call-assembler` loop back-edge
     /// (`pyjitpl.rs` opimpl_recursive_call_assembler).  Surface a typed
     /// abort so the key interprets without JIT (`FBW_DECLINED_KEYS`) until
     /// the walker itself covers loop-callee inlining (task #62, the Phase-6
@@ -2525,13 +2521,9 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// RPython parity context: in RPython the metainterp loop iterates
 /// over `metainterp.framestack[-1].pc` calling `bytecode_step` which
 /// dispatches to the right `opimpl_*`. There's no separate "walker
-/// entry" because the metainterp loop *is* the walker. Pyre is
-/// mid-migration: the production tracing path today is the
-/// trait-driven `MIFrame::execute_opcode_step` (`trace_opcode.rs`);
-/// this entry point lets shadow execution + per-opcode migration
-/// drive the orthodox walker
-/// against the same MIFrame state without first replacing the trait
-/// dispatch wholesale.
+/// entry" because the metainterp loop *is* the walker. This entry
+/// point is pyre's equivalent: it drives the walker against the
+/// supplied `MIFrame` state and is the sole production tracing path.
 ///
 /// Field plumbing:
 /// * `registers_r/i/f` — allocated fresh per call sized to
@@ -2570,9 +2562,8 @@ fn dispatch_switch_id<Sym: WalkSym>(
 ///   D-3) drives this for per-Python-opcode arms — a Python-opcode arm
 ///   compiled by the codewriter ends with `*_return/*` (since each arm
 ///   is a self-contained sub-jitcode invoked from the outer dispatcher
-///   via `inline_call_r_r/dR>r`), and the trait dispatch path emits
-///   no FINISH per Python opcode, so shadow mode must NOT emit one
-///   either.
+///   via `inline_call_r_r/dR>r`), so shadow mode must NOT emit a FINISH
+///   per Python opcode.
 ///
 /// Sub-walks driven by `inline_call_r_r/dR>r` recursion always set
 /// `is_top_level=false` regardless of this caller-side flag (the
@@ -2931,8 +2922,8 @@ fn jitcode_has_exception_handler(code: &[u8]) -> bool {
 /// `int_lt`/… result because the generic `compare` helper returns a Ref, but
 /// the immediately-following `POP_JUMP_IF_*` lowers to an `is_true` residual
 /// (`residual_call_r_i`) that unboxes it straight back to an Int for the
-/// branch.  That box→stack→unbox round-trip is pure overhead the trait path
-/// never emits (it branches on the raw compare result).  When the `is_true`
+/// branch. That box→stack→unbox round-trip was absent from the retired
+/// MIFrame path, which branched on the raw compare result. When the `is_true`
 /// residual's Ref arg is a mapped boxed bool we fold its result to the raw
 /// truth Int (bool→int is value-preserving), eliding the may-force unbox; the
 /// now-dead box + stack store are then DCE'd by the optimizer.
@@ -3057,7 +3048,7 @@ pub fn bool_box_truth_reset() {
 /// (`eval_loop_jit` skips `execute_opcode_step` for walker-handled
 /// opcodes).  In shadow / diagnostic-probe mode the flag is `false`, so
 /// the call is recorded symbolically only — re-executing there would
-/// double the side effects (the trait-path interpreter already ran it)
+/// double the side effects (the concrete interpreter already ran it)
 /// or corrupt the live heap under the discard-the-trace probe.
 ///
 /// **Return value**:
@@ -3228,7 +3219,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // `self.registers_X[index]` directly per liveness index.  Pyre
     // diverges on the Ref bank for portal-owner frames: the
     // `registers_r` semantic-mirror write in
-    // `write_stack_slot` (trace_opcode.rs:581/605) is retired so stack-slot colors
+    // `write_stack_slot` (trace_opcode.rs) is retired so stack-slot colors
     // sit at `OpRef::NONE` in `sym.registers_r`; the authoritative
     // shadow lives in `trace_ctx.virtualizable_boxes`.  Codewriter
     // liveness also force-alives `portal_frame_reg` / `portal_ec_reg`
@@ -3237,8 +3228,8 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // semantic frame slot, sourced instead from `sym.frame` /
     // `sym.execution_context` (`interp_jit.py:67 reds = ['frame', 'ec']`).
     //
-    // Mirror the trait-side snapshot materializer
-    // (trace_opcode.rs:1340-1395 `get_list_of_active_boxes`): map each
+    // Mirror the retired MIFrame snapshot materializer
+    // (trace_opcode.rs `get_list_of_active_boxes`): map each
     // live Ref color to its semantic index via
     // `semantic_ref_slot_for_reg_color`, read the vable shadow for
     // portal-owner frames, and route the two portal red regs through
@@ -3370,8 +3361,8 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
     // Int (last_instr, valuestackdepth, etc.); if liveness expects an Int
-    // register that the trait dispatcher never filled, the candidate fill
-    // is one of these sym shadow OpRefs.  Including them in the diagnostic
+    // register that the register banks did not fill, the candidate fill is
+    // one of these sym shadow OpRefs.  Including them in the diagnostic
     // lets fallback work jump straight to the right source.
     let vable_vsd = sym.vable_valuestackdepth();
     let vable_last_instr = sym.vable_last_instr();
@@ -3500,9 +3491,9 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 // pre-guard inline-parent-frame collection (the paused caller's
                 // active boxes are built BEFORE the callee sub-walk records its
                 // guards), so recording the recovery getfield here is
-                // well-ordered.  Recover the EC from the frame the same way the
-                // trait encoder's `ensure_execution_context` does
-                // (trace_opcode.rs:1248): record `getfield
+                // well-ordered. Recover the EC from the frame the same way the
+                // `MIFrame::ensure_execution_context` does
+                // (trace_opcode.rs): record `getfield
                 // frame.execution_context` and route that OpRef through as the
                 // portal EC red, so the resume snapshot never pushes NONE for
                 // `interp_jit.py:67 reds = ['frame', 'ec']`.  A NONE EC escapes
@@ -3759,7 +3750,7 @@ struct InlineParentFrame {
     resume_marker_jit_pc: Option<usize>,
     /// The caller's `in_a_call` active boxes at its resolved resume pc — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
-    /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs:1779).
+    /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs).
     boxes: Vec<OpRef>,
 }
 
@@ -4063,9 +4054,8 @@ thread_local! {
 
     /// B3 (`PYRE_FBW_RAISE`): the set of OpRefs the walker built inline via
     /// [`try_walker_trace_exception_new`] (the virtualizable `NewWithVtable`
-    /// exception).  Mirrors the trait's `sym.trace_built_exc`
-    /// (`trace_opcode.rs:7306`): the immediately-following `RaiseVarargs`
-    /// residual consults it to take the instance fast path — skipping the
+    /// exception). The immediately-following `RaiseVarargs` residual consults
+    /// it to take the instance fast path — skipping the
     /// residual `normalize_raise_varargs_jit` publish + `GUARD_EXCEPTION`
     /// and emitting `__context__` as a `SetfieldGc` on the (still virtual)
     /// exception.  Reset at each FBW walk entry via `fbw_store_journal_reset`
@@ -4531,7 +4521,7 @@ struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>);
 
 impl ActiveResumeFrame {
     /// The outermost portal/main frame (`fbw_mode.snapshot_sym`).  `None`
-    /// outside a full-body walk (per-opcode / trait path).
+    /// outside a full-body walk (tests or diagnostic callers).
     fn outer<Sym: WalkSym>(snapshot_sym: *const Sym) -> Option<Self> {
         let full_body_sym = snapshot_sym;
         if full_body_sym.is_null() {
@@ -4589,8 +4579,7 @@ impl ActiveResumeFrame {
 }
 
 /// Walker-side port of `pyjitpl.py:2156-2168 handle_possible_exception`'s
-/// exception branch (the trait-leg equivalent lives at
-/// `trace_opcode.rs:6962-7020 MIFrame::handle_possible_exception`).
+/// exception branch.
 ///
 /// Emit `GuardException(exc_type_const)` + snapshot, reading the
 /// exception's `ob_header.ob_type` from
@@ -4666,10 +4655,10 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // branch), so no `emit_guard_not_forced` gate is needed here.
     // RPython's pre-call vrefs heap mutation
     // (`pyjitpl.py:3318-3322 vrefs_before_residual_call`) and the
-    // after-call helpers (`pyjitpl.py:3337-3366`) both sit on the
-    // trait-driven leg in pyre — see
-    // [`walker_vable_and_vrefs_before_residual_call`] for the
-    // walker-vs-trait split rationale.
+    // after-call helpers (`pyjitpl.py:3337-3366`) are handled by the
+    // residual-call execution path — see
+    // [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
+    // split rationale.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
     // pyjitpl.py:3675: realfuncaddr, saveerr = effectinfo.call_release_gil_target
     let (realfuncaddr, saveerr) = ei.call_release_gil_target;
@@ -4934,8 +4923,8 @@ type ArgClassGuard = (OpRef, pyre_object::PyObjectRef, pyre_object::PyObjectRef)
 /// IR-only portion at `pyjitpl.py:3327-3335`: FORCE_TOKEN +
 /// SETFIELD_GC) is wired identically to `iRd_kind` via
 /// [`maybe_walker_vable_and_vrefs_before_residual_call`]; the runtime
-/// heap mutations and the after-call helpers stay on the
-/// trait-driven leg.
+/// heap mutations and the after-call helpers are handled by the
+/// residual-call execution path.
 ///
 /// Still missing relative to upstream — same set as `iRd_kind` and
 /// blocked on the same infrastructure: `OS_JIT_FORCE_VIRTUAL`
@@ -5021,7 +5010,7 @@ fn walker_concrete_ref_object<Sym: WalkSym>(
 /// the frame with `GetfieldGcR(frame, execution_context)` when
 /// `sym.execution_context` is unseeded.  Mirrors the inline-frame EC
 /// recovery (jitcode_dispatch.rs `try_walker_inline_self_recursive`) and
-/// the trait's `ensure_execution_context` (`trace_opcode.rs:1187`).
+/// `MIFrame::ensure_execution_context` (`trace_opcode.rs`).
 ///
 /// `None` outside a production full-body walk (no materialized portal sym)
 /// or when the portal frame OpRef is unset — the PUSH_EXC_INFO / POP_EXCEPT
@@ -5060,16 +5049,14 @@ fn walker_ensure_execution_context<Sym: WalkSym>(
 /// left `OpRef::NONE` by `setup_bridge_sym` (state.rs:8300-8326), which defers
 /// the recovery to `ensure_execution_context`.
 ///
-/// The trait leg performs that recovery inside `get_list_of_active_boxes`,
-/// which runs BEFORE the guard is recorded, so its getfield is well-ordered.
 /// The walker's snapshot-capture path
 /// (`walker_capture_snapshot_for_last_guard` → `collect_outer_active_boxes`)
 /// runs AFTER the guard, so recording the recovery there would place the
 /// getfield after the guard that references it (a use-before-def; the resume
 /// position would also stamp onto the getfield rather than the guard, leaving
 /// the guard with `resume_pos = -1`).  Recover here instead — at walk entry,
-/// before any opcode is dispatched and thus before any guard — mirroring the
-/// trait's cache-once semantics.  When the EC is already seeded, or the frame
+/// before any opcode is dispatched and thus before any guard. When the EC is
+/// already seeded, or the frame
 /// itself is unset, this is a no-op.
 pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
     sym: &mut Sym,
@@ -5250,7 +5237,7 @@ fn walker_unbox_int<Sym: WalkSym>(
 ///
 /// Reads the active portal sym via `fbw_mode.snapshot_sym` (the same
 /// source `reseed_vstack_from_shadow` uses for `nlocals`); `false` when the
-/// pointer is null (no materialized portal — the trait leg / tests), which
+/// pointer is null (no materialized portal, as in tests), which
 /// keeps the guard (correct-but-conservative).
 fn walker_inputarg_is_converted_local<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
@@ -6651,7 +6638,7 @@ fn handle<Sym: WalkSym>(
             // `walker_capture_snapshot_for_last_guard(other_target)`.
             // Branch guards resume at the runtime jump destination — the
             // branch NOT taken in the trace — not the `goto_if_not` opcode
-            // itself (`trace_opcode.rs:4456-4462`, `resume_pc =
+            // itself (`trace_opcode.rs`, `resume_pc =
             // other_target`).  The trace took the `switchcase` direction;
             // a guard failure flips to the other arm, where the Python
             // interpreter has already popped the comparison truth, so the
@@ -6744,12 +6731,9 @@ fn handle<Sym: WalkSym>(
                                 .is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b))
                         })
                     });
-                // `branch_resume_target_stack_depth` reads the full-body-walk-
-                // only `fbw_mode.snapshot_sym`, so `kept_stack` is always
-                // false in the trait leg — yet the trait leg re-executes the
-                // same not-taken arm on deopt and miscompiles the exact same
-                // boxed-int kept-stack shapes.  Probe the depth leg-
-                // independently for the unrestorable-arm decline below.
+                // `branch_resume_target_stack_depth` reads
+                // `fbw_mode.snapshot_sym`. Probe the jitcode-store depth for
+                // the unrestorable-arm decline below as well.
                 // `kept_stack_any_leg` and the kept-stack hazard checks below
                 // all read `fbw_mode.snapshot_sym`, which models the top-level
                 // traced jitcode's register file. In an inlined-callee sub-walk
@@ -6832,8 +6816,7 @@ fn handle<Sym: WalkSym>(
                 // and captures resumedata (pyjitpl.py:2603), never declining —
                 // its resume reconstruction is complete.  pyre's kept-stack
                 // resume reconstruction is NOT yet complete (the walker
-                // snapshot is partial; the trait leg has no snapshot at all, see
-                // `kept_stack_any_leg` above), so recording the guard and
+                // snapshot is partial), so recording the guard and
                 // resuming would rebuild a kept slot as NULL / a wrong value:
                 // the #416/#420 boxed-int short-circuit / conditional-expression
                 // SIGSEGV + silent miscompile.  Until that capture lands pyre
@@ -6844,8 +6827,8 @@ fn handle<Sym: WalkSym>(
                 // Decline → interpreter (correct).  Applies to depth-1 and
                 // depth > 1.
                 //
-                // Gate on the FBW-leg `kept_stack` (per-function-correct via
-                // `gate_frame`) OR the trait-leg `kept_stack_any_leg` fallback.
+                // Gate on `kept_stack` (per-function-correct via `gate_frame`)
+                // OR the jitcode-store `kept_stack_any_leg` fallback.
                 // `kept_stack_any_leg` alone is unsound for the second and later
                 // distinct functions in a program: its `outer_jitcode_index`
                 // resolves to `jitcodes[0]` (the first function) and reports a
@@ -6878,9 +6861,9 @@ fn handle<Sym: WalkSym>(
                                 live_ref,
                                 *num_regs_r,
                             ),
-                            // Liveness unavailable (the trait leg, where
-                            // `fbw_mode.snapshot_sym` is null, or an unresolved
-                            // coordinate) — cannot prove restorable, so decline.
+                            // Liveness unavailable (`fbw_mode.snapshot_sym` is
+                            // null, or the coordinate is unresolved) — cannot
+                            // prove restorable, so decline.
                             None => true,
                         };
                     // Hazard (2): the not-taken edge carries `ref_copy` renames
@@ -7937,9 +7920,8 @@ fn handle<Sym: WalkSym>(
             let dst = code[op.pc + 1] as usize;
             // Propagate the standing exception's
             // concrete shadow into the dst slot.  `ctx.last_exc_value_
-            // concrete` is the live `PyObjectRef` (seeded by either the
-            // retired trait path or an earlier walker
-            // `raise/r`).  This lets a follow-on `raise/r` reading
+            // concrete` is the live `PyObjectRef` (seeded by either an
+            // adapter caller or an earlier walker `raise/r`). This lets a follow-on `raise/r` reading
             // `registers_r[dst]` find a non-Null concrete and emit the
             // correct GUARD_CLASS.
             let exc_concrete = ctx.last_exc_value_concrete;
@@ -7959,9 +7941,8 @@ fn handle<Sym: WalkSym>(
             //
             // The class pointer is the standing exception's `ob_type`.
             // `read_typeptr_from_exception` (`dispatch.rs:1117`) routes
-            // through `cpu.cls_of_box`; the trait leg reads it directly off
-            // `W_BaseException.ob_header.ob_type`. Walker mirrors the
-            // direct read from the live concrete exception. The result is
+            // through `cpu.cls_of_box`. Walker reads the live concrete
+            // exception's `W_BaseException.ob_header.ob_type` directly. The result is
             // a `ConstInt(typeptr)` — no IR op recorded, matching
             // RPython's `return ConstInt(...)`.
             //
@@ -8047,9 +8028,7 @@ fn handle<Sym: WalkSym>(
             // The JitCode merge point carries its greens + reds inline
             // (`blackhole.rs:1726 bhimpl_jit_merge_point` decodes the same
             // six typed lists). Walking JitCode, the walker reads them
-            // directly — more orthodox than the trait leg, which recomputes
-            // live args via liveness (`close_loop_args_at`) because it
-            // walks CPython bytecode with no explicit merge-point op.
+            // directly rather than recomputing live args via liveness.
             //
             // Operand layout `cIRFIRF`: jdindex (`c`, 1 signed byte) +
             // greens (`I`=gi, `R`=gr, `F`=gf) + reds (`I`=ri, `R`=rr,
@@ -8310,8 +8289,7 @@ fn handle<Sym: WalkSym>(
             // [int.., ref.., float..]. For pyre's portal jitdriver the
             // reds are `[frame, ec]` (both Ref → rr), matching the
             // reds-only LABEL inputargs after
-            // `patch_new_loop_to_load_virtualizable_fields`
-            // (`trace_opcode.rs:2959-2967`).
+            // `patch_new_loop_to_load_virtualizable_fields`.
             let mut live_args: Vec<OpRef> = Vec::with_capacity(ri.len() + rr.len() + rf.len());
             live_args.extend(ri.iter().copied());
             live_args.extend(rr.iter().copied());

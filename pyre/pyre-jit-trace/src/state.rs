@@ -859,7 +859,7 @@ pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJit
 /// `MetaInterpStaticData.jitcodes` store (warmspot.py:282) and its bytecode /
 /// constant pools are immutable after build, so extending those slices to
 /// `'static` is sound — the same justification as the per-fn arm-entry borrow
-/// extension at `trace.rs:363` / `trace_opcode.rs:6735`.  Returns `None` when
+/// extension at `trace.rs:363` / `trace_opcode.rs`. Returns `None` when
 /// the code is null or the on-demand build did not install a payload.
 pub(crate) fn sub_jitcode_body_for_code(
     code: *const (),
@@ -2063,7 +2063,7 @@ pub struct PyreSym {
     /// `Option<u32>` value of `vable_array_base`) are split because their
     /// semantic roles differ: the predicate decides "consult vable
     /// shadow vs. registers", while the offset is only used as a
-    /// fallback OpRef synthesizer at `trace_opcode.rs:1248` when the
+    /// fallback OpRef synthesizer at `trace_opcode.rs` when the
     /// metainterp-scope shadow is not yet populated. RPython has neither
     /// per-frame state — the codewriter emits `getarrayitem_vable`
     /// opcodes only on the toplevel frame's bytecode. Pyre dispatches
@@ -2558,19 +2558,13 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             // opcode start restores the consumed operands as null / mismatched.
             | Instruction::BuildTuple { .. }
             | Instruction::UnpackSequence { .. }
-            // LOAD_ATTR reaches the trait leg (execute_opcode_step) in two
-            // cases the dispatch gate carves out of the arm walk: the foldable
-            // builtin list-method form (append/pop/reverse on a list receiver)
-            // and any method-load inside an inline frame. Both run load_method,
-            // which pop_value's the receiver first, then emits a non-residual
+            // LOAD_ATTR can run load_method, which pop_value's the receiver
+            // first, then emits a non-residual
             // receiver class guard (guard_class) plus a version_tag guard_value
             // — resume_pc=orgpc, so the consumed receiver must be in the
-            // opcode-start snapshot. The arm-walk leg (the common non-foldable
-            // form) ignores pre_opcode_registers_r, so capturing it there is
-            // inert; only the trait leg consults it.
+            // opcode-start snapshot.
             | Instruction::LoadAttr { .. }
-            // LIST_APPEND reaches the trait leg in an inline frame (it is
-            // walker-routed at the root). The `list_append` hook pop_value's
+            // The `list_append` hook pop_value's
             // the appended value, then records the generic `jit_list_append`
             // residual over the peeked list and popped value at
             // resume_pc=orgpc, so both consumed operands must be in the
@@ -2610,9 +2604,8 @@ pub struct PyreEnv;
 /// Descriptor for raw `PyObjectRef` item pointers that already address
 /// `items[0]` (no length prefix to skip). Used after an explicit
 /// `IntAdd(block, ITEMS_BLOCK_ITEMS_OFFSET)` converts a
-/// `*mut ItemsBlock` block-base pointer into the items-base pointer —
-/// see `load_namespace_value` in `trace_opcode.rs` for the canonical
-/// pattern. `GETARRAYITEM_GC_R(ptr, i)` lands on `ptr + i * item_size`.
+/// `*mut ItemsBlock` block-base pointer into the items-base pointer.
+/// `GETARRAYITEM_GC_R(ptr, i)` lands on `ptr + i * item_size`.
 ///
 /// For callers that hold the block-base pointer directly (i.e.
 /// `*mut ItemsBlock` for `W_ListObject.items` / tuple backing storage,
@@ -3043,9 +3036,8 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 // (= `optimize_GETFIELD_GC_I` via RPython's alias) handles folding.
 
 /// Unbox int with proper GuardClass resume data via the frame impl's
-/// `generate_guard`.  Generic over `WalkerFrameOps` so both `MIFrame`
-/// (trait dispatch) and `WalkContext` (walker dispatch) can invoke the
-/// same lowering.
+/// `generate_guard`. Generic over `WalkerFrameOps` so both `MIFrame` and
+/// `WalkContext` can invoke the same lowering.
 pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
     frame: &mut F,
     obj: OpRef,
@@ -3709,7 +3701,7 @@ pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
 ///
 /// Mirrors the `(callee_nlocals, callee_vsd)` pair the trace-side reads
 /// from `driver.get_compiled_meta(callee_key)` for CALL_ASSEMBLER
-/// emission (`trace_opcode.rs:4448-4450`). The second value is sized to
+/// emission (`trace_opcode.rs`). The second value is sized to
 /// match `pyframe.rs:1576` (`alloc_fixed_array_with_header(num_locals +
 /// num_cells + max_stack, ...)`) — i.e. heap capacity rather than live
 /// depth. Used as the fallback shape when no `compiled_meta` exists yet
@@ -4423,7 +4415,7 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 ///    full replacement `[missing] * num_regs_and_consts` (the
 ///    `if registers is None or len(registers) < ...` arm at
 ///    `pyjitpl.py:109`). Convergence is blocked by Adaptation 2 below:
-///    callers like `trace_opcode.rs:5466-5476` push callee args into
+///    callers like `trace_opcode.rs` push callee args into
 ///    `sym.registers_r[0..args.len()]` BEFORE invoking this helper, and
 ///    a full replacement would zero those slots. Migrating to
 ///    full-replace requires reordering the trace_opcode callee setup
@@ -4697,7 +4689,7 @@ impl PyreSym {
     /// Initialize symbolic tracking state. Called once when the owning
     /// MetaInterpFrame is pushed (trace.rs for root frame). Callee (inline)
     /// frames set symbolic state manually in perform_call
-    /// (trace_opcode.rs:3323-3424) and do NOT call this.
+    /// (trace_opcode.rs) and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
@@ -6025,7 +6017,7 @@ fn reconstruct_inline_recipe(
     // function_calls frames decode 0 int / 0 float registers). A reconstructed
     // inline callee has no virtualizable array, so an int/float-bank register
     // here would have no boxed-Ref source to seed `registers_r` (the reader
-    // always reads `registers_r[k]`, trace_opcode.rs:2128/684). Fall back to
+    // always reads `registers_r[k]`, trace_opcode.rs). Fall back to
     // the single-frame bridge rather than synthesize an unboxed local.
     if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
         return None;
@@ -6154,10 +6146,10 @@ fn reconstruct_inline_recipe(
 
     // The recipe banks are written and read by the register COLOR reported in
     // the liveness stream (`registers_r[reg_idx]` below), but every consumer
-    // indexes by the SEMANTIC `locals_cells_stack_w` slot: the trait re-trace's
-    // `load_local_value` reads `registers_r[local_idx]` (trace_opcode.rs:2360)
+    // indexes by the SEMANTIC `locals_cells_stack_w` slot: the retired MIFrame's
+    // `load_local_value` reads `registers_r[local_idx]` (trace_opcode.rs)
     // and `stack_slot_reg_idx` reads `registers_r[nlocals + stack_idx]`
-    // (trace_opcode.rs:628), and `assemble_bridge_inline_pending` reads
+    // (trace_opcode.rs), and `assemble_bridge_inline_pending` reads
     // `concrete_r[k]` by semantic slot k. This recipe is therefore only valid
     // when each live color equals the semantic slot it denotes (color ==
     // semantic). Regalloc pins that identity at call-boundary resume pcs (a
@@ -10338,10 +10330,10 @@ mod tests {
     /// Bind `sym.jitcode` to a populated `JitCode` whose `raw_code()`
     /// resolves to a real `PyCode` (derived from `w_code`), so the
     /// methods that hard-deref `(*sym.jitcode).raw_code()` — notably the
-    /// `close_loop_args` snapshot encoder at trace_opcode.rs:4874 — do not
+    /// `close_loop_args_at` snapshot encoder (trace_opcode.rs) — do not
     /// null-deref. Mirrors the
     /// `get_list_of_active_boxes_reads_kind_specific_register_banks`
-    /// harness (trace_opcode.rs:11151) but with a non-null `JitCode.code`.
+    /// harness (trace_opcode.rs) but with a non-null `JitCode.code`.
     ///
     /// `w_code` must be a real `PyCode` wrapper (e.g. `frame.pycode`,
     /// or `w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())`
@@ -11835,7 +11827,7 @@ mod tests {
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
         // Bind a populated jitcode with a real PyCode so the
-        // close_loop_args snapshot encoder (trace_opcode.rs:4874) reads
+        // close_loop_args_at snapshot encoder (trace_opcode.rs) reads
         // code.varnames/ncells/max_stackdepth instead of null-derefing. No
         // frame here, so build a standalone wrapper (pattern B). The three
         // live Ref colors map to local0/stack0/stack1 in registers_r.
@@ -11938,7 +11930,7 @@ mod tests {
         // concrete array length (the nlocals+stack_only fallback would only
         // yield 1). Empty input_values disables the concrete shadow; the
         // non-owner path then reads local0 from registers_r and PY_NULLs the
-        // dead stack tail (trace_opcode.rs:3470).
+        // dead stack tail (trace_opcode.rs).
         seed_virtualizable_boxes(
             &mut ctx,
             OpRef::input_arg_ref(0),

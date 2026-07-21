@@ -971,8 +971,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // tracing_before pairs with the tracing_after clear below only for
     // residuals that proceed, mirroring `do_residual_call` where
     // `vable_and_vrefs_before_residual_call` (pyjitpl.py:2017) runs only past
-    // the OS_NOT_IN_TRACE / force-virtual short-circuits.  Trait mirror:
-    // `MIFrame::vable_and_vrefs_before_residual_call` (trace_opcode.rs:2602).
+    // the OS_NOT_IN_TRACE / force-virtual short-circuits. RPython mirror:
+    // `pyjitpl.py:3318-3330`.
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -1043,9 +1043,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // pyjitpl.py:3349-3353 `vinfo.tracing_after_residual_call(virtualizable)`
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py:3365
-    // `SwitchToBlackhole(Counters.ABORT_ESCAPE, raising_exception=True)`;
-    // trait mirror `MIFrame::vable_after_residual_call`,
-    // trace_opcode.rs:2646).  The interpreter resumes from the live frame,
+    // `SwitchToBlackhole(Counters.ABORT_ESCAPE, raising_exception=True)`).
+    // The interpreter resumes from the live frame,
     // which the callee's force path made heap-authoritative — no
     // `load_fields_from_virtualizable` analogue is needed because the FBW
     // abort discards the walk shadow instead of handing it to a blackhole
@@ -1662,8 +1661,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // #62: a self-recursive call the inline path declined (e.g. the
     // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
     // (dev-gated PYRE_FBW_REC_CA) instead of the heavyweight func-entry
-    // residency residual.  Independent of inline eligibility, matching the
-    // trait's pending-token assembler branch (`trace_opcode.rs:6138`).
+    // residency residual. Independent of inline eligibility.
     if let Some(ca) = try_walker_call_assembler_self_recursive(
         ctx,
         op,
@@ -1826,8 +1824,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `is_true` residual (`residual_call_r_i`, Int result) whose sole Ref arg
     // is the boxed bool a preceding COMPARE specialization produced.  Folding
     // it to the raw truth Int elides the may-force unbox (and lets the dead box
-    // + value-stack store DCE), matching the trait path's branch-on-raw-compare
-    // behaviour.  bool->int is value-preserving so the fold is sound.  The
+    // + value-stack store DCE), matching the retired MIFrame path's
+    // branch-on-raw-compare behaviour. bool->int is value-preserving so the fold is sound. The
     // lookup is read-only (it does not remove the entry); OpRef SSA-uniqueness
     // (`recorder.rs`) guarantees the box opref never re-binds within one walk,
     // so a stale mis-fold is impossible and physical removal is unnecessary.
@@ -2080,8 +2078,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     // B3 piece 3 (`PYRE_FBW_RAISE`): lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
-    // `sys_exc_value` slot, mirroring the trait's `push_exc_info` /
-    // `pop_except` overrides (`trace_opcode.rs:11119`).  Recognised by the
+    // `sys_exc_value` slot. Recognised by the
     // codewriter-stamped `pyre_helper` tag (not a funcptr address — the
     // residual calls the cross-crate `cpu.{get,set}_current_exception_fn`
     // wrappers).  A balanced PUSH save + POP restore on the same descr-
@@ -2153,9 +2150,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // SETFIELD_GC IR for the active virtualizable; the runtime heap
         // mutations on `vinfo.tracing_before_residual_call` and
         // `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`)
-        // sit on the trait-driven leg only — see
-        // [`walker_vable_and_vrefs_before_residual_call`] docstring for
-        // the IR-vs-heap split rationale.
+        // are handled by the residual-call execution path — see
+        // [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
+        // split rationale.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx);
         }
@@ -2247,13 +2244,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         // pyjitpl.py:2079 `metainterp.generate_guard(rop.GUARD_NOT_FORCED)`
         // — unconditionally on the forces-virtual-or-virtualizable branch.
-        // Walker omits the `vable_after_residual_call(funcbox)`
-        // short-circuit (`pyjitpl.py:2078`) entirely — the trait-dispatch
-        // leg detects vable escape via
-        // `state.rs MIFrame::vable_after_residual_call`
-        // (`trace_opcode.rs:2237-2263`) and aborts to blackhole through
-        // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
-        // diff would run.
+        // The walker omits the `vable_after_residual_call(funcbox)`
+        // short-circuit (`pyjitpl.py:2078`): the residual-call execution
+        // path's heap-token bracket already detects a vable escape and
+        // surfaces `VableEscapedDuringResidualCall` before this guard is
+        // emitted.
         if emit_guard_not_forced {
             // #73: maintain the `-live-` AFTER anchor.  A
             // residual-call guard reads its resume point at `self.pc` (the
@@ -2963,7 +2958,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
-        // and the after-call helpers stay on the trait-driven leg.
+        // and the after-call helpers run in the residual-call execution path.
         // See `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.
         if emit_guard_not_forced {
@@ -3172,7 +3167,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
-        // and the after-call helpers stay on the trait-driven leg.
+        // and the after-call helpers run in the residual-call execution path.
         // See `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.
         if emit_guard_not_forced {

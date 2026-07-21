@@ -3712,8 +3712,7 @@ impl Descr for PyreVtableMethodDescr {
 /// `assembler.py:23 Assembler.descrs` parity adapter — translate one
 /// codewriter-side `BhDescr` slot (`majit-translate/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
-/// by both the walker (`crate::jitcode_dispatch::dispatch_via_miframe`)
-/// and the trait dispatch (`MIFrame::execute_opcode_step`) can carry
+/// by the walker (`crate::jitcode_dispatch::dispatch_via_miframe`) can carry
 /// real-content descrs instead of `make_fail_descr` placeholders.
 ///
 /// RPython parity: in upstream the metainterp + blackhole interpreter

@@ -80,8 +80,8 @@ use super::*;
 /// [`maybe_walker_vable_and_vrefs_before_residual_call`].  The
 /// after-call helpers (`pyjitpl.py:3337-3366
 /// vrefs_after_residual_call` / `vable_after_residual_call`) and the
-/// runtime heap mutations on `tracing_before_residual_call` stay on
-/// the trait-driven leg in pyre — see
+/// runtime heap mutations on `tracing_before_residual_call` run in the
+/// residual-call execution path — see
 /// [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
 /// split rationale.  The `OS_NOT_IN_TRACE` check fires up front via
 /// [`do_not_in_trace_call_result`] — fail-loud guard against future
@@ -103,19 +103,15 @@ use super::*;
 ///     already handles the constant-token / non-null-forced short-circuit
 ///     post-trace. Adding the PTR_EQ + GUARD_VALUE prelude (the only
 ///     way to retire the fail-loud guard) is not yet implemented and
-///     would land on both legs together; metainterp has a tests-only
+///     would land with the walker; metainterp has a tests-only
 ///     orthodox port at
 ///     `majit-metainterp/src/pyjitpl.rs:11828 _do_jit_force_virtual`
 ///     that the converged walker would route through. Production reach
 ///     today is zero — `jtransform.rs:1903 jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
-///   - Trait-leg-only: `vrefs_after_residual_call` / `vable_after_residual_call`
-///     observe runtime forces by reading the heap token after the
-///     callee runs.  Walker is symbolic-only, so it cannot detect
-///     forces; the trait dispatch (`state.rs MIFrame::vable_after_residual_call`,
-///     `trace_opcode.rs:2237-2263`) detects + aborts via
-///     `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
-///     diff would run.
+///   - `vrefs_after_residual_call` is unported; no `jit.virtual_ref`
+///     producers exist today, so the upstream loops are empty. Vable forces
+///     are detected by the residual-call execution path's heap-token bracket.
 ///   - `direct_libffi_call` (`pyjitpl.py:3622-3667`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
@@ -734,8 +730,7 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
 /// ZeroDivision/Overflow → `EF_ELIDABLE_CAN_RAISE` ⇒ trailing `GuardNoException`)
 /// and box the f64 with `wrapfloat` (transparent `new_with_vtable` +
 /// `setfield_gc_f`, the trace analogue of `_truediv`'s `space.newfloat(f)`), so a
-/// downstream float op keeps the quotient unboxed.  Walker-only — the trait path
-/// defers true-divide to the generic residual.
+/// downstream float op keeps the quotient unboxed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -821,7 +816,7 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
 /// `spec_ii` class once, then read `value0` / `value1` directly
 /// (`getfield_gc_pure_i` + `wrapint`) so the unpacked items stay unboxed ints
 /// through the downstream BINARY_OP int fold — the walker analogue of the
-/// trait path's `W_SpecialisedTupleObject_ii` value0/value1 reads.  Returns
+/// retired MIFrame `W_SpecialisedTupleObject_ii` value0/value1 reads. Returns
 /// `Ok(Some(()))` when folded (the caller returns `Continue`); `Ok(None)` to
 /// fall through to the opaque residual record, which stays correct for any
 /// other shape — so a non-foldable sequence is not declined.
@@ -1955,7 +1950,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
 /// truth, then boxes it to a `W_Bool`.  NON-fused: the walker sees
 /// COMPARE_OP and the following `goto_if_not` as separate JitCode ops, so
 /// it always materializes the boxed bool the generic `compare_fn` would
-/// have produced (the trait path's compare/jump fusion does not apply).
+/// have produced (the retired MIFrame compare/jump fusion does not apply).
 ///
 /// Same gate + return contract as
 /// [`try_walker_specialize_binary_op_int`].
@@ -2008,8 +2003,8 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     // raw truth.  In that shape the W_Bool is never read as a Ref, so the
     // box is dead the moment it is recorded — yet it is a non-pure `CallR`
     // the optimizer cannot DCE (pure.py:222 demotes CALL_PURE→CALL and
-    // emits it; RPython never *creates* the box because its trait path
-    // fuses COMPARE_OP+POP_JUMP at the bytecode level).  Mirroring that
+    // emits it; the retired MIFrame path never created the box because it
+    // fused COMPARE_OP+POP_JUMP at the bytecode level). Mirroring that
     // fusion walker-side: write the raw truth into the Ref dst as a marker
     // and record `bool_box_truth(truth, truth)` so the `is_true` fold
     // (dispatch_residual_call_iRd_kind:5137) resolves it to `truth`; emit
@@ -2039,8 +2034,7 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
 
 /// B3 (`PYRE_FBW_RAISE`): walker-native fold of the CHECK_EXC_MATCH
 /// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
-/// `call_jit.rs:4299`).  Mirrors the trait's `MIFrame::check_exc_match`
-/// override (`trace_opcode.rs:11226`): compute the match concretely from
+/// `call_jit.rs:4299`). Computes the match concretely from
 /// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
 /// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and,
 /// via [`bool_box_truth_record`], the immediately-following `is_true`
@@ -2089,7 +2083,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     }
     // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
     // (eval.rs), walking the exception class MRO and accepting a tuple of
-    // classes.  Inlined here (the trait-side mirror is module-private).
+    // classes. Inlined here.
     let matched = pyre_interpreter::eval::check_exc_match_against(exc, match_type);
 
     // --- commit to the fold: emit IR (no further declines) ---
@@ -3091,7 +3085,7 @@ unsafe fn orthodox_list_append_recognize(
     // `is_plain_int1` accepts a fits-int `W_LongObject` (it implies
     // `_fits_int()`), but a long is declined here: the commit path pins
     // `guard_class(value, INT_TYPE)` and a long has `ob_type == LONG_TYPE`,
-    // so supporting it needs the trait-path `unbox_long` machinery
+    // so supporting it needs equivalent `unbox_long` machinery
     // (guard_class LONG_TYPE + `_fits_int` residual guard + long
     // extraction) threaded through the sub-walk (PR248 §2). Empirically a
     // fits-int `W_LongObject` does not reach this append: pyre normalizes
@@ -3488,7 +3482,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
 /// bound-method callable).  Recognises the receiver/value against the shared
 /// gate and descends the same `w_list_append` body as the method-call form
 /// ([`try_walker_orthodox_list_append`]).  Returns `None` (fall through to the
-/// generic residual, SAFE — identical to the trait tracer's `jit_list_append`)
+/// generic residual, SAFE — identical to the retired MIFrame tracer's `jit_list_append`)
 /// for any non-matching shape; the residual is void so no result is written.
 pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3975,8 +3969,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3 (`PYRE_FBW_RAISE`): walker-native port of the trait's RAISE_VARARGS
-/// E1 fast path (`trace_opcode.rs:11329-11401`).  The `RaiseVarargs`
+/// B3 (`PYRE_FBW_RAISE`): walker-native RAISE_VARARGS E1 fast path. The `RaiseVarargs`
 /// residual is `normalize_raise_varargs_jit(frame, exc, cause)` —
 /// `r_args = [frame, exc, cause]`.  When `exc` was built inline by
 /// [`try_walker_trace_exception_new`] (∈ [`FBW_BUILT_EXC`]) and there is
@@ -4111,8 +4104,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
 
 /// B3 piece 3 (`PYRE_FBW_RAISE`): lower the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
-/// `sys_exc_value` slot (`ec_sys_exc_value_descr`), mirroring the trait's
-/// `push_exc_info` / `pop_except` overrides (`trace_opcode.rs:11119`).
+/// `sys_exc_value` slot (`ec_sys_exc_value_descr`).
 /// Recognised by the codewriter-stamped `pyre_helper` tag, NOT a funcptr
 /// address (the residual calls the cross-crate `cpu.{get,set}_current_
 /// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).

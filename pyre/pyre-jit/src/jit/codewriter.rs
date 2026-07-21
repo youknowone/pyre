@@ -871,7 +871,7 @@ fn derive_pc_live_indices_from_sparse(
     // stream position `q` carries a TRAILING `-live-` at `q+1`
     // (jtransform.py:467-482, flatten.rs:1373).  When the call raises the
     // runtime resumes at the call's FALLTHROUGH py_pc — not the call's own
-    // pc — reading `pc_map[fallthrough_pc]` (trace_opcode.rs:3634
+    // pc — reading `pc_map[fallthrough_pc]` (trace_opcode.rs
     // `resume_pc = self.fallthrough_pc` for `after_residual_call` guards).
     // So the fallthrough PC's resume marker must be the call's trailing
     // marker.  When that PC is stack-only (emits no pc-carrying op, hence
@@ -3702,9 +3702,8 @@ fn register_helper_fn_pointers(
     );
     // `bh_load_name_fn` / `bh_store_name_fn` delegate to the interpreter
     // `NamespaceOpcodeHandler` impl (pyopcode.py:945 LOAD_NAME / :855
-    // STORE_NAME).  Both run only on the blackhole/deopt path —
-    // LOAD_NAME / STORE_NAME are traced via the trait leg, never the
-    // walker — so they share `bh_getattr_fn`'s classification:
+    // STORE_NAME). The full-body walker traces the emitted residuals, which
+    // share `bh_getattr_fn`'s classification:
     // `CallFlavor::Plain` (can raise, no virtual-force while live).
     // Bound after the existing fn_ptrs to preserve their indices.
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
@@ -3965,7 +3964,7 @@ fn register_helper_fn_pointers(
     // `jit_list_append` appends a value to a list peeked in place; it runs no
     // user code and does not force the virtualizable, but the backing-array
     // grow can raise MemoryError → `EF_CAN_RAISE` → `Plain` (matches the
-    // trait tracer's void `jit_list_append` residual + no-exception guard).
+    // retired MIFrame tracer's void `jit_list_append` residual + no-exception guard).
     // Appended last to preserve fn_ptr indices.
     let list_append_fn = bind(
         assembler,
@@ -4103,7 +4102,7 @@ fn register_helper_fn_pointers(
     );
     // `jit_make_function_from_globals` wraps a code object into a function;
     // it allocates but runs no user code and never raises → `Plain` (matches
-    // the trait tracer's `trace_make_function`, which records only a
+    // the retired MIFrame tracer's `trace_make_function`, which records only a
     // no-exception guard).  Appended last to preserve fn_ptr indices.
     let make_function_fn = bind(
         assembler,
@@ -4238,7 +4237,7 @@ fn register_helper_fn_pointers(
 /// args are split into live_i / live_r / live_f sequences, mirroring
 /// upstream `assembler.py:150-152`
 /// (`get_liveness_info(insn[1:], 'int'/'ref'/'float')`). The
-/// tracer (`trace_opcode.rs:670`) and the blackhole bridge-resume
+/// tracer (`trace_opcode.rs`) and the blackhole bridge-resume
 /// (`call_jit.rs:870-887`) read the three banks in order via
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
@@ -9508,10 +9507,8 @@ impl CodeWriter {
                             // `load_name` HLOp with the portal frame as
                             // receiver; the canonical splice lowers it to a
                             // `bh_load_name_fn(frame, w_name, namei)` residual
-                            // call.  LOAD_NAME is traced via the trait leg
-                            // (`NamespaceOpcodeHandler::load_name_value`), so
-                            // the residual runs only on blackhole/deopt —
-                            // same contract as the LoadAttr arm.
+                            // call. The full-body walker traces this residual,
+                            // using the same contract as the LoadAttr arm.
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
@@ -9532,9 +9529,8 @@ impl CodeWriter {
                             // pyopcode.py:855-859 STORE_NAME — pops the value
                             // and writes it into `w_locals` via the
                             // `store_name` HLOp → `bh_store_name_fn(frame,
-                            // w_name, value)` residual call.  Traced via the
-                            // trait leg (`store_name_value`); the residual
-                            // runs only on blackhole/deopt.
+                            // w_name, value)` residual call, which the
+                            // full-body walker traces.
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
@@ -9554,9 +9550,8 @@ impl CodeWriter {
                             // writes it directly into `w_globals` (bypassing
                             // `w_locals`) via the `store_global` HLOp →
                             // `bh_store_global_fn(frame, w_name, value)`
-                            // residual call.  Traced via the trait leg
-                            // (`store_global_value`); the residual runs only on
-                            // blackhole/deopt.  Same void 3-Ref shape as the
+                            // residual call, which the full-body walker traces.
+                            // Same void 3-Ref shape as the
                             // StoreName arm.
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
@@ -10004,8 +9999,7 @@ impl CodeWriter {
                             // push next, fall to PC+1) and the exhaustion arm
                             // (null → iterator kept, side-exit to the FOR_ITER
                             // jump target so the interpreter re-runs FOR_ITER
-                            // and ends the loop).  Mirrors the trait-leg
-                            // record_for_iter_guard GuardNonnull and the
+                            // and ends the loop). Mirrors the GuardNonnull and
                             // PopJumpIfFalse two-exit CFG shape.
                             let exhaust_target = jump_target_forward(
                                 code,

@@ -76,8 +76,7 @@ pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
 /// Ref args' concrete values for a user Python function (`FUNCTION_TYPE`,
 /// non-builtin) and reports whether its per-`CodeObject` JitCode is installed
 /// (`jitcode_lookup`).  It confirms the runtime callable -> `CodeObject` ->
-/// JitCode recognition seam fires (the walker analog of the trait path's
-/// `_opimpl_recursive_call`) before any inline sub-walk wiring lands.
+/// JitCode recognition seam fires before any inline sub-walk wiring lands.
 pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
     let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
     // Single-letter kind tag per arg, so the call_fn arg layout (which slot
@@ -538,11 +537,10 @@ pub(crate) fn collect_callee_active_boxes(
 /// re-enters the callee through the func-entry residency door — one
 /// heavyweight frame build + entry-bridge per recursive call (the
 /// `fib_recursive` ~30x slowdown).  This emits instead the direct
-/// assembler->assembler jump the trait tracer uses: `CALL_ASSEMBLER_R` to
-/// the callee's own loop/pending token (mirror of `_opimpl_recursive_call`
+/// assembler->assembler jump: `CALL_ASSEMBLER_R` to the callee's own
+/// loop/pending token (mirror of `_opimpl_recursive_call`
 /// `recursion_exceeded -> assembler_call`, `pyjitpl.py:1404-1422`, and
-/// `do_residual_call`'s assembler branch, `pyjitpl.py:2053-2082`;
-/// trait reference `trace_opcode.rs:6138-6204`).
+/// `do_residual_call`'s assembler branch, `pyjitpl.py:2053-2082`).
 ///
 /// First cut — the `fib` shape only: a single positional INT argument to a
 /// self-recursive (`callee code == portal code`) callee whose frame is
@@ -690,8 +688,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
     let sym = unsafe { &*sym_ptr };
     let caller_frame = sym.frame();
-    // `is_self_recursive = callee code == portal code`
-    // (`trace_opcode.rs:5959-5960`: `callee_raw == caller_raw`).  During
+    // `is_self_recursive = callee code == portal code`. During
     // recording `we_are_jitted()` is false, so `function_get_code` (the
     // `w_code` already in hand) equals `getcode` — the pointer the
     // jit_merge_point green key and the portal jitcode were registered
@@ -750,9 +747,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     } {
         return Ok(None);
     }
-    // Resolve the callee's own loop or trace-in-progress marker
-    // (`trace_opcode.rs:5954` + `6138`: `make_green_key(w_callee_code, 0)`,
-    // `pc = 0` = function entry). A pending token only proves the callee is
+    // Resolve the callee's own loop or trace-in-progress marker with
+    // `make_green_key(w_callee_code, 0)` (`pc = 0` = function entry). A
+    // pending token only proves the callee is
     // being traced; emission below resolves compiled-or-tmp so the descr never
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
@@ -788,7 +785,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
 
-    // ---- emission (mirror of `trace_opcode.rs:6146-6204`) ----
+    // ---- emission ----
     // Past this point every step records IR; `?` propagation aborts the
     // whole walk (the trace is discarded), the correct failure mode for a
     // recording error.
@@ -857,9 +854,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // the forces branch EXECUTES the call during tracing —
     // `direct_assembler_call` (pyjitpl.py:2080) only rewrites the
     // already-recorded op into CALL_ASSEMBLER afterwards, so the result
-    // box always carries the executed value.  Trait mirror: the
-    // call-replay leg runs the callee and `trace_guarded_int_payload(
-    // ca_result)` consumes the real concrete (trace_opcode.rs:6188-6199).
+    // box always carries the executed value. The retired call-replay leg's
+    // `trace_guarded_int_payload(ca_result)` consumed the same concrete
+    // result (trace_opcode.rs).
     // Without the stamp the downstream BINARY_OP on two recursive-call
     // results cannot take the int specialization and records the generic
     // dunder-dispatch residual instead — the compiled loop then runs the
@@ -1307,9 +1304,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // Bound recursive inlining at `max_unroll_recursion`: a callee already
     // this deep on the FBW inline stack falls back to a residual call rather
     // than unrolling its (exponentially branching) call tree at trace time.
-    // Mirror of the trait tracer's `recursion_exceeded`
-    // (`pyjitpl.py:1388-1416`) → `assembler_call` instead of trace-through
-    // (`trace_opcode.rs:5604-5642`).
+    // Mirror of `pyjitpl.py:1388-1416` `recursion_exceeded` →
+    // `assembler_call` instead of trace-through.
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
     if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
         return Ok(None);
@@ -1393,8 +1389,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // The inlined callee body is entered at pc=0 with the fast-path
     // register convention `registers_r[0..nparams] = positional args` —
     // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
-    // inline calls and the trait path's `can_skip_traced_callee_frame`
-    // branch applies (`sym.registers_r = args.to_vec()`).  This only holds for a callee
+    // inline calls and the retired `can_skip_traced_callee_frame` branch used
+    // (`sym.registers_r = args.to_vec()`). This only holds for a callee
     // that reads its params straight from `r0`/`r1` (ref_copy +
     // residual_call args).  A callee that materializes a frame — any
     // `*_vable_*` op, emitted when a local must survive a sub-call —
@@ -1402,8 +1398,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // *whole* enclosing trace with `VableBoxNotSeeded`.
     //
     // The zero-param case lowers to an ordinary residual call (orthodox
-    // non-inlinable path); a residual zero-arg call is cheap and the trait
-    // leg has no positional-arg inline win to recover.
+    // non-inlinable path); a residual zero-arg call is cheap and has no
+    // positional-arg inline win to recover.
     if nparams == 0 {
         return Ok(None);
     }
@@ -1861,7 +1857,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // multi-frame snapshot (`walker_capture_multi_frame_inline_snapshot`) at
         // the callee's OWN coordinate, with the caller paused at the CALL return
         // point (`get_list_of_active_boxes(in_a_call=true)` parity,
-        // `trace_opcode.rs:1779`).  With the callee frame red now seeded,
+        // `trace_opcode.rs`). With the callee frame red now seeded,
         // `collect_callee_active_boxes` sources the callee's live boxes and the
         // snapshot succeeds, producing the full RPython `Snapshot.frames` chain
         // (`opencoder.py:767 create_top_snapshot`, resumed by

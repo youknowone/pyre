@@ -4722,10 +4722,8 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
 /// rtype `getattr` into `getfield_gc` (`rclass.py:838 rtype_getattr`
 /// rewrites `getattr` → `getfield_gc` after rtyping; pyre has no rtyper),
 /// so the per-CodeObject jitcode lowers `LOAD_ATTR` to this residual call
-/// rather than `abort_permanent`.  `LOAD_ATTR` is walker-skipped during
-/// trace recording (`trace_opcode.rs` `walker_skip_opcodes`), so this
-/// helper runs ONLY on the blackhole resume / deopt path — the optimized
-/// trace records `jit_getattr` via the trait leg instead.
+/// rather than `abort_permanent`. The full-body walker traces the emitted
+/// residual call.
 ///
 /// Mirrors the interpreter `eval.rs` `load_attr` / `load_method` getattr
 /// fallback (`baseobjspace::getattr_str`): returns the (possibly bound)
@@ -5261,9 +5259,7 @@ pub extern "C" fn bh_load_special_self_fn(obj: i64, attr: i64, method_kind: i64)
 /// to the `LOAD_GLOBAL` globals → builtins chain.  Delegates to the
 /// interpreter trait impl (`eval.rs load_name_checked_value`) so the
 /// blackhole re-execution and the interpreter share one lookup order.
-/// `LOAD_NAME` is traced via the `NamespaceOpcodeHandler` trait leg
-/// (not the walker), so this helper runs ONLY on the blackhole
-/// resume / deopt path, like `bh_getattr_fn`.  `w_name` is the
+/// The full-body walker traces the emitted residual call. `w_name` is the
 /// interned immortal str constant the flatten driver lowers the
 /// `load_name` HLOp's name operand to (`box_str_constant`); `namei`
 /// feeds the `pycode._globals_caches[nameindex]` global cache

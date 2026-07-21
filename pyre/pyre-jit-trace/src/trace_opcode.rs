@@ -284,7 +284,7 @@ pub(crate) struct LongBinopSpec {
 /// `cr == "mem"`); the divmod / shift ops also raise (ZeroDivision /
 /// ValueError·Overflow) so they are `EF_ELIDABLE_CAN_RAISE` (`call.py:296`).
 /// Both classes have `check_can_raise()` true, so `pyjitpl.py:2110-2112` emits
-/// the guard. The legacy trait path delegates to the generic residual because
+/// the guard. The legacy trait path delegated to the generic residual because
 /// it cannot reuse the authentic boxed result's payload.
 pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<LongBinopSpec> {
     use majit_metainterp::{ELIDABLE_EFFECT_INFO, ELIDABLE_OR_MEMERROR_EFFECT_INFO};
@@ -1090,7 +1090,7 @@ impl MIFrame {
         // fail_args. Mirror RPython's invariant by forcing lazy init
         // for every live register via the same `_opimpl_getarrayitem
         // _vable` mirror read that LOAD_FAST uses (load_local_value
-        // at trace_opcode.rs:660), BEFORE snapshotting registers_r
+        // at trace_opcode.rs), BEFORE snapshotting registers_r
         // below. Source for the live indices is the same packed
         // `all_liveness` byte stream (`jitcode.get_live_vars_info(pc,
         // op_live)` at `jitcode.py:82-93`) that resume.py uses at
@@ -2930,7 +2930,7 @@ impl MIFrame {
         // register source). Both should be populated by store_local_value's
         // dual-write. Any divergence here means a code path updated one
         // shadow without the other — most likely load_local_value's lazy
-        // fallback (trace_opcode.rs:1041-1063) which writes registers_r
+        // fallback (trace_opcode.rs) which writes registers_r
         // but does NOT call set_virtualizable_box_at. See
         // memory/phase_1_4_cand_a_landed_raise_catch_diagnostic_2026_04_26.md.
         if std::env::var("PYRE_PROBE_SNAPSHOT").ok().as_deref() == Some("1") {

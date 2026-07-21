@@ -1337,7 +1337,7 @@ impl<'a> GraphFlattener<'a> {
         // The walker covers this point incidentally via its per-PC `-live-`;
         // the canonical driver must emit it explicitly so the encoder's
         // FALLTHROUGH_pc read (`handle_possible_exception` ->
-        // `guard_no_exception`, trace_opcode.rs:7032) and the resume reader
+        // `guard_no_exception`, trace_opcode.rs) and the resume reader
         // find a marker at the post-call position.  Gated on `lowering_ctx`
         // so the production walker stream is untouched.  `may_call_jitcodes`
         // has no analogue at this site: the canonical lowering emits only
@@ -4077,9 +4077,8 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
 /// Ref, w_name: Ref, namei: Int) → Ref` delegates to the interpreter
 /// `load_name_checked_value`; the name Constant lowers to the interned
 /// immortal str pointer via `lower_constant` and `namei` to a plain
-/// `ConstInt`.  `LOAD_NAME` is traced via the trait leg (the walker
-/// never records this residual), so the frame lowers as a plain
-/// register operand.  `CallFlavor::Plain` (can-raise `NameError`, no
+/// `ConstInt`. The frame lowers as a plain register operand for the
+/// full-body walker. `CallFlavor::Plain` (can-raise `NameError`, no
 /// virtual-force) — same classification as `getattr_fn`.
 pub fn lower_load_name_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -4535,7 +4534,7 @@ where
             // shape (`pyjitpl.py:779 opimpl_newlist`) instead of recording the
             // opaque CallR.  Inert on the assembler/baseline path (it reads
             // fn_idx + args, not `pyre_helper`) and on the legacy trait path
-            // (which never emits this residual); only the FBW intercept, gated
+            // (which never emitted this residual); only the FBW intercept, gated
             // on `PYRE_NEWLIST_VIRT`, keys on it.
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.newlist_from_array_fn_idx,

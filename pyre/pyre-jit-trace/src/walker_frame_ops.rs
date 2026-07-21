@@ -5,7 +5,7 @@
 //! `generated_list_setslice_same_len_by_strategy`,
 //! `generated_store_subscr_value`, and the `store_subscr_value` body in
 //! `trace_opcode.rs`) run against either `MIFrame` or the walker
-//! `WalkContext`, so both dispatch paths emit the same
+//! `WalkContext`, so both implementations emit the same
 //! `guard_class`+`SETARRAYITEM_GC`-family shape.
 //!
 //! ## Trait shape — `self`-only signatures, `ctx` reached via accessor
@@ -49,8 +49,8 @@
 //! existing infrastructure (`MIFrame::generate_guard` and
 //! `walker_capture_snapshot_for_last_guard`, respectively).  The
 //! generated strategy helpers are generic over this trait, so the
-//! residual-call walker specialization can reuse the same IR shape as the
-//! trait-dispatch path.
+//! residual-call walker specialization can reuse the retained MIFrame IR
+//! shape.
 
 use majit_ir::{OpCode, OpRef, Type};
 use majit_metainterp::TraceCtx;
@@ -83,8 +83,8 @@ pub trait WalkerFrameOps {
     /// `pyjitpl.py:2558-2602` `generate_guard` parity — flush a pending
     /// quasi-immut guard, capture multi-frame resume snapshot, then
     /// record the guard op with its snapshot.  The single load-bearing
-    /// method; impls diverge between `MIFrame` (trait dispatch frame
-    /// state) and `WalkContext` (walker register banks + dispatch
+    /// method; impls diverge between `MIFrame` register state and
+    /// `WalkContext` (walker register banks + dispatch
     /// snapshot helper).
     fn generate_guard(&mut self, opcode: OpCode, args: &[OpRef]);
 
@@ -121,7 +121,7 @@ pub trait WalkerFrameOps {
         }
         if obj.is_constant() {
             // The const-arm `flush_guard_not_invalidated` in
-            // `MIFrame::guard_class` (trace_opcode.rs:4681) is skipped
+            // `MIFrame::guard_class` (trace_opcode.rs) is skipped
             // here.  It only fires when a prior quasi-immut field read
             // set `pending_guard_not_invalidated_pc`; the
             // `store_subscr_value` precondition (concrete obj/key/value
@@ -214,8 +214,8 @@ pub trait WalkerFrameOps {
 }
 
 // `MIFrame` impl — delegates `generate_guard` to the existing
-// `MIFrame::generate_guard` method so the trait-dispatch leg keeps its
-// current `flush_guard_not_invalidated` / `orgpc` plumbing untouched.
+// `MIFrame::generate_guard` method so the retained helper keeps its current
+// `flush_guard_not_invalidated` / `orgpc` plumbing untouched.
 // The `ctx_mut` / `ctx` accessors materialise the
 // borrow from `self.ctx: *mut TraceCtx` via unsafe deref.  The deref is
 // sound because `MIFrame`'s lifetime invariant
@@ -277,8 +277,8 @@ impl<'frame, 'static_a: 'frame, Sym: crate::state::WalkSym> WalkerFrameOps
         self.trace_ctx.record_guard(opcode, args, 0);
         // `walker_capture_snapshot_for_last_guard` returns a typed abort
         // (`GuardSnapshotVableUntyped`) for the multi-frame vable case the
-        // full-body walk routes through `DispatchError`.  The `()` trait
-        // signature (shared with the trait tracer's `MIFrame`) has no
+        // full-body walk routes through `DispatchError`. The `()` trait
+        // signature (shared with the retained `MIFrame` impl) has no
         // error channel, so latch the first failure on the context; the
         // STORE_SUBSCR specialization's dispatcher call site drains it
         // and aborts the walk — a guard without a resume snapshot must

@@ -117,7 +117,7 @@ pub(crate) fn set_active_sym_exc(sym: *mut PyreSym) -> ActiveSymExcGuard {
 
 /// Root the trace-time exception carriers held in the active `PyreSym`.
 ///
-/// Between construction (`trace_built_exc.insert`, `trace_opcode.rs`) and
+/// Between construction (`sym.trace_built_exc` insert, `state.rs`) and
 /// lift-out (`swap_remove` at the raise), a trace-built exception is reachable
 /// only through `sym.trace_built_exc`, invisible to the precise collector; an
 /// allocating safepoint in that window would otherwise sweep it. `last_exc_value`
@@ -625,7 +625,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     sym.set_live_vable_frame_addr(live_frame_addr);
     // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
     // construction. Callee (inline) frames are set up by perform_call
-    // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
+    // (trace_opcode.rs) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
     if let Some(ref carrier) = carrier {
@@ -1939,7 +1939,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // Non-branch-guard resume at the opcode-entry
                 // marker: the walk re-executes the opcode from the top, reading
                 // its operand-stack inputs POSITIONALLY — `registers_r[nlocals +
-                // stack_idx]` (trace_opcode.rs:628 `stack_slot_reg_idx`) — so
+                // stack_idx]` (trace_opcode.rs `stack_slot_reg_idx`) — so
                 // the slot-indexed `bridge_stack` tail seeds color `nlocals + i`.
                 //
                 // The reserved-red skip is per-PC-wrong here.  `portal_frame_reg`

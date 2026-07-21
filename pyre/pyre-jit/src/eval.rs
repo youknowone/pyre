@@ -8708,7 +8708,7 @@ pub(crate) fn decode_and_restore_guard_failure(
         // header pc instead of the guard's resume opcode.  The per-frame
         // section pc (`ResumedFrame.py_pc`, the same coordinate
         // `resume_in_blackhole` resumes at) is the correct resume point.
-        // Prefer it when the two disagree; for the trait tracer they always
+        // Prefer it when the two disagree; for the retired MIFrame tracer they always
         // match (the frame's `last_instr` tracks the Python pc), so this is
         // a no-op there. With flipped pc words, a single-frame resume uses
         // the restored vable position and a multi-frame resume uses the

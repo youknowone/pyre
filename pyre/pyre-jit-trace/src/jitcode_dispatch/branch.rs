@@ -208,7 +208,7 @@ pub(crate) fn decode_branch_trampoline_ref_moves(
 /// chained-comparison shape the single-frame snapshot cannot rebuild on
 /// the not-taken arm (#124/#281).
 ///
-/// Returns `None` outside a full-body walk (per-opcode / trait path,
+/// Returns `None` outside a full-body walk (tests or diagnostic callers,
 /// where the snapshot uses the static entry coordinate and this guard
 /// shape does not arise) or when the coordinate resolves past the last
 /// Python opcode (a synthetic loop-close overshoot, which carries no
@@ -258,8 +258,7 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
 ) -> bool {
     let pjc = &frame.0;
     if pjc.code_ptr.is_null() {
-        // No FBW frame layout — the trait-leg `reads_null_ref` gate already
-        // declines; report no hazard so this predicate adds nothing there.
+        // No FBW frame layout; report no hazard so this predicate adds nothing.
         return false;
     }
     // SAFETY: `metadata` is an immutable payload layout field kept alive by the
@@ -530,14 +529,10 @@ pub(crate) fn branch_arm_reads_unrestorable_ref(
 }
 
 /// The not-taken-arm Python stack depth at a branch guard's resume target,
-/// resolved leg-INDEPENDENTLY through the `MetaInterpStaticData` jitcode
+/// resolved through the `MetaInterpStaticData` jitcode
 /// store (`pyjitcode_for_jitcode_index`) rather than the full-body-walk-only
-/// `fbw_mode.snapshot_sym`.  [`branch_resume_target_stack_depth`] returns
-/// `None` in the trait leg (where the bug surfaces just as it does in the
-/// full-body walk — both legs re-execute the same not-taken arm on deopt),
-/// so the unrestorable-kept-stack decline needs a depth probe that works in
-/// either leg.  A depth `> 0` marks the short-circuit / conditional-
-/// expression / chained-comparison kept-stack shape.
+/// `fbw_mode.snapshot_sym`. A depth `> 0` marks the short-circuit /
+/// conditional-expression / chained-comparison kept-stack shape.
 pub(crate) fn branch_resume_target_stack_depth_any_leg(
     target: usize,
     jitcode_index: u32,

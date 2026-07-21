@@ -177,8 +177,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     }
 
     // Seed last_exc_value_concrete from
-    // sym.last_exc_value (the live PyObjectRef written by the retired
-    // trait-side raise path).  Null when
+    // sym.last_exc_value (the live PyObjectRef supplied by the adapter caller). Null when
     // no active exception, matching `initial_last_exc_value == None`.
     let initial_last_exc_value_concrete = if sym.last_exc_value().is_null() {
         ConcreteValue::Null
@@ -293,15 +292,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         //     arm always sets `wc.last_exc_value = Some(exc)` so
         //     mirroring `Some` → const=true is RPython-orthodox.
         //
-        // The walker CANNOT produce:
-        //   - `sym.last_exc_value` (concrete `PyObjectRef`): RPython
-        //     `exc_value_box.getref(rclass.OBJECTPTR)` reads the
-        //     concrete pointer at trace-recording time. The symbolic
-        //     walker has only OpRefs — concrete writeback is the
-        //     production tracer's responsibility (the trait-driven
-        //     `MIFrame::execute_opcode_step` path). This is a known
-        //     TODO (the walker is symbolic-only,
-        //     concrete state is fed by another path).
+        // This adapter does not currently write back `sym.last_exc_value`
+        // (the concrete `PyObjectRef`); it retains only the symbolic
+        // `final_last_exc` here.
         if let Some(exc) = final_last_exc {
             sym.set_last_exc_box(exc);
             sym.set_class_of_last_exc_is_const(final_class_of_last_exc_is_const);
@@ -490,8 +483,8 @@ pub(crate) fn recipe_parent_frame_from_recipe(
                 .unwrap_or(OpRef::NONE),
         );
     }
-    // Ref bank, in liveness-color order — mirror the trait encoder
-    // `get_list_of_active_boxes` (trace_opcode.rs:1902-1957) box-for-box:
+    // Ref bank, in liveness-color order — mirror the retired MIFrame encoder
+    // `get_list_of_active_boxes` (trace_opcode.rs) box-for-box:
     //   * the not-yet-produced call-result color is NULL-seeded (`in_a_call`);
     //   * a force-alived portal-red SCRATCH color (no live semantic slot at this
     //     pc) routes to the reconstructed frame's `frame`/`ec` box, NOT the
