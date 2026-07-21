@@ -2084,6 +2084,16 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
         as *const pyre_object::pyobject::PyType;
     let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::pyobject::PyType;
 
+    // Either layout may carry a subclass `w_class`, and the element reads below
+    // are only the whole target when it is a plain tuple.
+    let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    if !std::ptr::eq(
+        unsafe { (*(match_type as *const pyre_object::pyobject::PyObject)).w_class },
+        canonical_tuple_class,
+    ) {
+        return Ok(false);
+    }
+
     let mut items: Vec<(OpRef, pyre_object::PyObjectRef)> = Vec::new();
     if std::ptr::eq(ob_type, spec_oo) {
         walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, spec_oo as i64)?;
@@ -2102,13 +2112,6 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
             items.push((item, concrete));
         }
     } else if std::ptr::eq(ob_type, tuple_type) {
-        let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
-        if !std::ptr::eq(
-            unsafe { (*(match_type as *const pyre_object::pyobject::PyObject)).w_class },
-            canonical_tuple_class,
-        ) {
-            return Ok(false);
-        }
         // Read every element before recording anything: a bail-out after a
         // guard has been emitted would leave the target's class pinned, and the
         // caller reads that as "already guarded" and drops its own pin.
