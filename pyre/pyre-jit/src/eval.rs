@@ -5544,12 +5544,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             if needs_trace {
                 if let Err(err) = unsafe {
                     (*ec_ptr).bytecode_trace(
-                        frame_root.frame() as *mut PyFrame,
+                        f,
                         pyre_interpreter::executioncontext::TICK_COUNTER_STEP,
                     )
                 } {
                     return LoopResult::Done(Err(err));
                 }
+                // bytecode_trace may allocate (tracer callback) → the frame may
+                // have moved; re-seed before reading it again.
+                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
                 // A trace callback may perform a debugger line-jump by
                 // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
                 // = best_addr`).  The opcode for this iteration was
@@ -5562,11 +5565,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // (= `last_instr + 1`) at the top, so rebase the target
                 // through `set_last_instr_from_next_instr` for the next
                 // iteration to land on it rather than one past it.
-                if frame_root.frame().last_instr as usize != opcode_pc {
-                    let jump_target = frame_root.frame().last_instr as usize;
-                    frame_root
-                        .frame()
-                        .set_last_instr_from_next_instr(jump_target);
+                if unsafe { &*f }.last_instr as usize != opcode_pc {
+                    let jump_target = unsafe { &*f }.last_instr as usize;
+                    unsafe { &mut *f }.set_last_instr_from_next_instr(jump_target);
                     continue;
                 }
             } else {
