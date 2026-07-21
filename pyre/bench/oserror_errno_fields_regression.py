@@ -6,18 +6,21 @@
 # this guard is registered with skip_backends=("wasm",).  Behaviour verified
 # against CPython/PyPy.
 #
-# The mkdir target is a freshly created temp directory rather than "/" or the
-# cwd: "/" is a Windows drive root (access-denied, not EEXIST) and the cwd is
-# in-use on Windows (also access-denied), whereas a temp dir gives EEXIST on
-# both POSIX and Windows.  The errno/strerror/args *values* are asserted only
-# on POSIX; Windows maps different errno numbers and strerror text, so there
-# the guard checks the exception type and that the fields are populated.
+# Both fixtures come from `os` alone: a pid-named directory this script
+# creates in the cwd, rather than tempfile.mkdtemp, so the guard stays
+# independent of the shutil import chain.  The mkdir target has to be a
+# directory of its own because "/" is a drive root on Windows and the cwd is
+# in use there, and both report access-denied rather than EEXIST.
+#
+# The errno numbers are asserted on every platform, Windows included: the
+# posix module is the one installed there too, and the OS error kind is
+# translated back to a POSIX errno on the way into OSError.
 import os
-import tempfile
 
-POSIX = os.name == "posix"
-MISSING = os.path.join(tempfile.gettempdir(), "no_such_file_xyz_pyre_probe")
-EXISTING = tempfile.mkdtemp(prefix="pyre_eexist_")
+MISSING = "pyre_enoent_probe_missing_file"
+EXISTING = "pyre_eexist_probe_dir_%d" % os.getpid()
+
+os.mkdir(EXISTING)
 
 
 def check():
@@ -25,13 +28,10 @@ def check():
         open(MISSING, "r")
     except FileNotFoundError as e:
         assert type(e).__name__ == "FileNotFoundError", type(e).__name__
+        assert e.errno == 2, e.errno
         assert isinstance(e.strerror, str), e.strerror
         assert e.filename == MISSING, e.filename
-        if POSIX:
-            assert e.errno == 2, e.errno
-            assert e.args == (2, e.strerror), e.args
-        else:
-            assert e.errno is not None, e.errno
+        assert e.args == (2, e.strerror), e.args
     else:
         raise AssertionError("open() of a missing path did not raise")
 
@@ -39,12 +39,9 @@ def check():
         os.mkdir(EXISTING)
     except FileExistsError as e:
         assert type(e).__name__ == "FileExistsError", type(e).__name__
+        assert e.errno == 17, e.errno
         assert isinstance(e.strerror, str), e.strerror
-        if POSIX:
-            assert e.errno == 17, e.errno
-            assert e.args == (17, e.strerror), e.args
-        else:
-            assert e.errno is not None, e.errno
+        assert e.args == (17, e.strerror), e.args
     else:
         raise AssertionError("os.mkdir of an existing path did not raise")
 
