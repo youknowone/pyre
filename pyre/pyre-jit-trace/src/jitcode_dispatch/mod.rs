@@ -7606,6 +7606,45 @@ fn handle<Sym: WalkSym>(
         "setfield_gc_i/rcd" => setfield_gc_via_heapcache(code, op, ctx, 'c'),
         "setfield_gc_r/rrd" => setfield_gc_via_heapcache(code, op, ctx, 'r'),
         "setfield_gc_f/rfd" => setfield_gc_via_heapcache(code, op, ctx, 'f'),
+        // Raw memory carries no heapcache bookkeeping: where the `_gc_`
+        // family consults and updates the cache, `pyjitpl.py`'s raw pair
+        // only records.
+        //
+        //   def opimpl_raw_load_i(self, addrbox, offsetbox, arraydescr):
+        //       return self.execute_with_descr(rop.RAW_LOAD_I, arraydescr,
+        //                                      addrbox, offsetbox)
+        //
+        // Operand layout `iid>i`: 1B base + 1B offset + 2B descr + 1B dst.
+        "raw_load_i/iid>i" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let offset = read_int_reg(code, op, 1, ctx)?;
+            let descr = read_descr(code, op, 2, ctx)?;
+            let result =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::RawLoadI, &[base, offset], descr);
+            let dst = code[op.pc + 5] as usize;
+            // The walk never performed the load, so the result carries no
+            // recording-time concrete and readers decline instead of
+            // consuming a value the walker did not observe.
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // `_opimpl_raw_store` delegates to `execute_raw_store`:
+        //
+        //   self.execute_and_record(rop.RAW_STORE, arraydescr,
+        //                           addrbox, offsetbox, valuebox)
+        //
+        // Records and nothing else — no cache update, no result register.
+        // Operand layout `iiid`: 1B base + 1B offset + 1B value + 2B descr.
+        "raw_store_i/iiid" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let offset = read_int_reg(code, op, 1, ctx)?;
+            let value = read_int_reg(code, op, 2, ctx)?;
+            let descr = read_descr(code, op, 3, ctx)?;
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::RawStore, &[base, offset, value], descr);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // Heapcache-aware array reads/writes (canonical `rid>X` /
         // `ri{i,r,f}d` shapes).  Array indices are always int-classified,
         // so the index operand is always decoded from the `i` register

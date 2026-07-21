@@ -799,14 +799,25 @@ fn new_records_the_alloc_and_writes_the_ref_dst() {
     drive_alloc_with_descr("new/d>r", OpCode::New);
 }
 
-/// Step one heapcache-hint opcode (`assert_not_none`,
-/// `record_exact_class`) over caller-supplied banks.
+/// Step one record-only opcode (the heapcache hints, the raw-memory pair)
+/// over caller-supplied banks.
 fn run_hint_step(
     code: &[u8],
     tc: &mut TraceCtx,
     regs_r: &mut [OpRef],
     concrete_r: &mut [ConcreteValue],
     regs_i: &mut [OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    run_hint_step_with_descrs(code, tc, regs_r, concrete_r, regs_i, &[])
+}
+
+fn run_hint_step_with_descrs(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    regs_i: &mut [OpRef],
+    descr_pool: &[DescrRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -819,7 +830,7 @@ fn run_hint_step(
         registers_f: &mut [],
         concrete_registers_r: concrete_r,
         concrete_registers_i: &mut [],
-        descr_refs: &[],
+        descr_refs: descr_pool,
         raw_descrs: RawDescrPool::Global,
         is_authoritative_executor: false,
         is_full_body_walk: false,
@@ -904,6 +915,80 @@ fn assert_not_none_declines_when_the_operand_has_no_concrete() {
         tc.num_ops(),
         ops_before,
         "a declined step must not leave a recorded op behind"
+    );
+}
+
+#[test]
+fn raw_load_i_records_the_load_against_the_descr() {
+    let byte = *insns_opname_to_byte()
+        .get("raw_load_i/iid>i")
+        .expect("`raw_load_i/iid>i` must be in insns table");
+    // `iid>i`: 1B base + 1B offset + 2B descr + 1B dst.
+    let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x02];
+    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let mut tc = fresh_trace_ctx();
+    let base = tc.const_int(0x1000);
+    let offset = tc.const_int(8);
+    let mut regs_i = [base, offset, OpRef::NONE];
+    let (outcome, next_pc) =
+        run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
+            .expect("`raw_load_i/iid>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iid>i` consumes 3 register bytes plus a 2B descr"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RawLoadI);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![base, offset],
+        "raw loads record the address pair only; the descr rides alongside",
+    );
+    assert_eq!(
+        regs_i[2],
+        last.pos.get(),
+        "the `>i` decorator writes the dst"
+    );
+}
+
+#[test]
+fn raw_store_i_records_the_store_and_writes_no_register() {
+    let byte = *insns_opname_to_byte()
+        .get("raw_store_i/iiid")
+        .expect("`raw_store_i/iiid` must be in insns table");
+    // `iiid`: 1B base + 1B offset + 1B value + 2B descr.
+    let code = [byte, 0x00, 0x01, 0x02, 0x00, 0x00];
+    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let mut tc = fresh_trace_ctx();
+    let base = tc.const_int(0x1000);
+    let offset = tc.const_int(8);
+    let value = tc.const_int(42);
+    let mut regs_i = [base, offset, value];
+    let (outcome, next_pc) =
+        run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
+            .expect("`raw_store_i/iiid` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iiid` consumes 3 register bytes plus a 2B descr"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RawStore);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![base, offset, value],
+    );
+    assert_eq!(
+        regs_i,
+        [base, offset, value],
+        "a raw store leaves every register untouched"
     );
 }
 
