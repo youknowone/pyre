@@ -665,6 +665,16 @@ pub(crate) fn fbw_append_promote_journal_push(list: pyre_object::PyObjectRef) {
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().push(list));
 }
 
+/// Undo the most recent Empty-to-typed list promotion when its speculative
+/// append fold is locally declined.
+pub(crate) fn fbw_append_promote_journal_rollback_last(list: pyre_object::PyObjectRef) {
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| {
+        let popped = j.borrow_mut().pop();
+        assert_eq!(popped, Some(list));
+    });
+    unsafe { pyre_object::listobject::w_list_clear(list) };
+}
+
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
 /// for the in-place restore when the walk does not commit its end state.
 // Consumed by the StoreName/StoreGlobal cell fold

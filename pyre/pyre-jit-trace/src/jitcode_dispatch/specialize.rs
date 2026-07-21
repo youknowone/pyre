@@ -2953,9 +2953,9 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
 /// the sub-walk with inline-subwalk mode enabled.
 ///
 /// Like the fold, the walker only RECORDS the array-op IR; this applies the
-/// append to the concrete list + journals the rewind.  Declines (`Ok(None)`)
-/// BEFORE emitting any IR for a non-matching shape (SAFE fallback to the fold
-/// / residual).
+/// append to the concrete list + journals the rewind. Recognition declines
+/// before emitting IR; an unsupported body sub-walk rolls its tentative IR
+/// back before falling through to the residual call.
 ///
 /// STATUS: the descr-pool
 /// wiring, the host-static const relocation, and the list header field
@@ -2968,8 +2968,8 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
 /// at build time (`jtransform.rs`), so the descent completes and commits a
 /// working trace.  Safety net: if a stale build-time jitcode kept that ctor as
 /// a symbolic (`>>47`) fnaddr, `try_execute_residual_call_via_executor`
-/// declines it (`OrthodoxSubWalkTraceUnsupported`) and the descent aborts
-/// gracefully (interpreter fallback) instead of baking the hash as a code
+/// declines it (`OrthodoxSubWalkTraceUnsupported`) and the method-call form
+/// records the append as a residual call instead of baking the hash as a code
 /// address and branching to garbage.
 pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3022,7 +3022,14 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     // resolver) and stays live for the enclosing full-body walk.
     let sym = unsafe { &*sym_ptr };
 
-    // ── commit (record IR; no further declines) ──
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Mirror the commit's own promotion predicate exactly: a rollback must
+    // undo a promotion only when one was performed, or it would pop another
+    // list's journal entry.
+    let promoted_empty = empty_append_virt_enabled()
+        && unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
+
+    // ── tentative commit ──
     let callable_op = r_args[0];
     let value_op = r_args[2];
 
@@ -3060,9 +3067,22 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
         crate::descr::method_w_self_descr(),
     );
 
-    orthodox_list_append_commit(
+    let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, self_ref, value_op, inner_self, value, len_before,
-    )?;
+    );
+    match commit_result {
+        Ok(()) => {}
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            bool_box_truth_reset();
+            if promoted_empty {
+                fbw_append_promote_journal_rollback_last(inner_self);
+            }
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
 
     // The `list.append(x)` call's `None` return (the residual's Ref dst).
     let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);

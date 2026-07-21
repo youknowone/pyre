@@ -1986,9 +1986,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // parity suite folding function-entry helper appends on both backends.
     // #171 ORTHODOX descent: descend the real `w_list_append` body,
     // recording its array ops native.
-    // A decline (`None`) falls through to the generic residual below; an
-    // un-lowered in-body helper aborts the trace (graceful interpreter
-    // fallback).  Gated to top full-body frames, not inside a sub-walk.
+    // A recognition or body-sub-walk decline falls through to the generic
+    // residual below. Gated to top full-body frames, not inside a sub-walk.
     if ctx.is_authoritative_executor
         && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'r'
