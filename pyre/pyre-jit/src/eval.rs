@@ -5586,25 +5586,24 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     )
                 };
                 if ticker < 0 {
-                    if let Err(mut err) =
-                        unsafe { (*ec_ptr).perform_actions(frame_root.frame() as *mut PyFrame) }
-                    {
-                        // Deliver the action's exception (e.g. a signal
-                        // handler's KeyboardInterrupt) as if raised at the
-                        // current opcode so the frame's try/except can
-                        // catch it — CPython runs the eval-breaker
-                        // exception through the same `goto error` path.
-                        // `frame.last_instr` was set to `pc` above, so
+                    if let Err(mut err) = unsafe { (*ec_ptr).perform_actions(f) } {
+                        // perform_actions may allocate → re-seed before reading
+                        // the frame. Deliver the action's exception (e.g. a
+                        // signal handler's KeyboardInterrupt) as if raised at
+                        // the current opcode so the frame's try/except can catch
+                        // it. `frame.last_instr` was set to `pc` above, so
                         // `handle_exception` finds the covering handler.
-                        let mut next_instr = frame_root.frame().next_instr();
+                        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                        let mut next_instr = unsafe { &*f }.next_instr();
                         if pyre_interpreter::eval::handle_exception(
-                            frame_root.frame(),
+                            unsafe { &mut *f },
                             &mut err,
                             &mut next_instr,
                         ) {
-                            frame_root
-                                .frame()
-                                .set_last_instr_from_next_instr(next_instr);
+                            // handle_exception may allocate; re-seed before the
+                            // final frame write.
+                            let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                            unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
                         return LoopResult::Done(Err(err));
