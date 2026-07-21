@@ -3129,10 +3129,20 @@ impl<S: JitState> JitDriver<S> {
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
             // guard failure resumes via blackhole — isolates bridge-record
             // resume defects from the blackhole path.
-            let bridge_needs_materialization =
-                exit_layout.storage.as_deref().is_some_and(|storage| {
-                    !storage.rd_virtuals.is_empty() || !storage.rd_pendingfields.is_empty()
-                });
+            //
+            // Guard resume virtuals ARE bridgeable: the bridge trace emits a
+            // materialization prologue (`setup_bridge_sym` -> NEW_WITH_VTABLE /
+            // SETFIELD_GC, resume.py:1042-1057 ResumeDataBoxReader._prepare), so
+            // `rd_virtuals` alone must NOT decline — declining it strands the hot
+            // loop on blackhole deopt (recursive fib etc. lose all JIT speedup).
+            // `rd_pendingfields` still declines: the bridge path only seeds the
+            // exception channel, not the general SETFIELD_GC pending-field
+            // prologue (resume.py:993-1007 _prepare_pendingfields), which is the
+            // remaining orthodox gap tracked separately.
+            let bridge_needs_materialization = exit_layout
+                .storage
+                .as_deref()
+                .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
             if bridge_needs_materialization {
                 self.meta.record_declined_bridge_guard(&descr_arc);
             }
@@ -4889,11 +4899,13 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
             .and_then(|layout| layout.storage)
-            .is_some_and(|storage| {
-                !storage.rd_virtuals.is_empty() || !storage.rd_pendingfields.is_empty()
-            })
+            .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
         {
-            // resume.py:983-1006: bridge materialization prologue is required before attaching this guard.
+            // resume.py:993-1007 _prepare_pendingfields: the general SETFIELD_GC
+            // pending-field prologue is not yet emitted on the bridge path, so a
+            // guard carrying pending fields still declines. `rd_virtuals` alone
+            // is bridgeable via the `setup_bridge_sym` materialization prologue
+            // and must NOT gate here (see the handle_fail decline site).
             return false;
         }
 
