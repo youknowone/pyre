@@ -8970,11 +8970,7 @@ fn init_type_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__annotations__",
-            make_getset_property(
-                annotations_getter,
-                annotations_setter,
-                annotations_deleter,
-            ),
+            make_getset_property(annotations_getter, annotations_setter, annotations_deleter),
         )
     };
 

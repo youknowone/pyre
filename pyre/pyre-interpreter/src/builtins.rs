@@ -3624,10 +3624,7 @@ pub(crate) fn type_new_set_hash_if_eq(ns: PyObjectRef) {
 /// `__qualname__` entry before slot setup and retain it on the type object.
 /// Keeping it in the namespace changes `cls.__dict__` and makes libraries
 /// such as `typing.Protocol` mistake it for a user-declared member.
-pub(crate) fn type_new_take_qualname(
-    w_type: PyObjectRef,
-    ns: PyObjectRef,
-) -> crate::PyResult {
+pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> crate::PyResult {
     let Some(value) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__qualname__") }) else {
         return Ok(pyre_object::w_none());
     };

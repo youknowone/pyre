@@ -5437,9 +5437,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
         )));
     }
     if !unsafe { is_none(value) } && !callable_w(value) {
-        return Err(PyError::type_error(
-            "__annotate__ must be callable or None",
-        ));
+        return Err(PyError::type_error("__annotate__ must be callable or None"));
     }
     crate::type_dict_store(obj, "__annotate_func__", value);
     crate::type_dict_delete(obj, "__annotations_cache__");
@@ -7160,20 +7158,6 @@ thread_local! {
     });
 }
 
-/// `typeobject.py MethodCache.clear`, called by explicit `gc.collect()` before
-/// tracing so cached defining classes and descriptors do not keep otherwise
-/// unreachable heap types alive.
-pub(crate) fn clear_method_cache() {
-    METHOD_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        cache.versions.fill(0);
-        cache.names.fill(None);
-        cache
-            .lookup_where
-            .fill((std::ptr::null_mut(), std::ptr::null_mut()));
-    });
-}
-
 /// `typeobject.py:520-535` method-hash.  `version_tag` is pyre's u64
 /// version token directly (PyPy hashes `current_object_addr_as_int(
 /// version_tag)`; the u64 is its own address-stable surrogate).
@@ -8578,10 +8562,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                             object_functionstr_type_name(value),
                         )));
                     }
-                    pyre_object::w_type_set_qualname(
-                        obj,
-                        pyre_object::w_str_get_value(value),
-                    );
+                    pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
                     return Ok(w_none());
                 }
                 // typeobject.py:1258-1261 descr_set___abstractmethods__ —
@@ -9291,9 +9272,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return type_del_annotations(obj);
                 }
                 if name == "__annotate__" {
-                    return Err(PyError::type_error(
-                        "cannot delete __annotate__ attribute",
-                    ));
+                    return Err(PyError::type_error("cannot delete __annotate__ attribute"));
                 }
                 if crate::type_dict_delete(obj, name) {
                     // typeobject.py:1263-1267 descr_del___abstractmethods__.

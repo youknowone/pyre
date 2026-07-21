@@ -11577,22 +11577,6 @@ impl CodeWriter {
                                 )
                             {
                                 emit_abort_permanent!(py_pc);
-                                // The bailout is a graph terminator even though
-                                // the runtime transfers control back to the
-                                // interpreter before reaching its successor.
-                                // Close it explicitly so `flatten.py make_link`
-                                // enters this block and emits the
-                                // bailout instead of treating its FrameState-
-                                // wide input arguments as a direct return.
-                                append_exit(
-                                    &current_block.block(),
-                                    super::flow::Link::new(
-                                        vec![super::flow::Constant::none().into()],
-                                        Some(graph.returnblock.clone()),
-                                        None,
-                                    )
-                                    .into_ref(),
-                                );
                                 continue;
                             }
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(

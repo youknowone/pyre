@@ -3554,9 +3554,7 @@ fn build_class_inner(
     // the cell's provisional body namespace with the completed type dict.
     let classdictcell_root = {
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        let cell = unsafe {
-            pyre_object::w_dict_getitem_str(class_ns, "__classdictcell__")
-        };
+        let cell = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classdictcell__") };
         cell.filter(|value| unsafe { pyre_object::is_cell(*value) })
             .map(|cell| {
                 pyre_object::gc_roots::pin_root(cell);
@@ -4280,11 +4278,8 @@ pub unsafe fn create_all_slots(
         {
             let slot_index = base_nslots + newslotnames.len() as u32;
             if crate::type_dict_has_storage(w_type) {
-                let member = pyre_object::w_member_new(
-                    slot_index,
-                    "__dict_data__".to_string(),
-                    w_type,
-                );
+                let member =
+                    pyre_object::w_member_new(slot_index, "__dict_data__".to_string(), w_type);
                 crate::type_dict_store(w_type, "__dict_data__", member);
             }
             newslotnames.push("__dict_data__".to_string());

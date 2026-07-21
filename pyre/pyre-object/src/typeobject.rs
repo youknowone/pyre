@@ -325,10 +325,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
             crate::lltype::malloc_raw(name_value),
         )
     } else {
-        let name = crate::gc_storage::gc_alloc_storage_box(
-            name_value.clone(),
-            name_storage_gc_type_id(),
-        );
+        let name =
+            crate::gc_storage::gc_alloc_storage_box(name_value.clone(), name_storage_gc_type_id());
         crate::gc_roots::pin_root(name as PyObjectRef);
         let qualname =
             crate::gc_storage::gc_alloc_storage_box(name_value, name_storage_gc_type_id());

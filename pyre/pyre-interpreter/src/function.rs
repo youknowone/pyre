@@ -1181,9 +1181,7 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
-pub unsafe fn function_get_annotations(
-    obj: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+pub unsafe fn function_get_annotations(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if obj.is_null() {
             return Ok(pyre_object::w_dict_new());
@@ -1195,10 +1193,8 @@ pub unsafe fn function_get_annotations(
         }
         let annotate_fn = (*func).w_annotate;
         if !annotate_fn.is_null() && !pyre_object::is_none(annotate_fn) {
-            let dict = crate::call::call_function_impl_result(
-                annotate_fn,
-                &[pyre_object::w_int_new(1)],
-            )?;
+            let dict =
+                crate::call::call_function_impl_result(annotate_fn, &[pyre_object::w_int_new(1)])?;
             if !pyre_object::is_dict(dict) {
                 return Err(crate::PyError::type_error(format!(
                     "__annotate__ returned non-dict of type '{}'",

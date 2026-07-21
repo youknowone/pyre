@@ -1420,11 +1420,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         let _attr = self.pop_value()?;
         Ok(())
     }
-    fn load_from_dict_or_globals(
-        &mut self,
-        _name: &str,
-        _nameindex: usize,
-    ) -> Result<(), PyError> {
+    fn load_from_dict_or_globals(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_from_dict_or_globals not implemented").into())
     }
     fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), PyError> {
