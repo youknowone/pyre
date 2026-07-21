@@ -3620,6 +3620,30 @@ pub(crate) fn type_new_set_hash_if_eq(ns: PyObjectRef) {
     }
 }
 
+/// PyPy `typeobject.py:223-235 W_TypeObject.__init__`: consume the compiler's
+/// `__qualname__` entry before slot setup and retain it on the type object.
+/// Keeping it in the namespace changes `cls.__dict__` and makes libraries
+/// such as `typing.Protocol` mistake it for a user-declared member.
+pub(crate) fn type_new_take_qualname(
+    w_type: PyObjectRef,
+    ns: PyObjectRef,
+) -> crate::PyResult {
+    let Some(value) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__qualname__") }) else {
+        return Ok(pyre_object::w_none());
+    };
+    if !unsafe { pyre_object::is_str(value) } {
+        return Err(crate::PyError::type_error(format!(
+            "type __qualname__ must be a str, not {}",
+            crate::type_methods::arg_type_name(value),
+        )));
+    }
+    unsafe {
+        pyre_object::w_type_set_qualname(w_type, pyre_object::w_str_get_value(value));
+        pyre_object::w_dict_delitem_str_no_proxy(ns, "__qualname__");
+    }
+    Ok(pyre_object::w_none())
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -3815,6 +3839,7 @@ fn type_descr_new_with_metaclass(
         }
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
         let w_type = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        type_new_take_qualname(w_type, dict_obj)?;
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe { crate::call::create_all_slots(w_type, w_effective_bases)? };
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.

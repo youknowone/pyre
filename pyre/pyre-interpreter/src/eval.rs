@@ -3244,10 +3244,7 @@ impl OpcodeStepExecutor for PyFrame {
                 // evaluates with `format=1` when the runtime dict is
                 // requested; stored on the function's typed
                 // `w_annotate` slot (CPython 3.14 `func_annotate`).
-                unsafe { (*(func as *mut crate::function::Function)).w_annotate = attr };
-                // Direct field store bypasses `function_write_barrier`;
-                // record it for the prebuilt-root minor-collection skip.
-                pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+                unsafe { crate::function::function_set_annotate_unchecked(func, attr) };
             }
             // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
             // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a
@@ -3365,27 +3362,21 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadFromDictOrGlobals ──
     // CPython 3.13: LOAD_FROM_DICT_OR_GLOBALS — try TOS dict first, then globals
-    fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), PyError> {
-        let dict = self.pop();
-        // Try dict first (if it's a dict or has attrs)
-        if let Ok(val) = crate::baseobjspace::getattr_str(dict, name) {
-            self.push(val);
-            return Ok(());
-        }
-        // Fall back to globals
-        let w_globals = self.get_w_globals();
-        if !w_globals.is_null() {
-            if let Some(val) =
-                unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
-            {
-                self.push(val);
+    fn load_from_dict_or_globals(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
+        let mapping = self.pop();
+        let key = pyre_object::w_str_new(name);
+        match crate::baseobjspace::getitem(mapping, key) {
+            Ok(value) => {
+                self.push(value);
                 return Ok(());
             }
+            Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
+            Err(err) => return Err(err),
         }
-        Err(PyError::name_error_with_name(
-            format!("name '{name}' is not defined"),
-            name,
-        ))
+
+        let value = self.load_global_value(name, nameindex)?;
+        self.push(value);
+        Ok(())
     }
 
     // ── LoadFromDictOrDeref ──

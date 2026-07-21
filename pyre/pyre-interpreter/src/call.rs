@@ -3756,6 +3756,7 @@ fn build_class_inner(
         }
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
         let w = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        crate::builtins::type_new_take_qualname(w, dict_obj)?;
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe { create_all_slots(w, w_effective_bases)? };
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)

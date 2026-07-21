@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 T = TypeVar("T")
 
@@ -35,3 +35,19 @@ class ClassWithUnionParams:
 
     def method(self, value: Union[int, float]) -> Union[str, bytes]:
         return str(value)
+
+
+# PEP 649 class annotation scopes use LOAD_FROM_DICT_OR_GLOBALS.  A miss in
+# the class namespace must continue through module globals and builtins.
+class AnnotatedCoordinate:
+    x: int
+
+
+assert AnnotatedCoordinate.__annotations__ == {"x": int}
+
+
+class CoordinateProtocol(Protocol):
+    x: int
+
+
+assert CoordinateProtocol.__protocol_attrs__ == {"x"}

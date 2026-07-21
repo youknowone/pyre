@@ -91,11 +91,7 @@ pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) ->
             // PEP 649: `attr` is the `__annotate__` callable the runtime
             // `__annotations__` getter evaluates lazily; stored on the
             // typed `w_annotate` slot.
-            unsafe { (*(func as *mut crate::function::Function)).w_annotate = attr };
-            // The direct field store bypasses `function_write_barrier`;
-            // record it for the prebuilt-root minor-collection skip, exactly
-            // as the interpreter does.
-            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+            unsafe { crate::function::function_set_annotate_unchecked(func, attr) };
         }
         // `TypeParams = 5` carries a PEP 695 type-parameter tuple; pyre has
         // no PEP 695 surface, so the operand is accepted silently.

@@ -101,6 +101,9 @@ pub struct W_TypeObject {
     pub ob_header: PyObject,
     /// Class name (heap-allocated, leaked).
     pub name: *mut String,
+    /// Qualified class name.  PyPy `W_TypeObject.qualname` is populated by
+    /// consuming `__qualname__` from the class namespace at construction.
+    pub qualname: *mut String,
     /// Tuple of base type objects (PyObjectRef → W_TupleObject or PY_NULL).
     pub bases: PyObjectRef,
     /// Raw pointer to the class dict backing storage (`dict_w` analogue).
@@ -331,6 +334,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         },
         mro_w: std::ptr::null_mut(),
         name,
+        qualname,
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
@@ -425,7 +429,9 @@ pub fn w_type_new_builtin(
     dict_ptr: *mut u8,
     _layout_pytype: *const PyType,
 ) -> PyObjectRef {
+    let qualname_value = name.rsplit('.').next().unwrap_or(name).to_string();
     let name = crate::lltype::malloc_raw(name.to_string());
+    let qualname = crate::lltype::malloc_raw(qualname_value);
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
@@ -442,6 +448,7 @@ pub fn w_type_new_builtin(
         },
         mro_w: std::ptr::null_mut(),
         name,
+        qualname,
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
@@ -782,6 +789,16 @@ pub unsafe fn w_type_get_name(obj: PyObjectRef) -> &'static str {
 /// name and installs the new one, leaving the slot itself unchanged.
 pub unsafe fn w_type_set_name(obj: PyObjectRef, name: &str) {
     *(*(obj as *mut W_TypeObject)).name = name.to_string();
+}
+
+/// `typeobject.py:223-235` / `getqualname`: the class qualified name lives
+/// on `W_TypeObject`, not in its namespace after type creation.
+pub unsafe fn w_type_get_qualname(obj: PyObjectRef) -> &'static str {
+    &*(*(obj as *const W_TypeObject)).qualname
+}
+
+pub unsafe fn w_type_set_qualname(obj: PyObjectRef, qualname: &str) {
+    *(*(obj as *mut W_TypeObject)).qualname = qualname.to_string();
 }
 
 /// Get the bases tuple.

@@ -976,6 +976,18 @@ pub unsafe fn function_set_annotate(
         ));
     }
     unsafe {
+        function_set_annotate_unchecked(obj, value);
+    }
+    Ok(())
+}
+
+/// MAKE_FUNCTION helper for the compiler-provided PEP 649 callable.  The
+/// callable is already validated by bytecode construction, but the GC write
+/// barrier is still required: Function objects are old-generation carriers
+/// and the annotate function may be in the nursery.
+#[inline]
+pub unsafe fn function_set_annotate_unchecked(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
         function_write_barrier(obj);
         let func = obj as *mut Function;
         (*func).w_annotate = value;
@@ -983,7 +995,6 @@ pub unsafe fn function_set_annotate(
             (*func).w_ann = PY_NULL;
         }
     }
-    Ok(())
 }
 
 /// CPython 3.14 `function.__type_params__` getter.

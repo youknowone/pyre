@@ -5373,6 +5373,78 @@ unsafe fn type_getattr_hook_or_err(
     Err(e)
 }
 
+/// CPython 3.14 `type_get_annotations` with PyPy's per-object ownership
+/// shape: explicit annotations and the lazy cache belong to this type's own
+/// namespace and are never inherited from a base class.
+pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotations__") {
+        return Ok(value);
+    }
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotations_cache__") {
+        return Ok(value);
+    }
+
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::attribute_error(format!(
+            "type object '{}' has no attribute '__annotations__'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+
+    let annotate_fn = crate::type_dict_lookup(obj, "__annotate_func__")
+        .or_else(|| crate::type_dict_lookup(obj, "__annotate__"));
+    let annotations = match annotate_fn {
+        Some(callable) if !callable.is_null() && !unsafe { is_none(callable) } => {
+            let value = crate::call::call_function_impl_result(callable, &[w_int_new(1)])?;
+            if !unsafe { is_dict(value) } {
+                return Err(PyError::type_error(format!(
+                    "__annotate__ returned non-dict of type '{}'",
+                    object_functionstr_type_name(value),
+                )));
+            }
+            value
+        }
+        _ => pyre_object::w_dict_new(),
+    };
+    crate::type_dict_store(obj, "__annotations_cache__", annotations);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    Ok(annotations)
+}
+
+pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::type_error(format!(
+            "cannot set '__annotations__' attribute of immutable type '{}'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    crate::type_dict_store(obj, "__annotations_cache__", value);
+    crate::type_dict_store(obj, "__annotate_func__", w_none());
+    crate::type_dict_store(obj, "__annotate__", w_none());
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    unsafe { mutated(obj, Some("__annotations__")) };
+    Ok(w_none())
+}
+
+pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::type_error(format!(
+            "cannot delete '__annotations__' attribute of immutable type '{}'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    let removed = crate::type_dict_delete(obj, "__annotations_cache__")
+        || crate::type_dict_delete(obj, "__annotations__");
+    if !removed {
+        return Err(raiseattrerror(obj, "__annotations__", None));
+    }
+    crate::type_dict_store(obj, "__annotate_func__", w_none());
+    crate::type_dict_store(obj, "__annotate__", w_none());
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    unsafe { mutated(obj, Some("__annotations__")) };
+    Ok(w_none())
+}
+
 fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
     // Type objects: look up in type's own dict → base dicts
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
@@ -5454,16 +5526,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 return Ok(w_str_new(bare));
             }
             if name == "__qualname__" {
-                // Check if __qualname__ was explicitly set in class body
-                if let Some(qn) = lookup_in_type_where(obj, "__qualname__") {
-                    return Ok(qn);
-                }
-                // A static type's qualname is its bare name; a dotted tp_name
-                // (e.g. "re.Pattern") carries its module prefix only in repr,
-                // so strip to the final component here, matching __name__.
-                let full = w_type_get_name(obj);
-                let bare = full.rsplit('.').next().unwrap_or(full);
-                return Ok(w_str_new(bare));
+                return Ok(w_str_new(pyre_object::w_type_get_qualname(obj)));
             }
             if name == "__mro__" {
                 let mro_ptr = w_type_get_mro(obj);
@@ -5512,25 +5575,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
                 return Ok(base);
             }
-            // PEP 649 lazy annotations: when `cls.__annotations__` is
-            // requested and only `__annotate_func__` (or `__annotate__`)
-            // is set, call the annotate function with format=1 to
-            // produce the actual dict.  CPython 3.14+ stops emitting
-            // `__annotations__` directly in class bodies in favour of
-            // this lazy form.
             if name == "__annotations__" {
-                if let Some(v) = lookup_in_type_where(obj, "__annotations__") {
-                    return Ok(v);
-                }
-                if let Some(annotate_fn) = lookup_in_type_where(obj, "__annotate_func__")
-                    .or_else(|| lookup_in_type_where(obj, "__annotate__"))
-                {
-                    if !annotate_fn.is_null() && !is_none(annotate_fn) {
-                        // format=1 (VALUE) — return runtime values.
-                        return Ok(crate::call_function(annotate_fn, &[w_int_new(1)]));
-                    }
-                }
-                return Ok(pyre_object::w_dict_new());
+                return type_get_annotations(obj);
             }
             // PEP 649: `__annotate__` and `__annotate_func__` are the
             // same slot. Bytecode stores it as `__annotate_func__` in the
@@ -7371,12 +7417,7 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
     if !pyre_object::w_type_is_heaptype(w_type) {
         return w_type_get_name(w_type).to_string();
     }
-    // `w_type.getqualname(space)` — an explicit `__qualname__` set in the
-    // class body, else the bare name.
-    let qualname = match lookup_in_type_where(w_type, "__qualname__") {
-        Some(qn) if is_str(qn) => w_str_get_value(qn).to_string(),
-        _ => w_type_get_name(w_type).to_string(),
-    };
+    let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
     // `w_type.lookup("__module__")` prepends a string module name; a
     // non-string `__module__` is ignored (`utf8_w` raises `TypeError`).
     match lookup_in_type(w_type, "__module__") {
@@ -7402,10 +7443,7 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
         .map(|m| w_str_get_value(m).to_string());
     match module {
         Some(m) if m != "builtins" => {
-            let qualname = match lookup_in_type_where(w_type, "__qualname__") {
-                Some(qn) if is_str(qn) => w_str_get_value(qn).to_string(),
-                _ => name,
-            };
+            let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
             format!("{m}.{qualname}")
         }
         _ => name,
@@ -8468,6 +8506,30 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 )));
             }
             if crate::type_dict_has_storage(obj) {
+                // CPython 3.14 type_set_annotations stores assignments in
+                // the per-type cache and disables the lazy annotate
+                // callable.  The value is intentionally not inherited via
+                // the MRO.
+                if name == "__annotations__" {
+                    return type_set_annotations(obj, value);
+                }
+                // typeobject.py:1064-1072 descr_set__qualname__ stores the
+                // validated text in W_TypeObject.qualname; it never creates
+                // a class-dict entry.
+                if name == "__qualname__" {
+                    if !pyre_object::is_str(value) {
+                        return Err(PyError::type_error(format!(
+                            "can only assign string to {}.__qualname__, not '{}'",
+                            w_type_get_name(obj),
+                            object_functionstr_type_name(value),
+                        )));
+                    }
+                    pyre_object::w_type_set_qualname(
+                        obj,
+                        pyre_object::w_str_get_value(value),
+                    );
+                    return Ok(w_none());
+                }
                 // typeobject.py:1258-1261 descr_set___abstractmethods__ —
                 // evaluate truthiness BEFORE mutating the dict so a raising
                 // `__bool__` leaves the type unchanged (CPython
@@ -9171,6 +9233,9 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                 )));
             }
             if crate::type_dict_has_storage(obj) {
+                if name == "__annotations__" {
+                    return type_del_annotations(obj);
+                }
                 if crate::type_dict_delete(obj, name) {
                     // typeobject.py:1263-1267 descr_del___abstractmethods__.
                     if name == "__abstractmethods__" {
