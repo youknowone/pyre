@@ -1703,6 +1703,17 @@ fn build_function(
         sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
     }
 
+    // Bind the folded constants the optimizer left under a plain op position
+    // (see `unbound_pool_const_seeds`). Emitted before every block so the
+    // binding dominates the whole body, including a resume-at-LABEL entry.
+    for (raw, bits) in unbound_pool_const_seeds(inputargs, ops, constants, num_vars)? {
+        sink.i64_const(bits);
+        if value_types[raw as usize] == ValType::F64 {
+            sink.f64_reinterpret_i64();
+        }
+        sink.local_set(1 + raw);
+    }
+
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
     // JUMP branches back to it. Emit the `loop` at the LABEL selected by the
@@ -4516,6 +4527,73 @@ fn emit_resolve_f64(
         debug_assert_eq!(value_types[opref.raw() as usize], ValType::F64);
         sink.local_get(1 + opref.raw());
     }
+}
+
+/// Values the optimizer left as plain (non-`Const`) OpRefs whose only
+/// definition is a constant-pool entry, paired with that entry's raw bits.
+///
+/// Constant folding and the short preamble both hand the backend a folded
+/// value under its original op position, with no producing op left in the
+/// trace. `RegisterManager::loc` (dynasm `regalloc.rs`) covers that case with
+/// a constants-map fallback taken once no register and no frame binding is
+/// found. wasm materializes every value in a local instead of a location, so
+/// the equivalent binding is a prologue store: without it the never-written
+/// local reads as the zero wasm initializes it to, silently substituting 0
+/// for the folded constant at every use.
+///
+/// Only positions actually read as a plain OpRef are returned, so a trace
+/// whose pool holds no such value emits no extra prologue instruction.
+fn unbound_pool_const_seeds(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    num_vars: u32,
+) -> Result<Vec<(u32, i64)>, BackendError> {
+    use std::collections::HashSet;
+    let mut defined: HashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    for op in ops {
+        let r = op.pos.get();
+        if r != OpRef::NONE && !r.is_constant() {
+            defined.insert(r.raw());
+        }
+    }
+    let mut seeds: Vec<(u32, i64)> = Vec::new();
+    let mut unresolved: Vec<u32> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut consider = |a: OpRef, seeds: &mut Vec<(u32, i64)>, seen: &mut HashSet<u32>| {
+        if a == OpRef::NONE || a.is_constant() {
+            return;
+        }
+        let raw = a.raw();
+        if raw >= num_vars || defined.contains(&raw) || !seen.insert(raw) {
+            return;
+        }
+        match constants.get(&raw) {
+            Some(&bits) => seeds.push((raw, bits)),
+            // No producer and no pool entry: the local would read as the zero
+            // wasm initializes it to, which is a wrong value, not a missing
+            // one. Decline the trace (the interpreter runs it correctly,
+            // unaccelerated) exactly as the unhandled-opcode arm does.
+            None => unresolved.push(raw),
+        }
+    };
+    for op in ops {
+        for a in op.getarglist().iter() {
+            consider(a.to_opref(), &mut seeds, &mut seen);
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa.iter() {
+                consider(a.to_opref(), &mut seeds, &mut seen);
+            }
+        }
+    }
+    if !unresolved.is_empty() {
+        return Err(BackendError::Unsupported(format!(
+            "wasm codegen: value{unresolved:?} read with no producing op and no \
+             constant-pool entry"
+        )));
+    }
+    Ok(seeds)
 }
 
 /// Compile-time value of a constant operand (what `emit_resolve` would push
