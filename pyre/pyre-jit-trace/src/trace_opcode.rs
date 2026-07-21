@@ -548,15 +548,17 @@ use crate::frame_layout::{
 /// (`last_instr`, `pycode`, `valuestackdepth`, `debugdata`,
 /// `lastblock`, `w_globals`).
 ///
-/// No-op when `virtualizable_boxes` is not yet seeded
-/// (non-virtualizable trace, or before `init_virtualizable_boxes`).
+/// No-op when the virtualizable shadow is not seeded (non-virtualizable
+/// trace, or before `init_virtualizable_boxes`) and when only its OpRef
+/// half is live — a bridge-entry rebuild seeds no concrete values, and
+/// there is no concrete slot to mirror into.
 pub(crate) fn mirror_vable_static_to_boxes(
     ctx: &mut TraceCtx,
     static_field_name: &str,
     opref: OpRef,
     concrete: Value,
 ) {
-    if !ctx.has_virtualizable_boxes() {
+    if !ctx.has_virtualizable_shadow() {
         return;
     }
     let idx = ctx

@@ -1035,18 +1035,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-        if let Some(last_instr_index) = info
-            .static_fields
-            .iter()
-            .position(|field| field.name == "last_instr")
-        {
-            let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
-            ctx.trace_ctx.set_virtualizable_entry_at(
-                last_instr_index,
-                last_instr,
-                majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
-            );
-        }
+        // Publish the current Python pc so a force inside the callee reports
+        // the executing line rather than the one the last resume point left
+        // behind.
+        let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            last_instr,
+            majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
+        );
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);

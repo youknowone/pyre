@@ -2314,6 +2314,19 @@ impl TraceCtx {
         self.virtualizable_boxes.is_some()
     }
 
+    /// Whether BOTH halves of the standard virtualizable shadow are active.
+    ///
+    /// `init_virtualizable_boxes` seeds the OpRef half alone when the caller
+    /// has no live concrete values (the bridge-entry rebuild in
+    /// `seed_virtualizable_boxes`, test fixtures), leaving
+    /// `virtualizable_values` disabled so readers fall back to the zero
+    /// placeholder. `set_virtualizable_entry_at` writes both halves and
+    /// panics without the concrete one, so its callers must gate on this
+    /// rather than on `has_virtualizable_boxes`.
+    pub fn has_virtualizable_shadow(&self) -> bool {
+        self.virtualizable_boxes.is_some() && self.virtualizable_values.is_some()
+    }
+
     /// Drop the tracing-time virtualizable_boxes mirror.
     ///
     /// Used at bridge entry: `init_symbolic` seeds the cache with OpRefs
