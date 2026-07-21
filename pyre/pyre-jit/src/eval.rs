@@ -5543,10 +5543,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             if needs_trace {
                 if let Err(err) = unsafe {
-                    (*ec_ptr).bytecode_trace(
-                        f,
-                        pyre_interpreter::executioncontext::TICK_COUNTER_STEP,
-                    )
+                    (*ec_ptr)
+                        .bytecode_trace(f, pyre_interpreter::executioncontext::TICK_COUNTER_STEP)
                 } {
                     return LoopResult::Done(Err(err));
                 }
