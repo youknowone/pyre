@@ -67,4 +67,21 @@ assert not (C.__flags__ & DISALLOW)
 assert C().x == 1
 assert pickle.loads(pickle.dumps(C())).x == 1
 
+
+# A global that names an unimportable home module is a pickle protocol error,
+# not a leaked ModuleNotFoundError from whichmodule's verification import.
+class UnimportableGlobal:
+    pass
+
+
+UnimportableGlobal.__module__ = "pyre_missing_pickle_module"
+for proto in range(0, pickle.HIGHEST_PROTOCOL + 1):
+    for value in (UnimportableGlobal, UnimportableGlobal()):
+        try:
+            pickle.dumps(value, proto)
+        except pickle.PickleError:
+            pass
+        else:
+            raise AssertionError(("unimportable global should not pickle", proto, value))
+
 print("pickle_disallow OK")

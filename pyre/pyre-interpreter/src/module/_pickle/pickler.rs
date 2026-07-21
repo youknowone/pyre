@@ -1891,7 +1891,29 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
         }
     };
     // Verify `module_name.name` resolves back to `w_obj` (qualnames walked).
-    match crate::module::_pickle::try_resolve_global(&module_name, name, true)? {
+    // CPython pickle.whichmodule converts import failures (including the
+    // ModuleNotFoundError subclass), an invalid module name, and a missing
+    // sys.modules entry into PicklingError.  Other exceptions raised by a
+    // module's dynamic attribute machinery still propagate unchanged.
+    let resolved = match crate::module::_pickle::try_resolve_global(&module_name, name, true) {
+        Ok(value) => value,
+        Err(error)
+            if matches!(
+                error.kind,
+                crate::PyErrorKind::ImportError
+                    | crate::PyErrorKind::ModuleNotFoundError
+                    | crate::PyErrorKind::ValueError
+                    | crate::PyErrorKind::KeyError
+            ) =>
+        {
+            return Err(pickling_error(format!(
+                "Can't pickle object: {}",
+                error.message
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    match resolved {
         Some(resolved) if crate::baseobjspace::is_w(resolved, w_obj) => {
             Ok(pyre_object::w_str_new(&module_name))
         }
