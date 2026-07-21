@@ -748,6 +748,17 @@ impl PyError {
     /// the clean strerror, and the `.errno` / `.strerror` / `.filename` slots.
     /// `w_filename` is the affected path, or `PY_NULL` for none.
     pub fn os_error_syscall(errno: i32, w_filename: PyObjectRef) -> Self {
+        Self::os_error_syscall2(errno, w_filename, pyre_object::PY_NULL)
+    }
+
+    /// `os_error_syscall` for the two-path syscalls (`rename`, `replace`,
+    /// `link`, `symlink`): `w_filename2` becomes the `.filename2` slot, which
+    /// `str(e)` renders as the `" -> 'dest'"` suffix.
+    pub fn os_error_syscall2(
+        errno: i32,
+        w_filename: PyObjectRef,
+        w_filename2: PyObjectRef,
+    ) -> Self {
         let strerror = Self::clean_strerror(errno);
         let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
         // The dedicated FileNotFoundError kind carries its own str/repr; the
@@ -764,10 +775,16 @@ impl PyError {
         // `w_exception_new` / `w_list_new` could sweep them before the setters
         // stamp them onto `exc`.
         let _roots = pyre_object::gc_roots::push_roots();
-        let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !w_filename.is_null() {
-            pyre_object::gc_roots::pin_root(w_filename);
-        }
+        let pin = |obj: PyObjectRef| -> Option<usize> {
+            if obj.is_null() {
+                return None;
+            }
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            Some(slot)
+        };
+        let filename_slot = pin(w_filename);
+        let filename2_slot = pin(w_filename2);
         let exc = w_exception_new(exc_kind, &message);
         pyre_object::gc_roots::pin_root(exc);
         // Retag to the errno subclass through `w_class`, like
@@ -792,12 +809,16 @@ impl PyError {
                 exc,
                 pyre_object::w_str_new(&strerror),
             );
-            if !w_filename.is_null() {
-                // Reload the filename after the args allocations: the pin keeps
-                // it alive, but a minor collection may have relocated the young
-                // path, leaving this raw local pointing at the old address.
-                let w_filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
+            // Reload the paths after the args allocations: the pins keep them
+            // alive, but a minor collection may have relocated the young
+            // strings, leaving the raw locals pointing at the old addresses.
+            if let Some(slot) = filename_slot {
+                let w_filename = pyre_object::gc_roots::shadow_stack_get(slot);
                 pyre_object::interp_exceptions::w_exception_set_filename(exc, w_filename);
+            }
+            if let Some(slot) = filename2_slot {
+                let w_filename2 = pyre_object::gc_roots::shadow_stack_get(slot);
+                pyre_object::interp_exceptions::w_exception_set_filename2(exc, w_filename2);
             }
         }
         PyError {

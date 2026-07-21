@@ -109,20 +109,19 @@ pub type SeamResult<T> = Result<T, SeamError>;
 
 /// Map a [`SeamError`] onto the interpreter's `PyError`, mirroring the
 /// `io_err`/`fd_io_err` conversions the real-syscall call sites use. `context`
-/// is the path/name woven into the `OSError` message (empty = omit, matching the
-/// `""` path the fd call sites pass). Only the sandbox build routes errors
+/// is the path that becomes the `OSError`'s `filename` (empty = omit, matching
+/// the `""` the fd call sites pass). Only the sandbox build routes errors
 /// through here; the real build keeps its own inline `io_err`.
 #[cfg(feature = "sandbox")]
 pub fn seam_os_err(e: SeamError, context: &str) -> crate::PyError {
     match e {
         SeamError::Os(errno) => {
-            let io = std::io::Error::from_raw_os_error(errno);
-            let msg = if context.is_empty() {
-                io.to_string()
+            let w_filename = if context.is_empty() {
+                pyre_object::PY_NULL
             } else {
-                format!("{io}: '{context}'")
+                pyre_object::w_str_new(context)
             };
-            crate::PyError::os_error_with_errno(errno, msg)
+            crate::PyError::os_error_syscall(errno, w_filename)
         }
         SeamError::Io => crate::PyError::os_error_with_errno(libc::EIO, "I/O error"),
         SeamError::Value => crate::PyError::value_error("embedded null in path"),

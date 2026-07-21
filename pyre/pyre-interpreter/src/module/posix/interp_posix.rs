@@ -516,13 +516,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     use crate::gateway::fsencode_w as extract_path;
 
     // ── Helper: convert std::io::Error → PyError (OSError) ──
-    fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
+    fn errno_err(errno: i32, path: &str) -> crate::PyError {
         let w_filename = if path.is_empty() {
             pyre_object::PY_NULL
         } else {
             pyre_object::w_str_new(path)
         };
-        crate::PyError::os_error_syscall(crate::builtins::io_error_posix_errno(&e, 0), w_filename)
+        crate::PyError::os_error_syscall(errno, w_filename)
+    }
+
+    fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
+        errno_err(crate::builtins::io_error_posix_errno(&e, 0), path)
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──
@@ -886,7 +890,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             (None, None)
         };
-        host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
+        host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| {
+            let errno = crate::builtins::io_error_posix_errno(&e, 0);
+            // The source string must survive the destination's allocation.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&src));
+            let w_dst = pyre_object::w_str_new(&dst);
+            crate::PyError::os_error_syscall2(
+                errno,
+                pyre_object::gc_roots::shadow_stack_get(src_slot),
+                w_dst,
+            )
+        })?;
         Ok(pyre_object::w_none())
     }
     crate::module_ns_store(
@@ -1374,13 +1390,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let st_flags = 0u32;
                     Ok(make_stat_result(&m, st_flags))
                 }
-                Err(e) => {
-                    let kind = crate::builtins::io_error_posix_errno(&e, 2);
-                    Err(crate::PyError::os_error_with_errno(
-                        kind,
-                        format!("{}: '{}'", e, path_str),
-                    ))
-                }
+                Err(e) => Err(errno_err(
+                    crate::builtins::io_error_posix_errno(&e, 2),
+                    &path_str,
+                )),
             }
         }
     }
@@ -2095,9 +2108,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let path = extract_path(args[0])?;
                     let c_path = std::ffi::CString::new(path.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    host_posix::chdir(&c_path).map_err(|e| {
-                        crate::PyError::os_error_with_errno(e as i32, format!("chdir: '{}'", path))
-                    })?;
+                    host_posix::chdir(&c_path).map_err(|e| errno_err(e as i32, &path))?;
                     Ok(pyre_object::w_none())
                 },
                 1,
