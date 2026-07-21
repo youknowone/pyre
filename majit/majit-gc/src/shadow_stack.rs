@@ -212,7 +212,7 @@ thread_local! {
     static MAX_SHADOW_STACK_DEPTH: Cell<usize> = const { Cell::new(DEFAULT_SHADOW_STACK_DEPTH) };
 
     /// Thread-local shadow stack for individual GcRef roots.
-    static SHADOW_STACK: RefCell<ShadowStack> = RefCell::new(ShadowStack::new());
+    static SHADOW_STACK: RefCell<ShadowStack> = const { RefCell::new(ShadowStack::new()) };
 
     /// Thread-local flat jitframe root stack. Rust tests run multiple
     /// JIT/GC tests in parallel, so using one process-global root stack lets
@@ -372,9 +372,9 @@ struct ShadowStack {
 }
 
 impl ShadowStack {
-    fn new() -> Self {
+    const fn new() -> Self {
         ShadowStack {
-            entries: Vec::with_capacity(64),
+            entries: Vec::new(),
         }
     }
 }
@@ -428,6 +428,37 @@ pub fn get(index: usize) -> GcRef {
         let ss = ss.borrow();
         ss.entries[index]
     })
+}
+
+/// An opaque handle to this thread's `SHADOW_STACK` cell.
+///
+/// The pointer is stable for the life of the owning thread (the same
+/// invariant `MutatorEntry` relies on for STW walks): the thread-local cell is
+/// never reallocated once created. Resolving it once and reusing it lets a hot
+/// caller re-read roots without paying the thread-local resolution
+/// (`_tlv_get_addr` on macOS) on every access — the root-stack base is held in
+/// a fixed location and re-read cheaply, matching the C backend's
+/// once-per-function `gc_enter_roots_frame` resolution and the x86 JIT's
+/// register-cached root-stack top.
+#[derive(Clone, Copy)]
+pub struct ShadowStackSlot(*const RefCell<ShadowStack>);
+
+/// Resolve this thread's `SHADOW_STACK` cell once, for reuse by [`slot_get`].
+pub fn shadow_stack_slot() -> ShadowStackSlot {
+    ShadowStackSlot(SHADOW_STACK.with(|ss| ss as *const _))
+}
+
+/// Get a GcRef at `index` through a previously resolved [`ShadowStackSlot`].
+///
+/// # Safety
+///
+/// `slot` must have been produced by [`shadow_stack_slot`] on the current
+/// thread and the thread must still be alive (its `SHADOW_STACK` not yet torn
+/// down). No `&mut` borrow of the cell may be held across this call.
+pub unsafe fn slot_get(slot: ShadowStackSlot, index: usize) -> GcRef {
+    // SAFETY: per the contract, `slot.0` points at the live owning-thread cell.
+    let ss = unsafe { &*slot.0 }.borrow();
+    ss.entries[index]
 }
 
 /// Walk all entries on the GcRef shadow stack.

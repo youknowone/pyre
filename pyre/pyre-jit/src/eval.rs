@@ -172,18 +172,26 @@ struct FrameLocalsRoot {
 /// collection.
 struct FrameRoot {
     depth: usize,
+    slot: majit_gc::shadow_stack::ShadowStackSlot,
 }
 
 impl FrameRoot {
     #[majit_macros::dont_look_inside]
     fn new(frame: &mut PyFrame) -> Self {
         let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize));
-        Self { depth }
+        // Resolve the thread-local shadow-stack cell once; `frame()` re-reads
+        // the root through this cached slot instead of paying the thread-local
+        // resolution on every access.
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        Self { depth, slot }
     }
 
     #[majit_macros::dont_look_inside]
     fn frame(&mut self) -> &mut PyFrame {
-        let frame = majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame;
+        // SAFETY: `slot` was resolved on this thread in `new` and the thread is
+        // still running; no `&mut` borrow of the cell is held here.
+        let frame = unsafe { majit_gc::shadow_stack::slot_get(self.slot, self.depth) }.0
+            as *mut PyFrame;
         unsafe { &mut *frame }
     }
 
