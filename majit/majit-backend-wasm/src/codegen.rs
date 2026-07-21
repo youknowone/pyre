@@ -1373,7 +1373,7 @@ pub fn build_wasm_module(
             g.is_finish && !crate::failguard::meta_descr_is_exit_frame_with_exception(&g.meta_descr)
         })
         .map(|g| g.fail_index)
-        .unwrap_or(0);
+        .unwrap_or(crate::failguard::WASM_CA_FINISH_FI_UNKNOWN);
     // CA frames execute the source loop and this bridge on the same frozen
     // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
     // no global floor or speculative slack is needed here.
