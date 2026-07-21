@@ -499,20 +499,26 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// the guard skips it.
 unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let bytes = unsafe { &mut *(obj_addr as *mut pyre_object::bytesobject::W_BytesObject) };
+    f(&mut bytes.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !bytes.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(bytes.data as *mut u8) {
         let data_slot = std::ptr::addr_of_mut!(bytes.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
+    f(&mut bytes.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut bytes.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
 /// `W_BytesObject` (off-GC storage epic S4).
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
+    f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !ba.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(ba.data as *mut u8) {
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
+    f(&mut ba.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
@@ -826,34 +832,6 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
         return;
     }
     trace_bufferview(unsafe { &mut *view_ptr }, f);
-}
-
-/// W_BytesObject's mapdict SPECIAL slots for user subclasses.  Exact bytes
-/// leave both null, while subclass instances are managed and cycle-visible.
-unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let bytes = obj_addr as *mut pyre_object::bytesobject::W_BytesObject;
-    f(
-        unsafe { &mut (*bytes).ob_header.w_class } as *mut pyre_object::PyObjectRef
-            as *mut majit_ir::GcRef,
-    );
-    f(unsafe { &mut (*bytes).w_dict } as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(
-        unsafe { &mut (*bytes).w_weakreflifeline } as *mut pyre_object::PyObjectRef
-            as *mut majit_ir::GcRef,
-    );
-}
-
-unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let bytes = obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject;
-    f(
-        unsafe { &mut (*bytes).ob_header.w_class } as *mut pyre_object::PyObjectRef
-            as *mut majit_ir::GcRef,
-    );
-    f(unsafe { &mut (*bytes).w_dict } as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(
-        unsafe { &mut (*bytes).w_weakreflifeline } as *mut pyre_object::PyObjectRef
-            as *mut majit_ir::GcRef,
-    );
 }
 
 /// Reclaim the off-heap `BufferView` box (and any nested `Buffer::Sub`
