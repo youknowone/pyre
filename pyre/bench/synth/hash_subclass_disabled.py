@@ -24,7 +24,7 @@ def main():
     a = T([1, 2])
     b = F([1, 2])
     n = 0
-    for i in range(N):
+    for _ in range(N):
         if (
             kind(lambda: hash(a)) == "TypeError"
             and kind(lambda: {a}) == "TypeError"

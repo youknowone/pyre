@@ -2,9 +2,9 @@
 # positional-argument count instead of silently accepting it. The exact message
 # text differs between CPython and PyPy, so only the exception type (which they
 # agree on) is compared. Output verified against CPython/PyPy.
-def kind(callable, args):
+def kind(fn, args):
     try:
-        callable(*args)
+        fn(*args)
     except TypeError:
         return "TypeError"
     except KeyError:

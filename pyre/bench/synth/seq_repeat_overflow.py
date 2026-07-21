@@ -10,7 +10,7 @@ BIG = 2**63
 def main():
     over = 0
     ident = 0
-    for i in range(N):
+    for _ in range(N):
         try:
             [0] * BIG
         except OverflowError:
@@ -19,7 +19,7 @@ def main():
         b = b"ab"
         s = "ab"
         lst = [1, 2]
-        if (t * 1 is t) and (b * 1 is b) and (s * 1 is s) and not (lst * 1 is lst):
+        if (t * 1 is t) and (b * 1 is b) and (s * 1 is s) and (lst * 1 is not lst):
             ident += 1
     print(over, ident)
 

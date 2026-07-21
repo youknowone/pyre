@@ -7,7 +7,7 @@ BIG = 2**63
 
 def main():
     last = None
-    for i in range(N):
+    for _ in range(N):
         last = list(enumerate(["a", "b", "c"], BIG))
     print(last)
 

@@ -12,7 +12,7 @@ def f():
 
 def main():
     n = 0
-    for i in range(N):
+    for _ in range(N):
         it = iter(f, 0)
         if isinstance(type(it), type) and isinstance(it, object) and iter(it) is it:
             n += 1

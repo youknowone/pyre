@@ -17,7 +17,7 @@ def kind(codec):
 
 def main():
     n = 0
-    for i in range(N):
+    for _ in range(N):
         r = "".join(kind(c) for c in ("hex", "rot13", "base64", "zlib"))
         if r == "LLLL":
             n += 1

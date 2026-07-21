@@ -10,7 +10,7 @@ class BadInt:
 
 def main():
     caught = 0
-    for i in range(N):
+    for _ in range(N):
         try:
             int(BadInt())
         except TypeError:

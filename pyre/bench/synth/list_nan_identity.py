@@ -7,7 +7,7 @@ N = 20000
 def main():
     x = float("nan")
     hits = 0
-    for i in range(N):
+    for _ in range(N):
         L = [1.0, x, 2.0]
         ok = (
             L.index(x) == 1

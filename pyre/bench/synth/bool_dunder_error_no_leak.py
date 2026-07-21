@@ -22,7 +22,7 @@ def check(b):
 def main():
     b = Boom()
     n = 0
-    for i in range(N):
+    for _ in range(N):
         if check(b) == "2":
             n += 1
     print(n)

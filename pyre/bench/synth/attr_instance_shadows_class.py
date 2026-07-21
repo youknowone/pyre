@@ -32,7 +32,7 @@ class TD(tuple):
 
 def main():
     n = 0
-    for i in range(N):
+    for _ in range(N):
         t = T([1, 2])
         t.x = "inst"
         a = I(5)

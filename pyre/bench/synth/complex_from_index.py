@@ -12,7 +12,7 @@ class Idx:
 def main():
     obj = Idx()
     acc = 0.0
-    for i in range(N):
+    for _ in range(N):
         c = complex(obj)
         acc += c.real
     print(complex(obj), acc == N * 3.0)
