@@ -13515,11 +13515,7 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__invert__",
-            make_builtin_function_with_arity(
-                "__invert__",
-                |args| crate::objspace::descroperation::invert(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__invert__", int_descr_invert, 1),
         )
     };
     unsafe {
@@ -14588,6 +14584,31 @@ fn bool_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let truthy = !w_self.is_null() && crate::baseobjspace::is_true(w_self)?;
     Ok(w_str_new(if truthy { "True" } else { "False" }))
+}
+
+/// `W_IntObject.descr_invert` — the integer inversion slot.  `~x` reaches
+/// bool's warning-bearing slot first, but `int.__invert__` resolves straight
+/// to this one, so a bool receiver is inverted without the deprecation
+/// warning.  The registered arity is only a dispatch hint, so the positional
+/// count is enforced here.
+fn int_descr_invert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&w_self) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "int.__invert__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "int.__invert__() takes 1 positional argument but {} were given",
+            args.len(),
+        )));
+    }
+    if unsafe { pyre_object::is_bool(w_self) } {
+        return Ok(w_int_new(
+            !unsafe { crate::objspace::descroperation::int_value(w_self) },
+        ));
+    }
+    crate::objspace::descroperation::invert(w_self)
 }
 
 /// CPython 3.14 `Objects/boolobject.c:bool_invert`.
