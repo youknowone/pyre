@@ -1818,7 +1818,7 @@ impl majit_backend::Backend for WasmBackend {
                     && !failguard::meta_descr_is_exit_frame_with_exception(&descr.meta_descr)
             })
             .map(|descr| descr.fail_index)
-            .unwrap_or(0);
+            .unwrap_or(failguard::WASM_CA_FINISH_FI_UNKNOWN);
         // For a pending self target this is the exact map already embedded in
         // the module's CA arm. Reuse it for the published metadata so the
         // loop and its self-callee have demonstrably identical geometry. A
