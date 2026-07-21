@@ -3316,24 +3316,14 @@ unsafe fn orthodox_list_append_recognize(
 /// (the resume-coordinate source) shared by both list-append fold forms.
 /// Returns `None` (decline — no IR emitted yet) when the body jitcode is not
 /// compiled or the snapshot sym is absent.  The returned `sym_ptr` is
-/// non-null with a set `jitcode` field.
-/// 32-bit targets additionally decline: the sub-walk still miscompiles
-/// there.  Its `d` operands now resolve through a descr pool built from the
-/// target's own Charon layouts (`jitcode_runtime::build_time_field_offset`),
-/// so the reads land on the right bytes — but with the walk reaching the end
-/// instead of aborting, six `bench/synth` list programs
-/// (`list_ops`, `list_reverse`, `list_bound_method_mutation`,
-/// `list_append_funcentry_helper`, `inlined_helper_mutation`,
-/// `inlined_mutation_before_abort`) produce wrong output under the wasm
-/// backend while every native backend stays green.  The remaining defect is
-/// in the fold, not in the layouts; until it is found, the generic residual
-/// append handles the call on a 32-bit target.
+/// non-null with a set `jitcode` field.  Word size does not enter here: the
+/// `d` operands resolve through a descr pool built from the target's own
+/// Charon layouts (`jitcode_runtime::build_time_field_offset`), and the one
+/// storage arm wasm still mis-resumes is declined upstream at recognition
+/// ([`wasm_unboxed_append_fold_declined`]).
 pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(SubJitCodeBody, *const Sym)> {
-    if std::mem::size_of::<usize>() != 8 {
-        return None;
-    }
     let jc_arc = crate::jitcode_runtime::list_append_jitcode()?;
     let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
