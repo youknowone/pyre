@@ -1711,8 +1711,49 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 if jc.payload.code_ptr.is_null() {
                     caller_sym.valuestackdepth() as i64
                 } else {
-                    let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                    match lv.depth_at_py_pc().get(resume_py_pc as usize).copied() {
+                    // Raw py_pc-keyed static-liveness read: the fallback where the
+                    // twin does not apply (cross-jitcode parent, or empty twin),
+                    // and the audit oracle.
+                    let raw = || {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(resume_py_pc as usize)
+                            .copied()
+                    };
+                    // The raw read resolves `resume_py_pc` against
+                    // `outer.jitcode_index`'s tables but indexes THIS jitcode's
+                    // liveness; the twins key one jitcode, so cut only when both
+                    // are the same jitcode. `Some(inner)` = twin applies (inner is
+                    // its Option<u16> depth); `None` = not applicable -> raw.
+                    let twin: Option<Option<u16>> = if outer.jitcode_index != jc.index as u32 {
+                        None
+                    } else {
+                        match outer.resume_coord {
+                            ParentResumeCoord::Backxlat(jitcode_pc) => jc
+                                .payload
+                                .depth_trivia_populated()
+                                .then(|| jc.payload.depth_trivia_for_jitcode_pc(jitcode_pc)),
+                            ParentResumeCoord::CallFallthrough(call_jit_pc) => {
+                                jc.payload.depth_after_residual_populated().then(|| {
+                                    jc.payload.depth_after_residual_for_jitcode_pc(call_jit_pc)
+                                })
+                            }
+                        }
+                    };
+                    let depth = match twin {
+                        Some(d) => {
+                            if pcmap_afterresidual_audit_enabled() {
+                                assert_eq!(
+                                    d,
+                                    raw(),
+                                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: multiframe vsd depth twin diverged (py {resume_py_pc})"
+                                );
+                            }
+                            d
+                        }
+                        None => raw(),
+                    };
+                    match depth {
                         Some(d) => (caller_sym.nlocals() + d as usize) as i64,
                         None => caller_sym.valuestackdepth() as i64,
                     }
