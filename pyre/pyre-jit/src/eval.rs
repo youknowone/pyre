@@ -5753,33 +5753,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
         // The ec block above may have run bytecode_trace / perform_actions
         // (collection points) on a fall-through path; re-seed before the
-        // stack-effect reads and the opcode dispatch.
+        // opcode dispatch.
         let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
         let mut next_instr = unsafe { &*f }.next_instr();
-        let raw_arg: u32 = op_arg.into();
-        let delta = instruction.stack_effect(raw_arg);
-        if delta > 0 {
-            // `frame` is a shared reborrow used only in this block's reads and
-            // the `if` condition below; its last use ends before the `&mut *f`
-            // reborrow in the taken branch, so the two never alias. Keep any
-            // future `frame` use above that write — the raw pointer means the
-            // borrow checker will not catch an overlap introduced here.
-            let frame = unsafe { &*f };
-            let pushed_top = frame.valuestackdepth.saturating_add(delta as usize);
-            let next_pc = opcode_pc + 1;
-            // A JIT handoff can arrive with the stack depth for the point just
-            // after a super-instruction while `last_instr` still names the
-            // super-instruction itself. If metadata proves the current depth
-            // belongs to the next opcode, advance the pc instead of re-running
-            // pushes that are already reflected in the frame stack.
-            if pushed_top > frame.locals_w().len()
-                && pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, next_pc)
-                    == Some(frame.valuestackdepth)
-            {
-                unsafe { &mut *f }.set_last_instr_from_next_instr(next_pc);
-                continue;
-            }
-        }
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
         match step_result {
@@ -6764,9 +6740,15 @@ fn compile_and_run_once(
                     .frame()
                     .restore_resume_state_from(&executed_frame);
             } else if let Some(restart_pc) = walk_end_restart_pc {
-                frame_root
-                    .frame()
-                    .set_last_instr_from_next_instr(restart_pc);
+                // A marker inside a super-instruction closes the loop at
+                // `loop_header_pc + 1`, and the walk already advanced
+                // `valuestackdepth` through the super-instruction. Set both the
+                // resume pc and its operand depth so the handed-back frame is
+                // self-consistent, mirroring the flush leg above and the
+                // blackhole legs (`apply_blackhole_crn_handoff`).
+                let frame = frame_root.frame();
+                frame.set_last_instr_from_next_instr(restart_pc);
+                correct_resume_vsd(frame, restart_pc);
             }
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             action
