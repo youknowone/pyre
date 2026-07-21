@@ -110,10 +110,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "create_builtin",
             |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
+                // `BuiltinImporter.create_module` passes the spec and expects the
+                // module back; `_load` then binds it in sys.modules. A name
+                // already imported keeps its module, so the machinery and a plain
+                // `import X` agree on one object.
+                let Some(&spec) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "create_builtin() missing required argument 'spec'",
+                    ));
+                };
+                let w_name = crate::baseobjspace::getattr_str(spec, "name")?;
+                if !unsafe { pyre_object::is_str(w_name) } {
+                    return Err(crate::PyError::type_error("spec.name must be a string"));
                 }
-                Ok(args[0])
+                let name = unsafe { pyre_object::w_str_get_value(w_name) }.to_string();
+                if let Some(module) = crate::importing::get_sys_module(&name) {
+                    return Ok(module);
+                }
+                crate::importing::load_builtin_module(&name).ok_or_else(|| {
+                    crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        format!("no built-in module named {name}"),
+                    )
+                })
             },
             1,
         ),

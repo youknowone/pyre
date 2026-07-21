@@ -883,7 +883,7 @@ fn init_sysconfigdata_empty(ns: PyObjectRef) {
 /// `W_ModuleDictObject` for every module via
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
-fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
+pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let module_def = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1109,9 +1109,9 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
 /// report it — `None` is not a module it can hand back, so it falls through
 /// to the search — hence the separate lookup.
 fn sys_modules_blocks(name: &str) -> bool {
-    // Build the key before reading the dict, as `check_sys_modules` does: the
-    // allocation can run a minor collection that relocates the dict, and the
-    // cell holds the address the collector updates.
+    // Build the key before reading the dict, the order `check_sys_modules`
+    // uses: reading the thread-local last keeps the borrow off the stack
+    // across the allocation.
     let key = pyre_object::w_str_new(name);
     let dict = SYS_MODULES_DICT.with(|d| d.get());
     if dict.is_null() {
@@ -1849,7 +1849,71 @@ fn load_source_module(
         }
     }
 
+    // `_bootstrap` has no `sys` or `_imp` of its own until it is handed them,
+    // so every entry point through it raises NameError until this runs. Read
+    // the module back out of sys.modules rather than reusing the local: the
+    // body just executed arbitrary code, and a collection in there relocates
+    // a young module while only the dict entry is updated.
+    if modulename == "importlib._bootstrap" {
+        if let Some(loaded) = check_sys_modules(modulename) {
+            install_importlib_bootstrap(loaded, execution_context)?;
+        }
+    }
+
     Ok(module)
+}
+
+/// Wire a freshly executed `importlib._bootstrap` into this interpreter.
+///
+/// PyPy does the same from `_frozen_importlib`'s `install()`: `_install`
+/// binds `sys` / `_imp` into the module globals and appends BuiltinImporter
+/// and FrozenImporter to `sys.meta_path`, then
+/// `_install_external_importers` imports `_bootstrap_external` — reached
+/// through the `_frozen_importlib_external` alias `absolute_import` already
+/// maps — and appends PathFinder.
+///
+/// PyPy runs it while building the space; doing it as the module finishes
+/// loading keeps both bootstrap files off the startup path, since nothing
+/// reads `sys.meta_path` before something has imported the machinery that
+/// fills it.
+#[cfg(feature = "host_env")]
+fn install_importlib_bootstrap(
+    module: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let module_slot = shadow_stack_len();
+    pin_root(module);
+
+    let w_sys = absolute_import("sys", pyre_object::PY_NULL, execution_context)?;
+    let sys_slot = shadow_stack_len();
+    pin_root(w_sys);
+
+    let w_imp = absolute_import("_imp", pyre_object::PY_NULL, execution_context)?;
+    let imp_slot = shadow_stack_len();
+    pin_root(w_imp);
+
+    let install = crate::baseobjspace::getattr_str(shadow_stack_get(module_slot), "_install")?;
+    let install_slot = shadow_stack_len();
+    pin_root(install);
+    let args = [shadow_stack_get(sys_slot), shadow_stack_get(imp_slot)];
+    crate::call::call_function_impl_result(shadow_stack_get(install_slot), &args)?;
+
+    let install_external = crate::baseobjspace::getattr_str(
+        shadow_stack_get(module_slot),
+        "_install_external_importers",
+    )?;
+    crate::call::call_function_impl_result(install_external, &[])?;
+
+    // `_install_external_importers` imports `_frozen_importlib_external`,
+    // which aliases that name onto the loaded submodule; the bootstrap module
+    // itself is only reached under its submodule name, so it never picks up
+    // the matching alias. Register it once both installs have succeeded, so a
+    // body that raised leaves no alias behind.
+    set_sys_module("_frozen_importlib", shadow_stack_get(module_slot));
+    Ok(())
 }
 
 // ── load_package ─────────────────────────────────────────────────────
