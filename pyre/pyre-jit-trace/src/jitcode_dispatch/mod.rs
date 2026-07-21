@@ -6250,33 +6250,6 @@ pub fn nested_list_fold_virt_enabled() -> bool {
     *ENABLED
 }
 
-/// `PYRE_WASM_UNBOXED_APPEND_FOLD` gate (read once) — admits the unboxed
-/// (Integer/Float storage) `w_list_append` fold on the wasm backend. The fold
-/// records the spare-capacity fast path guarded by `GuardTrue(length <
-/// arraylen(items))`; when the comprehension result escapes the enclosing frame
-/// and a later append crosses the backing block's realloc boundary, the wasm
-/// backend mis-resumes that capacity-guard deopt — the reallocating append's
-/// iteration is lost (list one element short) or, when the partially built list
-/// is a kept operand-stack temp, the whole list resolves to NULL ("call
-/// failed"). dynasm / cranelift resume the identical guard IR correctly, so this
-/// is a wasm-backend deopt/resume defect. Until it is root-fixed, decline the
-/// unboxed arm on wasm so the append runs as the plain residual `jit_list_append`
-/// (interpreter fallback, correct if unaccelerated). DEFAULT-ON for wasm32 (the
-/// backend that mis-resumes); a strict no-op on native (the fold always folds
-/// there). Set `PYRE_WASM_UNBOXED_APPEND_FOLD=1` to force the fold back on for
-/// bisecting the root fix. The Object-storage arm is unaffected — it resumes
-/// correctly and stays folded.
-fn wasm_unboxed_append_fold_declined() -> bool {
-    static DECLINED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        if cfg!(target_arch = "wasm32") {
-            std::env::var("PYRE_WASM_UNBOXED_APPEND_FOLD").map_or(true, |v| v != "1")
-        } else {
-            false
-        }
-    });
-    *DECLINED
-}
-
 /// #62 dead-`box_bool` proof for [`try_walker_specialize_compare_op_int`] /
 /// `_float`.  Returns `true` only when a forward JitCode lookahead proves
 /// the compare's boxed Ref dst register (`dst_reg`) is consumed *solely*

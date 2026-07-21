@@ -3257,14 +3257,11 @@ unsafe fn orthodox_list_append_recognize(
             // Gate off: preserve the prior behavior (Empty always declined).
             return None;
         }
-        let unboxed_declined = wasm_unboxed_append_fold_declined();
-        let int_ok = !unboxed_declined
-            && pyre_object::is_plain_int1(value)
+        let int_ok = pyre_object::is_plain_int1(value)
             && !pyre_object::pyobject::is_long(value)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(value));
-        let float_ok =
-            !unboxed_declined && !value.is_null() && pyre_object::is_plain_float_strict(value);
+        let float_ok = !value.is_null() && pyre_object::is_plain_float_strict(value);
         // switch_to_correct_strategy routes `is_plain_int1` -> Integer with no
         // tagged exclusion. Exclude any plain-int / float from the object
         // fallback so a tagged-int / fits-int `W_LongObject` DECLINES (generic
@@ -3286,9 +3283,7 @@ unsafe fn orthodox_list_append_recognize(
     // fits-int `W_LongObject` is declined, see note above).
     // A tagged-immediate value would need a tag-aware unboxed store and no
     // `w_class` pin; decline to the generic residual append instead.
-    let unboxed_declined = wasm_unboxed_append_fold_declined();
-    let int_ok = !unboxed_declined
-        && pyre_object::w_list_uses_int_storage(inner_self)
+    let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
         && pyre_object::is_plain_int1(value)
         && !pyre_object::pyobject::is_long(value)
         && !(pyre_object::tagged_int::CAN_BE_TAGGED
@@ -3302,8 +3297,7 @@ unsafe fn orthodox_list_append_recognize(
     // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
     // arm also uses. No fits-* long analogue (a float is never re-boxed
     // across arithmetic, unlike a fits-int W_LongObject).
-    let float_ok = !unboxed_declined
-        && pyre_object::w_list_uses_float_storage(inner_self)
+    let float_ok = pyre_object::w_list_uses_float_storage(inner_self)
         && !value.is_null()
         && pyre_object::is_plain_float_strict(value);
     if !int_ok && !obj_ok && !float_ok {
@@ -3318,9 +3312,9 @@ unsafe fn orthodox_list_append_recognize(
 /// compiled or the snapshot sym is absent.  The returned `sym_ptr` is
 /// non-null with a set `jitcode` field.  Word size does not enter here: the
 /// `d` operands resolve through a descr pool built from the target's own
-/// Charon layouts (`jitcode_runtime::build_time_field_offset`), and the one
-/// storage arm wasm still mis-resumes is declined upstream at recognition
-/// ([`wasm_unboxed_append_fold_declined`]).
+/// Charon layouts (`jitcode_runtime::build_time_field_offset`), whose array
+/// descrs place the items at the first element-aligned offset past the length
+/// word — the offset a 4-byte word and an 8-byte item disagree on.
 pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(SubJitCodeBody, *const Sym)> {

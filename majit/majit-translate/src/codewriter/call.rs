@@ -1418,6 +1418,39 @@ impl CallControl {
         self.struct_layouts.get(&sid)
     }
 
+    /// Byte offset of the first item of a length-prefixed array whose length
+    /// word ends at `header_end` and whose elements are `elem` (`item_size`
+    /// bytes wide).
+    ///
+    /// The blocks these descrs address are `#[repr(C)] { length: usize, items:
+    /// [T; 0] }`, so the items begin at the length word rounded UP to `T`'s
+    /// alignment — not at the word itself. The two coincide whenever the word
+    /// is at least as wide as every element, which is why a 64-bit target sees
+    /// `header_end` unchanged; on a 32-bit target an 8-byte element (`i64` /
+    /// `f64` unboxed list storage) is aligned past the 4-byte length word, and
+    /// addressing it at the word would stride the array 4 bytes early.
+    fn array_items_base(&self, header_end: usize, elem: Option<&str>, item_size: usize) -> usize {
+        let align = self.element_align(elem, item_size);
+        header_end.next_multiple_of(align)
+    }
+
+    /// Alignment of an array element. A scalar or pointer aligns to its own
+    /// width, capped at the 8 bytes of the widest one (`i64` / `f64` / a
+    /// pointer); a struct aligns to its widest field, which its total size
+    /// does not report. An unregistered struct falls back to the length word,
+    /// the alignment every length-prefixed block already satisfies.
+    fn element_align(&self, elem: Option<&str>, item_size: usize) -> usize {
+        let word = crate::layout::target_word_size();
+        let scalar_align = |size: usize| size.clamp(1, 8).next_power_of_two();
+        match elem.filter(|name| self.is_known_struct(name)) {
+            Some(name) => self
+                .struct_layout_for(name)
+                .and_then(|layout| layout.fields.iter().map(|f| scalar_align(f.size)).max())
+                .unwrap_or(word),
+            None => scalar_align(item_size),
+        }
+    }
+
     /// RPython: resolve a struct field's type string.
     /// For `owner::field_name`, returns the full type of the field.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
@@ -1548,10 +1581,11 @@ impl CallControl {
         //   `nolength=False` → length at lendescr.offset → items past header
         // pyre's CallControl uses a single-word array header
         // (`array_header_size = WORD`), so the length-prefixed shape places
-        // items immediately after the length word at `len_offset + WORD`.
+        // items at the first element-aligned offset past the length word
+        // ([`Self::array_items_base`]).
         let base_size = match len_offset {
             None => 0,
-            Some(off) => off + self.array_header_size,
+            Some(off) => self.array_items_base(off + self.array_header_size, elem_ref, item_size),
         };
         // `descr.py:348-378 get_array_descr(gccache, ARRAY_OR_STRUCT)`:
         // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype's
@@ -2120,7 +2154,7 @@ impl CallControl {
         // `as Arc<dyn ArrayDescr>` matches the trait-object field type
         // on `SimpleInteriorFieldDescr.array_descr`.
         let item_size = compute_struct_size(self, &elem_name);
-        let base_size = self.array_header_size;
+        let base_size = self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
         let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
         let cached: majit_ir::descr::DescrRef = {
             let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
@@ -7381,6 +7415,25 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+
+    /// A length-prefixed block puts its items at the length word rounded up to
+    /// the element's alignment. Only a target whose word is narrower than an
+    /// element can tell the two apart: with a 4-byte word, an `i64` item sits
+    /// at 8, and addressing it at 4 strides the whole array one half-word
+    /// early — every read then returns two packed 32-bit halves. A pointer
+    /// item, being word-wide, stays at the word.
+    #[test]
+    fn array_items_base_rounds_up_to_the_element_alignment() {
+        let cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        assert_eq!(cc.array_items_base(word, Some("i64"), 8), 8);
+        assert_eq!(cc.array_items_base(word, Some("f64"), 8), 8);
+        assert_eq!(cc.array_items_base(word, Some("&PyObject"), word), word);
+        assert_eq!(cc.array_items_base(word, Some("u8"), 1), word);
+        // An unregistered struct element falls back to the word, which every
+        // length-prefixed block already satisfies.
+        assert_eq!(cc.array_items_base(word, Some("NoSuchStruct"), 24), word);
+    }
 
     /// `getkind(SingleFloat) == 'int'` (history.py:53): `f32` banks to the
     /// int kind across the field/return classifiers (FLAG_UNSIGNED,
