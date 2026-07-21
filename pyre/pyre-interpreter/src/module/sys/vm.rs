@@ -60,6 +60,10 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// instance dict directly, so `setdictvalue` is used rather than `setattr` — a
 /// subclass `__setattr__` is not consulted during construction.
 fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
+    // `self.__dict__.update(kwargs)` evaluates `self.__dict__` first, so a
+    // receiver without an instance dict raises AttributeError even for an
+    // empty keyword set.
+    crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
     if let Some(dict) = kwargs {
         unsafe {
             for (key, value) in pyre_object::w_dict_items(dict) {
@@ -168,19 +172,32 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
         return Ok(w_str_new("namespace(...)"));
     };
     let dict = crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
+    // A user `__lt__`, `__str__` or `__repr__` below can collect, and the
+    // moving GC relocates the items this snapshot holds. Pin every key and
+    // value on the shadow stack and address them by slot from here on: a raw
+    // `(key, value)` vector would go stale at the first such call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let items = unsafe { pyre_object::w_dict_items(dict) };
+    for (k, v) in &items {
+        pyre_object::gc_roots::pin_root(*k);
+        pyre_object::gc_roots::pin_root(*v);
+    }
+    let key = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i * 2);
+    let value = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i * 2 + 1);
+
     // `sorted(self.__dict__.items())` — order by the key objects with Python
     // `<`, not by their `str()`. Incomparable keys (e.g. `int` mixed with
     // `str`) raise, halting the repr as the sort itself does. Rust's `sort_by`
     // closure cannot return `Result`, so a raising comparison is captured in a
     // `Cell` and surfaced once the sort completes.
-    let mut items = unsafe { pyre_object::w_dict_items(dict) };
     let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
-    let lt = |x: PyObjectRef, y: PyObjectRef| -> bool {
+    let lt = |x: usize, y: usize| -> bool {
         if let Some(e) = sort_error.take() {
             sort_error.set(Some(e));
             return false;
         }
-        match crate::baseobjspace::compare(x, y, crate::baseobjspace::CompareOp::Lt) {
+        match crate::baseobjspace::compare(key(x), key(y), crate::baseobjspace::CompareOp::Lt) {
             Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
                 sort_error.set(Some(e));
                 false
@@ -191,10 +208,11 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
             }
         }
     };
-    items.sort_by(|a, b| {
-        if lt(a.0, b.0) {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| {
+        if lt(a, b) {
             std::cmp::Ordering::Less
-        } else if lt(b.0, a.0) {
+        } else if lt(b, a) {
             std::cmp::Ordering::Greater
         } else {
             std::cmp::Ordering::Equal
@@ -203,12 +221,12 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
     if let Some(e) = sort_error.take() {
         return Err(e);
     }
-    let mut parts = Vec::with_capacity(items.len());
-    for (k, v) in items {
+    let mut parts = Vec::with_capacity(order.len());
+    for i in order {
         parts.push(format!(
             "{}={}",
-            unsafe { crate::display::py_str(k)? },
-            unsafe { crate::display::py_repr(v)? }
+            unsafe { crate::display::py_str(key(i))? },
+            unsafe { crate::display::py_repr(value(i))? }
         ));
     }
     Ok(w_str_new(&format!("namespace({})", parts.join(", "))))
@@ -217,17 +235,26 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
 /// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
 /// when `other` is a namespace, NotImplemented otherwise.
 fn simple_namespace_eq(args: &[PyObjectRef]) -> crate::PyResult {
-    simple_namespace_richcompare(args, false)
+    simple_namespace_richcompare(args, "__eq__", false)
 }
 
 /// `_structseq.py:190 SimpleNamespace.__ne__`.
 fn simple_namespace_ne(args: &[PyObjectRef]) -> crate::PyResult {
-    simple_namespace_richcompare(args, true)
+    simple_namespace_richcompare(args, "__ne__", true)
 }
 
-fn simple_namespace_richcompare(args: &[PyObjectRef], negate: bool) -> crate::PyResult {
+fn simple_namespace_richcompare(
+    args: &[PyObjectRef],
+    name: &str,
+    negate: bool,
+) -> crate::PyResult {
+    // `def __eq__(self, other)` — a missing argument is an arity error, not a
+    // NotImplemented result.
     let (Some(&self_obj), Some(&other)) = (args.first(), args.get(1)) else {
-        return Ok(w_not_implemented());
+        return Err(crate::PyError::type_error(format!(
+            "SimpleNamespace.{name}() missing 1 required positional argument: '{}'",
+            if args.is_empty() { "self" } else { "other" }
+        )));
     };
     if !unsafe { crate::baseobjspace::isinstance_w(other, simple_namespace_type()) } {
         return Ok(w_not_implemented());
