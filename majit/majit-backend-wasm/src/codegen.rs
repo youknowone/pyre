@@ -2001,18 +2001,16 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardValue => {
-                let arg0 = op.arg(0).to_opref();
-                let is_float =
-                    !arg0.is_constant() && value_types[arg0.raw() as usize] == ValType::F64;
-                if is_float {
-                    emit_resolve_f64(&mut sink, constants, value_types, arg0);
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
-                    sink.f64_ne();
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, arg0);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                    sink.i64_ne();
-                }
+                // GUARD_VALUE checks bit-equality against the promoted constant:
+                // Value::eq (value.rs) compares floats by to_bits() (0.0 != -0.0,
+                // NaN == same-bit NaN, per history.py same_constant), which the
+                // dynasm/cranelift siblings implement as an integer bit-compare.
+                // emit_resolve pushes an F64 operand's i64 bits, so i64_ne is the
+                // correct compare for both int and float — an IEEE f64.ne would
+                // wrongly pass -0.0 == +0.0 (and fail NaN == same-bit NaN).
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                sink.i64_ne();
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
