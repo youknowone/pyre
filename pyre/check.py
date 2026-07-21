@@ -397,6 +397,43 @@ def _jit_stats_diff(saved, current, limit=6):
     return ", ".join(shown)
 
 
+# Sign-stable jit-stats counters: a nonzero value always means something went
+# wrong (a trace aborted, or an internal compile bug fell back to the
+# interpreter), never a tuning choice. They read 0 in every healthy baseline on
+# every platform, so a rise above baseline is a regression the regression floor
+# gates on unconditionally. The count-valued fields (guard_failures,
+# loops_compiled, bridges_compiled) are deliberately excluded: their absolute
+# value is not yet confirmed stable across runners, so they stay informational.
+JITSTATS_BADNESS_FIELDS = ("loops_aborted", "internal_compile_panics")
+
+
+def _jit_stats_regression_floor(saved, current):
+    """Return a failure reason if any badness counter rose above its committed
+    baseline, else "". A rise means the JIT started aborting traces or hitting
+    internal compile panics it did not before — a defect on any platform. A
+    counter that falls (an improvement) or holds never gates, and a field
+    missing from either side is read as 0 so it cannot fire spuriously."""
+    def parse(snapshot):
+        if snapshot is None:
+            return {}
+        return dict(line.split("=", 1) for line in snapshot.splitlines())
+
+    old_fields = parse(saved)
+    new_fields = parse(current)
+    regressions = []
+    for field in JITSTATS_BADNESS_FIELDS:
+        try:
+            base = int(old_fields.get(field, 0))
+            cur = int(new_fields.get(field, 0))
+        except ValueError:
+            continue
+        if cur > base:
+            regressions.append(f"{field} {base} -> {cur}")
+    if regressions:
+        return "jit-stats regression: " + ", ".join(regressions)
+    return ""
+
+
 def scaled_timeout(base, scale):
     v = base * scale
     return int(v) if v == int(v) else float(f"{v:.3f}".rstrip("0").rstrip("."))
@@ -701,6 +738,27 @@ class Check:
         time_path = self._snapshot_path(backend, name, "time")
         jitstats_path = self._jitstats_baseline_path(backend, script)
         jitstats = _jit_stats_snapshot(stderr)
+
+        # Regression floor — enforced on EVERY run, so a structural JIT
+        # regression reddens the default `pyre/check.py` (locally, and in the
+        # bare CI invocation) the instant it lands, with no --snapshot-diff
+        # needed. Only the sign-stable badness counters gate here, so this stays
+        # flake-free where the full-exact jit-stats diff (below, opt-in) cannot:
+        # healthy baselines carry 0 for both on every platform, so a trace that
+        # starts aborting or panicking is a real defect regardless of runner.
+        # This catches the inline-abort class (e.g. an inlined-callee LOAD_GLOBAL
+        # fold that stops resolving: loops_aborted 0 -> 5). Record mode is
+        # writing a fresh baseline, so it is exempt.
+        if (
+            self.args.snapshot_mode != "record"
+            and jitstats is not None
+            and jitstats_path.exists()
+        ):
+            floor = _jit_stats_regression_floor(
+                jitstats_path.read_text(encoding="utf-8"), jitstats
+            )
+            if floor:
+                return "fail", floor
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)

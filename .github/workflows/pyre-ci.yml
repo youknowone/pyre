@@ -387,14 +387,24 @@ jobs:
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided
       # by the platform-independent tracer, so a diff here means a change moved
-      # what the JIT compiles. Informational: the baselines were recorded on
-      # macOS aarch64 and cross-runner/cross-platform determinism of the
-      # counters is not yet confirmed in CI, so this must not gate main until
-      # the summaries stay clean across real PRs. The .out/.time baselines are
-      # not committed, so their snapshot checks report "missing" and only the
-      # jit-stats diff is exercised. Runs on Linux only (one OS is enough for a
-      # platform-independent signal). Use the runner's standard grep instead
-      # of assuming an optional ripgrep installation.
+      # what the JIT compiles.
+      #
+      # The sign-stable badness subset (loops_aborted, internal_compile_panics)
+      # is already HARD-gated by the "Run pyre/check.py" step above: check.py's
+      # regression floor fails the default run when either counter rises above
+      # its committed 0, so an inline-abort/compile-panic regression reddens CI
+      # immediately without this step. That subset is flake-free because the
+      # healthy value is 0 on every platform.
+      #
+      # This step stays informational for the COUNT-VALUED fields
+      # (guard_failures, loops_compiled, bridges_compiled): the baselines were
+      # recorded on macOS aarch64 and cross-runner/cross-platform determinism of
+      # those absolute counts is not yet confirmed in CI, so they must not gate
+      # main until the summaries stay clean across real PRs. The .out/.time
+      # baselines are not committed, so their snapshot checks report "missing"
+      # and only the jit-stats diff is exercised. Runs on Linux only (one OS is
+      # enough for a platform-independent signal). Use the runner's standard
+      # grep instead of assuming an optional ripgrep installation.
       if: runner.os == 'Linux'
       continue-on-error: true
       env:
