@@ -8587,14 +8587,20 @@ impl JitState for PyreJitState {
         // flips; the opt-out keeps the prior symbolic-bridge
         // behavior available for A/B.
         let seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
-        // For kept-stack branch guards the body-internal marker's
-        // liveness colors do not 1:1-correspond to semantic slots — a
-        // color that lives a temp at the body marker may name a different
-        // slot at the guard PC.  Seeding concrete values at the
-        // consume_boxes stage (color-indexed) stamps the wrong value onto
-        // the OpRef, causing downstream branch folds to take the wrong
-        // direction.  Defer seeding to the post-overlay stage where the
-        // mirror is slot-indexed and values are authoritative.
+        // `seed_deferred_to_overlay` is Ref-specific.  The Ref overlay below
+        // rebuilds a SLOT-indexed mirror from the color-indexed resume decode
+        // (via `pcdep_entries`).  At a kept-stack branch guard the body-internal
+        // marker's Ref colors do not 1:1-correspond to semantic slots — a color
+        // that lives a temp at the marker may name a different slot at the guard
+        // PC — so seeding the Ref concrete at the color-indexed consume stage
+        // stamps the wrong value; defer it to the post-overlay stage where the
+        // mirror is slot-indexed and authoritative.  The Int and Float banks
+        // (`sym.registers_i` / `sym.registers_f`) are pure scalar register reds
+        // with no operand-stack slot mirror, so they reconstruct concrete at the
+        // consume stage directly — matching `resume.py:1052-1055
+        // rebuild_from_resumedata` → `consume_boxes(f.get_current_position_info(),
+        // registers_i, registers_r, registers_f)`, which fills all three banks
+        // uniformly at the guard's resume position.
         let seed_deferred_to_overlay =
             crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc);
         let mut bridge_stamp_orphans =
@@ -8613,17 +8619,16 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
-            // The Int bank is color-indexed and can be seeded directly only
-            // when the frame position names its exact liveness marker.  A
-            // resolved body coordinate can share a marker whose Int color is
-            // an earlier scratch value; treating that value as the current
-            // branch condition lets a nested FOR_ITER bridge take the wrong
-            // arm.  Leave such scratches symbolic, as RPython does when an
-            // unboxed temporary is absent from the exact resume position.
-            if seed_bridge_locals
-                && !seed_deferred_to_overlay
-                && !matches!(concrete_val, majit_ir::Value::Void)
-            {
+            // The Int bank is a scalar register red: the decoded value is paired
+            // with `reg_indices.int` by `value_cursor` and read from this guard's
+            // `fail_values`, so it is guard-accurate.  Stamp it as the trace-time
+            // concrete unconditionally (not gated on `seed_deferred_to_overlay`,
+            // which is Ref-only) so a loop-carried Int red feeding an
+            // `(i % k) == 0` kept-stack branch guard folds its `goto_if_not`
+            // instead of declining the bridge with `GotoIfNotValueNotConcrete`.
+            // Mirrors `consume_boxes(..., f.registers_i, ...)` filling the Int
+            // bank at the guard's resume position.
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
                 ctx.try_set_opref_concrete(resolved, concrete_val);
             }
             let reg_idx = reg_idx as usize;
@@ -8675,10 +8680,11 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
-            if seed_bridge_locals
-                && !seed_deferred_to_overlay
-                && !matches!(concrete_val, majit_ir::Value::Void)
-            {
+            // Float bank: a scalar register red, guard-accurate like the Int
+            // bank above; stamp its concrete unconditionally (the Ref-only
+            // `seed_deferred_to_overlay` deferral does not apply), mirroring
+            // `consume_boxes(..., f.registers_f)`.
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
                 ctx.try_set_opref_concrete(resolved, concrete_val);
             }
             let reg_idx = reg_idx as usize;
