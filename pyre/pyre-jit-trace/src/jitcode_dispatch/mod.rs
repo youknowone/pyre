@@ -7698,6 +7698,19 @@ fn handle<Sym: WalkSym>(
         "setarrayitem_vable_r/rirdd" => setarrayitem_vable_via_metainterp(code, op, ctx, 'r'),
         "setarrayitem_vable_f/rifdd" => setarrayitem_vable_via_metainterp(code, op, ctx, 'f'),
         "arraylen_vable/rdd>i" => arraylen_vable_via_metainterp(code, op, ctx),
+        // RPython `pyjitpl.py opimpl_hint_force_virtualizable(box)` is a thin
+        // forward:
+        //
+        //   self.metainterp.gen_store_back_in_vable(box)
+        //
+        // `TraceCtx::gen_store_back_in_vable` hosts the whole body, including
+        // the nonstandard-virtualizable and already-forced gates, so the arm
+        // reads its one operand and hands it over. Operand layout `r`.
+        "hint_force_virtualizable/r" => {
+            let vable = read_ref_reg(code, op, 0, ctx)?;
+            ctx.trace_ctx.gen_store_back_in_vable(vable);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.

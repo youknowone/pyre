@@ -922,6 +922,28 @@ fn assert_not_none_declines_when_the_operand_has_no_concrete() {
 }
 
 #[test]
+fn hint_force_virtualizable_is_a_noop_without_virtualizable_info() {
+    let byte = *insns_opname_to_byte()
+        .get("hint_force_virtualizable/r")
+        .expect("`hint_force_virtualizable/r` must be in insns table");
+    // `r`: 1B ref reg.
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let vable = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [vable];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`hint_force_virtualizable/r` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2, "`r` consumes a single register byte");
+    // `gen_store_back_in_vable` returns before emitting anything when the
+    // jitdriver carries no virtualizable info -- the upstream `vinfo is None`
+    // gate -- so the hint writes back nothing here.
+    assert_eq!(tc.num_ops(), ops_before);
+}
+
+#[test]
 fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
