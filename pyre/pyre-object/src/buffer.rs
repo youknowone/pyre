@@ -46,6 +46,27 @@ pub enum Buffer {
     },
 }
 
+/// Drop the export an `External` window holds on its owner.  The owners that
+/// keep a count (`mmap`) live above this crate, so the interpreter installs
+/// the callback at start-up; until then, and for owners that keep no count
+/// (`ctypes.memoryview_at`, whose `w_obj` is `None`), releasing is a no-op.
+static EXTERNAL_RELEASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// # Safety
+/// `f` must stay valid for the process lifetime and accept any `w_obj` that
+/// was stored in an `External` buffer.
+pub unsafe fn set_external_release_hook(f: unsafe fn(PyObjectRef)) {
+    EXTERNAL_RELEASE.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+unsafe fn external_release(w_obj: PyObjectRef) {
+    let f = EXTERNAL_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if f != 0 && !w_obj.is_null() {
+        unsafe { core::mem::transmute::<usize, unsafe fn(PyObjectRef)>(f)(w_obj) }
+    }
+}
+
 impl Buffer {
     /// Release the single exporter lock owned by a root memoryview.
     /// Derived/sub views do not call this; their root view owns the count.
@@ -57,7 +78,7 @@ impl Buffer {
                 }
                 Buffer::Array { w_obj } => crate::interp_array::w_array_exports_decref(*w_obj),
                 Buffer::String { .. } => {}
-                Buffer::External { .. } => {}
+                Buffer::External { w_obj, .. } => external_release(*w_obj),
                 Buffer::Sub { parent, .. } => parent.release_export(),
             }
         }

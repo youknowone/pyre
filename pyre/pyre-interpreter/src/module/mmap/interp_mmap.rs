@@ -97,6 +97,9 @@ fn mmap_type() -> pyre_object::PyObjectRef {
         *c.get_or_init(|| {
             let tp = crate::typedef::make_builtin_type("mmap", init_mmap_type);
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            // A view dropped by the collector never reaches `__release_buffer__`,
+            // so the buffer layer needs a way back here to drop the count.
+            unsafe { pyre_object::buffer::set_external_release_hook(mmap_exports_decref) };
             tp
         })
     })
@@ -135,6 +138,42 @@ fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), crate::Py
         return Err(crate::PyError::value_error("mmap closed or invalid"));
     }
     Ok((p, len))
+}
+
+/// True when `obj` is an `mmap` instance.
+#[cfg(unix)]
+pub(crate) fn is_mmap(obj: pyre_object::PyObjectRef) -> bool {
+    crate::typedef::r#type(obj).is_some_and(|tp| std::ptr::eq(tp, mmap_type()))
+}
+
+/// `_exports` — how many buffers are currently exported from the mapping.
+/// The mapping is raw foreign memory, so unmapping it under a live view is a
+/// use-after-free rather than a stale-but-owned read; `close` and `resize`
+/// refuse while this is non-zero.
+#[cfg(unix)]
+pub(crate) fn mmap_exports_incref(obj: pyre_object::PyObjectRef) {
+    let n = mmap_get_attr_i64(obj, "_exports");
+    mmap_set_attr(obj, "_exports", pyre_object::w_int_new(n + 1));
+}
+
+/// Paired with [`mmap_exports_incref`]; saturates at zero so a double release
+/// cannot wrap the count and strand the mapping.
+#[cfg(unix)]
+pub(crate) unsafe fn mmap_exports_decref(obj: pyre_object::PyObjectRef) {
+    if !is_mmap(obj) {
+        return;
+    }
+    let n = mmap_get_attr_i64(obj, "_exports");
+    mmap_set_attr(obj, "_exports", pyre_object::w_int_new((n - 1).max(0)));
+}
+
+/// Reject unmapping while a view still points into the mapping.
+#[cfg(unix)]
+fn mmap_check_exports(obj: pyre_object::PyObjectRef, message: &str) -> Result<(), crate::PyError> {
+    if mmap_get_attr_i64(obj, "_exports") > 0 {
+        return Err(crate::PyError::new(crate::PyErrorKind::BufferError, message));
+    }
+    Ok(())
 }
 
 /// `W_MMap.readbuf_w` / `writebuf_w` — expose the live mapping to the
@@ -245,6 +284,22 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         }),
     ) };
 
+    // `__release_buffer__` — the explicit `memoryview.release()` path; the
+    // collector-driven one goes through the buffer layer's external hook.
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        ns,
+        "__release_buffer__",
+        crate::make_builtin_function_with_arity(
+            "__release_buffer__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                unsafe { mmap_exports_decref(obj) };
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    ) };
+
     // close() — munmap and zero the pointer.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -255,6 +310,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let p = mmap_get_attr_i64(obj, "_ptr") as usize;
                 if p != 0 {
+                    mmap_check_exports(obj, "cannot close exported pointers exist")?;
                     mmap_registry_remove(mmap_get_attr_i64(obj, "_id") as u64);
                     mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
                     mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
@@ -1051,6 +1107,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         "mmap can't resize a readonly or copy-on-write memory map.",
                     ));
                 }
+                mmap_check_exports(obj, "mmap can't resize with extant buffers exported.")?;
                 let (p, old_len) = mmap_ptr(obj)?;
                 let newsize = unsafe { pyre_object::w_int_get_value(args[1]) };
                 if newsize < 0 {

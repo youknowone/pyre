@@ -293,6 +293,10 @@ unsafe fn w_memoryview_new_mmap(
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        // Unlike the GC-owned exporters, the mapping is foreign memory that
+        // `close`/`resize` hand straight back to the kernel, so the window
+        // must keep it from being unmapped while this view can still read it.
+        crate::module::mmap::interp_mmap::mmap_exports_incref(r_obj);
         mv
     }
 }
