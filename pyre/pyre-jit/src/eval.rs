@@ -4990,21 +4990,15 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
             // executes and the optimizer never treats as a side effect).
             //
             // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is the one
-            // value-producing shape held back: the fold virtualizes the inner
-            // list, but its separately allocated backing block (`NewArray` /
-            // `NewArrayClear`) is not threaded into the append commit sub-walk's
-            // guard-exit resume data — `collect_outer_active_boxes` seeds the
-            // sub-walk's box set from jitcode liveness only, and the backing
-            // block has no liveness slot — so a deopt resolves it to a null
-            // OpRef and crashes. The orthodox recovery is recursive virtual-list
-            // forcing at the guard, threading each inner element box + length
-            // into resume data (mirroring `_visitor_walk_recursive` /
-            // `VArrayInfo`); that rooting machinery is being built behind the
-            // DEFAULT-OFF `PYRE_NESTED_LIST_FOLD_VIRT` gate, so until it is
-            // proven bit-exact the gate stays off and the shape still declines.
-            // An empty `[]` element is Empty-strategy (no backing block) and
-            // unaffected; tuple / set / dict elements take non-list allocation
-            // paths.
+            // value-producing shape: the fold virtualizes the inner list, whose
+            // separately allocated backing block (`NewArray` / `NewArrayClear`)
+            // carries no jitcode-liveness slot. With the trace-time single-executor
+            // forks retired the append body no longer runs under a speculative-replay
+            // sub-walk, so the backing block is bound at every guard-exit deopt and
+            // the shape compiles bit-exact on all backends; admitted by default
+            // (`PYRE_NESTED_LIST_FOLD_VIRT`). An empty `[]` element is Empty-strategy
+            // (no backing block) and unaffected; tuple / set / dict elements take
+            // non-list allocation paths.
             let nested_list_fold_ok =
                 pyre_jit_trace::jitcode_dispatch::nested_list_fold_virt_enabled();
             let (body_has_call, body_has_nonempty_list_build) = {

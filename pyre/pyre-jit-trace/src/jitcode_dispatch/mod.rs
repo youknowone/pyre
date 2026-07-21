@@ -6004,20 +6004,18 @@ fn empty_append_virt_enabled() -> bool {
 
 /// `PYRE_NESTED_LIST_FOLD_VIRT` gate (read once) — admits a non-empty nested
 /// `BUILD_LIST` element (`[[i] for i in range(n)]`) into the orthodox
-/// `w_list_append` fold. The appended value is an already-virtualized inner
-/// list whose separately allocated backing block (`NewArray` / `NewArrayClear`)
-/// has no jitcode-liveness slot, so `collect_outer_active_boxes` cannot root it
-/// and it resolves to a null `OpRef` at a guard-exit deopt. Closing the gap
-/// needs the inner wrapper threaded into the append commit sub-walk's guard
-/// snapshot as an extra virtual root, so the resume-data recursion (the ported
-/// `_visitor_walk_recursive` / `VArrayInfo`) registers the backing block. That
-/// rooting machinery is being built incrementally; this gate keeps it opt-in
-/// and DEFAULT-OFF until the whole path is proven bit-exact on all backends.
-/// While off, `for_iter_bodies_all_jit_safe` still declines the shape, so the
-/// gate is a strict no-op.
+/// `w_list_append` fold. The appended value is a virtualized inner list whose
+/// separately allocated backing block (`NewArray` / `NewArrayClear`) carries no
+/// jitcode-liveness slot; once the trace-time single-executor forks were retired
+/// the append body no longer runs under a speculative-replay sub-walk, so the
+/// backing block is bound at every guard-exit deopt and the shape compiles
+/// bit-exact on dynasm / cranelift / wasm (comprehension-hot acceptance repro
+/// `bench/synth/nested_list_comprehension_hot.py`). Default-on; set
+/// `PYRE_NESTED_LIST_FOLD_VIRT=0` to fall back to the `for_iter_bodies_all_jit_safe`
+/// decline (native only — the wasm guest cannot read the env var).
 pub fn nested_list_fold_virt_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("PYRE_NESTED_LIST_FOLD_VIRT").map_or(false, |v| v == "1")
+        std::env::var("PYRE_NESTED_LIST_FOLD_VIRT").map_or(true, |v| v != "0")
     });
     *ENABLED
 }
