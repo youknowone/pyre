@@ -2140,6 +2140,11 @@ pub trait Backend: Send {
         None
     }
 
+    /// Whether a force token is inside a call bracket with recovery data.
+    fn is_force_token_armed(&self, _force_token: GcRef) -> bool {
+        false
+    }
+
     /// Store a saved-data GC ref on a dead frame.
     fn set_savedata_ref(&self, _frame: &mut DeadFrame, _data: GcRef) {
         // No-op: backend doesn't support savedata

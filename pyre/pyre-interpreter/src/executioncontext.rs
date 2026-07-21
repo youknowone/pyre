@@ -3,6 +3,20 @@ use std::sync::OnceLock;
 
 use crate::PyFrame;
 
+pub type ForceFrameFn = unsafe extern "C" fn(*mut PyFrame);
+static FORCE_FRAME_HOOK: OnceLock<ForceFrameFn> = OnceLock::new();
+
+pub fn register_force_frame_hook(f: ForceFrameFn) {
+    let _ = FORCE_FRAME_HOOK.set(f);
+}
+
+#[inline]
+fn force_frame(frame: *mut PyFrame) {
+    if let Some(f) = FORCE_FRAME_HOOK.get() {
+        unsafe { f(frame) };
+    }
+}
+
 /// Return the live `PyFrame` as the Python-visible `frame` object passed
 /// to a trace / profile callback.
 ///
@@ -261,12 +275,19 @@ impl ExecutionContext {
 
     #[inline]
     pub fn gettopframe(&self) -> *mut PyFrame {
+        force_frame(self.topframeref);
+        self.topframeref
+    }
+
+    #[inline]
+    pub fn gettopframe_raw(&self) -> *mut PyFrame {
         self.topframeref
     }
 
     pub fn gettopframe_nohidden(&self) -> *mut PyFrame {
         let mut frame = self.topframeref;
         while !frame.is_null() {
+            force_frame(frame);
             // SAFETY: frame pointers are owned by interpreter call stack and can be
             // null-checked before dereference.
             unsafe {
@@ -282,6 +303,7 @@ impl ExecutionContext {
 
     pub fn getnextframe_nohidden(mut frame: *mut PyFrame) -> *mut PyFrame {
         while !frame.is_null() {
+            force_frame(frame);
             // SAFETY: caller provides a valid frame chain or null.
             unsafe {
                 let current = &*frame;
@@ -289,6 +311,7 @@ impl ExecutionContext {
                 if next.is_null() {
                     return std::ptr::null_mut();
                 }
+                force_frame(next);
                 if !(&*next).hide() {
                     return next;
                 }

@@ -2148,6 +2148,15 @@ fn run_perfn_walk<Sym: WalkSym>(
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
         if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
+            if matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            ) && let Some(resume_py_pc) =
+                crate::jitcode_dispatch::take_committed_frame_escape_pc()
+            {
+                WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
+                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+            }
             let call_forward_abort = match &walk_result {
                 Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
                     Some((*pc, true))

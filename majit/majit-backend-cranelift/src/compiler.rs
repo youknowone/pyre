@@ -16514,6 +16514,14 @@ impl majit_backend::Backend for CraneliftBackend {
         Some(force_token_to_dead_frame(force_token))
     }
 
+    fn is_force_token_armed(&self, force_token: GcRef) -> bool {
+        if force_token.0 == 0 {
+            return false;
+        }
+        let jf_ptr = jitframe_resolve(force_token.0 as *mut i64);
+        unsafe { *jf_ptr.add(JF_FORCE_DESCR_OFS as usize / 8) != 0 }
+    }
+
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         get_latest_descr_from_deadframe(frame).expect("get_latest_descr_from_deadframe failed")
     }

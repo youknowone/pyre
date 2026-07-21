@@ -2822,7 +2822,7 @@ fn call_metaclass_with_kwargs(
             if stored.is_null() {
                 std::ptr::null_mut()
             } else {
-                unsafe { (*stored).gettopframe() }
+                unsafe { (*stored).gettopframe_raw() }
             }
         };
         if !kwds.is_empty() && !frame.is_null() {
@@ -3188,7 +3188,7 @@ fn build_class_inner(
                     if stored.is_null() {
                         std::ptr::null_mut()
                     } else {
-                        unsafe { (*stored).gettopframe() }
+                        unsafe { (*stored).gettopframe_raw() }
                     }
                 };
                 let ns_obj = if !prepare_kwds.is_empty() && !prepare_frame.is_null() {
@@ -3908,7 +3908,7 @@ pub(crate) fn call_init_subclass_on_bases(
         if stored.is_null() {
             std::ptr::null_mut()
         } else {
-            unsafe { (*stored).gettopframe() }
+            unsafe { (*stored).gettopframe_raw() }
         }
     };
     if !frame.is_null() {

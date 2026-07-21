@@ -4363,12 +4363,12 @@ fn bh_call_kw_impl(
     let parent_frame_ptr: *const PyFrame = if ec.is_null() {
         std::ptr::null()
     } else {
-        unsafe { (*ec).gettopframe() as *const PyFrame }
+        unsafe { (*ec).gettopframe_raw() as *const PyFrame }
     };
     assert!(
         !parent_frame_ptr.is_null(),
         "bh_call_kw_impl requires a live parent PyFrame from \
-         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         getexecutioncontext().gettopframe_raw(); the eval loop must pin the \
          execution context before any residual call"
     );
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
@@ -4468,7 +4468,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         values
     };
     // `space.getexecutioncontext()` (call.rs:198 → TLS-pinned EC the eval
-    // loop stamps on entry) `.gettopframe()` is the active caller frame —
+    // loop stamps on entry) `.gettopframe_raw()` is the active caller frame —
     // `executioncontext.py:85-89 enter` / `:91-109 leave` keep
     // `topframeref` pointing at the running frame.  A null here means the
     // EC was never pinned before a residual call, which is a wiring bug, so
@@ -4477,12 +4477,12 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     let parent_frame_ptr: *const PyFrame = if ec.is_null() {
         std::ptr::null()
     } else {
-        unsafe { (*ec).gettopframe() as *const PyFrame }
+        unsafe { (*ec).gettopframe_raw() as *const PyFrame }
     };
     assert!(
         !parent_frame_ptr.is_null(),
         "bh_call_fn_impl requires a live parent PyFrame from \
-         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         getexecutioncontext().gettopframe_raw(); the eval loop must pin the \
          execution context before any residual call"
     );
     if pyre_object::gc_roots::shadow_stack_get(root_base).is_null() {
@@ -4593,12 +4593,12 @@ pub extern "C" fn bh_call_function_ex_fn(
     let parent_frame_ptr: *const PyFrame = if ec.is_null() {
         std::ptr::null()
     } else {
-        unsafe { (*ec).gettopframe() as *const PyFrame }
+        unsafe { (*ec).gettopframe_raw() as *const PyFrame }
     };
     assert!(
         !parent_frame_ptr.is_null(),
         "bh_call_function_ex_fn requires a live parent PyFrame from \
-         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         getexecutioncontext().gettopframe_raw(); the eval loop must pin the \
          execution context before any residual call"
     );
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();

@@ -11280,6 +11280,39 @@ impl<M: Clone> MetaInterp<M> {
         Some((all_virtuals_ptr, all_virtuals_int))
     }
 
+    /// Force a running virtualizable identified by its backend force token.
+    pub fn force_virtualizable_token(&mut self, token: u64) {
+        let deadframe = self
+            .backend
+            .force(GcRef(token as usize))
+            .expect("active virtualizable must have a backend deadframe");
+        let descr_arc = self.backend.get_latest_descr_arc(&deadframe);
+        let descr = descr_arc
+            .as_fail_descr()
+            .expect("forced virtualizable must have a fail descriptor");
+        let green_key = majit_backend::descr_owning_jct(descr)
+            .expect("forced virtualizable must belong to a compiled loop")
+            .green_key();
+        let trace_id = descr.trace_id();
+        let fail_index = descr.fail_index();
+        let fail_values = descr
+            .fail_arg_types()
+            .iter()
+            .enumerate()
+            .map(|(index, tp)| match tp {
+                Type::Int => self.backend.get_int_value(&deadframe, index),
+                Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
+                Type::Float => self.backend.get_float_value(&deadframe, index).to_bits() as i64,
+                Type::Void => 0,
+            })
+            .collect::<Vec<_>>();
+        let _ = self.handle_async_forcing(green_key, trace_id, fail_index, &fail_values);
+    }
+
+    pub fn is_force_token_armed(&self, token: u64) -> bool {
+        self.backend.is_force_token_armed(GcRef(token as usize))
+    }
+
     /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
     /// pyjitpl.py:3132 prepare_resume_from_failure parity.
     ///

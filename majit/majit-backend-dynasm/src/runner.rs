@@ -2701,6 +2701,43 @@ impl Backend for DynasmBackend {
             .expect("FrameData::fail_descr must implement FailDescr")
     }
 
+    fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
+        if force_token.is_null() {
+            return None;
+        }
+        let frame = unsafe { JitFrame::resolve(force_token.0 as *mut JitFrame) };
+        let force_descr = unsafe { (*frame).jf_force_descr };
+        assert_ne!(force_descr, 0, "force: jf_force_descr is null");
+        unsafe { (*frame).jf_descr = force_descr };
+
+        let descr = self.fail_descr_arc_from_addr(force_descr);
+        let fail_descr = descr
+            .as_fail_descr()
+            .expect("force descriptor must implement FailDescr");
+        let raw_values = fail_descr
+            .fail_arg_types()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                crate::guard::decode_rd_loc_slot(fail_descr, index)
+                    .map(|slot| unsafe { crate::llmodel::get_int_value_direct(frame, slot) as i64 })
+                    .unwrap_or(0)
+            })
+            .collect();
+        let exc_value = GcRef(unsafe { (*frame).jf_guard_exc });
+        Some(DeadFrame {
+            data: Box::new(FrameData::new(raw_values, descr, None, exc_value)),
+        })
+    }
+
+    fn is_force_token_armed(&self, force_token: GcRef) -> bool {
+        if force_token.is_null() {
+            return false;
+        }
+        let frame = unsafe { JitFrame::resolve(force_token.0 as *mut JitFrame) };
+        unsafe { (*frame).jf_force_descr != 0 }
+    }
+
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
         // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
         // metainterp `AbstractFailDescr` object op.descr stamped.  After

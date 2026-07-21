@@ -3135,6 +3135,18 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
+                if matches!(
+                    op.opcode,
+                    OpCode::CallMayForceI
+                        | OpCode::CallMayForceR
+                        | OpCode::CallMayForceF
+                        | OpCode::CallMayForceN
+                        | OpCode::CallReleaseGilI
+                        | OpCode::CallReleaseGilF
+                        | OpCode::CallReleaseGilN
+                ) {
+                    self._store_force_index_if_next_guard(ops, op_index, fail_index);
+                }
                 self.genop_call_with_arglocs(op, arglocs);
             }
             OpCode::CallR => {

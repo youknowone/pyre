@@ -1944,7 +1944,7 @@ impl TraceCtx {
     /// stops at `self.num_arrays + self.static_fields.len()` and leaves the
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
     /// or `virtualizable_values` is unavailable.
-    pub(crate) fn synchronize_virtualizable(&self) {
+    pub fn synchronize_virtualizable(&self) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };

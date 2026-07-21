@@ -17,6 +17,45 @@
 
 use super::*;
 
+thread_local! {
+    static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+struct ActiveFrameEscapeGuard(Option<(usize, usize)>);
+
+impl ActiveFrameEscapeGuard {
+    fn enter(frame: usize, py_pc: usize) -> Self {
+        let current = (frame != 0).then_some((frame, py_pc));
+        COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.set(None));
+        Self(ACTIVE_FRAME_ESCAPE.with(|slot| slot.replace(current)))
+    }
+}
+
+impl Drop for ActiveFrameEscapeGuard {
+    fn drop(&mut self) {
+        ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(self.0));
+    }
+}
+
+pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) {
+    ACTIVE_FRAME_ESCAPE.with(|slot| {
+        if let Some((expected, py_pc)) = slot.get()
+            && expected == frame as usize
+        {
+            if crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc) {
+                COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some(py_pc)));
+            }
+        }
+    });
+}
+
+pub fn take_committed_frame_escape_pc() -> Option<usize> {
+    COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.take())
+}
+
 /// Reject a residual_call whose `allboxes` (funcbox + permuted args)
 /// contains an `OpRef::NONE`.  RPython's `do_residual_call` resolves
 /// each argbox through `env[box]`, where an unbound box is a `KeyError`;
@@ -988,9 +1027,26 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `vable_and_vrefs_before_residual_call` (pyjitpl.py:2017) runs only past
     // the OS_NOT_IN_TRACE / force-virtual short-circuits. RPython mirror:
     // `pyjitpl.py:3318-3330`.
+    let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {
+        0
+    } else {
+        unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
+    };
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        if let Some(last_instr_index) = info
+            .static_fields
+            .iter()
+            .position(|field| field.name == "last_instr")
+        {
+            let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+            ctx.trace_ctx.set_virtualizable_entry_at(
+                last_instr_index,
+                last_instr,
+                majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
+            );
+        }
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);
@@ -1039,6 +1095,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let heap_write_odometer_before =
         (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
     let exec_result = {
+        let escape_frame = if is_may_force { live_frame } else { 0 };
+        let _frame_escape =
+            ActiveFrameEscapeGuard::enter(escape_frame, ctx.vstack_cur_pypc as usize);
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
@@ -1061,11 +1120,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py:3365
     // `SwitchToBlackhole(Counters.ABORT_ESCAPE, raising_exception=True)`).
-    // The interpreter resumes from the live frame,
-    // which the callee's force path made heap-authoritative — no
-    // `load_fields_from_virtualizable` analogue is needed because the FBW
-    // abort discards the walk shadow instead of handing it to a blackhole
-    // leg.  An intact token is cleared back to TOKEN_NONE.
+    // The interpreter resumes from the live frame, which the callee's force
+    // path made heap-authoritative. Reload the walk shadow before aborting so
+    // later cleanup cannot restore pre-force fields.  An intact token is
+    // cleared back to TOKEN_NONE.
     if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
@@ -1073,6 +1131,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
         if forced {
+            ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }
