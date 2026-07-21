@@ -806,7 +806,7 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
         ctx.vstack_valid = false;
         return;
     }
-    let (handler_py, code_ptr) = unsafe {
+    let (handler_py, code_ptr, twin_depth, twin_populated) = unsafe {
         let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             ctx.vstack_valid = false;
@@ -815,13 +815,32 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
         (
             vstack_containing_py_pc(&jc.payload.metadata, handler_jit_pc),
             jc.payload.code_ptr,
+            jc.payload.depth_containing_for_jitcode_pc(handler_jit_pc),
+            jc.payload.depth_containing_populated(),
         )
     };
-    let handler_depth = crate::liveness::liveness_for(code_ptr)
-        .depth_at_py_pc()
-        .get(handler_py as usize)
-        .copied()
-        .unwrap_or(0) as usize;
+    // Raw py_pc-keyed static-liveness read: the unpopulated-twin fallback
+    // (skeleton / fixture) and the audit oracle.
+    let raw_depth = || {
+        crate::liveness::liveness_for(code_ptr)
+            .depth_at_py_pc()
+            .get(handler_py as usize)
+            .copied()
+            .unwrap_or(0) as usize
+    };
+    let handler_depth = if twin_populated {
+        let depth = twin_depth.unwrap_or(0) as usize;
+        if pcmap_containing_audit_enabled() {
+            assert_eq!(
+                depth,
+                raw_depth(),
+                "PYRE_PCMAP_CONTAINING_AUDIT: enter-handler containing-depth twin diverged at jit_pc {handler_jit_pc} (py {handler_py})"
+            );
+        }
+        depth
+    } else {
+        raw_depth()
+    };
     ctx.vstack_boxes.clear();
     ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
     // The unwinder pushes the caught exception onto the new TOS.

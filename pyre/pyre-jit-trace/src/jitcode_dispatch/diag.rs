@@ -20,6 +20,15 @@ pub(crate) fn pcmap_recipe_resultcolor_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_CONTAINING_AUDIT`: assert the Slice-B floor-only depth twin
+/// (`depth_containing_for_jitcode_pc`) equals the raw
+/// `depth_at_py_pc[vstack_containing_py_pc(jit_pc)]` read at both consumer
+/// seams. Off in production; the gated branch is the only added code.
+pub(crate) fn pcmap_containing_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CONTAINING_AUDIT").is_some())
+}
+
 pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static str) {
     if let Some(path) = std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE") {
         use std::io::Write;

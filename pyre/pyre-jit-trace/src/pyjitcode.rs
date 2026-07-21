@@ -122,6 +122,14 @@ pub struct PyJitCodeMetadata {
     /// skeleton / fixture.
     pub depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
+    /// Slice B (#73): floor-only STATIC-liveness depth twin of the
+    /// containing-opcode resolution. Keys mirror `py_floor_by_jit_pc` exactly
+    /// (same offsets, same order); each value is
+    /// `liveness_for(code).depth_at_py_pc().get(py).copied().unwrap_or(0)` for
+    /// that segment's py. NO block-head marker precedence and NO trivia skip —
+    /// a floor lookup reproduces `depth_at_py_pc[vstack_containing_py_pc(jit_pc)]`
+    /// for every jit_pc. Empty for skeleton / fixture metadata.
+    pub depth_containing_by_jit_pc: Vec<(u32, u16)>,
     /// Reproduces `pcdep_color_slots[skip_python_trivia_forward(
     /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
     /// and predecessor-op-start tiers as the trivia-aware depth twin.
@@ -539,6 +547,27 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1)
     }
 
+    /// Floor-only containing-opcode STATIC-liveness depth keyed by a JitCode
+    /// byte offset via the `depth_containing_by_jit_pc` twin. Same
+    /// `partition_point` floor pivot as `floor_segment_for_jitcode_pc` over the
+    /// same keys as `py_floor_by_jit_pc`, so it equals
+    /// `liveness_for(code).depth_at_py_pc().get(vstack_containing_py_pc(jit_pc) as usize).copied().unwrap_or(0)`
+    /// by construction — no block-head marker precedence, no trivia skip. `None`
+    /// when the twin is empty (skeleton / fixture) — see
+    /// [`Self::depth_containing_populated`].
+    pub fn depth_containing_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.depth_containing_by_jit_pc;
+        let end = table.partition_point(|&(off, _)| (off as usize) <= jit_pc);
+        end.checked_sub(1).map(|idx| table[idx].1)
+    }
+
+    /// Whether the floor-only containing-depth twin carries entries. `false` for
+    /// skeleton / fixture installs; the #8/#17 consumers fall back to the raw
+    /// py_pc-keyed static-liveness read there.
+    pub fn depth_containing_populated(&self) -> bool {
+        !self.metadata.depth_containing_by_jit_pc.is_empty()
+    }
+
     /// The const operand-stack slots keyed by a JitCode byte offset via
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Returns the slots for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
@@ -806,6 +835,7 @@ impl PyJitCode {
                 depth_pred_by_jit_pc: Vec::new(),
                 depth_trivia_marker_by_jit_pc: Vec::new(),
                 depth_trivia_pred_by_jit_pc: Vec::new(),
+                depth_containing_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),

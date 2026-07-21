@@ -13499,6 +13499,21 @@ impl CodeWriter {
             py_floor_by_jit_pc.insert(0, (0, 0));
         }
 
+        // Floor-only depth twin of the containing-opcode resolution
+        // (`vstack_containing_py_pc`). Shares `py_floor_by_jit_pc`'s keys
+        // EXACTLY — no block-head marker precedence, no trivia skip — so a
+        // `partition_point(off <= jit_pc)` floor lookup reproduces
+        // `liveness_for(code).depth_at_py_pc().get(containing_py).copied().unwrap_or(0)`
+        // for every jit_pc, including the out-of-range → 0 collapse baked here.
+        let depth_containing_by_jit_pc: Vec<(u32, u16)> = {
+            let static_depth =
+                pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
+            py_floor_by_jit_pc
+                .iter()
+                .map(|&(off, py)| (off, static_depth.get(py as usize).copied().unwrap_or(0)))
+                .collect()
+        };
+
         // Sparse carry-forward sidecar: capture ONLY the py_pcs whose
         // dense marker the on-demand `derive_resume_marker` derivation cannot
         // reproduce from `first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`.
@@ -13822,6 +13837,7 @@ impl CodeWriter {
             depth_pred_by_jit_pc,
             depth_trivia_marker_by_jit_pc,
             depth_trivia_pred_by_jit_pc,
+            depth_containing_by_jit_pc,
             pcdep_trivia_marker_by_jit_pc,
             pcdep_trivia_pred_by_jit_pc,
             const_ref_trivia_marker_by_jit_pc,

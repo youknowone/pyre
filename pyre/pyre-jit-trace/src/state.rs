@@ -11645,6 +11645,7 @@ mod tests {
                 depth_pred_by_jit_pc: vec![(0, 2)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(2))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(2))],
+                depth_containing_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),

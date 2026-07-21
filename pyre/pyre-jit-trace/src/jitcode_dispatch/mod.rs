@@ -4806,11 +4806,28 @@ impl ActiveResumeFrame {
             return None;
         }
         let py_pc = vstack_containing_py_pc(&pjc.metadata, jit_pc);
-        let depth = crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(py_pc as usize)
-            .copied()
-            .unwrap_or(0) as usize;
+        // Raw py_pc-keyed static-liveness read: the unpopulated-twin fallback
+        // (skeleton / fixture) and the audit oracle.
+        let raw_depth = || {
+            crate::liveness::liveness_for(pjc.code_ptr)
+                .depth_at_py_pc()
+                .get(py_pc as usize)
+                .copied()
+                .unwrap_or(0) as usize
+        };
+        let depth = if pjc.depth_containing_populated() {
+            let depth = pjc.depth_containing_for_jitcode_pc(jit_pc).unwrap_or(0) as usize;
+            if pcmap_containing_audit_enabled() {
+                assert_eq!(
+                    depth,
+                    raw_depth(),
+                    "PYRE_PCMAP_CONTAINING_AUDIT: resume-frame containing-depth twin diverged at jit_pc {jit_pc} (py {py_pc})"
+                );
+            }
+            depth
+        } else {
+            raw_depth()
+        };
         Some((py_pc, pjc.code_ptr, depth))
     }
 
