@@ -1100,6 +1100,29 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     SYS_MODULES.with(|m| m.borrow().get(name).copied())
 }
 
+/// Whether `sys.modules[name]` is bound to `None`, the sentinel that marks
+/// a name as blocked.
+///
+/// `_bootstrap._find_and_load` treats it as a cached "this import must not
+/// succeed" and raises instead of searching, which is how code disables an
+/// import for everything downstream of it.  `check_sys_modules` cannot
+/// report it — `None` is not a module it can hand back, so it falls through
+/// to the search — hence the separate lookup.
+fn sys_modules_blocks(name: &str) -> bool {
+    // Build the key before reading the dict, as `check_sys_modules` does: the
+    // allocation can run a minor collection that relocates the dict, and the
+    // cell holds the address the collector updates.
+    let key = pyre_object::w_str_new(name);
+    let dict = SYS_MODULES_DICT.with(|d| d.get());
+    if dict.is_null() {
+        return false;
+    }
+    match unsafe { pyre_object::w_dict_lookup(dict, key) } {
+        Some(m) => !m.is_null() && unsafe { pyre_object::is_none(m) },
+        None => false,
+    }
+}
+
 /// Look up a loaded module by name in `sys.modules` (Python-visible dict
 /// first, then the interpreter cache). Mirrors `check_sys_modules`.
 pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
@@ -1894,6 +1917,15 @@ fn load_part(
     parent_dirs: Option<&[PathBuf]>,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
+    // A blocked name is answered before any search, so it also applies to a
+    // name that was never importable to begin with.
+    if sys_modules_blocks(modulename) {
+        return Err(crate::PyError::module_not_found_with_name(
+            format!("import of {modulename} halted; None in sys.modules"),
+            modulename,
+        ));
+    }
+
     // Check sys.modules cache first
     if let Some(cached) = check_sys_modules(modulename) {
         return Ok(Some(cached));
