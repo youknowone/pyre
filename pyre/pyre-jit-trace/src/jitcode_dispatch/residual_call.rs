@@ -1390,16 +1390,13 @@ pub(crate) fn do_not_in_trace_call_result(
 /// halves of the vable token protocol
 /// (`vinfo.tracing_before_residual_call(virtualizable)` /
 /// `vinfo.tracing_after_residual_call(virtualizable)`) live with
-/// whichever leg actually executes the callee:
-///
-/// * trait-driven leg — `state.rs
-///   MIFrame::vable_and_vrefs_before_residual_call` /
-///   `vable_after_residual_call` (`trace_opcode.rs:2602/2646`);
-/// * authoritative full-body walk —
-///   [`try_execute_residual_call_via_executor`], which brackets the
-///   concrete `execute_residual_call` with both halves and surfaces
-///   [`DispatchError::VableEscapedDuringResidualCall`] on a detected
-///   force (pyjitpl.py:3365 ABORT_ESCAPE parity).
+/// the walk that executes the callee:
+/// [`try_execute_residual_call_via_executor`] brackets the concrete
+/// `execute_residual_call` with both halves of
+/// `vable_and_vrefs_before_residual_call` /
+/// `vable_after_residual_call` and surfaces
+/// [`DispatchError::VableEscapedDuringResidualCall`] on a detected
+/// force (pyjitpl.py:3365 ABORT_ESCAPE parity).
 ///
 /// This helper records ONLY the IR portion here and never
 /// touches the token; the heap-half token protocol is bracketed by
@@ -1408,11 +1405,13 @@ pub(crate) fn do_not_in_trace_call_result(
 /// intact.
 ///
 /// `vrefs_before_residual_call` / `vrefs_after_residual_call`
-/// (`pyjitpl.py:3317-3326, 3337-3347`) are omitted — they have zero
-/// IR ops on the no-force path, and the walker tracks no
-/// `virtualref_boxes` (production producers of `jit.virtual_ref` are
-/// absent; the trait leg carries the vref halves at
-/// `trace_opcode.rs:2730/2752`).
+/// (`pyjitpl.py:3341-3372`) are unported.  `PyreSym` does carry
+/// `virtualref_boxes` (`state.rs`), so what is missing is the bracket
+/// itself: the pre-call `vrefinfo.tracing_before_residual_call` loop
+/// and the post-call `stop_tracking_virtualref`.  Unreachable today —
+/// the codewriter emits no `jit.virtual_ref` producers
+/// (`jit/call.rs`), leaving `virtualref_boxes` empty so both upstream
+/// loops iterate zero times.
 pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py:3326-3327: vinfo = self.jitdriver_sd.virtualizable_info;
     //                       if vinfo is not None:

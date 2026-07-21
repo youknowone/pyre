@@ -1,7 +1,10 @@
-//! MIFrame opcode handlers for trace-time JIT.
+//! MIFrame trace-time helpers for the full-body walker.
 //!
-//! Contains all `impl MIFrame` methods and trait implementations
-//! (SharedOpcodeHandler, LocalOpcodeHandler, etc.).
+//! Frame construction, guard-snapshot capture, register banks, and the
+//! stack-slot helpers the walker calls.  The opcode-handler traits
+//! (`SharedOpcodeHandler`, `LocalOpcodeHandler`) are implemented only
+//! by the real interpreter frame in `pyre-interpreter`; the trace-time
+//! mirror that once implemented them here is retired.
 
 use crate::state::*;
 
