@@ -2972,6 +2972,9 @@ impl MIFrame {
             frames,
             vable_boxes,
             vref_boxes,
+            // Trait-leg (MIFrame) snapshot: the nested-list append fold is a
+            // full-body-walk-only path, so no extra virtual roots here.
+            extra_virtual_roots: Vec::new(),
         }
     }
 

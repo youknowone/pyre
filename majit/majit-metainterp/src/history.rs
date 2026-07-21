@@ -1019,6 +1019,23 @@ impl TreeLoop {
                         .collect(),
                     vable_boxes: snap.vable_boxes.iter().map(&remap_tagged).collect(),
                     vref_boxes: snap.vref_boxes.iter().map(&remap_tagged).collect(),
+                    // Extra virtual roots are raw OpRefs (not tagged): remap each
+                    // to the post-cut namespace, mirroring `remap_tagged`'s Box
+                    // arm — unmapped runtime OpRefs drop to NONE, constants/NONE
+                    // pass through.
+                    extra_virtual_roots: snap
+                        .extra_virtual_roots
+                        .iter()
+                        .map(|old_ref| {
+                            if let Some(&new_ref) = remap.get(old_ref) {
+                                new_ref
+                            } else if !Self::is_runtime_opref(*old_ref) {
+                                *old_ref
+                            } else {
+                                OpRef::NONE
+                            }
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -2231,6 +2248,7 @@ impl TraceCtx {
             pc,
             &[],
             &[],
+            &[],
         );
     }
 
@@ -2256,6 +2274,7 @@ impl TraceCtx {
         pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
+        extra_virtual_roots: &[OpRef],
     ) {
         // The pc word is a raw JitCode offset.
         let boxes = self.encode_snapshot_boxes(active_boxes);
@@ -2267,6 +2286,7 @@ impl TraceCtx {
             }],
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
+            extra_virtual_roots: extra_virtual_roots.to_vec(),
         });
         self.set_last_guard_resume_position(snapshot_id);
     }
@@ -2293,6 +2313,7 @@ impl TraceCtx {
             }],
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
+            extra_virtual_roots: Vec::new(),
         });
         self.set_last_guard_op_resume_position(snapshot_id);
     }
@@ -2348,6 +2369,10 @@ impl TraceCtx {
             frames: recorder_frames,
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
+            // The nested-list append fold resumes through the single-frame
+            // collapse, never this multi-frame path, so no extra virtual roots
+            // flow here.
+            extra_virtual_roots: Vec::new(),
         });
         self.set_last_guard_resume_position(snapshot_id);
     }
@@ -2812,6 +2837,7 @@ impl TraceCtx {
             }],
             vable_boxes: Vec::new(),
             vref_boxes: Vec::new(),
+            extra_virtual_roots: Vec::new(),
         });
         let opref = self.record_guard(opcode, args, num_live);
         self.recorder.set_last_op_resume_position(snapshot_idx);

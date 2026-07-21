@@ -7970,6 +7970,7 @@ pub fn build_state_field_snapshot(
         frames: snapshot_frames,
         vable_boxes: vable_boxes_snap,
         vref_boxes: vref_boxes_snap,
+        extra_virtual_roots: Vec::new(),
     }
 }
 

@@ -3933,6 +3933,13 @@ impl ResumeDataLoopMemo {
     ///   target_tagged/value_tagged are filled in-place.
     /// `optimizer_knowledge`: bridgeopt.py:63 serialize_optimizer_knowledge.
     ///   Heap field triples and known-class info for bridge compilation.
+    /// `extra_virtual_roots`: virtual op-results reachable only as a field of
+    ///   another walker-minted virtual (no frame-liveness slot of their own).
+    ///   Seeded into the virtual worklist as `register_virtual_box` roots — the
+    ///   `_visitor_walk_recursive` analog descends into each via
+    ///   `get_virtual_fields`, so a nested `[[i] …]` inner-list wrapper roots its
+    ///   separately allocated backing block. Empty on every path except the
+    ///   nested-list append fold behind `PYRE_NESTED_LIST_FOLD_VIRT`.
     ///
     /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
     /// `livebox_types` maps typed OpRef → Type, captured at numbering time
@@ -3943,6 +3950,7 @@ impl ResumeDataLoopMemo {
         env: &dyn majit_ir::BoxEnv,
         pending_setfields: &mut [majit_ir::GuardPendingFieldEntry],
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
+        extra_virtual_roots: &[majit_ir::OpRef],
     ) -> (
         Vec<u8>,
         Vec<majit_ir::Const>,
@@ -3998,6 +4006,30 @@ impl ResumeDataLoopMemo {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 virtual_worklist.push(opref);
             }
+        }
+
+        // Seed the walker-minted extra virtual roots (the nested-list append
+        // fold's inner-list wrapper) into the same worklist. These carry no
+        // frame-liveness slot — they are reachable only as a field of another
+        // virtual — so they are numbered off the frame section: `register_
+        // virtual_box` stamps them UNASSIGNEDVIRTUAL (resume.py:359-368
+        // register_virtual_fields default) so `_number_virtuals` gives them an
+        // `rd_virtuals` slot without ever making them a fail-arg, and the drain
+        // below descends into each via `get_virtual_fields` — the pyre analog of
+        // `_visitor_walk_recursive` reaching the wrapper's backing block.
+        for &root in extra_virtual_roots {
+            if root.is_none() {
+                continue;
+            }
+            let resolved = env.get_box_replacement(root);
+            if resolved.is_none()
+                || virtual_fields.contains_key(&resolved)
+                || !(env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+            {
+                continue;
+            }
+            self.register_virtual_box(resolved, env, &numb_state.liveboxes, &mut new_liveboxes);
+            virtual_worklist.push(resolved);
         }
 
         // Worklist-based recursive virtual discovery (RPython visitor_walk_recursive).
@@ -4991,7 +5023,7 @@ mod tests {
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
-            memo.finish(numb_state, &env, &mut [], None);
+            memo.finish(numb_state, &env, &mut [], None, &[]);
 
         // liveboxes should contain only TAGBOX entries: OpRef::int_op(1) and OpRef::int_op(3)
         assert_eq!(liveboxes.len(), 2);

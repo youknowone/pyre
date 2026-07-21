@@ -34,6 +34,7 @@ fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Ty
         }],
         vable_boxes: Vec::new(),
         vref_boxes: Vec::new(),
+        extra_virtual_roots: Vec::new(),
     });
     ctx.set_last_guard_resume_position(snapshot_id);
 }
