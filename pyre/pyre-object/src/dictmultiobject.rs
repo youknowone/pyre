@@ -79,7 +79,12 @@ impl PartialEq for ObjectKey {
         if self.hash != other.hash {
             return false;
         }
-        unsafe { dict_keys_equal(self.obj, other.obj) }
+        // `IndexMap` compares `probe == stored`, so `self` is the incoming key
+        // and `other` the one already in the bucket.  `ll_dict_lookup` runs
+        // `keyeq(checkingkey, key)` with the *stored* key on the left
+        // (`rordereddict.py:1055`), which is what decides whose `__eq__` the
+        // comparison protocol tries first; hand them over in that order.
+        unsafe { dict_keys_equal(other.obj, self.obj) }
     }
 }
 
@@ -161,7 +166,7 @@ impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // `dict_keys_equal` does.  The materialized str is the rare-path
                 // cost (a str-subclass dict key); the common exact-str arm
                 // above allocates nothing.
-                dict_keys_equal(crate::w_str_new(self.key), k.obj)
+                dict_keys_equal(k.obj, crate::w_str_new(self.key))
             } else {
                 // ObjectDictStrategy uses the ordinary object equality hook
                 // for every hash collision.  A non-str key is allowed to
@@ -1659,6 +1664,12 @@ unsafe fn key_equality_is_builtin(key: PyObjectRef) -> bool {
 }
 
 /// Compare two dict keys for equality.
+///
+/// `a` is the key already stored in the bucket and `b` the incoming one, the
+/// order `ll_dict_lookup` passes to `keyeq` (`rordereddict.py:1055`,
+/// `keyeq(checkingkey, key)`).  The comparison protocol tries the left
+/// operand's `__eq__` first, so the order is observable whenever a key's
+/// `__eq__` is asymmetric or has side effects.
 ///
 /// `pypy/objspace/std/dictmultiobject.py:1209 ObjectDictStrategy` —
 /// the storage is `r_dict(space.eq_w, space.hash_w)` so every key
