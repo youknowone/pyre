@@ -611,6 +611,12 @@ pub unsafe fn walk_pyframe_roots_area(
             // copy alone is not authoritative for later EC reads).
             let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
             visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
+            // Exceptions may use the off-GC malloc_typed fallback.  In that
+            // case forwarding the carrier above is a no-op, so trace its raw
+            // GC-managed children just as `walk_in_flight_exception` does.
+            // This is the post-PUSH_EXC_INFO owner of the same exception and
+            // must preserve its traceback/frame graph identically.
+            unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
             // pending_with_disabled_del is a GC-visible list upstream
             // (executioncontext.py:652); pyre's Vec lives in the boxed
             // UserDelAction, so its element slots are visited here.
@@ -3283,6 +3289,11 @@ impl OpcodeStepExecutor for PyFrame {
         // `get_current_exception_fn` / `set_current_exception_fn`.
         let prev = get_current_exception();
         set_current_exception(exc);
+        // `PUSH_EXC_INFO` transfers ownership from the propagating `PyError`
+        // to the execution context.  Its `sys_exc_value` slot and raw
+        // exception children are walked above, so the temporary propagation
+        // root must no longer retain a completed handler's traceback.
+        set_in_flight_exception(pyre_object::PY_NULL);
         // Push "previous exception" for later restore
         self.push(prev);
         // Push the exception value back

@@ -318,10 +318,22 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     // snapshot tools) keeps a `malloc_raw` name that an immortal holder can never
     // grey — the non-collecting old-gen alloc above cannot sweep this box before
     // it is stored into the type below.
-    let name = if raw.is_null() {
-        crate::lltype::malloc_raw(name.to_string())
+    let name_value = name.to_string();
+    let (name, qualname) = if raw.is_null() {
+        (
+            crate::lltype::malloc_raw(name_value.clone()),
+            crate::lltype::malloc_raw(name_value),
+        )
     } else {
-        crate::gc_storage::gc_alloc_storage_box(name.to_string(), name_storage_gc_type_id())
+        let name = crate::gc_storage::gc_alloc_storage_box(
+            name_value.clone(),
+            name_storage_gc_type_id(),
+        );
+        crate::gc_roots::pin_root(name as PyObjectRef);
+        let qualname =
+            crate::gc_storage::gc_alloc_storage_box(name_value, name_storage_gc_type_id());
+        let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
+        (name, qualname)
     };
     // Install the forwarded bases and managed namespace addresses rather than the
     // pre-collection arguments (the pins survive any collection the alloc forces).

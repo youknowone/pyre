@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from types import GenericAlias
 from typing import ClassVar, Protocol, TypeVar
 
 T = TypeVar("T")
@@ -103,5 +104,46 @@ class ClassLocalAnnotation:
 
 
 assert ClassLocalAnnotation.__annotations__["value"] == ClassVar[int]
+
+
+class LazyAnnotatedBase:
+    value: int
+
+
+class LazyAnnotatedChild(LazyAnnotatedBase):
+    pass
+
+
+# CPython 3.14 type annotation slots are owned by the class.  A subclass does
+# not inherit its base's thunk, and replacing a thunk invalidates a previously
+# materialized annotations cache.
+assert LazyAnnotatedChild.__annotate__ is None
+assert LazyAnnotatedBase.__annotations__ == {"value": int}
+LazyAnnotatedBase.__annotate__ = lambda _: {}
+assert LazyAnnotatedBase.__annotations__ == {}
+
+try:
+    LazyAnnotatedBase.__annotate__ = 42
+except TypeError:
+    pass
+else:
+    raise AssertionError("type.__annotate__ accepted a non-callable")
+
+try:
+    del LazyAnnotatedBase.__annotate__
+except TypeError:
+    pass
+else:
+    raise AssertionError("type.__annotate__ was deletable")
 assert object.__type_params__ == ()
 assert ClassLocalAnnotation.__type_params__ == ()
+
+
+class GenericAliasSubclass(GenericAlias):
+    pass
+
+
+generic_alias_subclass = GenericAliasSubclass(list, int)
+assert type(generic_alias_subclass) is GenericAliasSubclass
+assert generic_alias_subclass.__origin__ is list
+assert generic_alias_subclass.__args__ == (int,)

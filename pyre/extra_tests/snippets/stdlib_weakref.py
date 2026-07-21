@@ -1,4 +1,5 @@
 import gc
+from dataclasses import dataclass
 
 from _weakref import getweakrefcount, getweakrefs, proxy, ref
 
@@ -63,3 +64,29 @@ del g
 gc.collect()
 
 assert_raises(ReferenceError, lambda: p.h)
+
+
+@dataclass(slots=True)
+class SlottedDataclass:
+    pass
+
+
+slotted = SlottedDataclass()
+assert "__weakref__" not in SlottedDataclass.__slots__
+assert_raises(TypeError, lambda: ref(slotted))
+assert_raises(AttributeError, lambda: slotted.__weakref__)
+
+
+def handled_exception_releases_locals():
+    value = X()
+    value_ref = ref(value)
+    try:
+        raise ValueError
+    except ValueError:
+        pass
+    return value_ref
+
+
+handled_value_ref = handled_exception_releases_locals()
+gc.collect()
+assert handled_value_ref() is None

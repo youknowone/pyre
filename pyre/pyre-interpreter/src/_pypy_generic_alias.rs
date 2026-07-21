@@ -726,14 +726,24 @@ fn ga_subclasscheck(_args: &[PyObjectRef]) -> crate::PyResult {
 /// `GenericAlias.__new__(cls, origin, args)` (`_pypy_generic_alias.py:19`)
 /// — the public `types.GenericAlias(list, int)` constructor.
 fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
-    // args[0] is the cls passed by `type.__call__`.
     if args.len() != 3 {
         return Err(crate::PyError::type_error(format!(
             "GenericAlias expected 2 arguments, got {}",
             args.len().saturating_sub(1)
         )));
     }
-    make_generic_alias(args[1], args[2])
+    let cls = args[0];
+    let generic_alias_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
+    // `_pypy_generic_alias.py GenericAlias.__new__` allocates through
+    // `super(GenericAlias, cls).__new__(cls)`, preserving a user subtype as
+    // the new alias's class while retaining the GenericAlias payload layout.
+    crate::typedef::check_user_subclass(generic_alias_type, cls)?;
+    let result = make_generic_alias(args[1], args[2])?;
+    if !std::ptr::eq(cls, generic_alias_type) {
+        unsafe { (*result).w_class = cls };
+        pyre_object::gc_hook::maybe_register_finalizer(result);
+    }
+    Ok(result)
 }
 
 /// Build the `types.GenericAlias` namespace.

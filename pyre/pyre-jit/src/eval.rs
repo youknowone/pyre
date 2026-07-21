@@ -349,6 +349,11 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         let name_slot = std::ptr::addr_of_mut!(t.name);
         f(name_slot as *mut majit_ir::GcRef);
     }
+    // `qualname` has the same ownership and storage shape as `name`.
+    if !t.qualname.is_null() && pyre_object::gc_hook::try_gc_owns_object(t.qualname as *mut u8) {
+        let qualname_slot = std::ptr::addr_of_mut!(t.qualname);
+        f(qualname_slot as *mut majit_ir::GcRef);
+    }
     if !t.mro_w.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8) {
             // GC-owned type-9 block: forward the `mro_w` field slot; the

@@ -5426,6 +5426,28 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
     Ok(w_none())
 }
 
+/// CPython 3.14 `type_set___annotate__`: the lazy annotation callable is an
+/// own-type slot, never inherited, and replacing it invalidates the result
+/// cached by `type_get_annotations`.
+pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::type_error(format!(
+            "cannot set '__annotate__' attribute of immutable type '{}'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    if !unsafe { is_none(value) } && !callable_w(value) {
+        return Err(PyError::type_error(
+            "__annotate__ must be callable or None",
+        ));
+    }
+    crate::type_dict_store(obj, "__annotate_func__", value);
+    crate::type_dict_delete(obj, "__annotations_cache__");
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    unsafe { mutated(obj, Some("__annotate__")) };
+    Ok(w_none())
+}
+
 pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
         return Err(PyError::type_error(format!(
@@ -5594,7 +5616,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // either name to the other, matching CPython's mapping in
             // typeobject.c type_get___annotate__.
             if name == "__annotate__" || name == "__annotate_func__" {
-                if let Some(v) = lookup_in_type_where(obj, name) {
+                if let Some(v) = crate::type_dict_lookup(obj, name) {
                     return Ok(v);
                 }
                 let alt = if name == "__annotate__" {
@@ -5602,7 +5624,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 } else {
                     "__annotate__"
                 };
-                if let Some(v) = lookup_in_type_where(obj, alt) {
+                if let Some(v) = crate::type_dict_lookup(obj, alt) {
                     return Ok(v);
                 }
                 return Ok(w_none());
@@ -7138,6 +7160,20 @@ thread_local! {
     });
 }
 
+/// `typeobject.py MethodCache.clear`, called by explicit `gc.collect()` before
+/// tracing so cached defining classes and descriptors do not keep otherwise
+/// unreachable heap types alive.
+pub(crate) fn clear_method_cache() {
+    METHOD_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        cache.versions.fill(0);
+        cache.names.fill(None);
+        cache
+            .lookup_where
+            .fill((std::ptr::null_mut(), std::ptr::null_mut()));
+    });
+}
+
 /// `typeobject.py:520-535` method-hash.  `version_tag` is pyre's u64
 /// version token directly (PyPy hashes `current_object_addr_as_int(
 /// version_tag)`; the u64 is its own address-stable surrogate).
@@ -8528,6 +8564,9 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 if name == "__annotations__" {
                     return type_set_annotations(obj, value);
                 }
+                if name == "__annotate__" {
+                    return type_set_annotate(obj, value);
+                }
                 // typeobject.py:1064-1072 descr_set__qualname__ stores the
                 // validated text in W_TypeObject.qualname; it never creates
                 // a class-dict entry.
@@ -9250,6 +9289,11 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             if crate::type_dict_has_storage(obj) {
                 if name == "__annotations__" {
                     return type_del_annotations(obj);
+                }
+                if name == "__annotate__" {
+                    return Err(PyError::type_error(
+                        "cannot delete __annotate__ attribute",
+                    ));
                 }
                 if crate::type_dict_delete(obj, name) {
                     // typeobject.py:1263-1267 descr_del___abstractmethods__.

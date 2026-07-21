@@ -6640,10 +6640,22 @@ impl CodeWriter {
                     None,
                     ($py_pc) as i64,
                 );
-                // pyre-only dead-end: the block has no successor in
-                // the shadow graph. Leaving `needs_fallthrough = false`
-                // blocks the auto-fallthrough at the next
-                // `emit_mark_label_pc!`.
+                // `abort_permanent` is a runtime terminator, but RPython's
+                // flow graph has no third terminal block beside returnblock
+                // and exceptblock (`model.py:18-19`).  Keep the orthodox
+                // graph shape by linking the unreachable continuation to
+                // returnblock.  Canonical flattening serializes
+                // `abort_permanent` first; its runtime dispatch never reaches
+                // the synthetic null return.  Leaving this block with no exit
+                // would instead make `flatten.py:107-109` mistake its full
+                // FrameState input tuple for return arguments.
+                let abort_return = super::flow::Link::new(
+                    vec![super::flow::Constant::none().into()],
+                    Some(graph.returnblock.clone()),
+                    None,
+                )
+                .into_ref();
+                append_exit(&current_block.block(), abort_return);
                 needs_fallthrough = false;
             }};
         }

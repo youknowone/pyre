@@ -1125,14 +1125,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "audit",
         crate::make_builtin_function("audit", |_| Ok(w_none())),
     );
-    // sys._clear_type_descriptors(cls) — clears a type's cached descriptors
-    // before `dataclasses._add_slots` rebuilds the class with __slots__.  The
-    // rebuilt class is constructed fresh from the original's dict, so dropping
-    // the descriptors on the soon-discarded original is a no-op here.
+    // sys._clear_type_descriptors(cls) — remove the descriptors owned by the
+    // original class before `dataclasses._add_slots` copies its namespace into
+    // the replacement slotted class.
     module_ns_store(
         ns,
         "_clear_type_descriptors",
-        crate::make_builtin_function("_clear_type_descriptors", |_| Ok(w_none())),
+        make_builtin_function_with_arity(
+            "_clear_type_descriptors",
+            sys_clear_type_descriptors,
+            1,
+        ),
     );
     // sys.is_finalizing
     module_ns_store(
@@ -1181,6 +1184,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "addaudithook",
         make_builtin_function_with_arity("addaudithook", |_| Ok(w_none()), 1),
     );
+}
+
+/// `sysmodule.c sys._clear_type_descriptors`: remove the instance-dict and weakref
+/// descriptors while retaining their references until both dictionary
+/// mutations are complete, then invalidate the type lookup caches once.
+fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_type = args[0];
+    if !unsafe { pyre_object::is_type(w_type) } {
+        return Err(crate::PyError::type_error(
+            "_clear_type_descriptors() argument must be a type",
+        ));
+    }
+    if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+        return Err(crate::PyError::type_error("argument is immutable"));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    if let Some(descr) = crate::type_dict_lookup(w_type, "__dict__") {
+        pyre_object::gc_roots::pin_root(descr);
+    }
+    if let Some(descr) = crate::type_dict_lookup(w_type, "__weakref__") {
+        pyre_object::gc_roots::pin_root(descr);
+    }
+    crate::type_dict_delete(w_type, "__dict__");
+    crate::type_dict_delete(w_type, "__weakref__");
+    unsafe { crate::baseobjspace::mutated(w_type, None) };
+    Ok(w_none())
 }
 
 /// Construct a stdio object whose type is `_io.TextIOWrapper` (so

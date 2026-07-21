@@ -3436,7 +3436,10 @@ fn init_zip_type(ns: PyObjectRef) {
 ///         raise TypeError("%N.__new__(%N) is not safe, use %N.__new__()", ...)
 ///     return w_subtype
 /// ```
-fn check_user_subclass(w_self: PyObjectRef, w_subtype: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) fn check_user_subclass(
+    w_self: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> Result<(), crate::PyError> {
     if w_subtype.is_null() || !unsafe { pyre_object::is_type(w_subtype) } {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         return Err(crate::PyError::type_error(format!(
