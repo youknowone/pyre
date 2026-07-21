@@ -28,7 +28,10 @@ class BytesIO:
         self._check_closed()
         return True
 
-    def read(self, size=-1):
+    def _read_from_buffer(self, size=-1):
+        # `W_BytesIO.read_w` copies straight out of the internal buffer, so the
+        # sibling slots below reach it here rather than through `self.read`,
+        # which a subclass may override.
         self._check_closed()
         if size is None or size < 0:
             end = len(self._buffer)
@@ -38,24 +41,30 @@ class BytesIO:
         self._pos = end
         return data
 
-    def read1(self, size=-1):
-        return self.read(size)
+    def read(self, size=-1):
+        return self._read_from_buffer(size)
 
-    def readinto(self, buffer):
+    def read1(self, size=-1):
+        return self._read_from_buffer(size)
+
+    def _readinto_from_buffer(self, buffer):
         self._check_closed()
-        # PyPy `W_BytesIO.readinto_w`: acquire a writable buffer for the
+        # `W_BytesIO.readinto_w`: acquire a writable buffer for the
         # duration of the read, consume at most its byte length, copy the
         # output at offset zero, and return the number of bytes copied.
         with memoryview(buffer) as view:
             if view.readonly:
                 raise TypeError("readinto() argument must be read-write bytes-like object")
             target = view.cast("B")
-            output = self.read(target.nbytes)
+            output = self._read_from_buffer(target.nbytes)
             target[:len(output)] = output
             return len(output)
 
+    def readinto(self, buffer):
+        return self._readinto_from_buffer(buffer)
+
     def readinto1(self, buffer):
-        return self.readinto(buffer)
+        return self._readinto_from_buffer(buffer)
 
     def readline(self, size=-1):
         self._check_closed()
