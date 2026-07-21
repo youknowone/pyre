@@ -92,3 +92,30 @@ b = BadRepr()
 d = deque([1, b, 2])
 b.d = d
 repr(d)
+
+
+# Dict subclasses keep their mapping payload independently of an instance
+# __dict__.  defaultdict follows PyPy's slotted layout and exposes the
+# default_factory member descriptor on the class (dataclasses.asdict relies on
+# that class-level probe).
+from collections import defaultdict
+
+
+defaults = defaultdict(list)
+defaults["items"].append(12)
+assert defaults["items"] == [12]
+assert hasattr(defaultdict, "default_factory")
+assert not hasattr(defaults, "__dict__")
+assert defaults.copy().default_factory is list
+
+
+class SlottedDict(dict):
+    __slots__ = ("marker",)
+
+
+slotted = SlottedDict()
+slotted.marker = 3
+slotted["key"] = "value"
+assert slotted == {"key": "value"}
+assert slotted.marker == 3
+assert not hasattr(slotted, "__dict__")

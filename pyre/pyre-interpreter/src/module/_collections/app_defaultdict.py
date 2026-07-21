@@ -15,20 +15,18 @@ mirrors ``_collectionsmodule.c``'s ``defaultdict``:
 * ``copy``/``__copy__``, ``__or__``/``__ror__`` and ``__repr__`` preserve the
   exact type and the factory.
 
-Two deliberate departures from ``_collectionsmodule.c``, both forced by pyre
-storing a dict subclass's items in an instance attribute (which precludes
-``__slots__`` on the subclass, the device PyPy and CPython use to keep the
-factory off the instance dict):
-
-* the factory is held in the ordinary instance dict rather than a slot, so a
-  ``defaultdict`` instance carries a ``__dict__``;
-* ``__missing__`` is written here rather than at interp-level (PyPy keeps it
-  interp-level only for thread atomicity; the behaviour is identical).
+As in PyPy's ``app_defaultdict.defaultdict``, ``default_factory`` is a real
+slot on the class.  Besides avoiding a per-instance ``__dict__``, the class
+descriptor is observable: stdlib users such as ``dataclasses.asdict`` detect
+defaultdict subclasses with ``hasattr(type(obj), 'default_factory')``.
+``__missing__`` remains app-level here; PyPy keeps it interp-level only for
+thread atomicity and the observable behaviour is otherwise identical.
 """
 
 
 class defaultdict(dict):
     __module__ = 'collections'
+    __slots__ = ['default_factory']
 
     def __init__(self, *args, **kwds):
         if args:

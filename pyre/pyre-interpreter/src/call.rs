@@ -4223,6 +4223,46 @@ pub unsafe fn create_all_slots(
             wantweakref = true;
         }
 
+        // PyPy dict subclasses are W_DictMultiObject instances, so their
+        // mapping payload is an intrinsic field independent of whether the
+        // Python class requests an instance __dict__.  Pyre composes that
+        // payload as `__dict_data__`; reserve it as an inherited layout slot
+        // rather than an ordinary mapdict attribute.  Otherwise a slotted
+        // dict subclass (PyPy's defaultdict shape) has nowhere to store its
+        // mapping and dict operations recurse through the missing backing.
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        let is_dict_subclass = !dict_type.is_null()
+            && !std::ptr::eq(w_type, dict_type)
+            && crate::baseobjspace::issubtype_w(w_type, dict_type);
+        let mut inherited_dict_data = false;
+        let mut ancestor_layout = base_layout;
+        while !ancestor_layout.is_null() {
+            if (*ancestor_layout)
+                .newslotnames
+                .iter()
+                .any(|name| name == "__dict_data__")
+            {
+                inherited_dict_data = true;
+                break;
+            }
+            ancestor_layout = (*ancestor_layout).base_layout;
+        }
+        if is_dict_subclass
+            && !inherited_dict_data
+            && !newslotnames.iter().any(|name| name == "__dict_data__")
+        {
+            let slot_index = base_nslots + newslotnames.len() as u32;
+            if crate::type_dict_has_storage(w_type) {
+                let member = pyre_object::w_member_new(
+                    slot_index,
+                    "__dict_data__".to_string(),
+                    w_type,
+                );
+                crate::type_dict_store(w_type, "__dict_data__", member);
+            }
+            newslotnames.push("__dict_data__".to_string());
+        }
+
         // typeobject.py:1192-1195: create_dict_slot / create_weakref_slot
         if wantdict {
             create_dict_slot(w_type);
