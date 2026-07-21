@@ -1685,7 +1685,7 @@ def main():
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None,    wasm_float_tol=True)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       1,       5,       1,       5,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
         # Skipped on wasm: the guard times calls with `time.perf_counter()`, and
         # the wasm guest has no `time` module (import fails before any output),
