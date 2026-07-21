@@ -11886,10 +11886,6 @@ impl CodeWriter {
                         Instruction::DeleteFast { var_num } => {
                             if fbw_delete_fast_enabled() {
                                 let idx = var_num.get(op_arg).as_usize();
-                                if current_state.local_value_at(idx).is_none() {
-                                    emit_abort_permanent!(py_pc);
-                                    continue;
-                                }
                                 let local_slot = local_to_vable_slot(idx) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -16173,6 +16169,44 @@ def f(n):
             opnames.contains(&"abort_permanent"),
             "the undefined LOAD_FAST_CHECK must bail to the interpreter"
         );
+    }
+
+    #[test]
+    fn walker_conditional_delete_reads_unbound_union_from_frame() {
+        let source = "\
+def f():
+    i = 0
+    x = 0
+    while i < 100000:
+        if i < 50000:
+            x = i
+        else:
+            del x
+        i = i + 1
+    return i
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("conditional DELETE_FAST must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(opnames.contains(&"ptr_iszero"));
+        assert!(opnames.contains(&"raise"));
     }
 
     #[test]
