@@ -3098,6 +3098,42 @@ where
                     Some(Value::Float(f64::from_bits(concrete as u64))),
                 );
             }
+            // ── BC_ARRAYLEN_GC ──
+            //
+            // RPython parity: pyjitpl.py:754-763 `opimpl_arraylen_gc`
+            // (`execute_with_descr(rop.ARRAYLEN_GC, arraydescr, arraybox)`) and
+            // blackhole.py:1370 `bhimpl_arraylen_gc(cpu, r, d) -> i`.
+            //
+            // Encoding (`arraylen_gc/rd>i`): [array_reg u8][descr_idx u16][dst u8].
+            // Reads the GC array's length word at the descr's lendescr offset
+            // (`bh_arraylen_gc`: `sizeof(usize)` signed load), records
+            // `OpCode::ArraylenGc` so the optimizer can narrow the lenbound /
+            // virtualize, and stamps the result register with the concrete
+            // length.  Aborts (fail-loud) if the descr does not resolve to an
+            // array descr in the canonical pool.
+            jitcode::insns::BC_ARRAYLEN_GC => {
+                let (array_reg, descr_idx, dst) = {
+                    let frame = self.frames.current_mut();
+                    let array_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
+                    (array_reg, descr_idx, dst)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
+                // Concrete length via the lendescr (`bh_arraylen_gc`); `None`
+                // when the cpu is unwired or the descr lacks a lendescr, in
+                // which case the recorded op is left unstamped.
+                let concrete = ctx.arraylen_sanity_load(array_addr, &descr);
+                let reg_concrete = match &concrete {
+                    Some(majit_ir::Value::Int(n)) => Some(*n),
+                    _ => None,
+                };
+                let opref = ctx.opimpl_arraylen_gc(array_opref, descr, concrete);
+                self.set_int_reg(dst, Some(opref), reg_concrete);
+            }
             // ── BC_GETARRAYITEM_GC_I ──
             //
             // RPython parity: pyjitpl.py:1183-1199 `_opimpl_getarrayitem_gc_any`:

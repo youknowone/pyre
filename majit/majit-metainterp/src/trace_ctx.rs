@@ -3704,6 +3704,45 @@ impl TraceCtx {
         true
     }
 
+    /// pyjitpl.py:754-763 `opimpl_arraylen_gc(arraybox, arraydescr)`.
+    ///
+    /// ```text
+    ///  def opimpl_arraylen_gc(self, arraybox, arraydescr):
+    ///      lengthbox = self.metainterp.heapcache.arraylen(arraybox)
+    ///      if lengthbox is None:
+    ///          lengthbox = self.execute_with_descr(rop.ARRAYLEN_GC,
+    ///                                              arraydescr, arraybox)
+    ///          self.metainterp.heapcache.arraylen_now_known(arraybox, lengthbox)
+    ///      else:
+    ///          self.metainterp.staticdata.profiler.count_ops(
+    ///              rop.ARRAYLEN_GC, Counters.HEAPCACHED_OPS)
+    ///      return lengthbox
+    /// ```
+    ///
+    /// `concrete` is the runtime length the `execute_with_descr` box carries
+    /// (`arraylen_sanity_load`); `None` leaves the recorded OpRef unstamped
+    /// (the cpu is unwired or the descr lacks a lendescr).
+    pub fn opimpl_arraylen_gc(
+        &mut self,
+        array_opref: OpRef,
+        arraydescr: DescrRef,
+        concrete: Option<Value>,
+    ) -> OpRef {
+        if let Some(cached_len) = self.heap_cache().arraylen(array_opref) {
+            // pyjitpl.py:763 profiler.count_ops(rop.ARRAYLEN_GC, HEAPCACHED_OPS).
+            self.profiler()
+                .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
+            return cached_len;
+        }
+        let len = self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], arraydescr);
+        if let Some(v) = concrete {
+            self.set_opref_concrete(len, v);
+        }
+        // pyjitpl.py:761 heapcache.arraylen_now_known(arraybox, lengthbox).
+        self.heap_cache_mut().arraylen_now_known(array_opref, len);
+        len
+    }
+
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
     ///
     /// ```text
@@ -3780,17 +3819,11 @@ impl TraceCtx {
                 self.heapcache_getfield_now_known(vable_opref, f_index, op);
                 op
             };
-            // return self.opimpl_arraylen_gc(arraybox, adescr)
-            if let Some(cached_len) = self.heap_cache().arraylen(array_opref) {
-                // pyjitpl.py:763 profiler.count_ops(rop.ARRAYLEN_GC, HEAPCACHED_OPS).
-                self.profiler()
-                    .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                return cached_len;
-            }
-            let len = self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], adescr);
-            // pyjitpl.py:761 heapcache.arraylen_now_known(arraybox, lengthbox).
-            self.heap_cache_mut().arraylen_now_known(array_opref, len);
-            return len;
+            // return self.opimpl_arraylen_gc(arraybox, adescr) — the
+            // nonstandard-virtualizable fallback reads the length through the GC
+            // array; no runtime concrete to stamp here (the vable read supplies
+            // the length on the standard path below).
+            return self.opimpl_arraylen_gc(array_opref, adescr, None);
         }
         // arrayindex = vinfo.array_field_by_descrs[fdescr]
         // result = vinfo.get_array_length(virtualizable, arrayindex)
