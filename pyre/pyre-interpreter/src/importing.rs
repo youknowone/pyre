@@ -944,6 +944,26 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     Some(module)
 }
 
+/// The builtin-module half of `load_part`: build the module, bind it in
+/// `sys.modules`, then run its `startup` hook. `_imp.create_builtin` performs
+/// the same three steps a native `import` does, so the two entry points leave
+/// a builtin module in the same state.
+pub(crate) fn create_builtin_module(
+    name: &str,
+    execution_context: *const PyExecutionContext,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let Some(module) = load_builtin_module(name) else {
+        return Ok(None);
+    };
+    pyre_object::gc_roots::pin_root(module);
+    set_sys_module(name, pyre_object::gc_roots::shadow_stack_get(module_slot));
+    let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
+    startup_builtin_module(name, module, execution_context)?;
+    Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
+}
+
 fn startup_builtin_module(
     name: &str,
     module: PyObjectRef,
@@ -2394,10 +2414,16 @@ pub fn import_from(
     // via `space.getattr(w_module, '__file__')`, so a descriptor- or
     // `__getattr__`-supplied value and a non-module `from` target are honored;
     // a missing / None path takes the default.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pkgname_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_pkgname = match crate::baseobjspace::getattr_str(module, "__name__") {
         Ok(v) if unsafe { pyre_object::is_str(v) } => v,
         _ => pyre_object::w_str_new("<unknown module name>"),
     };
+    // The `__file__` lookup below can run a descriptor or `__getattr__` and so
+    // collect; the name string is young and movable, so pin it and read it
+    // back from the slot afterwards.
+    pyre_object::gc_roots::pin_root(w_pkgname);
     // pypy/module/imp/importing.py:460 get_path
     let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
         Ok(v) if unsafe { pyre_object::is_none(v) } => pyre_object::w_str_new("unknown location"),
@@ -2407,6 +2433,7 @@ pub fn import_from(
         }
         Err(e) => return Err(e),
     };
+    let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) };
     let pkgpath = crate::baseobjspace::utf8_w(w_pkgpath)?;
     let msg = format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})");

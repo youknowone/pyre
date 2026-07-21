@@ -127,7 +127,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if let Some(module) = crate::importing::get_sys_module(&name) {
                     return Ok(module);
                 }
-                crate::importing::load_builtin_module(&name).ok_or_else(|| {
+                crate::importing::create_builtin_module(
+                    &name,
+                    crate::call::getexecutioncontext(),
+                )?
+                .ok_or_else(|| {
                     crate::PyError::new(
                         crate::PyErrorKind::ImportError,
                         format!("no built-in module named {name}"),
