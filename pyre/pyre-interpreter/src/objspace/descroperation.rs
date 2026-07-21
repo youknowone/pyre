@@ -1753,7 +1753,11 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// raises); `None` when neither side overrides — or every override returned
 /// `NotImplemented` — so the caller falls through to the by-layout fast paths
 /// / identity tail.
-unsafe fn try_compare_override(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<PyResult> {
+unsafe fn try_compare_override(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+) -> Result<Option<PyObjectRef>, PyError> {
     let dunder = match op {
         CompareOp::Lt => "__lt__",
         CompareOp::Le => "__le__",
@@ -1766,7 +1770,7 @@ unsafe fn try_compare_override(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
     let a_ov = crate::baseobjspace::subclass_special_override(a, dunder);
     let b_ov = crate::baseobjspace::subclass_special_override(b, rdunder);
     if a_ov.is_none() && b_ov.is_none() {
-        return None;
+        return Ok(None);
     }
     // Python's "subclass reflected op takes priority": if `b`'s type is a
     // proper subclass of `a`'s type and `b` overrides the reflected op, run it
@@ -1783,14 +1787,13 @@ unsafe fn try_compare_override(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
     };
     for (ov, recv, other) in order {
         if let Some((method, w_type)) = ov {
-            match crate::baseobjspace::get_and_call_function(method, recv, w_type, &[other]) {
-                Ok(result) if !is_not_implemented(result) => return Some(Ok(result)),
-                Ok(_) => {}
-                Err(e) => return Some(Err(e)),
+            let result = crate::baseobjspace::get_and_call_function(method, recv, w_type, &[other])?;
+            if !is_not_implemented(result) {
+                return Ok(Some(result));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Map forward dunder to reverse dunder.
@@ -1827,13 +1830,16 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 /// PyPy: `ObjSpace.call_function(space.lookup(w_obj, dunder), w_obj)`
 /// The Python-level OperationError must propagate to the caller; use the
 /// Result-returning call path so PENDING_CALL_ERROR is consumed.
-unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
+unsafe fn try_instance_unaryop(
+    a: PyObjectRef,
+    dunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
     if is_instance(a) {
         if let Some(method) = lookup(a, dunder) {
-            return Some(crate::call::call_function_impl_result(method, &[a]));
+            return Ok(Some(crate::call::call_function_impl_result(method, &[a])?));
         }
     }
-    None
+    Ok(None)
 }
 
 /// True when `obj`'s type defines `dunder` in a class other than the
@@ -2015,13 +2021,20 @@ unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
 /// Call the overriding unary special on a numeric subclass operand before
 /// the Rust fast path.  Returns `None` when `a` is an exact builtin
 /// numeric or does not override `dunder`, so the caller falls through.
-unsafe fn try_numeric_unaryop_override(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
+unsafe fn try_numeric_unaryop_override(
+    a: PyObjectRef,
+    dunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
     if !needs_numeric_unaryop_dispatch(a, dunder) {
-        return None;
+        return Ok(None);
     }
-    let t = crate::typedef::r#type(a)?;
-    let method = lookup_in_type_where(t, dunder)?;
-    Some(crate::call::call_function_impl_result(method, &[a]))
+    let Some(t) = crate::typedef::r#type(a) else {
+        return Ok(None);
+    };
+    let Some(method) = lookup_in_type_where(t, dunder) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
 }
 
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -3335,8 +3348,8 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // non-overriding subclasses fall through to the by-layout comparison slot,
     // which gives the inherited builtin comparison.
     unsafe {
-        if let Some(result) = try_compare_override(a, b, op) {
-            return result;
+        if let Some(result) = try_compare_override(a, b, op)? {
+            return Ok(result);
         }
     }
     compare_slot(a, b, op)
@@ -3698,8 +3711,8 @@ impl CompareOp {
 
 pub fn pos(a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, "__pos__") {
-            return result;
+        if let Some(result) = try_numeric_unaryop_override(a, "__pos__")? {
+            return Ok(result);
         }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(int_value(a)));
@@ -3714,8 +3727,8 @@ pub fn pos(a: PyObjectRef) -> PyResult {
             let (ar, ai) = complex_val(a).unwrap();
             return Ok(w_complex_new(ar, ai));
         }
-        if let Some(result) = try_instance_unaryop(a, "__pos__") {
-            return result;
+        if let Some(result) = try_instance_unaryop(a, "__pos__")? {
+            return Ok(result);
         }
         if a.is_null() {
             return Err(PyError::type_error(
@@ -3733,8 +3746,8 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 
 pub fn neg(a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, "__neg__") {
-            return result;
+        if let Some(result) = try_numeric_unaryop_override(a, "__neg__")? {
+            return Ok(result);
         }
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
@@ -3753,8 +3766,8 @@ pub fn neg(a: PyObjectRef) -> PyResult {
             return complex_neg(a);
         }
         // Instance __neg__
-        if let Some(result) = try_instance_unaryop(a, "__neg__") {
-            return result;
+        if let Some(result) = try_instance_unaryop(a, "__neg__")? {
+            return Ok(result);
         }
         if a.is_null() {
             return Err(PyError::type_error(
@@ -3772,8 +3785,8 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 
 pub fn invert(a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, "__invert__") {
-            return result;
+        if let Some(result) = try_numeric_unaryop_override(a, "__invert__")? {
+            return Ok(result);
         }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(!int_value(a)));
@@ -3781,8 +3794,8 @@ pub fn invert(a: PyObjectRef) -> PyResult {
         if is_long(a) {
             return Ok(bigint_result(bigint_invert(w_long_get_value(a).clone())));
         }
-        if let Some(result) = try_instance_unaryop(a, "__invert__") {
-            return result;
+        if let Some(result) = try_instance_unaryop(a, "__invert__")? {
+            return Ok(result);
         }
         Err(PyError::type_error(format!(
             "unsupported operand type for unary ~: '{}'",
