@@ -87,6 +87,11 @@ struct Host {
     /// executed this run. Per-store (not a global static): the increment sites
     /// already hold the `Caller<Host>`, and the runner is single-threaded.
     jit_compile_count: u64,
+    /// `PYRE_WASM_JIT_STATS` diagnostic: total wall time spent inside
+    /// `Module::new` (wasmtime Cranelift-compiling guest-emitted trace
+    /// modules), in nanoseconds. Isolates host-compile latency — the warmup
+    /// tax — from steady-state execution.
+    jit_compile_time_ns: u128,
     jit_execute_count: u64,
     /// Diagnostic: per-op residual-call host crossings (`env.jit_call`
     /// trampoline invocations). Compare against `jit_execute_count` to test
@@ -102,6 +107,8 @@ struct Host {
 }
 
 fn main() {
+    let t0_main = std::time::Instant::now();
+    let startup_trace = std::env::var_os("PYRE_WASM_STARTUP_TRACE").is_some();
     let mut module_path: Option<PathBuf> = None;
     let mut script: Option<PathBuf> = None;
     let mut inspect = false;
@@ -174,7 +181,15 @@ fn main() {
         .expect("spawn worker thread");
 
     match worker.join() {
-        Ok(Ok(code)) => std::process::exit(code),
+        Ok(Ok(code)) => {
+            if startup_trace {
+                eprintln!(
+                    "[startup] TOTAL(main-entry..worker-joined) {:.1}ms",
+                    t0_main.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            std::process::exit(code)
+        }
         Ok(Err(e)) => fatal(&e),
         Err(_) => fatal("worker thread panicked"),
     }
@@ -224,9 +239,23 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     if guest_profile_out.is_some() {
         config.epoch_interruption(true);
     }
+    // Diagnostic: PYRE_WASM_STARTUP_TRACE=1 prints a fixed-startup breakdown
+    // (module load/deserialize, main-module instantiate, guest bootstrap+run)
+    // so the warmup tax can be attributed to host module-load vs guest
+    // interpreter bootstrap.
+    let startup_trace = std::env::var_os("PYRE_WASM_STARTUP_TRACE").is_some();
+    let mut startup_mark = std::time::Instant::now();
+    let mut startup_lap = |label: &str| {
+        if startup_trace {
+            eprintln!("[startup] {label} {:.1}ms", startup_mark.elapsed().as_secs_f64() * 1e3);
+            startup_mark = std::time::Instant::now();
+        }
+    };
     let engine = Engine::new(&config)?;
+    startup_lap("engine_new");
 
     let module = load_main_module(&engine, module_path)?;
+    startup_lap("load_module");
 
     let mut store = Store::new(&engine, Host::default());
     if guest_profile_out.is_some() {
@@ -263,6 +292,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let instance = linker
         .instantiate(&mut store, &module)
         .context("instantiate main module")?;
+    startup_lap("instantiate");
 
     let memory = instance
         .get_memory(&mut store, "memory")
@@ -309,6 +339,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     // livelock): the JIT counters are populated at compile time, before the run
     // finishes, and the diag exports just read statics that survive a trap.
     let run_result = run_python.call(&mut store, (in_ptr, len));
+    startup_lap("run_python(bootstrap+script)");
     // After a fuel-exhaustion trap the store has no fuel, so the diagnostic
     // export calls below would themselves immediately trap and read as 0.
     // Refill so the readout reflects the real (compile-time) counter values.
@@ -442,9 +473,10 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             .ok();
         let host = store.data();
         eprintln!(
-            "[jit-stats] compiles={} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
+            "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
+            host.jit_compile_time_ns as f64 / 1.0e6,
             guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
             lin_mem,
@@ -515,6 +547,18 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     use std::io::Write;
     std::io::stdout().write_all(&out)?;
     std::io::stdout().flush()?;
+    startup_lap("dealloc+stdout");
+    // Exit without running the wasmtime `Store`/`Module`/`Engine` destructors.
+    // Dropping them frees ~40MB of mapped code + linear memory that the OS
+    // reclaims on process exit anyway; on a short run that teardown is ~0.2s —
+    // the dominant fixed startup tax, larger than the module load and far
+    // larger than trace compilation. stdout is already flushed above and the
+    // diagnostic stats print to (unbuffered) stderr, so nothing is lost.
+    // `PYRE_WASM_FULL_TEARDOWN=1` restores the drops for leak diagnostics.
+    if std::env::var_os("PYRE_WASM_FULL_TEARDOWN").is_none() {
+        std::io::stderr().flush().ok();
+        std::process::exit(0);
+    }
     Ok(0)
 }
 
@@ -790,7 +834,10 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
             Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
         }
     }
-    let module = match Module::new(&engine, &bytes) {
+    let compile_start = std::time::Instant::now();
+    let module_result = Module::new(&engine, &bytes);
+    caller.data_mut().jit_compile_time_ns += compile_start.elapsed().as_nanos();
+    let module = match module_result {
         Ok(m) => m,
         Err(e) => {
             if std::env::var_os("PYRE_WASM_DUMP_BAD_TRACE").is_some() {
