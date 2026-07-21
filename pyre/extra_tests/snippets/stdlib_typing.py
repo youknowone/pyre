@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Callable
-from typing import Protocol, TypeVar
+from typing import ClassVar, Protocol, TypeVar
 
 T = TypeVar("T")
 
@@ -92,3 +92,16 @@ deferred_init_annotations = annotationlib.get_annotations(
 assert isinstance(deferred_init_annotations["value"], annotationlib.ForwardRef)
 assert deferred_init_annotations["value"].__forward_arg__ == "DeferredValue"
 assert DeferredDataclass.__doc__ == "DeferredDataclass(value: DeferredValue)"
+
+
+# A compiler-generated class annotation thunk closes over the live class
+# namespace.  Names assigned before or after the annotation function is made
+# must remain visible through that one dictionary.
+class ClassLocalAnnotation:
+    LocalAlias = ClassVar[int]
+    value: LocalAlias
+
+
+assert ClassLocalAnnotation.__annotations__["value"] == ClassVar[int]
+assert object.__type_params__ == ()
+assert ClassLocalAnnotation.__type_params__ == ()

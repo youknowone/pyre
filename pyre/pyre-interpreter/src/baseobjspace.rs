@@ -5578,6 +5578,16 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             if name == "__annotations__" {
                 return type_get_annotations(obj);
             }
+            if name == "__type_params__" {
+                // CPython 3.14 type_get_type_params: PEP 695 parameters are
+                // owned by the class itself and every other type, including
+                // static `object`, exposes an empty tuple.  Do not inherit a
+                // base class's parameters through the MRO.
+                if let Some(value) = crate::type_dict_lookup(obj, "__type_params__") {
+                    return Ok(value);
+                }
+                return Ok(w_tuple_new(vec![]));
+            }
             // PEP 649: `__annotate__` and `__annotate_func__` are the
             // same slot. Bytecode stores it as `__annotate_func__` in the
             // class dict; user code reads it as `__annotate__`. Forward
