@@ -130,6 +130,17 @@ pub struct PyJitCodeMetadata {
     /// a floor lookup reproduces `depth_at_py_pc[vstack_containing_py_pc(jit_pc)]`
     /// for every jit_pc. Empty for skeleton / fixture metadata.
     pub depth_containing_by_jit_pc: Vec<(u32, u16)>,
+    /// Slice D (#73): exact-match STATIC-liveness depth twin of the block-head
+    /// marker resolution (`metadata_block_head_py_pc`). Keys mirror
+    /// `block_head_py_by_jit_pc` exactly (same marker offsets, same order); each
+    /// value is
+    /// `liveness_for(code).depth_at_py_pc().get(block_head_py).copied().unwrap_or(0)`
+    /// for that marker's py. EXACT binary search only (no predecessor, no
+    /// floor) — a miss means `start_pc` is not a block-head marker and the
+    /// consumer falls back to the floor twin, mirroring
+    /// `vstack_initial_py_pc`'s `metadata_block_head_py_pc(...).unwrap_or(floor)`.
+    /// Empty for skeleton / fixture metadata.
+    pub depth_block_head_by_jit_pc: Vec<(usize, u16)>,
     /// Reproduces `pcdep_color_slots[skip_python_trivia_forward(
     /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
     /// and predecessor-op-start tiers as the trivia-aware depth twin.
@@ -578,6 +589,19 @@ impl PyJitCode {
         !self.metadata.depth_containing_by_jit_pc.is_empty()
     }
 
+    /// Exact-match block-head marker STATIC-liveness depth keyed by a JitCode
+    /// byte offset via the `depth_block_head_by_jit_pc` twin.
+    /// Equals `liveness_for(code).depth_at_py_pc().get(metadata_block_head_py_pc(jit_pc) as usize).copied().unwrap_or(0)`
+    /// when `jit_pc` is a block-head marker offset; `None` when it is not (the
+    /// consumer then falls back to the floor twin) or the table is empty.
+    pub fn depth_block_head_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.depth_block_head_by_jit_pc;
+        table
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| table[i].1)
+    }
+
     /// The const operand-stack slots keyed by a JitCode byte offset via
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Returns the slots for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
@@ -878,6 +902,7 @@ impl PyJitCode {
                 depth_trivia_marker_by_jit_pc: Vec::new(),
                 depth_trivia_pred_by_jit_pc: Vec::new(),
                 depth_containing_by_jit_pc: Vec::new(),
+                depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),

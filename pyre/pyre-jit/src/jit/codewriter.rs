@@ -13514,6 +13514,21 @@ impl CodeWriter {
                 .collect()
         };
 
+        // Exact-match depth twin of the block-head marker resolution
+        // (`metadata_block_head_py_pc`). Same keys as
+        // `block_head_py_by_jit_pc`, values from the SAME static liveness the
+        // floor twin reads, so an exact lookup reproduces
+        // `depth_at_py_pc[metadata_block_head_py_pc(jit_pc)]` at seam #7's
+        // permuted FOR_ITER-entry arm. Empty when the code has no block heads.
+        let depth_block_head_by_jit_pc: Vec<(usize, u16)> = {
+            let static_depth =
+                pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
+            block_head_py_by_jit_pc
+                .iter()
+                .map(|&(off, py)| (off, static_depth.get(py as usize).copied().unwrap_or(0)))
+                .collect()
+        };
+
         // Sparse carry-forward sidecar: capture ONLY the py_pcs whose
         // dense marker the on-demand `derive_resume_marker` derivation cannot
         // reproduce from `first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`.
@@ -13845,6 +13860,7 @@ impl CodeWriter {
             depth_trivia_marker_by_jit_pc,
             depth_trivia_pred_by_jit_pc,
             depth_containing_by_jit_pc,
+            depth_block_head_by_jit_pc,
             pcdep_trivia_marker_by_jit_pc,
             pcdep_trivia_pred_by_jit_pc,
             const_ref_trivia_marker_by_jit_pc,

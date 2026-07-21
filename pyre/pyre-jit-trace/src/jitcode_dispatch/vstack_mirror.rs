@@ -645,11 +645,35 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
                 return;
             }
             let py_pc = vstack_step_py_pc(&jc.payload.metadata, jit_pc, ctx.vstack_cur_pypc);
-            let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
-                .depth_at_py_pc()
-                .get(py_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize;
+            // The depth is consumed only when the walk crosses a Python-opcode
+            // boundary (`py_pc != ctx.vstack_cur_pypc`; see the early-return
+            // below). On the block-head-marker branch `vstack_step_py_pc`
+            // returns `current_py_pc` and the value is dead; whenever it is
+            // live, `py_pc` is the floor segment py, so the floor twin
+            // reproduces the raw read.
+            let raw_depth = || {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize
+            };
+            let depth = if jc.payload.depth_containing_populated() {
+                let twin = jc
+                    .payload
+                    .depth_containing_for_jitcode_pc(jit_pc)
+                    .unwrap_or(0) as usize;
+                if pcmap_containing_audit_enabled() && py_pc != ctx.vstack_cur_pypc {
+                    assert_eq!(
+                        twin,
+                        raw_depth(),
+                        "PYRE_PCMAP_CONTAINING_AUDIT: vstack-step depth twin diverged (jit_pc {jit_pc}, py {py_pc})"
+                    );
+                }
+                twin
+            } else {
+                raw_depth()
+            };
             (py_pc, jc.payload.code_ptr, depth)
         }
     };
@@ -729,16 +753,44 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
                     pyre_interpreter::bytecode::Instruction::ForIter { .. }
                 )
             });
-        let first_pypc = vstack_initial_py_pc(
-            &jc.payload.metadata,
-            start_pc,
-            predecessor_permuted_stack && target_is_for_iter,
-        );
-        let d = crate::liveness::liveness_for(jc.payload.code_ptr)
-            .depth_at_py_pc()
-            .get(first_pypc as usize)
-            .copied()
-            .unwrap_or(0) as usize;
+        let permuted = predecessor_permuted_stack && target_is_for_iter;
+        let first_pypc = vstack_initial_py_pc(&jc.payload.metadata, start_pc, permuted);
+        let raw_depth = || {
+            crate::liveness::liveness_for(jc.payload.code_ptr)
+                .depth_at_py_pc()
+                .get(first_pypc as usize)
+                .copied()
+                .unwrap_or(0) as usize
+        };
+        let d = if jc.payload.depth_containing_populated() {
+            // Mirror `vstack_initial_py_pc`'s branch: the exact block-head
+            // marker depth for a permuted FOR_ITER entry (falling back to the
+            // floor when `start_pc` is not a marker), else the floor segment
+            // depth for a normal entry.
+            let twin = if permuted {
+                jc.payload
+                    .depth_block_head_for_jitcode_pc(start_pc)
+                    .unwrap_or_else(|| {
+                        jc.payload
+                            .depth_containing_for_jitcode_pc(start_pc)
+                            .unwrap_or(0)
+                    })
+            } else {
+                jc.payload
+                    .depth_containing_for_jitcode_pc(start_pc)
+                    .unwrap_or(0)
+            } as usize;
+            if pcmap_containing_audit_enabled() {
+                assert_eq!(
+                    twin,
+                    raw_depth(),
+                    "PYRE_PCMAP_CONTAINING_AUDIT: vstack-initial depth twin diverged (start_pc {start_pc}, py {first_pypc})"
+                );
+            }
+            twin
+        } else {
+            raw_depth()
+        };
         (first_pypc, d, sym.nlocals())
     };
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
