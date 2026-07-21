@@ -3320,6 +3320,19 @@ unsafe fn orthodox_list_append_recognize(
 pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(SubJitCodeBody, *const Sym)> {
+    // The sub-walk resolves `w_list_append`'s `d`/`j` operands through the
+    // build-time global descr pool, whose field offsets assume 8-byte pointers
+    // (`build_descr_layout_matches_target`).  On a 32-bit target they name the
+    // wrong bytes, so the body's `is_plain_int1` subclass test folds on
+    // garbage, the walk descends the dead `switch_to_object_strategy` leg and
+    // concretely executes its residuals against the live list before declining
+    // at the leg's un-lowered `ListStrategy::Object` ctor.  That abort leaves an
+    // unrollbackable body effect, which makes `fbw_foriter_inflight_take` refuse
+    // delivery and drop the in-flight FOR_ITER iteration.  Decline here instead,
+    // before any IR or side effect: the generic residual append handles the call.
+    if !crate::jitcode_runtime::build_descr_layout_matches_target() {
+        return None;
+    }
     let jc_arc = crate::jitcode_runtime::list_append_jitcode()?;
     let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
