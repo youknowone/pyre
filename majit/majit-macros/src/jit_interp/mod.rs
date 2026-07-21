@@ -2155,6 +2155,19 @@ fn rewrite_body(
                                     // loop is entered later via can_enter_jit /
                                     // warmstate, not by immediate direct entry.
                                     #driver.discard_single_pass_resume();
+                                    // A terminal dispatch return (Finish) means
+                                    // the interpreted function has returned:
+                                    // exit the native dispatch loop and run its
+                                    // own post-loop return exactly once. Resuming
+                                    // at the captured pc instead would re-enter
+                                    // the loop body when the terminal opcode is
+                                    // mid-program (its post-advance pc lands
+                                    // before the program end). A CloseLoop
+                                    // back-edge keeps interpreting from the
+                                    // merge-point pc.
+                                    if #driver.take_single_pass_finish() {
+                                        break;
+                                    }
                                     #pc = __sp_pc;
                                     continue;
                                 }

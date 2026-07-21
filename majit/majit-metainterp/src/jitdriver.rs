@@ -1443,6 +1443,21 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
+    /// Whether the just-published single-pass outcome came from a terminal
+    /// dispatch return (`TraceAction::Finish`) rather than a `CloseLoop`
+    /// back-edge. A CloseLoop resumes the native loop at the merge-point green
+    /// pc and keeps interpreting; a Finish means the interpreted function has
+    /// returned, so the native dispatch loop must EXIT and run its own
+    /// post-loop return once. The walk-final pc captured for a Finish is the
+    /// interpreter pc past the terminal opcode, which only lands past the
+    /// program end (making `while pc < size` exit) when the terminal is the
+    /// last opcode — a mid-program terminal would otherwise re-enter the loop.
+    /// The macro reads this to `break` instead of resuming at that pc.
+    /// Consumes (`take`s) the flag.
+    pub fn take_single_pass_finish(&mut self) -> bool {
+        std::mem::replace(&mut self.meta.single_pass_finish, false)
+    }
+
     /// Push the walk's scalar state fields into native `state`. The walk
     /// advances a scalar (notably a SEL's new `selected`) on the sym only;
     /// native `state` stays at its trace-start value until this write-back.
@@ -2451,12 +2466,20 @@ impl<S: JitState> JitDriver<S> {
                 exit_with_exception,
             } => {
                 // A terminal dispatch return is also a valid single-pass
-                // handoff. The JitCode machine captured i0 after the matched
-                // arm advanced it, so native execution resumes at the source
-                // loop exit and performs the post-loop work exactly once.
+                // handoff: the interpreted function has returned, so native
+                // execution must EXIT the dispatch loop and run its own
+                // post-loop work exactly once. The scalar/virt-array write-back
+                // still applies (post-loop reads the walk-final state), but the
+                // `single_pass_finish` flag tells the macro to `break` rather
+                // than resume at the captured pc. The captured pc (i0, past the
+                // terminal opcode) only lands past the program end — where
+                // `while pc < size` would exit on resume — when the terminal is
+                // the last opcode; a mid-program terminal would re-enter the
+                // loop body, so the exit is signalled explicitly.
                 let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                 if let Some(p) = pc {
                     self.meta.single_pass_outcome = Some((p, Vec::new()));
+                    self.meta.single_pass_finish = true;
                 }
                 if let Some(sym) = self.sym.as_ref() {
                     let scalars = S::collect_scalar_state_field_values(sym);
