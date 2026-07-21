@@ -5619,6 +5619,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         let raw_arg: u32 = op_arg.into();
         let delta = instruction.stack_effect(raw_arg);
         if delta > 0 {
+            // `frame` is a shared reborrow used only in this block's reads and
+            // the `if` condition below; its last use ends before the `&mut *f`
+            // reborrow in the taken branch, so the two never alias. Keep any
+            // future `frame` use above that write — the raw pointer means the
+            // borrow checker will not catch an overlap introduced here.
             let frame = unsafe { &*f };
             let pushed_top = frame.valuestackdepth.saturating_add(delta as usize);
             let next_pc = opcode_pc + 1;
