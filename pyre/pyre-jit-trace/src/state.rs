@@ -3983,8 +3983,8 @@ fn flush_walk_end_state_to_frame_inner(
 /// concrete effect, the outer frame is flushed as of the CALL that
 /// entered the callee: the locals/cells region from the vable shadow (exactly
 /// like [`flush_walk_end_state_to_frame`]), the operand-stack region rebuilt
-/// from the concrete `call_stack` (`[callable, null_or_self, args...]` the
-/// walker holds), `valuestackdepth` set to cover both, and
+/// from the concrete `call_stack` (any kept prefix followed by
+/// `[callable, null_or_self, args...]`), `valuestackdepth` set to cover both, and
 /// `last_instr = call_py_pc - 1` so `next_instr()` re-executes the CALL in the
 /// interpreter — running the callee from scratch.  Everything the walk applied
 /// BEFORE the CALL stands (the caller commits the store journals), so the

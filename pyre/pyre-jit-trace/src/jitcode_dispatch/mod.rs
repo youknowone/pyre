@@ -1803,7 +1803,11 @@ pub fn walk<Sym: WalkSym>(
                 if let Some(target) = try_catch_exception_at(code, pc) {
                     ctx.last_exc_value = Some(exc);
                     ctx.last_exc_value_concrete = exc_concrete;
-                    ctx.fbw_mode.class_of_last_exc_is_const = true;
+                    // pyjitpl.py:2530-2558 `finishframe_exception` only
+                    // unwinds frames and selects the handler.  The shared
+                    // MetaInterp exception-class state was established by
+                    // `execute_ll_raised` / `handle_possible_exception` or
+                    // `opimpl_raise` and must survive the frame transition.
                     // The exception is now caught by this frame's handler, so
                     // drain the standing residual-call exception flag the
                     // raising helper published (`try_execute_residual_call_via_

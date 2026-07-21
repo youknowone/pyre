@@ -1157,9 +1157,24 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
     let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
-    let mut stack = Vec::with_capacity(fresh.len());
     if fresh.is_empty() {
         return None;
+    }
+    // The encoded residual args describe only the CALL operands.  Values can
+    // remain below them on the Python operand stack (notably the iterator of
+    // an enclosing FOR_ITER).  RPython resumes the complete MIFrame stack, so
+    // retain that prefix from the authoritative vstack mirror.
+    let prefix_len = if ctx.vstack_valid {
+        ctx.vstack_boxes.len().checked_sub(fresh.len())?
+    } else {
+        0
+    };
+    let mut stack = Vec::with_capacity(prefix_len + fresh.len());
+    for &value in &ctx.vstack_boxes[..prefix_len] {
+        match concrete_from_recorded_opref(ctx, value) {
+            ConcreteValue::Ref(r) if !r.is_null() => stack.push(r),
+            _ => return None,
+        }
     }
     for c in fresh {
         match c {
@@ -1994,7 +2009,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ctx.outer_resume_marker_jit_pc,
         )
     };
-    let callee_outcome = {
+    let (callee_outcome, callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
             // Path-1: resolve scalar static-field reads off this callee's own
@@ -2250,8 +2265,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 }
             }
         }
-        result
+        let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
+        (result, class_of_last_exc_is_const)
     };
+    // RPython has one MetaInterp shared by every MIFrame.  The sub-walk uses
+    // a copied FbwWalkMode only to satisfy Rust's nested borrow, so write the
+    // MetaInterp-owned exception state back across the frame boundary.
+    ctx.fbw_mode.class_of_last_exc_is_const = callee_class_of_last_exc_is_const;
     let (outcome, _end_pc) = match callee_outcome {
         Ok(v) => v,
         Err(e) => {
@@ -2342,7 +2362,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
                 ctx.last_exc_value_concrete = exc_concrete;
-                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
                 Ok(Some((
@@ -2958,7 +2977,7 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
         callee_concrete_r[i] = *concrete;
     }
 
-    let (callee_outcome, _callee_end_pc) = {
+    let ((callee_outcome, _callee_end_pc), callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
             callee_shadow: None,
             inline_callee_consts: None,
@@ -3002,8 +3021,16 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
             }
         }
-        walk(sub_body.code, 0, &mut sub_wc)?
+        let (outcome, end_pc) = walk(sub_body.code, 0, &mut sub_wc)?;
+        (
+            (outcome, end_pc),
+            sub_wc.fbw_mode.class_of_last_exc_is_const,
+        )
     };
+    // `MetaInterp.class_of_last_exc_is_const` is shared across the RPython
+    // framestack.  Preserve the callee's final state when leaving this Rust
+    // sub-context instead of manufacturing a new value at the caller catch.
+    ctx.fbw_mode.class_of_last_exc_is_const = callee_class_of_last_exc_is_const;
     Ok(callee_outcome)
 }
 
@@ -3100,7 +3127,6 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
-                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -3243,7 +3269,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
-                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
@@ -3398,7 +3423,6 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
-                ctx.fbw_mode.class_of_last_exc_is_const = true;
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
                 // downstream `raise/r` / `reraise/` in the caller's
