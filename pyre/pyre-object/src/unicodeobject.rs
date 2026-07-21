@@ -181,10 +181,12 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     if raw.is_null() {
-        // Hook vanished after the value box: `value` is a GC box that only a
-        // GC-managed header can keep alive, so recover the bytes and rebuild a
-        // fully immortal string rather than pair it with a `malloc_typed` header.
-        let recovered = unsafe { *Box::from_raw(value) };
+        // Header alloc failed after the value box: rebuild a fully immortal
+        // string rather than pair a `malloc_typed` header with a GC value box it
+        // cannot grey. `gc_alloc_storage_box` may have returned a GC-owned
+        // pointer (its doc forbids `Box::from_raw` on that — the sweep reclaims
+        // it), so copy the bytes out and abandon the box instead of freeing it.
+        let recovered = unsafe { (*value).clone() };
         return w_str_from_wtf8_immortal(recovered);
     }
     crate::gc_interp::note_alloc();

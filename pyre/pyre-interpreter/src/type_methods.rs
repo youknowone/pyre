@@ -2247,11 +2247,13 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 crate::display::py_str_wtf8(args[0])?
             }));
         }
-        return Ok(pyre_object::w_str_new_managed(&unsafe { crate::py_str(args[0])? }));
+        return Ok(pyre_object::w_str_new_managed(&unsafe {
+            crate::py_str(args[0])?
+        }));
     }
-    Ok(pyre_object::w_str_from_wtf8_managed(format_with_spec_public(
-        args[0], &spec,
-    )?))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        format_with_spec_public(args[0], &spec)?,
+    ))
 }
 
 fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
