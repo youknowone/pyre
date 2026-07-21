@@ -1854,8 +1854,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // `PyDict_Check` accepts dict subclasses (annotationlib hands a
     // `_StringifierDict`); resolve the backing storage rather than
     // demanding an exact `dict`.
-    let w_globals_backing = crate::type_methods::resolve_dict_backing(w_globals);
-    if w_globals_backing.is_null() {
+    if crate::type_methods::resolve_dict_backing(w_globals).is_null() {
         return Err(crate::PyError::type_error(
             "function() argument 'globals' must be dict, not ...",
         ));
@@ -1875,15 +1874,12 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     } else {
         w_closure
     };
-    // Normalise a dict-subclass globals to its backing `W_DictObject`
-    // (the call-path frame builder reads the storage proxy off the
-    // `__globals__` object directly; a subclass instance carries no proxy
-    // and would fault — same normalisation the exec/eval `createframe_obj`
-    // path applies).  `__missing__`-based forward references are not
-    // surfaced through the backing, but defined-name annotations resolve.
     // `function.py:57 self.w_func_globals = w_globals` stores the dict
-    // object as the function's sole globals carrier.
-    let func = function_new_with_closure(w_code as *const (), name, w_globals_backing, closure);
+    // object itself as the function's sole globals carrier.  Preserving a
+    // dict subclass here is observable: annotationlib's `_StringifierDict`
+    // supplies unresolved names through `__missing__` when it clones a PEP
+    // 649 annotate function with `types.FunctionType`.
+    let func = function_new_with_closure(w_code as *const (), name, w_globals, closure);
     let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
     unsafe { function_set_qualname(func, qualname) };
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {

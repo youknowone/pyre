@@ -1868,8 +1868,19 @@ impl NamespaceOpcodeHandler for PyFrame {
     ) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
         if !w_globals.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
+            // A real W_DictObject / W_ModuleDictObject can use the borrowed
+            // string strategy path.  Dict subclasses are ordinary instance
+            // objects in pyre, however, and must retain their mapping object
+            // identity just as PyPy's `space.setitem_str(w_globals, ...)`
+            // does.  Casting such an instance to W_DictObject corrupts the
+            // layout and also skips an overridden `__setitem__`.
+            if unsafe { pyre_object::is_dict(w_globals) } {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
+                }
+            } else {
+                let key = unsafe { pyre_object::w_str_new(name) };
+                crate::baseobjspace::setitem(w_globals, key, value)?;
             }
         }
         Ok(())
@@ -1883,19 +1894,21 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// so `exec("x = len", {"__builtins__": {}})` raises `NameError`
     /// because the empty dict is the picked builtin.
     fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        // `pyframe.py:128-132 get_w_globals_storage` returns the W_DictObject
-        // directly; pyre's `w_globals` slot (eagerly resolved at
-        // frame construction per `pyframe.py:98 __init__`) carries
-        // that identity.  Route the primary lookup through the strategy
-        // dispatch (`dictmultiobject.py:111-112 setitem_str` /
-        // `:113-115 getitem_str`) so dict-subclass overrides resolve
-        // properly and the W_ModuleDictObject path consults its cell
-        // map directly instead of walking the back-mirror storage.
+        // `pyopcode.py:958-960 _load_global_fallback` uses
+        // `space.finditem_str(self.get_w_globals(), varname)`.  Keep the
+        // borrowed-string strategy fast path for real W_DictObject /
+        // W_ModuleDictObject layouts, but dispatch a dict subclass through
+        // the exact mapping object.  In pyre a dict subclass is represented
+        // by an instance plus `__dict_data__`; treating the instance as a
+        // W_DictObject both loses `__missing__` and reads an invalid layout.
         let w_globals = self.get_w_globals();
         if !w_globals.is_null() {
-            if let Some(value) =
+            let value = if unsafe { pyre_object::is_dict(w_globals) } {
                 unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
-            {
+            } else {
+                crate::baseobjspace::finditem_str(w_globals, name)?
+            };
+            if let Some(value) = value {
                 return Ok(value);
             }
         }

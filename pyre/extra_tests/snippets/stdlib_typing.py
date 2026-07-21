@@ -51,3 +51,24 @@ class CoordinateProtocol(Protocol):
 
 
 assert CoordinateProtocol.__protocol_attrs__ == {"x"}
+
+
+# types.FunctionType must retain a dict-subclass globals object.  CPython's
+# annotationlib clones PEP 649 annotation thunks this way and relies on
+# __missing__ to synthesize ForwardRef values for unresolved names.
+import types
+
+
+class StringifyingGlobals(dict):
+    def __missing__(self, key):
+        return f"missing:{key}"
+
+
+def resolve_from_globals():
+    return unresolved_annotation_name
+
+
+stringifying_globals = StringifyingGlobals(resolve_from_globals.__globals__)
+cloned_resolver = types.FunctionType(resolve_from_globals.__code__, stringifying_globals)
+assert cloned_resolver.__globals__ is stringifying_globals
+assert cloned_resolver() == "missing:unresolved_annotation_name"

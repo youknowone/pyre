@@ -3697,24 +3697,10 @@ pub fn createframe_obj(
     //   ...
     //   self.initialize_frame_scopes(outer_func, code)
     //
-    // Normalize a dict-subclass globals (`exec(src, G())`) to its inner
-    // `__dict_data__` dict.  The storage proxy that LOAD_GLOBAL reads lives
-    // on the `W_DictObject`, and downstream readers key off this object —
-    // `get_w_globals_storage`, MAKE_FUNCTION's `function.__globals__`, and the
-    // JIT inline / callee globals readers — so the frame must hold the
-    // `W_DictObject`, not the subclass instance whose layout has no proxy
-    // slot.  No-op for a plain dict / module dict (`resolve_dict_backing`
-    // returns the argument).
-    let w_globals = if w_globals.is_null() {
-        w_globals
-    } else {
-        let backing = crate::type_methods::resolve_dict_backing(w_globals);
-        if backing.is_null() {
-            w_globals
-        } else {
-            backing
-        }
-    };
+    // `pyframe.py:49 self.w_globals = w_globals`: preserve the exact object.
+    // This is observable for dict subclasses (notably annotationlib's
+    // `_StringifierDict`, whose `__missing__` creates ForwardRef values) and
+    // is the identity MAKE_FUNCTION must pass on to each callee frame.
     let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
     let code_ref = unsafe { &*raw };
     let num_locals = code_ref.varnames.len();

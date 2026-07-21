@@ -111,16 +111,24 @@ pub extern "C" fn jit_load_name_from_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    // `pyopcode.py:959 _load_global`: `space.finditem_str(get_w_globals_storage(),
-    // varname)`.  Dispatch through the dict strategy on the object
-    // (`dictmultiobject.py:113-115 getitem_str`) so module dicts
-    // (celldict cells) and plain dicts (exec/eval globals) are both
-    // handled directly. Mirrors the
-    // interpreter `load_global_value` (eval.rs).
+    // `pyopcode.py:959 _load_global`: `space.finditem_str(w_globals,
+    // varname)`.  Real dict layouts retain the borrowed-string strategy
+    // path; dict subclasses must dispatch through their exact mapping object
+    // so `__missing__` and observable globals identity survive tracing too.
     if !w_globals.is_null() {
-        if let Some(v) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
-        {
+        let lookup = if unsafe { pyre_object::is_dict(w_globals) } {
+            Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) })
+        } else {
+            crate::baseobjspace::finditem_str(w_globals, name)
+        };
+        let value = match lookup {
+            Ok(value) => value,
+            Err(mut error) => {
+                jit_publish_exception(error.to_exc_object());
+                return 0;
+            }
+        };
+        if let Some(v) = value {
             return v as i64;
         }
     }
@@ -172,12 +180,25 @@ pub extern "C" fn jit_store_name_to_namespace(
         return 0;
     };
     // `celldict.py:332 STORE_GLOBAL_cached` (jitted): `space.setitem_str(
-    // get_w_globals_storage(), varname, w_newvalue)`.  Strategy dispatch on the
-    // object (`dictmultiobject.py:111-112 setitem_str`) handles module
-    // dicts (cells) and plain dicts (exec/eval globals) uniformly.
+    // get_w_globals(), varname, w_newvalue)`.  As in the interpreter path,
+    // only actual dict layouts may use the raw strategy call; a dict subclass
+    // remains the receiver of generic mapping assignment.
     if !w_globals.is_null() {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value as PyObjectRef);
+        if unsafe { pyre_object::is_dict(w_globals) } {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    w_globals,
+                    name,
+                    value as PyObjectRef,
+                );
+            }
+        } else {
+            let key = unsafe { pyre_object::w_str_new(name) };
+            if let Err(mut error) =
+                crate::baseobjspace::setitem(w_globals, key, value as PyObjectRef)
+            {
+                jit_publish_exception(error.to_exc_object());
+            }
         }
     }
     0
