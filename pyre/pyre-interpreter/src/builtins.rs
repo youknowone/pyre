@@ -11420,7 +11420,7 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
 ///
 /// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
 /// components; an instance is asked for `__complex__` then `__float__`.
-fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
+pub(crate) fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_exact_type(obj, &COMPLEX_TYPE) {
