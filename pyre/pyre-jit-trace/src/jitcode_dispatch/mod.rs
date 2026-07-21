@@ -7654,6 +7654,38 @@ fn handle<Sym: WalkSym>(
         // The `cd>r` arm is the `c`-argcode form (inline signed-byte
         // length, USE_C_FORM): identical byte layout, length decoded
         // as ConstInt.
+        // RPython `pyjitpl.py opimpl_new_with_vtable` delegates straight to
+        // `execute_new_with_vtable`:
+        //
+        //   resbox = self.execute_and_record(rop.NEW_WITH_VTABLE, descr)
+        //   self.heapcache.new(resbox)
+        //   self.heapcache.class_now_known(resbox)
+        //   return resbox
+        //
+        // Operand layout `d>r`: 2B descr + 1B dst (`assembler.rs`
+        // `new_with_vtable` pushes the descr u16 then the result reg).
+        "new_with_vtable/d>r" => {
+            let descr = read_descr(code, op, 0, ctx)?;
+            // `class_now_known` takes the vtable address: pyre tracks the
+            // concrete class pointer where upstream only raises HF_KNOWN_CLASS.
+            let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
+            let resbox = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::NewWithVtable, &[], descr);
+            ctx.trace_ctx.heap_cache_mut().new_object(resbox);
+            if let Some(class) = known_class {
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(resbox, class);
+            }
+            let dst = code[op.pc + 3] as usize;
+            // No recording-time concrete: the walk never allocated a real
+            // object, so readers of the result decline instead of consuming a
+            // stale value — the posture `new_array_clear` keeps whenever it
+            // cannot materialize a backing block.
+            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "new_array_clear/id>r" | "new_array_clear/cd>r" => {
             let length = if op.key == "new_array_clear/cd>r" {
                 OpRef::ConstInt(code[op.pc + 1] as i8 as i64)

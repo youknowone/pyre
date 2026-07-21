@@ -706,6 +706,84 @@ fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
 }
 
 #[test]
+fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
+    let nwv_byte = *insns_opname_to_byte()
+        .get("new_with_vtable/d>r")
+        .expect("new_with_vtable must be in the runtime instruction table");
+    let live_byte = *insns_opname_to_byte()
+        .get("live/")
+        .expect("live must be in the runtime instruction table");
+    // `d>r`: 2B descr index (0) + 1B dst register (0); live tail at 4.
+    let code = [nwv_byte, 0, 0, 0, live_byte, 0, 0];
+    let _ = test_outer_resume_jitcode_index();
+    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let mut tc = TraceCtx::for_test_types(&[]);
+    let mut regs_r = vec![OpRef::NONE];
+    let mut concrete_r = vec![ConcreteValue::Null];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut concrete_r,
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        is_full_body_walk: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("new_with_vtable must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    let dst = wc.registers_r[0];
+    drop(wc);
+
+    let ops = tc.ops();
+    assert_eq!(
+        ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+        vec![OpCode::NewWithVtable],
+    );
+    assert_eq!(
+        ops[0].num_args(),
+        0,
+        "execute_new_with_vtable records the descr alone, with no box operands"
+    );
+    assert_eq!(
+        dst,
+        ops[0].pos.get(),
+        "the `>r` decorator writes the allocation into the ref bank"
+    );
+    assert_eq!(next_pc, 4, "`d>r` consumes a 2B descr plus a 1B dst");
+}
+
+#[test]
 fn switch_id_hit_jumps_to_matching_target() {
     let switch_byte = *insns_opname_to_byte()
         .get("switch/id")
