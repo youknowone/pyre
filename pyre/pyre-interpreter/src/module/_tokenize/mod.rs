@@ -89,6 +89,18 @@ pub struct W_TokenizerIter {
     pending_empty_fstring_middle: Option<(u8, usize, usize, String)>,
 }
 
+/// Sweep-time cleanup for a GC-reclaimed `W_TokenizerIter`: run its Drop glue
+/// so the owned Rust heap (source `String`, token / error `Vec`s, the line
+/// table) is freed instead of leaked. The only managed child, `readline`, is a
+/// raw `PyObjectRef` (Copy), and `Token` / `ParseError` carry no GC pointers,
+/// so this touches no GC memory and is safe to run at sweep time.
+///
+/// # Safety
+/// `obj` must point to a valid, GC-dead `W_TokenizerIter`.
+pub unsafe fn w_tokenizer_iter_dealloc(obj: PyObjectRef) {
+    unsafe { std::ptr::drop_in_place(obj as *mut W_TokenizerIter) }
+}
+
 fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
     let (readline, encoding) = {
         let this = W_TokenizerIter::from_obj(self_obj)

@@ -806,6 +806,16 @@ impl TypeRegistry {
         id as u32
     }
 
+    /// Attach a sweep-time destructor to an already-registered type.
+    /// For `#[pyre_class]` types registered through the generic
+    /// `object_subclass_with_gc_ptrs` path (which sets no destructor) that
+    /// nonetheless own Rust heap needing drop glue when the collector
+    /// reclaims a dead instance. Reads back through `get(type_id).destructor`
+    /// in the sweep, so mutating the `entries` slot is sufficient.
+    pub fn set_destructor(&mut self, type_id: u32, destructor: DestructorFn) {
+        self.entries[type_id as usize].destructor = Some(destructor);
+    }
+
     /// `gctypelayout.encode_type_shapes_now` parity
     /// (gctypelayout.py:393-398): freezes the registry so subsequent
     /// `register_type` calls panic and assigns each `is_object`

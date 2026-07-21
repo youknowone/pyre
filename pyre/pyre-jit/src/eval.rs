@@ -526,6 +526,14 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
+/// Reclaim the owned Rust heap (source string, token / error vectors, line
+/// table) of a swept tokenizer iterator, which `register_pyre_class` registers
+/// through the generic no-destructor path.
+unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_interpreter::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
+}
+
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
@@ -2825,12 +2833,18 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_collections::W_DequeRevIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    register_pyre_class(
+    let tokenizer_iter_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_interpreter::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_TokenizerIter owns Rust heap (source string, token / error vectors, the
+    // line table); as an immortal it was never swept, but now that it is
+    // GC-managed the marker reclaims dead instances, so attach a destructor to
+    // run its Drop glue and free that heap instead of leaking it.
+    gc.types
+        .set_destructor(tokenizer_iter_tid, tokenizer_iter_destructor);
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical
