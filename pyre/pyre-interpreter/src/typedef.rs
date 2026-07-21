@@ -14604,9 +14604,9 @@ fn int_descr_invert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         )));
     }
     if unsafe { pyre_object::is_bool(w_self) } {
-        return Ok(w_int_new(
-            !unsafe { crate::objspace::descroperation::int_value(w_self) },
-        ));
+        return Ok(w_int_new(!unsafe {
+            crate::objspace::descroperation::int_value(w_self)
+        }));
     }
     crate::objspace::descroperation::invert(w_self)
 }
