@@ -2676,11 +2676,12 @@ impl MiniMarkGC {
         } else {
             None
         };
-        // incminimark.py:2361-2369 `minor_and_major_collection`: first finish
-        // the current major cycle, if any.  Objects promoted by the complete
-        // minor below must be considered by a fresh major snapshot, not folded
-        // into a marking cycle that started before they existed.
-        self.gc_step_until_scanning();
+        // incminimark.py:2361-2378 `minor_and_major_collection` /
+        // `gc_step_until`: first finish the current major cycle, if any, with
+        // a minor collection before every major step.  Besides discovering
+        // new roots, that minor forwards every nursery edge held by the
+        // in-progress marking state before the next gray object is consumed.
+        self.gc_step_until_scanning_with_minors();
 
         // Minor collection first to empty the nursery.
         // This is the `_minor_collection()` performed by upstream's
@@ -2690,10 +2691,7 @@ impl MiniMarkGC {
         if self.gc_state == GcState::Scanning {
             self.start_incremental_cycle();
         }
-        // incminimark.py:2366-2378 `gc_step_until(STATE_SCANNING)`: bounded
-        // state-machine steps are still looped to completion inside this one
-        // stop-the-world call.
-        self.gc_step_until_scanning();
+        self.gc_step_until_scanning_with_minors();
     }
 
     /// Reclaim dead old-gen objects WITHOUT moving the nursery.
@@ -2749,6 +2747,26 @@ impl MiniMarkGC {
 
     fn gc_step_until_scanning(&mut self) {
         while self.gc_state != GcState::Scanning {
+            self.major_collection_step();
+        }
+    }
+
+    /// incminimark.py:2375-2378 `gc_step_until`: explicit full collection
+    /// performs a minor before every major state-machine step.  The ordinary
+    /// non-moving oldgen entry deliberately uses [`gc_step_until_scanning`]
+    /// instead because its contract is to leave the nursery byte-for-byte in
+    /// place.
+    fn gc_step_until_scanning_with_minors(&mut self) {
+        while self.gc_state != GcState::Scanning {
+            // `do_collect_nursery` is pyre's public
+            // `minor_collection_with_major_progress`, whereas upstream calls
+            // the lower-level `_minor_collection` here and then advances one
+            // explicit step.  Suppress that wrapper's automatic progress so
+            // this remains the literal one-minor/one-major loop.
+            let was_enabled = self.enabled;
+            self.enabled = false;
+            self.do_collect_nursery();
+            self.enabled = was_enabled;
             self.major_collection_step();
         }
     }
@@ -6239,6 +6257,41 @@ mod tests {
 
         assert_eq!(gc.major_collections, major_before + 2);
         assert!(gc.oldgen.contains(rooted.0));
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn full_collection_forwards_nursery_references_held_by_gray_objects() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(16));
+
+        let holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe { *(holder.0 as *mut GcRef) = GcRef::NULL };
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert_eq!(gc.incr_state.gray_stack, vec![root.0]);
+
+        let young = gc.alloc_with_type(leaf_tid, 16);
+        unsafe {
+            *(young.0 as *mut u64) = 0xF011_C011_EC70;
+            *(root.0 as *mut GcRef) = young;
+        }
+
+        // incminimark.py `minor_and_major_collection` finishes the active
+        // cycle through `gc_step_until`, whose leading minor forwards this
+        // edge before the gray holder is consumed.
+        gc.do_collect_full();
+
+        let forwarded = unsafe { *(root.0 as *const GcRef) };
+        assert!(!gc.is_in_nursery(forwarded.0));
+        assert_eq!(unsafe { *(forwarded.0 as *const u64) }, 0xF011_C011_EC70);
+        assert!(gc.oldgen.contains(forwarded.0));
         gc.roots.clear();
     }
 
