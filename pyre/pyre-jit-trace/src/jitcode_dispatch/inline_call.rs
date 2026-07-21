@@ -927,11 +927,30 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
         let call_py_pc = python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
         let resume_py_pc = crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32;
-        let resume_depth = crate::liveness::liveness_for(caller_jitcode.payload.code_ptr)
-            .depth_at_py_pc()
-            .get(resume_py_pc as usize)
-            .copied()
-            .unwrap_or(0) as usize;
+        let raw_depth = || {
+            crate::liveness::liveness_for(caller_jitcode.payload.code_ptr)
+                .depth_at_py_pc()
+                .get(resume_py_pc as usize)
+                .copied()
+                .unwrap_or(0) as usize
+        };
+        let resume_depth = if caller_jitcode.payload.depth_after_residual_populated() {
+            let depth = caller_jitcode
+                .payload
+                .depth_after_residual_for_jitcode_pc(op.pc)
+                .unwrap_or(0) as usize;
+            if pcmap_afterresidual_audit_enabled() {
+                assert_eq!(
+                    depth,
+                    raw_depth(),
+                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: self-recursive CA vstack depth twin diverged at jit_pc {} (py {resume_py_pc})",
+                    op.pc
+                );
+            }
+            depth
+        } else {
+            raw_depth()
+        };
         ctx.vstack_boxes.truncate(resume_depth);
         ctx.vstack_boxes.resize(resume_depth, OpRef::NONE);
         if resume_depth > 0 {

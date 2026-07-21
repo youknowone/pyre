@@ -29,6 +29,16 @@ pub(crate) fn pcmap_containing_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CONTAINING_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`: assert the Slice-C after-residual depth
+/// twin (`depth_after_residual_for_jitcode_pc`) equals the raw
+/// `depth_at_py_pc[semantic_fallthrough_pc(python_pc_for_jitcode_pc(jit_pc))]`
+/// read at each consumer seam. Off in production; the gated branch is the only
+/// added code.
+pub(crate) fn pcmap_afterresidual_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_AFTERRESIDUAL_AUDIT").is_some())
+}
+
 pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static str) {
     if let Some(path) = std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE") {
         use std::io::Write;

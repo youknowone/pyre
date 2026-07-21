@@ -1222,13 +1222,31 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         // A missing marker has no fallthrough-native key. Preserve the
         // existing Python-keyed path rather than declining a formerly valid
         // caller frame.
-        None => unsafe {
-            crate::liveness::liveness_for(code_ptr)
-                .depth_at_py_pc()
-                .get(fallthrough_py_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize
-        },
+        None => {
+            let payload = unsafe { &(*caller_sym.jitcode()).payload };
+            let raw = || unsafe {
+                crate::liveness::liveness_for(code_ptr)
+                    .depth_at_py_pc()
+                    .get(fallthrough_py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize
+            };
+            if payload.depth_after_residual_populated() {
+                let depth = payload
+                    .depth_after_residual_for_jitcode_pc(call_jit_pc)
+                    .unwrap_or(0) as usize;
+                if pcmap_afterresidual_audit_enabled() {
+                    assert_eq!(
+                        depth,
+                        raw(),
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc} (py {fallthrough_py_pc})"
+                    );
+                }
+                depth
+            } else {
+                raw()
+            }
+        }
     };
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
@@ -1327,13 +1345,30 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let depth = match resume_marker_jit_pc {
         Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
         None => {
-            let fallthrough_py_pc = legacy_fallthrough_py_pc();
-            unsafe {
-                crate::liveness::liveness_for(pjc.code_ptr)
-                    .depth_at_py_pc()
-                    .get(fallthrough_py_pc as usize)
-                    .copied()
-                    .unwrap_or(0) as usize
+            let raw = || {
+                let fallthrough_py_pc = legacy_fallthrough_py_pc();
+                unsafe {
+                    crate::liveness::liveness_for(pjc.code_ptr)
+                        .depth_at_py_pc()
+                        .get(fallthrough_py_pc as usize)
+                        .copied()
+                        .unwrap_or(0) as usize
+                }
+            };
+            if pjc.depth_after_residual_populated() {
+                let depth = pjc
+                    .depth_after_residual_for_jitcode_pc(call_jit_pc)
+                    .unwrap_or(0) as usize;
+                if pcmap_afterresidual_audit_enabled() {
+                    assert_eq!(
+                        depth,
+                        raw(),
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: nested inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc}"
+                    );
+                }
+                depth
+            } else {
+                raw()
             }
         }
     };
