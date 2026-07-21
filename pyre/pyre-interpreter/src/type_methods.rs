@@ -1907,6 +1907,9 @@ fn complex_component_spec(p: &ParsedSpec, sign: char) -> String {
     if sign != '-' {
         spec.push(sign);
     }
+    if p.no_neg_zero {
+        spec.push('z');
+    }
     if p.alt_form {
         spec.push('#');
     }
