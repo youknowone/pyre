@@ -2109,6 +2109,19 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
         ) {
             return Ok(false);
         }
+        // Read every element before recording anything: a bail-out after a
+        // guard has been emitted would leave the target's class pinned, and the
+        // caller reads that as "already guarded" and drops its own pin.
+        let len = unsafe { pyre_object::w_tuple_len(match_type) };
+        let mut concretes: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+        for index in 0..len {
+            let Some(concrete) =
+                (unsafe { pyre_object::w_tuple_getitem(match_type, index as i64) })
+            else {
+                return Ok(false);
+            };
+            concretes.push(concrete);
+        }
         walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, tuple_type as i64)?;
         walker_guard_exact_w_class(ctx, op_pc, match_op, canonical_tuple_class)?;
         let block = crate::state::opimpl_getfield_gc_r(
@@ -2116,7 +2129,6 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
             match_op,
             crate::descr::tuple_wrappeditems_descr(),
         );
-        let len = unsafe { pyre_object::w_tuple_len(match_type) };
         let length = crate::state::opimpl_arraylen_gc(
             ctx.trace_ctx,
             block,
@@ -2124,15 +2136,10 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
         );
         let len_const = ctx.trace_ctx.const_int(len as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[length, len_const])?;
-        for index in 0..len {
+        for (index, concrete) in concretes.into_iter().enumerate() {
             let index_op = ctx.trace_ctx.const_int(index as i64);
             let item =
                 crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, index_op);
-            let Some(concrete) =
-                (unsafe { pyre_object::w_tuple_getitem(match_type, index as i64) })
-            else {
-                return Ok(false);
-            };
             items.push((item, concrete));
         }
     } else {
