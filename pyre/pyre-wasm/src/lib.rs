@@ -349,7 +349,10 @@ pub extern "C" fn pyre_jit_loops_aborted() -> u64 {
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {
-    pyre_jit::eval::driver_pair().0.get_stats().internal_compile_panics as u64
+    pyre_jit::eval::driver_pair()
+        .0
+        .get_stats()
+        .internal_compile_panics as u64
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
