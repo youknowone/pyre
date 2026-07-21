@@ -3376,20 +3376,6 @@ fn init_enumerate_type(ns: PyObjectRef) {
     );
 }
 
-/// `operation.py W_IterCallable.typedef` — `iter(callable, sentinel)`.
-fn init_callable_iterator_type(ns: PyObjectRef) {
-    install_functional_entry(
-        ns,
-        "__iter__",
-        make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
-    );
-    install_functional_entry(
-        ns,
-        "__next__",
-        make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-    );
-}
-
 /// PyPy `functional.py W_ReversedIterator.typedef`.
 fn init_reversed_type(ns: PyObjectRef) {
     install_functional_entry(
@@ -9359,7 +9345,7 @@ fn init_type_type(ns: PyObjectRef) {
 unsafe fn mro_subclasses(w_type: PyObjectRef) {
     let mro = crate::baseobjspace::compute_mro(w_type);
     pyre_object::w_type_set_mro(w_type, mro);
-    for w_sc in pyre_object::typeobject::w_type_get_subclasses(w_type) {
+    for w_sc in unsafe { pyre_object::typeobject::w_type_get_subclasses(w_type, false) } {
         mro_subclasses(w_sc);
     }
 }
