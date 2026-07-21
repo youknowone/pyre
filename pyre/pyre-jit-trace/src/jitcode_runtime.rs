@@ -429,6 +429,26 @@ pub fn all_descr_refs() -> &'static [DescrRef] {
     &ALL_DESCR_REFS
 }
 
+/// Whether the build-time descr pool's field offsets describe the struct
+/// layout this binary actually runs on.
+///
+/// [`all_descrs`] is serialised by `build.rs` from the layout model in
+/// `majit-translate` (`codewriter::call::StructLayout::from_type_strings` /
+/// `get_type_flag`), which sizes every pointer-typed field at 8 bytes and
+/// aligns to an 8-byte word.  The exact per-field offsets the Charon LLBC
+/// carries (`front::semantic`'s `field_offsets`) come from the same 64-bit
+/// extraction.  On a 32-bit target the real structs pack pointers at 4
+/// (`PyObject.w_class` sits at 4, not 8; `PyType.instantiate` at 24, not 32),
+/// so every offset past the first pointer field names the wrong bytes and a
+/// concrete read through one of those descrs returns garbage.
+///
+/// The per-site descrs the walker builds itself (`crate::descr`) use
+/// `offset_of!` and are always right, so only consumers that resolve their
+/// `d` operands through the build-time pool need this gate.
+pub fn build_descr_layout_matches_target() -> bool {
+    std::mem::size_of::<usize>() == 8
+}
+
 /// Build the metainterp-side `RuntimeBhDescr` pool from the shared
 /// build-time `ALL_DESCRS` and install it into `majit-metainterp` as the
 /// process-global build-time descr pool (`JitCode::descr_at`'s fallback for
