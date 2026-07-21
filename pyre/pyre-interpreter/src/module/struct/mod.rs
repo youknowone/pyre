@@ -961,8 +961,11 @@ pub struct W_Struct {
 
 #[crate::pyre_methods(doc = "Struct(fmt) --> compiled struct object")]
 impl W_Struct {
+    /// `interp_struct.py:256 descr__new__` — the format string is consumed by
+    /// `__init__`, so the allocator accepts and discards the trailing
+    /// `__args__` instead of failing the gateway arity check.
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
+    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
         W_Struct::allocate_stable(W_Struct {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
