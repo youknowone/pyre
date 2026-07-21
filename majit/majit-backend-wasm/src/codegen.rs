@@ -2674,34 +2674,23 @@ fn build_function(
             }
 
             // ── String/Unicode ops (direct memory access) ──
-            OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    // Length at offset 8 (after ob_type pointer on wasm32)
-                    sink.i64_load(mem64(8));
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    // str[index]: base + header_size + index
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // index
-                    sink.i32_wrap_i64();
-                    sink.i32_add();
-                    // String data starts after header (assume 16 bytes: ob_type + length)
-                    sink.i32_load8_u(MemArg {
-                        offset: 16,
-                        align: 0,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
-                }
+            // strlen/strgetitem/unicodelen/unicodegetitem were lowered with a
+            // hardcoded layout (length as an 8-byte load of a 4-byte word field;
+            // item as a 1-byte, stride-1 read at a fixed offset) that is wrong for
+            // UNICODE (4-byte code units, stride 4) and folds garbage into a str
+            // length's high bits — a silent wrong value on wasm, where offset is
+            // valid linear memory and does not trap. pyre models strings/unicode
+            // as Array(Char) and routes these through the descr-driven
+            // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops; decline
+            // them (interpreter fallback) rather than ship a wrong hardcoded read.
+            OpCode::Strlen
+            | OpCode::Unicodelen
+            | OpCode::Strgetitem
+            | OpCode::Unicodegetitem => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: string/unicode direct-memory op {:?} (no descr-driven layout)",
+                    op.opcode
+                )));
             }
 
             // ── GC memory ops ──
