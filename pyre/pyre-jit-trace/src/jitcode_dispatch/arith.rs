@@ -72,6 +72,37 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     result
 }
 
+/// Record an overflow-checking integer operation and its concrete result.
+///
+/// RPython parity: `pyjitpl.py opimpl_int_add_jump_if_ovf` records the
+/// matching `INT_*_OVF`, while `pyjitpl.py handle_possible_overflow_error`
+/// chooses the guard separately from the concrete overflow flag.
+pub(crate) fn record_int_ovf<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    b1: OpRef,
+    b2: OpRef,
+) -> (OpRef, bool) {
+    let v1 = match ctx.trace_ctx.concrete_of_opref(b1) {
+        Some(Value::Int(value)) => value,
+        _ => unreachable!("int ovf jump operand b1 must have a concrete integer value"),
+    };
+    let v2 = match ctx.trace_ctx.concrete_of_opref(b2) {
+        Some(Value::Int(value)) => value,
+        _ => unreachable!("int ovf jump operand b2 must have a concrete integer value"),
+    };
+    let (wrapping_result, overflow) = match opcode {
+        OpCode::IntAddOvf => (v1.wrapping_add(v2), v1.checked_add(v2).is_none()),
+        OpCode::IntSubOvf => (v1.wrapping_sub(v2), v1.checked_sub(v2).is_none()),
+        OpCode::IntMulOvf => (v1.wrapping_mul(v2), v1.checked_mul(v2).is_none()),
+        _ => unreachable!("record_int_ovf requires an IntAddOvf/IntSubOvf/IntMulOvf opcode"),
+    };
+    let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
+    ctx.trace_ctx
+        .set_opref_concrete(resbox, Value::Int(wrapping_result));
+    (resbox, overflow)
+}
+
 /// RPython `pyjitpl.py opimpl_int_between`:
 ///
 /// ```python

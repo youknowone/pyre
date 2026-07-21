@@ -6656,53 +6656,41 @@ fn append_virtualizable_boxes(ctx: &TraceCtx, mut reds: Vec<OpRef>) -> Vec<OpRef
     reds
 }
 
-fn goto_if_not_branch_on<Sym: WalkSym>(
+fn write_branch_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    result_write: Option<(usize, OpRef)>,
+) -> Result<(), DispatchError> {
+    if let Some((dst, resbox)) = result_write {
+        let concrete = match ctx.trace_ctx.concrete_of_opref(resbox) {
+            Some(Value::Int(value)) => ConcreteValue::Int(value),
+            _ => ConcreteValue::Null,
+        };
+        write_int_reg(ctx, op_pc, dst, resbox, concrete)?;
+    }
+    Ok(())
+}
+
+fn branch_without_guard<Sym: WalkSym>(
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    taken_pc: usize,
+    result_write: Option<(usize, OpRef)>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    write_branch_result(ctx, op.pc, result_write)?;
+    Ok((DispatchOutcome::Continue, taken_pc))
+}
+
+fn guarded_branch_core<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
-    condbox: OpRef,
-    switchcase: i64,
-    target: usize,
+    guard_opcode: OpCode,
+    guard_operands: &[OpRef],
+    taken_pc: usize,
+    other_pc: usize,
+    result_write: Option<(usize, OpRef)>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // pyjitpl.py `assert switchcase == 1` — codewriter
-    // invariant: every condbox feeding GOTO_IF_NOT was produced
-    // by an int_is_* family op, so the only non-zero value
-    // possible is 1. Fail loud on any other truthy value rather
-    // than silently coercing.
-    assert!(
-        switchcase == 0 || switchcase == 1,
-        "opimpl_goto_if_not: switchcase must be 0 or 1, got {} (pc={})",
-        switchcase,
-        op.pc
-    );
-    let opcode = if switchcase != 0 {
-        OpCode::GuardTrue
-    } else {
-        OpCode::GuardFalse
-    };
-    // `pyjitpl.py opimpl_goto_if_not` calls
-    // `generate_guard(opnum, box, resumepc=orgpc)`; the first
-    // line of `generate_guard` (`pyjitpl.py`) is
-    // `if isinstance(box, Const): return` — Const boxes already
-    // pin the value and need no guard.
-    //
-    // No `replace_box`/register-rewrite here: the condbox feeding
-    // GOTO_IF_NOT is always the result of an int_is_* family op
-    // (the `assert switchcase == 0 || 1` invariant above), which
-    // `opimpl_goto_if_not_int_is_true` / `_int_is_zero` / the
-    // `int_lt..float_ge` fusions all dispatch with
-    // `replace=False` (`pyjitpl.py`): "does not make sense
-    // to replace condbox, because it does not appear anywhere in
-    // any register, we either just made it or it's constant
-    // anyway".  Only the bare `opimpl_goto_if_not(replace=True)`
-    // promotes its operand, and pyre never routes a raw boolean
-    // local through this arm.  Promoting the condbox to a constant
-    // here would fold a loop-variant truth value (e.g. the kept
-    // `flag` of `x = flag and 7`, `flag = i & 1`) into a constant,
-    // making the optimizer hoist the producing op + its guard out
-    // of the steady-state loop and drop the induction variable —
-    // a non-terminating miscompile.
-    //
     // Resume-data capture (`capture_resumedata(resumepc=orgpc)` at
     // `pyjitpl.py`) is threaded via
     // `walker_capture_snapshot_for_last_guard(other_target)`.
@@ -6715,11 +6703,8 @@ fn goto_if_not_branch_on<Sym: WalkSym>(
     // blackhole must re-enter past `POP_JUMP_IF_*`.  GuardTrue
     // (trace fell through to `op.next_pc`) → resume at `target`;
     // GuardFalse (trace jumped to `target`) → resume at `op.next_pc`.
-    let other_target = resolve_branch_target_through_trampoline(
-        code,
-        if switchcase != 0 { target } else { op.next_pc },
-    );
-    if !condbox.is_constant() {
+    let other_target = resolve_branch_target_through_trampoline(code, other_pc);
+    {
         // #124/#281: a branch guard whose resume target still holds a
         // live operand-stack temp (short-circuit `and`/`or`, the
         // conditional expression, chained comparison) keeps that temp
@@ -6842,7 +6827,7 @@ fn goto_if_not_branch_on<Sym: WalkSym>(
         // pairs (`#420`); the snapshot / vable recovery then reads
         // `registers_r[src]` for each kept slot — exact for any kept-
         // stack depth, superseding the positional depth-1 heuristic.
-        let raw_branch_target = if switchcase != 0 { target } else { op.next_pc };
+        let raw_branch_target = other_pc;
         let kept_recovered = if kept_stack {
             decode_branch_trampoline_ref_moves(code, raw_branch_target)
         } else {
@@ -7037,7 +7022,7 @@ fn goto_if_not_branch_on<Sym: WalkSym>(
             ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
             return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
         }
-        ctx.trace_ctx.record_guard(opcode, &[condbox], 0);
+        ctx.trace_ctx.record_guard(guard_opcode, guard_operands, 0);
         // Publish the guard's own jitcode coordinate ONLY for the
         // kept-stack case so the snapshot encoder recovers the kept
         // operand-stack values from the guard-pc register file (the
@@ -7068,8 +7053,90 @@ fn goto_if_not_branch_on<Sym: WalkSym>(
             },
         )?;
     }
-    let next_pc = if switchcase != 0 { op.next_pc } else { target };
-    Ok((DispatchOutcome::Continue, next_pc))
+    write_branch_result(ctx, op.pc, result_write)?;
+    Ok((DispatchOutcome::Continue, taken_pc))
+}
+
+fn goto_if_not_branch_on<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    condbox: OpRef,
+    switchcase: i64,
+    target: usize,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // pyjitpl.py `opimpl_goto_if_not` requires a boolean switchcase.
+    assert!(
+        switchcase == 0 || switchcase == 1,
+        "opimpl_goto_if_not: switchcase must be 0 or 1, got {} (pc={})",
+        switchcase,
+        op.pc
+    );
+    let (guard_opcode, taken_pc, other_pc) = if switchcase != 0 {
+        (OpCode::GuardTrue, op.next_pc, target)
+    } else {
+        (OpCode::GuardFalse, target, op.next_pc)
+    };
+
+    // `generate_guard` in `pyjitpl.py opimpl_goto_if_not` skips Const boxes.
+    // No register replacement occurs here; fused comparisons pass
+    // `replace=False`, preserving loop-variant conditions.
+    if condbox.is_constant() {
+        branch_without_guard(op, ctx, taken_pc, None)
+    } else {
+        guarded_branch_core(
+            code,
+            op,
+            ctx,
+            guard_opcode,
+            &[condbox],
+            taken_pc,
+            other_pc,
+            None,
+        )
+    }
+}
+
+fn int_ovf_jump<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let target = read_label(code, op, 0);
+    let b1 = read_int_reg(code, op, 2, ctx)?;
+    let b2 = read_int_reg(code, op, 3, ctx)?;
+    let dst = code[op.pc + 5] as usize;
+    let both_constant = b1.is_constant() && b2.is_constant();
+    let (resbox, overflow) = record_int_ovf(ctx, opcode, b1, b2);
+
+    // `pyjitpl.py opimpl_int_add_jump_if_ovf` and
+    // `pyjitpl.py handle_possible_overflow_error`: Const operands branch
+    // without a guard; symbolic operands emit an operand-less overflow guard.
+    let (guard_opcode, taken_pc, other_pc, result_write) = if overflow {
+        (OpCode::GuardOverflow, target, op.next_pc, None)
+    } else {
+        (
+            OpCode::GuardNoOverflow,
+            op.next_pc,
+            target,
+            Some((dst, resbox)),
+        )
+    };
+    if both_constant {
+        branch_without_guard(op, ctx, taken_pc, result_write)
+    } else {
+        guarded_branch_core(
+            code,
+            op,
+            ctx,
+            guard_opcode,
+            &[],
+            taken_pc,
+            other_pc,
+            result_write,
+        )
+    }
 }
 
 fn fused_goto_if_not_int<Sym: WalkSym>(
@@ -7275,6 +7342,9 @@ fn handle<Sym: WalkSym>(
         "goto_if_not_float_ge/ffL" => fused_goto_if_not_float(code, op, ctx, OpCode::FloatGe),
         "goto_if_not_ptr_eq/rrL" => fused_goto_if_not_ptr(code, op, ctx, OpCode::PtrEq),
         "goto_if_not_ptr_ne/rrL" => fused_goto_if_not_ptr(code, op, ctx, OpCode::PtrNe),
+        "int_add_jump_if_ovf/Lii>i" => int_ovf_jump(code, op, ctx, OpCode::IntAddOvf),
+        "int_sub_jump_if_ovf/Lii>i" => int_ovf_jump(code, op, ctx, OpCode::IntSubOvf),
+        "int_mul_jump_if_ovf/Lii>i" => int_ovf_jump(code, op, ctx, OpCode::IntMulOvf),
         "catch_exception/L" => {
             // RPython `blackhole.py bhimpl_catch_exception(target)` —
             // "no-op when run normally" — and `pyjitpl.py

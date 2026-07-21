@@ -598,6 +598,113 @@ fn regular_record_table_is_the_sole_dispatcher() {
     }
 }
 
+fn drive_int_add_jump_if_ovf(
+    lhs_value: i64,
+    rhs_value: i64,
+) -> (Vec<OpCode>, usize, bool, OpRef, OpRef, usize) {
+    let opname = "int_add_jump_if_ovf/Lii>i";
+    let ovf_byte = *insns_opname_to_byte()
+        .get(opname)
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let live_byte = *insns_opname_to_byte()
+        .get("live/")
+        .expect("live must be in the runtime instruction table");
+    // Lii>i: target 9, source registers 0/1, destination register 2.
+    // Separate live tails at 6 and 9 make fallthrough and jump observable.
+    let code = [ovf_byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    let _ = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let lhs = OpRef::input_arg_int(0);
+    let rhs = OpRef::input_arg_int(1);
+    tc.set_opref_concrete(lhs, Value::Int(lhs_value));
+    tc.set_opref_concrete(rhs, Value::Int(rhs_value));
+    let mut regs_i = vec![lhs, rhs, OpRef::NONE];
+    let mut concrete_i = vec![
+        ConcreteValue::Int(lhs_value),
+        ConcreteValue::Int(rhs_value),
+        ConcreteValue::Null,
+    ];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        is_full_body_walk: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_add_jump_if_ovf must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    let dst = wc.registers_i[2];
+    drop(wc);
+    let ops = tc.ops();
+    let opcodes = ops.iter().map(|op| op.opcode).collect();
+    let guard_num_args = ops[1].num_args();
+    let guard_has_snapshot = ops[1].rd_resume_position.get() >= 0;
+    let resbox = ops[0].pos.get();
+    (
+        opcodes,
+        guard_num_args,
+        guard_has_snapshot,
+        resbox,
+        dst,
+        next_pc,
+    )
+}
+
+#[test]
+fn int_add_jump_if_ovf_no_overflow_records_guard_no_overflow_and_writes_dst() {
+    let (opcodes, guard_num_args, guard_has_snapshot, resbox, dst, next_pc) =
+        drive_int_add_jump_if_ovf(40, 2);
+    assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardNoOverflow],);
+    assert_eq!(guard_num_args, 0, "GuardNoOverflow is operand-less");
+    assert!(guard_has_snapshot);
+    assert_eq!(next_pc, 6, "no overflow continues at op.next_pc");
+    assert_eq!(dst, resbox, "the no-overflow continue writes resbox to dst");
+}
+
+#[test]
+fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
+    let (opcodes, guard_num_args, guard_has_snapshot, _, dst, next_pc) =
+        drive_int_add_jump_if_ovf(i64::MAX, 1);
+    assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardOverflow],);
+    assert_eq!(guard_num_args, 0, "GuardOverflow is operand-less");
+    assert!(guard_has_snapshot);
+    assert_eq!(dst, OpRef::NONE, "the overflow jump does not write dst");
+    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+}
+
 #[test]
 fn switch_id_hit_jumps_to_matching_target() {
     let switch_byte = *insns_opname_to_byte()
@@ -5270,7 +5377,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
-        fbw_mode: Default::default(),
+        fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
         registers_i: &mut regs_i,
