@@ -463,25 +463,28 @@ fn t3_audit_opname_gap_inventory() {
     // dispatch arms of `handle()` — they look like
     // `"<opname>/[argcodes]" => ...`.  Filter to entries that are
     // also in the runtime table to drop test-fixture literals.
+    // An arm may list several keys on one line (`"a/i" | "b/c" => ...`),
+    // so every literal on the line counts, not just the leading one —
+    // reading only the first silently under-reports the handled set.
     for line in source.lines() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('"') {
             continue;
         }
-        let Some(rest) = trimmed.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end_quote_idx) = rest.find('"') else {
-            continue;
-        };
-        let key = &rest[..end_quote_idx];
-        // Must contain '/' (separates opname from argcodes); skip
-        // anything that doesn't look like an opname/argcodes literal.
-        if !key.contains('/') {
-            continue;
-        }
-        if runtime_names.contains(key) {
-            handled.insert(key.to_string());
+        for (idx, key) in trimmed.split('"').enumerate() {
+            // Odd indices are the quoted spans; even ones are the
+            // separators between them.
+            if idx % 2 == 0 {
+                continue;
+            }
+            // Must contain '/' (separates opname from argcodes); skip
+            // anything that doesn't look like an opname/argcodes literal.
+            if !key.contains('/') {
+                continue;
+            }
+            if runtime_names.contains(key) {
+                handled.insert(key.to_string());
+            }
         }
     }
 
@@ -705,11 +708,13 @@ fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
     assert_eq!(next_pc, 9, "overflow jumps to the handler target");
 }
 
-#[test]
-fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
+/// Drive one of the `d>r` struct-allocation handlers (`new`,
+/// `new_with_vtable`): both record the descr alone and write the
+/// allocation into the ref bank.
+fn drive_alloc_with_descr(opname: &str, expected_opcode: OpCode) {
     let nwv_byte = *insns_opname_to_byte()
-        .get("new_with_vtable/d>r")
-        .expect("new_with_vtable must be in the runtime instruction table");
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in the runtime instruction table"));
     let live_byte = *insns_opname_to_byte()
         .get("live/")
         .expect("live must be in the runtime instruction table");
@@ -760,7 +765,8 @@ fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("new_with_vtable must dispatch");
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
     assert_eq!(outcome, DispatchOutcome::Continue);
     let dst = wc.registers_r[0];
     drop(wc);
@@ -768,12 +774,12 @@ fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
     let ops = tc.ops();
     assert_eq!(
         ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
-        vec![OpCode::NewWithVtable],
+        vec![expected_opcode],
     );
     assert_eq!(
         ops[0].num_args(),
         0,
-        "execute_new_with_vtable records the descr alone, with no box operands"
+        "the allocation records the descr alone, with no box operands"
     );
     assert_eq!(
         dst,
@@ -781,6 +787,153 @@ fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
         "the `>r` decorator writes the allocation into the ref bank"
     );
     assert_eq!(next_pc, 4, "`d>r` consumes a 2B descr plus a 1B dst");
+}
+
+#[test]
+fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
+    drive_alloc_with_descr("new_with_vtable/d>r", OpCode::NewWithVtable);
+}
+
+#[test]
+fn new_records_the_alloc_and_writes_the_ref_dst() {
+    drive_alloc_with_descr("new/d>r", OpCode::New);
+}
+
+/// Step one heapcache-hint opcode (`assert_not_none`,
+/// `record_exact_class`) over caller-supplied banks.
+fn run_hint_step(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    regs_i: &mut [OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: regs_r,
+        registers_i: regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: concrete_r,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        is_full_body_walk: false,
+        trace_ctx: tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(code, 0, &mut wc)
+}
+
+#[test]
+fn assert_not_none_records_when_the_operand_has_a_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("assert_not_none/r")
+        .expect("`assert_not_none/r` must be in insns table");
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`assert_not_none/r` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 2, "`r` consumes a single register byte");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::AssertNotNone);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![operand],
+    );
+}
+
+#[test]
+fn assert_not_none_declines_when_the_operand_has_no_concrete() {
+    let byte = *insns_opname_to_byte()
+        .get("assert_not_none/r")
+        .expect("`assert_not_none/r` must be in insns table");
+    let code = [byte, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    // No shadow for the slot: the walker never observed this pointer, so
+    // it cannot stand behind the non-null check the recorder performs.
+    let mut concrete_r = [ConcreteValue::Null];
+    let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect_err("a shadow-less operand must decline instead of asserting");
+    assert_eq!(
+        err,
+        DispatchError::UnsupportedOpname {
+            pc: 0,
+            key: "assert_not_none/r",
+        },
+    );
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a declined step must not leave a recorded op behind"
+    );
+}
+
+#[test]
+fn record_exact_class_records_the_hint_with_both_operands() {
+    let byte = *insns_opname_to_byte()
+        .get("record_exact_class/ri")
+        .expect("`record_exact_class/ri` must be in insns table");
+    // `ri`: 1B ref reg + 1B int reg holding the class vtable address.
+    let code = [byte, 0x00, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let cls = tc.const_int(0x4000);
+    let mut regs_r = [operand];
+    let mut regs_i = [cls];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) =
+        run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+            .expect("`record_exact_class/ri` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3, "`ri` consumes two register bytes");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RecordExactClass);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![operand, cls],
+    );
 }
 
 #[test]

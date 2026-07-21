@@ -7645,15 +7645,55 @@ fn handle<Sym: WalkSym>(
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        // RPython `pyjitpl.py opimpl_new_array_clear` —
-        // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
-        // arraydescr)` records the op and seeds the heapcache via
-        // `heapcache.new_array(resbox, lengthbox)`.  Operand layout
-        // per `bhimpl_new_array_clear @arguments("cpu","i","d",
-        // returns="r")`: 1B i-reg(length) + 2B descr + 1B r-reg(dst).
-        // The `cd>r` arm is the `c`-argcode form (inline signed-byte
-        // length, USE_C_FORM): identical byte layout, length decoded
-        // as ConstInt.
+        // RPython `pyjitpl.py opimpl_assert_not_none` and
+        // `opimpl_record_exact_class` are heapcache hints: consult the
+        // cache, record once, then stamp what the record proved. Both
+        // bodies already live on `TraceCtx` — the walker reads the
+        // operands and delegates, so the two tracers cannot drift.
+        //
+        // Operand layout `r`: 1B ref reg.
+        "assert_not_none/r" => {
+            let opref = read_ref_reg(code, op, 0, ctx)?;
+            // `trace_assert_not_none` mirrors `executor.py do_assert_not_none`,
+            // which fatalerrors on a null operand — it can only be called with
+            // a concrete pointer in hand. The walker often has no shadow for a
+            // ref slot, and an absent shadow is not evidence of non-nullness,
+            // so decline rather than feed the check a value it did not observe.
+            let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
+                return Err(DispatchError::UnsupportedOpname {
+                    pc: op.pc,
+                    key: op.key,
+                });
+            };
+            ctx.trace_ctx.trace_assert_not_none(opref, ptr as i64);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // Operand layout `ri`: 1B ref reg + 1B int reg holding the class
+        // vtable address. A non-constant class operand is skipped inside
+        // the helper, matching the `isinstance(clsbox, Const)` gate.
+        "record_exact_class/ri" => {
+            let opref = read_ref_reg(code, op, 0, ctx)?;
+            let cls = read_int_reg(code, op, 1, ctx)?;
+            ctx.trace_ctx.trace_record_exact_class(opref, cls);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // RPython `pyjitpl.py opimpl_new` delegates to `execute_new`:
+        //
+        //   resbox = self.execute_and_record(rop.NEW, typedescr)
+        //   self.heapcache.new(resbox)
+        //   return resbox
+        //
+        // Same `d>r` layout and same posture as `new_with_vtable` below,
+        // minus the class stamp — a plain struct allocation carries no
+        // vtable word, so nothing is known about its class.
+        "new/d>r" => {
+            let descr = read_descr(code, op, 0, ctx)?;
+            let resbox = ctx.trace_ctx.record_op_with_descr(OpCode::New, &[], descr);
+            ctx.trace_ctx.heap_cache_mut().new_object(resbox);
+            let dst = code[op.pc + 3] as usize;
+            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // RPython `pyjitpl.py opimpl_new_with_vtable` delegates straight to
         // `execute_new_with_vtable`:
         //
@@ -7686,6 +7726,15 @@ fn handle<Sym: WalkSym>(
             write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        // RPython `pyjitpl.py opimpl_new_array_clear` —
+        // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
+        // arraydescr)` records the op and seeds the heapcache via
+        // `heapcache.new_array(resbox, lengthbox)`.  Operand layout
+        // per `bhimpl_new_array_clear @arguments("cpu","i","d",
+        // returns="r")`: 1B i-reg(length) + 2B descr + 1B r-reg(dst).
+        // The `cd>r` arm is the `c`-argcode form (inline signed-byte
+        // length, USE_C_FORM): identical byte layout, length decoded
+        // as ConstInt.
         "new_array_clear/id>r" | "new_array_clear/cd>r" => {
             let length = if op.key == "new_array_clear/cd>r" {
                 OpRef::ConstInt(code[op.pc + 1] as i8 as i64)
