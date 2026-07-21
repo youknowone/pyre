@@ -722,6 +722,20 @@ impl PyError {
     /// Rust's OS-error `Display` is `"{strerror} (os error {errno})"`;
     /// recover the bare strerror the way `rposix.strerror` reports it.
     fn clean_strerror(errno: i32) -> String {
+        // `from_raw_os_error` reads its argument as a Win32 code on Windows,
+        // where these errnos are the POSIX ones `io_error_posix_errno`
+        // translated to, so it would describe an unrelated system error (17 is
+        // EEXIST but also ERROR_NOT_SAME_DEVICE).  The C runtime keeps the
+        // errno-keyed table `strerror` reports from.
+        #[cfg(windows)]
+        {
+            let msg = unsafe { libc::strerror(errno) };
+            if !msg.is_null() {
+                return unsafe { std::ffi::CStr::from_ptr(msg) }
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         let full = std::io::Error::from_raw_os_error(errno).to_string();
         match full.rfind(" (os error ") {
             Some(idx) => full[..idx].to_string(),
