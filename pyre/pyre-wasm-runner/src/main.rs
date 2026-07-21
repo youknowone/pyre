@@ -465,6 +465,28 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             }
         }
     }
+    // Emit the sign-stable badness counters under MAJIT_STATS (the same env
+    // check.py sets for every backend), so the regression floor gates wasm on
+    // loops_aborted / internal_compile_panics like the native backends. Kept
+    // separate from the verbose PYRE_WASM_JIT_STATS block above and emitted
+    // last, so under check.py (MAJIT_STATS only) this is the single [jit-stats]
+    // line the snapshot picks up. The exports read 0 on an old module that
+    // predates them, which is the healthy value, so a stale runner degrades
+    // safely rather than reporting a false regression.
+    if std::env::var_os("MAJIT_STATS").is_some() {
+        let loops_aborted = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_jit_loops_aborted")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(0);
+        let internal_compile_panics = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_jit_internal_compile_panics")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(0);
+        eprintln!(
+            "[jit-stats] loops_aborted={loops_aborted} \
+             internal_compile_panics={internal_compile_panics}"
+        );
+    }
     let packed = match run_result {
         Ok(p) => p,
         Err(e) => {

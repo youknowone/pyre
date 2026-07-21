@@ -334,6 +334,24 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
+/// Sign-stable JIT counters that read 0 in a healthy run, the same badness
+/// fields the native `[jit-stats]` line reports (`pyrex` maybe_print_jit_stats).
+/// A nonzero value means a trace aborted or an internal compile bug degraded
+/// the trace, never a tuning choice — so `check.py`'s regression floor can gate
+/// wasm on them exactly as it gates the native backends. Exported (not imported)
+/// so reading them cannot perturb the JIT's table/function indices.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_loops_aborted() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().loops_aborted as u64
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().internal_compile_panics as u64
+}
+
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 
