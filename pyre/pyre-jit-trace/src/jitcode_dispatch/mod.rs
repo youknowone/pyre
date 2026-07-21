@@ -2178,9 +2178,9 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
 /// The answer is an over-approximation of the reads: whenever the successor set
 /// is not decodable — `switch/id`, whose targets live in a descr this scan
 /// cannot read, or any other label-carrying op whose shape is not modelled —
-/// the exception is reported as read. Over-reporting only leaves a recorded
-/// exception standing for the caller, whereas under-reporting drops one a later
-/// read still needs.
+/// the exception is reported as read, as it is for an op the decode cannot read
+/// at all. Over-reporting only leaves a recorded exception standing for the
+/// caller, whereas under-reporting drops one a later read still needs.
 fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
     // Arms queued by a conditional branch, and the jump targets already
     // started from. Both stay empty on a straight-line answer.
@@ -2189,11 +2189,19 @@ fn reads_last_exc_before_next_catch(code: &[u8], position: usize) -> bool {
     let mut pc = position;
     loop {
         let path_continues = match decode_op_at(code, pc) {
-            None => false,
+            // The decode fails on an opcode byte outside the instruction table
+            // and on a payload the stream is too short to hold, not only at the
+            // end of the code — the ops beyond it are unknown either way.
+            None => return true,
             Some(op) => match op.key {
-                // `opimpl_reraise` re-raises `last_exc_value`, so it reads the
-                // exception exactly like `last_exc_value/>r`.
-                "last_exception/>i" | "last_exc_value/>r" | "reraise/" => return true,
+                // `opimpl_reraise` re-raises `last_exc_value`, and
+                // `opimpl_goto_if_exception_mismatch` asserts it before testing
+                // the class, so both read the exception exactly like
+                // `last_exc_value/>r`.
+                "last_exception/>i"
+                | "last_exc_value/>r"
+                | "reraise/"
+                | "goto_if_exception_mismatch/iL" => return true,
                 "catch_exception/L" | "raise/r" | "unreachable/" | "int_return/i"
                 | "int_return/c" | "ref_return/r" | "float_return/f" | "void_return/" => false,
                 "goto/L" => {
