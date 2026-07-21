@@ -636,6 +636,41 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
     }
 }
 
+/// One export held on a `pack_into` target for as long as the writable slice
+/// is live.  `s_pack_into` keeps the buffer exported across `s_pack_internal`,
+/// so a value coercion that re-enters Python and calls `release()` — or
+/// resizes the exporter — raises instead of leaving the saved slice stale.
+struct PackIntoExport(PyObjectRef);
+
+impl PackIntoExport {
+    /// Returns `None` for a target that carries no export count; `writebuf`
+    /// rejects everything except the two kinds handled here.
+    unsafe fn acquire(obj: PyObjectRef) -> Option<Self> {
+        unsafe {
+            if bytearrayobject::is_bytearray(obj) {
+                bytearrayobject::w_bytearray_exports_incref(obj);
+            } else if memoryview::is_w_memoryview(obj) {
+                memoryview::w_memoryview_exports_incref(obj);
+            } else {
+                return None;
+            }
+        }
+        Some(Self(obj))
+    }
+}
+
+impl Drop for PackIntoExport {
+    fn drop(&mut self) {
+        unsafe {
+            if bytearrayobject::is_bytearray(self.0) {
+                bytearrayobject::w_bytearray_exports_decref(self.0);
+            } else {
+                memoryview::w_memoryview_exports_decref(self.0);
+            }
+        }
+    }
+}
+
 /// `do_pack_into` — pack `values` into `buffer` starting at `offset`,
 /// resolving a negative offset against the buffer end.
 fn do_pack_into(
@@ -646,6 +681,7 @@ fn do_pack_into(
 ) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()?;
+    let _export = unsafe { PackIntoExport::acquire(buffer) };
     let buf = unsafe { writebuf(buffer)? };
     let buflen = buf.len() as i64;
     let mut offset = offset;
