@@ -4,13 +4,10 @@
 //! getgrgid / getgrnam / getgrall return 4-tuples
 //! `(gr_name, gr_passwd, gr_gid, gr_mem)` matching CPython.
 //!
-//! `register_module` is `#[cfg(unix)]`; on Windows the module dict stays
-//! empty so `import grp` still resolves to the builtin module object.
+//! The module is registered only on unix: a host without the user/group
+//! database has no `grp` module for `import grp` to find, which is what the
+//! stdlib's `try/except ImportError` callers expect.
 
 pub mod grp;
 
-#[cfg(unix)]
 pub use grp::register_module as init;
-
-#[cfg(not(unix))]
-pub fn init(_ns: pyre_object::PyObjectRef) {}

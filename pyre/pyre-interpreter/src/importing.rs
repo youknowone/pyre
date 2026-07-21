@@ -573,9 +573,14 @@ pub fn install_builtin_modules() {
     {
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!("_signal"(signal));
-        #[cfg(not(target_arch = "wasm32"))]
+        // Only a POSIX host has the user/group databases these read; the
+        // platforms without them have no `pwd`/`grp` module at all, and the
+        // callers depend on that: `posixpath.expanduser`, `pathlib` and
+        // `tarfile` all reach for the module inside `try/except ImportError`
+        // and take a fallback when it is missing.
+        #[cfg(unix)]
         pyre_install_module!(pwd);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(unix)]
         pyre_install_module!(grp);
         #[cfg(unix)]
         pyre_install_module!(resource);

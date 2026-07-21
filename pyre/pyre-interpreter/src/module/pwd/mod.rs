@@ -5,13 +5,10 @@
 //! layout.  `struct_passwd` / `struct_pwent` share identity matching
 //! `app_pwd.py:1-21`.
 //!
-//! `register_module` is `#[cfg(unix)]`; on Windows the module dict stays
-//! empty so `import pwd` still resolves to the builtin module object.
+//! The module is registered only on unix: a host without the user/group
+//! database has no `pwd` module for `import pwd` to find, which is what the
+//! stdlib's `try/except ImportError` callers expect.
 
 pub mod interp_pwd;
 
-#[cfg(unix)]
 pub use interp_pwd::register_module as init;
-
-#[cfg(not(unix))]
-pub fn init(_ns: pyre_object::PyObjectRef) {}

@@ -69,7 +69,7 @@ pub mod faulthandler;
 #[cfg(not(feature = "sandbox"))]
 pub mod fcntl;
 pub mod gc;
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(unix, not(feature = "sandbox")))]
 pub mod grp;
 #[allow(non_snake_case)]
 pub mod imp;
@@ -82,7 +82,7 @@ pub mod mmap;
 pub mod operator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod posix;
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(unix, not(feature = "sandbox")))]
 pub mod pwd;
 pub mod pyexpat;
 #[cfg(not(feature = "sandbox"))]
