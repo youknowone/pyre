@@ -1907,12 +1907,6 @@ pub use crate::liveness::{LiveVars, liveness_for};
 pub struct PyreJitState {
     #[vable(frame)]
     pub frame: usize,
-    /// blackhole.py:337 parity: liveness PC from rd_numb (setposition PC).
-    /// When set, `restore_guard_failure_values` uses this instead of
-    /// next_instr for liveness lookup — matching RPython's pattern where
-    /// `blackholeinterp.setposition(jitcode, pc)` is called before
-    /// `consume_one_section`.
-    pub resume_pc: Option<usize>,
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -9693,9 +9687,6 @@ impl JitState for PyreJitState {
         exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
         // resume.py:1077 consume_boxes parity: write values to the frame.
-        // blackhole.py:337: setposition(jitcode, pc) before consume_one_section —
-        // frame_pc from rd_numb is the liveness PC (orgpc).
-        self.resume_pc = Some(_frame_pc as usize);
         self.restore_guard_failure_values(meta, values, exception)
     }
 
@@ -10530,10 +10521,7 @@ mod tests {
     }
 
     fn empty_state() -> PyreJitState {
-        PyreJitState {
-            frame: 0,
-            resume_pc: None,
-        }
+        PyreJitState { frame: 0 }
     }
 
     fn compile_function_body(src: &str) -> CodeObject {
@@ -11002,10 +10990,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut state = PyreJitState {
-            frame: frame_ptr,
-            resume_pc: None,
-        };
+        let mut state = PyreJitState { frame: frame_ptr };
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
         let meta = PyreMeta {

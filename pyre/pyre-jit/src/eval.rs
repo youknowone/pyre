@@ -8792,12 +8792,8 @@ pub(crate) fn decode_and_restore_guard_failure(
         if rd_numb.is_empty() {
             (dead_frame_typed.clone(), HashMap::new())
         } else {
-            let (t, rd_numb_pc, virtuals_cache) =
+            let (t, virtuals_cache) =
                 rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout);
-            // blackhole.py:337 parity: setposition(jitcode, pc) before
-            // consume_one_section. rd_numb_pc = orgpc used by
-            // get_list_of_active_boxes during encoding.
-            jit_state.resume_pc = rd_numb_pc;
             (t, virtuals_cache)
         }
     };
@@ -8930,17 +8926,12 @@ pub(crate) fn decode_and_restore_guard_failure(
 /// (virtual to materialize). Consumes only the outermost frame's values,
 /// but splits frames by per-jitcode liveness so the box-section boundary is
 /// correct for multi-frame (inlined-callee) guards.
-///
-/// Returns `(typed_values, rd_numb_frame_pc)`. The frame PC from rd_numb
-/// is the liveness PC used by get_list_of_active_boxes during encoding.
-/// The recovery side MUST use this same PC for expand — NOT next_instr
-/// (which may differ by 1+ due to cache slots).
 fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
-) -> (Vec<Value>, Option<usize>, HashMap<usize, Value>) {
+) -> (Vec<Value>, HashMap<usize, Value>) {
     use majit_ir::resumedata::rebuild_from_numbering;
 
     // resume.py:1049-1055 parity: bound each frame's box section by jitcode
@@ -9087,15 +9078,7 @@ fn rebuild_typed_from_rd_numb(
         );
     }
 
-    // The outer frame's decoded Python position is retained for resume-state
-    // hygiene. The live resume selection uses the rebuilt frame chain.
-    // pc=-1 = no-snapshot sentinel; screen it out (as build_resumed_frames does)
-    // so the negative word never reaches the `as usize` cast.
-    let rd_numb_pc = frames
-        .first()
-        .filter(|f| f.pc >= 0)
-        .map(|f| pyre_jit_trace::state::backxlat_py_pc(f.jitcode_index, f.pc) as usize);
-    (typed, rd_numb_pc, virtuals_cache)
+    (typed, virtuals_cache)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9731,7 +9714,6 @@ pub(crate) fn build_jit_state(
 ) -> PyreJitState {
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
-        resume_pc: None,
     };
     assert!(
         jit_state.sync_from_virtualizable(virtualizable_info),
@@ -10858,10 +10840,7 @@ mod tests {
             "frame-value count must come from the same compiled jitcode liveness block"
         );
 
-        let mut state = PyreJitState {
-            frame: frame_ptr,
-            resume_pc: Some(resume_pc),
-        };
+        let mut state = PyreJitState { frame: frame_ptr };
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
         let meta = PyreMeta {
