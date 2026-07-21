@@ -494,7 +494,6 @@ fn snapshot_map_from_trace_snapshots(
     SnapshotFrameSizes,
     SnapshotBoxes,
     SnapshotBoxes,
-    SnapshotBoxes,
     SnapshotFramePcs,
 ) {
     let _ = constants; // legacy idx-Const pool no longer populated here; see SnapshotTagged::Const arm
@@ -502,7 +501,6 @@ fn snapshot_map_from_trace_snapshots(
     let mut size_map = Vec::new();
     let mut vable_map = Vec::new();
     let mut vref_map = Vec::new();
-    let mut evr_map = Vec::new();
     let mut pc_map = Vec::new();
     // opencoder.py:603 _encode: trace snapshot recorder only emits Box
     // (live deadframe slot) and Const (compile-time pool) payloads.
@@ -554,14 +552,6 @@ fn snapshot_map_from_trace_snapshots(
         // AND vref_array. resume.py:243-247 _number_boxes consumes
         // vref_array as a separate section after vable_array.
         let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&tagged_to_box).collect();
-        // Extra virtual roots are raw OpRefs (not SnapshotTagged): wrap each as
-        // an untyped SnapshotBox so it rides the same unroll/bridge OpRef remap
-        // as the vable/vref sections. finish() reads only their position OpRef.
-        let extra_virtual_roots: Vec<SnapshotBox> = snap
-            .extra_virtual_roots
-            .iter()
-            .map(|opref| SnapshotBox::from(*opref))
-            .collect();
         let frame_pcs: Vec<(i32, i32)> = snap
             .frames
             .iter()
@@ -572,10 +562,9 @@ fn snapshot_map_from_trace_snapshots(
         snapshot_insert(&mut size_map, id, frame_sizes);
         snapshot_insert(&mut vable_map, id, vable_boxes);
         snapshot_insert(&mut vref_map, id, vref_boxes);
-        snapshot_insert(&mut evr_map, id, extra_virtual_roots);
         snapshot_insert(&mut pc_map, id, frame_pcs);
     }
-    (box_map, size_map, vable_map, vref_map, evr_map, pc_map)
+    (box_map, size_map, vable_map, vref_map, pc_map)
 }
 
 struct PreparedBridgeTrace {
@@ -585,7 +574,6 @@ struct PreparedBridgeTrace {
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
     snapshot_vref_boxes: SnapshotBoxes,
-    snapshot_extra_virtual_roots: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
@@ -672,7 +660,6 @@ fn prepare_bridge_trace_for_optimizer(
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
     snapshot_vref_boxes: SnapshotBoxes,
-    snapshot_extra_virtual_roots: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
@@ -721,8 +708,6 @@ fn prepare_bridge_trace_for_optimizer(
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
     let snapshot_vref_boxes = translate_trace_iter_box_map(snapshot_vref_boxes, &cache);
-    let snapshot_extra_virtual_roots =
-        translate_trace_iter_box_map(snapshot_extra_virtual_roots, &cache);
     let pending_bridge_rd = pending_bridge_rd.map(|mut prd| {
         prd.liveboxes = prd
             .liveboxes
@@ -747,7 +732,6 @@ fn prepare_bridge_trace_for_optimizer(
         snapshot_frame_sizes,
         snapshot_vable_boxes,
         snapshot_vref_boxes,
-        snapshot_extra_virtual_roots,
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
@@ -5467,7 +5451,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_evr_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is an
@@ -5478,7 +5461,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-        unroll_opt.snapshot_extra_virtual_roots = snapshot_evr_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
         // The original snapshot maps are re-cloned into `simple_opt` on the
         // InvalidLoop retry below, so they must stay rooted across the WHOLE
@@ -5604,10 +5586,6 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map;
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map;
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map;
-                        // Extra virtual roots carry only non-const virtual OpRefs
-                        // (no inline ConstPtr gcrefs), so they are not part of the
-                        // const-ptr root-slot set above; move the map through.
-                        simple_opt.snapshot_extra_virtual_roots = snapshot_evr_map;
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map;
                         simple_opt.call_pure_results = call_pure_results.clone();
                         // Forward the recorder's operand pool — the retry path
@@ -6519,7 +6497,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_sizes,
             mut snapshot_vable_boxes,
             mut snapshot_vref_boxes,
-            snapshot_extra_virtual_roots,
             snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
@@ -6606,7 +6583,6 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
                     snapshot_vref_boxes,
-                    snapshot_extra_virtual_roots,
                     snapshot_frame_pcs,
                     call_pure_results,
                 );
@@ -6640,7 +6616,6 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
                     snapshot_vref_boxes,
-                    snapshot_extra_virtual_roots,
                     snapshot_frame_pcs,
                 );
                 if success {
@@ -6861,7 +6836,6 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_frame_sizes,
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
-            retrace_snapshot_extra_virtual_roots,
             retrace_snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
@@ -6875,7 +6849,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_vref_boxes = retrace_snapshot_vref_boxes;
-        unroll_opt.snapshot_extra_virtual_roots = retrace_snapshot_extra_virtual_roots;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
@@ -7406,7 +7379,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_evr_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
@@ -7426,7 +7398,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
-        optimizer.snapshot_extra_virtual_roots = snapshot_evr_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
         // InvalidLoop during optimization should abort the trace, not crash
@@ -7819,7 +7790,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_evr_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
@@ -7831,7 +7801,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
-        optimizer.snapshot_extra_virtual_roots = snapshot_evr_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
         let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
@@ -9921,7 +9890,6 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
-        snapshot_extra_virtual_roots: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
@@ -9966,7 +9934,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_sizes,
             snapshot_vable_boxes,
             snapshot_vref_boxes,
-            snapshot_extra_virtual_roots,
             snapshot_frame_pcs,
             None,
             bridge_runtime_boxes,
@@ -9996,7 +9963,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
-        optimizer.snapshot_extra_virtual_roots = prepared.snapshot_extra_virtual_roots;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
@@ -10365,7 +10331,6 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
-        snapshot_extra_virtual_roots: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     ) -> bool {
@@ -10557,7 +10522,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_sizes,
             snapshot_vable_boxes,
             snapshot_vref_boxes,
-            snapshot_extra_virtual_roots,
             snapshot_frame_pcs,
             pending_bridge_rd,
             bridge_runtime_boxes,
@@ -10612,7 +10576,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
-        optimizer.snapshot_extra_virtual_roots = prepared.snapshot_extra_virtual_roots;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         // Store bridge inputarg types so export_state can mint typed
         // `renamed_inputargs` OpRefs that carry their type intrinsically
@@ -19290,7 +19253,6 @@ mod tests {
             snapshot_vable_boxes,
             Vec::new(),
             Vec::new(),
-            Vec::new(),
             Some(pending_bridge_rd),
             bridge_runtime_boxes,
             10,
@@ -20453,7 +20415,6 @@ mod tests {
                 }],
                 vable_boxes: Vec::new(),
                 vref_boxes: Vec::new(),
-                extra_virtual_roots: Vec::new(),
             })
         };
         assert_eq!(snapshot_id, 0);

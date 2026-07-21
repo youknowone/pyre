@@ -980,16 +980,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 scope.branch_guard_kept_recovered,
             );
             let pc_word = resolved_offset as u32;
-            // S2b: the walker-minted extra virtual roots (the nested-list append
-            // fold's inner-list wrapper) ride the snapshot as TAGVIRTUAL worklist
-            // seeds, NOT frame-liveness boxes — they must never enter `active`
-            // (which is liveness-counted, `state.rs` setup_bridge_sym assert) nor
-            // `vable_boxes` (size-exact, `resume.rs` consume_vable_info assert).
-            let extra_virtual_roots: Vec<majit_ir::OpRef> = scope
-                .sub_walk_extra_virtual_roots
-                .iter()
-                .map(|(opref, _ty)| *opref)
-                .collect();
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
                     &active,
@@ -997,7 +987,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     pc_word,
                     &vable_boxes,
                     &vref_boxes,
-                    &extra_virtual_roots,
                 );
             return Ok(());
         }
@@ -1029,8 +1018,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             arm_pc_word,
             &vable_boxes,
             &vref_boxes,
-            // Per-opcode arm path: not the nested-list append fold, no extra roots.
-            &[],
         );
     Ok(())
 }

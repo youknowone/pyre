@@ -754,12 +754,6 @@ pub struct OptContext {
     /// resume.py:243-247 _number_boxes consumes vref_array as a section
     /// after vable_array. opencoder.py:767 records vref_boxes here.
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard extra virtual roots (nested-list append fold's inner-list
-    /// wrapper) from tracing-time snapshots. Seeded into finish()'s virtual
-    /// worklist off the frame section. Empty except behind
-    /// `PYRE_NESTED_LIST_FOLD_VIRT`. Stored as `SnapshotBoxes` so they ride the
-    /// same unroll/bridge OpRef remap as the vable/vref sections.
-    pub snapshot_extra_virtual_roots: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
@@ -1697,7 +1691,6 @@ impl OptContext {
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
-            snapshot_extra_virtual_roots: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
@@ -2283,7 +2276,6 @@ impl OptContext {
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
-            snapshot_extra_virtual_roots: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
@@ -6340,28 +6332,10 @@ impl OptContext {
             return;
         };
 
-        // Extra virtual roots for this guard position — the nested-list append
-        // fold's inner-list wrapper, reachable only as a field of the outer
-        // virtual. Seeded into finish()'s virtual worklist off the frame section
-        // (empty except behind PYRE_NESTED_LIST_FOLD_VIRT). Stored as untyped
-        // SnapshotBoxes so they ride the same unroll/bridge OpRef remap as the
-        // vable/vref sections; finish() only reads their position OpRef.
-        let extra_virtual_roots: Vec<OpRef> = snapshot_get(
-            &self.snapshot_extra_virtual_roots,
-            op.rd_resume_position.get(),
-        )
-        .map(|boxes| boxes.iter().map(|b| b.opref()).collect())
-        .unwrap_or_default();
-
         // resume.py:428-445, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
-        let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) = memo.finish(
-            numb_state,
-            &env,
-            &mut pending_setfields,
-            knowledge.as_ref(),
-            &extra_virtual_roots,
-        );
+        let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
+            memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref());
 
         if crate::callee_rca_enabled() {
             let vable_items = if rd_numb.len() >= 3 {

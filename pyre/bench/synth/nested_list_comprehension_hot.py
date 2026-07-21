@@ -1,15 +1,15 @@
 # An inlined list comprehension whose LIST_APPEND element is a non-empty nested
 # list (`[[i] …]` / `[[i, i + 1] …]`). The #171 fold virtualizes the inner list,
-# but its separately allocated backing block (NewArray / NewArrayClear) carries
-# no jitcode-liveness color, so it is not rooted in the append commit sub-walk's
-# guard-exit resume data and a deopt resolves it to a null OpRef.
+# whose separately allocated backing block (NewArray / NewArrayClear) carries no
+# jitcode-liveness color. Once the trace-time single-executor forks were retired
+# the append body no longer runs under a speculative-replay sub-walk, so the
+# backing block is bound at every guard-exit deopt without an extra resume-data
+# root; the shape is admitted by default (PYRE_NESTED_LIST_FOLD_VIRT, default-on).
 #
-# Held back behind the DEFAULT-OFF PYRE_NESTED_LIST_FOLD_VIRT gate: while the
-# gate is off `for_iter_bodies_all_jit_safe` declines the shape, so this runs in
-# the interpreter and prints the correct total. It is the acceptance repro for
-# the recursive virtual-list-forcing rooting work — with the gate on it must
-# still print the same total on all three backends (dynasm / cranelift / wasm)
-# once the rooting lands.
+# Acceptance repro for that fold: it must print the same total on all three
+# backends (dynasm / cranelift / wasm). Set PYRE_NESTED_LIST_FOLD_VIRT=0 to fall
+# back to the `for_iter_bodies_all_jit_safe` interpreter decline (native only —
+# the wasm guest cannot read the env var).
 
 
 def single_comp(n):

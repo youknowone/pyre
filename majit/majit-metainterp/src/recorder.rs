@@ -59,18 +59,6 @@ pub struct Snapshot {
     pub vable_boxes: Vec<SnapshotTagged>,
     /// VirtualRef box references (tagged).
     pub vref_boxes: Vec<SnapshotTagged>,
-    /// Extra virtual roots to seed into the resume-data virtual worklist
-    /// beyond the frame's liveness boxes and the vable/vref prefixes — virtual
-    /// op-results reachable only as a field of another walker-minted virtual,
-    /// with no frame-liveness slot of their own.  Each entry is numbered
-    /// `TAGVIRTUAL` (off the liveness-counted frame section), so
-    /// `_number_boxes` / `finish` descends into it via
-    /// `get_virtual_fields` exactly as it does for a live TAGVIRTUAL box
-    /// (`_visitor_walk_recursive`).  Empty on every path except the
-    /// nested-list append fold behind `PYRE_NESTED_LIST_FOLD_VIRT`; the inner
-    /// `[[i] …]` wrapper enters here so its separately allocated backing block
-    /// is rooted in resume data.
-    pub extra_virtual_roots: Vec<OpRef>,
 }
 
 /// One frame in a snapshot — corresponds to one MIFrame/JitCode position.

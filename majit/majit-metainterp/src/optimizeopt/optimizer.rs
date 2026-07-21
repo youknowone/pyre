@@ -438,10 +438,6 @@ pub struct Optimizer {
     /// section. opencoder.py:767 create_top_snapshot records vref_boxes
     /// alongside vable_boxes.
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard extra virtual roots (nested-list append fold's inner-list
-    /// wrapper) from tracing-time snapshots. Empty except behind
-    /// `PYRE_NESTED_LIST_FOLD_VIRT`.
-    pub snapshot_extra_virtual_roots: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// Phase 1 emit ops carried into Phase 2's lookup surface (6).
@@ -1409,7 +1405,6 @@ impl Optimizer {
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
-            snapshot_extra_virtual_roots: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             opt_ops_emitted: 0,
@@ -2464,7 +2459,6 @@ impl Optimizer {
             .iter()
             .chain(self.snapshot_vable_boxes.iter())
             .chain(self.snapshot_vref_boxes.iter())
-            .chain(self.snapshot_extra_virtual_roots.iter())
             .flatten()
             .flat_map(|boxes| boxes.iter().map(|boxref| boxref.opref()))
             .filter(|opref| !opref.is_none() && !opref.is_constant())
@@ -2491,7 +2485,6 @@ impl Optimizer {
         ctx.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
         ctx.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
         ctx.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
-        ctx.snapshot_extra_virtual_roots = std::mem::take(&mut self.snapshot_extra_virtual_roots);
         ctx.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
 
         sanitize_backend_constants_for_ops(ops.iter().map(|op| &**op), constants);

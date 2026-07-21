@@ -294,10 +294,6 @@ pub struct UnrollOptimizer {
     /// (resume.py:243-247 vref_array — _number_boxes consumes them
     /// after the virtualizable array).
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard extra virtual roots (nested-list append fold's inner-list
-    /// wrapper) from tracing-time snapshots. Empty except behind
-    /// `PYRE_NESTED_LIST_FOLD_VIRT`.
-    pub snapshot_extra_virtual_roots: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
@@ -388,7 +384,6 @@ impl UnrollOptimizer {
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
-            snapshot_extra_virtual_roots: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             all_descrs: Vec::new(),
             quasi_immutable_deps: Vec::new(),
@@ -632,13 +627,11 @@ impl UnrollOptimizer {
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
-            opt_p1.snapshot_extra_virtual_roots = self.snapshot_extra_virtual_roots.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
                 &mut opt_p1.snapshot_boxes,
                 &mut opt_p1.snapshot_vable_boxes,
                 &mut opt_p1.snapshot_vref_boxes,
-                &mut opt_p1.snapshot_extra_virtual_roots,
             ]));
             opt_p1.call_pure_results = self.call_pure_results.clone();
             // RPython optimize_preamble (unroll.py:101-103): flush=False.
@@ -956,8 +949,6 @@ impl UnrollOptimizer {
         opt_p2.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
         opt_p2.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
         opt_p2.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
-        opt_p2.snapshot_extra_virtual_roots =
-            std::mem::take(&mut self.snapshot_extra_virtual_roots);
         opt_p2.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
         opt_p2.call_pure_results = std::mem::take(&mut self.call_pure_results);
         // RPython: same Optimizer instance keeps patchguardop across phases.
@@ -1114,16 +1105,10 @@ impl UnrollOptimizer {
                 *r = r.map_opref(translate_opref);
             }
         }
-        for boxes in opt_p2.snapshot_extra_virtual_roots.iter_mut().flatten() {
-            for r in boxes.iter_mut() {
-                *r = r.map_opref(translate_opref);
-            }
-        }
         self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [
             &mut opt_p2.snapshot_boxes,
             &mut opt_p2.snapshot_vable_boxes,
             &mut opt_p2.snapshot_vref_boxes,
-            &mut opt_p2.snapshot_extra_virtual_roots,
         ]));
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
@@ -5781,15 +5766,6 @@ fn clone_guard_snapshot_remapped(
             &mut ctx.snapshot_vref_boxes,
             new_pos,
             remap_snapshot_boxes(&vref_boxes, ref_map),
-        );
-    }
-    if let Some(extra_virtual_roots) =
-        snapshot_get(&ctx.snapshot_extra_virtual_roots, old_pos).cloned()
-    {
-        snapshot_insert(
-            &mut ctx.snapshot_extra_virtual_roots,
-            new_pos,
-            remap_snapshot_boxes(&extra_virtual_roots, ref_map),
         );
     }
     if let Some(frame_pcs) = snapshot_get(&ctx.snapshot_frame_pcs, old_pos).cloned() {

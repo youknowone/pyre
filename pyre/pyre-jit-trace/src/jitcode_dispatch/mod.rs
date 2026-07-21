@@ -3828,21 +3828,6 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// with the exact, depth-independent edge resolution. Empty outside the
     /// gated kept-stack path.
     pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
-
-    /// Extra virtual roots to seed into the guard snapshot beyond the outer
-    /// Python frame's jitcode-liveness boxes — walker-minted virtual op-results
-    /// that carry no liveness color yet must survive a deopt as fail-arg roots.
-    /// The motivating case is the `w_list_append` commit sub-walk over a
-    /// non-empty nested list element (`[[i] for i in range(n)]`): the appended
-    /// inner-list wrapper is passed to the sub-walk as a register arg but is not
-    /// named by any live outer color, so without an explicit root the resume
-    /// recursion never descends into it and its backing block resolves to a null
-    /// `OpRef`. Each entry is the `(OpRef, Type)` of a root the snapshot builder
-    /// must append to the top frame's boxes so the ported
-    /// `_visitor_walk_recursive` registers the nested virtual (wrapper + backing
-    /// block) in resume data. Empty on every path today: only populated behind
-    /// the DEFAULT-OFF `PYRE_NESTED_LIST_FOLD_VIRT` gate, so this is dormant.
-    pub sub_walk_extra_virtual_roots: &'a [(OpRef, majit_ir::Type)],
 }
 
 /// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
