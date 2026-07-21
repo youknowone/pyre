@@ -183,8 +183,11 @@ impl Logger {
     pub fn summary(&self) -> String {
         let total_before = self.total_ops_before();
         let total_after = self.total_ops_after();
+        // Signed in f64: optimization can raise the op count (guards/spills), so
+        // `total_after > total_before` is a legitimate negative reduction, not an
+        // unsigned-subtraction underflow.
         let reduction_pct = if total_before > 0 {
-            ((total_before - total_after) as f64 / total_before as f64) * 100.0
+            (total_before as f64 - total_after as f64) / total_before as f64 * 100.0
         } else {
             0.0
         };
