@@ -134,7 +134,13 @@ pub enum StepResult<V> {
 }
 
 pub fn decode_instruction_at(code: &CodeObject, pc: usize) -> Option<(Instruction, OpArg)> {
-    let code_unit = *code.instructions.get(pc)?;
+    // closure-free, Option-pattern-free `instructions.get(pc)` rewrite — see
+    // execute_load_fast for the rationale; keeps the bounds check a plain
+    // `lt + getitem` instead of walking into `Option<&CodeUnit>`.
+    if pc >= code_instructions_len(code) {
+        return None;
+    }
+    let code_unit = code.instructions[pc];
     let mut start = pc;
     while start > 0 {
         let prev = code.instructions[start - 1];
@@ -181,7 +187,9 @@ pub fn code_is_self_recursive(code: &CodeObject) -> bool {
         let (instruction, op_arg) = arg_state.get(unit);
         if let Instruction::LoadGlobal { namei } = instruction {
             let name_idx = (namei.get(op_arg) as usize) >> 1;
-            if code.names.get(name_idx).map(|n| n.as_ref()) == Some(own_name) {
+            // closure-free, Option-pattern-free `names.get(name_idx)` rewrite —
+            // keeps the bounds check a plain `lt + getitem`.
+            if name_idx < code.names.len() && code.names[name_idx].as_str() == own_name {
                 return true;
             }
         }
@@ -245,13 +253,14 @@ pub fn decode_instruction_forward(
 ) -> Result<(usize, Instruction, OpArg), crate::pycode::BytecodeCorruption> {
     // Back up over any `ExtendedArg` prefix so accumulation starts at the
     // logical instruction start. Zero iterations when `pc` is already a
-    // logical start (no preceding `ExtendedArg`).
+    // logical start (no preceding `ExtendedArg`). The `start - 1 < len` guard
+    // is a closure-free, Option-pattern-free rewrite of
+    // `.get(start - 1).is_some_and(..)` (see execute_load_fast for the
+    // rationale), keeping the bounds check a plain `lt + getitem`.
     let mut start = pc;
     while start > 0
-        && code
-            .instructions
-            .get(start - 1)
-            .is_some_and(|unit| matches!(unit.op, Instruction::ExtendedArg))
+        && start - 1 < code_instructions_len(code)
+        && matches!(code.instructions[start - 1].op, Instruction::ExtendedArg)
     {
         start -= 1;
     }
@@ -259,10 +268,10 @@ pub fn decode_instruction_forward(
     let mut opcode_pc = start;
     let mut state = OpArgState::default();
     loop {
-        let unit = *code
-            .instructions
-            .get(opcode_pc)
-            .ok_or(crate::pycode::BytecodeCorruption)?;
+        if opcode_pc >= code_instructions_len(code) {
+            return Err(crate::pycode::BytecodeCorruption);
+        }
+        let unit = code.instructions[opcode_pc];
         let (instruction, op_arg) = state.get(unit);
         if matches!(instruction, Instruction::ExtendedArg) {
             opcode_pc += 1;
@@ -1888,6 +1897,17 @@ pub fn raise_kind_arg_as_usize(
 #[majit_macros::elidable_cannot_raise]
 pub fn code_varnames_len(code: &CodeObject) -> usize {
     code.varnames.len()
+}
+
+/// Length of the instruction array behind an `#[elidable_cannot_raise]`
+/// first-party wrapper — same rationale as [`code_varnames_len`]. Lets the
+/// decode funnel's bounds check lower to a plain `lt + getitem` on
+/// `code.instructions[pc]` instead of a `slice::get(pc) -> Option<&CodeUnit>`
+/// the walker cannot fold.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+pub fn code_instructions_len(code: &CodeObject) -> usize {
+    code.instructions.len()
 }
 
 /// Extract a [`RaiseKind`]'s discriminant as `usize`. Same parity

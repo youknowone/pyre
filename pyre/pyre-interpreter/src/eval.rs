@@ -3163,7 +3163,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn delete_fast(&mut self, idx: usize) -> Result<(), PyError> {
         if self.locals_w()[idx].is_null() {
             let code = unsafe { &*crate::pyframe_get_pycode(self) };
-            let name = code.varnames.get(idx).map(String::as_str).unwrap_or("");
+            let name = if idx < code.varnames.len() {
+                code.varnames[idx].as_str()
+            } else {
+                ""
+            };
             return Err(PyError::unbound_local_error_with_name(
                 format!(
                     "cannot access local variable '{name}' where it is not associated with a value"

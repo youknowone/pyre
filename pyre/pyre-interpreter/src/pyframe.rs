@@ -1411,9 +1411,11 @@ pub fn ncells(code: &CodeObject) -> usize {
 #[inline]
 #[majit_macros::elidable_cannot_raise]
 pub fn hidden_local(code: &CodeObject, idx: usize) -> bool {
-    code.localspluskinds
-        .get(idx)
-        .is_some_and(|&kind| kind & crate::bytecode::CO_FAST_HIDDEN != 0)
+    // closure-free, Option-pattern-free `localspluskinds.get(idx)` rewrite —
+    // keeps the bounds check a plain `lt + getitem` instead of walking into an
+    // `Option<&u8>` the walker cannot fold.
+    idx < code.localspluskinds.len()
+        && code.localspluskinds[idx] & crate::bytecode::CO_FAST_HIDDEN != 0
 }
 
 /// `LOAD_DEREF` unbound-variable error for the unified deref slot `idx`,
@@ -1456,11 +1458,12 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
             .unwrap_or("");
         (name, false)
     } else {
-        let name = code
-            .freevars
-            .get(cell_slot - npure)
-            .map(|f| f.as_ref())
-            .unwrap_or("");
+        let free_idx = cell_slot - npure;
+        let name = if free_idx < code.freevars.len() {
+            code.freevars[free_idx].as_ref()
+        } else {
+            ""
+        };
         (name, true)
     }
 }
@@ -3535,7 +3538,14 @@ pub fn load_const_from_code(code: &CodeObject, idx: usize) -> PyObjectRef {
 /// full-body walker to resolve a `LOAD_GLOBAL` namei to the name string for
 /// the module-dict cell-cache lookup.  `None` when `idx` is out of range.
 pub fn load_name_from_code(code: &CodeObject, idx: usize) -> Option<&str> {
-    code.names.get(idx).map(|s| s.as_str())
+    // closure-free, Option-pattern-free `names.get(idx)` rewrite — keeps the
+    // bounds check a plain `lt + getitem` instead of walking into an
+    // `Option<&String>` the walker cannot fold.
+    if idx < code.names.len() {
+        Some(code.names[idx].as_str())
+    } else {
+        None
+    }
 }
 
 pub(crate) fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantData] {

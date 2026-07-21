@@ -839,8 +839,11 @@ pub unsafe fn code_varname_from_oparg(
     let code = unsafe { require_code(obj, "_varname_from_oparg")? };
     let mut index = unsafe { crate::builtins::space_index_w(index)? };
     if index >= 0 {
-        if let Some(name) = code.varnames.get(index as usize) {
-            return Ok(w_str_new(name));
+        // closure-free, Option-pattern-free `varnames.get` / `freevars.get`
+        // rewrites — keep the bounds check a plain `lt + getitem`.
+        let vi = index as usize;
+        if vi < code.varnames.len() {
+            return Ok(w_str_new(&code.varnames[vi]));
         }
         index -= code.varnames.len() as i64;
         let pure_cellvars = code
@@ -852,8 +855,9 @@ pub unsafe fn code_varname_from_oparg(
             return Ok(w_str_new(name));
         }
         index -= pure_cellvar_count as i64;
-        if let Some(name) = code.freevars.get(index as usize) {
-            return Ok(w_str_new(name));
+        let fi = index as usize;
+        if fi < code.freevars.len() {
+            return Ok(w_str_new(&code.freevars[fi]));
         }
     }
     Err(crate::PyError::new(
@@ -1350,7 +1354,12 @@ pub unsafe fn w_code_co_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRe
     }
     let code = unsafe { &*(w_code.code_ptr as *const crate::CodeObject) };
     let constants = crate::pyframe::code_constants(code);
-    let Some(crate::bytecode::ConstantData::Code { code: nested }) = constants.get(idx) else {
+    // closure-free, Option-pattern-free `constants.get(idx)` rewrite — keep the
+    // bounds check a plain `lt + getitem` ahead of the variant destructure.
+    if idx >= constants.len() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let crate::bytecode::ConstantData::Code { code: nested } = &constants[idx] else {
         return pyre_object::pyobject::PY_NULL;
     };
     if w_code.co_consts_w.is_null() {
