@@ -1787,7 +1787,8 @@ unsafe fn try_compare_override(
     };
     for (ov, recv, other) in order {
         if let Some((method, w_type)) = ov {
-            let result = crate::baseobjspace::get_and_call_function(method, recv, w_type, &[other])?;
+            let result =
+                crate::baseobjspace::get_and_call_function(method, recv, w_type, &[other])?;
             if !is_not_implemented(result) {
                 return Ok(Some(result));
             }

@@ -5634,12 +5634,26 @@ impl<'a> Lowering<'a> {
                 // read collapses to the bound element), and record the
                 // `(base, index)` pair so the paired `*p = v` write
                 // (`arr[i] = v` desugar) emits `ArrayWrite` from the
-                // `emit_projection_write` `Deref` arm.  `Vec<T>::index`
-                // ([`is_vec_index_call`]) lowers identically — the
-                // resized-list indirection is supplied downstream by the
-                // repr-dispatched `getitem`, not here.
+                // `emit_projection_write` `Deref` arm.  `Vec<T>::index` /
+                // `Vec<T>::index_mut` ([`is_vec_index_call`]) lower
+                // identically — the resized-list indirection is supplied
+                // downstream by the repr-dispatched `getitem` / `setitem`,
+                // not here.
+                //
+                // `Vec<T>::index_mut` yields a `&mut T`; binding
+                // `local_var[dest]` to the element value is sound only when
+                // that borrow is consumed by a single in-place deref
+                // (`*p` read or `*p = v` write) and never escapes as a
+                // pointer.  Unlike the `pyre_`-fenced workspace types, std
+                // `Vec::index_mut` matches any `Vec` in the crate, so the
+                // mutable leaf is gated on the [`add_dest_used_only_as_single_deref`]
+                // escape guard (a failing shape stays residual — safe).  The
+                // read leaf (`index`, a value copy) needs no such guard.
                 if args.len() == 2
-                    && (self.is_workspace_index_call(&reg) || self.is_vec_index_call(&reg))
+                    && (self.is_workspace_index_call(&reg)
+                        || (self.is_vec_index_call(&reg)
+                            && (!is_vec_index_mut_regular(&reg, self.llbc)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local))))
                 {
                     let res = self
                         .graph
@@ -7241,47 +7255,20 @@ impl<'a> Lowering<'a> {
         is_workspace_index_regular(reg, self.llbc)
     }
 
-    /// `v[i]` on a `Vec<T>` — its `<Vec<T> as Index>::index` impl,
-    /// returning `&T`.  Unlike the workspace fixed arrays
-    /// ([`is_workspace_index_call`]), the receiver is a resized
-    /// `ListRepr` (`length` + `items` block), so the element load goes
-    /// through the rtyper's `getitem` (`AbstractBaseListRepr.rtype_getitem`,
-    /// which loads the `items` field before indexing).  The caller lowers
-    /// both to the same `ArrayRead`; the flowspace `getitem` it becomes is
-    /// repr-dispatched, so the resized indirection is added by
-    /// `rtype_getitem` rather than the front end.  Owner/leaf are derived
-    /// the same way [`call_target_segments`] derives the call key
-    /// (`impl_method_owner_for_fundecl`), so the match tracks the segment
-    /// spelling (`["vec", "Vec", "index"]`) the generic fallback would
-    /// otherwise leave unregistered.
-    ///
-    /// Restricted to the integer-index impl (`Index<usize>`, the element
-    /// load).  `Vec`'s `Index<Range<…>>` impls share the `index` leaf but
-    /// return a sub-`&[T]` slice, not an element — lowering those to a
-    /// scalar `ArrayRead` would mis-index, so the index type must be an
-    /// integer.  Charon runs `monomorphize:false`, so the `index`
-    /// signature keeps the generic index param `I` (a `TypeVar` typing as
-    /// `Ref`); the concrete index type is the callsite substitution
-    /// `types[1]` of the impl generics `[T, I, A]`.  `Index<usize>` types
-    /// as `Int`; `Index<Range<…>>` resolves to a `Range*` Adt (`Ref`) and
-    /// stays foreign.
+    /// `v[i]` / `v[i] = x` on a `Vec<T>` — its `<Vec<T> as Index>::index`
+    /// (read) or `<Vec<T> as IndexMut>::index_mut` (write) impl.  Unlike
+    /// the workspace fixed arrays ([`is_workspace_index_call`]), the
+    /// receiver is a resized `ListRepr` (`length` + `items` block), so the
+    /// element load goes through the rtyper's `getitem`
+    /// (`AbstractBaseListRepr.rtype_getitem`, which loads the `items` field
+    /// before indexing).  The caller lowers the read to `ArrayRead` and the
+    /// paired `*p = v` write to `ArrayWrite`; the flowspace `getitem` /
+    /// `setitem` they become are repr-dispatched, so the resized
+    /// indirection is added by `rtype_getitem` / `rtype_setitem` rather than
+    /// the front end.  Delegates to the free [`is_vec_index_regular`] so the
+    /// same gate is shared with the deferred-write liveness pre-pass.
     fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let owner_leaf_ok = self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            impl_method_owner_for_fundecl(self.llbc, fd)
-                .is_some_and(|(owner, leaf)| owner == "vec::Vec" && leaf == "index")
-        });
-        if !owner_leaf_ok {
-            return false;
-        }
-        reg.generics
-            .get("types")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|tys| tys.get(1))
-            .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-            .is_some_and(|t| matches!(tyref_to_value_type(&t, self.llbc), ValueType::Int))
+        is_vec_index_regular(reg, self.llbc)
     }
 
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
@@ -10007,6 +9994,62 @@ fn is_workspace_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
     (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
 }
 
+/// The `Vec<T>` index leaf a statically-resolved [`RegularCall`] resolves
+/// to — `"index"` (`<Vec<T> as Index>::index`, read) or `"index_mut"`
+/// (`<Vec<T> as IndexMut>::index_mut`, write) — restricted to the
+/// integer-index impl.  `Vec`'s `Index<Range<…>>` / `IndexMut<Range<…>>`
+/// impls share the same leaf but return a sub-`&[T]` slice, not an element;
+/// lowering those to a scalar `ArrayRead` / `ArrayWrite` would mis-index,
+/// so the index type must be an integer.  Charon runs `monomorphize:false`,
+/// so the signature keeps the generic index param `I` (a `TypeVar` typing
+/// as `Ref`); the concrete index type is the callsite substitution
+/// `types[1]` of the impl generics `[T, I, A]`.  `Index<usize>` types as
+/// `Int`; `Index<Range<…>>` resolves to a `Range*` Adt (`Ref`) and returns
+/// `None`.  Owner/leaf are derived the same way [`call_target_segments`]
+/// derives the call key (`impl_method_owner_for_fundecl`).  Free so the
+/// same gate is shared by the call-lowering intercept and the deferred-write
+/// liveness pre-pass.
+fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let leaf = llbc.fn_by_id(*id).and_then(|fd| {
+        impl_method_owner_for_fundecl(llbc, fd).and_then(|(owner, leaf)| {
+            if owner != "vec::Vec" {
+                return None;
+            }
+            match leaf.as_str() {
+                "index" => Some("index"),
+                "index_mut" => Some("index_mut"),
+                _ => None,
+            }
+        })
+    })?;
+    let int_indexed = reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tys| tys.get(1))
+        .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
+        .is_some_and(|t| matches!(tyref_to_value_type(&t, llbc), ValueType::Int));
+    int_indexed.then_some(leaf)
+}
+
+/// Whether a [`RegularCall`] is a `Vec<T>` `index` **or** `index_mut` on an
+/// integer index (see [`vec_index_regular_leaf`]).
+fn is_vec_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
+    vec_index_regular_leaf(reg, llbc).is_some()
+}
+
+/// Whether a [`RegularCall`] is specifically a `Vec<T>::index_mut` on an
+/// integer index — the write half, which yields a `&mut T` and so must pass
+/// the single-deref escape guard before it may be devirtualized to an
+/// `ArrayWrite` (the read leaf `index` yields a value copy and needs no
+/// guard).
+fn is_vec_index_mut_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
+    vec_index_regular_leaf(reg, llbc) == Some("index_mut")
+}
+
 /// Whether a statically-resolved [`RegularCall`] is `<*mut T>::add` /
 /// `<*const T>::add` (`core::ptr::{mut_ptr,const_ptr}::<Impl>::add`) —
 /// the only `.add` spellings the items-base accessor collapse
@@ -10349,11 +10392,17 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
         let PlaceKind::Local(p) = call.dest.kind else {
             continue;
         };
-        // Both the workspace `index_mut` call and brick 3's
-        // `*base.add(idx)` defer their `*p = v` write to a later block,
-        // where the base / index operands are no longer spelled (the
-        // `ArrayWrite` is synthesised by `emit_projection_write`).
+        // The workspace `index_mut` call, `Vec<T>::index_mut`, and brick
+        // 3's `*base.add(idx)` all defer their `*p = v` write to a later
+        // block, where the base / index operands are no longer spelled (the
+        // `ArrayWrite` is synthesised by `emit_projection_write`).  The Vec
+        // arm must be gated on the identical escape guard the intercept
+        // applies, so the two stay in lockstep — threading a live-set entry
+        // for a write the intercept declined to lift would leave the base
+        // undefined.
         let is_deferred_write_producer = is_workspace_index_regular(reg, llbc)
+            || (is_vec_index_mut_regular(reg, llbc)
+                && add_dest_used_only_as_single_deref(body, p as usize))
             || is_list_items_elem_ptr_add_parts(
                 reg,
                 call.args.len(),
@@ -17665,6 +17714,52 @@ mod tests {
         assert_eq!(
             branch_calls, 0,
             "lookup: residual Try::branch Method-call after the recast-break-arm fold"
+        );
+    }
+
+    /// Real-LLBC anchor for the `Vec<T>::index_mut` write-lift: the
+    /// arg-fill path `fill_user_function_args` writes its `filled_args`
+    /// slots via `Vec::index_mut`; after the fold there must be no residual
+    /// `["vec","Vec","index_mut"]` call and at least one native `ArrayWrite`
+    /// (setarrayitem).  `#[ignore]`d (loads the ~440MB real LLBC); run with
+    /// `cargo test -p majit-translate --lib vec_index_mut_fill_user_function_args_real
+    /// -- --ignored`.
+    #[test]
+    #[ignore]
+    fn vec_index_mut_fill_user_function_args_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "fill_user_function_args")
+            .expect("lower fill_user_function_args");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["vec", "Vec", "index_mut"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "fill_user_function_args: residual vec::Vec::index_mut after the write-lift"
+        );
+        let array_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::ArrayWrite { .. }))
+            .count();
+        assert!(
+            array_writes >= 1,
+            "fill_user_function_args: expected at least one native ArrayWrite (setarrayitem)"
         );
     }
 }
