@@ -1829,9 +1829,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // lookup is read-only (it does not remove the entry); OpRef SSA-uniqueness
     // (`recorder.rs`) guarantees the box opref never re-binds within one walk,
     // so a stale mis-fold is impossible and physical removal is unnecessary.
-    // Full-body walks only: `BOOL_BOX_TRUTH` is reset at FBW walk entry;
-    // an arm walk consulting it could read a stale OpRef key from an
-    // earlier FBW walk's recorder.
+    // Authoritative walks only: `BOOL_BOX_TRUTH` is reset at FBW walk
+    // entry; a non-authoritative context consulting it could read a stale
+    // OpRef key from an earlier walk's recorder.
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
         if let Some(truth) = bool_box_truth_lookup(r_args[0]) {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;

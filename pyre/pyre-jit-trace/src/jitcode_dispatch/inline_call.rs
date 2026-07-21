@@ -575,9 +575,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
     // Default ON since the Phase 5 flip; `PYRE_FBW_REC_CA=0` opts out.
-    // Full-body walks only: the CALL_ASSEMBLER record + walk-commit
-    // bookkeeping is FBW machinery; the per-opcode arm walk records the
-    // plain residual instead.
+    // Authoritative walks only: the CALL_ASSEMBLER record + walk-commit
+    // bookkeeping is FBW machinery; a non-authoritative context (the
+    // diagnostic probe, tests) records the plain residual instead.
     if !ctx.is_authoritative_executor
         || std::env::var_os("PYRE_FBW_REC_CA").as_deref() == Some(std::ffi::OsStr::new("0"))
     {
@@ -1183,8 +1183,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Default ON since the Phase 5 flip; `PYRE_FBW_INLINE=0` opts out.
-    // Full-body walks only: inline sub-walks lean on FBW multi-frame
-    // snapshot plumbing the per-opcode arm walk does not carry.
+    // Authoritative walks only: inline sub-walks lean on FBW multi-frame
+    // snapshot plumbing a non-authoritative context does not carry.
     if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0") {
         return Ok(None);
     }

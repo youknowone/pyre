@@ -250,8 +250,9 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
     let array_pool_idx = read_pool_idx(array_offset);
     // RPython `MIFrame.vable_array_index_pair_at` reads `self.descrs[idx]`
     // — pyre's single per-walk pool, selected by `ctx.raw_descrs`
-    // (global `ALL_DESCRS` for arm walks, per-`CodeObject` `exec.descrs`
-    // for full-body walks).
+    // (global `ALL_DESCRS` only for the build-time canonical jitcode a
+    // specialization sub-walk inlines, per-`CodeObject` `exec.descrs`
+    // otherwise).
     let array_field_index = match (
         ctx.raw_descrs.bh_descr_at(field_idx),
         ctx.raw_descrs.bh_descr_at(array_pool_idx),

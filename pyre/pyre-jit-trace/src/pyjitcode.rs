@@ -752,14 +752,13 @@ impl PyJitCode {
     }
 
     /// Resolve a kept-stack branch guard's resume offset from its carried
-    /// direct JitCode coordinate alone (gh#368: the direct coordinate is the
-    /// resume key). The full-body-walk bridge entry seam only ever reaches a
+    /// direct JitCode coordinate alone — the direct coordinate is the resume
+    /// key. The full-body-walk bridge entry seam only ever reaches a
     /// non-sentinel `carried` (both callers gate on `!= NO_JITCODE_PC`), and a
     /// kept-stack branch guard's carried word is always a `-live-`-anchored
-    /// startpoint, so the stored Python pc is redundant here — the
-    /// `resume_jitcode_pc_for` fallback [`Self::resolve_resume_pc_with_jitcode_pc`]
-    /// keeps for other seams is dead at this one. `None` when the carried word
-    /// does not name a decodable startpoint (the caller keeps the pc_map entry).
+    /// startpoint, so no Python pc is consulted. `None` when the carried word
+    /// does not name a decodable startpoint, which declines the bridge at the
+    /// caller.
     pub fn resolve_bridge_walk_entry_pc(&self, carried: i32, op_live: u8) -> Option<usize> {
         let carried = crate::jitcode_dispatch::expand_branch_carried(self, carried);
         let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC

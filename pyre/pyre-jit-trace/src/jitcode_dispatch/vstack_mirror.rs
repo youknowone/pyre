@@ -597,9 +597,8 @@ pub(crate) fn vstack_step_py_pc(
 /// [`reconcile_vstack_at_boundary`]).
 ///
 /// No-op unless the outer full-body sym owns the virtualizable shadow and
-/// `vstack_valid` is still set.  Reached only on the full-body walk
-/// (`fbw_mode.snapshot_sym` non-null); the per-opcode arm walk leaves the
-/// mirror untouched (its guards use the static outer coordinate).  Writes
+/// `vstack_valid` is still set.  Reached only when the outer full-body sym
+/// owns the shadow (`fbw_mode.snapshot_sym` non-null).  Writes
 /// only the `vstack_*` side-fields; never the registers / snapshot.
 pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, jit_pc: usize) {
     if !ctx.vstack_valid {
