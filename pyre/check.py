@@ -316,6 +316,27 @@ def pyre_env():
     return env
 
 
+def _dump_failed_run(output, stderr, limit=40):
+    """Print the tail of a failed run's captured streams.
+
+    A self-checking guard reports only its exit code, so without this the
+    traceback that explains the failure never reaches the log and a
+    platform-specific break has to be reconstructed from the source. Bounded to
+    the last *limit* lines of each stream so a runaway script cannot flood CI.
+    """
+    for label, text in (("stdout", output), ("stderr", stderr)):
+        if not text or not text.strip():
+            continue
+        lines = text.rstrip().splitlines()
+        clipped = lines[-limit:]
+        print(f"─── {label} ───")
+        if len(clipped) < len(lines):
+            print(dim(f"... {len(lines) - len(clipped)} earlier line(s) omitted"))
+        for line in clipped:
+            print(line)
+    print("────────────────────")
+
+
 def _jit_panic_reason(stderr):
     """Return a failure reason if *stderr* shows a JIT-level Rust panic or a
     nonzero internal_compile_panics stat, else None.
@@ -1329,11 +1350,13 @@ class Check:
                 )
                 self._record(backend, False, name, detail)
                 print(f"{red('FAIL')}  {detail}")
+                _dump_failed_run(output, stderr)
                 self._append_comparison(backend, name, "-", "-", "FAIL")
                 continue
             if expect not in output:
                 self._record(backend, False, name, f"missing '{expect}'")
                 print(f"{red('FAIL')}  missing '{expect}'")
+                _dump_failed_run(output, stderr)
                 self._append_comparison(backend, name, "-", "-", "FAIL")
                 continue
             self._record(backend, True, name, "")
