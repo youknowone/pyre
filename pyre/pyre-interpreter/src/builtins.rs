@@ -51,6 +51,25 @@ unsafe fn backing_is_bytearray(obj: PyObjectRef) -> bool {
     }
 }
 
+/// Take one `_exports` count on whichever resizable exporter ultimately backs
+/// `buffer`, so the storage cannot be reallocated while a view over it is
+/// alive.  `Buffer::sub` never nests, so one parent peel is sufficient.  The
+/// matching release runs through the backing's `__release_buffer__`.
+pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer) {
+    use pyre_object::buffer::Buffer;
+    let root = match buffer {
+        Buffer::Sub { parent, .. } => parent.as_ref(),
+        other => other,
+    };
+    unsafe {
+        match root {
+            Buffer::Byte { w_obj } => pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj),
+            Buffer::Array { w_obj } => pyre_object::interp_array::w_array_exports_incref(*w_obj),
+            _ => {}
+        }
+    }
+}
+
 /// `_check_exports` — reject a size-changing mutation of a bytearray while a
 /// buffer export (a live memoryview) is outstanding.
 pub(crate) unsafe fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), crate::PyError> {
@@ -98,13 +117,16 @@ unsafe fn w_memoryview_new_derived(
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(mv_src);
-        // A derived view (copy / slice / cast) shares — never owns — the
-        // backing's export.
-        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        // A derived view stays alive independently of the view it came from,
+        // so it takes its own `_exports` count on the backing rather than
+        // relying on the source's: releasing the source must not leave this
+        // view pointing at storage the exporter is then free to reallocate.
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
         let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
         let view = derive(pyre_object::memoryview::w_memoryview_view(r_src));
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
         mv
     }
 }
@@ -120,7 +142,7 @@ unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) ->
         let sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(mv_src);
         pyre_object::gc_roots::pin_root(w_str_new(fmt));
-        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
         let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
         let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         let src_view = pyre_object::memoryview::w_memoryview_view(r_src);
@@ -132,6 +154,7 @@ unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) ->
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
         mv
     }
 }
@@ -157,7 +180,7 @@ unsafe fn w_memoryview_cast_nd(
         pyre_object::gc_roots::pin_root(w_str_new(fmt));
         pyre_object::gc_roots::pin_root(memoryview_wrap_dims(shape));
         pyre_object::gc_roots::pin_root(memoryview_wrap_dims(strides));
-        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
         let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
         let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 2);
@@ -177,6 +200,7 @@ unsafe fn w_memoryview_cast_nd(
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
         mv
     }
 }
@@ -664,25 +688,7 @@ unsafe fn memoryview_slice_view(
         // The root `Buffer` tag was fixed by `buffer_w`; follow it directly
         // instead of repeating an objspace isinstance lookup in this hot/JIT
         // path.  `Buffer::sub` never nests, so one parent peel is sufficient.
-        let backing = snapshot.backing();
-        match backing {
-            pyre_object::buffer::Buffer::Byte { w_obj } => {
-                pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
-            }
-            pyre_object::buffer::Buffer::Array { w_obj } => {
-                pyre_object::interp_array::w_array_exports_incref(*w_obj)
-            }
-            pyre_object::buffer::Buffer::Sub { parent, .. } => match parent.as_ref() {
-                pyre_object::buffer::Buffer::Byte { w_obj } => {
-                    pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
-                }
-                pyre_object::buffer::Buffer::Array { w_obj } => {
-                    pyre_object::interp_array::w_array_exports_incref(*w_obj)
-                }
-                _ => {}
-            },
-            _ => {}
-        }
+        backing_exports_incref(snapshot.backing());
         w_memoryview_set_view(sliced, bufferview_alloc(snapshot));
         pyre_object::gc_roots::pin_root(sliced);
 
