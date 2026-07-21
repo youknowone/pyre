@@ -63,9 +63,66 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
     };
     unsafe {
         match root {
-            Buffer::Byte { w_obj } => pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj),
+            Buffer::Byte { w_obj } => {
+                pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
+            }
             Buffer::Array { w_obj } => pyre_object::interp_array::w_array_exports_incref(*w_obj),
             _ => {}
+        }
+    }
+}
+
+/// Acquire one live buffer export directly from a Python exporter.
+///
+/// This is the object-level half of `space.acquire_py_buffer`: callers keep
+/// the exporter itself in a traced field and this function accounts for the
+/// matching `bf_releasebuffer` obligation.  Immutable `bytes` needs no
+/// release and returns `false`; the mutable/runtime-owned exporters return
+/// `true` and must later be paired with [`buffer_export_decref`].
+///
+/// PyPy keeps this state on the acquired `Py_buffer`/`Buffer` object.  Until
+/// pyre's generic `Py_buffer` carrier is shared by every consumer, keeping the
+/// boolean beside the owning object field preserves the same single-owner
+/// shape without an address-keyed side table.
+pub(crate) unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            pyre_object::bytearrayobject::w_bytearray_exports_incref(obj);
+            return true;
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            pyre_object::interp_array::w_array_exports_incref(obj);
+            return true;
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            pyre_object::memoryview::w_memoryview_exports_incref(obj);
+            return true;
+        }
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        if crate::module::mmap::interp_mmap::is_mmap(obj) {
+            crate::module::mmap::interp_mmap::mmap_exports_incref(obj);
+            return true;
+        }
+    }
+    false
+}
+
+/// Release one export acquired by [`buffer_export_incref`].
+///
+/// # Safety
+/// `obj` must still be the exporter paired with a successful (`true`)
+/// acquisition, and the pair must be released exactly once.
+pub(crate) unsafe fn buffer_export_decref(obj: PyObjectRef) {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            pyre_object::bytearrayobject::w_bytearray_exports_decref(obj);
+        } else if pyre_object::interp_array::is_array(obj) {
+            pyre_object::interp_array::w_array_exports_decref(obj);
+        } else if pyre_object::memoryview::is_w_memoryview(obj) {
+            pyre_object::memoryview::w_memoryview_exports_decref(obj);
+        } else {
+            #[cfg(all(unix, not(feature = "sandbox")))]
+            crate::module::mmap::interp_mmap::mmap_exports_decref(obj);
         }
     }
 }

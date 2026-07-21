@@ -126,6 +126,32 @@ def test_bytesio_readinto():
 test_bytesio_readinto()
 
 
+def test_struct_iter_unpack_holds_export():
+    # PyPy W_UnpackIter keeps the acquired Py_buffer until the iterator is
+    # exhausted (including the terminal next()) or finalized.
+    source = bytearray(struct.pack("II", 10, 20))
+    view = memoryview(source)
+    unpacked = struct.iter_unpack("I", view)
+    assert_raises(BufferError, view.release)
+    assert_raises(BufferError, lambda: source.append(0))
+    assert next(unpacked) == (10,)
+    assert list(unpacked) == [(20,)]
+    view.release()
+    source.append(0)
+
+    # A direct mutable export is likewise released by the native finalizer
+    # when an iterator is abandoned before exhaustion.
+    source = bytearray(struct.pack("I", 30))
+    unpacked = struct.iter_unpack("I", source)
+    assert_raises(BufferError, lambda: source.append(0))
+    del unpacked
+    gc.collect()
+    source.append(0)
+
+
+test_struct_iter_unpack_holds_export()
+
+
 # PyPy interp_buffer.py descr_new_picklebuffer acquires the buffer in
 # __new__, and its typedef is explicitly final.  CPython 3.14 exposes the
 # same constructor and final-type behavior through pickle.PickleBuffer.
@@ -140,6 +166,38 @@ assert_raises(TypeError, lambda: pickle.PickleBuffer(1))
 released_pickle_buffer_source = memoryview(b"released")
 released_pickle_buffer_source.release()
 assert_raises(ValueError, lambda: pickle.PickleBuffer(released_pickle_buffer_source))
+
+
+def test_pickle_buffer_holds_export():
+    source = bytearray(b"abc")
+    wrapped = pickle.PickleBuffer(source)
+    assert_raises(BufferError, lambda: source.append(0))
+    wrapped.release()
+    wrapped.release()  # `_release_buf` is idempotent.
+    source.append(0)
+
+    source = bytearray(b"abc")
+    view = memoryview(source)
+    wrapped = pickle.PickleBuffer(view)
+    assert_raises(BufferError, view.release)
+    wrapped.release()
+    view.release()
+
+    source = bytearray(b"abc")
+    wrapped = pickle.PickleBuffer(source)
+    assert_raises(BufferError, lambda: source.append(0))
+    del wrapped
+    gc.collect()
+    source.append(0)
+
+    wrapped = pickle.PickleBuffer(b"immutable")
+    wrapped_ref = weakref.ref(wrapped)
+    del wrapped
+    gc.collect()
+    assert wrapped_ref() is None
+
+
+test_pickle_buffer_holds_export()
 
 
 def subclass_pickle_buffer():

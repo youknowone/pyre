@@ -12,6 +12,9 @@ use crate::PyError;
 pub struct W_PickleBuffer {
     /// The wrapped buffer-supporting object, or `None` after `release()`.
     w_obj: PyObjectRef,
+    /// `self.buf is not None and self.buf.needs_release()`: owns exactly one
+    /// exporter release until `release()` or `_finalize_` takes it.
+    export_active: bool,
 }
 
 #[crate::pyre_methods(
@@ -41,13 +44,27 @@ impl W_PickleBuffer {
         pyre_object::gc_roots::pin_root(w_obj);
         // `allocate` may collect; store the post-collection exporter rather
         // than the stale Rust-stack copy.
-        Ok(W_PickleBuffer::allocate(W_PickleBuffer {
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let export_active = unsafe { crate::builtins::buffer_export_incref(r_obj) };
+        // Like the other self-mutating interp-level payloads, keep the
+        // wrapper stationary.  More importantly for `register_finalizer`, an
+        // acquired export must enter the old-object finalizer queue at its
+        // definitive address; a nursery registration is first promoted as a
+        // finalizer root and otherwise delays `_release_buf` by a collection.
+        let w_pickle_buffer = W_PickleBuffer::allocate_stable(W_PickleBuffer {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            w_obj: pyre_object::gc_roots::shadow_stack_get(sp),
-        }))
+            w_obj: r_obj,
+            export_active,
+        });
+        // Pyre also routes weakref invalidation through this finalizer queue,
+        // so register immutable-buffer wrappers too: PyPy's collector handles
+        // their weakrefs independently even when `buf.needs_release()` is
+        // false.  The idempotent release body is a no-op for that export.
+        crate::executioncontext::register_native_buffer_finalizer(w_pickle_buffer);
+        Ok(w_pickle_buffer)
     }
 
     /// `raw()` — a memoryview of the raw bytes underlying the wrapped buffer.
@@ -78,6 +95,19 @@ impl W_PickleBuffer {
 
     /// `release()` — drop the reference to the underlying buffer.
     fn release(&mut self) {
+        self.release_export();
+    }
+}
+
+impl W_PickleBuffer {
+    /// `_release_buf` (`interp_buffer.py:146-150`) — clear ownership before
+    /// calling the exporter release, making repeated explicit/finalizer calls
+    /// idempotent.
+    pub(crate) fn release_export(&mut self) {
+        if self.export_active {
+            self.export_active = false;
+            unsafe { crate::builtins::buffer_export_decref(self.w_obj) };
+        }
         self.w_obj = pyre_object::w_none();
     }
 }

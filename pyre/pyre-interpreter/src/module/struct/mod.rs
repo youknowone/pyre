@@ -652,39 +652,16 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
 struct PackIntoExport(PyObjectRef);
 
 impl PackIntoExport {
-    /// Returns `None` for a target that carries no export count; `writebuf`
-    /// rejects everything except the two kinds handled here.
+    /// Returns `None` for an immutable target that carries no export count;
+    /// `writebuf` rejects every unsupported exporter before use.
     unsafe fn acquire(obj: PyObjectRef) -> Option<Self> {
-        unsafe {
-            if bytearrayobject::is_bytearray(obj) {
-                bytearrayobject::w_bytearray_exports_incref(obj);
-            } else if memoryview::is_w_memoryview(obj) {
-                memoryview::w_memoryview_exports_incref(obj);
-            } else {
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                if crate::module::mmap::interp_mmap::is_mmap(obj) {
-                    crate::module::mmap::interp_mmap::mmap_exports_incref(obj);
-                    return Some(Self(obj));
-                }
-                return None;
-            }
-        }
-        Some(Self(obj))
+        unsafe { crate::builtins::buffer_export_incref(obj).then_some(Self(obj)) }
     }
 }
 
 impl Drop for PackIntoExport {
     fn drop(&mut self) {
-        unsafe {
-            if bytearrayobject::is_bytearray(self.0) {
-                bytearrayobject::w_bytearray_exports_decref(self.0);
-            } else if memoryview::is_w_memoryview(self.0) {
-                memoryview::w_memoryview_exports_decref(self.0);
-            } else {
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                crate::module::mmap::interp_mmap::mmap_exports_decref(self.0);
-            }
-        }
+        unsafe { crate::builtins::buffer_export_decref(self.0) }
     }
 }
 
@@ -716,12 +693,14 @@ fn do_pack_into(
         offset += buflen;
     }
     if buflen - offset < size {
+        // `r_uint(s_size + offset)` in PyPy: the diagnostic deliberately
+        // represents `sys.maxsize + size` above the signed machine range.
+        // Add in the unsigned domain so CPython 3.14's boundary message does
+        // not turn into a Rust debug-overflow panic.
+        let required = (offset as u64) + (size as u64);
         return Err(struct_error(format!(
             "pack_into requires a buffer of at least {} bytes for packing {} bytes at offset {} (actual buffer size is {})",
-            size + offset,
-            size,
-            offset,
-            buflen
+            required, size, offset, buflen
         )));
     }
     let packed = pack_values(&parsed, values)?;
@@ -884,12 +863,12 @@ fn do_unpack_from(format: &str, buf: &[u8], offset: i64) -> Result<PyObjectRef, 
         offset += buflen;
     }
     if buflen - offset < size as i64 {
+        // Same `r_uint(s_size + offset)` boundary calculation as
+        // `do_pack_into`; `sys.maxsize + size` is a valid diagnostic value.
+        let required = (offset as u64) + (size as u64);
         return Err(struct_error(format!(
             "unpack_from requires a buffer of at least {} bytes for unpacking {} bytes at offset {} (actual buffer size is {})",
-            size as i64 + offset,
-            size,
-            offset,
-            buflen
+            required, size, offset, buflen
         )));
     }
     let start = offset as usize;
@@ -1150,6 +1129,10 @@ pub mod unpack_iter {
         buffer: PyObjectRef,
         size: i64,
         index: i64,
+        /// `self.view is not None` (`interp_struct.py:212-224`).  A true
+        /// value owns exactly one exporter count and is cleared on normal
+        /// exhaustion or from the native finalizer.
+        export_active: bool,
     }
 
     #[crate::pyre_methods]
@@ -1161,8 +1144,14 @@ pub mod unpack_iter {
         /// `descr_next` — unpack the next record, raising `StopIteration`
         /// at the end of the buffer.
         fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+            if self.buffer.is_null() {
+                return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
+            }
             let buf = unsafe { readbuf(self.buffer)? };
             if self.index >= buf.len() as i64 {
+                // CPython/PyPy release the inline Py_buffer eagerly at the
+                // first exhausted `next()`, rather than waiting for GC.
+                self.release_export();
                 return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
             }
             let start = self.index as usize;
@@ -1175,11 +1164,28 @@ pub mod unpack_iter {
 
         /// `descr_length_hint` — records remaining.
         fn __length_hint__(&self) -> PyObjectRef {
+            if self.buffer.is_null() {
+                return w_int_new(0);
+            }
             let remaining = match unsafe { readbuf(self.buffer) } {
                 Ok(buf) => (buf.len() as i64 - self.index) / self.size,
                 Err(_) => 0,
             };
             w_int_new(remaining)
+        }
+
+        /// `_finalize_` / the exhausted branch share `_release_buf`'s
+        /// idempotent take-then-release shape.
+        pub(crate) fn release_export(&mut self) {
+            if self.buffer.is_null() {
+                return;
+            }
+            if self.export_active {
+                self.export_active = false;
+                unsafe { crate::builtins::buffer_export_decref(self.buffer) };
+            }
+            self.buffer = PY_NULL;
+            self.format = PY_NULL;
         }
     }
 
@@ -1206,7 +1212,8 @@ pub mod unpack_iter {
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
         }
-        Ok(W_UnpackIter::allocate_stable(W_UnpackIter {
+        let export_active = unsafe { crate::builtins::buffer_export_incref(buffer) };
+        let w_iter = W_UnpackIter::allocate_stable(W_UnpackIter {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -1215,7 +1222,12 @@ pub mod unpack_iter {
             buffer,
             size,
             index: 0,
-        }))
+            export_active,
+        });
+        if export_active {
+            crate::executioncontext::register_native_buffer_finalizer(w_iter);
+        }
+        Ok(w_iter)
     }
 }
 
