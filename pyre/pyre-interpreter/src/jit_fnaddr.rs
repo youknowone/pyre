@@ -1224,6 +1224,36 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::begin_callback_free_probe",
+        "pyre_object::begin_callback_free_probe",
+        pyre_object::dict_eq_hook::begin_callback_free_probe as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::end_callback_free_probe",
+        "pyre_object::end_callback_free_probe",
+        pyre_object::dict_eq_hook::end_callback_free_probe as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::callback_free_probe_active",
+        "pyre_object::callback_free_probe_active",
+        pyre_object::dict_eq_hook::callback_free_probe_active as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::callback_free_probe_broken",
+        "pyre_object::callback_free_probe_broken",
+        pyre_object::dict_eq_hook::callback_free_probe_broken as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::break_callback_free_probe",
+        "pyre_object::break_callback_free_probe",
+        pyre_object::dict_eq_hook::break_callback_free_probe as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::stack_check::stack_almost_full",
         "pyre_interpreter::stack_almost_full",
         crate::stack_check::stack_almost_full as *const (),
