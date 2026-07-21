@@ -213,7 +213,7 @@ impl W_TokenizerIter {
             None => None,
         };
         let _ = type_object();
-        Ok(W_TokenizerIter::allocate(W_TokenizerIter {
+        Ok(W_TokenizerIter::allocate_stable(W_TokenizerIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),

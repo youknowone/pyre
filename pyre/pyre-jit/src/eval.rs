@@ -1831,59 +1831,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,
         );
     }
-    // Immortal `#[pyre_class]` iterator / sequence wrappers whose managed
-    // children are held SOLELY through the immortal object.  The marker never
-    // scans a `malloc_typed`-immortal, so without a registered offset set the
-    // generic immortal-root walker (`walk_raw_immortal_roots`) cannot forward
-    // the child, and a collection reachable only through the wrapper frees it —
-    // e.g. `enumerate(list)` whose source list-iterator sits on a caller frame
-    // across a hot inner loop's collection, surfacing as
-    // `TypeError: not an iterator` on the next `__next__`.  These have no GC
-    // vtable site (immortal, keyed by `pytype_ptr`), so register the
-    // descriptor's `ptr_offsets` directly like the dict-view offsets above.
-    // The explicit `type_id`s never reach a GC arena, so no `register_type` /
-    // drift-check is involved.  This is the complete set of immortal
-    // `#[pyre_class]` wrappers with managed children that the
-    // `register_pyre_class` list above does not already cover; every other
-    // iterator family (map/filter/zip/cycle/chain/count/repeat, the four
-    // seq/list/tuple/set iterators, reversed, the SRE scanner) is registered
-    // there, and `W_Deque` is `allocate_stable` (GC-managed, not immortal).
-    for descr in [
-        <pyre_object::functional::W_Enumerate
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::functional::W_Range
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::functional::W_LongRangeIterator
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::interp_itertools::W_TakeWhile
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::interp_itertools::W_DropWhile
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::interp_itertools::W_FilterFalse
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::interp_itertools::W_Pairwise
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_object::operation::_CallableIterator
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_interpreter::module::r#struct::W_Struct
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_interpreter::module::r#struct::unpack_iter::W_UnpackIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_interpreter::module::_collections::W_DequeIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_interpreter::module::_collections::W_DequeRevIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        // `_tokenize.TokenizerIter` holds the callable source in an inline
-        // `readline` field and is `allocate`-immortal, so its offsets are
-        // registered here rather than through the managed marker.
-        <pyre_interpreter::module::_tokenize::W_TokenizerIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    ] {
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            descr.pytype_ptr as usize,
-            descr.ptr_offsets,
-        );
-    }
+    // Formerly-immortal `#[pyre_class]` iterator / sequence wrappers with
+    // managed children (`range`, the long-range iterator, takewhile / dropwhile
+    // / filterfalse / pairwise, the callable-sentinel iterator, `struct.Struct`
+    // and its unpack iterator, the two deque iterators, the tokenizer iterator)
+    // are now `allocate_stable` (GC-managed old-gen) and registered through
+    // `register_pyre_class` at the tail of the tid chain below.  The marker
+    // scans them and forwards their `ptr_offsets` on both the interpreter and
+    // JIT paths, so the separate immortal-root offset registration these types
+    // used to need is gone.
     // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
     // — fget/fset/fdel/doc/reqcls/name are W_Root references.
     // Pyre's `GetSetProperty` ports them as inline fields; the
@@ -2669,6 +2625,99 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut gc,
         &mut pytype_to_tid,
         <pyre_interpreter::module::_collections::W_Deque
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // `enumerate` W_Enumerate — AUTO-ID `allocate_stable` (GC-managed old-gen),
+    // like W_Deque above.  Its source iterator (`w_iter_or_list`) is a managed
+    // child held solely through the enumerate; as an immortal the marker skipped
+    // it and only the interpreter-side immortal-root walker forwarded the child,
+    // so under JIT (no immortal walk over jitframe slots) a collection reachable
+    // only through the enumerate freed the source iterator.  Managed + registered
+    // tid/offsets lets the marker forward the child uniformly on both paths.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::functional::W_Enumerate
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // Formerly-immortal iterator / sequence wrappers converted to
+    // `allocate_stable` (GC-managed).  Each holds managed children solely
+    // through the wrapper, so as immortals only the interpreter-side
+    // immortal-root walker forwarded them and the JIT (no immortal walk over
+    // jitframe slots) dropped them on a collection reachable only through the
+    // wrapper.  Managed + registered tid/offsets lets the marker forward the
+    // children uniformly on both paths.  Registered at the absolute tail of the
+    // tid chain — in this fixed order — so no earlier explicit-id / hardcoded
+    // slot shifts.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::functional::W_Range as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::functional::W_LongRangeIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_TakeWhile
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_DropWhile
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_FilterFalse
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Pairwise
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::operation::_CallableIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::r#struct::W_Struct
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::r#struct::unpack_iter::W_UnpackIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_collections::W_DequeIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_collections::W_DequeRevIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // ── GC-root registration completeness oracle ─────────────────────────

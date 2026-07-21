@@ -886,6 +886,17 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // GC type chain (`build_gc`), after the coroutine / dict-view-iterator
         // slots, so its vtable alias lands at the current max tid.
         subclass_range_alias(116, typed::<crate::module::_collections::W_Deque>()),
+        // Formerly-immortal iterators converted to `allocate_stable` (managed),
+        // registered at the tail of the JIT `register_pyre_class` chain after
+        // the pyre-object iterators (W_Struct = 125 .. W_TokenizerIter = 129).
+        subclass_range_alias(125, typed::<crate::module::r#struct::W_Struct>()),
+        subclass_range_alias(
+            126,
+            typed::<crate::module::r#struct::unpack_iter::W_UnpackIter>(),
+        ),
+        subclass_range_alias(127, typed::<crate::module::_collections::W_DequeIter>()),
+        subclass_range_alias(128, typed::<crate::module::_collections::W_DequeRevIter>()),
+        subclass_range_alias(129, typed::<crate::module::_tokenize::W_TokenizerIter>()),
     ]
 }
 

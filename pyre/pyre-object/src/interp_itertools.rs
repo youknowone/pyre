@@ -40,7 +40,7 @@ pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef 
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_firstval);
     crate::gc_roots::pin_root(w_step);
-    W_Count::allocate(W_Count {
+    W_Count::allocate_stable(W_Count {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -74,6 +74,7 @@ pub unsafe fn w_count_get_c(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_count_set_c(obj: PyObjectRef, v: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Count)).w_c = v;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 
@@ -122,7 +123,7 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_obj);
-    W_Repeat::allocate(W_Repeat {
+    W_Repeat::allocate_stable(W_Repeat {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -190,7 +191,7 @@ pub unsafe fn w_repeat_dec_count(obj: PyObjectRef) {
 // `next_w` lives in the interpreter (`baseobjspace::next`) because it
 // calls the predicate.
 
-#[pyre_class("itertools.takewhile", type_id = 54, static_name = "TAKEWHILE")]
+#[pyre_class("itertools.takewhile", static_name = "TAKEWHILE")]
 pub struct W_TakeWhile {
     pub w_predicate: PyObjectRef,
     pub w_iterable: PyObjectRef,
@@ -204,7 +205,7 @@ pub fn w_takewhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyO
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_predicate);
     crate::gc_roots::pin_root(w_iterable);
-    W_TakeWhile::allocate(W_TakeWhile {
+    W_TakeWhile::allocate_stable(W_TakeWhile {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -235,7 +236,7 @@ pub unsafe fn is_takewhile(obj: PyObjectRef) -> bool {
 //         self.started = False
 // ```
 
-#[pyre_class("itertools.dropwhile", type_id = 55, static_name = "DROPWHILE")]
+#[pyre_class("itertools.dropwhile", static_name = "DROPWHILE")]
 pub struct W_DropWhile {
     pub w_predicate: PyObjectRef,
     pub w_iterable: PyObjectRef,
@@ -249,7 +250,7 @@ pub fn w_dropwhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyO
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_predicate);
     crate::gc_roots::pin_root(w_iterable);
-    W_DropWhile::allocate(W_DropWhile {
+    W_DropWhile::allocate_stable(W_DropWhile {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -288,7 +289,7 @@ pub unsafe fn is_dropwhile(obj: PyObjectRef) -> bool {
 //
 // `w_predicate` is PY_NULL when the Python-level predicate was None.
 
-#[pyre_class("itertools.filterfalse", type_id = 56, static_name = "FILTERFALSE")]
+#[pyre_class("itertools.filterfalse", static_name = "FILTERFALSE")]
 pub struct W_FilterFalse {
     pub w_predicate: PyObjectRef,
     pub w_iterable: PyObjectRef,
@@ -303,7 +304,7 @@ pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> P
         crate::gc_roots::pin_root(w_predicate);
     }
     crate::gc_roots::pin_root(w_iterable);
-    W_FilterFalse::allocate(W_FilterFalse {
+    W_FilterFalse::allocate_stable(W_FilterFalse {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -347,7 +348,7 @@ pub fn w_compress_new(w_data: PyObjectRef, w_selectors: PyObjectRef) -> PyObject
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_data);
     crate::gc_roots::pin_root(w_selectors);
-    W_Compress::allocate(W_Compress {
+    W_Compress::allocate_stable(W_Compress {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -390,7 +391,7 @@ pub fn w_starmap_new(w_fun: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_fun);
     crate::gc_roots::pin_root(w_iterable);
-    W_StarMap::allocate(W_StarMap {
+    W_StarMap::allocate_stable(W_StarMap {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -435,7 +436,7 @@ pub fn w_accumulate_new(
         crate::gc_roots::pin_root(w_func);
     }
     crate::gc_roots::pin_root(w_initial);
-    W_Accumulate::allocate(W_Accumulate {
+    W_Accumulate::allocate_stable(W_Accumulate {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -486,7 +487,7 @@ pub fn w_zip_longest_new(
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iterators);
     crate::gc_roots::pin_root(w_fillvalue);
-    W_ZipLongest::allocate(W_ZipLongest {
+    W_ZipLongest::allocate_stable(W_ZipLongest {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -514,7 +515,7 @@ pub unsafe fn is_zip_longest(obj: PyObjectRef) -> bool {
 //
 // `w_prev` is PY_NULL until the first `next_w`.
 
-#[pyre_class("itertools.pairwise", type_id = 57, static_name = "PAIRWISE")]
+#[pyre_class("itertools.pairwise", static_name = "PAIRWISE")]
 pub struct W_Pairwise {
     pub w_iterator: PyObjectRef,
     pub w_prev: PyObjectRef,
@@ -526,7 +527,7 @@ pub fn w_pairwise_new(w_iterator: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iterator);
-    W_Pairwise::allocate(W_Pairwise {
+    W_Pairwise::allocate_stable(W_Pairwise {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -578,7 +579,7 @@ pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
     crate::gc_roots::pin_root(w_iterable);
     let saved = crate::listobject::w_list_new(Vec::new());
     crate::gc_roots::pin_root(saved);
-    W_Cycle::allocate(W_Cycle {
+    W_Cycle::allocate_stable(W_Cycle {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -643,7 +644,7 @@ pub fn w_chain_new(w_iterables: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iterables);
-    W_Chain::allocate(W_Chain {
+    W_Chain::allocate_stable(W_Chain {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -737,12 +738,8 @@ mod tests {
     }
 
     #[test]
-    fn w_takewhile_gc_type_id_matches_descr() {
-        assert_eq!(W_TAKEWHILE_GC_TYPE_ID, 54);
-        assert_eq!(
-            <W_TakeWhile as crate::lltype::GcType>::type_id(),
-            W_TAKEWHILE_GC_TYPE_ID
-        );
+    fn w_takewhile_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): tid assigned at JIT init.
         assert_eq!(
             <W_TakeWhile as crate::lltype::GcType>::SIZE,
             W_TAKEWHILE_OBJECT_SIZE
@@ -750,12 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn w_dropwhile_gc_type_id_matches_descr() {
-        assert_eq!(W_DROPWHILE_GC_TYPE_ID, 55);
-        assert_eq!(
-            <W_DropWhile as crate::lltype::GcType>::type_id(),
-            W_DROPWHILE_GC_TYPE_ID
-        );
+    fn w_dropwhile_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): tid assigned at JIT init.
         assert_eq!(
             <W_DropWhile as crate::lltype::GcType>::SIZE,
             W_DROPWHILE_OBJECT_SIZE
@@ -763,12 +756,8 @@ mod tests {
     }
 
     #[test]
-    fn w_filterfalse_gc_type_id_matches_descr() {
-        assert_eq!(W_FILTERFALSE_GC_TYPE_ID, 56);
-        assert_eq!(
-            <W_FilterFalse as crate::lltype::GcType>::type_id(),
-            W_FILTERFALSE_GC_TYPE_ID
-        );
+    fn w_filterfalse_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): tid assigned at JIT init.
         assert_eq!(
             <W_FilterFalse as crate::lltype::GcType>::SIZE,
             W_FILTERFALSE_OBJECT_SIZE
@@ -844,12 +833,8 @@ mod tests {
     }
 
     #[test]
-    fn w_pairwise_gc_type_id_matches_descr() {
-        assert_eq!(W_PAIRWISE_GC_TYPE_ID, 57);
-        assert_eq!(
-            <W_Pairwise as crate::lltype::GcType>::type_id(),
-            W_PAIRWISE_GC_TYPE_ID
-        );
+    fn w_pairwise_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): tid assigned at JIT init.
         assert_eq!(
             <W_Pairwise as crate::lltype::GcType>::SIZE,
             W_PAIRWISE_OBJECT_SIZE

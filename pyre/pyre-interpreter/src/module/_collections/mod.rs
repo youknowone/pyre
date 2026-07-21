@@ -208,7 +208,7 @@ mod deque_iter {
         let index = requested.max(0);
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(deque);
-        W_DequeIter::allocate(W_DequeIter {
+        W_DequeIter::allocate_stable(W_DequeIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -310,7 +310,7 @@ mod deque_rev_iter {
         let offset = requested.max(0);
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(deque);
-        W_DequeRevIter::allocate(W_DequeRevIter {
+        W_DequeRevIter::allocate_stable(W_DequeRevIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),

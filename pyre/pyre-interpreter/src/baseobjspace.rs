@@ -11296,9 +11296,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 w_prev = next(it.w_iterator)?;
                 // set before fetching w_next to handle reentrancy
                 it.w_prev = w_prev;
+                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
             }
             let w_next = next(it.w_iterator)?;
             it.w_prev = w_next;
+            pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
             return Ok(pyre_object::w_tuple_new(vec![w_prev, w_next]));
         }
         // itertools.cycle — interp_itertools.py W_Cycle.next_w

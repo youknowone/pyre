@@ -44,7 +44,7 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(seq);
-    W_SeqIterObject::allocate(W_SeqIterObject {
+    W_SeqIterObject::allocate_stable(W_SeqIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -58,7 +58,7 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
 pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(seq);
-    W_ListIterObject::allocate(W_ListIterObject {
+    W_ListIterObject::allocate_stable(W_ListIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -71,7 +71,7 @@ pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
 pub fn w_list_reverse_iter_new(seq: PyObjectRef, index: i64) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(seq);
-    W_ListReverseIterObject::allocate(W_ListReverseIterObject {
+    W_ListReverseIterObject::allocate_stable(W_ListReverseIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -84,7 +84,7 @@ pub fn w_list_reverse_iter_new(seq: PyObjectRef, index: i64) -> PyObjectRef {
 pub fn w_tuple_iter_new(seq: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(seq);
-    W_TupleIterObject::allocate(W_TupleIterObject {
+    W_TupleIterObject::allocate_stable(W_TupleIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -141,6 +141,7 @@ pub unsafe fn w_list_iter_index(obj: PyObjectRef) -> i64 {
 #[inline]
 pub unsafe fn w_list_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_ListIterObject)).seq = seq;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
@@ -161,6 +162,7 @@ pub unsafe fn w_list_reverse_iter_index(obj: PyObjectRef) -> i64 {
 #[inline]
 pub unsafe fn w_list_reverse_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_ListReverseIterObject)).seq = seq;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
@@ -181,6 +183,7 @@ pub unsafe fn w_tuple_iter_index(obj: PyObjectRef) -> i64 {
 #[inline]
 pub unsafe fn w_tuple_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_TupleIterObject)).seq = seq;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]

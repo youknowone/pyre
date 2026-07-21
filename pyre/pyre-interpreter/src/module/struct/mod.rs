@@ -965,7 +965,7 @@ pub struct W_Struct {
 impl W_Struct {
     #[staticmethod]
     fn __new__(_cls: PyObjectRef) -> PyObjectRef {
-        W_Struct::allocate(W_Struct {
+        W_Struct::allocate_stable(W_Struct {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -981,6 +981,7 @@ impl W_Struct {
         let format = format_to_string(w_format)?;
         self.size = parse_format(&format)?.calcsize()?;
         self.format = w_str_new(&format);
+        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         Ok(())
     }
 
@@ -1151,7 +1152,7 @@ pub mod unpack_iter {
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
         }
-        Ok(W_UnpackIter::allocate(W_UnpackIter {
+        Ok(W_UnpackIter::allocate_stable(W_UnpackIter {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),

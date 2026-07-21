@@ -569,6 +569,19 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (114, Some(0)),
     (115, Some(0)),
     (116, Some(0)),
+    (117, Some(0)),
+    (118, Some(0)),
+    (119, Some(0)),
+    (120, Some(0)),
+    (121, Some(0)),
+    (122, Some(0)),
+    (123, Some(0)),
+    (124, Some(0)),
+    (125, Some(0)),
+    (126, Some(0)),
+    (127, Some(0)),
+    (128, Some(0)),
+    (129, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -962,6 +975,19 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(23, &crate::iterobject::SEQ_ITER_TYPE),
         subclass_range_alias(24, typed::<crate::interp_itertools::W_Count>()),
         subclass_range_alias(25, typed::<crate::interp_itertools::W_Repeat>()),
+        // `enumerate` W_Enumerate — auto-id `allocate_stable` registered at the
+        // tail of the JIT `register_pyre_class` chain (after W_Deque = 116).
+        subclass_range_alias(117, typed::<crate::functional::W_Enumerate>()),
+        // Formerly-immortal iterators converted to `allocate_stable` (managed),
+        // registered at the tail of the JIT `register_pyre_class` chain in this
+        // exact order (after W_Enumerate = 117).
+        subclass_range_alias(118, typed::<crate::functional::W_Range>()),
+        subclass_range_alias(119, typed::<crate::functional::W_LongRangeIterator>()),
+        subclass_range_alias(120, typed::<crate::interp_itertools::W_TakeWhile>()),
+        subclass_range_alias(121, typed::<crate::interp_itertools::W_DropWhile>()),
+        subclass_range_alias(122, typed::<crate::interp_itertools::W_FilterFalse>()),
+        subclass_range_alias(123, typed::<crate::interp_itertools::W_Pairwise>()),
+        subclass_range_alias(124, typed::<crate::operation::_CallableIterator>()),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),

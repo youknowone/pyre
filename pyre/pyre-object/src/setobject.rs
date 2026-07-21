@@ -28,7 +28,7 @@ pub fn w_set_iter_new(w_set: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_set);
     let startlen = unsafe { w_set_len(w_set) };
-    W_SetIterObject::allocate(W_SetIterObject {
+    W_SetIterObject::allocate_stable(W_SetIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -55,6 +55,7 @@ pub unsafe fn w_set_iter_get_set(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_set_iter_set_set(obj: PyObjectRef, w_set: PyObjectRef) {
     (*(obj as *mut W_SetIterObject)).w_set = w_set;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]

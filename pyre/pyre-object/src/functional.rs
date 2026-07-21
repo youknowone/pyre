@@ -27,7 +27,7 @@ use pyre_macros::pyre_class;
 // carries the bigint value (PyPy line 297-303
 // `space.add(w_index, space.newint(1))` after `rarithmetic.ovfcheck`).
 
-#[pyre_class("enumerate", type_id = 41, static_name = "ENUMERATE")]
+#[pyre_class("enumerate", static_name = "ENUMERATE")]
 pub struct W_Enumerate {
     /// `functional.py:225 self.w_iter_or_list` — either the source
     /// iterator (general case) or the source list itself
@@ -54,7 +54,7 @@ pub fn w_enumerate_new(
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iter_or_list);
     crate::gc_roots::pin_root(w_index);
-    W_Enumerate::allocate(W_Enumerate {
+    W_Enumerate::allocate_stable(W_Enumerate {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -127,12 +127,9 @@ mod enumerate_tests {
     use super::*;
 
     #[test]
-    fn w_enumerate_gc_type_id_matches_descr() {
-        assert_eq!(W_ENUMERATE_GC_TYPE_ID, 41);
-        assert_eq!(
-            <W_Enumerate as crate::lltype::GcType>::type_id(),
-            W_ENUMERATE_GC_TYPE_ID
-        );
+    fn w_enumerate_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): the tid is assigned at JIT
+        // init, so there is no compile-time `W_ENUMERATE_GC_TYPE_ID` to check.
         assert_eq!(
             <W_Enumerate as crate::lltype::GcType>::SIZE,
             W_ENUMERATE_OBJECT_SIZE
@@ -178,7 +175,7 @@ pub struct W_ReversedIterator {
 pub fn w_reversed_new(w_sequence: PyObjectRef, remaining: i64) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_sequence);
-    W_ReversedIterator::allocate(W_ReversedIterator {
+    W_ReversedIterator::allocate_stable(W_ReversedIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -262,7 +259,7 @@ pub fn w_map_new(w_fun: PyObjectRef, w_iterators: PyObjectRef, strict: bool) -> 
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_fun);
     crate::gc_roots::pin_root(w_iterators);
-    W_Map::allocate(W_Map {
+    W_Map::allocate_stable(W_Map {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -348,7 +345,7 @@ pub fn w_filter_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObje
         crate::gc_roots::pin_root(w_predicate);
     }
     crate::gc_roots::pin_root(w_iterable);
-    W_Filter::allocate(W_Filter {
+    W_Filter::allocate_stable(W_Filter {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -414,7 +411,7 @@ pub struct W_Zip {
 pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iterators);
-    W_Zip::allocate(W_Zip {
+    W_Zip::allocate_stable(W_Zip {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -681,7 +678,12 @@ mod range_iter_tests {
 ///
 /// `w_length` is precomputed once at construction (`descr_new` →
 /// `compute_range_length`) and read back by `descr_len` / `descr_bool`.
-#[pyre_class("range", type_id = 7, static_name = "RANGE")]
+// Explicit `type_id` (not auto): `RANGE_DESCR_GROUP` in pyre-jit-trace bakes
+// `W_RANGE_GC_TYPE_ID` at compile time to virtualize range GET_ITER/FOR_ITER,
+// so the tid must be a const. 118 is the tail registration slot (right after
+// W_Enumerate = 117); register_pyre_class drift-checks it against the runtime
+// assignment order.
+#[pyre_class("range", type_id = 118, static_name = "RANGE")]
 pub struct W_Range {
     pub start: PyObjectRef,
     pub stop: PyObjectRef,
@@ -711,7 +713,7 @@ pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
         range_bigint_to_obj(len_big)
     };
     crate::gc_roots::pin_root(length);
-    W_Range::allocate(W_Range {
+    W_Range::allocate_stable(W_Range {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -1051,7 +1053,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
 // advances by one each step (`self.w_index`), so the cursor keeps arbitrary
 // precision and never overflows for a range longer than a machine word.
 
-#[pyre_class("longrange_iterator", type_id = 8, static_name = "LONG_RANGE_ITER")]
+#[pyre_class("longrange_iterator", static_name = "LONG_RANGE_ITER")]
 pub struct W_LongRangeIterator {
     pub start: PyObjectRef,
     pub step: PyObjectRef,
@@ -1071,7 +1073,7 @@ pub fn w_long_range_iter_new(
     crate::gc_roots::pin_root(len);
     let index = crate::intobject::w_int_new(0);
     crate::gc_roots::pin_root(index);
-    W_LongRangeIterator::allocate(W_LongRangeIterator {
+    W_LongRangeIterator::allocate_stable(W_LongRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -1128,6 +1130,7 @@ pub unsafe fn w_long_range_iter_set_index(obj: PyObjectRef, index: PyObjectRef) 
     let it = obj as *mut W_LongRangeIterator;
     unsafe {
         (*it).index = index;
+        crate::gc_hook::try_gc_write_barrier(it as *mut u8);
     }
 }
 
@@ -1167,6 +1170,7 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         crate::gc_roots::pin_root(next_index);
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;
         (*it).index = next_index;
+        crate::gc_hook::try_gc_write_barrier(it as *mut u8);
         Some(range_bigint_to_obj(value))
     }
 }
@@ -1176,12 +1180,9 @@ mod range_obj_tests {
     use super::*;
 
     #[test]
-    fn w_range_gc_type_id_matches_descr() {
-        assert_eq!(W_RANGE_GC_TYPE_ID, 7);
-        assert_eq!(
-            <W_Range as crate::lltype::GcType>::type_id(),
-            W_RANGE_GC_TYPE_ID
-        );
+    fn w_range_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): the tid is assigned at JIT
+        // init, so there is no compile-time `W_RANGE_GC_TYPE_ID` to check.
         assert_eq!(
             <W_Range as crate::lltype::GcType>::SIZE,
             W_RANGE_OBJECT_SIZE

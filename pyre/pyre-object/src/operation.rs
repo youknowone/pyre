@@ -30,7 +30,7 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-#[pyre_class("_CallableIterator", type_id = 42, static_name = "CALLABLE_ITERATOR")]
+#[pyre_class("_CallableIterator", static_name = "CALLABLE_ITERATOR")]
 pub struct _CallableIterator {
     /// The zero-argument callable invoked on each `__next__`.  Set to
     /// `PY_NULL` once the sentinel has been returned, latching the
@@ -46,7 +46,7 @@ pub fn w_callable_iterator_new(callable: PyObjectRef, sentinel: PyObjectRef) -> 
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(callable);
     crate::gc_roots::pin_root(sentinel);
-    _CallableIterator::allocate(_CallableIterator {
+    _CallableIterator::allocate_stable(_CallableIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -76,6 +76,7 @@ pub unsafe fn w_callable_iterator_get_callable(obj: PyObjectRef) -> PyObjectRef 
 pub unsafe fn w_callable_iterator_set_callable(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut _CallableIterator)).callable = value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
 }
 
@@ -91,12 +92,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn w_callable_iterator_gc_type_id_matches_descr() {
-        assert_eq!(W_CALLABLE_ITERATOR_GC_TYPE_ID, 42);
-        assert_eq!(
-            <_CallableIterator as crate::lltype::GcType>::type_id(),
-            W_CALLABLE_ITERATOR_GC_TYPE_ID
-        );
+    fn w_callable_iterator_object_size_matches_descr() {
+        // Auto-id `allocate_stable` (GC-managed): tid assigned at JIT init.
         assert_eq!(
             <_CallableIterator as crate::lltype::GcType>::SIZE,
             W_CALLABLE_ITERATOR_OBJECT_SIZE

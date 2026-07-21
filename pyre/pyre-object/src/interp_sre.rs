@@ -168,7 +168,7 @@ pub fn w_sre_match_new(
     crate::gc_roots::pin_root(w_srepat);
     crate::gc_roots::pin_root(w_string);
     crate::gc_roots::pin_root(w_buffer);
-    W_SRE_Match::allocate(W_SRE_Match {
+    W_SRE_Match::allocate_stable(W_SRE_Match {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -254,7 +254,7 @@ pub fn w_sre_scanner_new(
     crate::gc_roots::pin_root(w_srepat);
     crate::gc_roots::pin_root(w_string);
     crate::gc_roots::pin_root(w_buffer);
-    W_SRE_Scanner::allocate(W_SRE_Scanner {
+    W_SRE_Scanner::allocate_stable(W_SRE_Scanner {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
