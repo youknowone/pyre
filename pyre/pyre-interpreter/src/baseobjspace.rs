@@ -5935,9 +5935,6 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             if let Some(method) = w_descr {
-                if unsafe { crate::is_function(method) } {
-                    return Ok(pyre_object::w_method_new(method, obj, w_type));
-                }
                 match unsafe { get(method, obj, w_type) } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -5945,6 +5942,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                         return unsafe { instance_getattr_hook_or_err(w_type, obj, name, e) };
                     }
                     Err(e) => return Err(e),
+                }
+                // A plain Python function is the one callable `get` leaves
+                // unhandled; bind it here.  Binding before `get` would also
+                // bind a `BuiltinFunction` class attribute (`class T(tuple):
+                // f = len`), which must stay unbound.
+                if unsafe {
+                    crate::is_function(method)
+                        && !crate::is_builtin_code(
+                            crate::function_get_code(method) as pyre_object::PyObjectRef
+                        )
+                } {
+                    return Ok(pyre_object::w_method_new(method, obj, w_type));
                 }
                 return Ok(method);
             }
