@@ -2221,6 +2221,16 @@ pub fn exc_edge_bridge_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_EXC_EDGE_BRIDGE").is_some())
 }
 
+/// `PYRE_CARRIER_EXC_RESUME=1` enables the multi-frame (carrier) exception
+/// resume: seed the grabbed guard exception onto the bridge sym and route the
+/// inlined callee's carrier sub-walk into its own `catch_exception` handler
+/// (`finishframe_exception` parity, pyjitpl.py:2530).  Default-off while the
+/// #343/#126 depth-2 exception-resume slice is validated bit-exact.
+pub fn carrier_exc_resume_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_CARRIER_EXC_RESUME").is_some())
+}
+
 /// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`
 /// for the walker.  An after-residual-call exception guard resumes at the
 /// no-exception fallthrough `-live-` (the next opcode after the call); the

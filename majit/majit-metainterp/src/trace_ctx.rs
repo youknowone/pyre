@@ -523,6 +523,13 @@ pub struct TraceCtx {
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
     /// that only receive `TraceCtx`.
     pub(crate) bridge_source_is_exception_guard: bool,
+    /// llmodel.py:240 `cpu.grab_exc_value(deadframe)`: the pending exception
+    /// value grabbed at the guard failure that triggered this bridge, threaded
+    /// from `start_bridge_tracing` so `setup_bridge_sym` can seed the bridge
+    /// sym's standing exception (pyjitpl.py:3125 `_prepare_exception_resumption`
+    /// grabs BEFORE frame reconstruction). Raw `PyObjectRef as i64`; 0 when the
+    /// guard carried no exception. Class is re-derived from the value's typeptr.
+    pub(crate) bridge_guard_exc: i64,
 }
 
 /// A decoded-but-not-yet-built description of one inlined
@@ -1223,6 +1230,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
+            bridge_guard_exc: 0,
         }
     }
 
@@ -1299,6 +1307,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
+            bridge_guard_exc: 0,
         }
     }
 
@@ -1337,6 +1346,16 @@ impl TraceCtx {
     }
 
     /// True only for bridge traces sourced from an exception guard descr.
+    pub fn set_bridge_guard_exc(&mut self, guard_exc: i64) {
+        self.bridge_guard_exc = guard_exc;
+    }
+
+    /// The exception value grabbed at the guard failure that triggered this
+    /// bridge (0 when none). See `bridge_guard_exc`.
+    pub fn bridge_guard_exc(&self) -> i64 {
+        self.bridge_guard_exc
+    }
+
     pub fn bridge_source_is_exception_guard(&self) -> bool {
         self.bridge_source_is_exception_guard
     }

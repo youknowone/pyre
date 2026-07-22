@@ -8584,6 +8584,24 @@ impl JitState for PyreJitState {
             return;
         }
 
+        // pyjitpl.py:3125-3165 `_prepare_exception_resumption` + `execute_ll_raised`:
+        // the exception grabbed at guard failure (`cpu.grab_exc_value`, threaded
+        // via `ctx.bridge_guard_exc`) becomes the bridge's standing exception.
+        // Seed `current_exc_value` here so `seed_bridge_standing_exception_from_current`
+        // below promotes it into `last_exc_value` / `last_exc_box` (the
+        // `dispatch_via_miframe` / carrier exc-edge precondition reads these).
+        // Without this seed the sym only sees `get_current_exception()`, which the
+        // blackhole has already cleared by carrier re-trace time.  Gated while the
+        // #343/#126 depth-2 exception-resume slice is validated.
+        if crate::jitcode_dispatch::carrier_exc_resume_enabled()
+            && ctx.bridge_source_is_exception_guard()
+        {
+            let guard_exc = ctx.bridge_guard_exc();
+            if guard_exc != 0 && sym.current_exc_value.is_null() {
+                sym.current_exc_value = guard_exc as pyre_object::PyObjectRef;
+            }
+        }
+
         // virtualizable.py:139 load_list_of_boxes parity: decode each
         // RebuiltValue in the resume stream into a typed Value. The type
         // is the fixed Box kind the encoder recorded at numbering time
