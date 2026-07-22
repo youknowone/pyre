@@ -67,6 +67,18 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
                 pyre_object::bytearrayobject::w_bytearray_exports_incref(*w_obj)
             }
             Buffer::Array { w_obj } => pyre_object::interp_array::w_array_exports_incref(*w_obj),
+            Buffer::External { w_obj, .. } => {
+                // The only counted external exporter is `mmap` (ctypes'
+                // `memoryview_at` stores `None` and keeps no count), so a
+                // derived mmap view takes its own count here — otherwise
+                // releasing the view it came from would let `close`/`resize`
+                // unmap while this one still reads the mapping.
+                let _ = w_obj;
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                if crate::module::mmap::interp_mmap::is_mmap(*w_obj) {
+                    crate::module::mmap::interp_mmap::mmap_exports_incref(*w_obj);
+                }
+            }
             _ => {}
         }
     }
@@ -1473,6 +1485,22 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(w_str_new(&format!("<{label} at {mv:?}>")))
 }
 
+/// Drop an mmap-backed view's export directly, bypassing any Python-callable
+/// release.  Returns `true` when it handled an mmap backing.
+#[cfg(all(unix, not(feature = "sandbox")))]
+unsafe fn release_external_backing(backing: PyObjectRef) -> bool {
+    if crate::module::mmap::interp_mmap::is_mmap(backing) {
+        unsafe { crate::module::mmap::interp_mmap::mmap_exports_decref(backing) };
+        return true;
+    }
+    false
+}
+
+#[cfg(not(all(unix, not(feature = "sandbox"))))]
+unsafe fn release_external_backing(_backing: PyObjectRef) -> bool {
+    false
+}
+
 /// `memoryview.release` — drop the view; subsequent access raises ValueError.
 /// Idempotent (a second `release` on an already-released view is a no-op),
 /// matching `descr_release`.
@@ -1504,9 +1532,15 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
                 // Clear the view before invoking the exporter hook so a
                 // re-entrant release is a no-op.
                 pyre_object::memoryview::w_memoryview_set_released(mv);
-                if let Some(release_fn) = crate::baseobjspace::lookup(backing, "__release_buffer__")
-                {
-                    crate::call::call_function_impl_result(release_fn, &[backing, mv])?;
+                // An `mmap` mapping keeps its count internally — it exposes no
+                // Python-callable release, so the drop cannot be forged from
+                // user code.  Every other exporter runs `__release_buffer__`.
+                if !release_external_backing(backing) {
+                    if let Some(release_fn) =
+                        crate::baseobjspace::lookup(backing, "__release_buffer__")
+                    {
+                        crate::call::call_function_impl_result(release_fn, &[backing, mv])?;
+                    }
                 }
             } else {
                 pyre_object::memoryview::w_memoryview_set_released(mv);

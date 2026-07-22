@@ -284,22 +284,6 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         }),
     ) };
 
-    // `__release_buffer__` — the explicit `memoryview.release()` path; the
-    // collector-driven one goes through the buffer layer's external hook.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__release_buffer__",
-        crate::make_builtin_function_with_arity(
-            "__release_buffer__",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                unsafe { mmap_exports_decref(obj) };
-                Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
-
     // close() — munmap and zero the pointer.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -775,6 +759,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             if let Some(&obj) = args.first() {
                 let p = mmap_get_attr_i64(obj, "_ptr") as usize;
                 if p != 0 {
+                    mmap_check_exports(obj, "cannot close exported pointers exist")?;
                     mmap_registry_remove(mmap_get_attr_i64(obj, "_id") as u64);
                     mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
                     mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
