@@ -255,7 +255,10 @@ unsafe fn walk_raw_function_roots(
 /// never recurses into it; visit the slot as a root the same way
 /// `walk_raw_function_roots` forwards `w_func_globals_obj`.  No-op for non-code
 /// values and inert when the cached dict is non-moving.
-unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+pub unsafe fn walk_raw_code_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
     unsafe {
         if value.is_null() || !crate::pycode::is_code(value) {
             return;

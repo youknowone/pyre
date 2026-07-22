@@ -461,6 +461,10 @@ impl FrameBox {
         // block is non-moving (old-gen when GC-managed, `std::alloc`
         // otherwise), so only the locals array needs protecting.
         let _root = FrameLocalsRoot::new(frame_ptr);
+        // generator.py:21 `self.pycode = frame.pycode`: preserve the exact
+        // code object independently of the frame, which is cleared when the
+        // generator finishes.
+        let pycode = unsafe { (*frame_ptr).pycode as pyre_object::PyObjectRef };
         // generator.py: GeneratorIterator / Coroutine — native `async def`
         // frames have their own object type.  In particular, a Coroutine is
         // awaitable but is not itself an iterator; `__await__` supplies the
@@ -471,9 +475,9 @@ impl FrameBox {
                 .flags
                 .contains(crate::CodeFlags::COROUTINE)
         } {
-            pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8)
+            pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8, pycode)
         } else {
-            pyre_object::generator::w_generator_new(frame_ptr as *mut u8)
+            pyre_object::generator::w_generator_new(frame_ptr as *mut u8, pycode)
         };
         // GeneratorOrCoroutine.__init__ stores `_name` / `_qualname` on the
         // generator.  Root the new owner while allocating the two wrapped

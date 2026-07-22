@@ -409,6 +409,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
+    f(&mut gen_obj.pycode as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -424,6 +425,7 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     // for its active `sys_exc_value` slot.
     let mut exception_adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
     unsafe {
+        pyre_interpreter::eval::walk_raw_code_roots(gen_obj.pycode, &mut exception_adapter);
         pyre_interpreter::eval::walk_raw_exception_roots(
             gen_obj.saved_exc_value,
             &mut exception_adapter,

@@ -19,6 +19,9 @@ pub struct GeneratorIterator {
     /// Opaque pointer to the suspended PyFrame (Box<PyFrame>).
     /// NULL when the generator is exhausted.
     pub frame_ptr: *mut u8,
+    /// `generator.py:21` `self.pycode = frame.pycode`.  This remains owned by
+    /// the generator after `frame` is cleared on exhaustion.
+    pub pycode: PyObjectRef,
     /// Whether the generator has been started (first __next__ called).
     pub started: bool,
     /// Whether the generator is exhausted.
@@ -67,7 +70,13 @@ impl crate::lltype::GcType for GeneratorIterator {
     const SIZE: usize = W_GENERATOR_OBJECT_SIZE;
 }
 
-fn w_generator_or_coroutine_new(frame_ptr: *mut u8, coroutine: bool) -> PyObjectRef {
+fn w_generator_or_coroutine_new(
+    frame_ptr: *mut u8,
+    pycode: PyObjectRef,
+    coroutine: bool,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pycode);
     let value = GeneratorIterator {
         ob: PyObject {
             ob_type: if coroutine {
@@ -82,6 +91,7 @@ fn w_generator_or_coroutine_new(frame_ptr: *mut u8, coroutine: bool) -> PyObject
             },
         },
         frame_ptr,
+        pycode,
         started: false,
         exhausted: false,
         running: false,
@@ -116,12 +126,12 @@ fn w_generator_or_coroutine_new(frame_ptr: *mut u8, coroutine: bool) -> PyObject
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
 
-pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
-    w_generator_or_coroutine_new(frame_ptr, false)
+pub fn w_generator_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
+    w_generator_or_coroutine_new(frame_ptr, pycode, false)
 }
 
-pub fn w_coroutine_new(frame_ptr: *mut u8) -> PyObjectRef {
-    w_generator_or_coroutine_new(frame_ptr, true)
+pub fn w_coroutine_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
+    w_generator_or_coroutine_new(frame_ptr, pycode, true)
 }
 
 pub fn w_coroutine_wrapper_new(coroutine: PyObjectRef) -> PyObjectRef {
@@ -163,6 +173,11 @@ pub unsafe fn w_coroutine_wrapper_get_coroutine(obj: PyObjectRef) -> PyObjectRef
 
 pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
     unsafe { (*(obj as *const GeneratorIterator)).frame_ptr }
+}
+
+#[inline]
+pub unsafe fn w_generator_get_pycode(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).pycode }
 }
 
 #[inline]

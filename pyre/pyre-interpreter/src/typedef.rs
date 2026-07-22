@@ -21121,13 +21121,9 @@ fn generator_getter_for(args: &[PyObjectRef], field: usize, coroutine: bool) -> 
                 frame as PyObjectRef
             }
         }
-        3 => {
-            if frame.is_null() {
-                w_none()
-            } else {
-                unsafe { (*frame).pycode as PyObjectRef }
-            }
-        }
+        // generator.py:387 / :464 `interp_attrproperty_w('pycode')` reads the
+        // generator-owned immutable field, not the possibly-cleared frame.
+        3 => unsafe { pyre_object::generator::w_generator_get_pycode(obj) },
         4 => {
             if frame.is_null() {
                 w_none()
