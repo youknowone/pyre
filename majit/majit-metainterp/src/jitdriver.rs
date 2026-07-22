@@ -2649,6 +2649,10 @@ impl<S: JitState> JitDriver<S> {
                     }
                 }
                 self.meta.abort_trace_live(false);
+                // `pyjitpl.py:2785-2789` counts every SwitchToBlackhole abort,
+                // including a bridge whose greenkey is None. `Decline` is a
+                // pyre pre-trace coverage fallback, not a traced abort, so it
+                // deliberately remains outside `aborted_tracing` accounting.
                 if !matches!(action, TraceAction::Decline) {
                     self.meta.aborted_tracing(reason_int);
                 }

@@ -1994,13 +1994,8 @@ fn run_perfn_walk<Sym: WalkSym>(
     // resume marker's `live/` stream.  A bridge whose carried coordinate names
     // such a marker starts this walk from the input banks above, so reject the
     // walk when those banks cannot provide one of the marker's live colors.
-    //
-    // A null Ref in `argboxes_r` is also uncovered here.  For this bridge
-    // shape, positional Ref seeds come from the restored stack-slot mirror;
-    // a live register receiving its mirror's null is not a valid replacement
-    // for the register value `consume_boxes` would have restored.  This is
-    // deliberately a decline-only soundness gate: later color-indexed seeding
-    // may make the value available, but must prove this coverage first.
+    // `_callback_r` writes `next_ref()` directly (resume.py:1032-1034), so a
+    // restored null Ref is a covered value; only `OpRef::NONE` is absent.
     // `Some` is the actual resume-marker discriminator: setup_bridge_sym sets
     // it only when the carried frame pc is a decodable `live/` offset.
     if is_bridge_trace && sym.bridge_walk_entry_pc().is_some() {
@@ -2009,12 +2004,9 @@ fn run_perfn_walk<Sym: WalkSym>(
             entry as i32,
         );
         let missing_ref = live.ref_.iter().copied().find(|&color| {
-            !matches!(
-                argboxes_r.get(color as usize),
-                Some(opref)
-                    if !opref.is_none()
-                        && !matches!(opref, majit_ir::OpRef::ConstPtr(gcref) if gcref.0 == 0)
-            )
+            argboxes_r
+                .get(color as usize)
+                .is_none_or(|opref| opref.is_none())
         });
         let missing_int = live.int.iter().copied().find(|&color| {
             argboxes_i
@@ -2037,7 +2029,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                 );
             }
             fbw_bridge_decline(ctx);
-            fbw_decline(crate::driver::make_green_key(w_code, start_pc));
             return None;
         }
     }
