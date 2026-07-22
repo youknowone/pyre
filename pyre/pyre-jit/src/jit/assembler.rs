@@ -2159,6 +2159,57 @@ mod tests {
     }
 
     #[test]
+    fn try_assemble_declines_constant_pool_byte_overflow() {
+        // The register file alone fits (`num_regs.ref_ < 256`), so the
+        // up-front gate passes. Constants routed through the per-kind pool
+        // occupy the SAME one-byte namespace above `count_regs[ref]`
+        // (`assembler.py:131-137`), so enough of them push a
+        // `jit_merge_point` red-list operand past 255 —
+        // `assembler.py:265-269 check_result`. The runtime seam must decline
+        // rather than abort while emitting the operand.
+        const NUM_REGS_R: u16 = 200;
+        let reds_r: Vec<Operand> = (0..100).map(|i| Operand::ConstRef(i * 8)).collect();
+        let empty = |kind| {
+            Operand::ListOfKind(ListOfKind {
+                kind,
+                content: Vec::new(),
+            })
+        };
+
+        let mut ssarepr = SSARepr::new("pool_overflow");
+        ssarepr.insns.push(Insn::op(
+            "jit_merge_point",
+            vec![
+                Operand::ConstInt(0),
+                empty(Kind::Int),
+                empty(Kind::Ref),
+                empty(Kind::Float),
+                empty(Kind::Int),
+                Operand::ListOfKind(ListOfKind {
+                    kind: Kind::Ref,
+                    content: reds_r,
+                }),
+                empty(Kind::Float),
+            ],
+        ));
+
+        let mut assembler = Assembler::new();
+        let jitcode = assembler.try_assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: NUM_REGS_R,
+                ..NumRegs::default()
+            }),
+        );
+        assert!(
+            jitcode.is_none(),
+            "200 ref registers + 100 pooled ref constants exceeds the one-byte \
+             operand namespace and must decline"
+        );
+    }
+
+    #[test]
     fn assemble_records_insn_positions_and_liveness() {
         let mut ssarepr = SSARepr::new("live");
         ssarepr
