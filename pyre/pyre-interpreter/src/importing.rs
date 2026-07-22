@@ -529,24 +529,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_opcode);
     pyre_install_module!("_imp"(imp));
 
-    // importlib package — four submodules backed by distinct init fns.
-    pyre_install_module!(
-        "importlib.machinery" =>
-        crate::module::importlib::interp_importlib::register_machinery
-    );
-    pyre_install_module!(
-        "importlib" =>
-        crate::module::importlib::interp_importlib::register_pkg
-    );
-    // importlib.util is NOT registered as a builtin: with importlib.__path__
-    // pointing at the on-disk package, the real util.py loads from there and
-    // re-exports the full _bootstrap / _bootstrap_external surface
-    // (cache_from_source, source_from_cache, source_hash, find_spec, …) that
-    // a stub could only approximate.
-    pyre_install_module!(
-        "importlib.abc" =>
-        crate::module::importlib::interp_importlib::register_abc
-    );
+    // importlib package and its submodules load their real source from disk:
+    // the package `__init__.py` binds `__import__`/`import_module`/… from the
+    // frozen `_bootstrap`, and `machinery`/`abc`/`util` re-export the real
+    // finders/loaders/spec classes out of `_frozen_importlib{,_external}`. The
+    // frozen bootstrap modules already carry the full surface, so a native stub
+    // would only inject placeholder `object` classes that shadow them.
 
     // __pypy__ package + builders submodule — the PyPy-only surface
     // pickle.py imports (identity_dict + builders.BytesBuilder).
@@ -976,15 +964,170 @@ pub(crate) fn create_builtin_module(
     Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
 }
 
+/// Set a builtin module's `__spec__`/`__loader__`/`__package__` from the
+/// app-level `BuiltinImporter`, matching `BuiltinImporter.exec_module` →
+/// `_init_module_attrs`. Reachable only once `importlib._bootstrap` is wired;
+/// the handful of builtins imported before that are fixed up in bulk by
+/// `_bootstrap._setup`'s sys.modules walk, so a no-op here is correct then.
+#[cfg(feature = "host_env")]
+fn set_builtin_module_spec(
+    name: &str,
+    module: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let Some(bootstrap) = get_sys_module("importlib._bootstrap") else {
+        return Ok(());
+    };
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(module);
+    let boot_slot = shadow_stack_len();
+    pin_root(bootstrap);
+
+    // Best-effort throughout: a builtin imported while `_bootstrap` is still
+    // executing sees a partially-initialised module whose `BuiltinImporter` /
+    // `_init_module_attrs` are not defined yet. Skip rather than break the
+    // import — `_bootstrap._setup` fixes up any builtin missed here.
+    let Ok(importer) = crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "BuiltinImporter")
+    else {
+        return Ok(());
+    };
+    let importer_slot = shadow_stack_len();
+    pin_root(importer);
+    let Ok(find_spec) = crate::baseobjspace::getattr_str(shadow_stack_get(importer_slot), "find_spec")
+    else {
+        return Ok(());
+    };
+    let find_spec_slot = shadow_stack_len();
+    pin_root(find_spec);
+    let w_name = pyre_object::w_str_new(name);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let Ok(spec) = crate::call::call_function_impl_result(
+        shadow_stack_get(find_spec_slot),
+        &[shadow_stack_get(name_slot)],
+    ) else {
+        return Ok(());
+    };
+    if unsafe { pyre_object::is_none(spec) } {
+        return Ok(());
+    }
+    let spec_slot = shadow_stack_len();
+    pin_root(spec);
+
+    // _init_module_attrs(spec, module)
+    let Ok(init) = crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "_init_module_attrs")
+    else {
+        return Ok(());
+    };
+    let init_slot = shadow_stack_len();
+    pin_root(init);
+    let _ = crate::call::call_function_impl_result(
+        shadow_stack_get(init_slot),
+        &[shadow_stack_get(spec_slot), shadow_stack_get(mod_slot)],
+    );
+    Ok(())
+}
+
+/// Off-`host_env` builds have no app-level importlib to source specs from.
+#[cfg(not(feature = "host_env"))]
+fn set_builtin_module_spec(_name: &str, _module: PyObjectRef) -> Result<(), crate::PyError> {
+    Ok(())
+}
+
+/// Set a source module's `__spec__`/`__loader__`/`__file__`/`__cached__` from
+/// the app-level `_bootstrap_external._fix_up_module` — the helper
+/// `PyImport_ExecCodeModuleObject` calls. Returns `false` when the importlib
+/// bootstrap is not wired yet, so the caller can seed `None` instead.
+///
+/// `ns` (the module dict) is written in place; the caller keeps it pinned.
+#[cfg(feature = "host_env")]
+fn fix_up_source_module_spec(
+    ns: PyObjectRef,
+    pathname: &str,
+    cpathname: Option<&str>,
+) -> Result<bool, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let Some(ext) = get_sys_module("importlib._bootstrap_external") else {
+        return Ok(false);
+    };
+    let Some(w_name) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__name__") }) else {
+        return Ok(false);
+    };
+
+    let _roots = push_roots();
+    let ns_slot = shadow_stack_len();
+    pin_root(ns);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let ext_slot = shadow_stack_len();
+    pin_root(ext);
+    let w_path = pyre_object::w_str_new(pathname);
+    let path_slot = shadow_stack_len();
+    pin_root(w_path);
+    let w_cpath = match cpathname {
+        Some(c) => pyre_object::w_str_new(c),
+        None => pyre_object::w_none(),
+    };
+    let cpath_slot = shadow_stack_len();
+    pin_root(w_cpath);
+
+    // Best-effort: `_bootstrap_external` itself is a source module, and its
+    // spec is fixed up (during partial-init) before its body defines
+    // `_fix_up_module` — the getattr then raises. Fall back to `None` seeding
+    // for that (and any other partially-initialised) case rather than break
+    // the import; the module's spec is corrected by later imports / `_setup`.
+    let Ok(fix) = crate::baseobjspace::getattr_str(shadow_stack_get(ext_slot), "_fix_up_module")
+    else {
+        return Ok(false);
+    };
+    let fix_slot = shadow_stack_len();
+    pin_root(fix);
+    if crate::call::call_function_impl_result(
+        shadow_stack_get(fix_slot),
+        &[
+            shadow_stack_get(ns_slot),
+            shadow_stack_get(name_slot),
+            shadow_stack_get(path_slot),
+            shadow_stack_get(cpath_slot),
+        ],
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Off-`host_env` builds have no app-level importlib to source specs from.
+#[cfg(not(feature = "host_env"))]
+fn fix_up_source_module_spec(
+    _ns: PyObjectRef,
+    _pathname: &str,
+    _cpathname: Option<&str>,
+) -> Result<bool, crate::PyError> {
+    Ok(false)
+}
+
 fn startup_builtin_module(
     name: &str,
     module: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(module);
+
     let startup = BUILTIN_MODULES.with(|m| m.borrow().get(name).and_then(|d| d.startup));
     if let Some(startup) = startup {
-        startup(module, execution_context)?;
+        startup(shadow_stack_get(mod_slot), execution_context)?;
     }
+    set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
     Ok(())
 }
 
@@ -1021,8 +1164,22 @@ pub fn init_sys_path(script_dir: &Path) {
                 }
             }
         }
-        // CPython stdlib path is detected lazily on first stdlib import
-        // to avoid spawning python3 subprocess on every startup.
+        // PYTHONPATH entries follow the script/cwd seed and precede the
+        // lazily-detected stdlib (pathconfig.c). Honoured regardless of the
+        // safe-path flag, which only suppresses the script/cwd seed. The
+        // sandbox interpreter takes its search path from the controller, so it
+        // does not read the host environment here.
+        #[cfg(not(feature = "sandbox"))]
+        if let Ok(pythonpath) = host_os::var("PYTHONPATH") {
+            for entry in pythonpath.split(':').filter(|e| !e.is_empty()) {
+                let pb = PathBuf::from(entry);
+                if !path.contains(&pb) {
+                    path.push(pb);
+                }
+            }
+        }
+        // The stdlib path is detected lazily on first stdlib import to avoid
+        // spawning a python3 subprocess on every startup.
         // See find_module() → ensure_stdlib_path().
     });
 }
@@ -1571,9 +1728,56 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
     None
 }
 
+/// Read the live Python `sys.path` list as filesystem directories, or an
+/// empty vec before `sys` / its `path` list exists (the pre-`sync` bootstrap
+/// window). Only `str` entries are collected — path hooks (zipimporter keys
+/// and the like) are not resolvable by the native file search.
+#[cfg(feature = "host_env")]
+fn python_sys_path_dirs() -> Vec<PathBuf> {
+    let Some(sys_mod) = get_sys_module("sys") else {
+        return Vec::new();
+    };
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
+    if w_dict.is_null() {
+        return Vec::new();
+    }
+    let Some(w_path) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }) else {
+        return Vec::new();
+    };
+    if !unsafe { pyre_object::is_list(w_path) } {
+        return Vec::new();
+    }
+    let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+    let mut dirs = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
+            if unsafe { pyre_object::is_str(item) } {
+                dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
+            }
+        }
+    }
+    dirs
+}
+
+/// Search the import path for a top-level `partname`.
+///
+/// Python `sys.path` is authoritative — user code (and PYTHONPATH) mutate the
+/// Python list and imports must honor it, the same precedence `check_sys_modules`
+/// gives the Python `sys.modules` dict. The native `SYS_PATH` is the startup
+/// seed: it is appended (deduplicated) so the vendored stdlib and the default
+/// entries stay searchable, and it is the sole source in the pre-`sync`
+/// bootstrap window where the Python list is still the empty placeholder.
 #[cfg(feature = "host_env")]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
-    SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow()))
+    let mut dirs = python_sys_path_dirs();
+    SYS_PATH.with(|p| {
+        for d in p.borrow().iter() {
+            if !dirs.contains(d) {
+                dirs.push(d.clone());
+            }
+        }
+    });
+    find_in_dirs(partname, &dirs)
 }
 
 /// Extract a package module's `__path__` as filesystem directories.
@@ -1673,26 +1877,22 @@ fn exec_code_module(
             pyre_object::w_dict_setitem_str(w_globals, "__cached__", w_cpathname);
         }
         // importing.py:286-298 — `_fix_up_module(d, name, pathname,
-        // cpathname)`.  PyPy's `_fix_up_module`
-        // (`lib-python/3/importlib/_bootstrap_external.py:1728`) sets
-        // `__spec__`/`__loader__`/`__file__`/`__cached__` from the
-        // app-level `SourceFileLoader` + `spec_from_file_location`
-        // helpers.  Pyre lacks the importlib bootstrap machinery
-        // (`SourceFileLoader`, `ModuleSpec`, `spec_from_file_location`
-        // are not yet ported), so as a TODO we seed
-        // `__loader__`/`__spec__` with `None` only when missing —
-        // matching PyPy's `if not loader / if not spec` guards
-        // (_bootstrap_external.py:1732, 1739).  When the importlib
-        // app-level layer lands, the `None` arms will collapse onto the
-        // mechanical PyPy port.
-        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
-            unsafe {
-                pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
+        // cpathname)` sets `__spec__`/`__loader__`/`__file__`/`__cached__`
+        // from the app-level `SourceFileLoader` + `spec_from_file_location`
+        // helpers.  Reachable only once the importlib bootstrap is wired;
+        // before that, seed `__loader__`/`__spec__` with `None` only when
+        // missing — the `if not loader / if not spec` guards at
+        // `_bootstrap_external.py:_fix_up_module`.
+        if !fix_up_source_module_spec(w_globals, p, cpathname)? {
+            if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
+                unsafe {
+                    pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
+                }
             }
-        }
-        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
-            unsafe {
-                pyre_object::w_dict_setitem_str(w_globals, "__spec__", pyre_object::w_none());
+            if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
+                unsafe {
+                    pyre_object::w_dict_setitem_str(w_globals, "__spec__", pyre_object::w_none());
+                }
             }
         }
     }
@@ -2051,6 +2251,9 @@ fn load_part(
         };
         set_sys_module(modulename, m);
         startup_builtin_module(modulename, m, execution_context)?;
+        // `startup_builtin_module` runs app-level spec construction that can
+        // collect and relocate `m`; re-read the live pointer from sys.modules.
+        let m = check_sys_modules(modulename).unwrap_or(m);
         return Ok(Some(m));
     }
 
@@ -2093,7 +2296,9 @@ fn load_part(
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
             startup_builtin_module(partname, m, execution_context)?;
-            m
+            // `startup_builtin_module` may collect and relocate `m`; re-read
+            // the live pointer from sys.modules.
+            check_sys_modules(modulename).unwrap_or(m)
         }
     };
 
