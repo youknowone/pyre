@@ -6704,6 +6704,31 @@ fn parse_int_from_str(
             c.to_digit(radix).is_some()
         }
     };
+
+    // RPython `NumberStringParser.__init__` checks the configured digit
+    // limit immediately after whitespace/sign/base-prefix handling and
+    // before it allocates or parses the digit stream.  Preserve that order:
+    // malformed underscore placement is diagnosed later by `next_digit`,
+    // except for an empty input or a leading underscore before a base prefix,
+    // which the parser rejects ahead of the limit check.
+    if digits.is_empty() || (!had_base_prefix && digits.starts_with('_')) {
+        return Err(invalid_int_literal(w_source, base));
+    }
+    if radix & (radix - 1) != 0 {
+        let maxdigits = crate::module::sys::state::int_max_str_digits();
+        if maxdigits != 0 {
+            let digit_count = digits.chars().filter(|&c| c != '_').count();
+            if digit_count > maxdigits as usize {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::ValueError,
+                    format!(
+                        "Exceeds the limit ({maxdigits} digits) for integer string conversion: value has {digit_count} digits; use sys.set_int_max_str_digits() to increase the limit"
+                    ),
+                ));
+            }
+        }
+    }
+
     let digit_chars: Vec<char> = digits.chars().collect();
     let mut cleaned = String::with_capacity(digits.len());
     for (i, &c) in digit_chars.iter().enumerate() {
@@ -6720,21 +6745,6 @@ fn parse_int_from_str(
             return Err(invalid_int_literal(w_source, base));
         }
         cleaned.push(c);
-    }
-    // PyPy `pypy/objspace/std/intobject.py:_string_to_int_or_long` applies
-    // the configurable limit to every non-binary base. Underscores are not
-    // digits and have already been removed from `cleaned`.
-    if radix & (radix - 1) != 0 {
-        let maxdigits = crate::module::sys::state::int_max_str_digits();
-        if maxdigits != 0 && cleaned.len() > maxdigits as usize {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!(
-                    "Exceeds the limit ({maxdigits}) for integer string conversion: value has {} digits",
-                    cleaned.len()
-                ),
-            ));
-        }
     }
     if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
         return Ok(w_int_new(sign * v));
@@ -11985,6 +11995,35 @@ mod tests {
         let err = builtin_hash(&[value]).expect_err("tuple hash should reject list element");
 
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+    }
+
+    #[test]
+    fn int_string_digit_limit_precedes_digit_buffer_allocation() {
+        crate::typedef::init_typeobjects();
+        let text = "7".repeat(crate::module::sys::state::DEFAULT_MAX_STR_DIGITS as usize + 1);
+        let source = w_str_new(&text);
+        let err = parse_int_from_str(source, &text, 10).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        assert_eq!(
+            err.message,
+            "Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit"
+        );
+    }
+
+    #[test]
+    fn int_string_leading_underscore_error_precedes_digit_limit() {
+        crate::typedef::init_typeobjects();
+        let text = format!(
+            "_{}",
+            "7".repeat(crate::module::sys::state::DEFAULT_MAX_STR_DIGITS as usize + 1)
+        );
+        let source = w_str_new(&text);
+        let err = parse_int_from_str(source, &text, 10).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        assert!(
+            err.message
+                .starts_with("invalid literal for int() with base 10:")
+        );
     }
 
     #[test]
