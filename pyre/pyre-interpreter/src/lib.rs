@@ -892,6 +892,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             130,
             typed::<crate::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
         ),
+        subclass_range_alias(135, typed::<crate::module::_io::W_BufferedReader>()),
     ]
 }
 

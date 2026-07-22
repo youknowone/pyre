@@ -2920,6 +2920,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     ] {
         register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
     }
+    // `interp_bufferedio.BufferedMixin` keeps both `w_raw` and its backing
+    // byte buffer directly on the concrete reader.  Append this registration
+    // after every existing object type so their stable automatic ids do not
+    // move; the marker then forwards the two inline fields.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_io::W_BufferedReader
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical
