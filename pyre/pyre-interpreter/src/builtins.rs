@@ -10793,10 +10793,35 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
         let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
         let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(true));
         let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
         Ok(wrapper)
     }
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(all(not(feature = "sandbox"), unix))]
+    {
+        // PyPy: interp_io._open constructs W_FileIO, whose descr_init opens a
+        // pathname immediately through _open_fd.  In particular, `w` creates
+        // and truncates before open() returns, `x` reports EEXIST here, and
+        // `a` owns an O_APPEND descriptor.  Keeping pathname-backed streams in
+        // an in-memory side buffer postpones all three observable effects until
+        // close(), which is not the W_FileIO storage shape.
+        let _ = (reading, writing);
+        let flags = open_flags_for_mode(&mode);
+        let fd = crate::host_seam::ops::open(path.as_bytes(), flags, 0o666)
+            .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
+        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
+        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(true));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
+        Ok(wrapper)
+    }
+    #[cfg(all(not(feature = "sandbox"), not(unix)))]
     {
         let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
             #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
@@ -12024,6 +12049,31 @@ mod tests {
             err.message
                 .starts_with("invalid literal for int() with base 10:")
         );
+    }
+
+    /// PyPy `interp_io._open` constructs `W_FileIO`, and
+    /// `W_FileIO.descr_init` calls `_open_fd` before returning.  A writable
+    /// pathname must therefore be created/truncated while the stream is still
+    /// open, rather than when our wrapper is later flushed or closed.
+    #[cfg(unix)]
+    #[test]
+    fn open_write_path_opens_and_truncates_immediately() {
+        crate::typedef::init_typeobjects();
+        static NEXT_PATH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("pyre-open-write-{}-{serial}-æ", std::process::id()));
+        std::fs::write(&path, b"old contents").unwrap();
+
+        let path_text = path.to_str().unwrap();
+        let file = builtin_open(&[w_str_new(path_text), w_str_new("w")]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert!(!unsafe {
+            pyre_object::w_bool_get_value(crate::baseobjspace::getattr_str(file, "closed").unwrap())
+        });
+
+        file_method_close(&[file]).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

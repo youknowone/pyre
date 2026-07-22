@@ -110,9 +110,8 @@ pub type SeamResult<T> = Result<T, SeamError>;
 /// Map a [`SeamError`] onto the interpreter's `PyError`, mirroring the
 /// `io_err`/`fd_io_err` conversions the real-syscall call sites use. `context`
 /// is the path that becomes the `OSError`'s `filename` (empty = omit, matching
-/// the `""` the fd call sites pass). Only the sandbox build routes errors
-/// through here; the real build keeps its own inline `io_err`.
-#[cfg(feature = "sandbox")]
+/// the `""` the fd call sites pass). Both real and trampoline-backed opens
+/// use this conversion so they expose the same Python exception shape.
 pub fn seam_os_err(e: SeamError, context: &str) -> crate::PyError {
     match e {
         SeamError::Os(errno) => {
