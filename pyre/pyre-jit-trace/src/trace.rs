@@ -2688,8 +2688,15 @@ fn run_perfn_walk<Sym: WalkSym>(
     let journal = crate::jitcode_dispatch::fbw_store_journal_len();
     if committed {
         crate::jitcode_dispatch::fbw_store_journal_commit();
+        // A committed bridge recording keeps its advanced iterator cursor (the
+        // compiled bridge / adopted end state owns the iteration count).
+        crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
     } else {
         crate::jitcode_dispatch::fbw_store_journal_rollback();
+        // A bridge/retrace recording that does not commit restores the
+        // iterator cursor it eagerly advanced, so the interpreter resume
+        // re-consumes the in-flight item exactly once (no drop).
+        crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
     }
     if authoritative && std::env::var_os("PYRE_FBW_CENSUS").is_some() {
         let mut end = match &walk_result {

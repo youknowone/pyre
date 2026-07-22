@@ -5022,6 +5022,12 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(current, Value::Int(concrete_current));
 
+    if ctx.trace_ctx.is_bridge_trace {
+        // A bridge/retrace recording walk has no in-flight forward-delivery on
+        // abort, so journal the pre-advance cursor for restore if the walk does
+        // not commit (keeps the aborted recording side-effect neutral).
+        fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
+    }
     fbw_foriter_inflight_capture(concrete_item_ptr, body);
     // Range iteration stays at the C level, so the operand-stack mirror
     // remains valid and must receive the item produced by FOR_ITER.  Its

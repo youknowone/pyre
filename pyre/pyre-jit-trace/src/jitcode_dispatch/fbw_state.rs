@@ -741,6 +741,39 @@ pub(crate) fn fbw_store_journal_commit() {
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
 }
 
+/// Record a bridge/retrace recording walk's range-iterator cursor before its
+/// eager advance, so the abort path can restore it ([`FBW_BRIDGE_ITER_JOURNAL`]).
+/// Called from the range FOR_ITER specialization ONLY while `is_bridge_trace`.
+pub(crate) fn fbw_bridge_iter_journal_push(
+    iter: pyre_object::PyObjectRef,
+    pre_current: i64,
+    pre_remaining: i64,
+) {
+    FBW_BRIDGE_ITER_JOURNAL.with(|j| j.borrow_mut().push((iter, pre_current, pre_remaining)));
+}
+
+/// Non-commit epilogue for a bridge/retrace recording walk: restore each
+/// range iterator to the cursor it held before the walk advanced it, in
+/// reverse push order.  The interpreter resume then re-consumes the item the
+/// aborted recording had taken, so the iteration is executed exactly once.
+pub(crate) fn fbw_bridge_iter_journal_rollback() {
+    FBW_BRIDGE_ITER_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some((iter, pre_current, pre_remaining)) = entries.pop() {
+            unsafe {
+                pyre_object::functional::w_range_iter_set_cursor(iter, pre_current, pre_remaining);
+            }
+        }
+    });
+}
+
+/// Commit epilogue: a committed bridge recording keeps its advanced cursor
+/// (the compiled bridge adopts it as the authoritative continuation), so drop
+/// the undo log without restoring.
+pub(crate) fn fbw_bridge_iter_journal_clear() {
+    FBW_BRIDGE_ITER_JOURNAL.with(|j| j.borrow_mut().clear());
+}
+
 /// Record the in-flight FOR_ITER continuation (#57 Option C): the consumed
 /// item the `for_iter_next` residual produced and its FOR_ITER body coordinate.
 /// Called from the residual

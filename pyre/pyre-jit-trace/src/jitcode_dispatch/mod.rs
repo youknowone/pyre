@@ -4249,6 +4249,17 @@ thread_local! {
     static FBW_FORITER_INFLIGHT: std::cell::RefCell<Vec<InflightForiter>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for a bridge/retrace recording walk's eager range-iterator
+    /// cursor advance.  The main walk leaves the advance unjournaled and relies
+    /// on in-flight FOR_ITER forward-delivery to recover the consumed item on
+    /// abort; the bridge/retrace abort path has no such delivery, so a bridge
+    /// walk records `(iter, pre_current, pre_remaining)` here and restores the
+    /// cursor when it does NOT commit — leaving the recording side-effect
+    /// neutral so the interpreter resume re-consumes the item exactly once.
+    /// Only populated while `is_bridge_trace`; empty (no-op) on the main walk.
+    static FBW_BRIDGE_ITER_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     static FBW_UNJOURNALED_VALUE_UNAVAILABLE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static FBW_UNJOURNALED_SYMBOLIC: std::cell::Cell<bool> =
