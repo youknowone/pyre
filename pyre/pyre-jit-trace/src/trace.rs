@@ -2026,51 +2026,73 @@ fn run_perfn_walk<Sym: WalkSym>(
         return None;
     }
 
-    // resume.py:1042-1057 `consume_boxes` fills every register named by the
-    // resume marker's `live/` stream.  A bridge whose carried coordinate names
-    // such a marker starts this walk from the input banks above, so reject the
-    // walk when those banks cannot provide one of the marker's live colors.
+    // The foreign-JitCode check above is a first-class runtime decline. Below,
+    // resume.py:1017-1057 `consume_boxes` / `enumerate_vars` fills every live
+    // Ref, Int, and Float register from the marker's stream. With the total
+    // bridge seed above, an uncovered color is a codewriter/seed defect.
     // `_callback_r` writes `next_ref()` directly (resume.py:1032-1034), so a
-    // restored null Ref is a covered value; only `OpRef::NONE` is absent.
-    // `Some` is the actual resume-marker discriminator: setup_bridge_sym sets
-    // it only when the carried frame pc is a decodable `live/` offset.
+    // restored null Ref is covered; only `OpRef::NONE` is absent. `Some` is
+    // the resume-marker discriminator: setup_bridge_sym sets it only when the
+    // carried frame pc is a decodable `live/` offset.
     if is_bridge_trace && sym.bridge_walk_entry_pc().is_some() {
         let live = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
             pjc.jitcode.index() as i32,
             entry as i32,
         );
-        let missing_ref = live.ref_.iter().copied().find(|&color| {
-            argboxes_r
-                .get(color as usize)
-                .is_none_or(|opref| opref.is_none())
-        });
-        let missing_int = live.int.iter().copied().find(|&color| {
-            argboxes_i
-                .get(color as usize)
-                .is_none_or(|opref| opref.is_none())
-        });
-        // resume.py:1036-1038 `_callback_f` fills each Float color named by
-        // the resume marker, and the Float input bank above seeds it by color.
-        let missing_float = live.float.iter().copied().find(|&color| {
-            argboxes_f
-                .get(color as usize)
-                .is_none_or(|opref| opref.is_none())
-        });
-        if missing_ref.is_some() || missing_int.is_some() || missing_float.is_some() {
-            if missing_ref.is_some() {
-                crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded::Ref");
-            }
-            if missing_int.is_some() {
-                crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded::Int");
-            }
-            if missing_float.is_some() {
-                crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded::Float");
-            }
+        let uncovered = live
+            .ref_
+            .iter()
+            .copied()
+            .find(|&color| {
+                argboxes_r
+                    .get(color as usize)
+                    .is_none_or(|opref| opref.is_none())
+            })
+            .map(|color| ("Ref", color))
+            .or_else(|| {
+                live.int
+                    .iter()
+                    .copied()
+                    .find(|&color| {
+                        argboxes_i
+                            .get(color as usize)
+                            .is_none_or(|opref| opref.is_none())
+                    })
+                    .map(|color| ("Int", color))
+            })
+            .or_else(|| {
+                live.float
+                    .iter()
+                    .copied()
+                    .find(|&color| {
+                        argboxes_f
+                            .get(color as usize)
+                            .is_none_or(|opref| opref.is_none())
+                    })
+                    .map(|color| ("Float", color))
+            });
+        debug_assert!(
+            uncovered.is_none(),
+            "consume_boxes totality violated: jitcode_index={} entry={} uncovered={uncovered:?}",
+            pjc.jitcode.index(),
+            entry,
+        );
+        if let Some((bank, color)) = uncovered {
+            // read_int_reg/read_float_reg (jitcode_dispatch/mod.rs:1907-1936)
+            // only bounds-check. An uncovered color would record OpRef::NONE
+            // into an operation and can become a SIGSEGV or miscompile; retain
+            // this cold decline as the release airbag.
+            let census_key = match bank {
+                "Ref" => "Fbw::BridgeEntryLiveRegUnseeded::Ref",
+                "Int" => "Fbw::BridgeEntryLiveRegUnseeded::Int",
+                "Float" => "Fbw::BridgeEntryLiveRegUnseeded::Float",
+                _ => unreachable!("unknown bridge register bank"),
+            };
+            crate::jitcode_dispatch::census_record(census_key);
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!(
                     "[fbw-bridge-decline] uncovered resume-marker live register: \
-                     jitcode_index={} entry={} ref={missing_ref:?} int={missing_int:?} \
-                     float={missing_float:?}",
+                     jitcode_index={} entry={} bank={bank} color={color}",
                     pjc.jitcode.index(),
                     entry,
                 );
