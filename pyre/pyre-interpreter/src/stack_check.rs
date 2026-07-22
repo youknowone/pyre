@@ -422,11 +422,11 @@ pub extern "C" fn pyre_stack_criticalcode_stop() {
     TL_REPORT_ERROR.with(|c| c.set(1));
 }
 
-/// pypy/module/sys/vm.py:63 `setrecursionlimit` parity. Tentatively
-/// applies the new stack budget, probes `stack_check` at the current
-/// depth, and rolls the budget back on failure before raising
-/// `RecursionError`. Only on success does the visible recursion
-/// limit get committed and the shadow-stack depth grown.
+/// pypy/module/sys/vm.py:63 `setrecursionlimit`, with Python 3.14's
+/// logical-depth rejection before PyPy's byte-budget update.  The check must
+/// use Python call depth: native Rust frame size is unrelated to CPython's
+/// `py_recursion_remaining` and cannot decide whether a Python limit is below
+/// the current interpreter depth.
 pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     if new_limit <= 0 {
         return Err(PyError::value_error("recursion limit must be positive"));
@@ -434,18 +434,21 @@ pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     // pypy/module/sys/vm.py:86-87 silent upper bound.
     let limit = new_limit.min(MAX_RECURSION_LIMIT);
     let old_limit = get_recursion_limit();
-
-    // pypy/module/sys/vm.py:88-90 try: _stack_set_length_fraction + stack_check
-    pyre_stack_set_length_fraction(limit as f64 * 0.001);
-    if stack_check().is_err() {
-        // pypy/module/sys/vm.py:91-95 rollback on StackOverflow.
-        pyre_stack_set_length_fraction(old_limit as f64 * 0.001);
+    // CPython 3.14 Python/sysmodule.c `sys_setrecursionlimit_impl`: reject
+    // when the current Python recursion depth has already reached the limit.
+    let depth = crate::call::call_depth();
+    if depth >= limit as u32 {
         return Err(PyError::recursion_error(format!(
-            "cannot set the recursion limit to {limit} at the recursion depth: the limit is too low"
+            "cannot set the recursion limit to {limit} at the recursion depth {depth}: the limit is too low"
         )));
     }
 
-    // pypy/module/sys/vm.py:96-97 commit + grow shadow stack.
+    // CPython 3.14 keeps Python recursion accounting separate from native
+    // stack protection.  Preserve PyPy's native byte guard as a high-water
+    // allocation: lowering the Python limit must not shrink it underneath
+    // the already-running Rust interpreter stack.  Logical depth below is
+    // what enforces the newly lowered Python limit.
+    pyre_stack_set_length_fraction(old_limit.max(limit) as f64 * 0.001);
     crate::module::sys::state::set_recursion_limit(limit);
     majit_gc::shadow_stack::increase_root_stack_depth((limit as f64 * 0.001 * 163840.0) as usize);
     Ok(())
@@ -466,6 +469,12 @@ pub fn get_recursion_limit() -> i32 {
 #[inline]
 #[majit_macros::dont_look_inside]
 pub fn stack_check() -> Result<(), PyError> {
+    // CPython 3.14 checks `py_recursion_remaining`, i.e. Python interpreter
+    // depth, independently of native stack protection.  pyre's matching
+    // counter is bumped around every user-function call.
+    if crate::call::call_depth() >= get_recursion_limit() as u32 {
+        return Err(PyError::recursion_error("maximum recursion depth exceeded"));
+    }
     let current = current_sp();
     let end = PYRE_STACKTOOBIG.stack_end.load(Ordering::Relaxed);
     let length = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
@@ -605,16 +614,16 @@ mod tests {
     }
 
     #[test]
-    fn set_recursion_limit_scales_stack_budget() {
+    fn set_recursion_limit_keeps_native_stack_budget_high_water_mark() {
         let _g = lock_tests();
         reset_all();
-        // Halving the recursion limit halves the stack budget.
+        // Lowering the Python logical limit must not shrink native protection
+        // underneath the currently-running interpreter stack.
         set_recursion_limit(500).expect("500 is positive");
         assert_eq!(get_recursion_limit(), 500);
-        assert!(pyre_stack_get_length() < MAX_STACK_SIZE);
-        assert!(pyre_stack_get_length() >= MAX_STACK_SIZE / 2 - 4096);
+        assert_eq!(pyre_stack_get_length(), MAX_STACK_SIZE);
 
-        // Doubling it doubles the budget.
+        // Raising the limit grows both the logical limit and native budget.
         set_recursion_limit(2000).expect("2000 is positive");
         assert_eq!(get_recursion_limit(), 2000);
         assert!(pyre_stack_get_length() > MAX_STACK_SIZE);

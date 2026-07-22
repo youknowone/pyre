@@ -639,6 +639,54 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ),
     );
 
+    // Python 3.14 `os.readinto`: acquire one writable buffer export for the
+    // complete `_Py_read(fd, buffer->buf, buffer->len)` call and return the
+    // number of bytes transferred without allocating an intermediate bytes
+    // object on the real-host path.
+    crate::module_ns_store(
+        ns,
+        "readinto",
+        crate::make_builtin_function_with_arity(
+            "readinto",
+            |args| {
+                let fd_value = unsafe { pyre_object::w_int_get_value(args[0]) };
+                let fd = libc::c_int::try_from(fd_value).map_err(|_| {
+                    crate::PyError::overflow_error("fd is greater than maximum")
+                })?;
+                let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
+                let target = unsafe { buffer.as_mut_slice() };
+                #[cfg(not(feature = "sandbox"))]
+                let result = loop {
+                    let result = unsafe {
+                        libc::read(
+                            fd,
+                            target.as_mut_ptr() as *mut libc::c_void,
+                            target.len() as _,
+                        )
+                    };
+                    if result >= 0 {
+                        break result as i64;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(io_err(error, ""));
+                };
+                #[cfg(feature = "sandbox")]
+                let result = {
+                    let data = crate::host_seam::ops::read(fd, target.len() as i64)
+                        .map_err(|error| crate::host_seam::seam_os_err(error, ""))?;
+                    let length = data.len().min(target.len());
+                    target[..length].copy_from_slice(&data[..length]);
+                    length as i64
+                };
+                Ok(pyre_object::w_int_new(result))
+            },
+            2,
+        ),
+    );
+
     // ── posix.write(fd, data) → nbytes ──
     crate::module_ns_store(
         ns,
@@ -650,17 +698,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     return Err(crate::PyError::type_error("write() requires 2 arguments"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                let data = unsafe {
-                    if pyre_object::bytesobject::is_bytes_like(args[1]) {
-                        pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
-                    } else if pyre_object::is_str(args[1]) {
-                        pyre_object::w_str_get_value(args[1]).as_bytes().to_vec()
-                    } else {
-                        return Err(crate::PyError::type_error(
-                            "write() arg 2 must be bytes-like",
-                        ));
-                    }
-                };
+                // CPython `os_write_impl` receives a `Py_buffer`: text is not
+                // accepted, while every contiguous readable exporter is.
+                let data = unsafe { crate::builtins::file_write_buffer_bytes(args[1]) }
+                    .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
                     let ret = unsafe {

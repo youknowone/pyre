@@ -137,6 +137,16 @@ with TestWithTempDir() as tmpdir:
     assert os.read(fd, len(CONTENT3)) == CONTENT3
     os.close(fd)
 
+    # Python 3.14 os.readinto holds a writable-buffer export for the syscall
+    # and writes into the exact memoryview window supplied by the caller.
+    fd = os.open(fname, os.O_RDONLY)
+    target = bytearray(b"..............")
+    assert os.readinto(fd, memoryview(target)[2 : 2 + len(CONTENT2)]) == len(CONTENT2)
+    assert target == b".." + CONTENT2 + b".."
+    assert os.readinto(fd, bytearray()) == 0
+    assert_raises(TypeError, lambda: os.readinto(fd, b"readonly"))
+    os.close(fd)
+
     fname3 = os.path.join(tmpdir, FILE_NAME3)
     os.rename(fname, fname3)
     assert os.path.exists(fname) is False

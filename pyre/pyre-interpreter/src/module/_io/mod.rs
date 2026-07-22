@@ -284,6 +284,7 @@ crate::py_module! {
             "FileIO",
             |type_ns| {
                 crate::builtins::init_file_wrapper_type(type_ns);
+                crate::builtins::init_fileio_type(type_ns);
                 type_method(
                     type_ns,
                     "__init__",
@@ -292,6 +293,9 @@ crate::py_module! {
             },
             raw_base,
         );
+        // W_IOBase carries a weakref lifeline; W_FileIO instances therefore
+        // accept weak references just like PyPy's concrete raw stream.
+        unsafe { pyre_object::w_type_set_weakrefable(file_io, true) };
         let buffered_reader = crate::typedef::make_builtin_type_with_base(
             "BufferedReader",
             init_buffered_reader_type,
