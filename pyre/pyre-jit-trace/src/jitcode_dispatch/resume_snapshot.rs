@@ -1132,10 +1132,11 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         }
     }
     // Use the virtualizable shadow only after the live register/vstack
-    // sources.  A mid-opcode shadow stack slot can be NULL because it was not
-    // mirrored, while the corresponding live color still has the value.  The
-    // remaining NULL is the CALL's real null-or-self sentinel and must be
-    // preserved as an explicit slot override.
+    // sources, and only for slots those sources left unresolved.  A mid-opcode
+    // shadow stack slot can be NULL because it was not mirrored, while the
+    // corresponding live color still holds the value — so a NULL reaching this
+    // fallback is an UNRESOLVED slot, not a proven null (see the per-slot note
+    // below), and is dropped rather than committed.
     let base = ctx
         .trace_ctx
         .virtualizable_info()
@@ -1147,7 +1148,20 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         }
         if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
         {
-            overrides.push((slot, value.as_usize() as pyre_object::PyObjectRef));
+            // Only a positively-resolved (non-null) shadow value is a faithful
+            // stack slot.  The live vstack/color sources above already emit
+            // every genuine null-or-self sentinel they can resolve
+            // (`concrete_ref_for_opref` yields an explicit null Ref for a
+            // PUSH_NULL box).  A slot that reaches this shadow fallback with a
+            // NULL Ref is one the walk could not resolve — e.g. an
+            // unmaterialized `LOAD_CONST` operand whose concrete value was
+            // never mirrored — not a real null.  Leaving it ABSENT makes the
+            // outer-call flush validation decline, so the legacy replay
+            // rebuilds the frame from its start state instead of resuming the
+            // interpreter over a NULL where a live object belongs.
+            if value.as_usize() != 0 {
+                overrides.push((slot, value.as_usize() as pyre_object::PyObjectRef));
+            }
         }
     }
     overrides
