@@ -431,7 +431,18 @@ impl FrameBox {
     /// the heap, header-bearing frame, so ownership transfers straight through
     /// `into_raw` without the snapshot copy `PyFrame::initialize_as_generator`
     /// needs for the borrowed-`&mut self` case.
-    pub fn into_generator(mut self) -> crate::PyResult {
+    pub fn into_generator(self) -> crate::PyResult {
+        self.into_generator_named(None, None)
+    }
+
+    /// `pyframe.py:259 initialize_as_generator(name, qualname)` — function
+    /// calls pass the function's current writable metadata so each newly
+    /// created generator freezes it independently of the code object.
+    pub fn into_generator_named(
+        mut self,
+        name: Option<&str>,
+        qualname: Option<&str>,
+    ) -> crate::PyResult {
         self.fix_array_ptrs();
         let register_final = !self.code().exceptiontable.is_empty();
         // A suspended generator frame is off the call chain — `f_back` is
@@ -464,6 +475,19 @@ impl FrameBox {
         } else {
             pyre_object::generator::w_generator_new(frame_ptr as *mut u8)
         };
+        // GeneratorOrCoroutine.__init__ stores `_name` / `_qualname` on the
+        // generator.  Root the new owner while allocating the two wrapped
+        // strings, then publish them through the normal GC write barrier.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(generator);
+        if let Some(name) = name {
+            let w_name = pyre_object::w_str_new(name);
+            unsafe { pyre_object::generator::w_generator_set_name(generator, w_name) };
+        }
+        if let Some(qualname) = qualname {
+            let w_qualname = pyre_object::w_str_new(qualname);
+            unsafe { pyre_object::generator::w_generator_set_qualname(generator, w_qualname) };
+        }
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }

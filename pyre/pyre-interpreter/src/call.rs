@@ -10,8 +10,20 @@ use rustpython_wtf8::Wtf8Buf;
 
 use crate::{
     PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
-    function_get_globals_obj,
+    function_get_globals_obj, function_get_name, function_get_qualname,
 };
+
+/// `function.py:131/214/231 new_frame.run(self.name, self.qualname)`.
+/// Generator creation must capture the function's writable metadata rather
+/// than lazily rereading the immutable code object's names.
+pub(crate) fn frame_into_generator_for_function(
+    frame: crate::pyframe::FrameBox,
+    function: PyObjectRef,
+) -> PyResult {
+    let name = unsafe { function_get_name(function) }.to_string();
+    let qualname = unsafe { function_get_qualname(function) };
+    frame.into_generator_named(Some(&name), Some(&qualname))
+}
 
 struct FrameLocalsRoot {
     slot: *mut *mut u8,
@@ -577,7 +589,7 @@ fn call_user_function_with_eval(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
-        return gen_frame.into_generator();
+        return frame_into_generator_for_function(gen_frame, callable);
     }
 
     let mut func_frame =
@@ -625,7 +637,7 @@ pub fn call_user_function_resolved(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
-        return gen_frame.into_generator();
+        return frame_into_generator_for_function(gen_frame, callable);
     }
 
     let eval_fn = get_eval_fn();
@@ -1262,7 +1274,7 @@ pub fn call_user_function_plain_with_ctx(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
-        return gen_frame.into_generator();
+        return frame_into_generator_for_function(gen_frame, callable);
     }
 
     let mut func_frame =
@@ -2199,7 +2211,7 @@ pub fn call_with_kwargs(
             // `func(*args, **kwds)` from `contextlib.contextmanager`) would
             // execute eagerly and surface the first yielded value.
             if crate::pyframe::code_flags_make_generator(code.flags) {
-                return func_frame.into_generator();
+                return frame_into_generator_for_function(func_frame, callable);
             }
             let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
             let eval_fn = if plain_mode {
@@ -2738,7 +2750,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
                 }
             },
         );
-        return match gen_frame.into_generator() {
+        return match frame_into_generator_for_function(gen_frame, func) {
             Ok(v) => v,
             Err(e) => {
                 set_call_error(e);
@@ -2800,7 +2812,7 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
         ));
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        return match frame.into_generator() {
+        return match frame_into_generator_for_function(frame, func) {
             Ok(v) => v,
             Err(e) => {
                 set_call_error(e);

@@ -2700,7 +2700,7 @@ fn _flat_pycall(
     // ownership (no execution). Normal functions execute through the JIT-aware
     // eval, which needs the locals roots registered for the duration.
     if new_frame._is_generator_or_coroutine() {
-        match new_frame.into_generator() {
+        match crate::call::frame_into_generator_for_function(new_frame, func) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -2781,7 +2781,7 @@ fn _flat_pycall_defaults(
 
     // function.py:231 — return new_frame.run(self.name, self.qualname)
     if new_frame._is_generator_or_coroutine() {
-        match new_frame.into_generator() {
+        match crate::call::frame_into_generator_for_function(new_frame, func) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

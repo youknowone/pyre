@@ -2241,7 +2241,16 @@ pub fn importhook(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if name.is_empty() && level < 0 {
+    // CPython 3.14 import.c / PyPy's import-level validation: negative
+    // levels are rejected independently of the module name.  An empty name
+    // is valid only for an actual relative import (`from . import x`).
+    if level < 0 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "level must be >= 0",
+        ));
+    }
+    if name.is_empty() && level == 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
             "Empty module name",
@@ -2275,6 +2284,14 @@ fn relative_import(
             "attempted relative import with no known parent package",
         )
     })?;
+    // importlib._bootstrap._resolve_name: an empty fallback package (the
+    // `__main__` case) has no parent to anchor even a level-1 import.
+    if package.is_empty() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            "attempted relative import with no known parent package",
+        ));
+    }
 
     // Strip (level - 1) trailing components from package
     // PyPy: for dotted name "a.b.c" with level=2, strip "c" → "a.b", then strip "b" → "a"
@@ -2316,15 +2333,44 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
     // missing entry; any other `__getitem__` error (a dict-subclass globals
     // raising) must propagate.  `?` re-raises it; `if let Some(..)` consumes
     // the present case.
-    // Try __package__ first (PyPy: space.finditem_str(w_globals, '__package__'))
-    if let Some(pkg) = crate::baseobjspace::finditem_str(w_globals, "__package__")? {
-        if !pkg.is_null() && unsafe { pyre_object::is_str(pkg) } {
-            let s = unsafe { pyre_object::w_str_get_value(pkg) };
-            if !s.is_empty() {
-                return Ok(Some(s.to_string()));
+    // Python 3.14 importlib._bootstrap._calc___package__: an explicit
+    // non-None __package__ wins; otherwise __spec__.parent is authoritative.
+    let package = crate::baseobjspace::finditem_str(w_globals, "__package__")?;
+    let spec = crate::baseobjspace::finditem_str(w_globals, "__spec__")?;
+    if let Some(pkg) = package {
+        if !unsafe { pyre_object::is_none(pkg) } {
+            if !unsafe { pyre_object::is_str(pkg) } {
+                return Err(crate::PyError::type_error(
+                    "__package__ not set to a string",
+                ));
             }
+            return Ok(Some(
+                unsafe { pyre_object::w_str_get_value(pkg) }.to_string(),
+            ));
         }
     }
+    if let Some(spec) = spec {
+        if !unsafe { pyre_object::is_none(spec) } {
+            let parent = crate::baseobjspace::getattr_str(spec, "parent")?;
+            if !unsafe { pyre_object::is_str(parent) } {
+                return Err(crate::PyError::type_error(
+                    "__spec__.parent is not a string",
+                ));
+            }
+            return Ok(Some(
+                unsafe { pyre_object::w_str_get_value(parent) }.to_string(),
+            ));
+        }
+    }
+
+    // _calc___package__ emits ImportWarning before the legacy __name__ /
+    // __path__ fallback.  Route it through warnings.warn so assertWarns and
+    // user warning filters see the event.
+    crate::warn::warn_category(
+        "can't resolve package from __spec__ or __package__, falling back on __name__ and __path__",
+        "ImportWarning",
+        3,
+    )?;
 
     // Fallback: __name__ (for modules inside packages)
     if let Some(name_obj) = crate::baseobjspace::finditem_str(w_globals, "__name__")? {
@@ -2334,10 +2380,11 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
             if crate::baseobjspace::finditem_str(w_globals, "__path__")?.is_some() {
                 return Ok(Some(name.to_string()));
             }
-            // Otherwise strip the last component (module name within package)
-            if let Some(dot) = name.rfind('.') {
-                return Ok(Some(name[..dot].to_string()));
-            }
+            // Otherwise `rpartition('.')[0]` is also the empty string for a
+            // top-level module such as __main__.
+            return Ok(Some(
+                name.rfind('.').map_or("", |dot| &name[..dot]).to_string(),
+            ));
         }
     }
 
@@ -2596,6 +2643,29 @@ pub fn import_all_from_w(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn importhook_rejects_invalid_absolute_name_and_level() {
+        crate::test_hooks::install_hash_hook();
+        let empty = importhook("", PY_NULL, PY_NULL, 0, std::ptr::null()).unwrap_err();
+        assert_eq!(empty.kind, crate::PyErrorKind::ValueError);
+        assert_eq!(empty.message, "Empty module name");
+
+        let negative = importhook("sys", PY_NULL, PY_NULL, -1, std::ptr::null()).unwrap_err();
+        assert_eq!(negative.kind, crate::PyErrorKind::ValueError);
+        assert_eq!(negative.message, "level must be >= 0");
+
+        let globals = pyre_object::w_dict_new();
+        unsafe {
+            pyre_object::w_dict_setitem_str(globals, "__package__", pyre_object::w_str_new(""));
+        }
+        let no_parent = importhook("", globals, PY_NULL, 1, std::ptr::null()).unwrap_err();
+        assert_eq!(no_parent.kind, crate::PyErrorKind::ImportError);
+        assert_eq!(
+            no_parent.message,
+            "attempted relative import with no known parent package"
+        );
+    }
 
     #[test]
     fn test_sys_modules_cache() {

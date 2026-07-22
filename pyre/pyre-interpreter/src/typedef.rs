@@ -21245,6 +21245,20 @@ fn generator_set_name(args: &[PyObjectRef]) -> crate::PyResult {
 fn generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_set_name_common(args, true, false)
 }
+fn generator_delete_name(_args: &[PyObjectRef]) -> crate::PyResult {
+    // CPython 3.14 routes deletion through the same string-only member
+    // setter, so `del gen.__name__` is a TypeError (the bundled 3.14
+    // GeneratorTest requires the exception class), not PyPy's older
+    // null-fdel AttributeError.
+    Err(crate::PyError::type_error(
+        "__name__ must be set to a string object",
+    ))
+}
+fn generator_delete_qualname(_args: &[PyObjectRef]) -> crate::PyResult {
+    Err(crate::PyError::type_error(
+        "__qualname__ must be set to a string object",
+    ))
+}
 fn coroutine_set_name(args: &[PyObjectRef]) -> crate::PyResult {
     generator_set_name_common(args, false, true)
 }
@@ -21313,25 +21327,28 @@ fn init_generator_type(ns: PyObjectRef) {
             )
         };
     }
-    for (name, getter, setter) in [
+    for (name, getter, setter, deleter) in [
         (
             "__name__",
             generator_get_name as DunderFn,
             generator_set_name as DunderFn,
+            generator_delete_name as DunderFn,
         ),
         (
             "__qualname__",
             generator_get_qualname as DunderFn,
             generator_set_qualname as DunderFn,
+            generator_delete_qualname as DunderFn,
         ),
     ] {
         let get = make_builtin_function_with_arity(name, getter, 2);
         let set = make_builtin_function_with_arity(name, setter, 3);
+        let delete = make_builtin_function_with_arity(name, deleter, 2);
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_full(get, set, delete, PY_NULL, PY_NULL, Some(name)),
             )
         };
     }
@@ -21382,25 +21399,28 @@ fn init_coroutine_type(ns: PyObjectRef) {
             )
         };
     }
-    for (name, getter, setter) in [
+    for (name, getter, setter, deleter) in [
         (
             "__name__",
             coroutine_get_name as DunderFn,
             coroutine_set_name as DunderFn,
+            generator_delete_name as DunderFn,
         ),
         (
             "__qualname__",
             coroutine_get_qualname as DunderFn,
             coroutine_set_qualname as DunderFn,
+            generator_delete_qualname as DunderFn,
         ),
     ] {
         let get = make_builtin_function_with_arity(name, getter, 2);
         let set = make_builtin_function_with_arity(name, setter, 3);
+        let delete = make_builtin_function_with_arity(name, deleter, 2);
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, PY_NULL, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_full(get, set, delete, PY_NULL, PY_NULL, Some(name)),
             )
         };
     }

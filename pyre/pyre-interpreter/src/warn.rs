@@ -9,9 +9,19 @@
 
 /// baseobjspace.py:2087: space.warn(space.newtext(msg), space.w_DeprecationWarning)
 pub fn warn_deprecation(msg: &str) -> Result<(), crate::PyError> {
+    warn_category(msg, "DeprecationWarning", 2)
+}
+
+/// Route an interpreter warning through Python's warnings machinery so
+/// filters and `warnings.catch_warnings(record=True)` observe it.
+pub fn warn_category(
+    msg: &str,
+    category_name: &str,
+    stacklevel: i64,
+) -> Result<(), crate::PyError> {
     if let (Some(warnings), Some(category)) = (
         crate::importing::get_sys_module("warnings"),
-        crate::builtins::lookup_exc_class("DeprecationWarning"),
+        crate::builtins::lookup_exc_class(category_name),
     ) {
         if let Ok(warn_fn) = crate::baseobjspace::getattr_str(warnings, "warn") {
             crate::call::call_function_impl_result(
@@ -19,14 +29,14 @@ pub fn warn_deprecation(msg: &str) -> Result<(), crate::PyError> {
                 &[
                     pyre_object::w_str_new(msg),
                     category,
-                    pyre_object::w_int_new(2),
+                    pyre_object::w_int_new(stacklevel),
                 ],
             )
             .map(|_| ())?;
             return Ok(());
         }
     }
-    warn(msg, "DeprecationWarning");
+    warn(msg, category_name);
     Ok(())
 }
 

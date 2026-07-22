@@ -11729,29 +11729,24 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
 /// — PyPy: `pypy/module/imp/importing.py:importhook`.
 fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `__import__(name, globals, locals, fromlist, level)` — every parameter
-    // may be passed by keyword (`__import__("a.b", fromlist=["c"])`), so the
-    // positional slots fall back to the matching kwarg.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let arg = |idx: usize, key: &str| -> PyObjectRef {
-        pos.get(idx)
-            .copied()
-            .or_else(|| kwarg_get(kwargs, key))
-            .unwrap_or(pyre_object::PY_NULL)
-    };
-    let name_obj = arg(0, "name");
-    if name_obj.is_null() {
-        return Err(crate::PyError::type_error(
-            "__import__() missing required argument 'name' (pos 1)",
-        ));
-    }
+    // `__import__(name, globals, locals, fromlist, level)` — PyPy's gateway
+    // binds the five named slots before `importhook` runs.  Use the shared
+    // flat-ABI equivalent so duplicate positional/keyword values, unknown
+    // keywords, and surplus positionals raise at the same boundary.
+    let scope = bind_builtin_kwargs(
+        args,
+        &["name", "globals", "locals", "fromlist", "level"],
+        &[true, false, false, false, false],
+        "__import__",
+    )?;
+    let name_obj = scope[0];
     if !unsafe { pyre_object::is_str(name_obj) } {
         return Err(crate::PyError::type_error("module name must be a string"));
     }
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
-    let globals = arg(1, "globals");
-    let fromlist = arg(3, "fromlist");
-    let level_obj = arg(4, "level");
+    let globals = scope[1];
+    let fromlist = scope[3];
+    let level_obj = scope[4];
     // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
     // non-integer raises through the index protocol rather than defaulting.
     let level = if level_obj.is_null() {
