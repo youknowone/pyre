@@ -3504,7 +3504,7 @@ fn min_max_dispatch(
     // functional.py:216-218 — empty positional → TypeError, not panic.
     if positional.is_empty() {
         return Err(crate::PyError::type_error(format!(
-            "{fn_name}() expected at least one argument, got 0"
+            "{fn_name} expected at least 1 argument, got 0"
         )));
     }
     // functional.py:206-210 — `default=` is only meaningful for the
@@ -8306,23 +8306,33 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // base, recursively.
             classdir_into(obj, &mut names)?;
         } else if pyre_object::is_instance(obj) {
-            // util.py:80 `_objectdir` (`object.__dir__`) — the instance
-            // `__dict__` keys plus `_classdir(type(obj))`.  The instance dict
-            // for hasdict objects is the live W_DictObject returned by
-            // `w_obj.getdict(space)`; `__slots__` Member descriptor names live
-            // in the class namespaces walked by `classdir_into`, so every slot
-            // is listed regardless of whether it currently holds a value.
-            let w_dict = crate::baseobjspace::getdict(obj);
-            if !w_dict.is_null() {
+            // util.py:80 `_objectdir` (`object.__dir__`) — use ordinary
+            // `getattr(obj, '__dict__'/'__class__', None)`, not raw layout
+            // fields.  A class may shadow either name with a slot/descriptor;
+            // in particular an uninitialised `__class__` slot suppresses the
+            // recursive class namespace while the live `__dict__` remains.
+            let w_dict = match crate::baseobjspace::getattr_str(obj, "__dict__") {
+                Ok(w_dict) if pyre_object::is_dict(w_dict) => Some(w_dict),
+                Ok(_) => None,
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(w_dict) = w_dict {
                 for (k, _) in pyre_object::w_dict_items(w_dict) {
                     if pyre_object::is_str(k) {
                         names.push(pyre_object::w_str_get_wtf8(k).to_owned());
                     }
                 }
             }
-            let w_type = pyre_object::w_instance_get_type(obj);
-            if !w_type.is_null() && pyre_object::is_type(w_type) {
-                classdir_into(w_type, &mut names)?;
+            let w_class = match crate::baseobjspace::getattr_str(obj, "__class__") {
+                Ok(w_class) => Some(w_class),
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(w_class) = w_class {
+                if pyre_object::is_type(w_class) {
+                    classdir_into(w_class, &mut names)?;
+                }
             }
         } else {
             // Fallback `_objectdir` (util.py:80) for builtin W_Root types
@@ -8946,27 +8956,20 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let obj = args[0];
-    // operation.py:28 — space.int_w unwraps to int
-    let val = if unsafe { is_int(obj) } {
-        unsafe { w_int_get_value(obj) }
-    } else {
-        // int subclass instance — check __int_value__ via builtin_int
-        match builtin_int(args) {
-            Ok(v) if unsafe { is_int(v) } => unsafe { w_int_get_value(v) },
-            _ => {
-                return Err(crate::PyError::type_error(
-                    "an integer is required (got type non-int)",
-                ));
-            }
-        }
-    };
-    if val < 0 || val > 0x10ffff {
-        // `pypy/module/__builtin__/operation.py:31-32 chr` — out-of-range
-        // raises ValueError, message "chr() arg out of range".
-        return Err(crate::PyError::value_error("chr() arg out of range"));
+    // Python 3.14 `builtin_chr` uses the index protocol: `__int__` alone is
+    // insufficient, floats are rejected, and an arbitrarily large int reaches
+    // the range check rather than overflowing a host machine word.  This is
+    // the target-version difference from PyPy's `@unwrap_spec(code=int)`.
+    let val = index_to_bigint(args[0])?;
+    if val < BigInt::from(0) || val > BigInt::from(0x10ffff_u32) {
+        return Err(crate::PyError::value_error(
+            "chr() arg not in range(0x110000)",
+        ));
     }
-    match char::from_u32(val as u32) {
+    let val = val
+        .to_u32()
+        .expect("chr range check guarantees a value fitting u32");
+    match char::from_u32(val) {
         Some(c) => Ok(w_str_new(&c.to_string())),
         // Surrogate code points (0xD800-0xDFFF) are valid chr() arguments and
         // produce a lone-surrogate string; char::from_u32 rejects them, so
@@ -9517,13 +9520,19 @@ pub fn builtin_any_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_any(args)
 }
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "any() takes no keyword arguments",
+        ));
+    }
+    if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "any() takes exactly one argument ({} given)",
-            args.len()
+            positional.len()
         )));
     }
-    let it = crate::baseobjspace::iter(args[0])?;
+    let it = crate::baseobjspace::iter(positional[0])?;
     loop {
         match crate::baseobjspace::next(it) {
             Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
@@ -11055,13 +11064,19 @@ pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_all(args)
 }
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "all() takes no keyword arguments",
+        ));
+    }
+    if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "all() takes exactly one argument ({} given)",
-            args.len()
+            positional.len()
         )));
     }
-    let it = crate::baseobjspace::iter(args[0])?;
+    let it = crate::baseobjspace::iter(positional[0])?;
     loop {
         match crate::baseobjspace::next(it) {
             Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),

@@ -1963,7 +1963,10 @@ fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// module.py:164-173 `Module.descr_module__dir__`.
 fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__")?;
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    // module.py:164 — deliberately perform ordinary attribute lookup rather
+    // than reading `self.w_dict`: a ModuleType subclass may shadow
+    // `__dict__`, in which case the resulting non-dict is a TypeError.
+    let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
     if w_dict.is_null()
         || (!unsafe { pyre_object::is_dict(w_dict) }
             && !unsafe { pyre_object::dictmultiobject::is_module_dict(w_dict) }
@@ -16686,37 +16689,48 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             args.len().saturating_sub(1)
         )));
     }
-    let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let iterable = args[1];
-    let items: Vec<PyObjectRef> = unsafe {
-        if pyre_object::is_list(iterable) {
-            let n = pyre_object::w_list_len(iterable);
-            (0..n)
-                .filter_map(|i| pyre_object::w_list_getitem(iterable, i as i64))
-                .collect()
-        } else if pyre_object::is_tuple(iterable) {
-            let n = pyre_object::w_tuple_len(iterable);
-            (0..n)
-                .filter_map(|i| pyre_object::w_tuple_getitem(iterable, i as i64))
-                .collect()
-        } else {
-            crate::builtins::collect_iterable(iterable)?
-        }
-    };
-    let mut out: Vec<u8> = Vec::new();
-    for (i, &item) in items.iter().enumerate() {
-        if i > 0 {
-            out.extend_from_slice(sep);
-        }
-        let Some(src) = buffer_as_bytes_like(item)? else {
-            return Err(crate::PyError::type_error(format!(
-                "sequence item {i}: expected a bytes-like object, {} found",
-                type_name_of(item)
-            )));
+    // Python 3.14's bytearray join holds a buffer export on the separator
+    // while materialising the iterable and copying its items (GH-112625).
+    // A re-entrant iterator therefore cannot resize/clear the separator out
+    // from under the borrowed bytes.  Immutable bytes acquires no export.
+    let acquired_export = unsafe { crate::builtins::buffer_export_incref(args[0]) };
+    let result = (|| {
+        let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+        let iterable = args[1];
+        let items: Vec<PyObjectRef> = unsafe {
+            if pyre_object::is_list(iterable) {
+                let n = pyre_object::w_list_len(iterable);
+                (0..n)
+                    .filter_map(|i| pyre_object::w_list_getitem(iterable, i as i64))
+                    .collect()
+            } else if pyre_object::is_tuple(iterable) {
+                let n = pyre_object::w_tuple_len(iterable);
+                (0..n)
+                    .filter_map(|i| pyre_object::w_tuple_getitem(iterable, i as i64))
+                    .collect()
+            } else {
+                crate::builtins::collect_iterable(iterable)?
+            }
         };
-        out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(src) });
+        let mut out: Vec<u8> = Vec::new();
+        for (i, &item) in items.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(sep);
+            }
+            let Some(src) = buffer_as_bytes_like(item)? else {
+                return Err(crate::PyError::type_error(format!(
+                    "sequence item {i}: expected a bytes-like object, {} found",
+                    type_name_of(item)
+                )));
+            };
+            out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(src) });
+        }
+        Ok(new_bytes_like(args[0], &out))
+    })();
+    if acquired_export {
+        unsafe { crate::builtins::buffer_export_decref(args[0]) };
     }
-    Ok(new_bytes_like(args[0], &out))
+    result
 }
 
 /// `stringmethods.py:descr_partition` / `descr_rpartition` — split once

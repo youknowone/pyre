@@ -3745,8 +3745,11 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
     mro.iter().any(|&klass| is_w(klass, check_class))
 }
 
-/// Get the length of a container: `len(obj)`.
-pub fn len(obj: PyObjectRef) -> PyResult {
+/// `pypy/objspace/descroperation.py:294-298 _len` — invoke the concrete
+/// `__len__` descriptor and return its still-wrapped result.  The public
+/// [`len`] and [`len_w`] operations below perform the mandatory index,
+/// nonnegative, and machine-word checks around this primitive.
+fn _len(obj: PyObjectRef) -> PyResult {
     // descroperation.py:294-298 `_len` — a builtin subclass overriding
     // `__len__` dispatches the override (bound via `get_and_call_function`);
     // exact builtins and non-overriding subclasses fall through to the
@@ -3758,6 +3761,16 @@ pub fn len(obj: PyObjectRef) -> PyResult {
         }
     }
     len_slot(obj)
+}
+
+/// `pypy/objspace/descroperation.py:304-308 len` — preserve the wrapped
+/// integer returned by `space.index`, but validate negativity and overflow
+/// before exposing it to app-level `len()`.
+pub fn len(obj: PyObjectRef) -> PyResult {
+    let w_res = _len(obj)?;
+    let w_index = space_index(w_res)?;
+    _check_len_result(w_index)?;
+    Ok(w_index)
 }
 
 /// The builtin `__len__` slot body: length dispatch by concrete layout.
@@ -4638,31 +4651,27 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // Module objects: look up in module namespace.
-    // PyPy `space.getattr(w_module, w_name) → Module.getdictvalue(space,
-    // name)` (`pypy/interpreter/module.py:Module.getdictvalue`
-    // inherited from `baseobjspace.py:45-48 W_Root.getdictvalue`):
-    //
-    //     w_dict = self.getdict(space)        # module.py:77 → self.w_dict
-    //     if w_dict is not None:
-    //         return space.finditem_str(w_dict, attr)
-    //     return None
-    //
-    // Routing through `space.finditem_str` (rather than reading the
-    // backing storage directly) gives dict subclass `__getitem__`
-    // overrides their PyPy chance to fire on the user-supplied
-    // `__builtins__` aliasing case (`moduledef.py:102-103
-    // Module(space, None, w_builtin)`), and routes through the
-    // storage-authoritative read path so transient W_DictObject
-    // snapshots can't shadow the live storage state.  The Result-
-    // bearing variant propagates non-KeyError errors from subclass
-    // overrides (`baseobjspace.py:870 finditem` re-raise).
+    // Module objects use `object_getattribute` first (`module.py:130-134`),
+    // so their class descriptors and namespace follow the normal descriptor
+    // precedence.  This matters for a ModuleType subclass that shadows the
+    // base `__dict__` member: `class M(ModuleType): __dict__ = 8` must expose
+    // 8, and `module.__dir__` then rejects it as a non-dict.  Only after the
+    // complete normal lookup misses does module.py consult PEP 562
+    // `__getattr__` (the tail below).
     unsafe {
         if is_module(obj) {
-            if name == "__dict__" {
-                // module.py:20 — `Module.getdict(space)` returns
-                // `self.w_dict`.  Always non-null after construction.
-                return Ok(pyre_object::w_module_get_w_dict(obj));
+            let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+            let w_descr = if w_type.is_null() {
+                None
+            } else {
+                lookup_in_type_where(w_type, name)
+            };
+            if let Some(descr) = w_descr {
+                if is_data_descr(descr) {
+                    if let Some(value) = get(descr, obj, w_type)? {
+                        return Ok(value);
+                    }
+                }
             }
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
@@ -4671,6 +4680,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         return Ok(value);
                     }
                 }
+            }
+            if let Some(descr) = w_descr {
+                return Ok(get(descr, obj, w_type)?.unwrap_or(descr));
             }
         }
     }
@@ -10178,7 +10190,7 @@ fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
 /// before `_check_len_result` so `__index__` is consulted but `__int__`
 /// is NOT — matching PyPy's stricter contract.
 pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let w_res = len(w_obj)?;
+    let w_res = _len(w_obj)?;
     let w_index = space_index(w_res)?;
     _check_len_result(w_index)
 }
