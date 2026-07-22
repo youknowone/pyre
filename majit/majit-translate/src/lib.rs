@@ -1839,7 +1839,7 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _) = make_jitcodes(&config, &mut call_control);
+        let (jitcodes, _, _, _) = make_jitcodes(&config, &mut call_control);
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
         assert!(call_control.jitcodes().contains_key(&portal));
@@ -1907,7 +1907,7 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _) = make_jitcodes(&config, &mut call_control);
+        let (jitcodes, _, _, _) = make_jitcodes(&config, &mut call_control);
         let merge = jitcodes[0]
             .body()
             ._ssarepr
