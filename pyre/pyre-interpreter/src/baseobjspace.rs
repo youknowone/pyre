@@ -5396,7 +5396,9 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     let annotate_fn = crate::type_dict_lookup(obj, "__annotate__")
         .or_else(|| crate::type_dict_lookup(obj, "__annotate_func__"));
     let annotations = match annotate_fn {
-        Some(callable) if !callable.is_null() && !unsafe { is_none(callable) } => {
+        Some(callable)
+            if !callable.is_null() && !unsafe { is_none(callable) } && callable_w(callable) =>
+        {
             let value = crate::call::call_function_impl_result(callable, &[w_int_new(1)])?;
             if !unsafe { is_dict(value) } {
                 return Err(PyError::type_error(format!(

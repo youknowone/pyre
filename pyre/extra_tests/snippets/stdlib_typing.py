@@ -159,6 +159,14 @@ assert ExplicitAnnotate.__annotate__ is old_explicit_annotate
 assert ExplicitAnnotate.__annotations__ == {"old": 1}
 
 
+class NonCallableExplicitAnnotate:
+    __annotate__ = 42
+
+
+assert NonCallableExplicitAnnotate.__annotate__ == 42
+assert NonCallableExplicitAnnotate.__annotations__ == {}
+
+
 class AnnotationReader:
     def __set_name__(self, owner, name):
         owner.InjectedBySetName = int
