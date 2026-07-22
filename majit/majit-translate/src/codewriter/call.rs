@@ -1451,6 +1451,21 @@ impl CallControl {
         }
     }
 
+    /// Byte offset of the first item of a `GcTypedArray` — the flat
+    /// `{ len: usize, items: [u8; 0] }` block the guard-resume / blackhole
+    /// materialiser (`allocate_array_struct`) produces and that interior-field
+    /// struct arrays address. Its items always begin at
+    /// `GC_TYPED_ARRAY_ITEMS_OFFSET`, the bare length word, regardless of the
+    /// element's alignment — the opposite of [`Self::array_items_base`], whose
+    /// unboxed `i64` / `f64` list storage (`TypedItemsBlock`) is element-aligned.
+    /// The two coincide on a 64-bit word and diverge on a 32-bit one, where an
+    /// 8-byte element rounds past the 4-byte word: routing a struct array
+    /// through the element-aligned rule would stride its materialised block a
+    /// half-word late.
+    fn gc_typed_array_items_base(&self) -> usize {
+        self.array_header_size
+    }
+
     /// RPython: resolve a struct field's type string.
     /// For `owner::field_name`, returns the full type of the field.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
@@ -2154,15 +2169,10 @@ impl CallControl {
         // `as Arc<dyn ArrayDescr>` matches the trait-object field type
         // on `SimpleInteriorFieldDescr.array_descr`.
         let item_size = compute_struct_size(self, &elem_name);
-        // Interior-field struct arrays address `GcTypedArray`, a flat
-        // `{ len: usize, items: [u8; 0] }` block whose items always begin at
-        // `GC_TYPED_ARRAY_ITEMS_OFFSET = WORD` regardless of the element's
-        // alignment (both the live block and the guard-resume materialiser
-        // `allocate_array_struct` use that offset). The base must match the
-        // block, so it is the bare word — NOT the element-aligned offset the
-        // list int/float storage (`TypedItemsBlock`, genuinely element-aligned)
-        // needs in `arraydescrof_concrete`.
-        let base_size = self.array_header_size;
+        // Interior-field struct arrays address `GcTypedArray`, whose items sit
+        // flat at the length word — NOT the element-aligned offset the list
+        // int/float storage (`TypedItemsBlock`) needs in `arraydescrof_concrete`.
+        let base_size = self.gc_typed_array_items_base();
         let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
         let cached: majit_ir::descr::DescrRef = {
             let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
@@ -7424,8 +7434,8 @@ mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
 
-    /// A length-prefixed block puts its items at the length word rounded up to
-    /// the element's alignment. Only a target whose word is narrower than an
+    /// A `TypedItemsBlock` puts its items at the length word rounded up to the
+    /// element's alignment. Only a target whose word is narrower than an
     /// element can tell the two apart: with a 4-byte word, an `i64` item sits
     /// at 8, and addressing it at 4 strides the whole array one half-word
     /// early — every read then returns two packed 32-bit halves. A pointer
@@ -7441,6 +7451,45 @@ mod tests {
         // An unregistered struct element falls back to the word, which every
         // length-prefixed block already satisfies.
         assert_eq!(cc.array_items_base(word, Some("NoSuchStruct"), 24), word);
+
+        // The element-alignment rule is a pure function of `header_end` and the
+        // element, so a 32-bit word is reproducible on this 64-bit host by
+        // passing a 4-byte header_end directly (the scalar path never consults
+        // `target_word_size`). An `i64` / `f64` item rounds past the 4-byte
+        // word to 8; a word-wide pointer and a byte stay put.
+        assert_eq!(cc.array_items_base(4, Some("i64"), 8), 8);
+        assert_eq!(cc.array_items_base(4, Some("f64"), 8), 8);
+        assert_eq!(cc.array_items_base(4, Some("&PyObject"), 4), 4);
+        assert_eq!(cc.array_items_base(4, Some("u8"), 1), 4);
+    }
+
+    /// The two runtime typed-array blocks disagree on where items start, and a
+    /// descr's base must match the block it addresses. `TypedItemsBlock`
+    /// (unboxed list int/float storage) is element-aligned via
+    /// [`CallControl::array_items_base`]; `GcTypedArray` (the resume/blackhole
+    /// materialiser and interior-field struct arrays) is flat at the length
+    /// word via [`CallControl::gc_typed_array_items_base`]. The rules coincide
+    /// on a 64-bit word and part ways on a 32-bit one — the C5 regression was
+    /// routing a struct array through the element-aligned rule, invisible to a
+    /// host-only assertion because both land on 8 here.
+    #[test]
+    fn typed_block_and_gc_typed_array_bases_diverge_on_a_narrow_word() {
+        let cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+
+        // GcTypedArray keeps items flat at the length word, whatever the element.
+        assert_eq!(cc.gc_typed_array_items_base(), word);
+
+        // On this 64-bit host the two rules agree for an 8-byte element…
+        assert_eq!(
+            cc.array_items_base(word, Some("i64"), 8),
+            cc.gc_typed_array_items_base(),
+        );
+        // …but on a 32-bit word (header_end / word = 4) they must not: the
+        // element-aligned block rounds the `i64` up to 8 while GcTypedArray
+        // stays flat at 4.
+        assert_eq!(cc.array_items_base(4, Some("i64"), 8), 8);
+        assert_ne!(cc.array_items_base(4, Some("i64"), 8), 4);
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py:53): `f32` banks to the
