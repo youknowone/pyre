@@ -489,6 +489,16 @@ pub struct W_DictObject {
     /// `IndexMap::shift_remove` compacts its storage, so pyre records key-set
     /// changes explicitly; value-only overwrites leave this unchanged.
     pub keys_version: usize,
+    /// Generation bumped whenever `clear` empties an object dict in place.
+    /// `ll_dict_clear` reallocates `d.entries` to a fresh empty array
+    /// (`rordereddict.py:1360`), so a probe that cleared the dict through an
+    /// `__eq__` callback must restart on the `entries != d.entries` arm
+    /// (`:1058`).  `IndexMap::clear` retains its buffer, leaving the capacity
+    /// and every stale index unchanged, so the reentrant scan watches this
+    /// counter to reproduce that restart.  It bumps only on clear, never on a
+    /// non-emptying insert or delete, so a callback that merely reshapes the
+    /// dict does not trigger a spurious restart PyPy would not take.
+    pub clear_gen: usize,
 }
 
 /// Typed accessor — `dictmultiobject.py:1213-1215 ObjectDictStrategy.getitem`
@@ -880,6 +890,7 @@ pub fn w_dict_new() -> PyObjectRef {
             dstorage: entries as *mut u8,
             dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY,
             keys_version: 0,
+            clear_gen: 0,
         },
         false,
     )
@@ -901,6 +912,7 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
             dstorage: std::ptr::null_mut(),
             dstrategy: &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
             keys_version: 0,
+            clear_gen: 0,
         },
         false,
     )
@@ -925,6 +937,7 @@ pub fn w_dict_new_with(
             dstorage,
             dstrategy: strategy,
             keys_version: 0,
+            clear_gen: 0,
         },
         false,
     )
@@ -951,6 +964,7 @@ pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
         dstorage: entries as *mut u8,
         dstrategy: &crate::dictmultiobject::OBJECT_DICT_STRATEGY,
         keys_version: 0,
+        clear_gen: 0,
     }) as PyObjectRef
 }
 
@@ -1920,9 +1934,12 @@ unsafe fn scan_dict_key_reentrant(
         let obj_slot = crate::gc_roots::shadow_stack_len();
         crate::gc_roots::pin_root(obj);
         obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let table_capacity = {
+        let (table_capacity, clear_generation) = {
             let dict = &*(obj as *const W_DictObject);
-            (*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)).capacity()
+            (
+                (*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)).capacity(),
+                dict.clear_gen,
+            )
         };
         let mut i = 0;
         loop {
@@ -1961,8 +1978,11 @@ unsafe fn scan_dict_key_reentrant(
                     let dict = &*(obj as *const W_DictObject);
                     let entries =
                         &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-                    // `entries != d.entries`: a realloc moved the whole table.
+                    // `entries != d.entries`: a realloc grew the table, or a
+                    // `clear` reset it in place (`clear_gen`) — either
+                    // reallocates `d.entries` in `ll_dict_lookup`'s eyes.
                     entries.capacity() != table_capacity
+                        || dict.clear_gen != clear_generation
                         // `entries.valid(index) && entries[index].key == checkingkey`.
                         || !entries.get_index(i).is_some_and(|(stored, _)| {
                             stored.hash == stored_hash && stored.obj == stored_obj
@@ -2977,6 +2997,11 @@ pub unsafe fn w_dict_clear_object_strategy(obj: PyObjectRef) {
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     if !entries.is_empty() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
+        // Mirror `ll_dict_clear`'s `d.entries` realloc: an in-place
+        // `IndexMap::clear` keeps the buffer, so a reentrant scan that cleared
+        // the dict through `__eq__` would otherwise miss the restart when the
+        // dict is refilled to the same capacity.
+        dict.clear_gen = dict.clear_gen.wrapping_add(1);
     }
     entries.clear();
 }

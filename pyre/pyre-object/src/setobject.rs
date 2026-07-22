@@ -299,33 +299,35 @@ unsafe fn callback_free_set_op<T>(
     Some(Ok(result))
 }
 
-/// Find `key` by scanning same-hash entries one at a time.  The table borrow
-/// ends before equality can call user code.  If that callback changes the
-/// candidate entry, restart from the beginning like CPython's
-/// `set_add_entry` restart path.
+/// Find `key` by scanning same-hash entries of a *captured* storage box one at
+/// a time.  `items` is the box the caller snapshotted at operation entry and
+/// pinned, mirroring `AbstractUnwrappedSetStrategy`'s `d =
+/// self.unerase(w_set.sstorage)` (`setobject.py:934`): the whole probe runs
+/// against that box, so if a probing `__eq__` swaps the set's live storage (a
+/// `clear` → `switch_to_empty_strategy`, `:922`) the scan completes against the
+/// now-orphaned snapshot instead of chasing the fresh table.
+///
+/// The storage box has a stable address (`gc_alloc_storage_box` →
+/// `try_gc_alloc_stable_raw`), so `items` never moves; the caller's pin only
+/// keeps an orphaned box alive across the callbacks.  The table borrow ends
+/// before equality can call user code; a callback that grows or reorders the
+/// captured box restarts the scan (`ll_dict_lookup` paranoia,
+/// `rordereddict.py:1058`).  Capacity is exact here, not a proxy: within one
+/// box's lifetime `IndexMap` capacity only grows, and a `clear` swaps the box
+/// rather than resetting this one.
 unsafe fn scan_set_key_reentrant(
-    obj: PyObjectRef,
+    items: *mut SetItemsStorage,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(Option<usize>, crate::dictmultiobject::ObjectKey), crate::dictmultiobject::DictKeyError>
 {
     'restart: loop {
-        // Snapshot the table so a comparison that reallocates the backing
-        // store restarts the scan: `ll_dict_lookup` retries on
-        // `entries != d.entries` even when the candidate entry is untouched
-        // (`rordereddict.py:1058`).  A grow copies every entry to a fresh
-        // allocation, so a stale index would otherwise compare the wrong key.
-        let table_capacity = {
-            let s = &*(obj as *const W_SetObject);
-            (*s.items).capacity()
-        };
+        let table_capacity = (*items).capacity();
         let mut i = 0;
         loop {
-            let Some((stored_hash, stored_obj)) = ({
-                let s = &*(obj as *const W_SetObject);
-                (*s.items)
-                    .get_index(i)
-                    .map(|(stored, _)| (stored.hash, stored.obj))
-            }) else {
+            let Some((stored_hash, stored_obj)) = (*items)
+                .get_index(i)
+                .map(|(stored, _)| (stored.hash, stored.obj))
+            else {
                 return Ok((None, key));
             };
 
@@ -344,18 +346,14 @@ unsafe fn scan_set_key_reentrant(
                 }
                 // Validate the paranoia condition before acting on the result:
                 // `ll_dict_lookup` restarts even when the comparison answered
-                // `true`, because a callback that reallocated the table or moved
+                // `true`, because a callback that reallocated the buffer or moved
                 // the candidate leaves the matched index stale
                 // (`rordereddict.py:1058`).
-                let disturbed = {
-                    let s = &*(obj as *const W_SetObject);
-                    // `entries != d.entries`: a realloc moved the whole table.
-                    (*s.items).capacity() != table_capacity
-                        // `entries.valid(index) && entries[index].key == checkingkey`.
-                        || !(*s.items).get_index(i).is_some_and(|(stored, _)| {
-                            stored.hash == stored_hash && stored.obj == stored_obj
-                        })
-                };
+                let disturbed = (*items).capacity() != table_capacity
+                    // `entries.valid(index) && entries[index].key == checkingkey`.
+                    || !(*items).get_index(i).is_some_and(|(stored, _)| {
+                        stored.hash == stored_hash && stored.obj == stored_obj
+                    });
                 if disturbed {
                     continue 'restart;
                 }
@@ -366,6 +364,17 @@ unsafe fn scan_set_key_reentrant(
             i += 1;
         }
     }
+}
+
+/// Snapshot the set's storage box and pin it for a reentrant probe, mirroring
+/// PyPy's capture-before-probe (`d = self.unerase(w_set.sstorage)`).  The pin
+/// keeps the box alive even if a probing `__eq__` swaps the set's live storage
+/// (`w_set_clear`); the returned pointer is used for the whole operation.
+#[inline]
+unsafe fn capture_set_items(obj: PyObjectRef) -> *mut SetItemsStorage {
+    let items = (*(obj as *const W_SetObject)).items;
+    crate::gc_roots::pin_root(items as PyObjectRef);
+    items
 }
 
 /// Store a key that carries its own digest, propagating an `eq_w` raise from
@@ -405,7 +414,9 @@ pub unsafe fn w_set_contains_key_checked(
     }) {
         return result;
     }
-    let (found, _) = scan_set_key_reentrant(obj, key)?;
+    let _roots = crate::gc_roots::push_roots();
+    let items = capture_set_items(obj);
+    let (found, _) = scan_set_key_reentrant(items, key)?;
     Ok(found.is_some())
 }
 
@@ -438,10 +449,14 @@ pub unsafe fn w_set_discard_key_checked(
         return result;
     }
 
-    let (found, _) = scan_set_key_reentrant(obj, key)?;
+    let _roots = crate::gc_roots::push_roots();
+    let items = capture_set_items(obj);
+    let (found, _) = scan_set_key_reentrant(items, key)?;
     if let Some(index) = found {
+        // Remove from the captured box; a `clear` during the probe orphans it,
+        // leaving the live storage untouched (`discard` of an absent element).
+        (*items).shift_remove_index(index);
         let s = &mut *(obj as *mut W_SetObject);
-        (*s.items).shift_remove_index(index);
         s.len = (*s.items).len();
         s.hash = -1;
         return Ok(true);
@@ -497,16 +512,23 @@ pub unsafe fn w_set_discard_checked(
 
 /// Remove every element.
 ///
-/// `setobject.py W_BaseSetObject.clear` — the storage is dropped in one
-/// go, so no element is looked up (and so re-hashed) on the way out.
+/// `setobject.py W_BaseSetObject.clear` swaps the strategy to empty
+/// (`switch_to_empty_strategy`, `:922`), which installs a *fresh* storage box
+/// rather than emptying the current one.  A probe that captured the old box
+/// before the clear (`scan_set_key_reentrant`) therefore keeps running against
+/// that orphaned snapshot, matching PyPy: the element it later inserts lands in
+/// the dropped box and is lost, and a membership test completes as if the clear
+/// had not happened.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_clear(obj: PyObjectRef) {
     let s = &mut *(obj as *mut W_SetObject);
-    (*s.items).clear();
+    s.items =
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
     s.len = 0;
     s.hash = -1;
+    set_write_barrier(obj);
 }
 
 /// Remove and return an arbitrary stored element without hashing it again.
@@ -674,65 +696,42 @@ pub enum SetUpdateError {
     ChangedSize,
 }
 
-/// Insert one cached-hash key during `ObjectSetStrategy.update` without
-/// holding an IndexMap borrow across user `eq_w`.
+/// Insert one cached-hash key without holding an IndexMap borrow across user
+/// `eq_w`.
 ///
-/// RPython's `r_dict.update` detects a table size change during a comparison
-/// and raises instead of continuing through invalidated buckets.  IndexMap's
-/// ordinary `insert` owns a mutable table borrow while `ObjectKey::eq` calls
-/// Python; re-entering `set.clear()` through that callback invalidates its
-/// internal insertion index.  Read each candidate by value, release the Rust
-/// borrow before `eq_w`, verify the table shape, then use the already-proven
-/// vacant raw entry so insertion performs no second user comparison.
+/// The set's storage box is captured and pinned once at entry
+/// (`capture_set_items`), mirroring PyPy's `d = self.unerase(w_set.sstorage)`
+/// (`setobject.py:942`): the membership probe and the follow-up insert both run
+/// against that box.  If a probing `__eq__` clears the set, the fresh box
+/// installed by `w_set_clear` replaces the live storage while this insert still
+/// targets the orphaned snapshot, so the element lands in the dropped box and
+/// is lost — the behaviour PyPy exhibits when `add` captures its storage before
+/// a re-entrant `clear`.  The scan drops the table borrow before each
+/// comparison and inserts through an already-proven vacant raw entry, so
+/// insertion performs no second user callback.
 unsafe fn w_set_insert_key_reentrant(
     dst: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
-    // CPython 3.14's set probe restarts when a comparison mutates the table;
-    // PyPy's r_dict likewise resumes from a valid table state rather than
-    // retaining a bucket index across the callback.
-    'restart: loop {
-        let dst_items = (*(dst as *const W_SetObject)).items;
-        let dst_len = (*dst_items).len();
-        let mut i = 0;
-        while i < dst_len {
-            let Some((&stored, _)) = (*dst_items).get_index(i) else {
-                continue 'restart;
-            };
-            if stored.hash == key.hash {
-                let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
-                if crate::dictmultiobject::take_dict_key_error() {
-                    return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
-                }
-                if (*(dst as *const W_SetObject)).items != dst_items
-                    || (*dst_items).len() != dst_len
-                {
-                    continue 'restart;
-                }
-                if equal {
-                    return Ok(());
-                }
-            }
-            i += 1;
-        }
-
-        if (*(dst as *const W_SetObject)).items != dst_items || (*dst_items).len() != dst_len {
-            continue;
-        }
-        let entries = &mut *dst_items;
-        let hash = entries.hasher().hash_one(&key);
-        match entries.raw_entry_mut_v1().from_hash(hash, |_| false) {
-            RawEntryMut::Vacant(entry) => {
-                entry.insert_hashed_nocheck(hash, key, ());
-            }
-            RawEntryMut::Occupied(_) => unreachable!("a never-matching raw probe is vacant"),
-        }
-        let set = &mut *(dst as *mut W_SetObject);
-        set.len += 1;
-        set.hash = -1;
-        set_write_barrier(dst);
+    let _roots = crate::gc_roots::push_roots();
+    let items = capture_set_items(dst);
+    let (found, key) = scan_set_key_reentrant(items, key).map_err(SetUpdateError::Key)?;
+    if found.is_some() {
         return Ok(());
     }
+    let entries = &mut *items;
+    let hash = entries.hasher().hash_one(&key);
+    match entries.raw_entry_mut_v1().from_hash(hash, |_| false) {
+        RawEntryMut::Vacant(entry) => {
+            entry.insert_hashed_nocheck(hash, key, ());
+        }
+        RawEntryMut::Occupied(_) => unreachable!("a never-matching raw probe is vacant"),
+    }
+    let set = &mut *(dst as *mut W_SetObject);
+    set.len = (*set.items).len();
+    set.hash = -1;
+    set_write_barrier(dst);
+    Ok(())
 }
 
 /// Membership half of `contains_with_hash` for a mutation-sensitive set
