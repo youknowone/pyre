@@ -9506,8 +9506,22 @@ fn build_resumed_frames(
             } else {
                 std::ptr::null()
             }
+        } else if !w_code.is_null() {
+            // get_w_globals: each inlined-callee section resolves LOAD_GLOBAL
+            // in its own module namespace, taken from its own code — not the
+            // chain virtualizable's (mirrors recover_inline_callee_globals).
+            // Fall back to the chain namespace only when the callee code
+            // carries no globals yet.
+            let callee_ns = unsafe {
+                pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef)
+                    as *const ()
+            };
+            if !callee_ns.is_null() {
+                callee_ns
+            } else {
+                vable_ns
+            }
         } else {
-            // Inner frames share the chain virtualizable's namespace.
             vable_ns
         };
         result.push(crate::call_jit::ResumedFrame {
