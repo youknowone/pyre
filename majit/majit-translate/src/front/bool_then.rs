@@ -1,10 +1,15 @@
-//! `bool::then(cond, closure)` → short-circuit `Option` diamond.
+//! `bool::then(cond, closure)` / `bool::then_some(cond, value)` →
+//! short-circuit `Option` diamond.
 //!
 //! ## Positioning
 //!
-//! `core::bool::<Impl>::then` is a foreign combinator whose body is
-//! Opaque in the LLBC (Charon cannot extract core), so the caller emits a
-//! residual `then` call — an unregistered callee the rtyper census Skips.
+//! `core::bool::<Impl>::then` and `core::bool::<Impl>::then_some` are foreign
+//! combinators whose bodies are Opaque in the LLBC (Charon cannot extract
+//! core), so the caller emits a residual `then` / `then_some` call — an
+//! unregistered callee the rtyper census Skips.  They fold to the same
+//! diamond; the only difference is the `then` arm's payload: `then` calls the
+//! closure (`Some(closure())`), while `then_some` wraps its already-evaluated
+//! value arg directly (`Some(value)`, no closure, no `call_once`).
 //! Unlike the `Result` `?` and iterator `next` diamonds, which *rewrite* a
 //! Charon-emitted `Option`/`ControlFlow` match into the graph's native
 //! exception shape, `then` has no diamond in the source MIR at all: the
@@ -51,18 +56,22 @@ use crate::model::{
     ValueType,
 };
 
-/// A recognized `bool::then(cond, closure_env)` call site captured during
-/// body lowering (`front::mir` `recognize_bool_then_site`).  The owner
-/// strings are resolved at the recording site where the destination
-/// `Option` type and the closure env type are in hand; the post-pass only
-/// needs them to spell the ctor / method targets in the synthesized arms.
+/// A recognized `bool::then(cond, closure_env)` / `bool::then_some(cond,
+/// value)` call site captured during body lowering (`front::mir`
+/// `recognize_bool_then_site` / `recognize_bool_then_some_site`).  The owner
+/// strings are resolved at the recording site where the destination `Option`
+/// type (and, for `then`, the closure env type) are in hand; the post-pass
+/// only needs them to spell the ctor / method targets in the synthesized arms.
 #[derive(Clone)]
 pub(crate) struct BoolThenSite {
-    /// The `then` call result (the `Option<T>` value) — locates block A.
+    /// The `then` / `then_some` call result (the `Option<T>` value) — locates
+    /// block A.
     pub result_var: Variable,
     /// The closure env ADT `name_path` — the inherent-method owner for the
-    /// `call_once` call the `then` arm emits.
-    pub call_once_owner: String,
+    /// `call_once` call the `then` arm emits.  `None` for `then_some`, whose
+    /// arg #1 is an already-evaluated value wrapped directly in `Some` (no
+    /// closure, no `call_once`).
+    pub call_once_owner: Option<String>,
     /// The `Option` enum root `name_path` — the ctor owner for the
     /// `Some`/`None` aggregates.
     pub option_owner: String,
@@ -71,7 +80,8 @@ pub(crate) struct BoolThenSite {
     /// read owner).
     pub some_owner: String,
     /// The `Option`'s payload `T` projected to a [`ValueType`] — the
-    /// `call_once` result kind and the `Some::__pos_0` field kind.
+    /// `call_once` result kind (`then`) or the captured value kind
+    /// (`then_some`), and the `Some::__pos_0` field kind.
     pub payload_ty: ValueType,
 }
 
@@ -159,9 +169,11 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
 
     // --- All structural validation passed; mutate the graph. ---
 
-    // `then_bb` carries `carried` plus `env` (the receiver for `call_once`;
-    // it may already be among the carried set); `else_bb` carries only
-    // `carried`.  The source-var lists double as the branch link args.
+    // `then_bb` carries `carried` plus `env` — for `then` the closure receiver
+    // for `call_once`, for `then_some` the already-evaluated payload value
+    // (arg #1); either may already be among the carried set.  `else_bb`
+    // carries only `carried`.  The source-var lists double as the branch link
+    // args.
     let mut then_sources = carried.clone();
     if !then_sources.contains(&env) {
         then_sources.push(env.clone());
@@ -169,30 +181,38 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(carried.len());
 
-    // `then_bb`: payload = call_once(env, ()); opt = Some(payload).
+    // `then_bb`: build the `Some` payload.  For `then`, call the closure
+    // (`payload = call_once(env, ())`); for `then_some`, the payload is `env`
+    // itself (the eager value arg — no closure, no `call_once`).
     let env_in_then = map_source(&then_sources, &then_inputs, &env)
-        .ok_or_else(|| format!("{name}: closure env not threaded into then arm"))?;
-    // The closure's `Args` tuple; `then`'s closure is niladic, so the body
-    // ignores it — a synthetic empty tuple satisfies the `call_once`
-    // arity.
-    let unit = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(unit.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::synthetic_transparent_ctor("Tuple"),
-            args: Vec::new(),
-            result_ty: ValueType::Ref(None),
-        },
-    });
-    let payload = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(payload.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::method("call_once", Some(site.call_once_owner.clone())),
-            args: vec![env_in_then, unit],
-            result_ty: site.payload_ty.clone(),
-        },
-    });
+        .ok_or_else(|| format!("{name}: then arm payload/env not threaded into then arm"))?;
+    let payload = match &site.call_once_owner {
+        Some(call_once_owner) => {
+            // The closure's `Args` tuple; `then`'s closure is niladic, so the
+            // body ignores it — a synthetic empty tuple satisfies the
+            // `call_once` arity.
+            let unit = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(unit.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            let payload = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(payload.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::method("call_once", Some(call_once_owner.clone())),
+                    args: vec![env_in_then, unit],
+                    result_ty: site.payload_ty.clone(),
+                },
+            });
+            payload
+        }
+        None => env_in_then,
+    };
     let some_var = emit_option_variant(
         graph,
         then_bb,

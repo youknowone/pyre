@@ -6736,6 +6736,23 @@ impl<'a> Lowering<'a> {
         {
             self.bool_then_sites.push(site);
         }
+        // Capture `bool::then_some(cond, value)` sites for the same
+        // short-circuit `Option` diamond.  `then_some` is the eager sibling of
+        // `then`: arg #1 is an already-evaluated payload value, not a closure
+        // env, so the diamond's `then` arm wraps it in `Some` directly (no
+        // `call_once`).  Same Opaque-core-combinator residual + census Skip as
+        // `then`; a resolution miss leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["bool", "<Impl>", "then_some"])
+            && let Some(site) = self.recognize_bool_then_some_site(&call.dest.ty, &result_var)
+        {
+            self.bool_then_sites.push(site);
+        }
         // Capture `bigint::BigInt::div_rem()` sites for the modeled
         // `(quotient, remainder)` tuple producer `front::bigint_div_rem`
         // synthesizes.  Opaque foreign 2-arg FunctionPath (numerator,
@@ -8402,18 +8419,14 @@ impl<'a> Lowering<'a> {
         tyref_to_value_type(&TyRef::Other(v), self.llbc)
     }
 
-    /// Resolve a recognized `bool::then(cond, closure_env)` call into a
-    /// [`crate::front::bool_then::BoolThenSite`] — the owners and payload
-    /// type the short-circuit diamond post-pass needs.  `None` (leaving the
-    /// residual call) when the destination is not a resolvable `Option` or
-    /// the closure env type does not resolve to an ADT.
-    fn recognize_bool_then_site(
+    /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
+    /// call into its `(option_owner, some_owner, payload_ty)` — the enum root
+    /// ctor owner, the `Some` variant payload-field owner, and the payload
+    /// `ValueType`.  `None` when the destination is not a resolvable `Option`.
+    fn resolve_bool_then_option_dest(
         &self,
         dest_ty: &TyRef,
-        env_ty: Option<&TyRef>,
-        result_var: &Variable,
-    ) -> Option<crate::front::bool_then::BoolThenSite> {
-        // Destination `Option`: enum root + `Some` variant owners + payload.
+    ) -> Option<(String, String, ValueType)> {
         let def_id = self.tyref_adt_def_id(dest_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
         // Suffix the enum root with the destination `Option<X>`'s `<X>` so a
@@ -8426,6 +8439,21 @@ impl<'a> Lowering<'a> {
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
+        Some((option_owner, some_owner, payload_ty))
+    }
+
+    /// Resolve a recognized `bool::then(cond, closure_env)` call into a
+    /// [`crate::front::bool_then::BoolThenSite`] — the owners and payload
+    /// type the short-circuit diamond post-pass needs.  `None` (leaving the
+    /// residual call) when the destination is not a resolvable `Option` or
+    /// the closure env type does not resolve to an ADT.
+    fn recognize_bool_then_site(
+        &self,
+        dest_ty: &TyRef,
+        env_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::bool_then::BoolThenSite> {
+        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
         // Closure env ADT → its `name_path` is the `call_once` inherent
         // method owner (`resolve_impl_owner_adt_def_id_free` records the
         // same spelling for the closure's transparent `call_once` body).
@@ -8434,7 +8462,28 @@ impl<'a> Lowering<'a> {
         let call_once_owner = env_td.item_meta.name_path();
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
-            call_once_owner,
+            call_once_owner: Some(call_once_owner),
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `bool::then_some(cond, value)` call into a
+    /// [`crate::front::bool_then::BoolThenSite`].  Same destination `Option`
+    /// resolution as `then`, but arg #1 is an already-evaluated payload value
+    /// (not a closure env), so `call_once_owner` is `None` and the post-pass
+    /// wraps the value directly in `Some`.  `None` (leaving the residual call)
+    /// when the destination is not a resolvable `Option`.
+    fn recognize_bool_then_some_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::bool_then::BoolThenSite> {
+        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        Some(crate::front::bool_then::BoolThenSite {
+            result_var: result_var.clone(),
+            call_once_owner: None,
             option_owner,
             some_owner,
             payload_ty,

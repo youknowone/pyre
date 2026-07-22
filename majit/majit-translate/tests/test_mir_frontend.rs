@@ -586,6 +586,76 @@ fn bool_then_closure_lifts_to_short_circuit_diamond() {
     assert_eq!(none_ctor, 1, "the else arm builds `None`");
 }
 
+/// `bool_then_some`'s `c.then_some(x + 1)` lifts to the same short-circuit
+/// `Option` diamond (`front::bool_then`): the residual `core::bool::then_some`
+/// call — an unregistered callee that would make the rtyper census Skip — is
+/// replaced by a `bool(c)` branch whose arms build `Some(value)` and `None`.
+/// Unlike `then`, `then_some` takes an already-evaluated value, so the then
+/// arm wraps it directly — it emits **no** `call_once`.
+#[test]
+fn bool_then_some_lifts_to_short_circuit_diamond() {
+    use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "bool_then_some").expect("lowering");
+
+    let reachable = reachable_blocks(&graph);
+
+    let mut residual_then_some = 0usize;
+    let mut call_once = 0usize;
+    let mut bool_branches = 0usize;
+    let mut some_ctor = 0usize;
+    let mut none_ctor = 0usize;
+    for b in &graph.blocks {
+        if !reachable.contains(&b.id) {
+            continue;
+        }
+        if matches!(b.exitswitch, Some(ExitSwitch::Value(_))) {
+            bool_branches += 1;
+        }
+        let mut last_disc: Option<i64> = None;
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("then_some")
+                    && segments.iter().any(|s| s == "bool") =>
+                {
+                    residual_then_some += 1
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "call_once" => call_once += 1,
+                OpKind::ConstInt(d) => last_disc = Some(*d),
+                OpKind::FieldWrite { field, .. } if field.name == "__discriminant" => {
+                    match last_disc {
+                        Some(1) => some_ctor += 1,
+                        Some(0) => none_ctor += 1,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        residual_then_some, 0,
+        "the residual `core::bool::then_some` call must be replaced by the diamond",
+    );
+    assert_eq!(
+        call_once, 0,
+        "the then_some arm wraps the eager value directly — no `call_once`",
+    );
+    assert_eq!(
+        bool_branches, 1,
+        "the call block closes with a single `bool(cond)` branch",
+    );
+    assert_eq!(some_ctor, 1, "the then arm builds `Some(value)`");
+    assert_eq!(none_ctor, 1, "the else arm builds `None`");
+}
+
 /// `option_question_mark`'s `let v = opt?` lifts the residual
 /// `Try::branch(opt)` / `ControlFlow` diamond into a direct switch on
 /// `opt.__discriminant`: `Some` extracts `opt.__pos_0` and continues,

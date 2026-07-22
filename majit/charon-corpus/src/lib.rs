@@ -106,6 +106,14 @@ pub fn bool_then_closure(c: bool, x: i64) -> Option<i64> {
     c.then(|| x + 1)
 }
 
+// `then_some` is the eager sibling of `then`: it takes an already-evaluated
+// value rather than a closure, so the diamond's `then` arm wraps it in `Some`
+// directly (no `call_once`). Same Opaque-core-combinator residual shape.
+#[inline(never)]
+pub fn bool_then_some(c: bool, x: i64) -> Option<i64> {
+    c.then_some(x + 1)
+}
+
 // --- 7. Option question mark -------------------------------------------
 //
 // Exercises `Try::branch` on `Option`: `Some(v)` continues with `v`, while
