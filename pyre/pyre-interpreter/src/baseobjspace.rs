@@ -10446,6 +10446,28 @@ pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
     }
 }
 
+/// Index-protocol conversion for an argument whose callee performs its own
+/// negative-value check.  A positive bigint outside the machine range raises
+/// OverflowError; a negative overflow is represented by i64::MIN so the
+/// callee can issue its specified ValueError instead.  CPython 3.14's
+/// `_random.Random.getrandbits` has exactly this ordering (`-1 << 1000` is a
+/// domain error, while `1 << 1000` is a conversion overflow).
+pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
+    let w_index = space_index(obj)?;
+    match int_w(w_index) {
+        Ok(index) => Ok(index),
+        Err(error) if error.kind == PyErrorKind::OverflowError => {
+            let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
+            if big.sign() == malachite_bigint::Sign::Minus {
+                Ok(i64::MIN)
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// `objspace.honor__builtins__` default is False — the frame builtin is
 /// `space.builtin`, ignoring a custom `__builtins__` in globals.  The
 /// `pick_builtin*` family below is the `honor__builtins__=True` path,

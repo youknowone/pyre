@@ -132,26 +132,28 @@ impl W_Random {
     /// initialise it from the first constructor argument (or `None`).
     ///
     /// `__args__.firstarg()` deliberately leaves surplus-argument reporting to
-    /// the gateway.  Pyre's flat builtin ABI performs that gateway check here.
+    /// the later `__init__` dispatch, which is essential for subclasses whose
+    /// initializer accepts its own positional or keyword arguments.
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        if crate::builtins::has_real_kwargs(kwargs) {
-            return Err(crate::PyError::type_error(
-                "Random() takes no keyword arguments",
-            ));
-        }
+    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
         let user_args = positional.get(1..).unwrap_or(&[]);
-        if user_args.len() > 1 {
-            return Err(crate::PyError::type_error(
-                "Random() requires 0 or 1 argument",
-            ));
-        }
         let w_anything = user_args.first().copied().unwrap_or_else(w_none);
+        // interp_random.py:13 `space.allocate_instance(W_Random,
+        // w_subtype)` validates the requested subtype and preserves it on
+        // the allocated object's class header.  The typed payload layout is
+        // shared by subclasses, exactly as `check_user_subclass` verifies.
+        let random_type = type_object();
+        crate::typedef::check_user_subclass(random_type, cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(cls);
         pyre_object::gc_roots::pin_root(w_anything);
-        let seed_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 2;
+        let seed_slot = cls_slot + 1;
         let obj = W_Random::allocate_stable(W_Random::default());
+        unsafe {
+            (*obj).w_class = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+        }
         let random = W_Random::from_obj(obj)
             .expect("a freshly allocated _random.Random has the Random layout");
         random.seed(pyre_object::gc_roots::shadow_stack_get(seed_slot))?;
@@ -248,8 +250,8 @@ impl W_Random {
         Ok(())
     }
 
-    fn getrandbits(&mut self, k: PyIndex) -> Result<PyObjectRef, crate::PyError> {
-        let mut k = k as i64;
+    fn getrandbits(&mut self, k: PyIndexInt) -> Result<PyObjectRef, crate::PyError> {
+        let mut k = k;
         if k < 0 {
             crate::bail_value_error!("number of bits must be non-negative");
         }
@@ -262,7 +264,10 @@ impl W_Random {
             return Ok(w_int_new(r as i64));
         }
         let nbytes = (((k - 1) / 32 + 1) * 4) as usize;
-        let mut bytes = Vec::with_capacity(nbytes);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(nbytes)
+            .map_err(|_| crate::PyError::memory_error(""))?;
         while k > 0 {
             let mut r = self.rnd.genrand32();
             if k < 32 {

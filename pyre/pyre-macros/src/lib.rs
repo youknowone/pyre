@@ -419,6 +419,16 @@ fn typed_alias(
             quote! { i64 },
             quote! { crate::baseobjspace::getindex_w(args[#idx])? },
         ),
+        "PyIndexInt" => (
+            // CPython 3.14 Argument Clinic `int` parameters that accept the
+            // index protocol but must still reject values outside pyre's
+            // machine-int range.  Unlike `PyIndex`, this must not clamp a
+            // huge bigint to i64::{MIN,MAX}.
+            quote! { i64 },
+            quote! {
+                crate::baseobjspace::index_int_w_preserve_negative(args[#idx])?
+            },
+        ),
         // Integer aliases — route through the `space.gateway_nonnegint_w`
         // / `space.c_*_w` converters in baseobjspace.rs so the range / sign
         // checks and their exception messages live in one place.
@@ -1793,12 +1803,20 @@ fn expand_pyre_methods(
         let is_new = mname == "__new__" && matches!(kind, MethodKind::Static);
         let body = if is_new {
             quote! {
+                // `space.allocate_instance(W_X, w_subtype)` keeps the subtype
+                // live across allocation and initializer work.  The flat ABI
+                // argument slice is not itself a moving-GC root, so pin and
+                // reload it before stamping the result.
+                let __pyre_new_roots = ::pyre_object::gc_roots::push_roots();
+                let __pyre_cls_input = args.first().copied().unwrap_or(::pyre_object::PY_NULL);
+                ::pyre_object::gc_roots::pin_root(__pyre_cls_input);
+                let __pyre_cls_slot = ::pyre_object::gc_roots::shadow_stack_len() - 1;
                 let __pyre_obj: ::pyre_object::PyObjectRef = match { #body } {
                     ::std::result::Result::Ok(o) => o,
                     ::std::result::Result::Err(e) => return ::std::result::Result::Err(e),
                 };
                 if !__pyre_obj.is_null() {
-                    let __pyre_cls = args.first().copied().unwrap_or(::pyre_object::PY_NULL);
+                    let __pyre_cls = ::pyre_object::gc_roots::shadow_stack_get(__pyre_cls_slot);
                     if !__pyre_cls.is_null() && unsafe { ::pyre_object::is_type(__pyre_cls) } {
                         let __pyre_static_tp = crate::typedef::gettypefor(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
@@ -1826,8 +1844,12 @@ fn expand_pyre_methods(
             ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
                 #kwargs_preamble
                 #arity_preamble
-                #preamble
                 #(#unwrap_stmts)*
+                // Gateway coercions may invoke Python (`__index__`, path
+                // conversion, etc.) and therefore collect.  Perform them
+                // before borrowing the typed receiver, matching interp2app's
+                // unwrap-before-call boundary.
+                #preamble
                 #body
             }
         });
