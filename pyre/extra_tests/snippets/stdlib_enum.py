@@ -93,4 +93,19 @@ Custom.__name__ = custom_name
 assert Custom.__name__ is custom_name
 
 
+# `__slots__` accepts any iterable.  A `__doc__` slot suppresses the default
+# class-level None entry, while another slot iterable still gets that default.
+DocSlotSet = type("DocSlotSet", (), {"__slots__": {"__doc__"}})
+assert type(DocSlotSet.__dict__["__doc__"]).__name__ == "member_descriptor"
+
+doc_slots = iter(["__doc__"])
+DocSlotIterator = type("DocSlotIterator", (), {"__slots__": doc_slots})
+assert DocSlotIterator.__slots__ is doc_slots
+assert list(doc_slots) == []
+assert type(DocSlotIterator.__dict__["__doc__"]).__name__ == "member_descriptor"
+
+PlainSlotSet = type("PlainSlotSet", (), {"__slots__": {"value"}})
+assert PlainSlotSet.__dict__["__doc__"] is None
+
+
 print("stdlib enum ok")

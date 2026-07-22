@@ -13,7 +13,11 @@ fn opcode_predicate(
     args: &[PyObjectRef],
     predicate: impl FnOnce(AnyOpcode) -> bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let raw = crate::baseobjspace::int_w(args[0])?;
+    let opcode = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("opcode argument is required"))?;
+    let raw = crate::baseobjspace::int_w(opcode)?;
     Ok(w_bool_from(try_opcode(raw).is_some_and(predicate)))
 }
 

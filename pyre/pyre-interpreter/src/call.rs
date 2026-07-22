@@ -4193,6 +4193,11 @@ pub unsafe fn create_all_slots(
             wantdict = false;
             wantweakref = false;
             let all_names = collect_slot_names(w_slots)?;
+            if !all_names.iter().any(|name| name == "__doc__")
+                && !crate::type_dict_contains(w_type, "__doc__")
+            {
+                crate::runtime_ops::type_dict_store(w_type, "__doc__", pyre_object::w_none());
+            }
             for slot_name in &all_names {
                 match slot_name.as_str() {
                     // typeobject.py:1165-1169: __dict__ slot

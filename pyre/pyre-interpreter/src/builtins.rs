@@ -3753,21 +3753,12 @@ pub(crate) fn type_new_set_doc(ns: PyObjectRef) -> crate::PyResult {
     if unsafe { pyre_object::w_dict_getitem_str(ns, "__doc__") }.is_some() {
         return Ok(pyre_object::w_none());
     }
-    let doc_is_slot = match unsafe { pyre_object::w_dict_getitem_str(ns, "__slots__") } {
-        Some(slots)
-            if unsafe {
-                pyre_object::is_str(slots)
-                    || pyre_object::is_tuple(slots)
-                    || pyre_object::is_list(slots)
-            } =>
-        {
-            crate::call::collect_slot_names(slots)?
-                .iter()
-                .any(|name| name == "__doc__")
-        }
-        _ => false,
-    };
-    if !doc_is_slot {
+    // `create_all_slots` owns iteration of `__slots__`.  In particular, it
+    // must consume a one-shot iterator exactly once.  Defer the default doc
+    // entry whenever slots are present; `create_all_slots` installs it after
+    // collecting the complete slot-name sequence if `__doc__` was not among
+    // those names.
+    if unsafe { pyre_object::w_dict_getitem_str(ns, "__slots__") }.is_none() {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none()) };
     }
     Ok(pyre_object::w_none())
