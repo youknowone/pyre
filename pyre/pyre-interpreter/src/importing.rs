@@ -970,10 +970,7 @@ pub(crate) fn create_builtin_module(
 /// the handful of builtins imported before that are fixed up in bulk by
 /// `_bootstrap._setup`'s sys.modules walk, so a no-op here is correct then.
 #[cfg(feature = "host_env")]
-fn set_builtin_module_spec(
-    name: &str,
-    module: PyObjectRef,
-) -> Result<(), crate::PyError> {
+fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let Some(bootstrap) = get_sys_module("importlib._bootstrap") else {
@@ -990,13 +987,15 @@ fn set_builtin_module_spec(
     // executing sees a partially-initialised module whose `BuiltinImporter` /
     // `_init_module_attrs` are not defined yet. Skip rather than break the
     // import — `_bootstrap._setup` fixes up any builtin missed here.
-    let Ok(importer) = crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "BuiltinImporter")
+    let Ok(importer) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "BuiltinImporter")
     else {
         return Ok(());
     };
     let importer_slot = shadow_stack_len();
     pin_root(importer);
-    let Ok(find_spec) = crate::baseobjspace::getattr_str(shadow_stack_get(importer_slot), "find_spec")
+    let Ok(find_spec) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(importer_slot), "find_spec")
     else {
         return Ok(());
     };
@@ -1018,7 +1017,8 @@ fn set_builtin_module_spec(
     pin_root(spec);
 
     // _init_module_attrs(spec, module)
-    let Ok(init) = crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "_init_module_attrs")
+    let Ok(init) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "_init_module_attrs")
     else {
         return Ok(());
     };
@@ -1258,16 +1258,58 @@ pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
     }
 }
 
-/// Add a directory to sys.path.
+/// Add a directory to `sys.path`.
+///
+/// Before the `sys` module exists this stages the entry in the native
+/// `SYS_PATH` seed, which is flushed into `sys.path` when `sys` is created.
+/// Once `sys` exists the Python list is authoritative, so the entry is appended
+/// to it in place (deduplicated) and the spent seed is left untouched. A
+/// missing or non-list `sys.path` (e.g. after `del sys.path`) is respected.
 #[cfg(feature = "host_env")]
 pub fn add_sys_path(dir: &Path) {
-    SYS_PATH.with(|p| {
-        let mut path = p.borrow_mut();
-        let pb = dir.to_path_buf();
-        if !path.contains(&pb) {
-            path.push(pb);
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let entry = dir.to_string_lossy();
+    if get_sys_module("sys").is_none() {
+        SYS_PATH.with(|p| {
+            let mut path = p.borrow_mut();
+            let pb = dir.to_path_buf();
+            if !path.contains(&pb) {
+                path.push(pb);
+            }
+        });
+        return;
+    }
+    // Pin the new entry before any further allocation (`get_sys_module` and the
+    // dict lookup allocate) can relocate it. After the list is fetched below the
+    // path is allocation-free until the pinned entry reaches `w_list_append`.
+    let _roots = push_roots();
+    let slot = shadow_stack_len();
+    pin_root(pyre_object::w_str_new(entry.as_ref()));
+    let Some(sys_mod) = get_sys_module("sys") else {
+        return;
+    };
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
+    if w_dict.is_null() {
+        return;
+    }
+    let Some(w_path) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }) else {
+        return;
+    };
+    if !unsafe { pyre_object::is_list(w_path) } {
+        return;
+    }
+    let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+    for i in 0..n {
+        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
+            if unsafe { pyre_object::is_str(item) }
+                && unsafe { pyre_object::w_str_get_value(item) } == entry.as_ref()
+            {
+                return;
+            }
         }
-    });
+    }
+    unsafe { pyre_object::listobject::w_list_append(w_path, shadow_stack_get(slot)) };
 }
 
 // ── check_sys_modules ────────────────────────────────────────────────
@@ -1317,41 +1359,6 @@ fn sys_modules_blocks(name: &str) -> bool {
 pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
-
-/// Mirror the native search path (`SYS_PATH`) into Python `sys.path` so
-/// `PathFinder` — reached by `importlib.util.find_spec` for top-level module
-/// names — can resolve modules. `runpy._get_module_details` (the `-m` entry)
-/// drives that path, which is otherwise left empty.
-#[cfg(feature = "host_env")]
-pub fn sync_python_sys_path() {
-    // wasm seeds `sys.path` from its bootstrap and has no current_exe/python3
-    // lazy stdlib detection, so `ensure_stdlib_path` exists only off-wasm.
-    #[cfg(not(target_arch = "wasm32"))]
-    ensure_stdlib_path();
-    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
-        p.borrow()
-            .iter()
-            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
-            .collect()
-    });
-    if let Some(sys_mod) = get_sys_module("sys") {
-        // `sys.path` lives in the sys module's own dict; store it with the
-        // infallible direct dict write the module `setattr` branch reaches
-        // (`baseobjspace::object_setattr` module arm), avoiding the
-        // discarded `Result` of the general `setattr_str`.
-        unsafe {
-            let w_dict = pyre_object::w_module_get_w_dict(sys_mod);
-            if !w_dict.is_null() {
-                pyre_object::w_dict_setitem_str(w_dict, "path", pyre_object::w_list_new(items));
-            }
-        }
-    }
-}
-
-/// Off-`host_env` builds keep no native `SYS_PATH`, so there is nothing to
-/// mirror into Python `sys.path`.
-#[cfg(not(feature = "host_env"))]
-pub fn sync_python_sys_path() {}
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
 /// installed. Used by callers that need to iterate every loaded module
@@ -1644,7 +1651,9 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
         return Some(info);
     }
 
-    // Lazy stdlib detection — only on first miss (avoid python3 spawn at startup)
+    // Fallback stdlib detection. `create_sys_path_list` already forces this at
+    // sys-module creation, so the `DONE` guard normally makes this a no-op; it
+    // stays as a defensive retry for any miss reached before sys exists.
     ensure_stdlib_path();
     return find_in_sys_path(partname);
 }
@@ -1783,14 +1792,19 @@ fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
     }
 }
 
-/// Build the initial Python `sys.path` list from the native seed. Run once at
-/// sys-module creation so the Python list is fully populated the instant `sys`
-/// exists; from then on it is authoritative and `SYS_PATH` is a spent seed.
+/// Build the initial Python `sys.path` list from the native `SYS_PATH` seed.
+/// Called once at sys-module creation so the Python list is populated the
+/// instant `sys` exists; from then on the Python list is authoritative and the
+/// seed is spent.
+///
+/// Stdlib detection is forced here (off-wasm) so the vendored stdlib is on
+/// `sys.path` before any user code — including `python -S` / `-S -P` runs that
+/// never import `site` — reads it, matching the unconditional detection the
+/// removed `sync_python_sys_path` performed. `sys` is not yet in `sys.modules`
+/// during its own creation, so `ensure_stdlib_path`'s `add_sys_path` stages the
+/// stdlib in the seed, and the flush below picks it up.
 #[cfg(feature = "host_env")]
 pub(crate) fn create_sys_path_list() -> PyObjectRef {
-    // Force stdlib detection now (off-wasm) so the stdlib is in the list from
-    // the start rather than lazily on first miss; the `find_module` retry then
-    // never has to append to the live list.
     #[cfg(not(target_arch = "wasm32"))]
     ensure_stdlib_path();
     let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {

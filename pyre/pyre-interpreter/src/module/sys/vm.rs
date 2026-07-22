@@ -550,8 +550,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
     module_ns_store(ns, "modules", modules_dict);
-    // sys.path — empty list placeholder
-    module_ns_store(ns, "path", w_list_new(vec![]));
+    // sys.path — flush the native search-path seed into the authoritative list
+    // the instant `sys` exists; from here on the Python list is the source of
+    // truth and `add_sys_path` mutates it in place.
+    module_ns_store(ns, "path", crate::importing::create_sys_path_list());
     // sys.stdout/stderr/stdin — `_io.TextIOWrapper`-typed file-like objects.
     // Real CPython wires these through io.TextIOWrapper around the std fds;
     // pyre exposes objects of the same type with the minimum surface so

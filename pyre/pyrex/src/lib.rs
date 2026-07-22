@@ -780,9 +780,6 @@ fn run_module(module: &str, no_site: bool) {
 
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
         init_importlib_bootstrap(canonical, ec_ptr)?;
-        // Mirror the native search path into Python `sys.path` so `PathFinder`
-        // (used by `find_spec` for top-level module names) can resolve modules.
-        importing::sync_python_sys_path();
         import_site(no_site, canonical, ec_ptr);
         let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
         let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
@@ -863,12 +860,9 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
         );
     }
 
-    // `sys.path` is created as an empty placeholder; mirror the native search
-    // path into it before `site` and user code read it (run_module does the
-    // same after its importlib bootstrap). `sync_python_sys_path` needs `sys`
-    // loaded, so import it first.
+    // Import `sys` up front so its creation flushes the native search-path seed
+    // into `sys.path` before `site` and user code read it.
     let _ = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr);
-    importing::sync_python_sys_path();
 
     import_site(no_site, canonical, ec_ptr);
 
