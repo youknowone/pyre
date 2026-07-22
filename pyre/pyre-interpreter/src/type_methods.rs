@@ -1333,13 +1333,19 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "upper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(s, str::to_uppercase)))
+    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(
+        s,
+        str::to_uppercase,
+    )))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "lower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(s, str::to_lowercase)))
+    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(
+        s,
+        str::to_lowercase,
+    )))
 }
 
 /// PyPy: unicodeobject.py descr_format
