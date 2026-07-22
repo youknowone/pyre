@@ -477,13 +477,49 @@ MutatingSetKey.enabled = True
 mutating_target -= {0}
 
 
+# A colliding equality callback is a moving-GC collection point.  Set update
+# paths retain cached hashes from the operand, but must reload both copied key
+# pointers from the shadow stack before they continue probing or insert/remove
+# an entry.
+import gc
+
+
+class AllocatingSetKey:
+    def __init__(self, name):
+        self.name = name
+
+    def __hash__(self):
+        return 0
+
+    def __eq__(self, other):
+        # Equality may fill the nursery and therefore reach a normal moving-GC
+        # allocation safepoint while the set probe is holding copied keys.
+        self.allocations = [object() for _ in range(2000)]
+        return self is other
+
+
+collecting_a = AllocatingSetKey("a")
+collecting_b = AllocatingSetKey("b")
+collecting_target = {collecting_a}
+collecting_target.update({collecting_b})
+assert len(collecting_target) == 2
+assert any(item is collecting_a for item in collecting_target)
+assert any(item is collecting_b for item in collecting_target)
+
+collecting_target.difference_update({collecting_b})
+assert len(collecting_target) == 1
+assert next(iter(collecting_target)) is collecting_a
+
+collecting_small = {collecting_a}
+collecting_small.difference_update({collecting_b, object()})
+assert len(collecting_small) == 1
+assert next(iter(collecting_small)) is collecting_a
+
+
 # test_set.py TestJointOps.test_free_after_iterating: exhausting a set
 # iterator releases its source immediately. Layout-specific allocation must
 # also register `__del__` on set/frozenset subclasses, just like PyPy's common
 # objspace.allocate_instance path.
-import gc
-
-
 for _set_base in (set, frozenset):
     _finalized = []
 

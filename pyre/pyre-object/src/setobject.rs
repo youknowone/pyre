@@ -797,73 +797,102 @@ unsafe fn w_set_insert_key_into(
 }
 
 /// Membership half of `contains_with_hash` for a mutation-sensitive set
-/// operation.  As with the update inserter above, no IndexMap borrow crosses
-/// `eq_w`; a size-changing callback invalidates the traversal explicitly.
+/// operation.  As with `rordereddict.ll_dict_lookup`, no table borrow crosses
+/// `eq_w`, and a callback that replaces an entry restarts the lookup.
 unsafe fn w_set_contains_key_for_update(
     probe: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
+    mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, SetUpdateError> {
-    let items = (*(probe as *const W_SetObject)).items;
-    let len = (*items).len();
-    let mut i = 0;
-    while i < len {
-        let Some((&stored, _)) = (*items).get_index(i) else {
-            return Err(SetUpdateError::ChangedSize);
-        };
-        if stored.hash == key.hash {
-            let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
-            if crate::dictmultiobject::take_dict_key_error() {
-                return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+    'restart: loop {
+        let items = (*(probe as *const W_SetObject)).items;
+        let len = (*items).len();
+        let mut i = 0;
+        while i < len {
+            let Some((&stored, _)) = (*items).get_index(i) else {
+                continue 'restart;
+            };
+            if stored.hash == key.hash {
+                let _roots = crate::gc_roots::push_roots();
+                let stored_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(stored.obj);
+                let key_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(key.obj);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+                let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
+                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                if crate::dictmultiobject::take_dict_key_error() {
+                    return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+                }
+                if (*(probe as *const W_SetObject)).items != items
+                    || (*items).len() != len
+                    || !(*items).get_index(i).is_some_and(|(current, _)| {
+                        current.hash == stored.hash && current.obj == stored_obj
+                    })
+                {
+                    continue 'restart;
+                }
+                if equal {
+                    return Ok(true);
+                }
             }
-            if (*(probe as *const W_SetObject)).items != items || (*items).len() != len {
-                return Err(SetUpdateError::ChangedSize);
-            }
-            if equal {
-                return Ok(true);
-            }
+            i += 1;
         }
-        i += 1;
+        return Ok(false);
     }
-    Ok(false)
 }
 
 /// `delitem_with_hash` for a mutation-sensitive difference update.  Find the
-/// matching bucket without lending IndexMap across Python code, then delete
-/// the proven index without another equality callback.
+/// matching bucket without lending IndexMap across Python code, restart after
+/// a hostile comparison like `ll_dict_lookup`, then delete the proven index
+/// without another equality callback.
 unsafe fn w_set_remove_key_for_update(
     dst: PyObjectRef,
-    key: crate::dictmultiobject::ObjectKey,
+    mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
-    let items = (*(dst as *const W_SetObject)).items;
-    let len = (*items).len();
-    let mut found = None;
-    let mut i = 0;
-    while i < len {
-        let Some((&stored, _)) = (*items).get_index(i) else {
-            return Err(SetUpdateError::ChangedSize);
-        };
-        if stored.hash == key.hash {
-            let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
-            if crate::dictmultiobject::take_dict_key_error() {
-                return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+    'restart: loop {
+        let items = (*(dst as *const W_SetObject)).items;
+        let len = (*items).len();
+        let mut found = None;
+        let mut i = 0;
+        while i < len {
+            let Some((&stored, _)) = (*items).get_index(i) else {
+                continue 'restart;
+            };
+            if stored.hash == key.hash {
+                let _roots = crate::gc_roots::push_roots();
+                let stored_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(stored.obj);
+                let key_slot = crate::gc_roots::shadow_stack_len();
+                crate::gc_roots::pin_root(key.obj);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+                let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
+                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
+                if crate::dictmultiobject::take_dict_key_error() {
+                    return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+                }
+                if (*(dst as *const W_SetObject)).items != items
+                    || (*items).len() != len
+                    || !(*items).get_index(i).is_some_and(|(current, _)| {
+                        current.hash == stored.hash && current.obj == stored_obj
+                    })
+                {
+                    continue 'restart;
+                }
+                if equal {
+                    found = Some(i);
+                    break;
+                }
             }
-            if (*(dst as *const W_SetObject)).items != items || (*items).len() != len {
-                return Err(SetUpdateError::ChangedSize);
-            }
-            if equal {
-                found = Some(i);
-                break;
-            }
+            i += 1;
         }
-        i += 1;
+        if let Some(index) = found {
+            (*items).shift_remove_index(index);
+            let set = &mut *(dst as *mut W_SetObject);
+            set.len -= 1;
+            set.hash = -1;
+        }
+        return Ok(());
     }
-    if let Some(index) = found {
-        (*items).shift_remove_index(index);
-        let set = &mut *(dst as *mut W_SetObject);
-        set.len -= 1;
-        set.hash = -1;
-    }
-    Ok(())
 }
 
 /// Number of elements in the set.

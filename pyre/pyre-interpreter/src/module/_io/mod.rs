@@ -103,18 +103,17 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "_IOBase._checkClosed() takes no arguments",
+        ));
+    }
     let self_obj = args
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("_checkClosed() requires self"))?;
-    let message = args
-        .get(1)
-        .copied()
-        .filter(|value| !unsafe { pyre_object::is_none(*value) })
-        .map(|value| unsafe { pyre_object::w_str_get_value(value).to_string() })
-        .unwrap_or_else(|| "I/O operation on closed file".to_string());
     if io_closed(self_obj) {
-        Err(crate::PyError::value_error(message))
+        Err(crate::PyError::value_error("I/O operation on closed file"))
     } else {
         Ok(w_none())
     }
@@ -470,7 +469,7 @@ fn init_iobase_type(ns: PyObjectRef) {
     type_method(
         ns,
         "_checkClosed",
-        crate::make_builtin_function("_checkClosed", iobase_check_closed),
+        crate::make_builtin_function_with_arity("_checkClosed", iobase_check_closed, 1),
     );
     type_method(
         ns,

@@ -3,6 +3,18 @@ from io import BufferedReader, BytesIO, FileIO, RawIOBase, StringIO, TextIOWrapp
 
 from testutils import assert_raises
 
+
+# Python 3.14 exposes _checkClosed as a no-argument helper.  In particular,
+# an extra object must be rejected by argument parsing rather than interpreted
+# as an unchecked string pointer.
+_open_base = RawIOBase()
+assert _open_base._checkClosed() is None
+with assert_raises(TypeError):
+    _open_base._checkClosed(1)
+_open_base.close()
+with assert_raises(ValueError):
+    _open_base._checkClosed()
+
 fi = FileIO("README.md")
 assert isinstance(fi, RawIOBase)
 assert issubclass(FileIO, RawIOBase)
@@ -63,9 +75,13 @@ os.close(read_fd)
 with assert_raises(ValueError):
     FileIO("README.md", closefd=False)
 
-for bad_mode in ("", "rr", "rt", "rw", "rbb"):
+for bad_mode in ("", "rr", "rt", "rw"):
     with assert_raises(ValueError):
         FileIO("README.md", bad_mode)
+
+# Both PyPy's decode_mode and CPython 3.14 accept repeated binary markers.
+with FileIO("README.md", "rbb") as fio:
+    assert fio.mode == "rb"
 
 
 # Test that IOBase.isatty() raises ValueError when called on a closed file.
