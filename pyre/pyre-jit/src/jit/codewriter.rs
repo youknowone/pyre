@@ -13652,6 +13652,8 @@ impl CodeWriter {
         let mut result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut depth_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut depth_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut forward_py_pc_marker_by_jit_pc: Vec<(usize, u32)> = Vec::new();
+        let mut forward_py_pc_pred_by_jit_pc: Vec<(usize, u32)> = Vec::new();
         let mut after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)> =
             Vec::new();
         let mut after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
@@ -13688,6 +13690,9 @@ impl CodeWriter {
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
+                forward_py_pc_marker_by_jit_pc.push((off, skipped_py as u32));
+                let skipped_py =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 let depth_trivia = static_depth.get(skipped_py).copied();
                 depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
                 pcdep_trivia_marker_by_jit_pc.push((
@@ -13708,6 +13713,7 @@ impl CodeWriter {
                 result_color_trivia_marker_by_jit_pc.push((off, result_color_trivia));
             }
             depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            forward_py_pc_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             pcdep_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             const_ref_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
@@ -13716,6 +13722,7 @@ impl CodeWriter {
                 if pos != usize::MAX {
                     let skipped_py =
                         pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                    forward_py_pc_pred_by_jit_pc.push((pos, skipped_py as u32));
                     let depth_trivia = static_depth.get(skipped_py).copied();
                     depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
                     pcdep_trivia_pred_by_jit_pc.push((
@@ -13737,6 +13744,7 @@ impl CodeWriter {
                 }
             }
             depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            forward_py_pc_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             pcdep_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             const_ref_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
@@ -13849,6 +13857,8 @@ impl CodeWriter {
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
 
         let metadata = PyJitCodeMetadata {
+            forward_py_pc_marker_by_jit_pc,
+            forward_py_pc_pred_by_jit_pc,
             after_residual_call_resume_marker_by_jit_pc,
             after_residual_call_resume_pred_by_jit_pc,
             n_py_instrs,

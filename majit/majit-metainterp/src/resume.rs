@@ -273,6 +273,9 @@ pub struct SnapshotFrame {
     pub jitcode_index: i32,
     /// JitCode byte offset (resume.py:250 pc).
     pub pc: i32,
+    /// Forward-carried Python instruction PC. `-1` is the no-snapshot
+    /// sentinel, paired with `pc == -1`.
+    pub py_pc: i32,
     /// Live boxes for this frame's registers (resume.py:253).
     pub boxes: Vec<SnapshotBox>,
 }
@@ -300,6 +303,7 @@ impl Snapshot {
             framestack: vec![SnapshotFrame {
                 jitcode_index,
                 pc,
+                py_pc: pc,
                 boxes,
             }],
         }
@@ -337,6 +341,7 @@ impl Snapshot {
                 .map(|(jitcode_index, pc, boxes)| SnapshotFrame {
                     jitcode_index,
                     pc,
+                    py_pc: pc,
                     boxes,
                 })
                 .collect(),
@@ -345,7 +350,7 @@ impl Snapshot {
 
     /// Estimated encoded size for NumberingState capacity hint.
     pub fn estimated_size(&self) -> usize {
-        let frame_size: usize = self.framestack.iter().map(|f| f.boxes.len() + 2).sum();
+        let frame_size: usize = self.framestack.iter().map(|f| f.boxes.len() + 3).sum();
         self.vable_array.len() + self.vref_array.len() + frame_size + 4
     }
 }
@@ -696,6 +701,7 @@ fn resume_frame_layout_to_frame_info(layout: &ResumeFrameLayoutSummary) -> Frame
     FrameInfo {
         jitcode_index: layout.jitcode_index,
         pc: layout.pc,
+        py_pc: -1,
         slot_map: layout
             .slot_layouts
             .iter()
@@ -1975,6 +1981,7 @@ impl EncodedResumeData {
         for frame in frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
+            rd_numb.push(encode_u64(frame.py_pc as u64));
             // resume.py:253 _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
                 let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
@@ -2052,7 +2059,7 @@ impl EncodedResumeData {
             vref_array.push(self.decode_box(self.next_word(&mut cursor)));
         }
         // resume.py:1049-1055: frame section.
-        // Per-frame: jitcode_index, pc, [tagged_values...].
+        // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
         // RPython uses jitcode.get_live_vars_info(pc) for frame boundary;
         // we use self.frame_sizes[] stored at encode time.
         let items_resume_len = decode_len(items_resume_section);
@@ -2061,6 +2068,7 @@ impl EncodedResumeData {
         while cursor < items_resume_len {
             let jitcode_index = self.next_word(&mut cursor) as i32;
             let pc = decode_u64(self.next_word(&mut cursor));
+            let py_pc = self.next_word(&mut cursor) as i32;
             let slot_count = if frame_idx < self.frame_sizes.len() {
                 self.frame_sizes[frame_idx]
             } else {
@@ -2074,6 +2082,7 @@ impl EncodedResumeData {
             frames.push(FrameInfo {
                 jitcode_index,
                 pc,
+                py_pc,
                 slot_map,
             });
             frame_idx += 1;
@@ -2342,6 +2351,7 @@ impl ResumeDataExt for ResumeData {
             frames: vec![FrameInfo {
                 jitcode_index: 0,
                 pc,
+                py_pc: -1,
                 slot_map,
             }],
             virtuals: Vec::new(),
@@ -2877,6 +2887,7 @@ pub struct ResumeDataVirtualAdder {
 struct FrameInfoBuilder {
     jitcode_index: i32,
     pc: u64,
+    py_pc: i32,
     slot_map: Vec<FrameSlotSource>,
 }
 
@@ -2897,11 +2908,12 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Push a new frame onto the stack.
-    /// resume.py:249-252: jitcode_index, pc per frame.
-    pub fn push_frame(&mut self, jitcode_index: i32, pc: u64) {
+    /// resume.py:249-252: jitcode_index, pc, py_pc per frame.
+    pub fn push_frame(&mut self, jitcode_index: i32, pc: u64, py_pc: i32) {
         self.frames.push(FrameInfoBuilder {
             jitcode_index,
             pc,
+            py_pc,
             slot_map: Vec::new(),
         });
     }
@@ -3082,6 +3094,7 @@ impl ResumeDataVirtualAdder {
                 .map(|f| FrameInfo {
                     jitcode_index: f.jitcode_index,
                     pc: f.pc,
+                    py_pc: f.py_pc,
                     slot_map: f.slot_map,
                 })
                 .collect(),
@@ -3841,12 +3854,12 @@ impl ResumeDataLoopMemo {
     ///      [tagged boxes for vable_array]
     /// [n]  vref_array_length   (0 if no virtualrefs)
     ///      [tagged boxes for vref_array]
-    /// [m]  frame0_pc frame0_slots...
-    /// [m+] frame1_pc frame1_slots...
+    /// [m]  frame0_jitcode_index frame0_pc frame0_py_pc frame0_slots...
+    /// [m+] frame1_jitcode_index frame1_pc frame1_py_pc frame1_slots...
     /// ...
     /// ```
     ///
-    /// `frames` is a list of (pc, fail_args_slice) for each frame.
+    /// `frames` carries `(jitcode_index, pc, py_pc, fail_args_slice)` for each frame.
     /// In pyre (single frame), this is typically one frame.
     /// resume.py:228-256 number() — serialize a guard's full snapshot.
     ///
@@ -3907,12 +3920,13 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, [tagged_values...].
+        // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
         // RPython uses jitcode.get_live_vars_info(pc) at decode time
         // to know how many tagged values each frame has.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index as i64);
             numb_state.append_int(frame.pc as i64);
+            numb_state.append_int(frame.py_pc as i64);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -4246,11 +4260,12 @@ impl ResumeDataLoopMemo {
             rd_numb.push(tagged);
         }
 
-        // resume.py:249-253: per-frame: jitcode_index, pc, [tagged_values...].
+        // resume.py:249-253: per-frame: jitcode_index, pc, py_pc, [tagged_values...].
         let mut frame_sizes = Vec::with_capacity(rd.frames.len());
         for frame in &rd.frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
+            rd_numb.push(encode_u64(frame.py_pc as u64));
             for source in &frame.slot_map {
                 let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
                 rd_numb.push(tagged);
@@ -4573,6 +4588,7 @@ mod tests {
             frames: vec![FrameInfo {
                 jitcode_index: 0,
                 pc: 100,
+                py_pc: -1,
                 slot_map: vec![
                     FrameSlotSource::FailArg(2),
                     FrameSlotSource::Unavailable,
@@ -4604,11 +4620,13 @@ mod tests {
                 FrameInfo {
                     jitcode_index: 0,
                     pc: 10,
+                    py_pc: -1,
                     slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::FailArg(1)],
                 },
                 FrameInfo {
                     jitcode_index: 1,
                     pc: 20,
+                    py_pc: -1,
                     slot_map: vec![FrameSlotSource::FailArg(2), FrameSlotSource::FailArg(3)],
                 },
             ],
@@ -4635,7 +4653,7 @@ mod tests {
     #[test]
     fn test_builder() {
         let mut builder = ResumeDataVirtualAdder::new();
-        builder.push_frame(0, 42);
+        builder.push_frame(0, 42, -1);
         builder.map_slot(0, 0);
         builder.map_slot(2, 1); // gap at slot 1
         let rd = builder.build();
@@ -4921,11 +4939,13 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
+                    py_pc: 10,
                     boxes: vec![OpRef::int_op(1).into(), OpRef::const_int(99).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
                     pc: 20,
+                    py_pc: 20,
                     boxes: vec![OpRef::int_op(2).into(), OpRef::int_op(3).into()],
                 },
             ],
@@ -4938,12 +4958,16 @@ mod tests {
         // Multi-frame encoding: no box_count, RPython parity.
         let items = crate::resumecode::unpack_numbering(&rd_numb);
         assert_eq!(items[1], 3); // num_failargs: 3 boxes patched
-        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6..7]=tagged
+        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6]=py_pc(10),
+        // items[7..8]=tagged.
         assert_eq!(items[4], 0);
         assert_eq!(items[5], 10);
-        // Frame 1: items[8]=jitcode(1), items[9]=pc(20), items[10..11]=tagged
-        assert_eq!(items[8], 1);
-        assert_eq!(items[9], 20);
+        assert_eq!(items[6], 10);
+        // Frame 1: items[9]=jitcode(1), items[10]=pc(20), items[11]=py_pc(20),
+        // items[12..13]=tagged.
+        assert_eq!(items[9], 1);
+        assert_eq!(items[10], 20);
+        assert_eq!(items[11], 20);
 
         // Roundtrip with liveness-based closure.
         let rd_consts: Vec<majit_ir::Const> = memo.consts().to_vec();
@@ -4965,9 +4989,11 @@ mod tests {
         assert_eq!(rebuilt_frames.len(), 2);
         assert_eq!(rebuilt_frames[0].jitcode_index, 0);
         assert_eq!(rebuilt_frames[0].pc, 10);
+        assert_eq!(rebuilt_frames[0].py_pc, 10);
         assert_eq!(rebuilt_frames[0].values.len(), 2);
         assert_eq!(rebuilt_frames[1].jitcode_index, 1);
         assert_eq!(rebuilt_frames[1].pc, 20);
+        assert_eq!(rebuilt_frames[1].py_pc, 20);
         assert_eq!(rebuilt_frames[1].values.len(), 2);
     }
 
@@ -5036,6 +5062,7 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
+                py_pc: 8,
                 boxes: vec![OpRef::int_op(1).into()],
             }],
         };
@@ -6366,10 +6393,12 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ---- AbstractResumeDataReader methods (resume.py:928-1038) ----
 
-    /// resume.py:928 read_jitcode_pos_pc.  Returns `(jitcode_pos, pc)`.
+    /// resume.py:928 read_jitcode_pos_pc. The wire header also carries
+    /// forward `py_pc`, which blackhole does not use but must consume.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item();
         let pc = self.resumecodereader.next_item();
+        let _py_pc = self.resumecodereader.next_item();
         (jitcode_pos, pc)
     }
 

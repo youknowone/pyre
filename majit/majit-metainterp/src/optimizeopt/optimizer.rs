@@ -438,7 +438,7 @@ pub struct Optimizer {
     /// section. opencoder.py:767 create_top_snapshot records vref_boxes
     /// alongside vable_boxes.
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
+    /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// Phase 1 emit ops carried into Phase 2's lookup surface (6).
     ///

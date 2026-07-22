@@ -1029,7 +1029,6 @@ pub struct ResumedFrame {
     /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
     ///   pc=0 is valid (function start / loop header at bytecode 0).
     /// None: no-snapshot guard (rd_numb pc=-1), positional fallback.
-    pub rd_numb_pc: Option<usize>,
     /// CHAIN virtualizable pointer (same value on every section).
     /// RPython parity: there is ONE virtualizable per jitdriver_sd for the
     /// whole blackhole chain; inner sections do not own a separate PyFrame.

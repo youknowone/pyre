@@ -11,6 +11,19 @@
 
 use super::*;
 
+/// Read the Python PC paired with a native resume word.  The codewriter builds
+/// this table from Python-PC keys, including the same forward trivia skip as
+/// `backxlat_py_pc`; capture deliberately never projects the word backwards.
+fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchError> {
+    if pc == majit_ir::resumedata::NO_JITCODE_PC as u32 {
+        return Ok(u32::MAX);
+    }
+    crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .and_then(|payload| payload.resume_position_for_jitcode_pc(pc as usize))
+        .map(|(_, py_pc)| py_pc)
+        .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })
+}
+
 /// `generate_guard` (`pyjitpl.py`) keys `after_residual_call`
 /// on the guard opcode itself: `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` /
 /// `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS` resume *after* the residual
@@ -169,11 +182,13 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    let nsvable_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, nsvable_pc_word)?;
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_op_with_vable_vref(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             nsvable_pc_word,
+            nsvable_py_pc,
             &vable_boxes,
             &vref_boxes,
         );
@@ -972,11 +987,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 scope.branch_guard_kept_recovered,
             );
             let pc_word = resolved_offset as u32;
+            let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
                     &active,
                     jitcode_index,
                     pc_word,
+                    forward_py_pc,
                     &vable_boxes,
                     &vref_boxes,
                 );
@@ -1003,11 +1020,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
+    let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             arm_pc_word,
+            arm_py_pc,
             &vable_boxes,
             &vref_boxes,
         );
@@ -1764,7 +1783,8 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
 
     // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
     // top frame last (innermost).
-    let mut frames: Vec<(u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
+    let mut frames: Vec<(u32, u32, u32, &[OpRef])> =
+        Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
         let pf_word = pf
             .resume_marker_jit_pc
@@ -1780,11 +1800,15 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         else {
             return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc });
         };
-        frames.push((pf.jitcode_index, pf_pc_word, pf.boxes.as_slice()));
+        let pf_py_pc = forward_snapshot_py_pc(pf.jitcode_index, pf_pc_word)?;
+        frames.push((pf.jitcode_index, pf_pc_word, pf_py_pc, pf.boxes.as_slice()));
     }
+    let callee_py_pc =
+        forward_snapshot_py_pc(callee_jitcode_index as u32, callee_jitcode_pc as u32)?;
     frames.push((
         callee_jitcode_index as u32,
         callee_jitcode_pc as u32,
+        callee_py_pc,
         callee_boxes.as_slice(),
     ));
 

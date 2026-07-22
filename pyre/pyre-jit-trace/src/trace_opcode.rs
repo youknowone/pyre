@@ -2913,9 +2913,14 @@ impl MIFrame {
             crate::state::request_trace_abort();
             top_pc as u32
         });
+        let top_py_pc = resolved
+            .and_then(|offset| payload.resume_position_for_jitcode_pc(offset))
+            .map(|(_, py_pc)| py_pc)
+            .unwrap_or(top_pc as u32);
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,
+            py_pc: top_py_pc,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,

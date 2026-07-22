@@ -294,7 +294,7 @@ pub struct UnrollOptimizer {
     /// (resume.py:243-247 vref_array — _number_boxes consumes them
     /// after the virtualizable array).
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
+    /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.

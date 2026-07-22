@@ -27,6 +27,7 @@ fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Ty
         frames: vec![SnapshotFrame {
             jitcode_index: 0,
             pc,
+            py_pc: pc,
             boxes: boxes
                 .iter()
                 .map(|(opref, tp)| SnapshotTagged::Box(*opref, *tp))
@@ -1611,7 +1612,7 @@ fn jit_state_restore_guard_failure_restores_from_reconstructed_resume_frame() {
     };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 444);
+    resume.push_frame(0, 444, -1);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
     resume.set_slot_constant(2, majit_ir::Const::Int(99));
@@ -1645,7 +1646,7 @@ fn jit_state_restore_guard_failure_materializes_virtual_ref_from_resume_state() 
     };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 555);
+    resume.push_frame(0, 555, -1);
     let virtual_index = resume.add_virtual_struct(
         Some(typedescr_7),
         0,
@@ -1692,7 +1693,7 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
     };
     let meta = TestMeta { header_pc: 556 };
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 556);
+    resume.push_frame(0, 556, -1);
     let inner = resume.add_virtual_struct(
         Some(inner_typedescr),
         0,
@@ -1761,7 +1762,7 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     };
     let meta = TestMeta { header_pc: 557 };
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 557);
+    resume.push_frame(0, 557, -1);
     let parent = resume.add_virtual_struct(Some(parent_typedescr), 0, vec![], vec![], 0);
     let child = resume.add_virtual_struct(Some(child_typedescr), 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, parent);
@@ -1799,7 +1800,7 @@ fn jit_state_restore_guard_failure_replays_pending_field_writes() {
     let mut state = PendingWriteState { obj: 0, flag: 1 };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 666);
+    resume.push_frame(0, 666, -1);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(cell_ptr)));
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
@@ -1835,7 +1836,7 @@ fn jit_state_restore_guard_failure_replays_pending_array_writes_via_layout_hook(
     let mut state = PendingArrayWriteState { array: 0, flag: 1 };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 888);
+    resume.push_frame(0, 888, -1);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(array_ptr)));
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
@@ -1875,10 +1876,10 @@ fn jit_state_restore_guard_failure_can_restore_multi_frame_resume_state() {
     };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 100);
+    resume.push_frame(0, 100, -1);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
-    resume.push_frame(0, 200);
+    resume.push_frame(0, 200, -1);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
     let reconstructed_state = resume.build().reconstruct_state(&[2]);
@@ -1911,11 +1912,11 @@ fn jit_state_restore_guard_failure_can_restore_multi_frame_state_via_generic_fra
     };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 300);
+    resume.push_frame(0, 300, -1);
     let virtual_index = resume.add_virtual_struct(None, 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
-    resume.push_frame(0, 400);
+    resume.push_frame(0, 400, -1);
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
     let reconstructed_state = resume.build().reconstruct_state(&[2]);
@@ -1954,11 +1955,11 @@ fn jit_state_restore_guard_failure_reuses_virtual_cache_for_pending_writes() {
     };
 
     let mut resume = ResumeDataVirtualAdder::new();
-    resume.push_frame(0, 500);
+    resume.push_frame(0, 500, -1);
     let virtual_index = resume.add_virtual_struct(None, 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
-    resume.push_frame(0, 600);
+    resume.push_frame(0, 600, -1);
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(

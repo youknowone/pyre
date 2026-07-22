@@ -11,6 +11,14 @@
 
 use super::*;
 
+/// `PYRE_M73_PYPC_FWD_AUDIT`: verify the forward Python-PC resume word
+/// against the still-live decode-side back-translation.  Cached once, like
+/// the other walker diagnostics; the audit emits no per-event logging.
+pub fn py_pc_forward_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PYPC_FWD_AUDIT").is_some())
+}
+
 /// `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT` is a report-only census for the
 /// recipe resume-coordinate result-color reader and the multi-frame callee
 /// diagnostic's inversion. The optional `_PROBE` receives a fire row followed

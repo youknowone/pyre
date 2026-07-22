@@ -586,7 +586,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 // as separate sections. Do not merge vable_array entries into
                 // the innermost frame slots here.
                 for frame in frames.iter() {
-                    builder.push_frame(frame.jitcode_index, frame.pc as u64);
+                    builder.push_frame(frame.jitcode_index, frame.pc as u64, frame.py_pc);
                     let mut slot_idx = 0usize;
                     for val in &frame.values {
                         add_slot(&mut builder, slot_idx, val);
@@ -595,7 +595,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 }
             } else {
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
-                builder.push_frame(0, pc);
+                builder.push_frame(0, pc, -1);
                 let num_slots = op
                     .getfailargs()
                     .map(|fa| fa.len())
@@ -2625,6 +2625,7 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
+                py_pc: 8,
                 boxes: vec![OpRef::input_arg_int(1).into()],
             }],
         };

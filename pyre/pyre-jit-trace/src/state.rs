@@ -11620,6 +11620,8 @@ mod tests {
         let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
             runtime_jitcode,
             crate::PyJitCodeMetadata {
+                forward_py_pc_marker_by_jit_pc: Vec::new(),
+                forward_py_pc_pred_by_jit_pc: Vec::new(),
                 after_residual_call_resume_marker_by_jit_pc: Vec::new(),
                 after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 n_py_instrs: 0,
@@ -11723,6 +11725,7 @@ mod tests {
             frames: vec![RebuiltFrame {
                 jitcode_index,
                 pc: 0,
+                py_pc: 0,
                 values: vec![
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),

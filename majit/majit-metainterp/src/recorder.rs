@@ -74,6 +74,9 @@ pub struct SnapshotFrame {
     /// context; the runtime translates `py_pc` through `pc_map` at resume
     /// time until pyre's walker-as-tracer epic lands.
     pub pc: u32,
+    /// Forward-carried Python instruction PC for this JitCode position.
+    /// `u32::MAX` is the no-snapshot sentinel paired with `pc == -1`.
+    pub py_pc: u32,
     /// Tagged references to the live boxes in this frame.
     pub boxes: Vec<SnapshotTagged>,
 }

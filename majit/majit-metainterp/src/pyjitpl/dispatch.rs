@@ -8036,6 +8036,7 @@ pub fn build_state_field_snapshot(
         snapshot_frames.push(crate::recorder::SnapshotFrame {
             jitcode_index,
             pc: frame.pc as u32,
+            py_pc: frame.pc as u32,
             boxes,
         });
     }

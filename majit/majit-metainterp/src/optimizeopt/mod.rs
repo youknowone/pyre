@@ -45,7 +45,7 @@ use std::collections::VecDeque;
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
-pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32)>>>;
+pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32, i32)>>>;
 type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;
 
 pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
@@ -754,7 +754,7 @@ pub struct OptContext {
     /// resume.py:243-247 _number_boxes consumes vref_array as a section
     /// after vable_array. opencoder.py:767 records vref_boxes here.
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
+    /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
@@ -6244,14 +6244,32 @@ impl OptContext {
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
                 let frame_boxes: Vec<SnapshotBox> = snapshot_boxes[offset..end].to_vec();
-                let (jitcode_index, pc) = frame_pcs.get(i).copied().unwrap_or((0, 0));
-                frames.push((jitcode_index, pc, frame_boxes));
+                let (jitcode_index, pc, py_pc) = frame_pcs.get(i).copied().unwrap_or((0, 0, 0));
+                frames.push(crate::resume::SnapshotFrame {
+                    jitcode_index,
+                    pc,
+                    py_pc,
+                    boxes: frame_boxes,
+                });
                 offset = end;
             }
-            Snapshot::multi_frame_boxes(frames)
+            Snapshot {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                framestack: frames,
+            }
         } else {
-            let (jitcode_index, pc) = frame_pcs.first().copied().unwrap_or((0, 0));
-            Snapshot::single_frame_boxes(jitcode_index, pc, snapshot_boxes.clone())
+            let (jitcode_index, pc, py_pc) = frame_pcs.first().copied().unwrap_or((0, 0, 0));
+            Snapshot {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                framestack: vec![crate::resume::SnapshotFrame {
+                    jitcode_index,
+                    pc,
+                    py_pc,
+                    boxes: snapshot_boxes.clone(),
+                }],
+            }
         };
         // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
         // ni/vsd are constants (TAGINT/TAGCONST) so they don't affect
