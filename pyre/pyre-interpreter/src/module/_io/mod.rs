@@ -9,6 +9,8 @@ use pyre_object::*;
 
 mod buffered;
 pub use buffered::W_BufferedReader;
+mod buffered_writer;
+pub use buffered_writer::W_BufferedWriter;
 
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
@@ -946,17 +948,11 @@ crate::py_module! {
         // accept weak references just like PyPy's concrete raw stream.
         unsafe { pyre_object::w_type_set_weakrefable(file_io, true) };
         let buffered_reader = buffered::type_object();
+        let buffered_writer = buffered_writer::type_object();
         for (name, t) in [
             ("FileIO", file_io),
             ("BufferedReader", buffered_reader),
-            (
-                "BufferedWriter",
-                crate::typedef::make_builtin_type_with_base(
-                    "BufferedWriter",
-                    |_| {},
-                    buffered_base,
-                ),
-            ),
+            ("BufferedWriter", buffered_writer),
             (
                 "BufferedRWPair",
                 crate::typedef::make_builtin_type_with_base(
