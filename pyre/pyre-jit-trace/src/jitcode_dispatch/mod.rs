@@ -7273,6 +7273,13 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// stays walker-side because resume snapshots are —
 /// `walker_emit_guard_with_snapshot` is the walk's `generate_guard`.
 ///
+/// The heapcache check runs before `box.nonnull()`: upstream reads the
+/// concrete pointer unconditionally, but the walker knows it only through
+/// the concrete shadow, which may be absent even when a prior guard already
+/// proved the box's nullity. Consulting the cache first keeps the known
+/// answer from being lost to a missing shadow (the value is read lazily only
+/// on a cache miss).
+///
 /// Returns `box.nonnull()`.
 fn establish_nullity<Sym: WalkSym>(
     code: &[u8],
@@ -7280,19 +7287,13 @@ fn establish_nullity<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     boxref: OpRef,
 ) -> Result<bool, DispatchError> {
-    // `box.nonnull()` reads the pointer itself. The walker knows it only
-    // through the concrete shadow, and an absent shadow is not evidence of
-    // either nullity, so decline rather than guess the branch direction.
-    let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
-        return Err(DispatchError::UnsupportedOpname {
-            pc: op.pc,
-            key: op.key,
-        });
-    };
-    let value = !ptr.is_null();
     // Pyre's `is_nullity_known` splits upstream's boolean into which side is
-    // known (`Some(true)` non-null, `Some(false)` null, `None` unknown), so
-    // upstream's "is it known at all" test is `is_some`.
+    // known (`Some(true)` non-null, `Some(false)` null, `None` unknown). When
+    // the nullity is already known, the stored side *is* `box.nonnull()` — an
+    // SSA box's nullity is immutable — so the heapcache answers the branch
+    // without reading the pointer. This is consulted before the concrete
+    // shadow so a box whose nullity a prior guard proved still resolves even
+    // when its Ref shadow is absent.
     let known = ctx.trace_ctx.heap_cache().is_nullity_known(boxref, |op| {
         op.inline_const_to_value().and_then(|v| match v {
             Value::Int(n) => Some(n),
@@ -7300,13 +7301,24 @@ fn establish_nullity<Sym: WalkSym>(
             _ => None,
         })
     });
-    if known.is_some() {
+    if let Some(value) = known {
         ctx.trace_ctx.profiler().count_ops(
             OpCode::GuardNonnull,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
         return Ok(value);
     }
+    // Nullity not yet known: `box.nonnull()` reads the pointer itself. The
+    // walker knows it only through the concrete shadow, and an absent shadow
+    // is not evidence of either nullity, so decline rather than guess the
+    // branch direction.
+    let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: op.key,
+        });
+    };
+    let value = !ptr.is_null();
     if value {
         // A known class already implies non-null, so the guard is redundant.
         if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {

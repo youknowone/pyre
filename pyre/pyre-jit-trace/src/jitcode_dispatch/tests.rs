@@ -1185,6 +1185,35 @@ fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
 }
 
 #[test]
+fn goto_if_not_ptr_nonzero_uses_known_nonnull_heapcache_without_a_ref_shadow() {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    // `rL`: 1B ref reg + 2B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.heap_cache_mut().new_object(operand);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [operand];
+    // The Ref shadow is absent, yet the heapcache already proved non-nullness.
+    // `_establish_nullity` answers from the cache before demanding a pointer.
+    let mut concrete_r = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("a heapcache-known non-null box needs no ref shadow");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 4,
+        "a known non-null pointer falls through without reading a shadow"
+    );
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the heapcache-known fast path emits no nullity guard"
+    );
+}
+
+#[test]
 fn raw_load_i_records_the_load_against_the_descr() {
     let byte = *insns_opname_to_byte()
         .get("raw_load_i/iid>i")
