@@ -9,23 +9,24 @@
       MiniMarkGC::alloc_with_type
       majit_backend_cranelift::compiler::gc_alloc_nursery_shim
 
-`4294967254` is `(u32)-42`: `TypeRegistry::get` was handed a type id read off an
-object header that is not a live, initialized object.
+`4294967254` is `(u32)-42`: `finalizer_children` (collector.rs:2485) reads a type
+id off an object header that is not a live, initialized object.  Sets and dicts
+each own a GC storage box carrying a finalizer (it drops the backing Rust
+IndexMap), so a hot loop that allocates fresh containers under the cranelift JIT
+churns finalizer-bearing nursery boxes; one reaches finalization ordering with a
+garbage header.
 
-This is `synth/key_eq_restart_forgets` with the filler count it was first
-written with.  Intermittent -- measured 2/6 runs, and it does not reproduce on
-every shuffle of the same operations, so expect to run it repeatedly.
-Attribution, 6 runs each:
+Intermittent -- CI (macos-26-arm64) tripped it, and locally it is ~2/8 runs, so
+run it repeatedly.  Attribution:
 
-    cranelift, JIT on         2/6 crash
-    cranelift, PYRE_NO_JIT=1  0/6
-    dynasm, JIT on            0/6
+    cranelift, JIT on         crashes
+    cranelift, PYRE_NO_JIT=1  clean
+    dynasm, JIT on            clean
 
-The container code driving this is plain interpreter-side Rust, identical in all
-three, so the fault is on the cranelift JIT's nursery allocation path rather
-than in the key probe.  It needs a user `__eq__` that allocates
-finalizer-bearing objects (sets and dicts each own a GC storage box) from inside
-a bucket probe, run hot enough to be traced.
+The container code is plain interpreter-side Rust, identical in all three, so the
+fault is on the cranelift JIT's nursery allocation path, not the key probe --
+this is why the shipped `synth/key_eq_restart_forgets` verifies the restart
+answer in a single interpreter pass and keeps its hot loop allocation-free.
 """
 
 

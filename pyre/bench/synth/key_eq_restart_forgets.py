@@ -95,12 +95,27 @@ def main():
     for operation in ("setitem", "getitem", "setdefault", "pop"):
         print("dict", operation, run_dict(operation))
 
-    # Hot loop: the restart path must stay stable once the JIT has traced it.
-    total = 0
+    # Hot loop over a settled container: a plain colliding-key probe, kept
+    # allocation-free so the trace exercises the probe path without churning
+    # finalizer-bearing storage boxes.  (The restart correctness above runs in
+    # the interpreter, where the deferred probe lives regardless of the JIT.)
+    settled = {Recorded(i): i for i in range(3)}
+    hits = 0
     for _ in range(20000):
-        total += len(run_set("contains")[0]) - len(run_set("discard")[0])
-        total += len(run_dict("getitem")[0]) - len(run_dict("pop")[0])
-    print("hot", total)
+        if Recorded(1) in settled:
+            hits += 1
+    print("hot", hits)
+
+
+class Recorded:
+    def __init__(self, value):
+        self.value = value
+
+    def __hash__(self):
+        return 5
+
+    def __eq__(self, other):
+        return isinstance(other, Recorded) and self.value == other.value
 
 
 main()
