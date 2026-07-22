@@ -1029,6 +1029,34 @@ fn inject_root_call_result<Sym: WalkSym>(
     true
 }
 
+/// The ROOT frame's `except` handler jitcode pc covering the CALL paused at
+/// `root_pc`, for the carrier-boundary `finishframe_exception` (a depth-2
+/// inlined callee raised).  `root_pc` is the CALL's post-call resume `-live-`,
+/// with the enclosing try's `catch_exception/L` sitting BEHIND it (the same
+/// shape the single-frame exception-edge router scans), so read backward.
+/// Accept the handler only when it rejoins a loop (`exc_handler_rejoins_loop`)
+/// so the bridge closes with a `Jump` into the enclosing loop instead of a
+/// cross-frame return the carrier cannot reconstruct.
+fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<usize> {
+    if sym.jitcode().is_null() {
+        return None;
+    }
+    let payload = unsafe { &(*sym.jitcode()).payload };
+    let code = payload.jitcode.code.as_slice();
+    // The paused caller's resume pc is the CALL's post-call `-live-`; the
+    // `catch_exception/L` for the enclosing try sits BEHIND it (between the
+    // CALL's post-call `-live-` and the next op), so scan backward — the same
+    // lookup the single-frame exception-edge router uses.
+    let candidate = crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc);
+    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+        eprintln!(
+            "[p2-raise] root_pc={root_pc} catch_before={candidate:?} rejoins={:?}",
+            candidate.map(|t| crate::jitcode_dispatch::exc_handler_rejoins_loop(code, t)),
+        );
+    }
+    candidate.filter(|&t| crate::jitcode_dispatch::exc_handler_rejoins_loop(code, t))
+}
+
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -1189,6 +1217,47 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
+        }
+    }
+
+    // `finishframe_exception` at the carrier boundary: the inlined callee's
+    // sub-walk raised and had no local handler, so it surfaced `SubRaise`.  The
+    // ROOT frame paused at the CALL; if its `except` handler covers the CALL and
+    // rejoins a loop, deliver the exception to that handler and continue the
+    // root walk from it (the same handler-entry reconstruction the walk-level
+    // SubRaise routing performs, threaded across the carrier the sub-walk
+    // crossed on its own).  Without this the raise is dropped and re-interpreted
+    // every iteration (deopt-storm).
+    let subwalk_raise = match &walk {
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubRaise { exc, exc_concrete }, _))) => {
+            Some((*exc, *exc_concrete))
+        }
+        _ => None,
+    };
+    if let Some((exc, exc_concrete)) = subwalk_raise {
+        if carrier.recipes.len() == 1 && crate::jitcode_dispatch::fbw_carrier_raise_enabled() {
+            if let Some(catch_target) = carrier_root_catch_target(sym, root_pc) {
+                crate::jitcode_dispatch::set_carrier_raise_seed(
+                    crate::jitcode_dispatch::CarrierRaiseSeed {
+                        exc,
+                        exc_concrete,
+                        catch_target,
+                    },
+                );
+                crate::jitcode_dispatch::census_record("P2Drain::CompileRootRaise");
+                let root_py_pc =
+                    crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
+                        as usize;
+                let action =
+                    full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
+                // Defensive: `dispatch_via_miframe` consumes the seed, but a
+                // walk that early-declines before reaching it would leave the
+                // seed standing and leak it into a later unrelated walk. Clear
+                // any residual seed so exactly this walk can observe it.
+                let _ = crate::jitcode_dispatch::take_carrier_raise_seed();
+                return action;
+            }
+            crate::jitcode_dispatch::census_record("P2Drain::RaiseNoRootCatch");
         }
     }
 

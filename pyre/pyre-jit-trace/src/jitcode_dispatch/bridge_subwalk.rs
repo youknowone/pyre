@@ -326,6 +326,10 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // last_exc_value` is already the standing exception box, so the handler's
         // `last_exc_value/>r` reads it.  On the normal path, seed the mirror at
         // the first-walked pc as before.
+        // Carrier-boundary raise seed (`finishframe_exception`): a depth-2
+        // inlined callee's sub-walk raised and the root frame's handler covers
+        // the CALL (set by `drive_bridge_carrier_walk`).  Consumed once here.
+        let carrier_raise_seed = crate::jitcode_dispatch::take_carrier_raise_seed();
         let walk_position = if let Some(catch_target) = exc_edge_catch_target {
             // RPython `pyjitpl.py:3125-3173` exception-guard resumption, emitted
             // at the bridge-entry frame state so the GUARD_EXCEPTION captures a
@@ -373,6 +377,20 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // already-caught exception (mirrors `blackhole.rs route_to_catch`).
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             catch_target
+        } else if let Some(seed) = carrier_raise_seed {
+            // Carrier-boundary raise: the inlined callee's sub-walk already
+            // RECORDED the exception (a NewWithVtable of a known const class from
+            // its inline RAISE), so `seed.exc` is a live trace box carrying its
+            // own class — no SAVE/RESTORE/GUARD_EXCEPTION is needed (that path
+            // exists for a runtime exception restored from the pending cell).
+            // Mirror the walk-level SubRaise routing (mod.rs `finishframe_
+            // exception`): seed `last_exc_value` + the handler-entry operand
+            // stack (exc on TOS), then enter at the handler.
+            wc.last_exc_value = Some(seed.exc);
+            wc.last_exc_value_concrete = seed.exc_concrete;
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+            vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
+            seed.catch_target
         } else {
             seed_vstack_mirror(&mut wc, sym, position);
             position

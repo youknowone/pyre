@@ -1819,6 +1819,34 @@ pub(crate) fn census_dump() {
     });
 }
 
+/// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
+/// set by [`crate::trace::drive_bridge_carrier_walk`] when a depth-2 inlined
+/// callee's sub-walk ended in `SubRaise` and the ROOT frame's `except` handler
+/// covers the CALL.  [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it
+/// once when it sets up the root walk and enters at `catch_target` with the
+/// caught exception seeded — the same handler-entry reconstruction the
+/// walk-level SubRaise routing performs, but at the carrier boundary the
+/// sub-walk crossed on its own.
+#[derive(Clone, Copy)]
+pub(crate) struct CarrierRaiseSeed {
+    pub exc: OpRef,
+    pub exc_concrete: crate::state::ConcreteValue,
+    pub catch_target: usize,
+}
+
+thread_local! {
+    static FBW_CARRIER_RAISE_SEED: std::cell::Cell<Option<CarrierRaiseSeed>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn set_carrier_raise_seed(seed: CarrierRaiseSeed) {
+    FBW_CARRIER_RAISE_SEED.with(|c| c.set(Some(seed)));
+}
+
+pub(crate) fn take_carrier_raise_seed() -> Option<CarrierRaiseSeed> {
+    FBW_CARRIER_RAISE_SEED.with(|c| c.take())
+}
+
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
 /// next pc. Side effects reach `ctx.trace_ctx` only for opnames whose
 /// handler explicitly records (e.g. `ref_return/r` calls

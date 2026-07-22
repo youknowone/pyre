@@ -1078,18 +1078,33 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
         // for the enclosing try sits right after it (`finishframe_exception`
         // lookahead), so read the handler target forward from there, then test
         // it rejoins the CALL's own loop header specifically.
-        let rejoins = crate::jitcode_dispatch::enclosing_loop_header_jit_pc(
-            caller_jitcode,
-            call_jit_pc,
-        )
-        .zip(crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos))
-        .is_some_and(|(loop_header, catch_target)| {
-            crate::jitcode_dispatch::exc_handler_rejoins_specific_loop(
-                caller_jitcode,
-                catch_target,
-                loop_header,
-            )
-        });
+        let rejoins =
+            crate::jitcode_dispatch::enclosing_loop_header_jit_pc(caller_jitcode, call_jit_pc)
+                .zip(crate::jitcode_dispatch::try_catch_exception_at(
+                    caller_jitcode,
+                    resume_pos,
+                ))
+                .is_some_and(|(loop_header, catch_target)| {
+                    if fbw_carrier_raise_enabled() {
+                        // The carrier-boundary raise delivery bridges an inlined callee's
+                        // hot raise into whatever loop the handler rejoins, so a handler
+                        // that BREAKS/RETURNS to an ENCLOSING loop no longer deopt-storms
+                        // — widen the gate to ANY-loop rejoin.
+                        crate::jitcode_dispatch::exc_handler_rejoins_loop(
+                            caller_jitcode,
+                            catch_target,
+                        )
+                    } else {
+                        // Without the delivery, only a handler rejoining the CALL's OWN
+                        // loop is exc-edge-bridgeable; a break/return-to-outer handler's
+                        // hot raise would deopt-storm, so keep it on the residual path.
+                        crate::jitcode_dispatch::exc_handler_rejoins_specific_loop(
+                            caller_jitcode,
+                            catch_target,
+                            loop_header,
+                        )
+                    }
+                });
         if rejoins {
             return Ok(());
         }
