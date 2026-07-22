@@ -128,11 +128,34 @@ pub struct W_Random {
     weakrefable
 )]
 impl W_Random {
-    fn __init__(
-        &mut self,
-        #[default(pyre_object::w_none())] w_anything: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
-        self.seed(w_anything)
+    /// PyPy `interp_random.py:descr_new__`: allocate the requested subtype and
+    /// initialise it from the first constructor argument (or `None`).
+    ///
+    /// `__args__.firstarg()` deliberately leaves surplus-argument reporting to
+    /// the gateway.  Pyre's flat builtin ABI performs that gateway check here.
+    #[staticmethod]
+    fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        if crate::builtins::has_real_kwargs(kwargs) {
+            return Err(crate::PyError::type_error(
+                "Random() takes no keyword arguments",
+            ));
+        }
+        let user_args = positional.get(1..).unwrap_or(&[]);
+        if user_args.len() > 1 {
+            return Err(crate::PyError::type_error(
+                "Random() requires 0 or 1 argument",
+            ));
+        }
+        let w_anything = user_args.first().copied().unwrap_or_else(w_none);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_anything);
+        let seed_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let obj = W_Random::allocate_stable(W_Random::default());
+        let random = W_Random::from_obj(obj)
+            .expect("a freshly allocated _random.Random has the Random layout");
+        random.seed(pyre_object::gc_roots::shadow_stack_get(seed_slot))?;
+        Ok(obj)
     }
 
     fn random(&mut self) -> f64 {
