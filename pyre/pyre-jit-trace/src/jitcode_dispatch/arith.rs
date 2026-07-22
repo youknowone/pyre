@@ -333,6 +333,24 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
         write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // Distinct all-`Const` ref operands fold to a result constant without
+    // recording — `execute_and_record` const-folds any pure op whose operands
+    // are all `Const`, and the sibling `record_ptr_cmp` already does this. Two
+    // constant refs have a GC-stable identity relation, so the `is`/`is not`
+    // outcome is known at trace time.
+    if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        let folded = match opcode {
+            OpCode::PtrEq | OpCode::InstancePtrEq => (la == rb) as i64,
+            OpCode::PtrNe | OpCode::InstancePtrNe => (la != rb) as i64,
+            _ => unreachable!("binop_ref_to_int_record: unsupported opcode {opcode:?}"),
+        };
+        let result = ctx.trace_ctx.const_int(folded);
+        let dst = code[op.pc + 3] as usize;
+        write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Stamp the bool result from the operands' concrete carriers: the
     // `box_value` carrier first, then the `concrete_registers_r` shadow. The

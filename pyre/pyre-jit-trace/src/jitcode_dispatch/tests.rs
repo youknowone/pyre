@@ -5484,8 +5484,14 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         .get(opname)
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     let code = [byte, 0x02, 0x04, 0x06]; // r-src1=2, r-src2=4, i-dst=6
-    let mut tc = fresh_trace_ctx();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
     let mut regs_r = distinct_const_refs(&mut tc, 8);
+    // Non-const operands so the compare records: PyPy folds a ptr compare only
+    // when both operands are `Const`; the distinct-const fold is covered by
+    // `ptr_eq_folds_two_distinct_const_refs_without_recording`. InputArg refs
+    // (declared by `for_test_types`) are the recordable non-const operand.
+    regs_r[2] = OpRef::input_arg_ref(0);
+    regs_r[4] = OpRef::input_arg_ref(1);
     let mut regs_i = distinct_const_refs(&mut tc, 8);
     let arg0 = regs_r[2];
     let arg1 = regs_r[4];
@@ -5569,6 +5575,37 @@ fn instance_ptr_eq_records_instanceptreq() {
 #[test]
 fn instance_ptr_ne_records_instanceptrne() {
     drive_ptr_compare("instance_ptr_ne/rr>i", majit_ir::OpCode::InstancePtrNe);
+}
+
+#[test]
+fn ptr_eq_folds_two_distinct_const_refs_without_recording() {
+    // `execute_and_record` const-folds a pure op whose operands are all
+    // `Const`; two distinct const refs answer `is` (PtrEq -> false) at trace
+    // time without a recorded PTR_EQ.
+    let byte = *insns_opname_to_byte()
+        .get("ptr_eq/rr>i")
+        .expect("`ptr_eq/rr>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x00]; // `rr>i`: r-src1=0, r-src2=1, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let a = tc.const_ref(0xC0DE_0000);
+    let b = tc.const_ref(0xC0DE_0001);
+    let mut regs_r = [a, b];
+    let mut regs_i = [OpRef::None];
+    let mut concrete_r = [ConcreteValue::Null, ConcreteValue::Null];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+        .expect("ptr_eq on two const refs must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "distinct const-ref operands fold without recording a PtrEq",
+    );
+    assert_eq!(
+        tc.concrete_of_opref(regs_i[0]),
+        Some(majit_ir::Value::Int(0)),
+        "distinct const refs are not identical -> PtrEq folds to 0",
+    );
 }
 
 #[test]
