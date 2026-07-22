@@ -686,6 +686,15 @@ impl FrameBox {
     ) -> crate::PyResult {
         self.fix_array_ptrs();
         let register_final = !self.code().exceptiontable.is_empty();
+        let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
+        let _origin_roots = pyre_object::gc_roots::push_roots();
+        let coroutine_origin_slot = if is_coroutine {
+            let origin = capture_coroutine_origin(self.execution_context);
+            pyre_object::gc_roots::pin_root(origin);
+            Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+        } else {
+            None
+        };
         // A suspended generator frame is off the call chain — `f_back` is
         // None until a resume re-links it (`executioncontext.py enter`
         // rebinds `f_backref = topframeref`; pyre does the same at
@@ -717,16 +726,19 @@ impl FrameBox {
                 .contains(crate::CodeFlags::ASYNC_GENERATOR)
         } {
             pyre_object::generator::w_async_generator_new(frame_ptr as *mut u8, pycode)
-        } else if unsafe {
-            (*frame_ptr)
-                .code()
-                .flags
-                .contains(crate::CodeFlags::COROUTINE)
-        } {
+        } else if is_coroutine {
             pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8, pycode)
         } else {
             pyre_object::generator::w_generator_new(frame_ptr as *mut u8, pycode)
         };
+        if let Some(slot) = coroutine_origin_slot {
+            unsafe {
+                pyre_object::generator::w_coroutine_set_origin(
+                    generator,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                );
+            }
+        }
         // GeneratorOrCoroutine.__init__ stores `_name` / `_qualname` on the
         // generator.  Root the new owner while allocating the two wrapped
         // strings, then publish them through the normal GC write barrier.
@@ -748,6 +760,52 @@ impl FrameBox {
         }
         Ok(generator)
     }
+}
+
+/// Capture `coroutine.cr_origin` from the visible caller chain.
+///
+/// The coroutine frame has not executed yet, so its `f_backref` is empty.
+/// Creation therefore walks the live ExecutionContext from its current top
+/// frame, using the PyPy no-hidden-frame traversal, and records summaries in
+/// most-recent-first order.
+fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
+    if ec.is_null() {
+        return w_none();
+    }
+    let depth = unsafe { (*ec).coroutine_origin_tracking_depth };
+    if depth <= 0 {
+        return w_none();
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut summary_slots = Vec::new();
+    let mut frame = unsafe { (*ec).gettopframe_nohidden() };
+    for _ in 0..depth {
+        if frame.is_null() {
+            break;
+        }
+        let code = unsafe { (*frame).code() };
+        let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_str_new(&code.source_path));
+        let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_int_new(unsafe { (*frame).fget_f_lineno() } as i64));
+        let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_str_new(&code.obj_name));
+        let summary = w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(filename_slot),
+            pyre_object::gc_roots::shadow_stack_get(lineno_slot),
+            pyre_object::gc_roots::shadow_stack_get(funcname_slot),
+        ]);
+        pyre_object::gc_roots::pin_root(summary);
+        summary_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+        frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(frame);
+    }
+    w_tuple_new(
+        summary_slots
+            .into_iter()
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .collect(),
+    )
 }
 
 impl std::ops::Deref for FrameBox {

@@ -8722,7 +8722,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         pyre_object::type_name_of(value)
                     )));
                 }
-                pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
+                pyre_object::w_type_set_qualname(obj, value);
                 mutated(obj, Some(name));
                 return Ok(w_none());
             }

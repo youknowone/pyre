@@ -382,6 +382,12 @@ pub unsafe fn w_coroutine_get_origin(obj: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline]
+pub unsafe fn w_coroutine_set_origin(obj: PyObjectRef, origin: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).cr_origin = origin };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
 pub unsafe fn w_async_generator_hooks_inited(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).hooks_inited }
 }

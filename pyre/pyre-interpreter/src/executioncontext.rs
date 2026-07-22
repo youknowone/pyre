@@ -213,6 +213,10 @@ pub struct ExecutionContext {
     /// per-thread EC pointer and the optimizer can dead-store-eliminate a
     /// balanced save/restore.  GC-rooted via `walk_pyframe_roots`.
     pub sys_exc_value: PyObjectRef,
+    /// Per-execution-context coroutine origin tracking depth. CPython keeps
+    /// the corresponding setting in the thread state; pyre keeps all such
+    /// execution state on the PyPy-style ExecutionContext.
+    pub coroutine_origin_tracking_depth: i64,
     /// `executioncontext.py:55` — linked-list head for running generators and
     /// coroutines.  Each node owns the suspended exception state of its
     /// caller through `GeneratorOrCoroutine.previous_gen_or_coroutine`.
@@ -270,6 +274,7 @@ impl ExecutionContext {
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
             sys_exc_value: pyre_object::PY_NULL,
+            coroutine_origin_tracking_depth: 0,
             current_gen_or_coroutine: pyre_object::PY_NULL,
             w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,

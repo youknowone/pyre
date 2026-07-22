@@ -9388,7 +9388,7 @@ fn init_type_type(ns: PyObjectRef) {
                 )));
             }
             unsafe {
-                pyre_object::w_type_set_qualname(w_type, pyre_object::w_str_get_value(value));
+                pyre_object::w_type_set_qualname(w_type, value);
                 crate::baseobjspace::mutated(w_type, Some("__qualname__"));
             }
             Ok(pyre_object::w_none())

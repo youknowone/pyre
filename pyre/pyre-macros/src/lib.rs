@@ -1529,7 +1529,10 @@ fn expand_pyre_methods(
     if has_init && !has_new {
         let synth: ImplItem = parse_quote! {
             #[staticmethod]
-            fn __new__(_cls: ::pyre_object::PyObjectRef) -> ::pyre_object::PyObjectRef {
+            fn __new__(
+                _cls: ::pyre_object::PyObjectRef,
+                _args: &[::pyre_object::PyObjectRef],
+            ) -> ::pyre_object::PyObjectRef {
                 <#self_ty>::allocate(<#self_ty as ::std::default::Default>::default())
             }
         };
@@ -1975,12 +1978,12 @@ fn expand_pyre_methods(
 
     let type_object_fn = quote! {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
-            thread_local! {
-                static CELL: ::std::cell::OnceCell<::pyre_object::PyObjectRef>
-                    = const { ::std::cell::OnceCell::new() };
-            }
-            CELL.with(|c| {
-                *c.get_or_init(|| {
+            // PyPy TypeDef objects are interpreter/process-owned, never
+            // execution-context or thread-local.  Store the immortal pointer
+            // as usize so the process-global cache remains Sync without
+            // duplicating Python type identity per thread.
+            static CELL: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
+            *CELL.get_or_init(|| {
                     let tp = crate::typedef::make_builtin_type_with_layout(
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                         |ns| { #(#registrations)* },
@@ -1993,9 +1996,8 @@ fn expand_pyre_methods(
                         },
                         tp,
                     );
-                    tp
-                })
-            })
+                    tp as usize
+                }) as ::pyre_object::PyObjectRef
         }
     };
 

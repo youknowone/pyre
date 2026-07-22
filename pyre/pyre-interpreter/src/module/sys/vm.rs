@@ -332,6 +332,34 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
+fn sys_get_coroutine_origin_tracking_depth(_args: &[PyObjectRef]) -> crate::PyResult {
+    let ec = current_execution_context();
+    let depth = if ec.is_null() {
+        0
+    } else {
+        unsafe { (*ec).coroutine_origin_tracking_depth }
+    };
+    Ok(pyre_object::w_int_new(depth))
+}
+
+fn sys_set_coroutine_origin_tracking_depth(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_depth = *args.first().ok_or_else(|| {
+        crate::PyError::type_error(
+            "set_coroutine_origin_tracking_depth() missing required argument 'depth'",
+        )
+    })?;
+    let indexed = crate::baseobjspace::space_index(w_depth)?;
+    let depth = crate::baseobjspace::int_w(indexed)?;
+    if depth < 0 {
+        return Err(crate::PyError::value_error("depth must be >= 0"));
+    }
+    let ec = current_execution_context();
+    if !ec.is_null() {
+        unsafe { (*ec).coroutine_origin_tracking_depth = depth };
+    }
+    Ok(w_none())
+}
+
 fn asyncgen_hooks_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
@@ -1328,6 +1356,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "setprofile",
         make_builtin_function_with_arity("setprofile", sys_setprofile_impl, 1),
+    );
+    module_ns_store(
+        ns,
+        "get_coroutine_origin_tracking_depth",
+        make_builtin_function_with_arity(
+            "get_coroutine_origin_tracking_depth",
+            sys_get_coroutine_origin_tracking_depth,
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "set_coroutine_origin_tracking_depth",
+        make_builtin_function_with_arity(
+            "set_coroutine_origin_tracking_depth",
+            sys_set_coroutine_origin_tracking_depth,
+            1,
+        ),
     );
     module_ns_store(
         ns,

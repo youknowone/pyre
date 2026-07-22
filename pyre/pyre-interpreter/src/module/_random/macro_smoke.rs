@@ -151,4 +151,30 @@ mod tests {
         assert!(unsafe { is_list(result) });
         assert_eq!(unsafe { w_list_len(result) }, 2);
     }
+
+    /// PyPy's `generic_new_descr` accepts the constructor arguments and
+    /// leaves them for `__init__`; the synthesized allocator must do the same.
+    #[test]
+    fn synthesized_new_accepts_init_arguments() {
+        crate::typedef::init_typeobjects();
+        let cls = type_object();
+        let seed = w_int_new(37);
+        let obj = __pyre_wrap___new__(&[cls, seed]).expect("synthesized __new__");
+        let demo = Demo::from_obj(obj).expect("Demo allocation");
+        assert_eq!(demo.state, 0);
+        __pyre_wrap___init__(&[obj, seed]).expect("Demo.__init__");
+        assert_eq!(Demo::from_obj(obj).expect("initialized Demo").state, 37);
+    }
+
+    /// TypeDef ownership is process-global: another OS thread must observe
+    /// the exact same Python type object, not a fresh TLS allocation.
+    #[test]
+    fn generated_type_object_is_process_global() {
+        crate::typedef::init_typeobjects();
+        let expected = type_object() as usize;
+        let observed = std::thread::spawn(|| type_object() as usize)
+            .join()
+            .expect("type lookup thread");
+        assert_eq!(observed, expected);
+    }
 }
