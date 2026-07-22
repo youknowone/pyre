@@ -1943,10 +1943,11 @@ unsafe fn scan_dict_key_reentrant(
                 if take_dict_key_error() {
                     return Err(DictKeyError);
                 }
-                if equal {
-                    return Ok((Some(i), key));
-                }
-
+                // Validate the paranoia condition before acting on the result:
+                // `ll_dict_lookup` restarts even when the comparison answered
+                // `true`, because a callback that reallocated the table or moved
+                // the candidate leaves the matched index stale
+                // (`rordereddict.py:1058`).
                 let disturbed = {
                     let dict = &*(obj as *const W_DictObject);
                     let entries =
@@ -1960,6 +1961,9 @@ unsafe fn scan_dict_key_reentrant(
                 };
                 if disturbed {
                     continue 'restart;
+                }
+                if equal {
+                    return Ok((Some(i), key));
                 }
             }
             i += 1;
