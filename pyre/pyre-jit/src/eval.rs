@@ -409,6 +409,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
+    f(&mut gen_obj.ob.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.pycode as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -477,6 +478,7 @@ unsafe fn pytraceback_object_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let tb = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pytraceback::PyTraceback) };
+    f(&mut tb.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_next as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_code as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !tb.frame.is_null() && pyre_object::gc_hook::try_gc_owns_object(tb.frame as *mut u8) {
@@ -486,6 +488,8 @@ unsafe fn pytraceback_object_custom_trace(
 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let w_dict = obj_addr as pyre_object::PyObjectRef;
+    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
+    f(&mut dict.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
     // Keep the stable leaf storage box alive by forwarding its owning
     // `dstorage` field slot (off-GC storage). The box has no walker
@@ -497,7 +501,6 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // (`w_dict_new_unmanaged_side_table_value`) is not collector-owned —
     // both are skipped (Map by kind, the side table by `try_gc_owns_object`).
     if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
-        let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
         if !dict.dstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(dict.dstorage) {
             let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
             f(dstorage_slot as *mut majit_ir::GcRef);
@@ -633,13 +636,14 @@ unsafe fn module_dict_object_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     let obj = obj_addr as pyre_object::PyObjectRef;
+    let md = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_ModuleDictObject) };
+    f(&mut md.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // Grey each GC-managed storage box through its field slot so a major GC
     // keeps it live; the box interiors are GC leaves, so the walk below is
     // the only thing that forwards their element slots.  Non-moving, so the
     // minor-GC forward is a no-op.  Guard on GC ownership: a `tid == 0`
     // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
     if pyre_object::dictmultiobject::is_module_dict(obj) {
-        let md = &mut *(obj as *mut pyre_object::dictmultiobject::W_ModuleDictObject);
         for field in [
             std::ptr::addr_of_mut!(md.dstorage) as *mut *mut u8,
             std::ptr::addr_of_mut!(md.object_storage) as *mut *mut u8,
@@ -666,6 +670,13 @@ unsafe fn module_dict_object_custom_trace(
 
 unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
+    // A builtin-layout instance can carry a mortal heap subclass in the
+    // inline `w_class` header word.  This is the instance -> class edge that
+    // PyPy obtains from the W_Root object's runtime class.  Keep it on the
+    // set itself: in `check_free_after_iterating`, exhausting the iterator
+    // releases the last other reference to a frozenset subclass immediately
+    // before its instance finalizer resolves `__del__` through that class.
+    f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // Keep the stable leaf storage box alive by forwarding its owning field
     // slot. The box has no walker of its own; this trace also walks its inner
     // ObjectKey slots below, matching the mapdict leaf-storage pattern.
@@ -698,7 +709,8 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// (`capacity == len`, every slot written by `alloc_tuple_items_block`).
 unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
-    let tuple = unsafe { &*tuple_ptr };
+    let tuple = unsafe { &mut *tuple_ptr };
+    f(&mut tuple.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
@@ -733,7 +745,8 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 /// behind.
 unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
-    let list = unsafe { &*list_ptr };
+    let list = unsafe { &mut *list_ptr };
+    f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
             // Phase L2: a GC-managed (moving) block is forwarded by handing the
@@ -918,6 +931,7 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
 
+    f(&mut frame.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
 
