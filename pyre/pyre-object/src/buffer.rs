@@ -50,8 +50,7 @@ pub enum Buffer {
 /// keep a count (`mmap`) live above this crate, so the interpreter installs
 /// the callback at start-up; until then, and for owners that keep no count
 /// (`ctypes.memoryview_at`, whose `w_obj` is `None`), releasing is a no-op.
-static EXTERNAL_RELEASE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static EXTERNAL_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// # Safety
 /// `f` must stay valid for the process lifetime and accept any `w_obj` that

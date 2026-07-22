@@ -3732,10 +3732,37 @@ fn type_descr_new_with_metaclass(
         let name_obj = args[0];
         let bases = args[1];
         let w_namespace_dict = args[2];
+        // typeobject.py:_check_new_args — validate the three public
+        // arguments before attempting to copy or normalise any of them.
+        if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 1 must be str, not {}",
+                unsafe { pyre_object::type_name_of(name_obj) }
+            )));
+        }
+        if !unsafe { is_tuple(bases) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 2 must be tuple, not {}",
+                unsafe { pyre_object::type_name_of(bases) }
+            )));
+        }
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
+            return Err(crate::PyError::type_error(format!(
+                "type() argument 3 must be dict, not {}",
+                unsafe { pyre_object::type_name_of(w_namespace_dict) }
+            )));
+        }
+        let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
         // typeobject.py:953 `_check_surrogate(space, name)` — reject a lone
         // surrogate in the name before it is read as UTF-8 below.
-        if unsafe { pyre_object::is_str(name_obj) } {
-            check_surrogate(name_obj)?;
+        check_surrogate(name_obj)?;
+        for cp in unsafe { pyre_object::w_str_get_wtf8(name_obj) }.code_points() {
+            if cp.to_u32() == 0 {
+                return Err(crate::PyError::value_error(
+                    "type name must not contain null characters",
+                ));
+            }
         }
         // typeobject.py `type.__new__` — `isinstance_w(w_bases, w_tuple)` and
         // `isinstance_w(w_dict, w_dict)`: bases must be a tuple and the
@@ -3808,7 +3835,6 @@ fn type_descr_new_with_metaclass(
         // the dict backing so e.g. an `enum._EnumDict` class body is
         // walked instead of dropped.
         let w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(namespace_root);
-        let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
         if !w_ns_backing.is_null() {
             let backing_root = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(w_ns_backing);
@@ -3853,6 +3879,54 @@ fn type_descr_new_with_metaclass(
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                 unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
             }
+        }
+        // typeobject.py:ensure_common_attributes / ensure_module_attr.  Direct
+        // three-argument type() calls do not pass through __build_class__, so
+        // fill __module__ from the live caller frame when the namespace did
+        // not supply it.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
+            let frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+            if !frame.is_null() {
+                let globals = unsafe { (*frame).get_w_globals() };
+                if !globals.is_null() {
+                    if let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")? {
+                        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                        unsafe {
+                            pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__module__", module)
+                        };
+                    }
+                }
+            }
+        }
+        // CPython 3.14 rejects lone surrogates in the initial type doc while
+        // retaining the historical freedom to assign arbitrary objects later.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        if let Some(doc) = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__doc__") } {
+            if unsafe { pyre_object::is_str(doc) } {
+                check_surrogate(doc)?;
+            }
+        }
+        // W_TypeObject.__init__: pop and validate __qualname__ before slot
+        // construction.  Pyre keeps it in the canonical namespace because it
+        // has no separate qualname field, but preserves the same validation.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        if let Some(qualname) = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__qualname__") }
+        {
+            if !unsafe { crate::baseobjspace::isinstance_str_w(qualname) } {
+                return Err(crate::PyError::type_error(format!(
+                    "type __qualname__ must be a str, not {}",
+                    unsafe { pyre_object::type_name_of(qualname) }
+                )));
+            }
+        }
+        // typeobject.py:ensure_common_attributes always installs __doc__;
+        // user heap types use None when no class-body docstring was supplied.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__doc__") }.is_none() {
+            unsafe {
+                pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__doc__", pyre_object::w_none())
+            };
         }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_hash_if_eq(class_ns);

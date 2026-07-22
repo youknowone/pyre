@@ -366,7 +366,12 @@ pub fn init_typeobjects() {
         // str — PyPy: unicodeobject.py, bases=(object,)
         reg.insert(
             &STR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("str", init_str_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "str",
+                init_str_type,
+                object_type,
+                &STR_TYPE as *const PyType,
+            ) as usize,
         );
 
         // list — PyPy: listobject.py, bases=(object,)
@@ -9157,7 +9162,7 @@ fn init_type_type(ns: PyObjectRef) {
             // filters out null entries but preserves `w_none()`, matching
             // PyPy's "value present even if it's None" semantic.
             if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-                if let Some(v) = unsafe { crate::baseobjspace::lookup_in_type(cls, "__module__") } {
+                if let Some(v) = crate::type_dict_lookup(cls, "__module__") {
                     if !v.is_null() {
                         return Ok(v);
                     }
@@ -9186,6 +9191,10 @@ fn init_type_type(ns: PyObjectRef) {
             unsafe {
                 if pyre_object::is_type(cls) {
                     crate::type_dict_store(cls, "__module__", value);
+                    // CPython 3.14 type_set_module clears the compiler's
+                    // source-location metadata when the owning module changes.
+                    crate::type_dict_delete(cls, "__firstlineno__");
+                    crate::baseobjspace::mutated(cls, Some("__module__"));
                 }
             }
             Ok(pyre_object::w_none())
@@ -9288,6 +9297,48 @@ fn init_type_type(ns: PyObjectRef) {
             ns,
             "__name__",
             make_getset_property_named(name_getter, name_setter, pyre_object::PY_NULL, "__name__"),
+        )
+    };
+
+    let qualname_getter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| unsafe {
+            Ok(pyre_object::w_str_new(pyre_object::w_type_get_qualname(
+                args[1],
+            )))
+        },
+        2,
+    );
+    let qualname_setter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| {
+            let w_type = args[1];
+            let value = args[2];
+            if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
+                return Err(crate::PyError::type_error(format!(
+                    "can only assign string to {}.__qualname__, not '{}'",
+                    unsafe { pyre_object::w_type_get_name(w_type) },
+                    unsafe { pyre_object::type_name_of(value) }
+                )));
+            }
+            unsafe {
+                pyre_object::w_type_set_qualname(w_type, pyre_object::w_str_get_value(value));
+                crate::baseobjspace::mutated(w_type, Some("__qualname__"));
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__qualname__",
+            make_getset_property_named(
+                qualname_getter,
+                qualname_setter,
+                pyre_object::PY_NULL,
+                "__qualname__",
+            ),
         )
     };
 

@@ -969,7 +969,15 @@ impl MapdictCacheEntry {
 /// # Safety
 /// `w_obj` must be a live object.
 unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
-    if w_obj.is_null() || !unsafe { pyre_object::is_instance(w_obj) } {
+    // W_TypeObject is represented with the broad INSTANCE_TYPE family for
+    // parts of the object-space dispatch, but PyPy's W_TypeObject does not
+    // mix in MapdictStorageMixin.  Let type attribute stores reach the
+    // metatype data descriptors (__name__, __qualname__, __module__, ...)
+    // instead of treating the type object's header as mapdict storage.
+    if w_obj.is_null()
+        || unsafe { pyre_object::is_type(w_obj) }
+        || !unsafe { pyre_object::is_instance(w_obj) }
+    {
         return std::ptr::null();
     }
     unsafe { ensure_mapdict_initialized(w_obj) };

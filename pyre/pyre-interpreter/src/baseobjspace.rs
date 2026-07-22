@@ -8704,6 +8704,26 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     w_type_get_name(obj)
                 )));
             }
+            // typeobject.py's metadata setters update the heap type itself;
+            // they are not ordinary inherited class attributes.
+            if name == "__qualname__" {
+                if !crate::baseobjspace::isinstance_str_w(value) {
+                    return Err(PyError::type_error(format!(
+                        "can only assign string to {}.__qualname__, not '{}'",
+                        w_type_get_name(obj),
+                        pyre_object::type_name_of(value)
+                    )));
+                }
+                pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
+                mutated(obj, Some(name));
+                return Ok(w_none());
+            }
+            if name == "__module__" {
+                crate::type_dict_store(obj, name, value);
+                crate::type_dict_delete(obj, "__firstlineno__");
+                mutated(obj, Some(name));
+                return Ok(w_none());
+            }
             if crate::type_dict_has_storage(obj) {
                 // CPython 3.14 type_set_annotations stores assignments in
                 // the per-type cache and disables the lazy annotate
@@ -9448,6 +9468,15 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             if !pyre_object::w_type_is_heaptype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot delete attributes on immutable type object '{}'",
+                    w_type_get_name(obj)
+                )));
+            }
+            // CPython 3.14 exposes these as non-deletable type metadata.
+            // Their values may be assigned, but deletion must not fall
+            // through to raw namespace removal.
+            if name == "__name__" || name == "__qualname__" || name == "__type_params__" {
+                return Err(PyError::type_error(format!(
+                    "cannot delete '{name}' attribute of type '{}'",
                     w_type_get_name(obj)
                 )));
             }
