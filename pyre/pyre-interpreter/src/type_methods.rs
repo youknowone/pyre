@@ -783,7 +783,7 @@ fn cps_to_str(cps: &[CodePoint]) -> PyObjectRef {
     for &cp in cps {
         buf.push(cp);
     }
-    w_str_from_wtf8(buf)
+    w_str_from_wtf8_managed(buf)
 }
 
 /// A lone surrogate is not whitespace.
@@ -880,11 +880,11 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             if maxsplit < 0 {
                 s.split(sep)
-                    .map(|p| w_str_from_wtf8(p.to_wtf8_buf()))
+                    .map(|p| w_str_from_wtf8_managed(p.to_wtf8_buf()))
                     .collect()
             } else {
                 s.splitn((maxsplit as usize) + 1, sep)
-                    .map(|p| w_str_from_wtf8(p.to_wtf8_buf()))
+                    .map(|p| w_str_from_wtf8_managed(p.to_wtf8_buf()))
                     .collect()
             }
         }
@@ -954,7 +954,7 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             };
             out.reverse();
             out.into_iter()
-                .map(|p| w_str_from_wtf8(p.to_wtf8_buf()))
+                .map(|p| w_str_from_wtf8_managed(p.to_wtf8_buf()))
                 .collect()
         }
         None => wtf8_rsplit_whitespace(s, maxsplit),
@@ -980,7 +980,7 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "casefold")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8(case::casefold_wtf8(s)))
+    Ok(w_str_from_wtf8_managed(case::casefold_wtf8(s)))
 }
 
 /// `pypy/objspace/std/unicodeobject.py:429-430 W_UnicodeObject
@@ -1054,7 +1054,7 @@ pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         Some(&a) => extract_strip_chars(a, "strip")?,
         None => None,
     };
-    Ok(w_str_from_wtf8(strip_chars(
+    Ok(w_str_from_wtf8_managed(strip_chars(
         s,
         chars.as_deref(),
         true,
@@ -1069,7 +1069,7 @@ pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         Some(&a) => extract_strip_chars(a, "lstrip")?,
         None => None,
     };
-    Ok(w_str_from_wtf8(strip_chars(
+    Ok(w_str_from_wtf8_managed(strip_chars(
         s,
         chars.as_deref(),
         true,
@@ -1084,7 +1084,7 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         Some(&a) => extract_strip_chars(a, "rstrip")?,
         None => None,
     };
-    Ok(w_str_from_wtf8(strip_chars(
+    Ok(w_str_from_wtf8_managed(strip_chars(
         s,
         chars.as_deref(),
         false,
@@ -1281,7 +1281,7 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         Some(w_count) => crate::builtins::space_index_w(w_count)?,
         None => -1,
     };
-    Ok(w_str_from_wtf8(wtf8_replace(s, old, new, maxcount)))
+    Ok(w_str_from_wtf8_managed(wtf8_replace(s, old, new, maxcount)))
 }
 
 /// WTF-8 window for the optional `start` / `end` search args: resolve them
@@ -1333,13 +1333,13 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "upper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8(wtf8_map_str_runs(s, str::to_uppercase)))
+    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(s, str::to_uppercase)))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "lower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8(wtf8_map_str_runs(s, str::to_lowercase)))
+    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(s, str::to_lowercase)))
 }
 
 /// PyPy: unicodeobject.py descr_format
@@ -3948,7 +3948,7 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     for cp in cps {
         out.push(cp);
     }
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8_managed(out))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4630,21 +4630,21 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "title")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8(case::title_wtf8(s)))
+    Ok(w_str_from_wtf8_managed(case::title_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "capitalize")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8(case::capitalize_wtf8(s)))
+    Ok(w_str_from_wtf8_managed(case::capitalize_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "swapcase")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8(case::swapcase_wtf8(s)))
+    Ok(w_str_from_wtf8_managed(case::swapcase_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_center
@@ -4687,7 +4687,7 @@ pub(crate) fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { is_exact_type(obj, &STR_TYPE) } {
         obj
     } else {
-        w_str_from_wtf8(unsafe { w_str_get_wtf8(obj) }.to_owned())
+        w_str_from_wtf8_managed(unsafe { w_str_get_wtf8(obj) }.to_owned())
     }
 }
 
@@ -4708,7 +4708,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     push_cp_repeated(&mut out, fillchar, left);
     out.push_wtf8(s);
     push_cp_repeated(&mut out, fillchar, right);
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8_managed(out))
 }
 
 /// PyPy: unicodeobject.py descr_ljust
@@ -4724,7 +4724,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
     out.push_wtf8(s);
     push_cp_repeated(&mut out, fillchar, width - s_len);
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8_managed(out))
 }
 
 /// PyPy: unicodeobject.py descr_rjust
@@ -4740,7 +4740,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
     push_cp_repeated(&mut out, fillchar, width - s_len);
     out.push_wtf8(s);
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8_managed(out))
 }
 
 /// `pypy/objspace/std/unicodeobject.py descr_isprintable` —
@@ -4844,7 +4844,7 @@ pub fn str_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// the partition cuts below (the separator aligns on boundaries).
 fn wtf8_slice_str(bytes: &[u8]) -> PyObjectRef {
     let part = unsafe { Wtf8::from_bytes_unchecked(bytes) };
-    w_str_from_wtf8(part.to_wtf8_buf())
+    w_str_from_wtf8_managed(part.to_wtf8_buf())
 }
 
 /// Replaces up to `maxcount` occurrences of `sub` with `by` over the
@@ -5029,7 +5029,7 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let prefix = unsafe { w_str_get_wtf8(pos[1]) };
     match s.strip_prefix(prefix) {
-        Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
+        Some(rest) => Ok(w_str_from_wtf8_managed(rest.to_wtf8_buf())),
         None => Ok(str_result_unchanged(pos[0])),
     }
 }
@@ -5052,7 +5052,7 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let suffix = unsafe { w_str_get_wtf8(pos[1]) };
     match s.strip_suffix(suffix) {
-        Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
+        Some(rest) => Ok(w_str_from_wtf8_managed(rest.to_wtf8_buf())),
         None => Ok(str_result_unchanged(pos[0])),
     }
 }
@@ -5129,7 +5129,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             }
         }
     }
-    Ok(w_str_from_wtf8(result))
+    Ok(w_str_from_wtf8_managed(result))
 }
 
 /// str.translate(table) — table is a mapping from ordinals (int) to
@@ -5166,7 +5166,7 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }
         }
     }
-    Ok(w_str_from_wtf8(result))
+    Ok(w_str_from_wtf8_managed(result))
 }
 
 // ── Dict methods ─────────────────────────────────────────────────────
