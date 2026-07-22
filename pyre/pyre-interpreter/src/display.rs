@@ -352,17 +352,18 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
         }
-        let Some(found) = crate::baseobjspace::lookup_in_type_where(w_class, name) else {
+        let Some((src, found)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
             return Ok(None);
         };
         // `object`'s inherited default is not a leaf override — fall through
         // so the builtin formatting runs (and `object.__repr__` does not
-        // re-enter through this path).
+        // re-enter through this path). An explicit
+        // `Subclass.__str__ = object.__str__` is different: its owner is the
+        // subclass and the descriptor must run, allowing object.__str__ to
+        // delegate to the subclass's __repr__.
         let w_object = crate::typedef::w_object();
-        if let Some(default) = crate::baseobjspace::lookup_in_type_where(w_object, name) {
-            if std::ptr::eq(found, default) {
-                return Ok(None);
-            }
+        if std::ptr::eq(src, w_object) {
+            return Ok(None);
         }
         // A raising override propagates; a non-string return is a TypeError.
         let r = crate::builtins::call_and_check(found, &[obj])?;
@@ -370,6 +371,42 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             return Ok(Some(r));
         }
         Err(dunder_returned_non_string(name, r))
+    }
+}
+
+/// Resolve a class object's special method on its metaclass.
+///
+/// PyPy: `space.lookup(w_obj, name)` uses `space.type(w_obj)`, so a class
+/// receives an EnumType/user-metaclass override before the native `type`
+/// implementation. The builtin `type`/`object` definitions are terminals and
+/// deliberately left to the native formatting path to avoid re-entry.
+pub(crate) unsafe fn type_metaclass_dunder_obj(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
+        if !pyre_object::is_type(obj) {
+            return Ok(None);
+        }
+        let Some(metaclass) = crate::typedef::r#type(obj) else {
+            return Ok(None);
+        };
+        if !pyre_object::is_type(metaclass) {
+            return Ok(None);
+        }
+        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(metaclass, name) else {
+            return Ok(None);
+        };
+        if std::ptr::eq(src, crate::typedef::w_type())
+            || std::ptr::eq(src, crate::typedef::w_object())
+        {
+            return Ok(None);
+        }
+        let result = crate::builtins::call_and_check(method, &[obj])?;
+        if pyre_object::is_str(result) {
+            return Ok(Some(result));
+        }
+        Err(dunder_returned_non_string(name, result))
     }
 }
 
@@ -395,6 +432,9 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // A builtin leaf subclass's `__repr__` override may return a
             // lone surrogate; read it as WTF-8 rather than folding to `&str`.
             if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
+                return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+            }
+            if let Some(r) = type_metaclass_dunder_obj(obj, "__repr__")? {
                 return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
             }
             if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
@@ -477,6 +517,13 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         // `__repr__` override before the `ob_type`-keyed formatting below.
         if let Some(s) = builtin_subclass_dunder(obj, tp, "__repr__")? {
             return Ok(s);
+        }
+        // A class object is an instance of its metaclass.  PyPy's
+        // `space.repr` therefore resolves `__repr__` on that metaclass before
+        // `type`'s native `<class ...>` representation.  This is observable
+        // for EnumType and any user metaclass defining `__repr__`.
+        if let Some(result) = type_metaclass_dunder_obj(obj, "__repr__")? {
+            return Ok(pyre_object::w_str_get_value(result).to_string());
         }
         let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp) {
             s

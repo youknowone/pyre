@@ -5,6 +5,14 @@ from _weakref import getweakrefcount, getweakrefs, proxy, ref
 
 from testutils import assert_raises
 
+import weakref
+
+for type_name in ("ReferenceType", "ProxyType", "CallableProxyType"):
+    weak_type = getattr(weakref, type_name)
+    assert weak_type.__module__ == "weakref"
+    assert weak_type.__name__ == type_name
+    assert weak_type.__qualname__ == type_name
+
 
 class X:
     pass

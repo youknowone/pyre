@@ -5174,6 +5174,14 @@ unsafe fn delattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 return crate::call::call_function_impl_result(da, &[obj, w_name])
                     .map(|_| w_none());
             }
+        } else if let Some(w_type) = crate::typedef::r#type(obj) {
+            // descroperation.py:254 dispatches through space.lookup for every
+            // receiver kind. A class is an instance of its metaclass, so its
+            // __delattr__ override precedes direct type-dict removal too.
+            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
+                return crate::call::call_function_impl_result(da, &[obj, w_name])
+                    .map(|_| w_none());
+            }
         }
     }
     unsafe { object_delattr_surrogate(obj, w_name, name) }
@@ -5557,15 +5565,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             if name == "__name__" {
-                // `type.__name__` is the bare type name; a dotted tp_name
-                // (e.g. "types.UnionType") carries its module prefix only
-                // in repr, so strip to the final component here.
-                let full = w_type_get_name(obj);
-                let bare = full.rsplit('.').next().unwrap_or(full);
-                return Ok(w_str_new(bare));
+                return Ok(pyre_object::w_type_get_name_obj(obj));
             }
             if name == "__qualname__" {
-                return Ok(w_str_new(pyre_object::w_type_get_qualname(obj)));
+                return Ok(pyre_object::w_type_get_qualname_obj(obj));
             }
             if name == "__mro__" {
                 let mro_ptr = w_type_get_mro(obj);
@@ -5700,8 +5703,21 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             {
                 return Ok(w_str_new(crate::typedef::METHOD_DOC));
             }
-            if name == "__doc__"
-                || name == "__code__"
+            // typeobject.py:1166-1179 descr__doc — a heap type reads only its
+            // own dict and returns None when absent; class docs are never
+            // inherited. EnumType may omit an explicit `__doc__ = None`, so an
+            // MRO lookup here would incorrectly surface Enum.__doc__.
+            if name == "__doc__" && pyre_object::w_type_is_heaptype(obj) {
+                if let Some(value) = crate::type_dict_lookup(obj, name) {
+                    return match get(value, PY_NULL, obj) {
+                        Ok(Some(result)) => Ok(result),
+                        Ok(None) => Ok(value),
+                        Err(e) => Err(e),
+                    };
+                }
+                return Ok(w_none());
+            }
+            if name == "__code__"
                 || name == "__func__"
                 || name == "__self__"
                 || name == "__globals__"
@@ -5867,6 +5883,22 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
     if let Some(w_type) = crate::typedef::r#type(obj) {
         if let Some(method) = unsafe { lookup_in_type_where(w_type, name) } {
+            // descroperation.py:90-104 — a data descriptor wins, but a
+            // non-data descriptor or plain class value must wait until after
+            // the instance dict. This ordering matters for native-layout
+            // subclasses too: IntFlag stores `_inverted_` on the member while
+            // Flag carries a class-level `_inverted_ = None` default.
+            if unsafe { is_data_descr(method) }
+                && let Some(result) = unsafe { get(method, obj, w_type)? }
+            {
+                return Ok(result);
+            }
+            let w_dict = getdict_backing(obj);
+            if !w_dict.is_null()
+                && let Some(value) = finditem_str(w_dict, name)?
+            {
+                return Ok(value);
+            }
             if unsafe { crate::is_function(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type));
             }
@@ -6462,7 +6494,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // second half of the "hasdict instance dict" protocol.
     let w_dict = getdict_backing(obj);
     if !w_dict.is_null() {
-        if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+        // `w_dict` may use MapDictStrategy, whose storage is the backing
+        // instance rather than a native r_dict. PyPy calls
+        // `w_obj.getdictvalue`, which routes through that strategy; use the
+        // generic dict lookup here for the same reason. Reading the raw native
+        // storage skips MapDictStrategy and makes an int/str/etc. subclass's
+        // freshly stored attribute appear shadowed by an inherited class value.
+        if let Some(value) = finditem_str(w_dict, name)? {
             return Ok(value);
         }
     }
@@ -8581,7 +8619,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                             object_functionstr_type_name(value),
                         )));
                     }
-                    pyre_object::w_type_set_qualname(obj, pyre_object::w_str_get_value(value));
+                    pyre_object::w_type_set_qualname(obj, value);
                     return Ok(w_none());
                 }
                 // typeobject.py:1258-1261 descr_set___abstractmethods__ —
@@ -9192,6 +9230,14 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
+            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
+                let w_name = w_str_new(name);
+                return crate::call::call_function_impl_result(da, &[obj, w_name])
+                    .map(|_| w_none());
+            }
+        } else if let Some(w_type) = crate::typedef::r#type(obj) {
+            // A class object's attribute operations dispatch through its
+            // metaclass in PyPy (`space.lookup(w_obj, '__delattr__')`).
             if let Some(da) = lookup_in_type(w_type, "__delattr__") {
                 let w_name = w_str_new(name);
                 return crate::call::call_function_impl_result(da, &[obj, w_name])

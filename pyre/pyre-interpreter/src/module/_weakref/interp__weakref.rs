@@ -206,7 +206,10 @@ fn init_weakref_type(ns: PyObjectRef) {
 
 pub fn weakref_type() -> PyObjectRef {
     *WEAKREF_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakref", init_weakref_type);
+        // CPython exposes `_weakref.ref` as `weakref.ReferenceType`.
+        // The dotted builtin name supplies the public module while the type
+        // metadata getters expose the final component as the bare name.
+        let tp = crate::typedef::make_builtin_type("weakref.ReferenceType", init_weakref_type);
         unsafe { pyre_object::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
@@ -254,7 +257,7 @@ fn init_proxy_type(ns: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub fn proxy_type() -> PyObjectRef {
     *PROXY_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakproxy", init_proxy_type);
+        let tp = crate::typedef::make_builtin_type("weakref.ProxyType", init_proxy_type);
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
@@ -313,7 +316,10 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub fn callable_proxy_type() -> PyObjectRef {
     *CALLABLE_PROXY_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakcallableproxy", init_callable_proxy_type);
+        let tp = crate::typedef::make_builtin_type(
+            "weakref.CallableProxyType",
+            init_callable_proxy_type,
+        );
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
@@ -834,10 +840,39 @@ fn is_w_weakref(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
-    match crate::typedef::r#type(obj) {
-        Some(tp) => std::ptr::eq(tp, weakref_type()),
-        None => false,
+    unsafe { crate::baseobjspace::isinstance_w(obj, weakref_type()) }
+}
+
+/// PyPy `app_weakref._remove_dead_weakref`, backed by
+/// `W_DictMultiObject.nondescr_delitem_if_value_is`.
+///
+/// The lookup and deletion operate on the intrinsic dict backing so dict
+/// subclass hooks are bypassed.  Rechecking pointer identity immediately
+/// before deletion preserves the upstream atomic "delete only this weakref"
+/// contract if key comparison mutates the dictionary.
+pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let dict = args[0];
+    let key = args[1];
+    let backing = crate::type_methods::resolve_dict_backing(dict);
+    if backing.is_null() {
+        return Err(PyError::type_error(format!(
+            "_remove_dead_weakref() argument 1 must be dict, not {}",
+            crate::baseobjspace::object_functionstr_type_name(dict),
+        )));
     }
+    let Some(stored) = crate::baseobjspace::finditem(backing, key)? else {
+        return Ok(pyre_object::w_none());
+    };
+    if !is_w_weakref(stored) {
+        return Err(PyError::type_error("not a weakref"));
+    }
+    if !dereference(stored).is_null() {
+        return Ok(pyre_object::w_none());
+    }
+    if crate::baseobjspace::finditem(backing, key)? == Some(stored) {
+        crate::baseobjspace::delitem_slot(backing, key)?;
+    }
+    Ok(pyre_object::w_none())
 }
 
 fn is_callable(obj: PyObjectRef) -> bool {

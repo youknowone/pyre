@@ -3620,6 +3620,34 @@ pub(crate) fn type_new_set_hash_if_eq(ns: PyObjectRef) {
     }
 }
 
+/// CPython `type_new_set_classdict`: every new class owns a `__doc__` entry,
+/// using None when its namespace has no docstring. A declared `__doc__` slot
+/// is the sole exception because the class variable would collide with its
+/// member descriptor.
+pub(crate) fn type_new_set_doc(ns: PyObjectRef) -> crate::PyResult {
+    if unsafe { pyre_object::w_dict_getitem_str(ns, "__doc__") }.is_some() {
+        return Ok(pyre_object::w_none());
+    }
+    let doc_is_slot = match unsafe { pyre_object::w_dict_getitem_str(ns, "__slots__") } {
+        Some(slots)
+            if unsafe {
+                pyre_object::is_str(slots)
+                    || pyre_object::is_tuple(slots)
+                    || pyre_object::is_list(slots)
+            } =>
+        {
+            crate::call::collect_slot_names(slots)?
+                .iter()
+                .any(|name| name == "__doc__")
+        }
+        _ => false,
+    };
+    if !doc_is_slot {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none()) };
+    }
+    Ok(pyre_object::w_none())
+}
+
 /// PyPy `typeobject.py:223-235 W_TypeObject.__init__`: consume the compiler's
 /// `__qualname__` entry before slot setup and retain it on the type object.
 /// Keeping it in the namespace changes `cls.__dict__` and makes libraries
@@ -3635,7 +3663,7 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
         )));
     }
     unsafe {
-        pyre_object::w_type_set_qualname(w_type, pyre_object::w_str_get_value(value));
+        pyre_object::w_type_set_qualname(w_type, value);
         pyre_object::w_dict_delitem_str_no_proxy(ns, "__qualname__");
     }
     Ok(pyre_object::w_none())
@@ -3759,6 +3787,8 @@ fn type_descr_new_with_metaclass(
                 unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
             }
         }
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        type_new_set_doc(class_ns)?;
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_hash_if_eq(class_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -6054,6 +6084,9 @@ unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             if let Some(r) = crate::display::builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
+                return Ok(r);
+            }
+            if let Some(r) = crate::display::type_metaclass_dunder_obj(obj, "__repr__")? {
                 return Ok(r);
             }
             if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
