@@ -898,6 +898,10 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(127, typed::<crate::module::_collections::W_DequeIter>()),
         subclass_range_alias(128, typed::<crate::module::_collections::W_DequeRevIter>()),
         subclass_range_alias(129, typed::<crate::module::_tokenize::W_TokenizerIter>()),
+        subclass_range_alias(
+            130,
+            typed::<crate::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
+        ),
     ]
 }
 

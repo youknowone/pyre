@@ -6329,8 +6329,10 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_locals — read-only; runs `fast2locals` (pyframe.py:644
-    // fget_getdictscope), so it needs `&mut` and can raise.
+    // f_locals — read-only.  Python 3.14 exposes a fresh write-through
+    // FrameLocalsProxy for optimized frames; module/class frames retain their
+    // actual locals mapping.  The proxy itself routes through the frame-owned
+    // getdictscope/locals2fast machinery.
     let locals_getter = make_builtin_function_with_arity(
         "f_locals",
         |args| {
@@ -6338,7 +6340,11 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let w = unsafe { &mut *f }.getdictscope()?;
+            let frame = unsafe { &mut *f };
+            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+                return Ok(crate::pyframe::frame_locals_proxy::new(args[1]));
+            }
+            let w = frame.getdictscope()?;
             Ok(if w.is_null() {
                 pyre_object::w_dict_new()
             } else {

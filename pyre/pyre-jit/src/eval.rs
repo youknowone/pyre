@@ -2878,6 +2878,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // run its Drop glue and free that heap instead of leaking it.
     gc.types
         .set_destructor(tokenizer_iter_tid, tokenizer_iter_destructor);
+    // Python 3.14 FrameLocalsProxy — its sole managed edge owns the live
+    // PyFrame whose fast locals it exposes.  Keep the proxy in the ordinary
+    // AUTO-ID class chain so the generated offset walker forwards that frame
+    // for as long as user code retains the proxy.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical
