@@ -62,7 +62,7 @@ def probe_order():
 
 def asymmetric():
     # `LeftOnly(0)` is stored; probing with `LeftOnly(1)` hits the same bucket.
-    # `stored == probe` is False and `probe == stored` is True, so membership
+    # `stored == probe` is True and `probe == stored` is False, so membership
     # answers differently depending on which side the probe puts first.
     s = {LeftOnly(0)}
     d = {LeftOnly(0): "x"}
