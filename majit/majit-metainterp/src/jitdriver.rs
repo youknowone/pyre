@@ -2562,7 +2562,9 @@ impl<S: JitState> JitDriver<S> {
             // (PyreMetaInterp::step_inline_frame pops the inline frame and
             // records the CALL_ASSEMBLER); it never reaches the jitdriver.
             // Defensive: treat an escaped instance as a plain Abort.
-            action @ (TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort) => {
+            action @ (TraceAction::RecursiveCallAssembler { .. }
+            | TraceAction::Abort
+            | TraceAction::Decline) => {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }
@@ -2647,7 +2649,9 @@ impl<S: JitState> JitDriver<S> {
                     }
                 }
                 self.meta.abort_trace_live(false);
-                self.meta.aborted_tracing(reason_int);
+                if !matches!(action, TraceAction::Decline) {
+                    self.meta.aborted_tracing(reason_int);
+                }
                 self.sym = None;
                 self.meta.clear_trace_session();
             }

@@ -367,6 +367,9 @@ pub enum TraceAction {
     SegmentedLoop,
     /// Abort the current trace (recoverable — may retry later).
     Abort,
+    /// Decline the current trace before compilation and return to residual
+    /// execution without charging a trace abort.
+    Decline,
     /// Abort the current trace permanently (never trace this location again).
     AbortPermanent,
     /// A loop back-edge was reached inside an inline callee frame whose

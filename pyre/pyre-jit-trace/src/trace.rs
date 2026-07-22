@@ -1990,6 +1990,58 @@ fn run_perfn_walk<Sym: WalkSym>(
         Vec::new()
     };
 
+    // resume.py:1042-1057 `consume_boxes` fills every register named by the
+    // resume marker's `live/` stream.  A bridge whose carried coordinate names
+    // such a marker starts this walk from the input banks above, so reject the
+    // walk when those banks cannot provide one of the marker's live colors.
+    //
+    // A null Ref in `argboxes_r` is also uncovered here.  For this bridge
+    // shape, positional Ref seeds come from the restored stack-slot mirror;
+    // a live register receiving its mirror's null is not a valid replacement
+    // for the register value `consume_boxes` would have restored.  This is
+    // deliberately a decline-only soundness gate: later color-indexed seeding
+    // may make the value available, but must prove this coverage first.
+    // `Some` is the actual resume-marker discriminator: setup_bridge_sym sets
+    // it only when the carried frame pc is a decodable `live/` offset.
+    if is_bridge_trace && sym.bridge_walk_entry_pc().is_some() {
+        let live = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+            pjc.jitcode.index() as i32,
+            entry as i32,
+        );
+        let missing_ref = live.ref_.iter().copied().find(|&color| {
+            !matches!(
+                argboxes_r.get(color as usize),
+                Some(opref)
+                    if !opref.is_none()
+                        && !matches!(opref, majit_ir::OpRef::ConstPtr(gcref) if gcref.0 == 0)
+            )
+        });
+        let missing_int = live.int.iter().copied().find(|&color| {
+            argboxes_i
+                .get(color as usize)
+                .is_none_or(|opref| opref.is_none())
+        });
+        // `dispatch_via_miframe` has no Float bridge-input bank; therefore any
+        // Float color live at a resume marker is
+        // necessarily uncovered.
+        let missing_float = live.float.first().copied();
+        if missing_ref.is_some() || missing_int.is_some() || missing_float.is_some() {
+            crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded");
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-bridge-decline] uncovered resume-marker live register: \
+                     jitcode_index={} entry={} ref={missing_ref:?} int={missing_int:?} \
+                     float={missing_float:?}",
+                    pjc.jitcode.index(),
+                    entry,
+                );
+            }
+            fbw_bridge_decline(ctx);
+            fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+            return None;
+        }
+    }
+
     let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
         ctx,
         sym,
@@ -3411,7 +3463,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
-            TraceAction::Abort
+            if ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()) {
+                TraceAction::Decline
+            } else {
+                TraceAction::Abort
+            }
         }
     }
 }
