@@ -1,12 +1,121 @@
 //! _opcode module — PyPy: `pypy/module/_opcode/`.
 //!
-//! Stub providing stack_effect + has_arg / has_const / has_name /
-//! has_jump and related classifiers — enough for opcode.py to import.
-//! Returns neutral values (0 for stack_effect, False for has_*, empty
-//! lists / dicts for the rest).  Full implementations would mirror
-//! Python/compile.c.
+//! Opcode metadata used by `opcode.py` and `dis.py`.
 
 use pyre_object::*;
+use rustpython_compiler_core::bytecode::{AnyOpcode, oparg};
+
+fn try_opcode(raw: i64) -> Option<AnyOpcode> {
+    u16::try_from(raw).ok()?.try_into().ok()
+}
+
+fn opcode_predicate(
+    args: &[PyObjectRef],
+    predicate: impl FnOnce(AnyOpcode) -> bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let raw = crate::baseobjspace::int_w(args[0])?;
+    Ok(w_bool_from(try_opcode(raw).is_some_and(predicate)))
+}
+
+fn is_valid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |_| true)
+}
+
+fn has_arg(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.has_arg())
+}
+
+fn has_const(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.has_const())
+}
+
+fn has_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.has_name())
+}
+
+fn has_jump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.has_jump())
+}
+
+fn has_free(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.has_free())
+}
+
+fn has_local(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.has_local())
+}
+
+fn has_exc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    opcode_predicate(args, |op| op.is_block_push())
+}
+
+fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let raw = positional
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("stack_effect() missing opcode"))?;
+    let raw = crate::baseobjspace::int_w(raw)?;
+    let opcode = try_opcode(raw)
+        .filter(|op| op.real().is_none_or(|real| real.deopt().is_none()))
+        .ok_or_else(|| crate::PyError::value_error("invalid opcode or oparg"))?;
+
+    let oparg = positional
+        .get(1)
+        .copied()
+        .map(crate::baseobjspace::int_w)
+        .transpose()?
+        .unwrap_or(0);
+    let oparg =
+        u32::try_from(oparg).map_err(|_| crate::PyError::value_error("invalid opcode or oparg"))?;
+
+    let jump = crate::builtins::kwarg_get(kwargs, "jump").or_else(|| positional.get(2).copied());
+    let effect = match jump {
+        Some(value) if unsafe { !is_none(value) } => {
+            if crate::baseobjspace::is_true(value)? {
+                opcode.stack_effect_jump(oparg)
+            } else {
+                opcode.stack_effect(oparg)
+            }
+        }
+        _ => opcode
+            .stack_effect(oparg)
+            .max(opcode.stack_effect_jump(oparg)),
+    };
+    Ok(w_int_new(effect as i64))
+}
+
+fn get_intrinsic1_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_list_new(
+        oparg::IntrinsicFunction1::iter()
+            .map(|value| w_str_new(value.desc()))
+            .collect(),
+    ))
+}
+
+fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_list_new(
+        oparg::IntrinsicFunction2::iter()
+            .map(|value| w_str_new(value.desc()))
+            .collect(),
+    ))
+}
+
+fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_list_new(
+        oparg::BinaryOperator::iter()
+            .map(|value| w_tuple_new(vec![w_str_new(value.desc()), w_str_new(&value.to_string())]))
+            .collect(),
+    ))
+}
+
+fn special_method_names_impl() -> PyObjectRef {
+    w_list_new(
+        oparg::SpecialMethod::iter()
+            .map(|value| w_str_new(&value.to_string()))
+            .collect(),
+    )
+}
 
 crate::py_module! {
     "_opcode",
@@ -15,21 +124,16 @@ crate::py_module! {
             format!("<{opcode}>")
         }
         fn get_special_method_names() -> PyObjectRef {
-            w_list_new(vec![
-                w_str_new("__enter__"),
-                w_str_new("__exit__"),
-                w_str_new("__aenter__"),
-                w_str_new("__aexit__"),
-            ])
+            crate::module::_opcode::special_method_names_impl()
         }
     },
     functions: {
-        "stack_effect"             / 3 = |_| Ok(w_int_new(0)),
+        "stack_effect"             / 3 = stack_effect,
         "get_executor"             / 0 = |_| Ok(w_none()),
-        "get_specialization_stats" / 0 = |_| Ok(w_dict_new()),
-        "get_intrinsic1_descs"     / 0 = |_| Ok(w_list_new(vec![])),
-        "get_intrinsic2_descs"     / 0 = |_| Ok(w_list_new(vec![])),
-        "get_nb_ops"               / 0 = |_| Ok(w_list_new(vec![])),
+        "get_specialization_stats" / 0 = |_| Ok(w_none()),
+        "get_intrinsic1_descs"     / 0 = get_intrinsic1_descs,
+        "get_intrinsic2_descs"     / 0 = get_intrinsic2_descs,
+        "get_nb_ops"               / 0 = get_nb_ops,
         "get_executor_count"       / 0 = |_| Ok(w_int_new(0)),
         "get_hot_code"             / 0 = |_| Ok(w_list_new(vec![])),
     },
@@ -39,14 +143,17 @@ crate::py_module! {
         // gated on `@requires_specialization` then skip.
         crate::module_ns_store(ns, "ENABLE_SPECIALIZATION", w_bool_from(false));
         crate::module_ns_store(ns, "ENABLE_SPECIALIZATION_FT", w_bool_from(false));
-        for name in [
-            "has_arg", "has_const", "has_name", "has_jump", "has_jrel",
-            "has_jabs", "has_free", "has_local", "has_exc",
+        for (name, function) in [
+            ("is_valid", is_valid as crate::BuiltinCodeFn),
+            ("has_arg", has_arg as crate::BuiltinCodeFn),
+            ("has_const", has_const as crate::BuiltinCodeFn),
+            ("has_name", has_name as crate::BuiltinCodeFn),
+            ("has_jump", has_jump as crate::BuiltinCodeFn),
+            ("has_free", has_free as crate::BuiltinCodeFn),
+            ("has_local", has_local as crate::BuiltinCodeFn),
+            ("has_exc", has_exc as crate::BuiltinCodeFn),
         ] {
-            crate::module_ns_store(
-                ns, name,
-                crate::make_builtin_function_with_arity(name, |_| Ok(w_bool_from(false)), 0),
-            );
+            crate::module_ns_store(ns, name, crate::make_builtin_function_with_arity(name, function, 1));
         }
     }
 }
