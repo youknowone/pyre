@@ -311,8 +311,8 @@ pub(crate) fn unop_int_record<Sym: WalkSym>(
 /// `pyjitpl.py` exec-generated `opimpl_ptr_eq` /
 /// `opimpl_ptr_ne` (and instance variants) follow `self.execute(rop.<OPNUM>,
 /// b1, b2)` — both `b1`/`b2` are ref boxes, result is an int box. The
-/// `b1 is b2` fast path is omitted (same rationale as `binop_int_record`'s
-/// comparison family — pyre's recorder shares constants by value).
+/// `b1 is b2` fast path folds via `FASTPATHS_SAME_BOXES`; distinct operands
+/// record and then stamp the bool from the operands' concrete carriers.
 pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -334,16 +334,35 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
-    // Box(value) parity: stamp the bool result from the operands' Box.value
-    // carriers (matches dispatch.rs trace_binop_r_to_i).
-    if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
+    // Stamp the bool result from the operands' concrete carriers: the
+    // `box_value` carrier first, then the `concrete_registers_r` shadow. The
+    // shadow is a distinct channel from `box_value` and the primary carrier
+    // for inline-callee params (whose OpRef has no `set_opref_concrete`
+    // stamp), so without this fallback a materialized `is`/`is not` on a
+    // shadow-only ref operand left the bool symbolic and a downstream
+    // `goto_if_not` declined. Matches the sibling fallbacks in
+    // `record_ptr_cmp` and `ptr_nullity_record`.
+    let folded = if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
     {
-        let folded = match opcode {
+        Some(match opcode {
             OpCode::PtrEq | OpCode::InstancePtrEq => (la == rb) as i64,
             OpCode::PtrNe | OpCode::InstancePtrNe => (la != rb) as i64,
             _ => panic!("binop_ref_to_int_record: unsupported opcode {opcode:?}"),
-        };
+        })
+    } else if let (ConcreteValue::Ref(la), ConcreteValue::Ref(rb)) = (
+        read_ref_reg_concrete(code, op, 0, ctx),
+        read_ref_reg_concrete(code, op, 1, ctx),
+    ) {
+        Some(match opcode {
+            OpCode::PtrEq | OpCode::InstancePtrEq => (la == rb) as i64,
+            OpCode::PtrNe | OpCode::InstancePtrNe => (la != rb) as i64,
+            _ => panic!("binop_ref_to_int_record: unsupported opcode {opcode:?}"),
+        })
+    } else {
+        None
+    };
+    if let Some(folded) = folded {
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
     }

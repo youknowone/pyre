@@ -1069,6 +1069,41 @@ fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
 }
 
 #[test]
+fn ptr_eq_folds_from_the_ref_shadow_when_box_value_is_absent() {
+    // A non-fused `ptr_eq/rr>i` whose operands carry a concrete only in the
+    // ref-register shadow (box_value absent — the inline-callee-param case)
+    // must still fold the bool result, matching the fused twin and
+    // ptr_nullity. Without the shadow fallback the bool stayed symbolic and a
+    // downstream goto_if_not declined.
+    let byte = *insns_opname_to_byte()
+        .get("ptr_eq/rr>i")
+        .expect("`ptr_eq/rr>i` must be in insns table");
+    // `rr>i`: 1B r-src1 + 1B r-src2 + 1B i-dst.
+    let code = [byte, 0x00, 0x01, 0x00];
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let a = OpRef::input_arg_ref(0);
+    let b = OpRef::input_arg_ref(1);
+    assert_eq!(
+        tc.box_value(a),
+        None,
+        "an input-arg ref has no box_value carrier"
+    );
+    let mut regs_r = [a, b];
+    let mut regs_i = [OpRef::None];
+    let pa = 0xdead_0000_usize as *mut pyre_object::pyobject::PyObject;
+    let pb = 0xbeef_0000_usize as *mut pyre_object::pyobject::PyObject;
+    let mut concrete_r = [ConcreteValue::Ref(pa), ConcreteValue::Ref(pb)];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+        .expect("ptr_eq must record from the ref shadow");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.concrete_of_opref(regs_i[0]),
+        Some(majit_ir::Value::Int(0)),
+        "distinct shadow pointers fold PtrEq to false without a box_value carrier",
+    );
+}
+
+#[test]
 fn hint_force_virtualizable_is_a_noop_without_virtualizable_info() {
     let byte = *insns_opname_to_byte()
         .get("hint_force_virtualizable/r")
