@@ -3554,7 +3554,10 @@ fn vable_arraydescrof(
 ) -> crate::jitcode::BhDescr {
     let item_type = value_type_to_ir_type_for_descr(ty);
     crate::jitcode::BhDescr::Array {
-        base_size: std::mem::size_of::<usize>(),
+        // A virtualizable frame array is length-prefixed by a single word
+        // (`len_offset = Some(0)`), so its items start at the target word — the
+        // build host's word would mis-stride the block on a narrower target.
+        base_size: crate::layout::target_word_size(),
         itemsize,
         len_offset: Some(0),
         type_id: 0,
