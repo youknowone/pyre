@@ -67,4 +67,16 @@ assert not hasattr(g, "deleted")
 assert "x" not in g
 
 
+class GetattributeGlobals(dict):
+    def __getattribute__(self, name):
+        if name == "__dict_data__":
+            raise AssertionError("DELETE_GLOBAL exposed its intrinsic backing")
+        return super().__getattribute__(name)
+
+
+g = GetattributeGlobals(x=1)
+exec("global x\ndel x", g)
+assert "x" not in g
+
+
 print("OK")

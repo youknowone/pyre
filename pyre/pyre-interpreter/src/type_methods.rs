@@ -5124,9 +5124,35 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             }
         }
         if is_instance(obj) {
-            if let Ok(backing) = crate::baseobjspace::getattr_str(obj, "__dict_data__") {
-                if is_dict(backing) {
-                    return backing;
+            // `__dict_data__` is pyre's object-resident stand-in for the
+            // intrinsic W_DictMultiObject payload of a PyPy dict subclass.
+            // Read that reserved layout slot directly: going through
+            // `getattr_str` would incorrectly expose internal dict operations
+            // to a subclass's Python-level `__getattribute__` hook.
+            let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+            if !w_type.is_null() {
+                let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
+                while !layout.is_null() {
+                    let current = &*layout;
+                    let first_slot = current
+                        .nslots
+                        .saturating_sub(current.newslotnames.len() as u32);
+                    if let Some(offset) = current
+                        .newslotnames
+                        .iter()
+                        .position(|name| name == "__dict_data__")
+                    {
+                        if let Some(backing) = crate::objspace::std::mapdict::getslotvalue(
+                            obj,
+                            first_slot + offset as u32,
+                        ) {
+                            if is_dict(backing) {
+                                return backing;
+                            }
+                        }
+                        break;
+                    }
+                    layout = current.base_layout;
                 }
             }
         }
