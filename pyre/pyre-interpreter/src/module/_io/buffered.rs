@@ -385,6 +385,35 @@ impl W_BufferedReader {
         self.with_lock(|this| {
             let mut have = this.readahead();
             if have == 0 {
+                // CPython 3.14 `_bufferedreader_read1`: an empty buffer and a
+                // request larger than the buffer performs one direct raw
+                // read of the requested size.  The older PyPy source fills
+                // its fixed buffer here (and calls that behavior probably
+                // wrong); 3.14 semantics win for pyre.
+                if size > this.buffer_size {
+                    this.reader_reset_buf();
+                    let requested = size as usize;
+                    let temp = pyre_object::bytearrayobject::w_bytearray_new(requested);
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    pyre_object::gc_roots::pin_root(this.self_obj());
+                    pyre_object::gc_roots::pin_root(temp);
+                    let temp_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let result = super::call_method_result(
+                        this.w_raw,
+                        "readinto",
+                        &[pyre_object::gc_roots::shadow_stack_get(temp_slot)],
+                    )?;
+                    if unsafe { pyre_object::is_none(result) } {
+                        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+                    }
+                    let read = raw_readinto_size(result, requested)?;
+                    if this.abs_pos != -1 {
+                        this.abs_pos += read as i64;
+                    }
+                    let temp = pyre_object::gc_roots::shadow_stack_get(temp_slot);
+                    let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(temp) };
+                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data[..read]));
+                }
                 this.reader_reset_buf();
                 this.pos = 0;
                 have = match this.fill_buffer() {
