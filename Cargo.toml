@@ -7,7 +7,7 @@ homepage = "https://github.com/youknowone/pyre"
 
 [workspace]
 resolver = "2"
-exclude = ["wasmi"]
+exclude = ["wasmi", "cel-rust"]
 default-members = ["pyre/pyrex"]
 members = [
     # majit
@@ -34,6 +34,8 @@ members = [
     "majit/examples/tlc",
     "majit/examples/calc",
     "majit/examples/i64env",
+    "majit/examples/celprobe",
+    "majit/examples/celpolicy",
     "majit/examples/spcount",
     # pyre
     "pyre/pyre-object",
