@@ -340,7 +340,20 @@ impl BufferView {
                 BufferView::View1D { parent, .. } => parent.length(),
                 BufferView::ViewND {
                     parent, w_shape, ..
-                } => read_dims(*w_shape).iter().product::<i64>() * parent.itemsize(),
+                } => {
+                    let shape = read_dims(*w_shape);
+                    // CPython 3.14 exposes a resized zero-field ctypes
+                    // Structure as a 0-D, itemsize-zero buffer whose nbytes
+                    // is nevertheless the full resized backing.  Preserve
+                    // that parent's byte extent so `view.cast("B")` can
+                    // flatten it; ordinary BufferViewND follows PyPy's
+                    // product(shape) * itemsize calculation below.
+                    if shape.is_empty() && parent.itemsize() == 0 {
+                        parent.length()
+                    } else {
+                        shape.iter().product::<i64>() * parent.itemsize()
+                    }
+                }
                 BufferView::Readonly { view, .. } => view.length(),
             }
         }

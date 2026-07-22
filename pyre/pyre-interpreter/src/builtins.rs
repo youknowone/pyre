@@ -9941,6 +9941,24 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     .get(2)
                     .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
                     .unwrap_or(0) as i32;
+                // CPython 3.14 TextIOWrapper only permits the opaque-cookie
+                // forms for current/end-relative seeks; FileIO remains free
+                // to use ordinary non-zero offsets.
+                if !file_is_binary(args[0]) && offset != 0 {
+                    // POSIX/Python's public SEEK_CUR and SEEK_END values are
+                    // 1 and 2.  Keep this semantic validation target-neutral;
+                    // wasm libc intentionally does not expose lseek constants.
+                    if whence == 1 {
+                        return Err(crate::module::_io::unsupported(
+                            "can't do nonzero cur-relative seeks",
+                        ));
+                    }
+                    if whence == 2 {
+                        return Err(crate::module::_io::unsupported(
+                            "can't do nonzero end-relative seeks",
+                        ));
+                    }
+                }
                 if let Some(fd) = file_get_fd(args[0]) {
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
@@ -10337,10 +10355,7 @@ fn file_check_readable(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
     if mode.contains('r') || mode.contains('+') {
         Ok(())
     } else {
-        // `UnsupportedOperation` derives from ValueError; until exception
-        // instances carry that multiple-inheritance class here, preserve the
-        // observable ValueError branch and PyPy's exact message.
-        Err(crate::PyError::value_error("File not open for reading"))
+        Err(crate::module::_io::unsupported("File not open for reading"))
     }
 }
 
@@ -10349,14 +10364,15 @@ fn file_check_writable(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
     if mode.contains('w') || mode.contains('a') || mode.contains('x') || mode.contains('+') {
         Ok(())
     } else {
-        Err(crate::PyError::value_error("File not open for writing"))
+        Err(crate::module::_io::unsupported("File not open for writing"))
     }
 }
 
 /// One `space.acquire_writebuf` export held for a FileIO `readinto` call.
 /// PyPy's `with view:` keeps this lock until after `output_slice`/`c_read`.
 pub(crate) struct WritableBuffer {
-    obj: PyObjectRef,
+    _roots: pyre_object::gc_roots::RootScope,
+    owner_slot: usize,
     held: bool,
     address: *mut u8,
     length: usize,
@@ -10364,16 +10380,26 @@ pub(crate) struct WritableBuffer {
 
 impl WritableBuffer {
     pub(crate) unsafe fn acquire(obj: PyObjectRef) -> Result<Self, crate::PyError> {
-        let mut acquired = Self {
-            obj,
-            held: unsafe { buffer_export_incref(obj) },
-            address: std::ptr::null_mut(),
-            length: 0,
-        };
-        let data = unsafe { fileio_writebuf(obj) }?;
-        acquired.address = data.as_mut_ptr();
-        acquired.length = data.len();
-        Ok(acquired)
+        // `space.acquire_writebuf` owns a traced exporter for the complete
+        // `with view:` extent.  Root both the requested object and the
+        // concrete storage owner so Python called while the buffer is live
+        // cannot leave Drop with a pre-GC address.
+        let roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let (data, owner) =
+            unsafe { fileio_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))? };
+        pyre_object::gc_roots::pin_root(owner);
+        let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
+        let held = unsafe { buffer_export_incref(owner) };
+        Ok(Self {
+            _roots: roots,
+            owner_slot,
+            held,
+            address: data.as_mut_ptr(),
+            length: data.len(),
+        })
     }
 
     pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -10384,26 +10410,44 @@ impl WritableBuffer {
 impl Drop for WritableBuffer {
     fn drop(&mut self) {
         if self.held {
-            unsafe { buffer_export_decref(self.obj) };
+            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+            unsafe { buffer_export_decref(owner) };
         }
     }
 }
 
 /// `space.acquire_writebuf` for FileIO.readinto.  These are pyre's native
 /// writable exporters; a memoryview contributes its exact contiguous window.
-unsafe fn fileio_writebuf(obj: PyObjectRef) -> Result<&'static mut [u8], crate::PyError> {
+unsafe fn fileio_writebuf(
+    obj: PyObjectRef,
+) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return Ok(pyre_object::bytearrayobject::w_bytearray_data_mut(obj));
+            return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj));
         }
         if pyre_object::interp_array::is_array(obj) {
-            return Ok(pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice());
+            return Ok((
+                pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice(),
+                obj,
+            ));
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
             let (address, length, readonly) = view?;
             if !readonly {
-                return Ok(std::slice::from_raw_parts_mut(address as *mut u8, length));
+                return Ok((
+                    std::slice::from_raw_parts_mut(address as *mut u8, length),
+                    obj,
+                ));
+            }
+        }
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        if let Some((backing, offset, length, _format, _itemsize, _shape)) =
+            crate::module::_ctypes::cdata::cdata_buffer_view(obj)
+        {
+            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            if offset <= full.len() && length <= full.len() - offset {
+                return Ok((&mut full[offset..offset + length], backing));
             }
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
@@ -10427,7 +10471,7 @@ unsafe fn fileio_writebuf(obj: PyObjectRef) -> Result<&'static mut [u8], crate::
                     "memoryview buffer is no longer valid",
                 ));
             }
-            return Ok(&mut full[offset..offset + length]);
+            return Ok((&mut full[offset..offset + length], obj));
         }
         Err(crate::PyError::type_error(
             "readinto() argument must be read-write bytes-like object",
@@ -10737,15 +10781,16 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         return Err(crate::PyError::type_error("read() requires self"));
     }
     file_check_closed(args[0])?;
+    file_check_readable(args[0])?;
     if let Some(fd) = file_get_fd(args[0]) {
-        let n = args.get(1).and_then(|&o| unsafe {
-            if pyre_object::is_int(o) {
-                let v = pyre_object::w_int_get_value(o);
-                if v < 0 { None } else { Some(v as usize) }
-            } else {
-                None
+        let n = match args.get(1).copied() {
+            None => None,
+            Some(value) if unsafe { pyre_object::is_none(value) } => None,
+            Some(value) => {
+                let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?;
+                (value >= 0).then_some(value as usize)
             }
-        });
+        };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             let data = fd_read(fd, n).map_err(fd_io_err)?;
@@ -10784,16 +10829,17 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Err(crate::PyError::type_error("readline() requires self"));
     }
     file_check_closed(args[0])?;
+    file_check_readable(args[0])?;
     // Optional size cap (`readline(size)`): stop after `size` bytes even
     // before a newline. A missing or negative size means no cap.
-    let max = args.get(1).and_then(|&o| unsafe {
-        if pyre_object::is_int(o) {
-            let v = pyre_object::w_int_get_value(o);
-            if v < 0 { None } else { Some(v as usize) }
-        } else {
-            None
+    let max = match args.get(1).copied() {
+        None => None,
+        Some(value) if unsafe { pyre_object::is_none(value) } => None,
+        Some(value) => {
+            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?;
+            (value >= 0).then_some(value as usize)
         }
-    });
+    };
     if let Some(fd) = file_get_fd(args[0]) {
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
@@ -10896,6 +10942,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         return Err(crate::PyError::type_error("write() requires (self, data)"));
     }
     file_check_closed(args[0])?;
+    file_check_writable(args[0])?;
     if let Some(fd) = file_get_fd(args[0]) {
         let bytes: Vec<u8> = unsafe {
             if pyre_object::is_str(args[1]) {
