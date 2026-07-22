@@ -7017,6 +7017,11 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             return Ok(w_list_new(items));
         }
     }
+    // listobject.py:1049-1053 `_extend_from_iterable` asks for the source's
+    // length hint before obtaining/consuming its iterator.  The hint is only a
+    // preallocation aid, but RuntimeError and other non-TypeError failures
+    // from `__len__` / `__length_hint__` are observable and must propagate.
+    let _ = crate::baseobjspace::length_hint(obj, 0)?;
     // Consume iterator — PyPy: listobject.py W_ListObject(iterable)
     Ok(w_list_new(collect_iterable(obj)?))
 }

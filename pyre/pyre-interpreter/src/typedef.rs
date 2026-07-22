@@ -18483,6 +18483,11 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                     e
                 }
             })?;
+            // bytesobject.py:855-860 `_from_byte_sequence`: after obtaining
+            // the iterator, query the original source's length hint to size
+            // the builder.  RuntimeError and other real hint failures must
+            // propagate before any bytearray mutation.
+            let _ = crate::baseobjspace::length_hint(other, 0)?;
             let is_str = pyre_object::is_str(other);
             let mut appended = Vec::new();
             loop {

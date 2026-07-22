@@ -442,10 +442,13 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 }
             }
         } else {
-            // listobject.py:1019 _extend_from_iterable: append each yielded
-            // value before asking the iterator for the next one.  In
-            // particular, an exception from a later `next()` must not roll
-            // back the prefix already appended to the receiver.
+            // listobject.py:1052 `_extend_from_iterable` asks for a length
+            // hint before `_do_extend_from_iterable` obtains and consumes the
+            // iterator.  Hint failures other than TypeError/AttributeError are
+            // observable and propagate without appending a prefix.
+            let _ = crate::baseobjspace::length_hint(other, 0)?;
+            // Append each yielded value before asking for the next one.  An
+            // exception from a later `next()` does not roll back the prefix.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(list);
