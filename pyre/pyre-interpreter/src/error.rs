@@ -426,6 +426,7 @@ pub enum PyErrorKind {
     AttributeError,
     RuntimeError,
     StopIteration,
+    StopAsyncIteration,
     OverflowError,
     ArithmeticError,
     ImportError,
@@ -994,6 +995,10 @@ impl PyError {
         Self::new(PyErrorKind::StopIteration, String::new())
     }
 
+    pub fn stop_async_iteration() -> Self {
+        Self::new(PyErrorKind::StopAsyncIteration, String::new())
+    }
+
     /// Convert to a W_BaseException for pushing onto the value stack.
     /// Reuses the cached object from from_exc_object() if available, otherwise
     /// materialises it once and memoises it into `self.exc_object` so repeat
@@ -1256,6 +1261,7 @@ impl PyError {
             PyErrorKind::AttributeError => ExcKind::AttributeError,
             PyErrorKind::RuntimeError => ExcKind::RuntimeError,
             PyErrorKind::StopIteration => ExcKind::StopIteration,
+            PyErrorKind::StopAsyncIteration => ExcKind::StopAsyncIteration,
             PyErrorKind::OverflowError => ExcKind::OverflowError,
             PyErrorKind::ArithmeticError => ExcKind::ArithmeticError,
             PyErrorKind::ImportError => ExcKind::ImportError,
@@ -1326,6 +1332,7 @@ impl PyError {
             ExcKind::AttributeError => PyErrorKind::AttributeError,
             ExcKind::RuntimeError => PyErrorKind::RuntimeError,
             ExcKind::StopIteration => PyErrorKind::StopIteration,
+            ExcKind::StopAsyncIteration => PyErrorKind::StopAsyncIteration,
             ExcKind::OverflowError => PyErrorKind::OverflowError,
             ExcKind::ArithmeticError => PyErrorKind::ArithmeticError,
             ExcKind::ImportError => PyErrorKind::ImportError,

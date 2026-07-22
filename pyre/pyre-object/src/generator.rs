@@ -8,6 +8,7 @@ use pyre_macros::pyre_class;
 
 pub static GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("generator");
 pub static COROUTINE_TYPE: PyType = crate::pyobject::new_pytype("coroutine");
+pub static ASYNC_GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("async_generator");
 
 /// Generator object: holds a boxed frame that can be resumed.
 ///
@@ -48,6 +49,11 @@ pub struct GeneratorIterator {
     /// `generator.py:30` `previous_gen_or_coroutine`: the execution-context
     /// linked-list edge while this generator is running.
     pub previous_gen_or_coroutine: PyObjectRef,
+    /// `AsyncGenerator.hooks_inited` / `ag_running` / `w_finalizer`.
+    /// Generator and coroutine instances keep the neutral values.
+    pub hooks_inited: bool,
+    pub ag_running: bool,
+    pub w_finalizer: PyObjectRef,
 }
 
 /// PyPy `generator.py CoroutineWrapper`: the iterator returned by
@@ -55,6 +61,39 @@ pub struct GeneratorIterator {
 #[pyre_class("coroutine_wrapper", static_name = "COROUTINE_WRAPPER")]
 pub struct CoroutineWrapper {
     pub coroutine: PyObjectRef,
+}
+
+/// PyPy `generator.py AsyncGenValueWrapper`: distinguishes a value yielded
+/// by an async generator from a value yielded by an await inside its body.
+#[pyre_class(
+    "async_generator_wrapped_value",
+    static_name = "ASYNC_GEN_VALUE_WRAPPER"
+)]
+pub struct AsyncGenValueWrapper {
+    pub w_value: PyObjectRef,
+}
+
+/// Shared state values from PyPy `AsyncGenABase`.
+pub const ASYNC_GEN_STATE_INIT: u8 = 0;
+pub const ASYNC_GEN_STATE_ITER: u8 = 1;
+pub const ASYNC_GEN_STATE_CLOSED: u8 = 2;
+
+#[pyre_class("async_generator_asend", static_name = "ASYNC_GEN_ASEND")]
+pub struct AsyncGenASend {
+    pub async_gen: PyObjectRef,
+    pub w_value_to_send: PyObjectRef,
+    pub state: u8,
+}
+
+#[pyre_class("async_generator_athrow", static_name = "ASYNC_GEN_ATHROW")]
+pub struct AsyncGenAThrow {
+    pub async_gen: PyObjectRef,
+    /// `PY_NULL` identifies `aclose()`; otherwise these are the arguments to
+    /// `athrow()` and optional values use Python `None`.
+    pub w_exc_type: PyObjectRef,
+    pub w_exc_value: PyObjectRef,
+    pub w_exc_tb: PyObjectRef,
+    pub state: u8,
 }
 
 /// GC type id assigned to `GeneratorIterator` at JitDriver init time.
@@ -73,21 +112,21 @@ impl crate::lltype::GcType for GeneratorIterator {
 fn w_generator_or_coroutine_new(
     frame_ptr: *mut u8,
     pycode: PyObjectRef,
-    coroutine: bool,
+    kind: GeneratorKind,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(pycode);
     let value = GeneratorIterator {
         ob: PyObject {
-            ob_type: if coroutine {
-                &COROUTINE_TYPE as *const PyType
-            } else {
-                &GENERATOR_TYPE as *const PyType
+            ob_type: match kind {
+                GeneratorKind::Generator => &GENERATOR_TYPE as *const PyType,
+                GeneratorKind::Coroutine => &COROUTINE_TYPE as *const PyType,
+                GeneratorKind::AsyncGenerator => &ASYNC_GENERATOR_TYPE as *const PyType,
             },
-            w_class: if coroutine {
-                get_instantiate(&COROUTINE_TYPE)
-            } else {
-                get_instantiate(&GENERATOR_TYPE)
+            w_class: match kind {
+                GeneratorKind::Generator => get_instantiate(&GENERATOR_TYPE),
+                GeneratorKind::Coroutine => get_instantiate(&COROUTINE_TYPE),
+                GeneratorKind::AsyncGenerator => get_instantiate(&ASYNC_GENERATOR_TYPE),
             },
         },
         frame_ptr,
@@ -97,10 +136,17 @@ fn w_generator_or_coroutine_new(
         running: false,
         name: PY_NULL,
         qualname: PY_NULL,
-        cr_origin: if coroutine { crate::w_none() } else { PY_NULL },
+        cr_origin: if kind == GeneratorKind::Coroutine {
+            crate::w_none()
+        } else {
+            PY_NULL
+        },
         warned_unawaited: false,
         saved_exc_value: PY_NULL,
         previous_gen_or_coroutine: PY_NULL,
+        hooks_inited: false,
+        ag_running: false,
+        w_finalizer: PY_NULL,
     };
     // A generator must be GC-managed, not immortal `malloc_typed`: the
     // collector never reaches an immortal object, so the registered
@@ -126,12 +172,23 @@ fn w_generator_or_coroutine_new(
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeneratorKind {
+    Generator,
+    Coroutine,
+    AsyncGenerator,
+}
+
 pub fn w_generator_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
-    w_generator_or_coroutine_new(frame_ptr, pycode, false)
+    w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::Generator)
 }
 
 pub fn w_coroutine_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
-    w_generator_or_coroutine_new(frame_ptr, pycode, true)
+    w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::Coroutine)
+}
+
+pub fn w_async_generator_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
+    w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::AsyncGenerator)
 }
 
 pub fn w_coroutine_wrapper_new(coroutine: PyObjectRef) -> PyObjectRef {
@@ -157,8 +214,65 @@ pub unsafe fn is_coroutine(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+pub unsafe fn is_async_generator(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ASYNC_GENERATOR_TYPE) }
+}
+
+#[inline]
 pub unsafe fn is_generator_or_coroutine(obj: PyObjectRef) -> bool {
-    unsafe { is_generator(obj) || is_coroutine(obj) }
+    unsafe { is_generator(obj) || is_coroutine(obj) || is_async_generator(obj) }
+}
+
+pub fn w_async_gen_value_wrapper_new(w_value: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_value);
+    AsyncGenValueWrapper::allocate(AsyncGenValueWrapper {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_value,
+    })
+}
+
+pub fn w_async_gen_asend_new(async_gen: PyObjectRef, w_value_to_send: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(async_gen);
+    crate::gc_roots::pin_root(w_value_to_send);
+    AsyncGenASend::allocate(AsyncGenASend {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        async_gen,
+        w_value_to_send,
+        state: ASYNC_GEN_STATE_INIT,
+    })
+}
+
+pub fn w_async_gen_athrow_new(
+    async_gen: PyObjectRef,
+    w_exc_type: PyObjectRef,
+    w_exc_value: PyObjectRef,
+    w_exc_tb: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    for value in [async_gen, w_exc_type, w_exc_value, w_exc_tb] {
+        if !value.is_null() {
+            crate::gc_roots::pin_root(value);
+        }
+    }
+    AsyncGenAThrow::allocate(AsyncGenAThrow {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        async_gen,
+        w_exc_type,
+        w_exc_value,
+        w_exc_tb,
+        state: ASYNC_GEN_STATE_INIT,
+    })
 }
 
 #[inline]
@@ -265,6 +379,37 @@ pub unsafe fn w_generator_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
 #[inline]
 pub unsafe fn w_coroutine_get_origin(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).cr_origin }
+}
+
+#[inline]
+pub unsafe fn w_async_generator_hooks_inited(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const GeneratorIterator)).hooks_inited }
+}
+
+#[inline]
+pub unsafe fn w_async_generator_set_hooks_inited(obj: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).hooks_inited = true };
+}
+
+#[inline]
+pub unsafe fn w_async_generator_is_running(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const GeneratorIterator)).ag_running }
+}
+
+#[inline]
+pub unsafe fn w_async_generator_set_running(obj: PyObjectRef, value: bool) {
+    unsafe { (*(obj as *mut GeneratorIterator)).ag_running = value };
+}
+
+#[inline]
+pub unsafe fn w_async_generator_get_finalizer(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).w_finalizer }
+}
+
+#[inline]
+pub unsafe fn w_async_generator_set_finalizer(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).w_finalizer = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[cfg(test)]

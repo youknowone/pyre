@@ -626,6 +626,14 @@ pub unsafe fn walk_pyframe_roots_area(
             let current_gen_slot =
                 unsafe { &mut (*ec).current_gen_or_coroutine as *mut PyObjectRef };
             visitor(unsafe { &mut *(current_gen_slot as *mut majit_ir::GcRef) });
+            for hook in unsafe {
+                [
+                    &mut (*ec).w_asyncgen_firstiter_fn as *mut PyObjectRef,
+                    &mut (*ec).w_asyncgen_finalizer_fn as *mut PyObjectRef,
+                ]
+            } {
+                visitor(unsafe { &mut *(hook as *mut majit_ir::GcRef) });
+            }
             // pending_with_disabled_del is a GC-visible list upstream
             // (executioncontext.py:652); pyre's Vec lives in the boxed
             // UserDelAction, so its element slots are visited here.
@@ -3873,6 +3881,10 @@ impl OpcodeStepExecutor for PyFrame {
         crate::opcode_ops::list_to_tuple_value(val)
     }
 
+    fn async_gen_wrap(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        Ok(pyre_object::generator::w_async_gen_value_wrapper_new(val))
+    }
+
     // ── print_expr ──
     // PRINT_EXPR → sys.displayhook(value). Routing through the live hook lets
     // a rebound displayhook (doctest, IDLE) and a redirected sys.stdout take
@@ -4050,6 +4062,64 @@ impl OpcodeStepExecutor for PyFrame {
         // `running` flag.
         self.push(w_iter);
         Ok(())
+    }
+
+    fn get_aiter(&mut self) -> Result<(), PyError> {
+        let obj = self.pop();
+        let method =
+            unsafe { crate::baseobjspace::lookup_special(obj, "__aiter__")? }.ok_or_else(|| {
+                crate::PyError::type_error(format!(
+                    "'async for' requires an object with __aiter__ method, got {}",
+                    crate::type_methods::arg_type_name(obj)
+                ))
+            })?;
+        let iter = crate::call::call_function_impl_result(method, &[])?;
+        if unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }.is_none() {
+            return Err(crate::PyError::type_error(format!(
+                "'async for' received an object from __aiter__ that does not implement __anext__: {}",
+                crate::type_methods::arg_type_name(iter)
+            )));
+        }
+        self.push(iter);
+        Ok(())
+    }
+
+    fn get_anext(&mut self) -> Result<(), PyError> {
+        let iter = self.peek();
+        let method = unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }
+            .ok_or_else(|| {
+                crate::PyError::type_error(format!(
+                    "'async for' requires an iterator with __anext__ method, got {}",
+                    crate::type_methods::arg_type_name(iter)
+                ))
+            })?;
+        let next = crate::call::call_function_impl_result(method, &[])?;
+        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|err| {
+            if err.kind == crate::PyErrorKind::TypeError {
+                crate::PyError::type_error(format!(
+                    "'async for' received an invalid object from __anext__: {}",
+                    crate::type_methods::arg_type_name(next)
+                ))
+            } else {
+                err
+            }
+        })?;
+        self.push(awaitable);
+        Ok(())
+    }
+
+    fn end_async_for(&mut self) -> Result<(), PyError> {
+        let exc = self.pop();
+        let err = unsafe { crate::PyError::from_exc_object(exc) };
+        if err.kind == crate::PyErrorKind::StopAsyncIteration {
+            // The 3.14 exception table preserves the surrounding handler's
+            // previous-exception entry below the asynchronous iterator; the
+            // StopAsyncIteration edge itself pushes only `exc`.
+            self.pop(); // asynchronous iterator
+            Ok(())
+        } else {
+            Err(err)
+        }
     }
 
     // ── load_method ──
@@ -5603,6 +5673,126 @@ while i < 3000:
         unsafe {
             let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_async_generator_asend_yield_and_exhaustion() {
+        let source = r#"
+async def agen():
+    yield 42
+
+g = agen()
+frame_visible = g.ag_frame is not None
+code_visible = g.ag_code is not None
+initially_suspended = g.ag_suspended
+a = g.__anext__()
+try:
+    a.send(None)
+except StopIteration as e:
+    yielded = e.value
+try:
+    g.__anext__().send(None)
+except StopAsyncIteration:
+    exhausted = True
+"#;
+        let (result, frame) = run_exec_frame(source);
+        result.expect("async generator program failed");
+        unsafe {
+            let yielded = w_dict_getitem_str(frame.w_globals, "yielded").unwrap();
+            assert_eq!(w_int_get_value(yielded), 42);
+            let exhausted = w_dict_getitem_str(frame.w_globals, "exhausted").unwrap();
+            assert!(is_true(exhausted).unwrap());
+            for name in ["frame_visible", "code_visible"] {
+                assert!(is_true(w_dict_getitem_str(frame.w_globals, name).unwrap()).unwrap());
+            }
+            assert!(
+                !is_true(w_dict_getitem_str(frame.w_globals, "initially_suspended").unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_async_generator_asend_value_and_aclose() {
+        let source = r#"
+closed = False
+async def agen():
+    global closed
+    try:
+        value = yield 1
+        yield value
+    finally:
+        closed = True
+
+g = agen()
+try:
+    g.__anext__().send(None)
+except StopIteration as e:
+    first = e.value
+try:
+    g.asend(42).send(None)
+except StopIteration as e:
+    second = e.value
+try:
+    g.aclose().send(None)
+except StopIteration:
+    close_done = True
+"#;
+        let (result, frame) = run_exec_frame(source);
+        result.expect("async generator asend/aclose program failed");
+        unsafe {
+            for (name, expected) in [("first", 1), ("second", 42)] {
+                assert_eq!(
+                    w_int_get_value(w_dict_getitem_str(frame.w_globals, name).unwrap()),
+                    expected
+                );
+            }
+            for name in ["closed", "close_done"] {
+                assert!(is_true(w_dict_getitem_str(frame.w_globals, name).unwrap()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn test_async_for_consumes_async_generator() {
+        let source = r#"
+async def agen():
+    yield 2
+    yield 3
+
+preserved_exception = False
+async def consume():
+    global preserved_exception
+    result = []
+    try:
+        raise ValueError('outer')
+    except ValueError:
+        async for value in agen():
+            result.append(value)
+        try:
+            raise
+        except ValueError:
+            preserved_exception = True
+    return result
+
+coro = consume()
+try:
+    coro.send(None)
+except StopIteration as e:
+    result = e.value
+"#;
+        let (result, frame) = run_exec_frame(source);
+        result.expect("async-for program failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(w_list_len(result), 2);
+            assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
+            assert_eq!(w_int_get_value(w_list_getitem(result, 1).unwrap()), 3);
+            assert!(
+                is_true(w_dict_getitem_str(frame.w_globals, "preserved_exception").unwrap())
+                    .unwrap()
+            );
         }
     }
 

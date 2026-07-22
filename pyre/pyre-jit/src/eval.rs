@@ -414,6 +414,7 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.w_finalizer as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.saved_exc_value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(
         &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
@@ -1740,7 +1741,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `pytype_to_tid`, so this pre-registration wins over its
     // generic `object_subclass(sizeof(PyObject), parent_tid)`
     // default which would underallocate `W_BaseException`.
-    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::UnboundLocalError as u8) {
+    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::StopAsyncIteration as u8) {
         // Round-trip the byte through the enum so we don't depend
         // on unsafe transmute; every value in [0, UnboundLocalError]
         // is a valid `ExcKind` variant by construction.
@@ -1778,6 +1779,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             30 => pyre_object::interp_exceptions::ExcKind::SyntaxError,
             31 => pyre_object::interp_exceptions::ExcKind::BufferError,
             32 => pyre_object::interp_exceptions::ExcKind::UnboundLocalError,
+            33 => pyre_object::interp_exceptions::ExcKind::StopAsyncIteration,
             _ => unreachable!(),
         };
         let pytype_ptr =
@@ -2888,6 +2890,34 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // AsyncGenerator shares GeneratorOrCoroutine's suspended-frame payload
+    // and custom trace, but keeps a distinct vtable identity.  Its helper
+    // awaitables are appended at the absolute AUTO-ID tail so existing type
+    // ids remain stable.
+    let async_generator_vtable_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        std::mem::size_of::<pyre_object::generator::GeneratorIterator>(),
+        object_tid,
+        generator_object_custom_trace,
+    ));
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const _ as usize,
+        async_generator_vtable_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const _ as usize,
+        async_generator_vtable_tid,
+    );
+    for descriptor in [
+        <pyre_object::generator::AsyncGenValueWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::generator::AsyncGenASend
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::generator::AsyncGenAThrow
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    ] {
+        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical

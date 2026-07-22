@@ -332,6 +332,101 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
+fn asyncgen_hooks_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq("asyncgen_hooks", &["firstiter", "finalizer"]) as usize
+    }) as PyObjectRef
+}
+
+fn sys_get_asyncgen_hooks_impl(_args: &[PyObjectRef]) -> crate::PyResult {
+    let ec = current_execution_context();
+    let (firstiter, finalizer) = if ec.is_null() {
+        (w_none(), w_none())
+    } else {
+        unsafe {
+            (
+                if (*ec).w_asyncgen_firstiter_fn.is_null() {
+                    w_none()
+                } else {
+                    (*ec).w_asyncgen_firstiter_fn
+                },
+                if (*ec).w_asyncgen_finalizer_fn.is_null() {
+                    w_none()
+                } else {
+                    (*ec).w_asyncgen_finalizer_fn
+                },
+            )
+        }
+    };
+    Ok(crate::_structseq::new_instance(
+        asyncgen_hooks_type(),
+        vec![firstiter, finalizer],
+    ))
+}
+
+fn sys_set_asyncgen_hooks_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["firstiter", "finalizer"],
+        "set_asyncgen_hooks",
+    )?;
+    if positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "set_asyncgen_hooks() takes at most 2 arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let kw_firstiter = crate::builtins::kwarg_get(kwargs, "firstiter");
+    let kw_finalizer = crate::builtins::kwarg_get(kwargs, "finalizer");
+    if !positional.is_empty() && kw_firstiter.is_some() {
+        return Err(crate::PyError::type_error(
+            "set_asyncgen_hooks() got multiple values for argument 'firstiter'",
+        ));
+    }
+    if positional.len() > 1 && kw_finalizer.is_some() {
+        return Err(crate::PyError::type_error(
+            "set_asyncgen_hooks() got multiple values for argument 'finalizer'",
+        ));
+    }
+    let firstiter = positional.first().copied().or(kw_firstiter);
+    let finalizer = positional.get(1).copied().or(kw_finalizer);
+    let ec = current_execution_context();
+    if !ec.is_null() {
+        unsafe {
+            // PyPy vm.py:set_asyncgen_hooks updates and validates finalizer
+            // first, then firstiter.  Preserve that observable ordering when
+            // the second argument is invalid.
+            if let Some(value) = finalizer {
+                if is_none(value) {
+                    (*ec).w_asyncgen_finalizer_fn = PY_NULL;
+                } else if crate::baseobjspace::callable_w(value) {
+                    (*ec).w_asyncgen_finalizer_fn = value;
+                } else {
+                    return Err(crate::PyError::type_error(format!(
+                        "callable finalizer expected, got {}",
+                        crate::type_methods::arg_type_name(value)
+                    )));
+                }
+            }
+            if let Some(value) = firstiter {
+                if is_none(value) {
+                    (*ec).w_asyncgen_firstiter_fn = PY_NULL;
+                } else if crate::baseobjspace::callable_w(value) {
+                    (*ec).w_asyncgen_firstiter_fn = value;
+                } else {
+                    return Err(crate::PyError::type_error(format!(
+                        "callable firstiter expected, got {}",
+                        crate::type_methods::arg_type_name(value)
+                    )));
+                }
+            }
+        }
+    }
+    Ok(w_none())
+}
+
 fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&w_hookargs) = args.first() else {
         return Err(crate::PyError::type_error(
@@ -792,7 +887,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         if args.len() == 1 { "was" } else { "were" },
                     )));
                 }
-                Ok(w_int_new(crate::module::sys::state::int_max_str_digits() as i64))
+                Ok(w_int_new(
+                    crate::module::sys::state::int_max_str_digits() as i64
+                ))
             },
             0,
         ),
@@ -1232,6 +1329,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "setprofile",
         make_builtin_function_with_arity("setprofile", sys_setprofile_impl, 1),
     );
+    module_ns_store(
+        ns,
+        "get_asyncgen_hooks",
+        make_builtin_function_with_arity("get_asyncgen_hooks", sys_get_asyncgen_hooks_impl, 0),
+    );
+    module_ns_store(
+        ns,
+        "set_asyncgen_hooks",
+        crate::make_builtin_function("set_asyncgen_hooks", sys_set_asyncgen_hooks_impl),
+    );
     // sys.getfilesystemencoding
     module_ns_store(
         ns,
@@ -1259,11 +1366,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "_clear_type_descriptors",
-        make_builtin_function_with_arity(
-            "_clear_type_descriptors",
-            sys_clear_type_descriptors,
-            1,
-        ),
+        make_builtin_function_with_arity("_clear_type_descriptors", sys_clear_type_descriptors, 1),
     );
     // sys.is_finalizing
     module_ns_store(

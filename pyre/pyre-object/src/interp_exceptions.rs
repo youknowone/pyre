@@ -28,6 +28,8 @@ pub static EXC_KEY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("KeyError");
 pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AttributeError");
 pub static EXC_RUNTIME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RuntimeError");
 pub static EXC_STOP_ITERATION_TYPE: PyType = crate::pyobject::new_pytype("StopIteration");
+pub static EXC_STOP_ASYNC_ITERATION_TYPE: PyType =
+    crate::pyobject::new_pytype("StopAsyncIteration");
 pub static EXC_IMPORT_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ImportError");
 pub static EXC_MODULE_NOT_FOUND_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("ModuleNotFoundError");
@@ -94,6 +96,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::AttributeError => &EXC_ATTRIBUTE_ERROR_TYPE,
         ExcKind::RuntimeError => &EXC_RUNTIME_ERROR_TYPE,
         ExcKind::StopIteration => &EXC_STOP_ITERATION_TYPE,
+        ExcKind::StopAsyncIteration => &EXC_STOP_ASYNC_ITERATION_TYPE,
         ExcKind::ImportError => &EXC_IMPORT_ERROR_TYPE,
         ExcKind::ModuleNotFoundError => &EXC_MODULE_NOT_FOUND_ERROR_TYPE,
         ExcKind::NotImplementedError => &EXC_NOT_IMPLEMENTED_ERROR_TYPE,
@@ -213,6 +216,9 @@ pub enum ExcKind {
     BufferError = 31,
     /// Subclass of NameError raised when a fast local is read while unbound.
     UnboundLocalError = 32,
+    /// Signals exhaustion of an asynchronous iterator.  Appended so the
+    /// existing discriminants embedded by the JIT remain stable.
+    StopAsyncIteration = 33,
 }
 
 impl ExcKind {
@@ -621,7 +627,7 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::UnboundLocalError as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::StopAsyncIteration as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -1348,6 +1354,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::AttributeError => "AttributeError",
         ExcKind::RuntimeError => "RuntimeError",
         ExcKind::StopIteration => "StopIteration",
+        ExcKind::StopAsyncIteration => "StopAsyncIteration",
         ExcKind::OverflowError => "OverflowError",
         ExcKind::ArithmeticError => "ArithmeticError",
         ExcKind::ImportError => "ImportError",
@@ -1454,6 +1461,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "AttributeError" => Some(ExcKind::AttributeError),
         "RuntimeError" => Some(ExcKind::RuntimeError),
         "StopIteration" => Some(ExcKind::StopIteration),
+        "StopAsyncIteration" => Some(ExcKind::StopAsyncIteration),
         "OverflowError" => Some(ExcKind::OverflowError),
         "ArithmeticError" => Some(ExcKind::ArithmeticError),
         "ImportError" => Some(ExcKind::ImportError),
@@ -1565,6 +1573,7 @@ mod tests {
             ExcKind::AttributeError,
             ExcKind::RuntimeError,
             ExcKind::StopIteration,
+            ExcKind::StopAsyncIteration,
             ExcKind::OverflowError,
             ExcKind::ArithmeticError,
             ExcKind::ImportError,

@@ -583,6 +583,10 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (128, Some(0)),
     (129, Some(0)),
     (130, Some(0)),
+    (131, Some(0)),
+    (132, Some(0)),
+    (133, Some(0)),
+    (134, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -769,6 +773,10 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (
             &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
             &crate::interp_exceptions::EXCEPTION_TYPE,
+        ),
+        (
+            &crate::interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
             &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE,
@@ -1003,6 +1011,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         ),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE),
+        subclass_range_alias(31, &crate::interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE),
         subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
         subclass_range_alias(33, &TYPE_TYPE),
         subclass_range_alias(34, &STR_TYPE),
@@ -1083,6 +1092,13 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE),
         subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE),
         subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE),
+        // Async-generator support is appended after the interpreter-owned
+        // FrameLocalsProxy (130) in build_gc: the shared generator payload
+        // gets 131, followed by the three pyre_class helper awaitables.
+        subclass_range_alias(131, &crate::generator::ASYNC_GENERATOR_TYPE),
+        subclass_range_alias(132, typed::<crate::generator::AsyncGenValueWrapper>()),
+        subclass_range_alias(133, typed::<crate::generator::AsyncGenASend>()),
+        subclass_range_alias(134, typed::<crate::generator::AsyncGenAThrow>()),
     ]
 }
 

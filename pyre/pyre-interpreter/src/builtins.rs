@@ -2441,7 +2441,11 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "StopAsyncIteration",
-        make_exc_type("StopAsyncIteration", exc_exception_new, exception),
+        make_exc_type(
+            "StopAsyncIteration",
+            exc_stop_async_iteration_new,
+            exception,
+        ),
     );
     crate::module_ns_store(
         ns,
@@ -4263,6 +4267,10 @@ exc_constructor!(
     pyre_object::interp_exceptions::ExcKind::StopIteration
 );
 exc_constructor!(
+    exc_stop_async_iteration,
+    pyre_object::interp_exceptions::ExcKind::StopAsyncIteration
+);
+exc_constructor!(
     exc_overflow_error,
     pyre_object::interp_exceptions::ExcKind::OverflowError
 );
@@ -5272,6 +5280,7 @@ exc_new_wrapper!(exc_attribute_error_new, exc_attribute_error);
 exc_new_wrapper!(exc_name_error_new, exc_name_error);
 exc_new_wrapper!(exc_runtime_error_new, exc_runtime_error);
 exc_new_wrapper!(exc_stop_iteration_new, exc_stop_iteration);
+exc_new_wrapper!(exc_stop_async_iteration_new, exc_stop_async_iteration);
 exc_new_wrapper!(exc_overflow_error_new, exc_overflow_error);
 exc_new_wrapper!(exc_import_error_new, exc_import_error);
 exc_new_wrapper!(exc_not_implemented_error_new, exc_not_implemented_error);

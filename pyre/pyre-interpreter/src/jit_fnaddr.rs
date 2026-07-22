@@ -2102,11 +2102,31 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "interp_exceptions::EXC_SYNTAX_ERROR_TYPE",
             interp_exceptions::EXC_SYNTAX_ERROR_TYPE
         ),
+        pytype_addr!(
+            "interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE",
+            interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE
+        ),
         pytype_addr!("generator::GENERATOR_TYPE", generator::GENERATOR_TYPE),
         pytype_addr!("generator::COROUTINE_TYPE", generator::COROUTINE_TYPE),
         pytype_addr!(
+            "generator::ASYNC_GENERATOR_TYPE",
+            generator::ASYNC_GENERATOR_TYPE
+        ),
+        pytype_addr!(
             "generator::COROUTINE_WRAPPER_TYPE",
             generator::COROUTINE_WRAPPER_TYPE
+        ),
+        pytype_addr!(
+            "generator::ASYNC_GEN_VALUE_WRAPPER_TYPE",
+            generator::ASYNC_GEN_VALUE_WRAPPER_TYPE
+        ),
+        pytype_addr!(
+            "generator::ASYNC_GEN_ASEND_TYPE",
+            generator::ASYNC_GEN_ASEND_TYPE
+        ),
+        pytype_addr!(
+            "generator::ASYNC_GEN_ATHROW_TYPE",
+            generator::ASYNC_GEN_ATHROW_TYPE
         ),
         pytype_addr!("pyobject::INT_TYPE", pyobject::INT_TYPE),
         pytype_addr!("pyobject::BOOL_TYPE", pyobject::BOOL_TYPE),

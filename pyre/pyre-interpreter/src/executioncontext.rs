@@ -217,6 +217,10 @@ pub struct ExecutionContext {
     /// coroutines.  Each node owns the suspended exception state of its
     /// caller through `GeneratorOrCoroutine.previous_gen_or_coroutine`.
     pub current_gen_or_coroutine: PyObjectRef,
+    /// `executioncontext.py:53-54` — PEP 525 hooks, owned by the execution
+    /// context (thread-specific), never by a process-global side table.
+    pub w_asyncgen_firstiter_fn: PyObjectRef,
+    pub w_asyncgen_finalizer_fn: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -267,6 +271,8 @@ impl ExecutionContext {
             check_signal_action: None,
             sys_exc_value: pyre_object::PY_NULL,
             current_gen_or_coroutine: pyre_object::PY_NULL,
+            w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
+            w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
         }
     }
 

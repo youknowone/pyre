@@ -1381,6 +1381,15 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn get_awaitable(&mut self, _context: u32) -> Result<(), PyError> {
         Err(crate::PyError::type_error("get_awaitable not implemented").into())
     }
+    fn get_aiter(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("get_aiter not implemented").into())
+    }
+    fn get_anext(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("get_anext not implemented").into())
+    }
+    fn end_async_for(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("end_async_for not implemented").into())
+    }
 
     // Class
     fn load_build_class(&mut self) -> Result<(), PyError> {
@@ -1551,10 +1560,11 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 Ok(())
             }
             IntrinsicFunction1::AsyncGenWrap => {
-                // Wraps a value yielded from an async generator. pyre conflates
-                // generators / coroutines / async generators into a single
-                // suspended-frame object, so the wrapper type is not modeled —
-                // the value passes through unchanged.
+                // PyPy `YIELD_VALUE`: an async-generator yield is wrapped so
+                // AsyncGenASend can distinguish it from an await suspension.
+                let value = self.pop_value()?;
+                let wrapped = self.async_gen_wrap(value)?;
+                self.push_value(wrapped)?;
                 Ok(())
             }
             // PEP 695 type-parameter construction (`class C[T]:`, `def f[T]()`).
@@ -1622,6 +1632,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         _val: <Self as SharedOpcodeHandler>::Value,
     ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
         Err(crate::PyError::type_error("list_to_tuple not implemented").into())
+    }
+    fn async_gen_wrap(
+        &mut self,
+        _val: <Self as SharedOpcodeHandler>::Value,
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
+        Err(crate::PyError::type_error("async_gen_wrap not implemented").into())
     }
     fn print_expr(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<(), PyError> {
         Err(crate::PyError::type_error("print_expr not implemented").into())
@@ -2456,6 +2472,27 @@ pub fn execute_get_awaitable<E: OpcodeStepExecutor>(
         unreachable!()
     };
     executor.get_awaitable(r#where.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_get_aiter<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<E::Value>, PyError> {
+    executor.get_aiter()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_get_anext<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<E::Value>, PyError> {
+    executor.get_anext()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_end_async_for<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<E::Value>, PyError> {
+    executor.end_async_for()?;
     Ok(StepResult::Continue)
 }
 
@@ -3641,10 +3678,9 @@ where
         // ── Await ──
         Instruction::GetAwaitable { .. } => execute_get_awaitable(executor, instruction, op_arg),
 
-        // ── Async stubs ──
-        Instruction::GetAiter | Instruction::GetAnext | Instruction::EndAsyncFor => {
-            Err(crate::PyError::type_error("async not yet implemented").into())
-        }
+        Instruction::GetAiter => execute_get_aiter(executor),
+        Instruction::GetAnext => execute_get_anext(executor),
+        Instruction::EndAsyncFor => execute_end_async_for(executor),
 
         // yield from: handled by PyFrame override in eval.rs
         Instruction::GetYieldFromIter => execute_get_yield_from_iter(executor),

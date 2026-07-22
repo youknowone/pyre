@@ -714,6 +714,13 @@ impl FrameBox {
             (*frame_ptr)
                 .code()
                 .flags
+                .contains(crate::CodeFlags::ASYNC_GENERATOR)
+        } {
+            pyre_object::generator::w_async_generator_new(frame_ptr as *mut u8, pycode)
+        } else if unsafe {
+            (*frame_ptr)
+                .code()
+                .flags
                 .contains(crate::CodeFlags::COROUTINE)
         } {
             pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8, pycode)
