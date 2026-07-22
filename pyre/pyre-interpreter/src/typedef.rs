@@ -9301,10 +9301,7 @@ fn init_type_type(ns: PyObjectRef) {
 
     let name_getter = make_builtin_function_with_arity(
         "__name__",
-        |args| unsafe {
-            let name = pyre_object::w_type_get_name(args[1]);
-            Ok(pyre_object::w_str_new(name))
-        },
+        |args| unsafe { Ok(pyre_object::w_type_get_name_obj(args[1])) },
         2,
     );
     // typeobject.py:1046 descr_set__name__
@@ -9345,8 +9342,7 @@ fn init_type_type(ns: PyObjectRef) {
             crate::builtins::check_surrogate(w_value)?;
             // typeobject.py:1058 `w_type.name = name` — surrogate-free, so
             // the str view is valid UTF-8.
-            let name = unsafe { pyre_object::w_str_get_value(w_value) };
-            unsafe { pyre_object::w_type_set_name(w_type, name) };
+            unsafe { pyre_object::w_type_set_name(w_type, w_value) };
             Ok(pyre_object::w_none())
         },
         3,
@@ -15360,23 +15356,26 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init_subclass__",
-            make_builtin_function("__init_subclass__", |args| {
-                let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if let Some(kw) = kwargs {
-                    let has_real_kw = unsafe {
-                        pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
-                            pyre_object::is_str(k)
-                                && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
-                        })
-                    };
-                    if has_real_kw {
-                        return Err(crate::PyError::type_error(
-                            "__init_subclass__() takes no keyword arguments",
-                        ));
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__init_subclass__",
+                |args| {
+                    let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                    if let Some(kw) = kwargs {
+                        let has_real_kw = unsafe {
+                            pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
+                                pyre_object::is_str(k)
+                                    && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
+                            })
+                        };
+                        if has_real_kw {
+                            return Err(crate::PyError::type_error(
+                                "__init_subclass__() takes no keyword arguments",
+                            ));
+                        }
                     }
-                }
-                Ok(pyre_object::w_none())
-            }),
+                    Ok(pyre_object::w_none())
+                },
+            )),
         )
     };
     unsafe {

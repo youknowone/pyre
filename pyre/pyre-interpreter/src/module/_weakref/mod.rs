@@ -12,8 +12,8 @@
 //! }
 //! ```
 //!
-//! `_remove_dead_weakref` is CPython-only and is stubbed as a no-op for
-//! cleanup-driven users like weakref.py's WeakValueDictionary.
+//! CPython exposes `_remove_dead_weakref`; PyPy implements the same operation
+//! in `app_weakref.py` through its atomic `delitem_if_value_is` helper.
 
 pub mod interp__weakref;
 
@@ -31,6 +31,6 @@ crate::py_module! {
     module_functions: {
         "getweakrefcount"      / 1 = interp__weakref::getweakrefcount,
         "getweakrefs"          / 1 = interp__weakref::getweakrefs,
-        "_remove_dead_weakref" / 2 = |_| Ok(pyre_object::w_none()),
+        "_remove_dead_weakref" / 2 = interp__weakref::remove_dead_weakref,
     },
 }

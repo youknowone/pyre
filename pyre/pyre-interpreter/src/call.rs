@@ -3584,34 +3584,7 @@ fn build_class_inner(
     // collide with the member descriptor (typing._SpecialForm).
     {
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__doc__") }.is_none() {
-            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-            let doc_is_slot =
-                match unsafe { pyre_object::w_dict_getitem_str(class_ns, "__slots__") } {
-                    Some(slots)
-                        if unsafe {
-                            pyre_object::is_str(slots)
-                                || pyre_object::is_tuple(slots)
-                                || pyre_object::is_list(slots)
-                        } =>
-                    {
-                        collect_slot_names(slots)
-                            .map(|names| names.iter().any(|n| n == "__doc__"))
-                            .unwrap_or(false)
-                    }
-                    _ => false,
-                };
-            if !doc_is_slot {
-                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                unsafe {
-                    pyre_object::w_dict_setitem_str_no_proxy(
-                        class_ns,
-                        "__doc__",
-                        pyre_object::w_none(),
-                    )
-                };
-            }
-        }
+        crate::builtins::type_new_set_doc(class_ns)?;
     }
 
     // Create W_TypeObject from the class namespace
@@ -4051,7 +4024,9 @@ fn type_descr_call_with_mode(
 ///       slot_names_w = space.unpackiterable(w_slots)
 ///   for w_slot_name in slot_names_w:
 ///       slot_name = space.text_w(w_slot_name)
-fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Result<Vec<String>, crate::PyError> {
+pub(crate) fn collect_slot_names(
+    w_slots: pyre_object::PyObjectRef,
+) -> Result<Vec<String>, crate::PyError> {
     unsafe {
         // typeobject.py:1158-1162: str → single-element list, else unpackiterable
         let slot_names_w = if pyre_object::is_str(w_slots) {

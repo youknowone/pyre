@@ -2009,20 +2009,53 @@ fn box_value(typ: UnboxType, val: i64) -> PyObjectRef {
     }
 }
 
-/// `type(w_value) is space.IntObjectCls` (mapdict.py:574,615). `is_int` matches
-/// `bool` too (bool subclasses int), but bool's impl class is not the int
-/// class, so a bool must not be unboxed — `w_int_new` boxing would discard its
-/// bool identity.
+/// `type(w_value) is space.IntObjectCls` (mapdict.py:198,574,615).
+///
+/// Pyre gives an int subclass the same native storage layout as W_IntObject
+/// and carries its app-level identity in `w_class`. Testing only the layout
+/// (`is_int`) would unbox IntEnum/user-int instances and reconstruct them as
+/// builtin ints, losing `w_class`. Compare the exact app-level type just as
+/// PyPy compares the exact implementation class.
 ///
 /// # Safety
 /// `w_value` must point to a live object.
 unsafe fn is_unboxable_int(w_value: PyObjectRef) -> bool {
-    // Early-return control flow rather than `if c { false } else { x }`, which
-    // can become a `!c && x` (a `bool_not`) that majit-translate cannot lower.
-    if unsafe { pyre_object::is_bool(w_value) } {
+    if !unsafe { pyre_object::is_int(w_value) } {
         return false;
     }
-    unsafe { pyre_object::is_int(w_value) }
+    let exact = crate::typedef::gettypeobject(&pyre_object::INT_TYPE);
+    if exact.is_null() {
+        // Interpreter-only unit tests may exercise mapdict before the app-level
+        // type registry is initialized. A native int with no class stamp is
+        // the bootstrap representation of that same exact type.
+        if pyre_object::tagged_int::CAN_BE_TAGGED
+            && unsafe { pyre_object::tagged_int::is_tagged_int(w_value) }
+        {
+            return true;
+        }
+        return unsafe { (*w_value).w_class.is_null() };
+    }
+    let Some(actual) = crate::typedef::r#type(w_value) else {
+        return false;
+    };
+    std::ptr::eq(actual, exact)
+}
+
+/// Float half of `_pick_unbox_type`: PyPy uses
+/// `type(w_value) is space.FloatObjectCls`, so a float subclass must retain
+/// its boxed object and `w_class` too.
+unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
+    if !unsafe { pyre_object::is_float(w_value) } {
+        return false;
+    }
+    let exact = crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE);
+    if exact.is_null() {
+        return unsafe { (*w_value).w_class.is_null() };
+    }
+    let Some(actual) = crate::typedef::r#type(w_value) else {
+        return false;
+    };
+    std::ptr::eq(actual, exact)
 }
 
 /// mapdict.py:586-590 `UnboxedPlainAttribute._convert_to_boxed` — rebuild the
@@ -2066,7 +2099,7 @@ unsafe fn convert_to_boxed_and_write<O: MapdictObject>(
 unsafe fn value_has_unbox_type(typ: UnboxType, w_value: PyObjectRef) -> bool {
     match typ {
         UnboxType::Int => unsafe { is_unboxable_int(w_value) },
-        UnboxType::Float => unsafe { pyre_object::is_float(w_value) },
+        UnboxType::Float => unsafe { is_unboxable_float(w_value) },
     }
 }
 
@@ -2603,7 +2636,7 @@ unsafe fn pick_unbox_type(self_node: MapRef, w_value: PyObjectRef) -> Option<Unb
     if term.allow_unboxing.get() {
         if ALLOW_UNBOXING_INTS && unsafe { is_unboxable_int(w_value) } {
             return Some(UnboxType::Int);
-        } else if unsafe { pyre_object::is_float(w_value) } {
+        } else if unsafe { is_unboxable_float(w_value) } {
             return Some(UnboxType::Float);
         }
     }

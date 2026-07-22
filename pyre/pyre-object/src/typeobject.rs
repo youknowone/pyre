@@ -101,9 +101,16 @@ pub struct W_TypeObject {
     pub ob_header: PyObject,
     /// Class name (heap-allocated, leaked).
     pub name: *mut String,
+    /// App-level `__name__` object.  CPython preserves this object's identity
+    /// (including a str subclass assigned to a heap type); null means the
+    /// initial exact string has not been materialised yet.
+    pub w_name: PyObjectRef,
     /// Qualified class name.  PyPy `W_TypeObject.qualname` is populated by
     /// consuming `__qualname__` from the class namespace at construction.
     pub qualname: *mut String,
+    /// App-level `__qualname__` object, with the same lazy/identity semantics
+    /// as `w_name`.
+    pub w_qualname: PyObjectRef,
     /// Tuple of base type objects (PyObjectRef → W_TupleObject or PY_NULL).
     pub bases: PyObjectRef,
     /// Raw pointer to the class dict backing storage (`dict_w` analogue).
@@ -344,7 +351,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         },
         mro_w: std::ptr::null_mut(),
         name,
+        w_name: PY_NULL,
         qualname,
+        w_qualname: PY_NULL,
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
@@ -458,7 +467,9 @@ pub fn w_type_new_builtin(
         },
         mro_w: std::ptr::null_mut(),
         name,
+        w_name: PY_NULL,
         qualname,
+        w_qualname: PY_NULL,
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
@@ -793,12 +804,30 @@ pub unsafe fn w_type_get_name(obj: PyObjectRef) -> &'static str {
     &*(*(obj as *const W_TypeObject)).name
 }
 
+/// Return the stable app-level `type.__name__` object.
+pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
+    let t = &mut *(obj as *mut W_TypeObject);
+    if t.w_name.is_null() {
+        let full = &*t.name;
+        let bare = if t.flag_heaptype {
+            full.as_str()
+        } else {
+            full.rsplit('.').next().unwrap_or(full)
+        };
+        t.w_name = crate::w_str_new(bare);
+    }
+    t.w_name
+}
+
 /// Replace the class name (`descr_set__name__`, typeobject.py:1058
 /// `w_type.name = name`).  `name` is an owned `String` behind a raw
 /// pointer (`malloc_raw` = boxed); assigning through it drops the old
 /// name and installs the new one, leaving the slot itself unchanged.
-pub unsafe fn w_type_set_name(obj: PyObjectRef, name: &str) {
-    *(*(obj as *mut W_TypeObject)).name = name.to_string();
+pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
+    let t = &mut *(obj as *mut W_TypeObject);
+    *t.name = crate::w_str_get_value(w_name).to_string();
+    t.w_name = w_name;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// `typeobject.py:223-235` / `getqualname`: the class qualified name lives
@@ -807,8 +836,20 @@ pub unsafe fn w_type_get_qualname(obj: PyObjectRef) -> &'static str {
     &*(*(obj as *const W_TypeObject)).qualname
 }
 
-pub unsafe fn w_type_set_qualname(obj: PyObjectRef, qualname: &str) {
-    *(*(obj as *mut W_TypeObject)).qualname = qualname.to_string();
+/// Return the stable app-level `type.__qualname__` object.
+pub unsafe fn w_type_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
+    let t = &mut *(obj as *mut W_TypeObject);
+    if t.w_qualname.is_null() {
+        t.w_qualname = crate::w_str_new(&*t.qualname);
+    }
+    t.w_qualname
+}
+
+pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
+    let t = &mut *(obj as *mut W_TypeObject);
+    *t.qualname = crate::w_str_get_value(w_qualname).to_string();
+    t.w_qualname = w_qualname;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// Get the bases tuple.

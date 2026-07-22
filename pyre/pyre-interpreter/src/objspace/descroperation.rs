@@ -3356,6 +3356,12 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // RPython inserts a stack check on this recursive object-space call.
+    // Container comparisons recurse without pushing a Python frame (for
+    // example two distinct self-referential lists), so keep the same guard
+    // explicitly in the Rust port and raise RecursionError before exhausting
+    // the native stack.
+    crate::stack_check::stack_check()?;
     // A builtin subclass overriding the comparison dunder dispatches the
     // override first (with reflected-subclass priority); exact builtins and
     // non-overriding subclasses fall through to the by-layout comparison slot,
