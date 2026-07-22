@@ -221,8 +221,16 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
                 for (key, rows) in prog.struct_field_attrs {
                     acc.struct_field_attrs.entry(key).or_insert(rows);
                 }
+                // Last-writer-wins, unlike the first-writer merges around it:
+                // a cross-target layout sidecar is appended after the host
+                // artefacts (`auto_discover_workspace_llbc_paths`) precisely so
+                // its target field offsets overwrite the host's here, while its
+                // (body-stripped, so partly unresolvable) per-type-string
+                // tables lose to the host above.  Among the host artefacts this
+                // is a no-op: they describe one target, so a shared struct's
+                // layout is identical in each.
                 for (key, layout) in prog.exact_layouts {
-                    acc.exact_layouts.entry(key).or_insert(layout);
+                    acc.exact_layouts.insert(key, layout);
                 }
                 // Merge the name → StructId resolver, collapsing a key to
                 // `None` when two crates disagree on the identity (a

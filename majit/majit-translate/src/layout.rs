@@ -38,6 +38,25 @@ pub fn target_word_size() -> usize {
     })
 }
 
+/// Whether `target` is a real cross target — non-empty and distinct from the
+/// build `host` — so its layout sidecars apply. Native builds share the host's
+/// struct layouts and need no sidecar.
+pub fn is_cross_target(target: &str, host: &str) -> bool {
+    !target.is_empty() && target != host
+}
+
+/// Filename of the cross-target layout sidecar for `crate_stem` (an `.ullbc`
+/// stem such as `pyre-object`) and `target`, e.g.
+/// `pyre-object.wasm32-unknown-unknown.layouts.ullbc`.
+///
+/// The single home for this naming convention: `pyre-jit-trace/build.rs`
+/// (preflight, rerun tracking, the codegen cache key) and
+/// [`crate::auto_discover_workspace_llbc_paths`] both derive sidecar names
+/// through here, so the convention cannot drift between them.
+pub fn layout_sidecar_filename(crate_stem: &str, target: &str) -> String {
+    format!("{crate_stem}.{target}.layouts.ullbc")
+}
+
 /// RPython: `symbolic.get_field_token` + `symbolic.get_size` provider.
 ///
 /// Supplies struct layouts for the codewriter pipeline. Each struct is

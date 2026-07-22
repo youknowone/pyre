@@ -402,7 +402,7 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
     text = source.read_text(encoding="utf-8")
     decoder = json.JSONDecoder()
 
-    def field(name: str):
+    def field(name: str, *, want: type):
         key = f'"{name}":'
         at = text.find(key)
         if at < 0:
@@ -411,15 +411,34 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
         start = at + len(key)
         while text[start] in " \t\r\n":
             start += 1
-        value, _ = decoder.raw_decode(text, start)
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError as exc:
+            # The substring scan is unscoped, so `"{name}":` could match inside
+            # a string literal before the real key; then `start` points at
+            # non-JSON and decoding fails.  Report it the same way the rest of
+            # this file does instead of surfacing a bare traceback.
+            raise SystemExit(
+                f"extract-llbc.py: {source.name} `{name}` did not decode as JSON "
+                f"({exc}); the reducer's key scan matched a non-field occurrence."
+            ) from exc
+        # Shape guard: a wrong (earlier) match can still decode as valid JSON of
+        # the wrong type.  `type_decls` in particular must reach the sidecar
+        # intact — it is the sole source of the target field offsets.
+        if not isinstance(value, want):
+            raise SystemExit(
+                f"extract-llbc.py: {source.name} `{name}` decoded as "
+                f"{type(value).__name__}, expected {want.__name__}; the reducer's "
+                f"key scan matched a non-field occurrence."
+            )
         return value
 
     slim = {
-        "charon_version": field("charon_version"),
-        "has_errors": field("has_errors"),
+        "charon_version": field("charon_version", want=str),
+        "has_errors": field("has_errors", want=bool),
         "translated": {
-            "crate_name": field("crate_name"),
-            "type_decls": field("type_decls"),
+            "crate_name": field("crate_name", want=str),
+            "type_decls": field("type_decls", want=list),
             "fun_decls": [],
         },
     }

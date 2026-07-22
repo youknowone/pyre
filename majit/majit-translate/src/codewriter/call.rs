@@ -2154,7 +2154,15 @@ impl CallControl {
         // `as Arc<dyn ArrayDescr>` matches the trait-object field type
         // on `SimpleInteriorFieldDescr.array_descr`.
         let item_size = compute_struct_size(self, &elem_name);
-        let base_size = self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
+        // Interior-field struct arrays address `GcTypedArray`, a flat
+        // `{ len: usize, items: [u8; 0] }` block whose items always begin at
+        // `GC_TYPED_ARRAY_ITEMS_OFFSET = WORD` regardless of the element's
+        // alignment (both the live block and the guard-resume materialiser
+        // `allocate_array_struct` use that offset). The base must match the
+        // block, so it is the bare word — NOT the element-aligned offset the
+        // list int/float storage (`TypedItemsBlock`, genuinely element-aligned)
+        // needs in `arraydescrof_concrete`.
+        let base_size = self.array_header_size;
         let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
         let cached: majit_ir::descr::DescrRef = {
             let mut gc = majit_ir::descr::gc_cache().lock().unwrap();

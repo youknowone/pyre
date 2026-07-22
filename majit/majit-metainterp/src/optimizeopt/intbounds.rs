@@ -1636,12 +1636,6 @@ impl Optimization for OptIntBounds {
                 | OpCode::GetfieldRawI
                 | OpCode::GetfieldGcI
                 | OpCode::GetinteriorfieldGcI
-                | OpCode::GetfieldRawR
-                | OpCode::GetfieldGcR
-                | OpCode::GetinteriorfieldGcR
-                | OpCode::GetfieldRawF
-                | OpCode::GetfieldGcF
-                | OpCode::GetinteriorfieldGcF
                 | OpCode::GetarrayitemRawI
                 | OpCode::GetarrayitemGcI
                 | OpCode::CallPureI

@@ -181,7 +181,26 @@ fn preflight_llbc_or_fail() {
     if !charon_present {
         println!("cargo::error=Install charon (one-time): scripts/install-charon.py");
     }
-    println!("cargo::error=Extract the LLBC: scripts/extract-llbc.py");
+    // Cross-compiling: the driver's default `LAYOUT_TARGETS` only covers
+    // wasm32, so any other target's sidecars are produced only when the
+    // extraction is told this target explicitly.  Advertise it (harmless but
+    // redundant for wasm32).  The override must also list the sidecar paths,
+    // since `PYRE_MIR_FRONTEND_LLBC` is treated as the complete input set and
+    // returns before the sidecar check above.
+    let sidecars = llbc_layout_sidecars();
+    let (extract_cmd, override_extra) = if sidecars.is_empty() {
+        ("scripts/extract-llbc.py".to_string(), String::new())
+    } else {
+        let target = std::env::var("TARGET").unwrap_or_default();
+        (
+            format!("LLBC_LAYOUT_TARGETS={target} scripts/extract-llbc.py"),
+            sidecars
+                .iter()
+                .map(|name| format!(":/abs/{name}"))
+                .collect::<String>(),
+        )
+    };
+    println!("cargo::error=Extract the LLBC: {extract_cmd}");
 
     // The install step is only needed when the charon binary is absent;
     // with it present the fix is the single extract command.
@@ -199,10 +218,10 @@ fn preflight_llbc_or_fail() {
 {}\n\
  Bootstrap (run from the repo root):\n\
 {}\
-   scripts/extract-llbc.py\n\
+   {}\n\
 \n\
  …or point the build at existing artefacts:\n\
-   export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc:/abs/pyre-jit.ullbc\n\
+   export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc:/abs/pyre-jit.ullbc{}\n\
 ========================================================================\n",
         missing
             .iter()
@@ -210,6 +229,8 @@ fn preflight_llbc_or_fail() {
             .collect::<Vec<_>>()
             .join("\n"),
         install_line,
+        extract_cmd,
+        override_extra,
     );
 
     std::process::exit(1);
@@ -616,14 +637,17 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
 /// artefacts so their Charon-resolved field offsets win.
 fn llbc_layout_sidecars() -> Vec<String> {
     let target = std::env::var("TARGET").unwrap_or_default();
-    if target.is_empty() || target == std::env::var("HOST").unwrap_or_default() {
+    let host = std::env::var("HOST").unwrap_or_default();
+    if !majit_translate::layout::is_cross_target(&target, &host) {
         return Vec::new();
     }
     // `pyre-jit` is absent: it has no sidecar (see the extraction driver's
     // spec for why), so only the object model gets cross-target layouts.
+    // The naming convention lives in `majit_translate::layout` so it stays in
+    // lockstep with `auto_discover_workspace_llbc_paths`.
     ["pyre-object", "pyre-interpreter"]
         .iter()
-        .map(|crate_name| format!("{crate_name}.{target}.layouts.ullbc"))
+        .map(|crate_name| majit_translate::layout::layout_sidecar_filename(crate_name, &target))
         .collect()
 }
 
@@ -787,6 +811,21 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
                 .join("build")
                 .join("llbc")
                 .join(llbc),
+        );
+    }
+    // Cross-target sidecars are build inputs too: they supply the target field
+    // offsets `auto_discover_workspace_llbc_paths` merges in.  Without them in
+    // the key, regenerating a sidecar (same Rust sources, same target — e.g.
+    // after fixing the extraction flags) leaves the key unchanged, so
+    // `restore_codegen_cache` would serve the descrs built from the old
+    // offsets.  Empty on a native build.
+    for sidecar in llbc_layout_sidecars() {
+        hash_file_content(
+            h,
+            &std::path::Path::new(repo_root)
+                .join("build")
+                .join("llbc")
+                .join(&sidecar),
         );
     }
 }
