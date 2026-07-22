@@ -279,7 +279,7 @@ unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut m
 /// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
 /// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
 /// -held children. No-op for non-exception values.
-unsafe fn walk_raw_exception_roots(
+pub unsafe fn walk_raw_exception_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
@@ -617,6 +617,12 @@ pub unsafe fn walk_pyframe_roots_area(
             // This is the post-PUSH_EXC_INFO owner of the same exception and
             // must preserve its traceback/frame graph identically.
             unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
+            // `executioncontext.py:55` current_gen_or_coroutine is the head
+            // of the running-generator chain.  The generator custom trace
+            // follows each node's `previous_gen_or_coroutine` edge.
+            let current_gen_slot =
+                unsafe { &mut (*ec).current_gen_or_coroutine as *mut PyObjectRef };
+            visitor(unsafe { &mut *(current_gen_slot as *mut majit_ir::GcRef) });
             // pending_with_disabled_del is a GC-visible list upstream
             // (executioncontext.py:652); pyre's Vec lives in the boxed
             // UserDelAction, so its element slots are visited here.
@@ -1072,6 +1078,19 @@ pub fn get_current_exception() -> PyObjectRef {
     unsafe { (*ec).sys_exc_value }
 }
 
+/// `executioncontext.py:219-233 sys_exc_info` — return the topmost handled
+/// exception, including one parked on the running generator/coroutine chain.
+/// The bytecode PUSH_EXC_INFO machinery deliberately continues to use
+/// [`get_current_exception`] for the direct EC slot; app-level `sys.exception`
+/// and bare raise use this logical view instead.
+pub fn get_sys_exception() -> PyObjectRef {
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return PY_NULL;
+    }
+    unsafe { (*ec).sys_exc_info(false) }
+}
+
 /// Flat TLS write of the per-thread `CURRENT_EXCEPTION` slot — same
 /// residual-leaf contract as [`get_current_exception`].
 #[majit_macros::dont_look_inside]
@@ -1142,7 +1161,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
-    crate::error::chain_context(exc, get_current_exception());
+    crate::error::chain_context(exc, get_sys_exception());
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
             // `interp_exceptions.py:166-174 descr_setcause` — writes
@@ -1308,7 +1327,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     // handled records that active exception as its __context__, not only an
     // explicit `raise`.  Recorded once (skipped when a __context__ is already
     // stamped), so it lands at the frame where the exception first surfaces.
-    crate::error::chain_context(err.exc_object, get_current_exception());
+    crate::error::chain_context(err.exc_object, get_sys_exception());
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the
@@ -2949,7 +2968,7 @@ impl OpcodeStepExecutor for PyFrame {
             0 => {
                 // Bare `raise` — re-raise current exception
                 // PyPy: executioncontext.py sys_exc_info
-                let exc = get_current_exception();
+                let exc = get_sys_exception();
                 if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
                     Err(PyError::runtime_error("No active exception to reraise"))
                 } else if unsafe { pyre_object::is_exception(exc) } {

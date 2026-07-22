@@ -370,7 +370,7 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
 /// out lets the JIT bypass invoke the same logic without going through the
 /// builtin call dispatch.
 pub fn exc_info_direct() -> PyObjectRef {
-    let exc = crate::eval::get_current_exception();
+    let exc = crate::eval::get_sys_exception();
     unsafe {
         if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
             w_tuple_new(vec![w_none(), w_none(), w_none()])
@@ -1131,7 +1131,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function_with_arity(
             "exception",
             |_| {
-                let exc = crate::eval::get_current_exception();
+                let exc = crate::eval::get_sys_exception();
                 Ok(unsafe {
                     if exc.is_null() || !pyre_object::is_exception(exc) {
                         w_none()

@@ -38,6 +38,13 @@ pub struct GeneratorIterator {
     pub cr_origin: PyObjectRef,
     /// PyPy: `Coroutine._warned_unawaited`.
     pub warned_unawaited: bool,
+    /// `generator.py:29` `GeneratorOrCoroutine.saved_operr`.  Pyre stores
+    /// the materialized exception value carried by `ExecutionContext` rather
+    /// than an `OperationError`, but preserves the same per-generator owner.
+    pub saved_exc_value: PyObjectRef,
+    /// `generator.py:30` `previous_gen_or_coroutine`: the execution-context
+    /// linked-list edge while this generator is running.
+    pub previous_gen_or_coroutine: PyObjectRef,
 }
 
 /// PyPy `generator.py CoroutineWrapper`: the iterator returned by
@@ -82,6 +89,8 @@ fn w_generator_or_coroutine_new(frame_ptr: *mut u8, coroutine: bool) -> PyObject
         qualname: PY_NULL,
         cr_origin: if coroutine { crate::w_none() } else { PY_NULL },
         warned_unawaited: false,
+        saved_exc_value: PY_NULL,
+        previous_gen_or_coroutine: PY_NULL,
     };
     // A generator must be GC-managed, not immortal `malloc_typed`: the
     // collector never reaches an immortal object, so the registered
@@ -192,6 +201,28 @@ pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).running = val;
     }
+}
+
+#[inline]
+pub unsafe fn w_generator_get_saved_exc_value(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).saved_exc_value }
+}
+
+#[inline]
+pub unsafe fn w_generator_set_saved_exc_value(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).saved_exc_value = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_generator_get_previous(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).previous_gen_or_coroutine }
+}
+
+#[inline]
+pub unsafe fn w_generator_set_previous(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).previous_gen_or_coroutine = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]

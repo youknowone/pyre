@@ -412,6 +412,23 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.saved_exc_value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(
+        &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+    // W_BaseException is currently malloc_typed-immortal, so forwarding its
+    // carrier above does not make the collector visit traceback/context/args.
+    // Preserve the children of the exception parked by
+    // `ExecutionContext.pop_gen_or_coroutine`, just as the EC root walker does
+    // for its active `sys_exc_value` slot.
+    let mut exception_adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_exception_roots(
+            gen_obj.saved_exc_value,
+            &mut exception_adapter,
+        )
+    };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         if pyre_object::gc_hook::try_gc_owns_object(gen_obj.frame_ptr) {

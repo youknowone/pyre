@@ -12788,64 +12788,70 @@ fn generator_send_ex(
         w_generator_set_started(gen_obj);
         w_generator_set_running(gen_obj, true);
 
-        // A suspended `yield from` owns the next resume operation.  Keep the
-        // outer frame parked until its delegate either yields again or is
-        // exhausted, so a value or exception never takes the bytecode path
-        // intended for an awaitable resume.
-        let mut pending_operr = operr;
-        let mut delegated_completion = false;
-        if already_started && !frame.w_yielding_from.is_null() {
-            match resume_yield_from(frame, w_arg, pending_operr.take(), throw_args) {
-                Ok(Some(value)) => {
-                    w_generator_set_running(gen_obj, false);
-                    return Ok(value);
-                }
-                Ok(None) => delegated_completion = true,
-                Err(err) => pending_operr = Some(err),
-            }
+        // generator.py:127 `ec.push_gen_or_coroutine(self)`: make the
+        // exception suspended on this generator current for the whole resume,
+        // including a delegated `yield from` call.
+        let ec =
+            crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
+        if !ec.is_null() {
+            (*ec).push_gen_or_coroutine(gen_obj);
         }
+        let invoke_result = (|| -> PyResult {
+            // A suspended `yield from` owns the next resume operation.  Keep
+            // the outer frame parked until its delegate either yields again or
+            // is exhausted, so a value or exception never takes the bytecode
+            // path intended for an awaitable resume.
+            let mut pending_operr = operr;
+            let mut delegated_completion = false;
+            if already_started && !frame.w_yielding_from.is_null() {
+                match resume_yield_from(frame, w_arg, pending_operr.take(), throw_args) {
+                    Ok(Some(value)) => return Ok(value),
+                    Ok(None) => delegated_completion = true,
+                    Err(err) => pending_operr = Some(err),
+                }
+            }
 
-        // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
-        let w_inputvalue = if already_started && pending_operr.is_none() && !delegated_completion {
-            Some(w_arg)
-        } else {
-            None
-        };
-        let result = frame.execute_frame(w_inputvalue, pending_operr);
+            // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
+            let w_inputvalue =
+                if already_started && pending_operr.is_none() && !delegated_completion {
+                    Some(w_arg)
+                } else {
+                    None
+                };
+            let result = frame.execute_frame(w_inputvalue, pending_operr);
 
-        w_generator_set_running(gen_obj, false);
-
-        match result {
-            Ok(value) => {
-                // generator.py:109-114 — if the frame marked itself finished,
-                // it was RETURNed from; otherwise it YIELDed.
-                if frame.frame_finished_execution() {
+            match result {
+                Ok(value) => {
+                    // generator.py:109-114 — if the frame marked itself
+                    // finished, it was RETURNed from; otherwise it YIELDed.
+                    if frame.frame_finished_execution() {
+                        generator_frame_is_finished(gen_obj, frame);
+                        // generator.py:117-119 / pyopcode.py RETURN_VALUE in
+                        // generator frames — `raise StopIteration(returnvalue)`
+                        // so callers can pull the return value off `.value`.
+                        Err(stop_iteration_with_value(value))
+                    } else {
+                        Ok(value)
+                    }
+                }
+                Err(e) => {
                     generator_frame_is_finished(gen_obj, frame);
-                    // generator.py:117-119 / pyopcode.py RETURN_VALUE in
-                    // generator frames — `raise StopIteration(returnvalue)`
-                    // so callers can pull the return value off `.value`.
-                    // Wrap any non-None return into the exception's args
-                    // tuple; bare `return` (or fallthrough → None) keeps
-                    // an empty args tuple.
-                    Err(stop_iteration_with_value(value))
-                } else {
-                    Ok(value)
+                    // generator.py `_leak_stopiteration` (PEP 479).
+                    if e.kind == crate::PyErrorKind::StopIteration {
+                        Err(leak_stopiteration(e))
+                    } else {
+                        Err(e)
+                    }
                 }
             }
-            Err(e) => {
-                generator_frame_is_finished(gen_obj, frame);
-                // generator.py `_leak_stopiteration` (PEP 479) — a
-                // StopIteration that escaped the body becomes RuntimeError;
-                // any other error propagates unchanged.  The normal-return
-                // StopIteration is built in the `Ok`/`frame_finished_execution`
-                // arm above and never reaches here.
-                if e.kind == crate::PyErrorKind::StopIteration {
-                    Err(leak_stopiteration(e))
-                } else {
-                    Err(e)
-                }
-            }
+        })();
+        // generator.py:142-145 `finally`: always clear the running flag and
+        // restore the caller's exception state after this resume.
+        w_generator_set_running(gen_obj, false);
+        if !ec.is_null() {
+            (*ec).pop_gen_or_coroutine(gen_obj);
         }
+        invoke_result
     }
 }
 
