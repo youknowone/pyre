@@ -247,6 +247,28 @@ pub(crate) fn classify_vstack_opcode(
     }
 }
 
+/// The boxed constant a value `LOAD_CONST` pushes, as a trace-constant OpRef,
+/// or `OpRef::NONE` when `instr` is not a `LOAD_CONST` (or its constant is
+/// unresolvable). Realizes the constant the same way `bh_load_const_fn`
+/// (`call_jit.rs`) and the LOAD_CONST fold (`residual_call.rs`) do, so the
+/// mirror carries the identical box the resume path would.
+fn loadconst_operand_ref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &pyre_interpreter::CodeObject,
+    instr: &pyre_interpreter::bytecode::Instruction,
+    op_arg: pyre_interpreter::OpArg,
+) -> OpRef {
+    let pyre_interpreter::bytecode::Instruction::LoadConst { consti } = instr else {
+        return OpRef::NONE;
+    };
+    let idx = usize::from(consti.get(op_arg));
+    let w_const = pyre_interpreter::pyframe::load_const_from_code(code, idx);
+    if w_const.is_null() {
+        return OpRef::NONE;
+    }
+    ctx.trace_ctx.const_ref(w_const as i64)
+}
+
 /// #73: reconcile the PREVIOUS Python opcode's stack effect into
 /// [`WalkContext::vstack_boxes`] at an opcode boundary, BEFORE the new
 /// opcode (`new_pypc`) is walked.  Running this before the new op means
@@ -368,7 +390,25 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // `NONE` means the result was produced in an unboxed bank;
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
-                ctx.vstack_boxes[new_depth - 1] = ctx.vstack_last_ref;
+                let mut top = ctx.vstack_last_ref;
+                if top == OpRef::NONE {
+                    // A value `LOAD_CONST` (large int / float) routes its result
+                    // through the unboxed int/float bank, so `write_ref_reg`
+                    // never stamps `vstack_last_ref` and this slot would stay a
+                    // NONE hole. Unlike a genuine int-bank temp, a constant has
+                    // no live register the resume can re-box from, so `stack_sync`
+                    // omitting it leaves the bridge-resumed slot NULL — fatal when
+                    // it is a following CALL argument (a literal `f(1000)` in a
+                    // hot loop makes the callee parameter reconstruct unbound).
+                    // Materialize the boxed constant so the mirror carries it,
+                    // mirroring `MIFrame.registers_r` holding a `Const` box for
+                    // the same operand (resume numbers it via `getconst`). A
+                    // Ref-typed const (str / code) already stamped
+                    // `vstack_last_ref` through `write_ref_reg`, so it never
+                    // reaches this fallback.
+                    top = loadconst_operand_ref(ctx, code, &instr, op_arg);
+                }
+                ctx.vstack_boxes[new_depth - 1] = top;
             }
         }
         VstackOpClass::PopOnlyOrSideStore => {
