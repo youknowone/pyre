@@ -9986,31 +9986,17 @@ fn generator_unpack_into(
             // resume value (e.g. `x = yield`) would observe stale
             // stack on the second iteration.
             w_generator_set_started(gen_obj);
-            w_generator_set_running(gen_obj, true);
-            let result = frame.execute_frame(Some(pyre_object::w_none()), None);
-            w_generator_set_running(gen_obj, false);
+            let result = generator_invoke_execute_frame(
+                gen_obj,
+                frame,
+                Some(pyre_object::w_none()),
+                None,
+                None,
+            );
             match result {
-                // generator.py:132-138 `_invoke_execute_frame`'s
-                // `finally: self.frame_is_finished()` runs before the
-                // OperationError reaches the unpack_into try/except,
-                // so by the time PyPy's `if e.match(StopIteration):
-                // break` fires the generator is already marked
-                // finished.  Pyre's inline `frame.execute_frame` path
-                // skips that finally block, so mirror it explicitly.
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
-                    // generator.py:131-138 — `_invoke_execute_frame` applies
-                    // `_leak_stopiteration` (PEP 479) BEFORE unpack_into's
-                    // `if e.match(StopIteration): break`, so a StopIteration
-                    // leaked from the body becomes RuntimeError and propagates;
-                    // it is not the normal-exhaustion path (which is the
-                    // `Ok`/`frame_finished_execution` arm below).
-                    generator_frame_is_finished(gen_obj, frame);
-                    return Err(leak_stopiteration(e));
-                }
-                Err(e) => {
-                    generator_frame_is_finished(gen_obj, frame);
-                    return Err(e);
-                }
+                // `_invoke_execute_frame` has already applied PEP 479 and
+                // finalized the frame for any escaping error.
+                Err(e) => return Err(e),
                 Ok(w_result) => {
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
@@ -12744,6 +12730,46 @@ unsafe fn generator_frame_is_finished(gen_obj: PyObjectRef, frame: &mut crate::p
     unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
 }
 
+/// generator.py:121-145 `_invoke_execute_frame`: install the generator's
+/// exception state, execute its already-entered frame resume, finish the frame
+/// on errors, and perform the common frame/running/EC cleanup in `finally`.
+unsafe fn generator_invoke_execute_frame(
+    gen_obj: PyObjectRef,
+    frame: &mut crate::pyframe::PyFrame,
+    w_inputvalue: Option<PyObjectRef>,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyResult {
+    use pyre_object::generator::*;
+    if w_generator_is_running(gen_obj) {
+        return Err(PyError::value_error("generator already executing"));
+    }
+    w_generator_set_running(gen_obj, true);
+    let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
+    if !ec.is_null() {
+        (*ec).push_gen_or_coroutine(gen_obj);
+    }
+    let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
+    let result = match result {
+        Err(e) => {
+            generator_frame_is_finished(gen_obj, frame);
+            if e.kind == crate::PyErrorKind::StopIteration {
+                Err(leak_stopiteration(e))
+            } else {
+                Err(e)
+            }
+        }
+        result => result,
+    };
+    // generator.py:142-145 `finally`.
+    frame.f_backref = std::ptr::null_mut();
+    w_generator_set_running(gen_obj, false);
+    if !ec.is_null() {
+        (*ec).pop_gen_or_coroutine(gen_obj);
+    }
+    result
+}
+
 /// PyPy: GeneratorIterator._send_ex(w_arg, operr)
 ///
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
@@ -12756,10 +12782,6 @@ fn generator_send_ex(
 ) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
-        if w_generator_is_running(gen_obj) {
-            return Err(PyError::value_error("generator already executing"));
-        }
-
         if w_generator_is_exhausted(gen_obj) {
             if let Some(err) = operr {
                 return Err(err);
@@ -12786,72 +12808,30 @@ fn generator_send_ex(
             }
         }
         w_generator_set_started(gen_obj);
-        w_generator_set_running(gen_obj, true);
-
-        // generator.py:127 `ec.push_gen_or_coroutine(self)`: make the
-        // exception suspended on this generator current for the whole resume,
-        // including a delegated `yield from` call.
-        let ec =
-            crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
-        if !ec.is_null() {
-            (*ec).push_gen_or_coroutine(gen_obj);
-        }
-        let invoke_result = (|| -> PyResult {
-            // A suspended `yield from` owns the next resume operation.  Keep
-            // the outer frame parked until its delegate either yields again or
-            // is exhausted, so a value or exception never takes the bytecode
-            // path intended for an awaitable resume.
-            let mut pending_operr = operr;
-            let mut delegated_completion = false;
-            if already_started && !frame.w_yielding_from.is_null() {
-                match resume_yield_from(frame, w_arg, pending_operr.take(), throw_args) {
-                    Ok(Some(value)) => return Ok(value),
-                    Ok(None) => delegated_completion = true,
-                    Err(err) => pending_operr = Some(err),
-                }
-            }
-
-            // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
-            let w_inputvalue =
-                if already_started && pending_operr.is_none() && !delegated_completion {
-                    Some(w_arg)
-                } else {
-                    None
-                };
-            let result = frame.execute_frame(w_inputvalue, pending_operr);
-
-            match result {
-                Ok(value) => {
-                    // generator.py:109-114 — if the frame marked itself
-                    // finished, it was RETURNed from; otherwise it YIELDed.
-                    if frame.frame_finished_execution() {
-                        generator_frame_is_finished(gen_obj, frame);
-                        // generator.py:117-119 / pyopcode.py RETURN_VALUE in
-                        // generator frames — `raise StopIteration(returnvalue)`
-                        // so callers can pull the return value off `.value`.
-                        Err(stop_iteration_with_value(value))
-                    } else {
-                        Ok(value)
-                    }
-                }
-                Err(e) => {
+        // generator.py:104 `_invoke_execute_frame` delegates the complete
+        // resume to `frame.execute_frame(w_arg_or_err)`.  In particular,
+        // `PyFrame.resume_execute_frame` handles `w_yielding_from` only after
+        // the outer frame has entered the execution context.
+        let w_inputvalue = if already_started && operr.is_none() {
+            Some(w_arg)
+        } else {
+            None
+        };
+        match generator_invoke_execute_frame(gen_obj, frame, w_inputvalue, operr, throw_args) {
+            Ok(value) => {
+                // generator.py:109-114 — if the frame marked itself finished,
+                // it was RETURNed from; otherwise it YIELDed.
+                if frame.frame_finished_execution() {
                     generator_frame_is_finished(gen_obj, frame);
-                    // generator.py `_leak_stopiteration` (PEP 479).
-                    if e.kind == crate::PyErrorKind::StopIteration {
-                        Err(leak_stopiteration(e))
-                    } else {
-                        Err(e)
-                    }
+                    // generator.py:117-119 / pyopcode.py RETURN_VALUE in
+                    // generator frames — `raise StopIteration(returnvalue)`.
+                    Err(stop_iteration_with_value(value))
+                } else {
+                    Ok(value)
                 }
             }
-        })();
-        // generator.py:142-145 `finally`: always clear the running flag and
-        // restore the caller's exception state after this resume.
-        w_generator_set_running(gen_obj, false);
-        if !ec.is_null() {
-            (*ec).pop_gen_or_coroutine(gen_obj);
+            Err(e) => Err(e),
         }
-        invoke_result
     }
 }
 
@@ -12860,13 +12840,13 @@ fn generator_send_ex(
 /// `Some` is a value yielded by the delegate and is therefore also the
 /// outer generator's result.  `None` means the delegate completed and the
 /// outer frame has been positioned at the completion path.
-fn resume_yield_from(
+pub(crate) fn resume_yield_from(
     frame: &mut crate::pyframe::PyFrame,
+    w_yf: PyObjectRef,
     w_arg: PyObjectRef,
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let w_yf = frame.w_yielding_from;
     debug_assert!(!w_yf.is_null());
 
     let result = match operr {
@@ -12890,7 +12870,20 @@ fn resume_yield_from(
     };
 
     match result {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => {
+            // pyopcode.py:1225-1227 `next_yield_from`: publish the delegate
+            // only after its call has yielded.  While the delegate is
+            // executing, `gi_yieldfrom` must therefore remain None.
+            frame.w_yielding_from = w_yf;
+            if pyre_object::gc_hook::try_gc_owns_object(
+                frame as *mut crate::pyframe::PyFrame as *mut u8,
+            ) {
+                pyre_object::gc_hook::try_gc_write_barrier(
+                    frame as *mut crate::pyframe::PyFrame as *mut u8,
+                );
+            }
+            Ok(Some(value))
+        }
         Err(err) if err.kind == PyErrorKind::StopIteration => {
             frame.w_yielding_from = pyre_object::PY_NULL;
             finish_yield_from(frame, err)?;

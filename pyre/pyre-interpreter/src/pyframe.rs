@@ -2511,11 +2511,8 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:300 resume_execute_frame (send-path only).
-    ///
-    /// A suspended delegate is resumed by `generator_send_ex` before this
-    /// method runs.  Once that delegate completes, this path receives the
-    /// normal outer-frame input again.
+    /// pyframe.py:300 resume_execute_frame, after any suspended delegate has
+    /// either yielded or completed in `eval_frame_plain_with_resume`.
     #[inline]
     pub fn resume_execute_frame(
         &mut self,
@@ -2537,12 +2534,21 @@ impl PyFrame {
         w_inputvalue: Option<PyObjectRef>,
         operr: Option<crate::PyError>,
     ) -> crate::PyResult {
-        if operr.is_none() {
-            if let Some(w_arg_or_err) = w_inputvalue {
-                let _ = self.resume_execute_frame(w_arg_or_err)?;
-            }
-        }
-        crate::eval::eval_frame_plain_with_operr(self, operr)
+        crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
+    }
+
+    /// Generator/coroutine execution entry carrying the original throw
+    /// arguments for non-generator delegates.  This is the Rust representation
+    /// of PyPy's `SApplicationException` payload passed through
+    /// `PyFrame.execute_frame(w_arg_or_err)`.
+    #[inline]
+    pub fn execute_generator_frame(
+        &mut self,
+        w_inputvalue: Option<PyObjectRef>,
+        operr: Option<crate::PyError>,
+        throw_args: Option<([PyObjectRef; 3], usize)>,
+    ) -> crate::PyResult {
+        crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, throw_args)
     }
 
     /// pyframe.py:521-522 `hide(self): return self.pycode.hidden_applevel`.

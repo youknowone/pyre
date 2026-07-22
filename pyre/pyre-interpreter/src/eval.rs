@@ -1487,7 +1487,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
 /// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (call.rs:328 etc.)
 /// continues to reference it directly.
 pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
-    eval_frame_plain_with_operr(frame, None)
+    eval_frame_plain_with_resume(frame, None, None, None)
 }
 
 /// pyframe.py:270-299 execute_frame body — enter/call_trace/eval_loop/
@@ -1495,14 +1495,69 @@ pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
 /// throw() path routes it through handle_operation_error and sets
 /// last_instr = next_instr - 1 before resuming (pyframe.py:273-277).
 pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
+    eval_frame_plain_with_resume(frame, None, operr, None)
+}
+
+enum FrameResume {
+    Yielded(PyObjectRef),
+    Dispatch(Option<PyError>),
+}
+
+/// pyframe.py:285-315 `resume_execute_frame`.  A suspended `yield from` is
+/// resumed only after `execute_frame` has entered the outer frame.  Clearing
+/// `w_yielding_from` before the delegate call gives the running generator the
+/// same transient `gi_yieldfrom is None` state as PyPy.
+fn prepare_frame_resume(
+    frame: &mut PyFrame,
+    w_inputvalue: Option<PyObjectRef>,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> Result<FrameResume, PyError> {
+    let mut pending_operr = operr;
+    if !frame.w_yielding_from.is_null() {
+        let w_yf = frame.w_yielding_from;
+        frame.w_yielding_from = pyre_object::PY_NULL;
+        let w_arg = w_inputvalue.unwrap_or_else(pyre_object::w_none);
+        match crate::baseobjspace::resume_yield_from(
+            frame,
+            w_yf,
+            w_arg,
+            pending_operr.take(),
+            throw_args,
+        ) {
+            Ok(Some(value)) => return Ok(FrameResume::Yielded(value)),
+            // The delegate's StopIteration value is already on the outer
+            // frame stack and its SEND completion target is installed.
+            Ok(None) => return Ok(FrameResume::Dispatch(None)),
+            Err(err) => pending_operr = Some(err),
+        }
+    }
+    if pending_operr.is_none() {
+        if let Some(w_arg_or_err) = w_inputvalue {
+            let _ = frame.resume_execute_frame(w_arg_or_err)?;
+        }
+    }
+    Ok(FrameResume::Dispatch(pending_operr))
+}
+
+pub(crate) fn eval_frame_plain_with_resume(
+    frame: &mut PyFrame,
+    w_inputvalue: Option<PyObjectRef>,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyResult {
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
-        if let Some(mut err) = operr {
-            let mut next_instr = frame.next_instr();
-            if !handle_exception(frame, &mut err, &mut next_instr) {
-                return Err(err);
+        match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
+            FrameResume::Yielded(value) => return Ok(value),
+            FrameResume::Dispatch(Some(mut err)) => {
+                let mut next_instr = frame.next_instr();
+                if !handle_exception(frame, &mut err, &mut next_instr) {
+                    return Err(err);
+                }
+                frame.last_instr = next_instr as isize - 1;
             }
-            frame.last_instr = next_instr as isize - 1;
+            FrameResume::Dispatch(None) => {}
         }
         return eval_loop(frame);
     }
@@ -1531,12 +1586,19 @@ pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyE
     let outer_result = (|| -> PyResult {
         execution_context.call_trace(frame as *mut PyFrame)?;
         let inner_result = (|| -> PyResult {
-            if let Some(mut err) = operr {
-                let mut next_instr = frame.next_instr();
-                if !handle_exception(frame, &mut err, &mut next_instr) {
-                    return Err(err);
+            match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
+                FrameResume::Yielded(value) => {
+                    w_exitvalue = value;
+                    return Ok(value);
                 }
-                frame.last_instr = next_instr as isize - 1;
+                FrameResume::Dispatch(Some(mut err)) => {
+                    let mut next_instr = frame.next_instr();
+                    if !handle_exception(frame, &mut err, &mut next_instr) {
+                        return Err(err);
+                    }
+                    frame.last_instr = next_instr as isize - 1;
+                }
+                FrameResume::Dispatch(None) => {}
             }
             let result = eval_loop(frame)?;
             w_exitvalue = result;
