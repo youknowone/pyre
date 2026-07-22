@@ -3512,9 +3512,15 @@ fn arraydescrof(
     // descr.py:354/359-362 + symbolic.get_array_token — basesize follows
     // the lltype's nolength flag: nolength → items at offset 0;
     // length-prefixed → items past the header at len_offset + WORD.
+    //
+    // This codewriter-less fallback is shape-only and serves GC arrays, whose
+    // items sit flat at the length word (`GcTypedArray`) — it does NOT
+    // element-align. The word must be the target's, not the host's, so a
+    // cross-target extraction (build host ≠ run target) bakes the right stride;
+    // the `CallControl` path above already routes through `array_items_base`.
     let base_size = match len_offset {
         None => 0,
-        Some(off) => off + std::mem::size_of::<usize>(),
+        Some(off) => off + crate::layout::target_word_size(),
     };
     crate::jitcode::BhDescr::Array {
         base_size,
