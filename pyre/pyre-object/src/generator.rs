@@ -156,6 +156,14 @@ pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
     unsafe { (*(obj as *const GeneratorIterator)).frame_ptr }
 }
 
+#[inline]
+pub unsafe fn w_generator_set_frame(obj: PyObjectRef, frame_ptr: *mut u8) {
+    unsafe { (*(obj as *mut GeneratorIterator)).frame_ptr = frame_ptr };
+    if !frame_ptr.is_null() {
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
 pub unsafe fn w_generator_is_exhausted(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).exhausted }
 }

@@ -10004,18 +10004,18 @@ fn generator_unpack_into(
                     // leaked from the body becomes RuntimeError and propagates;
                     // it is not the normal-exhaustion path (which is the
                     // `Ok`/`frame_finished_execution` arm below).
-                    w_generator_set_exhausted(gen_obj);
+                    generator_frame_is_finished(gen_obj, frame);
                     return Err(leak_stopiteration(e));
                 }
                 Err(e) => {
-                    w_generator_set_exhausted(gen_obj);
+                    generator_frame_is_finished(gen_obj, frame);
                     return Err(e);
                 }
                 Ok(w_result) => {
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {
-                        w_generator_set_exhausted(gen_obj);
+                        generator_frame_is_finished(gen_obj, frame);
                         break;
                     }
                     // generator.py:342 `results.append(w_result)`.
@@ -12728,6 +12728,22 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 // - throw(t,v) → send_ex(None, OperationError(t,v))
 // - close()    → throw(GeneratorExit) then check result
 
+/// generator.py:313-315 `frame_is_finished` plus Python 3.14's eager frame
+/// clearing on `close()`.  Dropping the generator's frame edge releases all
+/// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
+unsafe fn generator_frame_is_finished(gen_obj: PyObjectRef, frame: &mut crate::pyframe::PyFrame) {
+    use pyre_object::generator::*;
+    unsafe { w_generator_set_exhausted(gen_obj) };
+    frame.set_frame_finished_execution(true);
+    frame.w_yielding_from = PY_NULL;
+    // The exhausted flag makes `descr_clear` take its permitted finalized
+    // branch.  It has no semantic failure path after that state transition.
+    let _ = frame.descr_clear();
+    frame.f_backref = std::ptr::null_mut();
+    frame.f_generator_nowref = PY_NULL;
+    unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
+}
+
 /// PyPy: GeneratorIterator._send_ex(w_arg, operr)
 ///
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
@@ -12804,7 +12820,7 @@ fn generator_send_ex(
                 // generator.py:109-114 — if the frame marked itself finished,
                 // it was RETURNed from; otherwise it YIELDed.
                 if frame.frame_finished_execution() {
-                    w_generator_set_exhausted(gen_obj);
+                    generator_frame_is_finished(gen_obj, frame);
                     // generator.py:117-119 / pyopcode.py RETURN_VALUE in
                     // generator frames — `raise StopIteration(returnvalue)`
                     // so callers can pull the return value off `.value`.
@@ -12817,7 +12833,7 @@ fn generator_send_ex(
                 }
             }
             Err(e) => {
-                w_generator_set_exhausted(gen_obj);
+                generator_frame_is_finished(gen_obj, frame);
                 // generator.py `_leak_stopiteration` (PEP 479) — a
                 // StopIteration that escaped the body becomes RuntimeError;
                 // any other error propagates unchanged.  The normal-return
@@ -13273,7 +13289,12 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_none());
         }
         if !w_generator_is_started(gen_obj) {
-            w_generator_set_exhausted(gen_obj);
+            let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+            if frame_ptr.is_null() {
+                w_generator_set_exhausted(gen_obj);
+            } else {
+                generator_frame_is_finished(gen_obj, &mut *frame_ptr);
+            }
             return Ok(w_none());
         }
     }
@@ -13283,9 +13304,15 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // Generator yielded after GeneratorExit — RuntimeError
             Err(PyError::runtime_error("generator ignored GeneratorExit"))
         }
-        Err(e) if e.kind == PyErrorKind::StopIteration || e.kind == PyErrorKind::GeneratorExit => {
-            Ok(w_none())
+        Err(mut e) if e.kind == PyErrorKind::StopIteration => {
+            // Python 3.13+ / 3.14: close() returns the value produced when
+            // GeneratorExit is caught and the generator executes `return x`.
+            let w_exc = e.to_exc_object();
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_exc);
+            getattr_str(w_exc, "value").or_else(|_| Ok(w_none()))
         }
+        Err(e) if e.kind == PyErrorKind::GeneratorExit => Ok(w_none()),
         Err(e) => Err(e),
     }
 }
