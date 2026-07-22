@@ -20465,6 +20465,7 @@ mod tests {
                 frames: vec![crate::recorder::SnapshotFrame {
                     jitcode_index: 0,
                     pc: 123,
+                    py_pc: 123,
                     boxes: vec![crate::recorder::SnapshotTagged::Box(
                         OpRef::int_op(0),
                         majit_ir::Type::Int,

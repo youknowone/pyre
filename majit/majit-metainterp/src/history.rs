@@ -2220,6 +2220,13 @@ impl TraceCtx {
     /// resolve to a known `Box.type`; constants must have a recorded
     /// value.  Misses are bookkeeping bugs and panic, not silent
     /// fallbacks.
+    /// `py_pc == pc` here: this convenience serves jitdrivers whose
+    /// interpreter pc already *is* the JitCode pc — the native meta-tracing
+    /// clients (and unit tests) that have no CPython-bytecode layer, so the
+    /// two coordinates coincide and no JitCode→Python translation applies.
+    /// The pyre CPython-bytecode path never uses this shortcut; it carries a
+    /// distinct forward Python pc through
+    /// `capture_snapshot_for_last_guard_with_vable_vref`.
     pub fn capture_snapshot_for_last_guard(
         &mut self,
         active_boxes: &[OpRef],

@@ -26,6 +26,12 @@ fn test_outer_resume_jitcode_index() -> u32 {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
     pyjit.metadata.is_drained = true;
+    // Forward `(jitcode_pc, py_pc)` resume markers a real drained JitCode
+    // carries: guard capture reads the innermost frame's Python pc forward
+    // from this table (never projected backward). The single-instruction
+    // synthetic body maps every JitCode offset to py_pc 0.
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0)];
     let jitcode = crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
         as *const crate::state::JitCode;
     let index = unsafe { (*jitcode).index as u32 };

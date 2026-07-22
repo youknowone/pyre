@@ -4681,7 +4681,7 @@ mod tests {
             vec![OpRef::const_int(42), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
+        // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), 8(py_pc), tagged...]
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[0] = total size
         assert!(items[0] > 0);
@@ -4696,16 +4696,18 @@ mod tests {
         assert_eq!(items[4], 0);
         // items[5] = pc = 8
         assert_eq!(items[5], 8);
-        // items[6] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
-        let (val, tagbits) = untag(items[6] as i16);
+        // items[6] = py_pc = 8 (forward-carried Python pc; single_frame sets py_pc = pc)
+        assert_eq!(items[6], 8);
+        // items[7] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
-        // items[7] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[8] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[8] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
-        let (val, tagbits) = untag(items[8] as i16);
+        // items[9] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
+        let (val, tagbits) = untag(items[9] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
     }
@@ -4796,16 +4798,18 @@ mod tests {
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
-        // items[6] = OpRef::int_op(1) → TAGBOX(0)
-        let (val, tagbits) = untag(items[6] as i16);
+        // items[6] = py_pc = 10 (single_frame sets py_pc = pc)
+        assert_eq!(items[6], 10);
+        // items[7] = OpRef::int_op(1) → TAGBOX(0)
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[7] = OpRef::ref_op(2) → TAGVIRTUAL(0)
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[8] = OpRef::ref_op(2) → TAGVIRTUAL(0)
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
-        // items[8] = OpRef::int_op(3) → TAGBOX(1)
-        let (val, tagbits) = untag(items[8] as i16);
+        // items[9] = OpRef::int_op(3) → TAGBOX(1)
+        let (val, tagbits) = untag(items[9] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
     }
@@ -4918,8 +4922,10 @@ mod tests {
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
 
-        // items[6] = the frame's box.
-        let (val, tagbits) = untag(items[6] as i16);
+        // items[6] = py_pc = 10 (single_frame sets py_pc = pc)
+        assert_eq!(items[6], 10);
+        // items[7] = the frame's box.
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
         assert_eq!(numb_state.num_boxes, 0);
@@ -5082,11 +5088,12 @@ mod tests {
         assert_eq!(items[5], 0); // vref_array_length
         assert_eq!(items[6], 0); // jitcode_index
         assert_eq!(items[7], 8); // pc
+        assert_eq!(items[8], 8); // py_pc (single_frame sets py_pc = pc)
 
         // The frame slot reuses the payload tag because numbering follows
         // Box identity exactly: upstream dedups only when the same Box object
         // appears twice, and in this test we passed the same OpRef twice.
-        let (val, tagbits) = untag(items[8] as i16);
+        let (val, tagbits) = untag(items[9] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
     }
@@ -5104,6 +5111,7 @@ mod tests {
         writer.append_int(0); // vref_array length
         writer.append_int(0); // jitcode_pos
         writer.append_int(0); // pc
+        writer.append_int(0); // py_pc
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
