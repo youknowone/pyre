@@ -6435,13 +6435,13 @@ fn bridge_decode_box(
     }
 }
 
-/// Seed the bridge walk's current-exception channel from the guard-owned
-/// pending field stream.  `resume.py:_prepare_pendingfields` decodes these
-/// tagged values only after virtual preparation; bridge tracing must decode
-/// the same fieldbox without applying the write to the live execution
-/// context, because the walk may still be abandoned.
+/// Prepare the guard-owned pending field stream for bridge tracing.
+/// `resume.py:_prepare_pendingfields` decodes these tagged values only after
+/// virtual preparation; the exception-channel entry seeds the bridge walk's
+/// current exception, while ordinary entries are re-emitted as trace ops
+/// instead of being applied directly to the live execution context.
 #[allow(clippy::too_many_arguments)]
-fn seed_bridge_pending_current_exception(
+fn prepare_bridge_pending_fields(
     sym: &mut PyreSym,
     ctx: &mut majit_metainterp::TraceCtx,
     resume_data: &majit_metainterp::ResumeDataResult,
@@ -6459,9 +6459,8 @@ fn seed_bridge_pending_current_exception(
         let Some(descr) = pending.descr.as_ref() else {
             continue;
         };
-        if pending.item_index >= 0 || !std::sync::Arc::ptr_eq(descr, &target_descr) {
-            continue;
-        }
+        let is_exc_channel =
+            pending.item_index < 0 && std::sync::Arc::ptr_eq(descr, &target_descr);
 
         // resume.py:1002-1005: both operands use the same tagged decoder as
         // frame boxes.  Decode the target as well as the fieldbox so virtual
@@ -6481,34 +6480,90 @@ fn seed_bridge_pending_current_exception(
             &resume_data.fail_arg_types,
             storage.rd_virtuals.len(),
         );
-        let _ = bridge_decode_box(
-            ctx,
-            &target,
-            Type::Ref,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        let (value_box, value_concrete) = bridge_decode_box(
-            ctx,
-            &value,
-            Type::Ref,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        let majit_ir::Value::Ref(value_ref) = value_concrete else {
-            continue;
-        };
-        sym.last_exc_box = value_box;
-        sym.last_exc_value = value_ref.as_usize() as pyre_object::PyObjectRef;
-        sym.class_of_last_exc_is_const = false;
+
+        if is_exc_channel {
+            let _ = bridge_decode_box(
+                ctx,
+                &target,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            let (value_box, value_concrete) = bridge_decode_box(
+                ctx,
+                &value,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            let majit_ir::Value::Ref(value_ref) = value_concrete else {
+                continue;
+            };
+            sym.last_exc_box = value_box;
+            sym.last_exc_value = value_ref.as_usize() as pyre_object::PyObjectRef;
+            sym.class_of_last_exc_is_const = false;
+        } else {
+            // resume.py:993-1007 `_prepare_pendingfields`: replay ordinary
+            // pending writes as bridge-entry SETFIELD_GC / SETARRAYITEM_GC ops.
+            let (target_op, _) = bridge_decode_box(
+                ctx,
+                &target,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            let value_kind = if pending.item_index < 0 {
+                descr
+                    .as_field_descr()
+                    .map(|fd| fd.field_type())
+                    .unwrap_or(Type::Ref)
+            } else {
+                descr
+                    .as_array_descr()
+                    .map(|ad| ad.item_type())
+                    .unwrap_or(Type::Ref)
+            };
+            let (value_op, _) = bridge_decode_box(
+                ctx,
+                &value,
+                value_kind,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            if pending.item_index < 0 {
+                ctx.record_op_with_descr(OpCode::SetfieldGc, &[target_op, value_op], descr.clone());
+                if let Some(field_descr) = descr.as_field_descr() {
+                    ctx.heapcache_setfield_cached(
+                        target_op,
+                        field_descr.index_in_parent() as u32,
+                        value_op,
+                    );
+                }
+            } else {
+                let index_op = ctx.const_int(pending.item_index as i64);
+                ctx.record_op_with_descr(
+                    OpCode::SetarrayitemGc,
+                    &[target_op, index_op, value_op],
+                    descr.clone(),
+                );
+            }
+        }
     }
 }
 
@@ -9457,7 +9512,7 @@ impl JitState for PyreJitState {
             });
         }
 
-        seed_bridge_pending_current_exception(
+        prepare_bridge_pending_fields(
             sym,
             ctx,
             resume_data,

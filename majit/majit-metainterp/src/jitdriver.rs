@@ -860,6 +860,10 @@ pub struct JitDriver<S: JitState> {
     /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
     /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
     pub last_bridge_is_exception_guard: bool,
+    /// Recorded op count after bridge setup prologue materialization and
+    /// before the bridge body walk starts. Used to distinguish deterministic
+    /// setup aborts from transient mid-trace aborts.
+    bridge_body_start_op_count: Option<usize>,
     /// Additional entry points sharing this driver's compiled loops.
     entry_points: Vec<EntryPoint>,
     /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
@@ -1041,6 +1045,7 @@ impl<S: JitState> JitDriver<S> {
             descriptor: None,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
+            bridge_body_start_op_count: None,
             entry_points: Vec::new(),
             is_recursive: false,
             epoch_qmut,
@@ -2568,6 +2573,34 @@ impl<S: JitState> JitDriver<S> {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }
+                let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
+                    && self.meta.bridge_info().is_some()
+                    && self.meta.tracing.as_ref().is_some_and(|ctx| {
+                        let Some(start_ops) = self.bridge_body_start_op_count else {
+                            return false;
+                        };
+                        let current_ops = ctx.num_ops();
+                        current_ops == start_ops
+                            || (current_ops == start_ops + 1
+                                && ctx.ops().get(start_ops).is_some_and(|op| {
+                                    op.opcode == majit_ir::OpCode::GetfieldRawI
+                                }))
+                    })
+                {
+                    self.meta
+                        .bridge_info_cloned()
+                        .map(|bridge| bridge.source_descr)
+                } else {
+                    None
+                };
+                if let Some(source_descr) = setup_aborted_bridge_descr {
+                    // pyjitpl.rs:9527-9532 structural-decline contract:
+                    // a bridge abort before bytecode-body ops is deterministic
+                    // setup failure from the fixed guard resume shape, so it
+                    // must not refire. The lone GetfieldRawI case is emitted
+                    // by bridge symbolic init before the body walker runs.
+                    self.meta.record_declined_bridge_guard(&source_descr);
+                }
                 // `pyjitpl.py:2491` `except SwitchToBlackhole as stb:
                 // self.aborted_tracing(stb.reason)` — the
                 // `aborted_tracing(reason)` accounting half of RPython's
@@ -2657,6 +2690,7 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.aborted_tracing(reason_int);
                 }
                 self.sym = None;
+                self.bridge_body_start_op_count = None;
                 self.meta.clear_trace_session();
             }
             TraceAction::AbortPermanent => {
@@ -2693,6 +2727,7 @@ impl<S: JitState> JitDriver<S> {
     #[inline(never)]
     fn clear_tracing_session_state(&mut self) {
         self.sym = None;
+        self.bridge_body_start_op_count = None;
         self.meta.clear_trace_session();
     }
 
@@ -3137,26 +3172,11 @@ impl<S: JitState> JitDriver<S> {
             // guard failure resumes via blackhole — isolates bridge-record
             // resume defects from the blackhole path.
             //
-            // Guard resume virtuals ARE bridgeable: the bridge trace emits a
-            // materialization prologue (`setup_bridge_sym` -> NEW_WITH_VTABLE /
-            // SETFIELD_GC, resume.py:1042-1057 ResumeDataBoxReader._prepare), so
-            // `rd_virtuals` alone must NOT decline — declining it strands the hot
-            // loop on blackhole deopt (recursive fib etc. lose all JIT speedup).
-            // `rd_pendingfields` still declines: the bridge path only seeds the
-            // exception channel, not the general SETFIELD_GC pending-field
-            // prologue (resume.py:993-1007 _prepare_pendingfields), which is the
-            // remaining orthodox gap tracked separately.
-            let bridge_needs_materialization = exit_layout
-                .storage
-                .as_deref()
-                .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
-            if bridge_needs_materialization {
-                self.meta.record_declined_bridge_guard(&descr_arc);
-            }
+            // Pending-field guards bridge through setup_bridge_sym's
+            // pending-field prologue (resume.py:993-1007).
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled()
-                && !bridge_needs_materialization;
+                && !no_bridge_enabled();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -4881,6 +4901,7 @@ impl<S: JitState> JitDriver<S> {
         resume_pc: usize,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
+        self.bridge_body_start_op_count = None;
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
         // is dead (memmgr-evicted).  Pyre signals the same outcome by
@@ -4901,20 +4922,6 @@ impl<S: JitState> JitDriver<S> {
             majit_metainterp::mc_diag_bump(15); // sbt early: no compiled_meta
             return false;
         };
-
-        if self
-            .meta
-            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
-            .and_then(|layout| layout.storage)
-            .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-        {
-            // resume.py:993-1007 _prepare_pendingfields: the general SETFIELD_GC
-            // pending-field prologue is not yet emitted on the bridge path, so a
-            // guard carrying pending fields still declines. `rd_virtuals` alone
-            // is bridgeable via the `setup_bridge_sym` materialization prologue
-            // and must NOT gate here (see the handle_fail decline site).
-            return false;
-        }
 
         if !state.can_trace() {
             majit_metainterp::mc_diag_bump(16); // sbt early: !can_trace
@@ -5141,6 +5148,7 @@ impl<S: JitState> JitDriver<S> {
                 &retrace.fail_types,
             );
         }
+        self.bridge_body_start_op_count = self.meta.tracing.as_ref().map(|ctx| ctx.num_ops());
         self.meta.begin_trace_session(trace_meta);
         // resume.py:1047-1055 parity:
         //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,
