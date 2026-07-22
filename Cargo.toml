@@ -36,6 +36,7 @@ members = [
     "majit/examples/i64env",
     "majit/examples/celprobe",
     "majit/examples/celpolicy",
+    "majit/examples/celcolumn",
     "majit/examples/spcount",
     # pyre
     "pyre/pyre-object",
