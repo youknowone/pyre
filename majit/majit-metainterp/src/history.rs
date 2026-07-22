@@ -2382,10 +2382,6 @@ impl TraceCtx {
             frames: recorder_frames,
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
-            // The nested-list append fold resumes through the single-frame
-            // collapse, never this multi-frame path, so no extra virtual roots
-            // flow here.
-            extra_virtual_roots: Vec::new(),
         });
         self.set_last_guard_op_resume_position(snapshot_id);
     }
