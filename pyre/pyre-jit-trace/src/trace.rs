@@ -802,7 +802,7 @@ type PerfnWalkResult = Result<
 /// ([`drive_bridge_carrier_walk`]).  Resolves the five terminal descrs off
 /// `MetaInterpStaticData`, builds the per-CodeObject descr pool + sub-jitcode
 /// lookup off `pjc.jitcode.exec.descrs`, and runs `dispatch_via_miframe` from
-/// `entry` with the caller-seeded `argboxes_r`.  Returns
+/// `entry` with the caller-seeded register banks.  Returns
 /// `(code_len, walk_result)`; `None` when the terminal descrs are unwired.
 fn dispatch_perfn_frame<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -814,6 +814,7 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
     entry: usize,
     argboxes_r: &[majit_ir::OpRef],
     argboxes_i: &[majit_ir::OpRef],
+    argboxes_f: &[majit_ir::OpRef],
     authoritative: bool,
 ) -> Option<(usize, PerfnWalkResult)> {
     // Resolve the five terminal descrs off MetaInterpStaticData so the
@@ -918,7 +919,7 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
         pjc.jitcode.constants_f.as_slice(),
         argboxes_r,
         argboxes_i,
-        &[],
+        argboxes_f,
     );
     Some((code_len, walk_result))
 }
@@ -1990,6 +1991,18 @@ fn run_perfn_walk<Sym: WalkSym>(
         Vec::new()
     };
 
+    // resume.py:1036-1038 `_callback_f` parity: seed the Float bank the same
+    // way as argboxes_i. Empty for a non-marker resume; `truncate(num_regs_f)`
+    // strips the copy_constants tail exactly as the Int build does.
+    let argboxes_f: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
+        let num_regs_f = pjc.jitcode.num_regs_f() as usize;
+        let mut v = sym.registers_f().to_vec();
+        v.truncate(num_regs_f);
+        v
+    } else {
+        Vec::new()
+    };
+
     // resume.py:1042-1057 `consume_boxes` fills every register named by the
     // resume marker's `live/` stream.  A bridge whose carried coordinate names
     // such a marker starts this walk from the input banks above, so reject the
@@ -2013,10 +2026,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                 .get(color as usize)
                 .is_none_or(|opref| opref.is_none())
         });
-        // `dispatch_via_miframe` has no Float bridge-input bank; therefore any
-        // Float color live at a resume marker is
-        // necessarily uncovered.
-        let missing_float = live.float.first().copied();
+        // resume.py:1036-1038 `_callback_f` fills each Float color named by
+        // the resume marker, and the Float input bank above seeds it by color.
+        let missing_float = live.float.iter().copied().find(|&color| {
+            argboxes_f
+                .get(color as usize)
+                .is_none_or(|opref| opref.is_none())
+        });
         if missing_ref.is_some() || missing_int.is_some() || missing_float.is_some() {
             crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded");
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -2043,6 +2059,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         entry,
         &argboxes_r,
         &argboxes_i,
+        &argboxes_f,
         authoritative,
     ) else {
         return None;
