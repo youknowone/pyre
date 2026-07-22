@@ -1733,51 +1733,79 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
 /// window). Only `str` entries are collected — path hooks (zipimporter keys
 /// and the like) are not resolvable by the native file search.
 #[cfg(feature = "host_env")]
-fn python_sys_path_dirs() -> Vec<PathBuf> {
-    let Some(sys_mod) = get_sys_module("sys") else {
-        return Vec::new();
-    };
+fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
+    // `None` means the `sys` module does not exist yet (the pre-`sys` bootstrap
+    // window) — the caller falls back to the native seed. Once `sys` exists the
+    // Python list is authoritative even when empty: a missing / non-list / empty
+    // `sys.path` searches nothing, so `del sys.path` and `sys.path.clear()` break
+    // imports exactly as they do under CPython, rather than resurrecting the seed.
+    let sys_mod = get_sys_module("sys")?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
     if w_dict.is_null() {
-        return Vec::new();
+        return None;
     }
-    let Some(w_path) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }) else {
-        return Vec::new();
-    };
-    if !unsafe { pyre_object::is_list(w_path) } {
-        return Vec::new();
-    }
-    let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
-    let mut dirs = Vec::with_capacity(n);
-    for i in 0..n {
-        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
-            if unsafe { pyre_object::is_str(item) } {
-                dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
+    // Copy the entries up front so no Python borrow is held across the
+    // filesystem probes in `find_in_dirs` (which never invoke user code).
+    let mut dirs = Vec::new();
+    if let Some(w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") } {
+        if unsafe { pyre_object::is_list(w_path) } {
+            let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+            dirs.reserve(n);
+            for i in 0..n {
+                if let Some(item) =
+                    unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) }
+                {
+                    // Non-str entries are skipped: pyre's only path hook is the
+                    // native filesystem probe, and CPython also skips an entry no
+                    // hook accepts.
+                    if unsafe { pyre_object::is_str(item) } {
+                        dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
+                    }
+                }
             }
         }
     }
-    dirs
+    Some(dirs)
 }
 
 /// Search the import path for a top-level `partname`.
 ///
-/// Python `sys.path` is authoritative — user code (and PYTHONPATH) mutate the
-/// Python list and imports must honor it, the same precedence `check_sys_modules`
-/// gives the Python `sys.modules` dict. The native `SYS_PATH` is the startup
-/// seed: it is appended (deduplicated) so the vendored stdlib and the default
-/// entries stay searchable, and it is the sole source in the pre-`sync`
-/// bootstrap window where the Python list is still the empty placeholder.
+/// The live Python `sys.path` list is authoritative — user code (and PYTHONPATH)
+/// mutate it and imports must honor it, the same precedence `check_sys_modules`
+/// gives the Python `sys.modules` dict. The native `SYS_PATH` is only the write
+/// side of a pre-`sys` staging seed (flushed into `sys.path` at sys-module
+/// creation) and is consulted here solely in that pre-`sys` window.
 #[cfg(feature = "host_env")]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
-    let mut dirs = python_sys_path_dirs();
-    SYS_PATH.with(|p| {
-        for d in p.borrow().iter() {
-            if !dirs.contains(d) {
-                dirs.push(d.clone());
-            }
-        }
+    match python_sys_path_dirs() {
+        Some(dirs) => find_in_dirs(partname, &dirs),
+        None => SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())),
+    }
+}
+
+/// Build the initial Python `sys.path` list from the native seed. Run once at
+/// sys-module creation so the Python list is fully populated the instant `sys`
+/// exists; from then on it is authoritative and `SYS_PATH` is a spent seed.
+#[cfg(feature = "host_env")]
+pub(crate) fn create_sys_path_list() -> PyObjectRef {
+    // Force stdlib detection now (off-wasm) so the stdlib is in the list from
+    // the start rather than lazily on first miss; the `find_module` retry then
+    // never has to append to the live list.
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_stdlib_path();
+    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
+        p.borrow()
+            .iter()
+            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+            .collect()
     });
-    find_in_dirs(partname, &dirs)
+    pyre_object::w_list_new(items)
+}
+
+/// Off-`host_env` builds have no native seed; `sys.path` starts empty.
+#[cfg(not(feature = "host_env"))]
+pub(crate) fn create_sys_path_list() -> PyObjectRef {
+    pyre_object::w_list_new(vec![])
 }
 
 /// Extract a package module's `__path__` as filesystem directories.
