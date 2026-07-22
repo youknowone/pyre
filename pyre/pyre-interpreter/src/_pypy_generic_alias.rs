@@ -632,6 +632,30 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     Ok(w_union_from_members(members, parameters))
 }
 
+/// `UnionType(items)` construction used by `typing.Union[items]`.
+///
+/// Unlike `_create_union(x, y)`, the constructor does not apply the
+/// operator-level `_unionable` gate: typing's Python-level `_GenericAlias`
+/// instances are valid members even though a generic arbitrary object must
+/// still make the direct `obj | type` operator return `NotImplemented`.
+/// The remaining body is `UnionType.__init__`: collect parameters from the
+/// raw items, recursively flatten nested unions, and deduplicate by equality.
+pub(crate) fn union_from_items(items: &[PyObjectRef]) -> crate::PyResult {
+    if items.len() == 1 {
+        return Ok(normalize_none(items[0]));
+    }
+    let parameters = collect_parameters(w_tuple_new(items.to_vec()))?;
+    let mut members: Vec<PyObjectRef> = Vec::new();
+    for &item in items {
+        add_recurse(item, &mut members)?;
+    }
+    if members.len() == 1 {
+        Ok(members[0])
+    } else {
+        Ok(w_union_from_members(members, parameters))
+    }
+}
+
 /// `add_recurse(arg)` (`_pypy_generic_alias.py:253-262`) — the deduplicating
 /// flatten body of `UnionType.__init__`.  `None` becomes `NoneType`, a nested
 /// `UnionType` is spliced member-by-member, and a member is appended only when

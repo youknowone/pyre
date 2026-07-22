@@ -5565,7 +5565,6 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         if is_type(obj) {
             // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
             let w_type_type = crate::typedef::w_type();
-            let w_object = crate::typedef::w_object();
             let w_metaclass = {
                 let w_class = (*obj).w_class;
                 if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
@@ -5576,20 +5575,17 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             };
             let w_metaclasses: [Option<PyObjectRef>; 2] =
                 [w_metaclass, crate::typedef::gettypefor((*obj).ob_type)];
-            // typeobject.py:811-819 — a metatype DATA descriptor is consulted
-            // before anything else, including the hardcoded type attributes
-            // below.  Only honor one defined on a user metaclass (its owner is
-            // neither `type` nor `object`): the builtin getsets those bases
-            // carry are served by the dedicated short-circuits below, so
-            // letting them through here would re-enter this lookup.
+            // typeobject.py:811-819 — `space.lookup(self, name)` searches the
+            // complete metaclass MRO, and any data descriptor found there is
+            // consulted before the class's own MRO.  This includes getsets
+            // defined by `type` itself: for example `type.__module__` must
+            // invoke type's descriptor with `type` as its receiver rather
+            // than return the raw descriptor from type's own dictionary.
             for w_metaclass in w_metaclasses.iter().flatten() {
                 let w_metaclass = *w_metaclass;
                 if is_type(w_metaclass) {
-                    if let Some((src, descr)) = lookup_where_pair(w_metaclass, name) {
-                        if !std::ptr::eq(src, w_type_type)
-                            && !std::ptr::eq(src, w_object)
-                            && is_data_descr(descr)
-                        {
+                    if let Some(descr) = lookup_in_type_where(w_metaclass, name) {
+                        if is_data_descr(descr) {
                             match get(descr, obj, w_metaclass) {
                                 Ok(Some(result)) => return Ok(result),
                                 Ok(None) => {}

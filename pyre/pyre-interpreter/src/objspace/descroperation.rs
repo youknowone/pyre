@@ -1756,16 +1756,15 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     pyre_object::w_type_issubtype(w_type, cls)
 }
 
-/// Builtin-subclass comparison override dispatch.
+/// Comparison special-method dispatch.
 ///
-/// When either operand is a builtin subclass that *overrides* the comparison
-/// dunder, dispatch it with Python's reflected-subclass priority, calling
-/// only genuine overrides — never the inherited builtin slot, which delegates
-/// straight back into [`compare`] and would recurse forever.  Returns
-/// `Some(result)` once an override yields a non-`NotImplemented` value (or
-/// raises); `None` when neither side overrides — or every override returned
-/// `NotImplemented` — so the caller falls through to the by-layout fast paths
-/// / identity tail.
+/// PyPy: `descroperation.py:_make_comparison_impl`.  Generic instances use
+/// the complete MRO lookup, including inherited `object.__eq__` /
+/// `object.__ne__`; the latter deliberately calls the receiver's live
+/// `__eq__`.  Builtin layouts retain the override-only lookup because their
+/// inherited slots delegate straight back into [`compare`] and would recurse
+/// forever.  The reflected method of a proper subclass has priority, and
+/// equal types only invoke the shared `__eq__` / `__ne__` implementation once.
 unsafe fn try_compare_override(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -1780,8 +1779,26 @@ unsafe fn try_compare_override(
         CompareOp::Ne => "__ne__",
     };
     let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
-    let a_ov = crate::baseobjspace::subclass_special_override(a, dunder);
-    let b_ov = crate::baseobjspace::subclass_special_override(b, rdunder);
+    let comparison_method = |obj: PyObjectRef, name: &str| {
+        if is_instance(obj) {
+            let w_type = crate::typedef::r#type(obj)?;
+            let method = lookup_in_type_where(w_type, name)?;
+            Some((method, w_type))
+        } else {
+            crate::baseobjspace::subclass_special_override(obj, name)
+        }
+    };
+    let a_type = crate::typedef::r#type(a);
+    let b_type = crate::typedef::r#type(b);
+    let a_ov = comparison_method(a, dunder);
+    let mut b_ov = comparison_method(b, rdunder);
+    if dunder == rdunder
+        && matches!((a_type, b_type), (Some(at), Some(bt)) if std::ptr::eq(at, bt))
+    {
+        // descroperation.py: for __eq__ and __ne__, objects of the same
+        // class resolve the same method, so do not invoke it twice.
+        b_ov = None;
+    }
     if a_ov.is_none() && b_ov.is_none() {
         return Ok(None);
     }
@@ -1789,7 +1806,7 @@ unsafe fn try_compare_override(
     // proper subclass of `a`'s type and `b` overrides the reflected op, run it
     // first.
     let b_first = b_ov.is_some()
-        && match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
+        && match (a_type, b_type) {
             (Some(at), Some(bt)) => !std::ptr::eq(at, bt) && issubtype_cached(bt, at),
             _ => false,
         };
