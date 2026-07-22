@@ -174,8 +174,9 @@ impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // observable side effects), so the borrowed-str fast path
                 // must not reject it by layout.  Materialise the query only
                 // on this rare collision path, matching
-                // `object_key_for(w_str_new(key))`.
-                dict_keys_equal(crate::w_str_new(self.key), k.obj)
+                // `object_key_for(w_str_new(key))`.  Pass the stored key first,
+                // the order `keyeq(checkingkey, key)` uses (`rordereddict.py:1055`).
+                dict_keys_equal(k.obj, crate::w_str_new(self.key))
             }
         }
     }
