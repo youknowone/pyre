@@ -502,7 +502,7 @@ pub(crate) fn collect_callee_active_boxes(
     // frame's box section from, and the decoder would resume on one anyway;
     // decline the inline rather than encode against an empty window.
     if carried_jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+        return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     }
     // The resume decoder consumes this frame's section per the liveness at the
     // carried `jitcode_pc` (`setposition` → `get_current_position_info`), not
@@ -536,7 +536,7 @@ pub(crate) fn collect_callee_active_boxes(
                         banks.float,
                     );
                 }
-                Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc })
+                Err(DispatchError::callee_inline_unsupported(callee_op_pc))
             }
         }
     };
@@ -1641,7 +1641,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if fbw_rec_mutual_cutover_enabled() {
             return Ok(None);
         }
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
 
     // Path-1 (#68): the inlined callee's compile-time-constant frame fields,
@@ -1830,14 +1830,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             };
             if raw.is_null() {
                 if try_multiframe {
-                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
             let callee_code = unsafe { &*raw };
             if pyre_interpreter::ncells(callee_code) != 0 {
                 if try_multiframe {
-                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
@@ -1865,7 +1865,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 )
             }) {
                 if try_multiframe {
-                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
@@ -1876,7 +1876,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 crate::state::ensure_jitcode_index(callee_code_key as *const ())
             else {
                 if try_multiframe {
-                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             };
@@ -1887,7 +1887,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 || ec_reg as usize >= callee_regs_r.len()
             {
                 if try_multiframe {
-                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
@@ -1902,7 +1902,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 if try_multiframe {
-                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
@@ -2031,10 +2031,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
                     }
                 }
-                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
             Err(InlineCallerFrameDecline::Unavailable) => {
-                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
         }
     } else if callee_frame_seeded {
@@ -2517,7 +2517,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         }
                     }
                 }
-                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
             match dst_bank {
                 'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
@@ -2558,7 +2558,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if fbw_store_journal_len() > prologue_journal_before
                 || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect())
             {
-                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
             emit_walker_loop_callee_call_assembler(
                 ctx,
@@ -2860,7 +2860,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             ConcreteValue::Ref(obj)
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
         if !result.is_constant() {
             let not_implemented = ctx
@@ -3004,7 +3004,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
             ConcreteValue::Ref(obj)
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
         if !result.is_constant() {
             let not_implemented = ctx

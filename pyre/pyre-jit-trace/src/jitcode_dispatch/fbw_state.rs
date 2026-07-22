@@ -112,6 +112,27 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_TRYBLOCK_INLINE`: multi-frame-inline a branch-bearing callee
+/// CALLed inside a try-block when its `except` handler REJOINS the CALL's own
+/// loop (`exc_handler_rejoins_specific_loop`).  The paused caller frame resumes
+/// at the CALL fallthrough on the no-raise path, and on a raise the caller's
+/// `lastblock` (a static box in its virtualizable image) unwinds to the handler
+/// in the blackhole — bit-exact.  A handler that BREAKS / RETURNS out of that
+/// loop is not routed (a hot raise there cannot be bridged and would
+/// deopt-storm), so it keeps declining to the residual path.  Default-on;
+/// `PYRE_FBW_TRYBLOCK_INLINE=0` (or `false`) restores the blanket try-block
+/// decline as the rollback escape hatch.
+pub(crate) fn fbw_tryblock_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_TRYBLOCK_INLINE") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_NSVABLE_MULTIFRAME` (#73): publish the `_nonstandard_virtualizable`
 /// promote guard through the full multi-frame resume chain (each paused caller
 /// plus the callee's own coordinate) instead of the single-frame sentinel
@@ -1378,7 +1399,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
             *c.borrow_mut() = stack_overrides;
         });
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc });
+        return Err(DispatchError::callee_inline_unsupported(pc));
     }
     Ok(())
 }

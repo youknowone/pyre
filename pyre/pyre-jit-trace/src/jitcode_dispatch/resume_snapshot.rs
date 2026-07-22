@@ -1038,9 +1038,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
 /// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
 /// jitcode pc in the caller.  Returns a named decline reason
 /// when the caller frame is not snapshot-able for this first slice: missing
-/// liveness / resume tables, a CALL inside a try-block whose catch-marker
-/// resume is not representable in this py_pc-only multi-frame capture, or no
-/// result on the operand stack at the return point.
+/// liveness / resume tables, a CALL inside a try-block whose `except` handler
+/// does NOT rejoin the CALL's own loop (a `break` / `return` out of it — its hot
+/// raise cannot be bridged, so it stays on the residual path, see
+/// [`decline_inline_caller_frame_for_catch_marker`]), or no result on the
+/// operand stack at the return point.
 ///
 /// The caller resumes at the CALL's return point (fallthrough) with the
 /// not-yet-produced call-result slot nulled — `get_list_of_active_boxes(
@@ -1055,12 +1057,44 @@ pub(crate) enum InlineCallerFrameDecline {
 
 pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     after_residual_call_resume: Option<usize>,
+    caller_jitcode: &[u8],
+    call_jit_pc: usize,
 ) -> Result<(), InlineCallerFrameDecline> {
-    if after_residual_call_resume.is_some() {
-        Err(InlineCallerFrameDecline::TryBlockCatchMarker)
-    } else {
-        Ok(())
+    let Some(resume_pos) = after_residual_call_resume else {
+        // Not a try-block CALL — nothing to route on a raise.
+        return Ok(());
+    };
+    // The CALL is inside a try-block.  Inline it when its exception handler
+    // REJOINS the CALL's own loop (the exc-edge-bridgeable shape): the paused
+    // caller frame resumes at the CALL fallthrough on the no-raise path, and on
+    // a raise the caller's `lastblock` (a static box in its virtualizable image)
+    // unwinds to the catch handler in the blackhole — bit-exact, and a HOT raise
+    // can later be bridged.  A handler that BREAKS/RETURNS out of that loop
+    // cannot be bridged, so a hot raise would deopt-storm; keep declining to the
+    // residual path, whose after-residual catch marker handles the raise without
+    // a per-iteration deopt.
+    if fbw_tryblock_inline_enabled() {
+        // `resume_pos` is the CALL's post-call `live/`; the `catch_exception/L`
+        // for the enclosing try sits right after it (`finishframe_exception`
+        // lookahead), so read the handler target forward from there, then test
+        // it rejoins the CALL's own loop header specifically.
+        let rejoins = crate::jitcode_dispatch::enclosing_loop_header_jit_pc(
+            caller_jitcode,
+            call_jit_pc,
+        )
+        .zip(crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos))
+        .is_some_and(|(loop_header, catch_target)| {
+            crate::jitcode_dispatch::exc_handler_rejoins_specific_loop(
+                caller_jitcode,
+                catch_target,
+                loop_header,
+            )
+        });
+        if rejoins {
+            return Ok(());
+        }
     }
+    Err(InlineCallerFrameDecline::TryBlockCatchMarker)
 }
 
 pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
@@ -1224,11 +1258,15 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             return Err(InlineCallerFrameDecline::Unavailable);
         }
         let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
-        // A CALL inside a try-block resumes at its own catch marker, which this
-        // py_pc-only multi-frame capture cannot represent — decline this slice.
+        // A CALL inside a try-block: inline it only when its exception handler
+        // rejoins the loop (the exc-edge-bridgeable shape); otherwise decline so
+        // the residual path handles the raise via its after-residual catch
+        // marker without a per-iteration deopt.
         decline_inline_caller_frame_for_catch_marker(
             jc.payload
                 .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
+            jc.payload.jitcode.code.as_slice(),
+            call_jit_pc,
         )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
@@ -1370,9 +1408,11 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     }
     let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
-    // A CALL inside a try-block resumes at its own catch marker, which this
-    // py_pc-only multi-frame capture cannot represent.
-    decline_inline_caller_frame_for_catch_marker(after_residual_call_resume)?;
+    // A CALL inside a try-block at inline depth ≥2: the rejoin-loop lift is
+    // scoped to the top-level caller (`compute_inline_caller_frame`) for now, so
+    // pass an empty jitcode here — a nested try-block CALL keeps declining
+    // (its catch-marker resume is not yet routed through the deeper snapshot).
+    decline_inline_caller_frame_for_catch_marker(after_residual_call_resume, &[], call_jit_pc)?;
     let legacy_fallthrough_py_pc = || unsafe {
         let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;
@@ -1589,17 +1629,17 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         .last()
         .map(|frame| frame.w_code);
     let Some(callee_w_code) = callee_w_code else {
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+        return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     };
     let Some(callee_jitcode_index) = crate::state::ensure_jitcode_index(callee_w_code as *const ())
     else {
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+        return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index) else {
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+        return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     };
     if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
-        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+        return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     }
     let mf_diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
     let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();

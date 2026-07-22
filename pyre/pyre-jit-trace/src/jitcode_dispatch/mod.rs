@@ -1731,6 +1731,21 @@ impl DispatchError {
             Self::ExcEdgeCrossFrameReturnUnsupported { .. } => "ExcEdgeCrossFrameReturnUnsupported",
         }
     }
+
+    /// Construct the callee-inline decline.  The
+    /// `LoopBearingCalleeInlineUnsupported` variant is emitted from ~20 sites
+    /// (multi-frame seed preconditions, snapshot capture, hazard scan), so
+    /// route them through one constructor that records the source location
+    /// under `PYRE_LB_SITE` to tell the decline reasons apart in a census.
+    #[track_caller]
+    #[inline]
+    pub(crate) fn callee_inline_unsupported(pc: usize) -> Self {
+        if std::env::var_os("PYRE_LB_SITE").is_some() {
+            let loc = std::panic::Location::caller();
+            eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
+        }
+        Self::LoopBearingCalleeInlineUnsupported { pc }
+    }
 }
 
 /// Per-process census of full-body-walk decline classes, keyed by
@@ -2161,7 +2176,7 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
 /// (both cases continue unwinding from the caller's POV — the
 /// instrumentation side effect is dropped today, matching RPython's
 /// non-trace-recorded `cintf` call).
-fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
+pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
     match finishframe_lookahead_at(code, position) {
         FinishframeLookahead::CatchTarget(target) => Some(target),
         FinishframeLookahead::RvmprofCode { .. } | FinishframeLookahead::NoMatch => None,
@@ -2286,6 +2301,75 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
                 // Multi-target dispatch not followed; leave this path un-proven
                 // (routing declines unless another path rejoins the loop).
             }
+            _ => work.push(op.next_pc),
+        }
+    }
+    false
+}
+
+/// The CALL's own loop header: the `jit_merge_point` op with the greatest pc at
+/// or before `call_jit_pc`.  Loop headers precede their body in the jitcode
+/// (outermost first), so among the merge points before the CALL the last one is
+/// the INNERMOST enclosing loop.  `None` when the CALL sits under no loop.
+pub(crate) fn enclosing_loop_header_jit_pc(code: &[u8], call_jit_pc: usize) -> Option<usize> {
+    crate::jitcode_runtime::decoded_ops(code)
+        .filter(|op| op.pc <= call_jit_pc && op.key.starts_with("jit_merge_point"))
+        .map(|op| op.pc)
+        .max()
+}
+
+/// Whether the `except` handler at `catch_target` rejoins the SPECIFIC loop
+/// whose header is `loop_header_pc` (the CALL's own loop), as opposed to
+/// breaking / returning out to an ENCLOSING loop or out of the frame.
+///
+/// [`exc_handler_rejoins_loop`] answers "reaches ANY `jit_merge_point`", which
+/// is too weak at the inline gate: a `break` out of the CALL's loop still
+/// reaches the ENCLOSING loop's merge point and would read as a rejoin.  Here a
+/// path is a rejoin ONLY if it reaches `loop_header_pc` itself; reaching a
+/// DIFFERENT merge point (broke out to an outer loop) or a `*_return` (out of
+/// frame) is a non-rejoin terminal.  Only the exact-loop rejoin is the
+/// exc-edge-bridgeable shape whose hot raise avoids a deopt-storm.
+pub(crate) fn exc_handler_rejoins_specific_loop(
+    code: &[u8],
+    catch_target: usize,
+    loop_header_pc: usize,
+) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut work = vec![catch_target];
+    let mut budget = 4096usize;
+    while let Some(pc) = work.pop() {
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+        if !visited.insert(pc) {
+            continue;
+        }
+        if pc == loop_header_pc {
+            // Rejoined the CALL's own loop header.
+            return true;
+        }
+        let Some(op) = decode_op_at(code, pc) else {
+            continue;
+        };
+        if op.key.starts_with("jit_merge_point") {
+            // A DIFFERENT loop's header: the handler broke out of the CALL's
+            // loop into an enclosing one.  Non-rejoin terminal.
+            continue;
+        }
+        if matches!(
+            op.key,
+            "ref_return/r" | "int_return/i" | "float_return/f" | "void_return/"
+        ) {
+            continue;
+        }
+        match op.key {
+            "goto/L" => work.push(read_label(code, &op, 0)),
+            "goto_if_not/iL" => {
+                work.push(read_label(code, &op, 1));
+                work.push(op.next_pc);
+            }
+            key if key.starts_with("switch") => {}
             _ => work.push(op.next_pc),
         }
     }
