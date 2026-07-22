@@ -6959,6 +6959,7 @@ impl<'a> Lowering<'a> {
                 "unwrap_or_else" => {
                     Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
                 }
+                "or_else" => Some(crate::front::option_closure_select::ClosureCombinator::OrElse),
                 _ => None,
             }
             && let Some(site) = self.recognize_closure_select_site(
@@ -8550,10 +8551,13 @@ impl<'a> Lowering<'a> {
         is_some: bool,
     ) -> Option<crate::front::option_is_none::IsNoneSite> {
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+        // `is_none`/`is_some` take `&self`, so the receiver arrives as
+        // `&Option<..>` (a `Ref` wrapper).  Peel it — the by-value
+        // `tyref_is_option` / `tyref_adt_def_id` would see the `Ref` and miss.
+        if !crate::front::result_exc::tyref_is_option_ref(recv_ty, self.llbc) {
             return None;
         }
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let def_id = self.tyref_ref_adt_def_id(recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
         let option_owner = td.item_meta.name_path();
         Some(crate::front::option_is_none::IsNoneSite {
@@ -8713,13 +8717,14 @@ impl<'a> Lowering<'a> {
         let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
         // The type the closure's `call_once` returns: `map`'s dest is
         // `Option<U>` and its closure returns `U` (the dest payload);
-        // `and_then`'s dest is `Option<U>` returned directly; `unwrap_or_else`'s
-        // dest is the bare `T`.
+        // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
+        // is `Option<T>` and its closure returns that same `Option<T>`;
+        // `unwrap_or_else`'s dest is the bare `T`.
         let call_result_ty = match kind {
             ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
-            ClosureCombinator::AndThen | ClosureCombinator::UnwrapOrElse => {
-                tyref_to_value_type(dest_ty, self.llbc)
-            }
+            ClosureCombinator::AndThen
+            | ClosureCombinator::OrElse
+            | ClosureCombinator::UnwrapOrElse => tyref_to_value_type(dest_ty, self.llbc),
         };
         Some(crate::front::option_closure_select::ClosureSelectSite {
             kind,
@@ -17053,6 +17058,111 @@ mod tests {
             count_call_leaf(&["iter", "adapters", "map", "Map", "collect"]),
             0,
             "no residual Map::collect reload wall"
+        );
+    }
+
+    /// Anchor the `&self` `Option::is_some` fold to the real lowered IR of
+    /// `callable_w` — `lookup_in_type(t, "__call__").is_some()`.  The
+    /// receiver is an owned `Option<PyObjectRef>` that Rust auto-refs to
+    /// `&Option` at the call, so the receiver type arrives as `Ref(Option)`;
+    /// the `_ref` guard + `tyref_ref_adt_def_id` peel it (the by-value
+    /// `tyref_is_option` would see the `Ref` and miss).  After the fold no
+    /// residual `is_some` Method call survives and a `__discriminant` read is
+    /// present.  Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn is_some_fold_real_callable_w() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "callable_w").expect("lower callable_w");
+
+        let method_calls = |leaf: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                            if name == leaf
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            method_calls("is_some"),
+            0,
+            "residual &Option::is_some Method call removed by the fold"
+        );
+        let disc_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+            })
+            .count();
+        assert!(disc_reads >= 1, "the fold reads the Option __discriminant");
+    }
+
+    /// Anchor the `Option::or_else` fold to the real lowered IR of
+    /// `space_int` — `lookup(obj, "__int__").or_else(|| lookup(obj,
+    /// "__index__"))`.  `or_else` takes `self` by value (like the sibling
+    /// closure-select combinators), so the by-value receiver resolution
+    /// applies.  After the fold no residual `or_else` Method call survives,
+    /// the discriminant diamond branches, and the `Some` arm forwards the
+    /// receiver (no `Some::__pos_0` read introduced by the rewrite).  Ignored
+    /// by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn or_else_fold_real_space_int() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "space_int").expect("lower space_int");
+
+        let or_else_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "or_else"
+                )
+            })
+            .count();
+        assert_eq!(
+            or_else_calls, 0,
+            "residual or_else Method call removed by the fold"
+        );
+        // The niladic `None`-arm closure lowers to a `call_once` Method call.
+        let call_once = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "call_once"
+                )
+            })
+            .count();
+        assert!(
+            call_once >= 1,
+            "the None arm calls the or_else closure via call_once"
         );
     }
 

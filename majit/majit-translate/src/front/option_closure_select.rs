@@ -14,13 +14,16 @@
 //!     map(opt, f):            Some(x) => Some(f(x))   None => None
 //!     and_then(opt, f):       Some(x) => f(x)         None => None
 //!     unwrap_or_else(opt, f): Some(x) => x            None => f()
+//!     or_else(opt, f):        Some(x) => Some(x)      None => f()
 //! ```
 //!
-//! `map`/`and_then` run the closure on the `Some` payload; `unwrap_or_else` runs
-//! its niladic closure on the `None` arm instead and forwards the payload
-//! directly on `Some`.  `map` wraps the closure result back into `Some`, and
-//! both `map`/`and_then` build a fresh `None` on the empty arm; `unwrap_or_else`
-//! returns a bare `T`.  Everything else — locating the residual call, absorbing
+//! `map`/`and_then` run the closure on the `Some` payload; `unwrap_or_else` and
+//! `or_else` run their niladic closure on the `None` arm instead.  On `Some`,
+//! `unwrap_or_else` forwards the payload directly while `or_else` forwards the
+//! whole receiver `Option` unchanged (no `__pos_0` read).  `map` wraps the
+//! closure result back into `Some`, and both `map`/`and_then` build a fresh
+//! `None` on the empty arm; `unwrap_or_else` returns a bare `T` and `or_else`
+//! an `Option<T>`.  Everything else — locating the residual call, absorbing
 //! the trailing `*mut <registered ADT>` narrowing cast, threading the live
 //! values through the arms, and closing the `bool(disc)` branch — is the
 //! [`crate::front::option_map_or`] skeleton.
@@ -47,6 +50,8 @@ pub(crate) enum ClosureCombinator {
     AndThen,
     /// `Some(x) => x`, `None => f()`.
     UnwrapOrElse,
+    /// `Some(x) => Some(x)`, `None => f()` where `f() -> Option<T>`.
+    OrElse,
 }
 
 /// A recognized `Option::map`/`and_then`/`unwrap_or_else(opt, closure_env)`
@@ -74,7 +79,7 @@ pub(crate) struct ClosureSelectSite {
     pub payload_ty: ValueType,
     /// The type the closure's `call_once` returns, projected to a
     /// [`ValueType`]: `U` for `map`, `Option<U>` for `and_then`, `T` for
-    /// `unwrap_or_else`.
+    /// `unwrap_or_else`, `Option<T>` for `or_else`.
     pub call_result_ty: ValueType,
     /// The `<X>` suffix for the closure `Args` tuple `(payload,)` — the same
     /// `Tuple<X>` leaf the extracted `call_once` reads its `.0` under, derived
@@ -190,10 +195,15 @@ fn rewire_one_closure_select_site(
         }
     }
 
-    // The `Some` arm always reads `opt.__pos_0`; `map`/`and_then` also run the
-    // closure there (so need `env`), while `unwrap_or_else` runs its closure on
-    // the `None` arm instead.  Thread each arm exactly the sources it consumes.
-    let closure_on_some = site.kind != ClosureCombinator::UnwrapOrElse;
+    // `map`/`and_then` run the closure on the `Some` arm (so need `env` there),
+    // while `unwrap_or_else`/`or_else` run their closure on the `None` arm
+    // instead.  The `Some` arm always needs `opt` — to read `opt.__pos_0`
+    // (`map`/`and_then`/`unwrap_or_else`) or to forward the receiver unchanged
+    // (`or_else`).  Thread each arm exactly the sources it consumes.
+    let closure_on_some = !matches!(
+        site.kind,
+        ClosureCombinator::UnwrapOrElse | ClosureCombinator::OrElse
+    );
     let mut then_sources = carried.clone();
     if !then_sources.contains(&opt) {
         then_sources.push(opt.clone());
@@ -211,23 +221,14 @@ fn rewire_one_closure_select_site(
     // --- `then_bb` (`Some`) ---
     let opt_in_then = map_source(&then_sources, &then_inputs, &opt)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    let payload = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(payload.clone()),
-        kind: OpKind::FieldRead {
-            base: opt_in_then,
-            field: FieldDescriptor {
-                name: "__pos_0".to_string(),
-                owner_root: Some(site.some_owner.clone()),
-                owner_id: None,
-            },
-            ty: site.payload_ty.clone(),
-            pure: true,
-        },
-    });
     let then_value = match site.kind {
-        ClosureCombinator::UnwrapOrElse => payload,
+        // `or_else` forwards the whole receiver `Option` unchanged — no `__pos_0`.
+        ClosureCombinator::OrElse => opt_in_then,
+        // `unwrap_or_else` forwards the bare payload.
+        ClosureCombinator::UnwrapOrElse => read_some_payload(graph, then_bb, opt_in_then, site),
+        // `map`/`and_then` run the closure on the payload.
         ClosureCombinator::Map | ClosureCombinator::AndThen => {
+            let payload = read_some_payload(graph, then_bb, opt_in_then, site);
             let env_in_then = map_source(&then_sources, &then_inputs, &env)
                 .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?;
             let call_result = emit_call_once(
@@ -270,8 +271,9 @@ fn rewire_one_closure_select_site(
         ClosureCombinator::Map | ClosureCombinator::AndThen => {
             emit_option_variant(graph, else_bb, &site.option_owner, 0, None)
         }
-        // `unwrap_or_else` runs its niladic closure.
-        ClosureCombinator::UnwrapOrElse => {
+        // `unwrap_or_else`/`or_else` run their niladic closure and forward its
+        // result (`T` for `unwrap_or_else`, `Option<T>` for `or_else`).
+        ClosureCombinator::UnwrapOrElse | ClosureCombinator::OrElse => {
             let env_in_else = map_source(&else_sources, &else_inputs, &env)
                 .ok_or_else(|| format!("{name}: closure env not threaded into None arm"))?;
             emit_call_once(
@@ -318,6 +320,33 @@ fn rewire_one_closure_select_site(
     });
     graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
     Ok(())
+}
+
+/// Read `opt.__pos_0` (the `Some` payload) in `block`, returning the payload
+/// value.  Used by every combinator that consumes the payload on the `Some`
+/// arm (`map`/`and_then`/`unwrap_or_else`); `or_else` forwards the whole
+/// receiver instead and skips this.
+fn read_some_payload(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    opt: Variable,
+    site: &ClosureSelectSite,
+) -> Variable {
+    let payload = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(payload.clone()),
+        kind: OpKind::FieldRead {
+            base: opt,
+            field: FieldDescriptor {
+                name: "__pos_0".to_string(),
+                owner_root: Some(site.some_owner.clone()),
+                owner_id: None,
+            },
+            ty: site.payload_ty.clone(),
+            pure: true,
+        },
+    });
+    payload
 }
 
 /// Emit `call_once(env, args)` in `block`, returning the call result.  `arg` is
@@ -503,6 +532,51 @@ mod tests {
         );
         assert_eq!(ctors, 0, "unwrap_or_else returns a bare value");
         assert_eq!(g.blocks[a].exits.len(), 2);
+    }
+
+    fn count_field_reads(g: &FunctionGraph, field_name: &str) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == field_name))
+            .count()
+    }
+
+    #[test]
+    fn or_else_forwards_receiver_and_calls_on_none() {
+        let (g, a) = build_and_rewrite(ClosureCombinator::OrElse, "or_else");
+        assert!(
+            residual_gone(&g, "or_else"),
+            "residual or_else call removed"
+        );
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
+            1,
+            "the None arm calls the niladic closure once"
+        );
+        // The Some arm forwards the WHOLE receiver Option — it must not read the
+        // `Some` payload (`__pos_0`); only the branch discriminant is read.
+        assert_eq!(
+            count_field_reads(&g, "__pos_0"),
+            0,
+            "or_else forwards the receiver, never reading the Some payload"
+        );
+        assert_eq!(
+            count_field_reads(&g, "__discriminant"),
+            1,
+            "only the branch discriminant is read"
+        );
+        // Neither arm builds an Option: Some forwards the receiver, None returns
+        // the closure's own `Option<T>`.
+        let ctors = count_calls(
+            &g,
+            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        );
+        assert_eq!(ctors, 0, "or_else builds no Option");
+        assert_eq!(g.blocks[a].exits.len(), 2, "A branches to Some/None arms");
     }
 
     #[test]

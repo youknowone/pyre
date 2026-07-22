@@ -140,6 +140,59 @@ pub(crate) fn tyref_is_option(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of(body, llbc).as_deref() == Some("core::option::Option")
 }
 
+/// True when `ty` is `core::option::Option<T>` **after peeling any leading
+/// `Ref`/`RawPtr`/dedup/hash-cons wrappers** — the `&self` receiver form the
+/// `is_none`/`is_some`/`or_else` predicates arrive in (`opt.is_some()` passes
+/// `&Option`).  [`tyref_is_option`] matches only the by-value shape (an
+/// `Iterator::next()`-style return), so a `&Option` receiver would slip past
+/// it as a bare `Ref`.  Mirrors the wrapper-peeling loop in
+/// [`crate::front::mir`] `tyref_ref_adt_def_id`.
+pub(crate) fn tyref_is_option_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut v: &serde_json::Value = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    for _ in 0..24 {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            match llbc.dedup_body(id) {
+                Some(next) => v = next,
+                None => return false,
+            }
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            match arr.get(1) {
+                Some(next) => v = next,
+                None => return false,
+            }
+            continue;
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            match arr.first() {
+                Some(next) => v = next,
+                None => return false,
+            }
+            continue;
+        }
+        break;
+    }
+    adt_path_of(v, llbc).as_deref() == Some("core::option::Option")
+}
+
 /// True when `ty` is any `core::result::Result<T, E>` (error type
 /// unconstrained) — the guard for combinators like `Result::unwrap_or` that
 /// discard the error and so do not care about `E`.  For the `Result<T,
