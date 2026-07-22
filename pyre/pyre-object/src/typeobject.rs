@@ -333,15 +333,6 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
         (name, qualname)
     };
-    crate::gc_roots::pin_root(name as PyObjectRef);
-    let qualname = if raw.is_null() {
-        crate::lltype::malloc_raw(unsafe { (&*name).clone() })
-    } else {
-        crate::gc_storage::gc_alloc_storage_box(
-            unsafe { (&*name).clone() },
-            name_storage_gc_type_id(),
-        )
-    };
     // Install the forwarded bases and managed namespace addresses rather than the
     // pre-collection arguments (the pins survive any collection the alloc forces).
     let bases = crate::gc_roots::shadow_stack_get(save_point);
