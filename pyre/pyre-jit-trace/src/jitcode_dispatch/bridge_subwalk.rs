@@ -780,6 +780,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let consts = InlineCalleeConsts {
         w_globals: callee_w_globals,
         w_code: callee_code_key,
+        jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
 
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
@@ -1144,6 +1145,7 @@ pub(crate) fn drive_outer_frame_continuation<Sym: WalkSym>(
     let consts = InlineCalleeConsts {
         w_globals: root_w_globals,
         w_code: root_code_key,
+        jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
 
     let root_sym_ptr = root_sym as *const Sym;

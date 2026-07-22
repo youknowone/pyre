@@ -647,6 +647,53 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     }
 }
 
+pub(crate) extern "C" fn record_inline_traceback_for_recording(
+    exc_value: i64,
+    w_code_value: i64,
+    w_globals_value: i64,
+    jitcode_index: i32,
+    opcode_position: i32,
+) {
+    if exc_value == 0 || w_code_value == 0 {
+        return;
+    }
+    let Some(last_instruction) =
+        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position)
+            .map(i64::from)
+    else {
+        return;
+    };
+    let w_exc = exc_value as PyObjectRef;
+    let w_code = w_code_value as PyObjectRef;
+    let w_globals = w_globals_value as PyObjectRef;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_exc);
+    pyre_object::gc_roots::pin_root(w_code);
+    pyre_object::gc_roots::pin_root(w_globals);
+    // `record_application_traceback` requires the traceback's own frame
+    // identity. The recording walker cannot force the optimizer's virtual
+    // locals, so materialize a traceback-only frame from the promoted callee
+    // metadata instead of substituting the caller's frame.
+    let Ok(mut frame) = pyre_interpreter::createframe_obj(
+        w_code as *const (),
+        w_globals,
+        pyre_interpreter::call::getexecutioncontext(),
+        None,
+    ) else {
+        return;
+    };
+    frame.last_instr = last_instruction as isize;
+    let frame_ptr = frame.into_raw();
+    pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    unsafe {
+        pyre_interpreter::pytraceback::record_application_traceback(
+            w_exc,
+            frame_ptr,
+            last_instruction,
+        );
+    }
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]

@@ -1600,6 +1600,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     let inline_consts = InlineCalleeConsts {
         w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) } as usize,
         w_code: callee_code_key,
+        jitcode_index: crate::state::ensure_jitcode_index(callee_code_key as *const ())
+            .map_or(-1, |index| index as i32),
     };
 
     // Specialize the inlined body on this exact callable: a later
@@ -2474,6 +2476,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_inline_application_traceback(ctx, exc_concrete, op.pc, true);
                 record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 ctx.last_exc_value_concrete = exc_concrete;
@@ -3241,6 +3244,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_inline_application_traceback(ctx, exc_concrete, op.pc, true);
                 record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
@@ -3384,6 +3388,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_inline_application_traceback(ctx, exc_concrete, op.pc, true);
                 record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
@@ -3539,6 +3544,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_inline_application_traceback(ctx, exc_concrete, op.pc, true);
                 record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete

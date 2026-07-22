@@ -1513,12 +1513,24 @@ pub struct JitHooks {
 /// owns the application frame and the jitcode-to-source-position mapping, so
 /// majit keeps only this crate-neutral ABI hook.
 pub type RecordApplicationTraceback = extern "C" fn(i64, i64, i32, i32);
+pub type RecordInlineApplicationTraceback = extern "C" fn(i64, i64, i64, i32, i32);
 
 static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static RECORD_INLINE_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
     RECORD_APPLICATION_TRACEBACK.store(
+        hook.map_or(0, |callback| callback as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub fn set_record_inline_application_traceback_hook(
+    hook: Option<RecordInlineApplicationTraceback>,
+) {
+    RECORD_INLINE_APPLICATION_TRACEBACK.store(
         hook.map_or(0, |callback| callback as usize),
         std::sync::atomic::Ordering::Release,
     );
@@ -1537,8 +1549,7 @@ fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MI
 }
 
 /// Invoke the host traceback callback for a recording frame represented by a
-/// crate-external walker.  The caller must supply the concrete frame identity;
-/// inline frames without one must not call this function.
+/// crate-external walker. The caller must supply the concrete frame identity.
 pub fn record_application_traceback_for_recording(
     exc_value: i64,
     frame_ptr: i64,
@@ -1556,6 +1567,28 @@ pub fn record_application_traceback_for_recording(
     // function pointer in set_record_application_traceback_hook.
     let callback: RecordApplicationTraceback = unsafe { std::mem::transmute(callback) };
     callback(exc_value, frame_ptr, jitcode_index, opcode_position);
+}
+
+/// Invoke the host callback for an inlined recording frame represented by its
+/// own promoted code/globals metadata rather than a concrete frame pointer.
+pub fn record_inline_application_traceback_for_recording(
+    exc_value: i64,
+    w_code: i64,
+    w_globals: i64,
+    jitcode_index: i32,
+    opcode_position: i32,
+) {
+    if exc_value == 0 || w_code == 0 {
+        return;
+    }
+    let callback = RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
+    if callback == 0 {
+        return;
+    }
+    // Safety: the only stored values come from a
+    // RecordInlineApplicationTraceback function pointer.
+    let callback: RecordInlineApplicationTraceback = unsafe { std::mem::transmute(callback) };
+    callback(exc_value, w_code, w_globals, jitcode_index, opcode_position);
 }
 
 /// framework.py `root_walker.walk_roots` per-op helper: visit every

@@ -453,6 +453,10 @@ pub struct InlineFrame {
     /// reaches [`FBW_MAX_INLINE_RECURSION`], the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
     pub w_code: usize,
+    /// Exception most recently caught by this frame. Matching
+    /// `MIFrame.last_caught_exception_value`, this suppresses a second
+    /// traceback node when the same exception later leaves via bare re-raise.
+    pub last_caught_exception_value: i64,
     /// Paused caller snapshot for the multi-frame path. `None` preserves the
     /// straight-line single-frame collapse while retaining the callee level.
     pub parent: Option<InlineParentFrame>,
@@ -490,7 +494,8 @@ pub struct WalkSession {
     pub tmpreg_i_concrete: ConcreteValue,
     pub tmpreg_f: OpRef,
     /// Concrete root frame and jitcode identity for application traceback
-    /// recording. Inlined callees have no concrete frame here and are skipped.
+    /// recording. Inlined callees carry their own identity separately in
+    /// `InlineCalleeConsts`.
     pub recording_frame_ptr: usize,
     pub recording_jitcode_index: i32,
     /// Last opcode executed by the root recording frame.
@@ -551,6 +556,46 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
     );
 }
 
+fn record_inline_application_traceback<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    exc_concrete: ConcreteValue,
+    opcode_position: usize,
+    caught: bool,
+) {
+    if ctx.is_top_level {
+        return;
+    }
+    let Some(consts) = ctx.inline_callee_consts else {
+        return;
+    };
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return;
+    };
+    if exc_ptr.is_null() {
+        return;
+    }
+    let exc_value = exc_ptr as usize as i64;
+    {
+        let mut session = ctx.session.borrow_mut();
+        let Some(frame) = session.framestack.last_mut() else {
+            return;
+        };
+        if !caught && frame.last_caught_exception_value == exc_value {
+            return;
+        }
+        if caught {
+            frame.last_caught_exception_value = exc_value;
+        }
+    }
+    majit_metainterp::record_inline_application_traceback_for_recording(
+        exc_value,
+        consts.w_code as i64,
+        consts.w_globals as i64,
+        consts.jitcode_index,
+        opcode_position as i32,
+    );
+}
+
 /// Compile-time-constant frame fields of an inlined callee.
 #[derive(Clone, Copy)]
 pub struct InlineCalleeConsts {
@@ -560,6 +605,9 @@ pub struct InlineCalleeConsts {
     /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
     /// pointer.
     w_code: usize,
+    /// Jitcode identity used to translate a callee opcode to its Python
+    /// instruction coordinate when constructing `PyTraceback` metadata.
+    jitcode_index: i32,
 }
 
 /// Walk-scoped FBW modes inherited parent-to-child across sub-walk
@@ -1832,6 +1880,7 @@ pub fn walk<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let mut pc = start_pc;
     loop {
+        let opcode_position = pc;
         let (outcome, next_pc) = step(code, pc, ctx)?;
         pc = next_pc;
         match outcome {
@@ -1863,6 +1912,7 @@ pub fn walk<Sym: WalkSym>(
                 // `exit_frame_with_exception`, letting the exception escape a
                 // frame that actually catches it.
                 if let Some(target) = try_catch_exception_at(code, pc) {
+                    record_inline_application_traceback(ctx, exc_concrete, opcode_position, true);
                     let opcode_position = ctx.session.borrow().recording_opcode_position;
                     record_top_level_application_traceback(
                         ctx,
@@ -1919,6 +1969,16 @@ pub fn walk<Sym: WalkSym>(
                     fbw_terminate_with_raise(exc, exc_concrete);
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
+                    let is_bare_reraise = decode_op_at(code, opcode_position)
+                        .is_some_and(|op| op.opname == "reraise/");
+                    if !is_bare_reraise {
+                        record_inline_application_traceback(
+                            ctx,
+                            exc_concrete,
+                            opcode_position,
+                            false,
+                        );
+                    }
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
                 }
             }
@@ -4100,10 +4160,11 @@ impl<'a> InlineFrameGuard<'a> {
         w_code: usize,
         parent: Option<InlineParentFrame>,
     ) -> Self {
-        session
-            .borrow_mut()
-            .framestack
-            .push(InlineFrame { w_code, parent });
+        session.borrow_mut().framestack.push(InlineFrame {
+            w_code,
+            last_caught_exception_value: 0,
+            parent,
+        });
         ACTIVE_WALK_SESSION.with(|c| c.set(session as *const _));
         InlineFrameGuard(session)
     }
