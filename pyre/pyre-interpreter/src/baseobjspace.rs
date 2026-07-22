@@ -13180,23 +13180,78 @@ pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
 pub(crate) fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = if args.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        args[0]
-    };
-    let w_type = if args.len() > 1 {
-        args[1]
-    } else {
-        pyre_object::PY_NULL
-    };
+    let given = args.len().saturating_sub(1);
+    if given == 0 {
+        return Err(PyError::type_error(
+            "throw expected at least 1 argument, got 0",
+        ));
+    }
+    if given > 3 {
+        return Err(PyError::type_error(format!(
+            "throw expected at most 3 arguments, got {given}"
+        )));
+    }
+    let gen_obj = args[0];
+    let w_type = args[1];
     let w_val = args.get(2).copied().unwrap_or_else(w_none);
     let w_tb = args.get(3).copied().unwrap_or_else(w_none);
-    let argc = (args.len() - 1).clamp(1, 3);
+    let argc = given;
 
-    // A non-exception argument or a normalization failure is raised to the
-    // caller; the generator is not resumed.
-    let err = normalize_throw_args(w_type, w_val)?;
+    // Python 3.14 deprecates only the legacy three-argument spelling; the
+    // one- and two-argument forms retain their existing semantics.
+    if argc == 3 {
+        crate::warn::warn_category(
+            "the (type, exc, tb) signature of throw() is deprecated, use the single-arg signature instead.",
+            "DeprecationWarning",
+            2,
+        )?;
+    }
+
+    // generator.py:185-216 `throw` — validate the traceback before the
+    // exception class/instance, then normalize an OperationError.  Usage
+    // errors are raised to the caller; failures produced while constructing
+    // an exception class are thrown into the generator itself.
+    let traceback = if unsafe { is_none(w_tb) } {
+        None
+    } else if unsafe { crate::pytraceback::is_pytraceback(w_tb) } {
+        Some(w_tb)
+    } else {
+        return Err(PyError::type_error(
+            "throw() third argument must be a traceback object",
+        ));
+    };
+    let is_class = unsafe { exception_is_valid_obj_as_class_w(w_type) };
+    let is_instance = if is_class {
+        false
+    } else {
+        let w_class = exception_getclass(w_type);
+        !w_class.is_null() && unsafe { exception_is_valid_class_w(w_class) }
+    };
+    if !is_class && !is_instance {
+        return Err(PyError::type_error(format!(
+            "exceptions must be classes or instances deriving from BaseException, not {}",
+            crate::type_methods::arg_type_name(w_type),
+        )));
+    }
+    if is_instance && unsafe { !is_none(w_val) } {
+        return Err(PyError::type_error(
+            "instance exception may not have a separate value",
+        ));
+    }
+
+    let mut operr = crate::error::OperationError::new(w_type, w_val);
+    operr._application_traceback = traceback;
+    let err = match operr.normalize_exception(w_none()) {
+        Ok(w_value) => unsafe { PyError::from_exc_object(w_value) },
+        Err(err) => {
+            return generator_send_ex(
+                gen_obj,
+                w_none(),
+                Some(err),
+                Some(([w_type, w_val, w_tb], argc)),
+            );
+        }
+    };
     generator_send_ex(
         gen_obj,
         w_none(),
@@ -13293,41 +13348,6 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         }
     }
     Ok(w_none())
-}
-
-/// Normalize throw() arguments into a PyError.
-///
-/// PyPy: generator.py throw() → OperationError(w_type, w_val, tb) + normalize
-///
-/// Handles:
-///   throw(TypeError)         — type → creates instance
-///   throw(TypeError("msg"))  — instance → derives type
-///   throw(TypeError, "msg")  — type + value → creates instance
-fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> Result<PyError, PyError> {
-    unsafe {
-        // If w_type is an exception instance, use it directly
-        if !w_type.is_null() && pyre_object::interp_exceptions::is_exception(w_type) {
-            return Ok(PyError::from_exc_object(w_type));
-        }
-
-        // generator.py throw(): a valid exception class is called to make
-        // the exception instance, including user-defined subclasses.
-        if !w_type.is_null() && exception_is_valid_obj_as_class_w(w_type) {
-            let w_exc = if w_val.is_null() || pyre_object::is_none(w_val) {
-                crate::call::call_function_impl_result(w_type, &[])?
-            } else {
-                crate::call::call_function_impl_result(w_type, &[w_val])?
-            };
-            if pyre_object::interp_exceptions::is_exception(w_exc) {
-                return Ok(PyError::from_exc_object(w_exc));
-            }
-        }
-
-        // Fallback: TypeError
-        Err(PyError::type_error(
-            "exceptions must be classes or instances deriving from BaseException",
-        ))
-    }
 }
 
 #[cfg(test)]

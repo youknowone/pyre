@@ -97,7 +97,7 @@ impl OperationError {
                         return Err(crate::call::take_call_error()
                             .unwrap_or_else(|| PyError::type_error("constructor failed")));
                     }
-                    w_type = self._exception_getclass(w_value)?;
+                    w_type = self._exception_getclass_from_call(w_type, w_value)?;
                 } else {
                     // error.py:212 w_valuetype = space.exception_getclass(w_value)
                     let w_valuetype = crate::baseobjspace::exception_getclass(w_value);
@@ -124,7 +124,7 @@ impl OperationError {
                             return Err(crate::call::take_call_error()
                                 .unwrap_or_else(|| PyError::type_error("constructor failed")));
                         }
-                        w_type = self._exception_getclass(w_value)?;
+                        w_type = self._exception_getclass_from_call(w_type, w_value)?;
                     }
                 }
                 // error.py:225-236 traceback attach — fast path writes
@@ -171,6 +171,32 @@ impl OperationError {
             return Err(PyError::type_error(
                 "exceptions must derive from BaseException",
             ));
+        }
+        Ok(w_type)
+    }
+
+    /// Python 3.14 exception normalization diagnostic for a class call whose
+    /// `__new__` returned a non-exception.  This is the class-construction
+    /// counterpart of `_exception_getclass`; direct `raise non_exception`
+    /// retains the ordinary "exceptions must derive" wording.
+    fn _exception_getclass_from_call(
+        &self,
+        w_constructor: PyObjectRef,
+        w_inst: PyObjectRef,
+    ) -> Result<PyObjectRef, PyError> {
+        let w_type = crate::baseobjspace::exception_getclass(w_inst);
+        if w_type.is_null() || !unsafe { crate::baseobjspace::exception_is_valid_class_w(w_type) } {
+            let constructor = unsafe { crate::display::py_repr(w_constructor) }
+                .unwrap_or_else(|_| "<exception class>".to_string());
+            let returned_type = if w_type.is_null() {
+                "<unknown type>".to_string()
+            } else {
+                unsafe { crate::display::py_repr(w_type) }
+                    .unwrap_or_else(|_| "<unknown type>".to_string())
+            };
+            return Err(PyError::type_error(format!(
+                "calling {constructor} should have returned an instance of BaseException, not {returned_type}"
+            )));
         }
         Ok(w_type)
     }
