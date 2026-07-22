@@ -664,11 +664,20 @@ pub(crate) fn write_stack_slot(
         // wrapint/wrapfloat emitted a NewWithVtable OpRef without
         // allocating yet — update only the OpRef half so
         // synchronize_virtualizable keeps writing the existing W_Root.
+        //
+        // The `has_virtualizable_shadow()` guard is a shadow-ownership
+        // safeguard: an owner (`owns_virtualizable_shadow()`) normally seeds
+        // both halves, but the disabled-concrete-shadow state (owner seeded
+        // with no live values — the init-before-run path) leaves
+        // `virtualizable_values` absent. Writing only the OpRef half there
+        // matches that state's contract (`virtualizable_entry_at` returns
+        // None, readers use the zero placeholder) and mirrors the #699 guard
+        // on `mirror_vable_static_to_boxes`.
         match concrete.to_ir_ref_value() {
-            Some(v) => {
+            Some(v) if ctx.has_virtualizable_shadow() => {
                 ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
             }
-            None => {
+            _ => {
                 ctx.set_virtualizable_box_at(flat_idx, boxed);
             }
         }
@@ -860,6 +869,18 @@ pub(crate) fn swap_stack_slots(
         ) {
             ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
             ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
+        } else if let (Some(op_top), Some(op_other)) = (
+            ctx.virtualizable_box_at(flat_top),
+            ctx.virtualizable_box_at(flat_other),
+        ) {
+            // Disabled-concrete-shadow owner (seeded with no live values):
+            // `virtualizable_entry_at` returns None because
+            // `virtualizable_values` is absent, so the pair-read above fails
+            // even though the boxes exist. Swap only the OpRef halves, the
+            // sole readers in that state, matching the disabled-shadow
+            // contract (see `write_stack_slot`).
+            ctx.set_virtualizable_box_at(flat_top, op_other);
+            ctx.set_virtualizable_box_at(flat_other, op_top);
         } else {
             panic!(
                 "swap_stack_slots: missing virtualizable_boxes entries for stack slots {top_idx} and {other_idx}"
@@ -3569,6 +3590,51 @@ mod tests {
         }
 
         assert_eq!(unsafe { &*frame.ctx }.num_ops(), before);
+    }
+
+    #[test]
+    fn stack_slot_writers_degrade_to_opref_only_when_concrete_shadow_disabled() {
+        // A disabled-concrete-shadow owner (`owns_virtualizable_shadow()` true
+        // but `virtualizable_values` absent — the init-before-run seed state)
+        // must update only the OpRef half of the vable shadow instead of
+        // panicking in `set_virtualizable_entry_at`. Production never reaches
+        // this state; the guard hardens the incidental owns/values coupling.
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let placeholder = ctx.const_ref(0);
+        // Boxes cover stack slots 0 and 1 at `nlocals == 0`; the empty values
+        // slice disables the concrete shadow.
+        let boxes = vec![placeholder; nvs + 4];
+        ctx.set_virtualizable_boxes_with_info(boxes, Vec::new(), &info, &[4]);
+        assert!(
+            !ctx.has_virtualizable_shadow(),
+            "empty values must disable the concrete shadow",
+        );
+
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.bridge_local_oprefs = Some(Vec::new()); // owns via the bridge half
+        sym.nlocals = 0;
+        sym.registers_r = vec![OpRef::NONE; 2]; // swap's semantic mirror needs both slots
+        assert!(sym.owns_virtualizable_shadow());
+
+        let ptr = 0xdead_beef_usize as *mut pyre_object::pyobject::PyObject;
+        let boxed0 = ctx.const_ref(0x1111);
+        let boxed1 = ctx.const_ref(0x2222);
+        // Ref concrete + disabled shadow: OpRef-only write, no panic.
+        write_stack_slot(&mut sym, &mut ctx, 0, boxed0, ConcreteValue::Ref(ptr));
+        write_stack_slot(&mut sym, &mut ctx, 1, boxed1, ConcreteValue::Ref(ptr));
+        assert_eq!(ctx.virtualizable_box_at(nvs), Some(boxed0));
+        assert_eq!(ctx.virtualizable_box_at(nvs + 1), Some(boxed1));
+        assert!(
+            !ctx.has_virtualizable_shadow(),
+            "the values half stays disabled after a Ref push",
+        );
+
+        // Swap degrades to an OpRef-only exchange rather than the entry-pair panic.
+        swap_stack_slots(&mut sym, &mut ctx, 0, 1);
+        assert_eq!(ctx.virtualizable_box_at(nvs), Some(boxed1));
+        assert_eq!(ctx.virtualizable_box_at(nvs + 1), Some(boxed0));
     }
 
     #[test]
