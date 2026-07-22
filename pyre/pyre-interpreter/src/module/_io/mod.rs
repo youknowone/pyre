@@ -856,10 +856,9 @@ crate::py_module! {
     // BytesIO / StringIO are the pure-Python in-memory streams: pickle's
     // Pickler/Unpickler use BytesIO; logging / traceback / csv use StringIO.
     appleveldefs: {
-        "_io_app.py" => ["BytesIO", "StringIO"],
+        "_io_app.py" => ["BytesIO", "StringIO", "IncrementalNewlineDecoder"],
     },
     functions: {
-        "IncrementalNewlineDecoder" / * = |_| Ok(w_none()),
         "open"            / * = crate::builtins::builtin_open,
         // `io.open_code(path)` — `_PyIO_open_code` opens the path in binary
         // read mode ("rb"); pyre has no audit hooks so it is just `open`.
