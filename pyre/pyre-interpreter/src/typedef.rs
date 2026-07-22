@@ -3747,7 +3747,7 @@ fn set_init_from_iterable(
                     key,
                 )
             }
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            .map_err(crate::baseobjspace::map_set_update_error)?;
             copied_hashed_key = true;
             index += 1;
         }
@@ -20065,7 +20065,7 @@ pub(crate) fn set_method_union(
     for other in &args[1..] {
         if unsafe { pyre_object::is_set_or_frozenset(*other) } {
             unsafe { pyre_object::w_set_update_from_set(result, *other) }
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(crate::baseobjspace::map_set_update_error)?;
         } else {
             let other_items = crate::builtins::collect_iterable(*other)?;
             crate::builtins::builtin_set_add_items(result, &other_items)?;
@@ -20160,7 +20160,7 @@ fn set_intersect_update(
                     break;
                 };
                 pyre_object::w_set_insert_key_checked(result, key)
-                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                    .map_err(crate::baseobjspace::map_set_update_error)?;
             }
             i += 1;
         }
@@ -20472,7 +20472,7 @@ fn set_method_update(
     for other in &args[1..] {
         if unsafe { pyre_object::is_set_or_frozenset(*other) } {
             unsafe { pyre_object::w_set_update_from_set(args[0], *other) }
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(crate::baseobjspace::map_set_update_error)?;
         } else {
             let other_items = crate::builtins::collect_iterable(*other)?;
             crate::builtins::builtin_set_add_items(args[0], &other_items)?;
@@ -20494,7 +20494,7 @@ fn set_method_difference_update(
     for other in &args[1..] {
         let w_other_as_set = set_operand_as_set(*other)?;
         unsafe { pyre_object::w_set_difference_update_from_set(args[0], w_other_as_set) }
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+            .map_err(crate::baseobjspace::map_set_update_error)?;
     }
     Ok(pyre_object::w_none())
 }
@@ -20561,7 +20561,7 @@ fn set_symmetric_difference_storage(
                         break;
                     };
                     pyre_object::w_set_insert_key_checked(w_new, key)
-                        .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                        .map_err(crate::baseobjspace::map_set_update_error)?;
                 }
                 i += 1;
             }
@@ -20686,7 +20686,7 @@ fn init_set_type(ns: PyObjectRef) {
                         let set = pyre_object::gc_roots::shadow_stack_get(sp);
                         let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                         pyre_object::w_set_add_hashed_checked(set, item, hash)
-                            .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                            .map_err(crate::baseobjspace::map_set_update_error)?;
                     }
                     Ok(pyre_object::w_none())
                 },

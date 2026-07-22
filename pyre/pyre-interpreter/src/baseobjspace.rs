@@ -64,6 +64,17 @@ pub fn take_pending_hash_error() -> PyError {
     })
 }
 
+/// Convert the two failure modes of a checked set-table operation back into
+/// the Python exception carried by PyPy's `r_dict` operation.
+pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyError {
+    match err {
+        pyre_object::setobject::SetUpdateError::Key(_) => take_pending_hash_error(),
+        pyre_object::setobject::SetUpdateError::ChangedSize => {
+            PyError::runtime_error("Set changed size during iteration")
+        }
+    }
+}
+
 /// Root the exception parked in `PENDING_HASH_ERROR` while a raising
 /// `__hash__`/`__eq__` propagates across a dict probe. Its `PyError` holds GC
 /// refs the precise collector does not reach through the raw `Cell`; forward
@@ -136,11 +147,23 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
     ))
 }
 
-/// The set-element counterpart of [`wrap_dict_key_hash_error`]: a bad element
-/// raises the bare `unhashable type: '<type>'` TypeError from hashing, so the
-/// error passes through unchanged.
-pub fn wrap_set_element_hash_error(_item: PyObjectRef, err: PyError) -> PyError {
-    err
+/// Python 3.14's set-element counterpart of [`wrap_dict_key_hash_error`].
+pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
+    if err.kind != PyErrorKind::TypeError {
+        return err;
+    }
+    if !err.exc_object.is_null() {
+        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let raised_type = crate::typedef::r#type(err.exc_object).unwrap_or(PY_NULL);
+        if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
+            return err;
+        }
+    }
+    PyError::type_error(format!(
+        "cannot use '{}' as a set element ({})",
+        object_functionstr_type_name(item),
+        err.message,
+    ))
 }
 
 /// Compatibility alias for PyPy's base-object type.

@@ -7127,7 +7127,7 @@ pub fn builtin_set_add_items(
             let set = pyre_object::gc_roots::shadow_stack_get(sp);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             pyre_object::w_set_add_hashed_checked(set, item, hash)
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                .map_err(crate::baseobjspace::map_set_update_error)?;
         }
         Ok(())
     }

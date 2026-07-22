@@ -10,7 +10,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::pyobject::*;
+use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
 use pyre_macros::pyre_class;
+use std::hash::BuildHasher;
 
 pub static SET_TYPE: PyType = crate::pyobject::new_pytype("set");
 pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype("frozenset");
@@ -270,7 +272,7 @@ pub unsafe fn w_set_add_hashed_checked(
     obj: PyObjectRef,
     item: PyObjectRef,
     hash: i64,
-) -> Result<(), crate::dictmultiobject::DictKeyError> {
+) -> Result<(), SetUpdateError> {
     w_set_insert_key_checked(obj, crate::dictmultiobject::object_key_hashed(item, hash))
 }
 
@@ -363,34 +365,8 @@ unsafe fn scan_set_key_reentrant(
 pub unsafe fn w_set_insert_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
-) -> Result<(), crate::dictmultiobject::DictKeyError> {
-    if let Some(result) = callback_free_set_op(|| {
-        let s = &mut *(obj as *mut W_SetObject);
-        let present = (*s.items).get_index_of(&key).is_some();
-        if !crate::dict_eq_hook::callback_free_probe_broken() && !present {
-            (*s.items).insert(key, ());
-            s.len = (*s.items).len();
-            s.hash = -1;
-            set_write_barrier(obj);
-        }
-    }) {
-        return result;
-    }
-
-    let (found, key) = scan_set_key_reentrant(obj, key)?;
-    if found.is_none() {
-        // The scan established inequality against every same-hash key.  Keep
-        // IndexMap's placement probe callback-free; any comparison outside
-        // the builtin ladder therefore answers false, reproducing that scan.
-        crate::dict_eq_hook::begin_callback_free_probe();
-        let s = &mut *(obj as *mut W_SetObject);
-        (*s.items).insert(key, ());
-        let _ = crate::dict_eq_hook::end_callback_free_probe();
-        s.len = (*s.items).len();
-        s.hash = -1;
-        set_write_barrier(obj);
-    }
-    Ok(())
+) -> Result<(), SetUpdateError> {
+    w_set_insert_key_reentrant(obj, key)
 }
 
 /// Membership test for a key that carries its own digest, propagating an
@@ -577,7 +553,7 @@ pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
 pub unsafe fn w_set_difference_update_from_set(
     dst: PyObjectRef,
     src: PyObjectRef,
-) -> Result<(), crate::dictmultiobject::DictKeyError> {
+) -> Result<(), SetUpdateError> {
     if std::ptr::eq(
         (*(dst as *const W_SetObject)).items,
         (*(src as *const W_SetObject)).items,
@@ -592,15 +568,25 @@ pub unsafe fn w_set_difference_update_from_set(
     // exact contains-with-hash callback direction of the upstream strategy.
     if w_set_len(dst) < w_set_len(src) {
         let result = w_set_new();
+        let dst_items = (*(dst as *const W_SetObject)).items;
+        let dst_len = (*dst_items).len();
         let mut i = 0;
-        while let Some(key) = w_set_key_at(dst, i) {
-            if !w_set_contains_key_checked(src, key)? {
+        while i < dst_len {
+            let Some(key) = w_set_key_at(dst, i) else {
+                return Err(SetUpdateError::ChangedSize);
+            };
+            if !w_set_contains_key_for_update(src, key)? {
+                if (*(dst as *const W_SetObject)).items != dst_items
+                    || (*dst_items).len() != dst_len
+                {
+                    return Err(SetUpdateError::ChangedSize);
+                }
                 // The comparison may clear or otherwise shorten `dst`.
                 // CPython's set probe restarts when `entry->key` changes;
                 // once this live index disappeared there is no surviving
                 // entry to copy into the difference result.
                 let Some(key) = w_set_key_at(dst, i) else {
-                    break;
+                    return Err(SetUpdateError::ChangedSize);
                 };
                 w_set_insert_key_checked(result, key)?;
             }
@@ -610,9 +596,17 @@ pub unsafe fn w_set_difference_update_from_set(
         return Ok(());
     }
     // `src` is a distinct storage, so removing from `dst` cannot renumber it.
+    let src_items = (*(src as *const W_SetObject)).items;
+    let src_len = (*src_items).len();
     let mut i = 0;
-    while let Some(key) = w_set_key_at(src, i) {
-        w_set_discard_key_checked(dst, key)?;
+    while i < src_len {
+        let Some(key) = w_set_key_at(src, i) else {
+            return Err(SetUpdateError::ChangedSize);
+        };
+        w_set_remove_key_for_update(dst, key)?;
+        if (*(src as *const W_SetObject)).items != src_items || (*src_items).len() != src_len {
+            return Err(SetUpdateError::ChangedSize);
+        }
         i += 1;
     }
     Ok(())
@@ -631,7 +625,7 @@ pub unsafe fn w_set_difference_update_from_set(
 pub unsafe fn w_set_update_from_set(
     dst: PyObjectRef,
     src: PyObjectRef,
-) -> Result<(), crate::dictmultiobject::DictKeyError> {
+) -> Result<(), SetUpdateError> {
     if std::ptr::eq(
         (*(dst as *const W_SetObject)).items,
         (*(src as *const W_SetObject)).items,
@@ -644,12 +638,153 @@ pub unsafe fn w_set_update_from_set(
     // (`set_object_custom_trace`) — a `Vec` of keys lifted out of them would
     // not be walked and would be left holding stale pointers.
     let mut i = 0;
-    while i < (*(*(src as *const W_SetObject)).items).len() {
-        let Some((&key, _)) = (*(*(src as *const W_SetObject)).items).get_index(i) else {
+    loop {
+        let src_items = (*(src as *const W_SetObject)).items;
+        let Some((&key, _)) = (*src_items).get_index(i) else {
             break;
         };
         w_set_insert_key_checked(dst, key)?;
         i += 1;
+    }
+    Ok(())
+}
+
+/// Failure modes of the PyPy `ObjectSetStrategy.update` table merge.
+pub enum SetUpdateError {
+    /// An equality callback raised; its concrete exception is parked in the
+    /// interpreter's pending dict-key error slot.
+    Key(crate::dictmultiobject::DictKeyError),
+    /// A callback changed one of the tables while it was being traversed.
+    ChangedSize,
+}
+
+/// Insert one cached-hash key during `ObjectSetStrategy.update` without
+/// holding an IndexMap borrow across user `eq_w`.
+///
+/// RPython's `r_dict.update` detects a table size change during a comparison
+/// and raises instead of continuing through invalidated buckets.  IndexMap's
+/// ordinary `insert` owns a mutable table borrow while `ObjectKey::eq` calls
+/// Python; re-entering `set.clear()` through that callback invalidates its
+/// internal insertion index.  Read each candidate by value, release the Rust
+/// borrow before `eq_w`, verify the table shape, then use the already-proven
+/// vacant raw entry so insertion performs no second user comparison.
+unsafe fn w_set_insert_key_reentrant(
+    dst: PyObjectRef,
+    key: crate::dictmultiobject::ObjectKey,
+) -> Result<(), SetUpdateError> {
+    // CPython 3.14's set probe restarts when a comparison mutates the table;
+    // PyPy's r_dict likewise resumes from a valid table state rather than
+    // retaining a bucket index across the callback.
+    'restart: loop {
+        let dst_items = (*(dst as *const W_SetObject)).items;
+        let dst_len = (*dst_items).len();
+        let mut i = 0;
+        while i < dst_len {
+            let Some((&stored, _)) = (*dst_items).get_index(i) else {
+                continue 'restart;
+            };
+            if stored.hash == key.hash {
+                let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+                if crate::dictmultiobject::take_dict_key_error() {
+                    return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+                }
+                if (*(dst as *const W_SetObject)).items != dst_items
+                    || (*dst_items).len() != dst_len
+                {
+                    continue 'restart;
+                }
+                if equal {
+                    return Ok(());
+                }
+            }
+            i += 1;
+        }
+
+        if (*(dst as *const W_SetObject)).items != dst_items || (*dst_items).len() != dst_len {
+            continue;
+        }
+        let entries = &mut *dst_items;
+        let hash = entries.hasher().hash_one(&key);
+        match entries.raw_entry_mut_v1().from_hash(hash, |_| false) {
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_hashed_nocheck(hash, key, ());
+            }
+            RawEntryMut::Occupied(_) => unreachable!("a never-matching raw probe is vacant"),
+        }
+        let set = &mut *(dst as *mut W_SetObject);
+        set.len += 1;
+        set.hash = -1;
+        set_write_barrier(dst);
+        return Ok(());
+    }
+}
+
+/// Membership half of `contains_with_hash` for a mutation-sensitive set
+/// operation.  As with the update inserter above, no IndexMap borrow crosses
+/// `eq_w`; a size-changing callback invalidates the traversal explicitly.
+unsafe fn w_set_contains_key_for_update(
+    probe: PyObjectRef,
+    key: crate::dictmultiobject::ObjectKey,
+) -> Result<bool, SetUpdateError> {
+    let items = (*(probe as *const W_SetObject)).items;
+    let len = (*items).len();
+    let mut i = 0;
+    while i < len {
+        let Some((&stored, _)) = (*items).get_index(i) else {
+            return Err(SetUpdateError::ChangedSize);
+        };
+        if stored.hash == key.hash {
+            let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+            if crate::dictmultiobject::take_dict_key_error() {
+                return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+            }
+            if (*(probe as *const W_SetObject)).items != items || (*items).len() != len {
+                return Err(SetUpdateError::ChangedSize);
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        i += 1;
+    }
+    Ok(false)
+}
+
+/// `delitem_with_hash` for a mutation-sensitive difference update.  Find the
+/// matching bucket without lending IndexMap across Python code, then delete
+/// the proven index without another equality callback.
+unsafe fn w_set_remove_key_for_update(
+    dst: PyObjectRef,
+    key: crate::dictmultiobject::ObjectKey,
+) -> Result<(), SetUpdateError> {
+    let items = (*(dst as *const W_SetObject)).items;
+    let len = (*items).len();
+    let mut found = None;
+    let mut i = 0;
+    while i < len {
+        let Some((&stored, _)) = (*items).get_index(i) else {
+            return Err(SetUpdateError::ChangedSize);
+        };
+        if stored.hash == key.hash {
+            let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+            if crate::dictmultiobject::take_dict_key_error() {
+                return Err(SetUpdateError::Key(crate::dictmultiobject::DictKeyError));
+            }
+            if (*(dst as *const W_SetObject)).items != items || (*items).len() != len {
+                return Err(SetUpdateError::ChangedSize);
+            }
+            if equal {
+                found = Some(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+    if let Some(index) = found {
+        (*items).shift_remove_index(index);
+        let set = &mut *(dst as *mut W_SetObject);
+        set.len -= 1;
+        set.hash = -1;
     }
     Ok(())
 }
