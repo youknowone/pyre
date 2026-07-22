@@ -1094,6 +1094,7 @@ pub fn get_current_exception() -> PyObjectRef {
 /// The bytecode PUSH_EXC_INFO machinery deliberately continues to use
 /// [`get_current_exception`] for the direct EC slot; app-level `sys.exception`
 /// and bare raise use this logical view instead.
+#[majit_macros::dont_look_inside]
 pub fn get_sys_exception() -> PyObjectRef {
     let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
@@ -1172,7 +1173,11 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // `__context__` and `__cause__`/`__suppress_context__` writes land
     // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
-    crate::error::chain_context(exc, get_sys_exception());
+    // A running generator swaps its suspended exception into this flat EC
+    // slot before entering the frame.  Keep the hot raise path on the same
+    // residual leaf as PyPy's live frame state; walking the outer generator
+    // chain here would expose the virtualizable frame during tracing.
+    crate::error::chain_context(exc, get_current_exception());
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
             // `interp_exceptions.py:166-174 descr_setcause` — writes
@@ -1338,7 +1343,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     // handled records that active exception as its __context__, not only an
     // explicit `raise`.  Recorded once (skipped when a __context__ is already
     // stamped), so it lands at the frame where the exception first surfaces.
-    crate::error::chain_context(err.exc_object, get_sys_exception());
+    crate::error::chain_context(err.exc_object, get_current_exception());
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the

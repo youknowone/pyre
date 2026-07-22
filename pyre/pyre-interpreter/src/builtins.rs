@@ -335,7 +335,7 @@ unsafe fn w_memoryview_new_plain(
 
 /// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
 /// byte window whose owner remains the mmap object.
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "sandbox")))]
 unsafe fn w_memoryview_new_mmap(
     w_obj: PyObjectRef,
     address: usize,
@@ -7225,6 +7225,24 @@ pub fn builtin_set_add_items(
     set: PyObjectRef,
     items: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
+    builtin_set_add_items_impl(set, items, true)
+}
+
+/// Intersection materializes an operand through PyPy's internal `_newobj`
+/// path.  Unlike the public set constructor/mutators, CPython 3.14 and PyPy
+/// let the original `unhashable type` escape from this path unchanged.
+pub(crate) fn builtin_set_add_items_intersection(
+    set: PyObjectRef,
+    items: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    builtin_set_add_items_impl(set, items, false)
+}
+
+fn builtin_set_add_items_impl(
+    set: PyObjectRef,
+    items: &[PyObjectRef],
+    wrap_hash_error: bool,
+) -> Result<(), crate::PyError> {
     unsafe {
         // `try_hash_value` may run a user `__hash__` that allocates and
         // triggers a moving minor collection; `set` and every not-yet-added
@@ -7241,10 +7259,14 @@ pub fn builtin_set_add_items(
         for i in 0..item_len {
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             let hash = try_hash_value(item).map_err(|err| {
-                crate::baseobjspace::wrap_set_element_hash_error(
-                    pyre_object::gc_roots::shadow_stack_get(item_base + i),
-                    err,
-                )
+                if wrap_hash_error {
+                    crate::baseobjspace::wrap_set_element_hash_error(
+                        pyre_object::gc_roots::shadow_stack_get(item_base + i),
+                        err,
+                    )
+                } else {
+                    err
+                }
             })?;
             let set = pyre_object::gc_roots::shadow_stack_get(sp);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);

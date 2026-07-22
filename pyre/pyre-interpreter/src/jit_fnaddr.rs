@@ -1366,6 +1366,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::get_current_exception",
         get_current_exc as *const (),
     );
+    // `get_sys_exception` is the PyPy `ExecutionContext.sys_exc_info` leaf:
+    // it may walk the running-generator chain, but that execution-context
+    // state is runtime data and must not be folded into a trace.
+    let get_sys_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_sys_exception;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::get_sys_exception",
+        "pyre_interpreter::get_sys_exception",
+        get_sys_exc as *const (),
+    );
     let set_current_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
     push_alias_pair(
         &mut entries,
@@ -2517,6 +2527,14 @@ mod tests {
             get_exc
         );
         assert_eq!(bindings["pyre_interpreter::get_current_exception"], get_exc);
+
+        let get_sys_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_sys_exception;
+        let get_sys_exc = get_sys_exc as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::eval::get_sys_exception"],
+            get_sys_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::get_sys_exception"], get_sys_exc);
 
         let set_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
         let set_exc = set_exc as *const () as usize as i64;

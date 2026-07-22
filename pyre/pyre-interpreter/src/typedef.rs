@@ -3749,6 +3749,14 @@ fn set_init_from_iterable(
     w_set: PyObjectRef,
     w_iterable: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    set_init_from_iterable_impl(w_set, w_iterable, true)
+}
+
+fn set_init_from_iterable_impl(
+    w_set: PyObjectRef,
+    w_iterable: PyObjectRef,
+    wrap_hash_error: bool,
+) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_set_or_frozenset(w_iterable) } {
         unsafe { pyre_object::w_set_copy_storage_from(w_set, w_iterable) };
         return Ok(());
@@ -3814,7 +3822,11 @@ fn set_init_from_iterable(
     let items =
         crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
     let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-    crate::builtins::builtin_set_add_items(w_set, &items)
+    if wrap_hash_error {
+        crate::builtins::builtin_set_add_items(w_set, &items)
+    } else {
+        crate::builtins::builtin_set_add_items_intersection(w_set, &items)
+    }
 }
 
 /// `set.__init__(self, [iterable])` — PyPy: setobject.py W_SetObject.descr_init.
@@ -6812,8 +6824,14 @@ fn dict_view_as_set_op(
     rhs: pyre_object::PyObjectRef,
     methname: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-    let w_set = crate::call::call_function_impl_result(w_set_type, &[lhs])?;
+    let w_set = if methname == "intersection_update" {
+        let w_set = pyre_object::w_set_new();
+        set_init_from_iterable_impl(w_set, lhs, false)?;
+        w_set
+    } else {
+        let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+        crate::call::call_function_impl_result(w_set_type, &[lhs])?
+    };
     let method = crate::baseobjspace::getattr_str(w_set, methname)?;
     crate::call::call_function_impl_result(method, &[rhs])?;
     Ok(w_set)
@@ -20219,6 +20237,14 @@ fn set_newobj(
     Ok(w_set)
 }
 
+fn set_newobj_intersection(
+    w_iterable: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let w_set = pyre_object::w_set_new();
+    set_init_from_iterable_impl(w_set, w_iterable, false)?;
+    Ok(w_set)
+}
+
 /// The operand as a set: itself when it already is one, otherwise a set built
 /// from it.
 ///
@@ -20317,12 +20343,12 @@ pub(crate) fn set_method_intersection(
 
     // `setobject.py` — the seed and every operand become sets, and a
     // set operand is intersected as it stands rather than rebuilt.
-    let mut result = set_newobj(others_w[0])?;
+    let mut result = set_newobj_intersection(others_w[0])?;
     for &w_other in &others_w[1..] {
         let w_other_as_set = if unsafe { pyre_object::is_set_or_frozenset(w_other) } {
             w_other
         } else {
-            set_newobj(w_other)?
+            set_newobj_intersection(w_other)?
         };
         result = set_intersect_update(result, w_other_as_set)?;
     }
