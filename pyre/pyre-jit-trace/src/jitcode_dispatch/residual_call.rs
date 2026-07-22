@@ -40,7 +40,14 @@ impl Drop for ActiveFrameEscapeGuard {
     }
 }
 
-pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) {
+/// Returns whether `frame` is the one recorded as escaping this residual call
+/// (`expected == frame`) — i.e. the traced virtualizable itself was handed to
+/// Python, so its tracing token must be forced. A residual callee inspecting
+/// its own frame passes a different `frame` and returns false. Independently,
+/// the walk-end resume pc is committed only when the state flush succeeds (a
+/// merge point with cached depth); a matched frame that cannot flush still
+/// escaped and must be forced, so the two signals are decoupled.
+pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
     ACTIVE_FRAME_ESCAPE.with(|slot| {
         if let Some((expected, py_pc)) = slot.get()
             && expected == frame as usize
@@ -48,8 +55,10 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             if crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc) {
                 COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some(py_pc)));
             }
+            return true;
         }
-    });
+        false
+    })
 }
 
 pub fn take_committed_frame_escape_pc() -> Option<usize> {

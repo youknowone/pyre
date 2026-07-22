@@ -3477,8 +3477,10 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
     }
     let (driver, info) = driver_pair();
     unsafe {
+        let mut traced_frame_escaped = false;
         let tracing_frame = driver.meta_interp_mut().trace_ctx().and_then(|ctx| {
-            pyre_jit_trace::jitcode_dispatch::flush_active_frame_escape(ctx, frame);
+            traced_frame_escaped =
+                pyre_jit_trace::jitcode_dispatch::flush_active_frame_escape(ctx, frame);
             ctx.virtualizable_heap_ptr()
         });
         let tracing_frame = tracing_frame.map(|ptr| ptr as *mut u8).filter(|ptr| {
@@ -3498,14 +3500,17 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 driver.meta_interp_mut().force_virtualizable_token(token);
             });
         };
-        // Force the traced frame even when it IS the escaping one: clearing
+        // Force the traced frame only when the frame handed to Python IS the
+        // traced virtualizable (it was the one recorded as escaping). Clearing
         // TOKEN_TRACING_RESCALL is what `tracing_after_residual_call` reads as
-        // "the callee forced the virtualizable", which raises
-        // `VableEscapedDuringResidualCall` and lets the walk resume forward
-        // from the pc `flush_active_frame_escape` just committed.  Skipping it
-        // would leave the walk tracing against a shadow whose frame has already
-        // been handed to Python code.
-        if let Some(ptr) = tracing_frame {
+        // "the callee forced the virtualizable", raising
+        // `VableEscapedDuringResidualCall` so the walk resumes forward.  A
+        // residual callee inspecting its own frame escapes a DIFFERENT frame;
+        // clearing the token there raises a spurious escape with no committed
+        // resume pc, so the walk replays from entry — double-applying the
+        // residual's non-journaled body effects.  Skipping the force there
+        // leaves the callee frame (which is not the traced shadow) untouched.
+        if traced_frame_escaped && let Some(ptr) = tracing_frame {
             force(ptr);
         }
         if live_frame_armed {
