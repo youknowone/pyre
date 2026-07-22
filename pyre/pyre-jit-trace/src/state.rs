@@ -1996,6 +1996,11 @@ pub struct PyreSym {
     /// `None` for a non-branch-guard resume, where the walk
     /// keeps the opcode-entry offset for `py_pc`.
     pub(crate) bridge_walk_entry_pc: Option<usize>,
+    /// JitCode body that owns `bridge_walk_entry_pc`. `resume.py:1049-1056`
+    /// constructs the resumed frame and applies its PC from the same resume
+    /// section; retain that body identity so the walker never interprets the
+    /// offset in another installed body for this code object.
+    pub(crate) bridge_walk_entry_jitcode_index: i32,
     /// The color-indexed Ref register bank as `consume_boxes`
     /// (resume.py:1055) fills `f.registers_r` — one box per abstract
     /// register color the guard's resume numbering named. This is the
@@ -2185,6 +2190,7 @@ pub trait WalkSym {
     fn live_vable_frame_addr(&self) -> usize;
     fn set_live_vable_frame_addr(&mut self, value: usize);
     fn bridge_walk_entry_pc(&self) -> Option<usize>;
+    fn bridge_walk_entry_jitcode_index(&self) -> i32;
     fn bridge_registers_r(&self) -> Option<&Vec<OpRef>>;
     fn bridge_registers_r_mut(&mut self) -> &mut Option<Vec<OpRef>>;
     fn bridge_stack_oprefs(&self) -> Option<&Vec<OpRef>>;
@@ -2304,6 +2310,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn bridge_walk_entry_pc(&self) -> Option<usize> {
         self.bridge_walk_entry_pc
+    }
+
+    #[inline]
+    fn bridge_walk_entry_jitcode_index(&self) -> i32 {
+        self.bridge_walk_entry_jitcode_index
     }
 
     #[inline]
@@ -4477,6 +4488,7 @@ impl PyreSym {
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
             bridge_walk_entry_pc: None,
+            bridge_walk_entry_jitcode_index: -1,
             bridge_registers_r: None,
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
@@ -9267,6 +9279,7 @@ impl JitState for PyreJitState {
         sym.bridge_walk_entry_pc =
             crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
                 .then_some(frame0.pc as usize);
+        sym.bridge_walk_entry_jitcode_index = frame0.jitcode_index;
         sym.bridge_local_types = Some(bridge_local_types);
         // consume_boxes (resume.py:1055) fills `f.registers_r` by abstract
         // register color; keep that color-indexed decode so a cross-frame

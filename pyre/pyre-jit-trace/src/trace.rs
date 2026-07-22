@@ -2003,6 +2003,29 @@ fn run_perfn_walk<Sym: WalkSym>(
         Vec::new()
     };
 
+    // resume.py:1049-1056 constructs a frame and consumes its register stream
+    // against that frame's JitCode body. Do not interpret a carried offset in
+    // another installed body for the same code object: its register colors are
+    // a foreign coordinate space. This is a runtime decline, not a green-key
+    // disable, because a later bridge may carry a matching body identity.
+    if is_bridge_trace
+        && sym.bridge_walk_entry_pc().is_some()
+        && pjc.jitcode.index() as i32 != sym.bridge_walk_entry_jitcode_index()
+    {
+        crate::jitcode_dispatch::census_record("Fbw::BridgeEntryForeignJitcode");
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-bridge-decline] foreign resume-marker jitcode: body_index={} \\
+                 bridge_jitcode_index={} entry={}",
+                pjc.jitcode.index(),
+                sym.bridge_walk_entry_jitcode_index(),
+                entry,
+            );
+        }
+        fbw_bridge_decline(ctx);
+        return None;
+    }
+
     // resume.py:1042-1057 `consume_boxes` fills every register named by the
     // resume marker's `live/` stream.  A bridge whose carried coordinate names
     // such a marker starts this walk from the input banks above, so reject the
@@ -2034,7 +2057,15 @@ fn run_perfn_walk<Sym: WalkSym>(
                 .is_none_or(|opref| opref.is_none())
         });
         if missing_ref.is_some() || missing_int.is_some() || missing_float.is_some() {
-            crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded");
+            if missing_ref.is_some() {
+                crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded::Ref");
+            }
+            if missing_int.is_some() {
+                crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded::Int");
+            }
+            if missing_float.is_some() {
+                crate::jitcode_dispatch::census_record("Fbw::BridgeEntryLiveRegUnseeded::Float");
+            }
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!(
                     "[fbw-bridge-decline] uncovered resume-marker live register: \
