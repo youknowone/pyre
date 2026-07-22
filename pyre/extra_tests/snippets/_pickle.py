@@ -949,6 +949,32 @@ if HAVE_PICKLE:
     finally:
         globals()["Shadow"] = _real_shadow
 
+    # Import/sys.modules failures become PicklingError, but exceptions from a
+    # real module's PEP 562 __getattr__ remain user exceptions.
+    import sys
+    import types
+
+    dynamic_module = types.ModuleType("pickle_dynamic_keyerror")
+
+    def dynamic_getattr(name):
+        raise KeyError(name)
+
+    dynamic_module.__getattr__ = dynamic_getattr
+    sys.modules[dynamic_module.__name__] = dynamic_module
+
+    def dynamic_target():
+        pass
+
+    dynamic_target.__module__ = dynamic_module.__name__
+    dynamic_target.__qualname__ = "dynamic_target"
+    try:
+        dumps(dynamic_target, 4)
+        raise AssertionError("module __getattr__ KeyError was masked")
+    except KeyError as exc:
+        assert exc.args == ("dynamic_target",), exc
+    finally:
+        del sys.modules[dynamic_module.__name__]
+
     # ── persistent_id / persistent_load: the external-object hook ──
     class Ref:
         def __init__(self, name):

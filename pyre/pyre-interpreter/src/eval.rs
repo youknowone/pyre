@@ -3834,13 +3834,13 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_global ──
     // pypy/interpreter/pyopcode.py:901-903 DELETE_GLOBAL —
     //   `self.space.delitem(self.get_w_globals_storage(), w_varname)`.
-    // `space.delitem` on a dict raises `KeyError(w_varname)` when the
-    // key is missing; pyre routes through `w_dict_delitem_str` on the
-    // canonical W_DictObject so the W_ModuleDictObject's strategy is updated.
+    // CPython/PyPy dict deletion uses the dict's intrinsic strategy and does
+    // not invoke a dict subclass's Python-level __delitem__.  Resolve pyre's
+    // composed dict-subclass backing first, then use that same strategy path.
     fn delete_global(&mut self, name: &str) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
-        let found =
-            !w_globals.is_null() && unsafe { pyre_object::w_dict_delitem_str(w_globals, name) };
+        let backing = unsafe { crate::type_methods::resolve_dict_backing(w_globals) };
+        let found = !backing.is_null() && unsafe { pyre_object::w_dict_delitem_str(backing, name) };
         if !found {
             return Err(PyError::key_error(format!("'{name}'")));
         }

@@ -3784,6 +3784,18 @@ fn build_class_inner(
         // `weak_subclasses` so cross-subclass invalidation in
         // `mutated()` and `__subclasses__()` see this class.
         unsafe { pyre_object::typeobject::w_type_ready(w) };
+        // CPython type_new_set_classdict binds __classdict__ before
+        // type_new_set_names.  A descriptor's __set_name__ may mutate the
+        // completed type dict and immediately materialize lazy annotations;
+        // the annotation thunk must observe that final dict, not the
+        // provisional class-body namespace.
+        if let Some(classdictcell_root) = classdictcell_root {
+            let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
+            let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w) as PyObjectRef };
+            if !type_dict.is_null() {
+                unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
+            }
+        }
         // __set_name__ protocol — type_new_set_names
         // Only needed here because w_type_new is a raw Rust call that
         // bypasses the type() builtin (builtins.rs) which already calls
@@ -3842,6 +3854,9 @@ fn build_class_inner(
         }
     }
 
+    // The default path bound this before __set_name__; the metaclass path
+    // normally binds it inside type.__new__.  Retain this final validation/
+    // fallback for a custom metaclass returning a type without delegating.
     if let Some(classdictcell_root) = classdictcell_root {
         if unsafe { pyre_object::is_type(w_type) } {
             let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);

@@ -1935,11 +1935,7 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     "__annotate__ returned non-dict of type '{received}'"
                 )));
             }
-            // Module annotation functions consult the mutable
-            // `__conditional_annotations__` set.  A partially executed
-            // module may therefore produce a larger dict on a later read;
-            // do not freeze the intermediate result in `__annotations__`.
-            return Ok(result);
+            result
         }
         _ => pyre_object::w_dict_new(),
     };

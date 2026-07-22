@@ -8821,6 +8821,10 @@ impl CodeWriter {
                             };
                             if nargs > 14 {
                                 emit_abort_permanent!(py_pc);
+                                // `abort_permanent` closes this graph block.
+                                // Do not record the synthetic call result or
+                                // any later operation on the closed block.
+                                continue;
                             }
                             push_and_bump!(call_result_value, py_pc);
                         }

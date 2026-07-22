@@ -3707,6 +3707,7 @@ fn type_descr_new_with_metaclass(
         // both explicit class cells out of the new type's `__dict__`
         // (CPython consumes them here rather than storing them).
         let mut classcell_root = None;
+        let mut classdictcell_root = None;
         // `type.__new__` accepts any `dict` subclass as the namespace
         // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
         // the dict backing so e.g. an `enum._EnumDict` class body is
@@ -3747,6 +3748,11 @@ fn type_descr_new_with_metaclass(
                     continue;
                 }
                 if key.as_str() == Ok("__classdictcell__") {
+                    if unsafe { pyre_object::is_cell(value) } {
+                        let root = pyre_object::gc_roots::shadow_stack_len();
+                        pyre_object::gc_roots::pin_root(value);
+                        classdictcell_root = Some(root);
+                    }
                     continue;
                 }
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -3863,6 +3869,17 @@ fn type_descr_new_with_metaclass(
         // `weak_subclasses` so `mutated()` and `__subclasses__()`
         // observe this class.
         unsafe { pyre_object::typeobject::w_type_ready(w_type) };
+
+        // CPython type_new_set_classdict precedes type_new_set_names: lazy
+        // annotation thunks invoked by __set_name__ must resolve class-local
+        // names through the completed type dictionary.
+        if let Some(classdictcell_root) = classdictcell_root {
+            let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
+            let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef };
+            if !type_dict.is_null() {
+                unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
+            }
+        }
 
         // _set_names (typeobject.py:1006) — call `__set_name__(owner, name)`
         // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),

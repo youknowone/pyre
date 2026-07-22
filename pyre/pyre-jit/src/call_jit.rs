@@ -4731,7 +4731,7 @@ pub extern "C" fn bh_load_global_fn(
 
 /// LOAD_FROM_DICT_OR_GLOBALS residual (`load_from_dict_or_globals` HLOp →
 /// `residual_call_ir_r`).  Mirrors `eval.rs::load_from_dict_or_globals`:
-/// try `getattr_str(dict, name)` on the popped mapping first, then fall
+/// try `getitem(dict, name)` on the popped mapping first, then fall
 /// back to the live frame's globals, else NameError.  `namei` is a direct
 /// `code.names` index (no LOAD_GLOBAL push-null low-bit shift).
 ///
@@ -4757,11 +4757,17 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     let varname = code.names[idx].as_ref();
     let dict = dict_ptr as pyre_object::PyObjectRef;
 
-    // Try the popped mapping first (`getattr_str`), matching the
-    // interpreter's `if let Ok(val) = getattr_str(dict, name)` fast path.
-    match pyre_interpreter::baseobjspace::getattr_str(dict, varname) {
+    // CPython/PyPy LOAD_FROM_DICT_OR_GLOBALS uses mapping subscription, not
+    // attribute lookup.  Preserve __getitem__/__missing__ and propagate every
+    // exception except the KeyError that selects the globals fallback.
+    let key = pyre_object::w_str_new(varname);
+    match pyre_interpreter::baseobjspace::getitem(dict, key) {
         Ok(val) => return val as i64,
-        Err(_) => {}
+        Err(err) if matches!(err.kind, pyre_interpreter::PyErrorKind::KeyError) => {}
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            return 0;
+        }
     }
 
     // Fall back to the live frame's globals (GC-safe when the frame owns
@@ -4775,10 +4781,13 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
         unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
     };
     if !w_globals.is_null() {
-        if let Some(val) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, varname) }
-        {
-            return val as i64;
+        match pyre_interpreter::baseobjspace::finditem_str(w_globals, varname) {
+            Ok(Some(val)) => return val as i64,
+            Ok(None) => {}
+            Err(mut err) => {
+                publish_residual_call_exception(err.to_exc_object() as i64);
+                return 0;
+            }
         }
     }
 

@@ -1895,8 +1895,8 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
     // ModuleNotFoundError subclass), an invalid module name, and a missing
     // sys.modules entry into PicklingError.  Other exceptions raised by a
     // module's dynamic attribute machinery still propagate unchanged.
-    let resolved = match crate::module::_pickle::try_resolve_global(&module_name, name, true) {
-        Ok(value) => value,
+    let module = match import_module(&module_name) {
+        Ok(module) => module,
         Err(error)
             if matches!(
                 error.kind,
@@ -1911,6 +1911,14 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
                 error.message
             )));
         }
+        Err(error) => return Err(error),
+    };
+    // Attribute traversal is deliberately outside the import-error
+    // conversion above.  A module's PEP 562 __getattr__ may raise KeyError,
+    // and that user exception must propagate rather than become PicklingError.
+    let resolved = match getattribute_dotted(module, name) {
+        Ok((value, _)) => Some(value),
+        Err(error) if matches!(error.kind, crate::PyErrorKind::AttributeError) => None,
         Err(error) => return Err(error),
     };
     match resolved {

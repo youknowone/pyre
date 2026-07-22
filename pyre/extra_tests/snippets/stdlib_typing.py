@@ -44,6 +44,10 @@ class AnnotatedCoordinate:
     x: int
 
 
+if hasattr(AnnotatedCoordinate.__annotate__, "__jit__"):
+    # Force the annotation thunk through the LOAD_FROM_DICT_OR_GLOBALS JIT
+    # residual before materializing its cache.
+    AnnotatedCoordinate.__annotate__.__jit__()
 assert AnnotatedCoordinate.__annotations__ == {"x": int}
 
 
@@ -121,6 +125,64 @@ assert LazyAnnotatedChild.__annotate__ is None
 assert LazyAnnotatedBase.__annotations__ == {"value": int}
 LazyAnnotatedBase.__annotate__ = lambda _: {}
 assert LazyAnnotatedBase.__annotations__ == {}
+
+# Clearing __annotate__ preserves an already materialized cache, while a new
+# callable replaces both the compiler-facing and public slots.
+LazyAnnotatedBase.__annotate__ = lambda format: {"cached": format}
+assert LazyAnnotatedBase.__annotations__ == {"cached": 1}
+LazyAnnotatedBase.__annotate__ = None
+assert LazyAnnotatedBase.__annotations__ == {"cached": 1}
+LazyAnnotatedBase.__annotate__ = lambda format: {"new": format}
+assert LazyAnnotatedBase.__annotate__(1) == {"new": 1}
+assert LazyAnnotatedBase.__annotations__ == {"new": 1}
+
+
+class ExplicitAnnotations:
+    __annotations__ = {"old": int}
+
+
+ExplicitAnnotations.__annotations__ = {"new": str}
+assert ExplicitAnnotations.__annotations__ == {"new": str}
+assert ExplicitAnnotations.__dict__["__annotations__"] == {"new": str}
+del ExplicitAnnotations.__annotations__
+assert ExplicitAnnotations.__annotations__ == {}
+
+
+class ExplicitAnnotate:
+    def __annotate__(format):
+        return {"old": format}
+
+
+old_explicit_annotate = ExplicitAnnotate.__annotate__
+ExplicitAnnotate.__annotate__ = lambda format: {"new": format}
+assert ExplicitAnnotate.__annotate__ is old_explicit_annotate
+assert ExplicitAnnotate.__annotations__ == {"old": 1}
+
+
+class AnnotationReader:
+    def __set_name__(self, owner, name):
+        owner.InjectedBySetName = int
+        self.seen = owner.__annotations__
+
+
+class SetNameAnnotations:
+    value: InjectedBySetName
+    reader = AnnotationReader()
+
+
+assert SetNameAnnotations.reader.seen == {"value": int}
+
+
+class AnnotationMeta(type):
+    pass
+
+
+class MetaSetNameAnnotations(metaclass=AnnotationMeta):
+    value: InjectedBySetName
+    reader = AnnotationReader()
+
+
+assert MetaSetNameAnnotations.reader.seen == {"value": int}
 
 try:
     LazyAnnotatedBase.__annotate__ = 42

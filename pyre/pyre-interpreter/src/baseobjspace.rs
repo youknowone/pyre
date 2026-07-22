@@ -5391,8 +5391,10 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
         )));
     }
 
-    let annotate_fn = crate::type_dict_lookup(obj, "__annotate_func__")
-        .or_else(|| crate::type_dict_lookup(obj, "__annotate__"));
+    // An explicit class-body __annotate__ is an ordinary visible class-dict
+    // entry and takes precedence over the compiler-facing descriptor slot.
+    let annotate_fn = crate::type_dict_lookup(obj, "__annotate__")
+        .or_else(|| crate::type_dict_lookup(obj, "__annotate_func__"));
     let annotations = match annotate_fn {
         Some(callable) if !callable.is_null() && !unsafe { is_none(callable) } => {
             let value = crate::call::call_function_impl_result(callable, &[w_int_new(1)])?;
@@ -5418,7 +5420,14 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
             unsafe { w_type_get_name(obj) },
         )));
     }
-    crate::type_dict_store(obj, "__annotations_cache__", value);
+    // CPython updates an explicit class-body __annotations__ key in place;
+    // otherwise the descriptor stores through __annotations_cache__.
+    if crate::type_dict_lookup(obj, "__annotations__").is_some() {
+        crate::type_dict_store(obj, "__annotations__", value);
+        crate::type_dict_delete(obj, "__annotations_cache__");
+    } else {
+        crate::type_dict_store(obj, "__annotations_cache__", value);
+    }
     crate::type_dict_store(obj, "__annotate_func__", w_none());
     crate::type_dict_store(obj, "__annotate__", w_none());
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -5439,8 +5448,15 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
     if !unsafe { is_none(value) } && !callable_w(value) {
         return Err(PyError::type_error("__annotate__ must be callable or None"));
     }
+    // CPython stores descriptor assignments in the compiler-facing slot.
+    // An explicit class-body __annotate__ key remains an ordinary visible
+    // class attribute and intentionally shadows this internal slot.
     crate::type_dict_store(obj, "__annotate_func__", value);
-    crate::type_dict_delete(obj, "__annotations_cache__");
+    // Setting None preserves an already materialized annotations cache;
+    // installing a new callable invalidates it.
+    if !unsafe { is_none(value) } {
+        crate::type_dict_delete(obj, "__annotations_cache__");
+    }
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe { mutated(obj, Some("__annotate__")) };
     Ok(w_none())
@@ -5453,8 +5469,9 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
             unsafe { w_type_get_name(obj) },
         )));
     }
-    let removed = crate::type_dict_delete(obj, "__annotations_cache__")
-        || crate::type_dict_delete(obj, "__annotations__");
+    let removed_cache = crate::type_dict_delete(obj, "__annotations_cache__");
+    let removed_explicit = crate::type_dict_delete(obj, "__annotations__");
+    let removed = removed_cache || removed_explicit;
     if !removed {
         return Err(raiseattrerror(obj, "__annotations__", None));
     }
