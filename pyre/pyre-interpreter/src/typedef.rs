@@ -21079,16 +21079,18 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     if !override_value.is_null() {
         return Ok(override_value);
     }
-    let frame = generator_frame(obj);
-    if frame.is_null() {
-        return Ok(w_str_new("<generator>"));
+    // generator.py:32-43 `get_name` / `get_qualname`: both fallback paths
+    // read the immutable generator-owned `pycode`, never the frame (which is
+    // cleared on exhaustion).  `_qualname is None` delegates to `get_name`.
+    let pycode = unsafe { pyre_object::generator::w_generator_get_pycode(obj) };
+    if pycode.is_null() || unsafe { pyre_object::is_none(pycode) } {
+        return Ok(w_str_new("<finished>"));
     }
-    let code = unsafe { (*frame).code() };
-    Ok(w_str_new(if qualname {
-        &code.qualname
-    } else {
-        &code.obj_name
-    }))
+    let code_ptr = unsafe { crate::pycode::w_code_get_ptr(pycode) } as *const crate::CodeObject;
+    if code_ptr.is_null() {
+        return Ok(w_str_new("<finished>"));
+    }
+    Ok(w_str_new(unsafe { &(*code_ptr).obj_name }))
 }
 
 fn generator_getter_for(args: &[PyObjectRef], field: usize, coroutine: bool) -> crate::PyResult {
