@@ -9432,20 +9432,15 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
-        let decoded_py_pc = (frame.pc >= 0)
-            .then(|| pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize);
-        if pyre_jit_trace::jitcode_dispatch::py_pc_forward_audit_enabled() {
-            let expected_py_pc = decoded_py_pc.map(|pc| pc as i32).unwrap_or(-1);
-            assert_eq!(
-                frame.py_pc,
-                expected_py_pc,
-                "PYRE_M73_PYPC_FWD_AUDIT: forward py_pc diverged for jitcode {} jitcode_pc {}",
-                frame.jitcode_index,
-                frame.pc,
-            );
-        }
-        let py_pc = decoded_py_pc.unwrap_or(vable_ni);
+        // Forward-carried Python resume pc, recorded at guard capture from the
+        // codewriter `(jitcode_pc, py_pc)` marker pair (no jitcode→py inverse at
+        // decode).  py_pc=-1 is the no-snapshot sentinel (pc<0) → fall back to
+        // the vable next-instr.
+        let py_pc = if frame.py_pc >= 0 {
+            frame.py_pc as usize
+        } else {
+            vable_ni
+        };
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame: code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).

@@ -1783,8 +1783,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
 
     // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
     // top frame last (innermost).
-    let mut frames: Vec<(u32, u32, u32, &[OpRef])> =
-        Vec::with_capacity(parent_frames.len() + 1);
+    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
         let pf_word = pf
             .resume_marker_jit_pc
