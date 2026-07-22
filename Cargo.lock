@@ -253,6 +253,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "celcolscalar"
+version = "0.0.2"
+dependencies = [
+ "majit-ir",
+ "majit-macros",
+ "majit-metainterp",
+]
+
+[[package]]
 name = "celcolumn"
 version = "0.0.2"
 dependencies = [
