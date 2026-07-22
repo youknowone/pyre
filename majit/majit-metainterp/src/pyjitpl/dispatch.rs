@@ -1690,7 +1690,24 @@ where
                 }
             }
             if handled {
+                let frame = self.frames.current_mut();
+                super::record_application_traceback(
+                    self.last_exception_value,
+                    ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
+                    frame,
+                );
+                frame.last_caught_exception_value = self.last_exception_value;
                 return TraceAction::Continue;
+            }
+            {
+                let frame = self.frames.current_mut();
+                if frame.last_caught_exception_value != self.last_exception_value {
+                    super::record_application_traceback(
+                        self.last_exception_value,
+                        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
+                        frame,
+                    );
+                }
             }
             self.pop_exception_frame(ctx);
         }
@@ -2599,7 +2616,11 @@ where
             return TraceAction::Continue;
         }
 
-        let bytecode = self.frames.current_mut().next_u8();
+        let bytecode = {
+            let frame = self.frames.current_mut();
+            frame.last_opcode_position = frame.code_cursor;
+            frame.next_u8()
+        };
         match bytecode {
             // RPython `blackhole.py:950 bhimpl_live` — no-op marker
             // emitted by the codewriter ahead of every guard-bearing
@@ -6736,12 +6757,32 @@ where
                 self.last_exception_box = Some(opref);
                 self.last_exception_value = concrete;
                 self.class_of_last_exc_is_const = true;
+                {
+                    let frame = self.frames.current_mut();
+                    if frame.last_caught_exception_value != concrete {
+                        super::record_application_traceback(
+                            concrete,
+                            ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
+                            frame,
+                        );
+                    }
+                }
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);
             }
             jitcode::insns::BC_RERAISE => {
                 if self.last_exception_value == 0 {
                     return TraceAction::Abort;
+                }
+                {
+                    let frame = self.frames.current_mut();
+                    if frame.last_caught_exception_value != self.last_exception_value {
+                        super::record_application_traceback(
+                            self.last_exception_value,
+                            ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
+                            frame,
+                        );
+                    }
                 }
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);

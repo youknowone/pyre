@@ -77,6 +77,14 @@ pub struct MIFrame {
     pub jitcode: Arc<JitCode>,
     pub pc: usize,
     pub code_cursor: usize,
+    /// Bytecode position of the operation currently being executed.
+    /// Exception unwinding uses this instead of the post-decode cursor when
+    /// the host records the Python traceback for this frame.
+    pub last_opcode_position: usize,
+    /// Exception already recorded when this frame entered a catch handler.
+    /// A later bare re-raise of the same object must not prepend this frame a
+    /// second time.
+    pub last_caught_exception_value: i64,
     pub int_regs: Vec<Option<OpRef>>,
     pub int_values: Vec<Option<i64>>,
     pub ref_regs: Vec<Option<OpRef>>,
@@ -175,6 +183,8 @@ impl MIFrame {
             jitcode,
             pc,
             code_cursor: 0,
+            last_opcode_position: pc,
+            last_caught_exception_value: 0,
             int_regs: vec![None; regs_and_consts_i],
             int_values: vec![None; regs_and_consts_i],
             ref_regs: vec![None; regs_and_consts_r],

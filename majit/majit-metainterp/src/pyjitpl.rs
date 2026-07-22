@@ -1508,6 +1508,56 @@ pub struct JitHooks {
     pub on_compile_error: Option<Box<dyn Fn(u64, &str) + Send>>,
 }
 
+/// Runtime callback used to attach an application traceback while the
+/// metainterpreter is executing the one-shot recording iteration.  The host
+/// owns the application frame and the jitcode-to-source-position mapping, so
+/// majit keeps only this crate-neutral ABI hook.
+pub type RecordApplicationTraceback = extern "C" fn(i64, i64, i32, i32);
+
+static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
+    RECORD_APPLICATION_TRACEBACK.store(
+        hook.map_or(0, |callback| callback as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MIFrame) {
+    if exc_value == 0 || frame_ptr.is_null() || frame.inline_frame {
+        return;
+    }
+    record_application_traceback_for_recording(
+        exc_value,
+        frame_ptr as usize as i64,
+        frame.jitcode.try_index().map_or(-1, |index| index as i32),
+        frame.last_opcode_position as i32,
+    );
+}
+
+/// Invoke the host traceback callback for a recording frame represented by a
+/// crate-external walker.  The caller must supply the concrete frame identity;
+/// inline frames without one must not call this function.
+pub fn record_application_traceback_for_recording(
+    exc_value: i64,
+    frame_ptr: i64,
+    jitcode_index: i32,
+    opcode_position: i32,
+) {
+    if exc_value == 0 || frame_ptr == 0 {
+        return;
+    }
+    let callback = RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
+    if callback == 0 {
+        return;
+    }
+    // Safety: the only stored values come from a RecordApplicationTraceback
+    // function pointer in set_record_application_traceback_hook.
+    let callback: RecordApplicationTraceback = unsafe { std::mem::transmute(callback) };
+    callback(exc_value, frame_ptr, jitcode_index, opcode_position);
+}
+
 /// framework.py `root_walker.walk_roots` per-op helper: visit every
 /// inline `ConstPtr.value` slot stored in `op.args` and `op.fail_args`.
 /// history.py:314 `ConstPtr.value` is inline on the Box object; pyre
@@ -12437,8 +12487,17 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             if handled {
+                let frame = self.framestack.current_mut();
+                record_application_traceback(excvalue, self.vable_ptr, frame);
+                frame.last_caught_exception_value = excvalue;
                 // pyjitpl.py:2522: raise ChangeFrame
                 return Err(FinishframeExceptionSignal::ChangeFrame);
+            }
+            {
+                let frame = self.framestack.current_mut();
+                if frame.last_caught_exception_value != excvalue {
+                    record_application_traceback(excvalue, self.vable_ptr, frame);
+                }
             }
             self.popframe(true);
         }

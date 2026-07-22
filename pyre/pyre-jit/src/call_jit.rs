@@ -625,7 +625,7 @@ pub(crate) fn drain_backend_jit_exc() {
     majit_backend_wasm::jit_exc_clear();
 }
 
-extern "C" fn record_caught_blackhole_traceback(
+pub(crate) extern "C" fn record_caught_blackhole_traceback(
     exc_value: i64,
     frame_value: i64,
     jitcode_index: i32,

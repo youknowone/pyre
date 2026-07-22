@@ -2474,6 +2474,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 ctx.last_exc_value_concrete = exc_concrete;
                 Ok(Some((DispatchOutcome::Continue, target)))
@@ -3240,6 +3241,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
@@ -3382,6 +3384,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a
@@ -3536,6 +3539,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                record_top_level_application_traceback(ctx, exc_concrete, op.pc, true);
                 ctx.last_exc_value = Some(exc);
                 // Thread the callee's concrete
                 // exception across the frame boundary.  Without this a

@@ -3402,6 +3402,9 @@ thread_local! {
 }
 
 fn build_jit_driver_pair() -> JitDriverPair {
+    majit_metainterp::set_record_application_traceback_hook(Some(
+        crate::call_jit::record_caught_blackhole_traceback,
+    ));
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
     d.set_virtualizable_info(info.clone());
