@@ -1098,6 +1098,24 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         } else {
             None
         };
+    // A `jit_list_append(list, value)` residual (LIST_APPEND opcode, tagged
+    // `ListAppendValue`) reaches this generic executor only when the orthodox
+    // append fold DECLINED and fell through — most commonly at a realloc
+    // boundary, where the backing block is full and the in-place fast-store
+    // fold cannot lower the resize (`w_list_append`'s `Vec::push` else-leg is an
+    // un-lowered allocating helper).  Executing it here mutates `list` in place
+    // (resize + store); journal the pre-append length so an aborting walk's
+    // rollback rewinds the one append and the deliver re-applies it exactly once
+    // (the same `fbw_append_journal_push` contract the fold's own commit uses),
+    // making the fall-through abort-safe instead of a silent double.
+    let list_append_journal: Option<(pyre_object::PyObjectRef, usize)> =
+        if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ListAppendValue {
+            let list = args.first().map(|&a| a as usize as pyre_object::PyObjectRef);
+            list.filter(|&l| !l.is_null() && unsafe { pyre_object::pyobject::is_list(l) })
+                .map(|l| (l, unsafe { pyre_object::w_list_len(l) }))
+        } else {
+            None
+        };
     // `do_residual_call` (pyjitpl.py for CALL_MAY_FORCE_N /
     // CALL_LOOPINVARIANT_N / CALL_N) runs `executor.execute_varargs` for a void
     // call exactly like the value-returning shapes, applying the side effect
@@ -1465,6 +1483,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 if result_i64 as usize == lhs as usize {
                     fbw_append_journal_push(lhs, len_before);
                 }
+            }
+            // A folded-decline `jit_list_append` fall-through (realloc-boundary
+            // append) mutated `list` in place; journal its pre-append length so
+            // the abort rollback rewinds it and the deliver re-applies exactly
+            // once.  The append always mutates its receiver (void `0` result),
+            // so no in-place `result == lhs` re-check is needed.
+            if let Some((list, len_before)) = list_append_journal {
+                fbw_append_journal_push(list, len_before);
             }
             // pyjitpl.py `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
@@ -2324,19 +2350,31 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue
     {
-        // Fold, or ABORT — never fall through to the generic residual.  The
+        // Fold to native array stores when the receiver has spare capacity, or
+        // fall through to the generic `jit_list_append` residual below.  The
         // fold's `orthodox_list_append_commit` journals the append
-        // (`fbw_append_journal_push`) so `fbw_store_journal_rollback` can rewind
-        // it on abort; the generic dispatcher concrete-executes
-        // `jit_list_append` UNjournaled, so a later abort + interpreter replay
-        // would apply the SAME append twice (a silent double).  The decline
-        // point in `try_walker_orthodox_list_append_opcode` is side-effect-free
-        // (it declines BEFORE emitting any IR), so surfacing the abort here is
-        // safe.  Mirrors the pre-#171 `emit_abort_permanent` lowering.
+        // (`fbw_append_journal_push`) so `fbw_store_journal_rollback` rewinds it
+        // on abort; the generic executor is now equally abort-safe — its
+        // `list_append_journal` records the same pre-append length before
+        // running `jit_list_append`, so a later abort + interpreter replay
+        // applies the append exactly once (no silent double).  The fold's
+        // decline point (`try_walker_orthodox_list_append_opcode`) is
+        // side-effect-free — it declines BEFORE emitting any IR — so the
+        // fall-through starts from a clean trace position.  This lets a resize
+        // side-exit's bridge (the fold declines at a full backing block) compile
+        // a `jit_list_append` residual instead of aborting the whole bridge.
         if try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
-        return Err(DispatchError::UnfoldableListAppendResidualUnsupported { pc: op.pc });
+        // The wasm backend miscompiles the resulting resize/append bridge
+        // (#389b-class element drop, wasm-only — `comprehension_object_append_hot`
+        // / `nested_list_comprehension_hot` return short), the same wasm-append
+        // codegen hazard `wasm_unboxed_append_fold_declined` guards the unboxed
+        // fold against. Keep the safeguard abort on wasm so the loop falls back
+        // to correct interpretation; only native backends take the fall-through.
+        if cfg!(target_arch = "wasm32") {
+            return Err(DispatchError::UnfoldableListAppendResidualUnsupported { pc: op.pc });
+        }
     }
 
     // `len(x)` on an exact canonical list: inline the strategy-guarded
