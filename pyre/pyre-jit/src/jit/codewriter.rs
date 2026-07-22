@@ -13691,8 +13691,6 @@ impl CodeWriter {
                 let skipped_py =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 forward_py_pc_marker_by_jit_pc.push((off, skipped_py as u32));
-                let skipped_py =
-                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 let depth_trivia = static_depth.get(skipped_py).copied();
                 depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
                 pcdep_trivia_marker_by_jit_pc.push((
