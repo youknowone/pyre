@@ -167,6 +167,18 @@ assert NonCallableExplicitAnnotate.__annotate__ == 42
 assert NonCallableExplicitAnnotate.__annotations__ == {}
 
 
+class ResetAnnotationsThenAnnotate:
+    pass
+
+
+ResetAnnotationsThenAnnotate.__annotations__ = {"old": int}
+ResetAnnotationsThenAnnotate.__annotate__ = lambda format: {"new": format}
+assert ResetAnnotationsThenAnnotate.__annotations__ == {"new": 1}
+del ResetAnnotationsThenAnnotate.__annotations__
+ResetAnnotationsThenAnnotate.__annotate__ = lambda format: {"again": format}
+assert ResetAnnotationsThenAnnotate.__annotations__ == {"again": 1}
+
+
 class AnnotationReader:
     def __set_name__(self, owner, name):
         owner.InjectedBySetName = int

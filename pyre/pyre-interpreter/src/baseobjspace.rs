@@ -5431,7 +5431,7 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
         crate::type_dict_store(obj, "__annotations_cache__", value);
     }
     crate::type_dict_store(obj, "__annotate_func__", w_none());
-    crate::type_dict_store(obj, "__annotate__", w_none());
+    crate::type_dict_delete(obj, "__annotate__");
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe { mutated(obj, Some("__annotations__")) };
     Ok(w_none())
@@ -5478,7 +5478,7 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
         return Err(raiseattrerror(obj, "__annotations__", None));
     }
     crate::type_dict_store(obj, "__annotate_func__", w_none());
-    crate::type_dict_store(obj, "__annotate__", w_none());
+    crate::type_dict_delete(obj, "__annotate__");
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe { mutated(obj, Some("__annotations__")) };
     Ok(w_none())
