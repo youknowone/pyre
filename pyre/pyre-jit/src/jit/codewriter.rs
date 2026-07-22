@@ -13715,37 +13715,42 @@ impl CodeWriter {
             pcdep_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             const_ref_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            // Op-start tier: predecessor scan, markers EXCLUDED.
+            // Op-start tier: predecessor scan, markers EXCLUDED. Dedup on the
+            // jitcode offset (later py wins, matching `by_off`): a run of
+            // trivia py_pcs collapses onto one jitcode offset, so direct-push
+            // left duplicate offsets whose binary-search winner depended on
+            // unstable-sort order. `BTreeMap` yields one offset-sorted entry
+            // per offset; duplicates share `skip_python_trivia_forward`'s
+            // target, so the surviving values are unchanged.
+            let mut pred_by_off: BTreeMap<usize, usize> = BTreeMap::new();
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
-                    let skipped_py =
-                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
-                    forward_py_pc_pred_by_jit_pc.push((pos, skipped_py as u32));
-                    let depth_trivia = static_depth.get(skipped_py).copied();
-                    depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
-                    pcdep_trivia_pred_by_jit_pc.push((
-                        pos,
-                        pcdep_color_slots
-                            .get(skipped_py)
-                            .cloned()
-                            .unwrap_or_default(),
-                    ));
-                    const_ref_trivia_pred_by_jit_pc.push((
-                        pos,
-                        const_ref_slots_at_pc
-                            .get(skipped_py)
-                            .cloned()
-                            .unwrap_or_default(),
-                    ));
-                    let result_color_trivia = result_color_at_pc.get(skipped_py).copied();
-                    result_color_trivia_pred_by_jit_pc.push((pos, result_color_trivia));
+                    pred_by_off.insert(pos, py);
                 }
             }
-            depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            forward_py_pc_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            pcdep_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            const_ref_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            result_color_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            for (&pos, &py) in pred_by_off.iter() {
+                let skipped_py =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                forward_py_pc_pred_by_jit_pc.push((pos, skipped_py as u32));
+                let depth_trivia = static_depth.get(skipped_py).copied();
+                depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
+                pcdep_trivia_pred_by_jit_pc.push((
+                    pos,
+                    pcdep_color_slots
+                        .get(skipped_py)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+                const_ref_trivia_pred_by_jit_pc.push((
+                    pos,
+                    const_ref_slots_at_pc
+                        .get(skipped_py)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+                let result_color_trivia = result_color_at_pc.get(skipped_py).copied();
+                result_color_trivia_pred_by_jit_pc.push((pos, result_color_trivia));
+            }
             // Marker tier: exact-match, block-head precedence.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
@@ -13756,18 +13761,17 @@ impl CodeWriter {
                 resume_marker_marker_by_jit_pc.push((off, marker));
             }
             resume_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            // Op-start tier: predecessor scan, markers EXCLUDED.
-            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
-                if pos != usize::MAX {
-                    let skipped_py =
-                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
-                    let marker = first_jit_pc_by_py_pc
-                        .get(skipped_py)
-                        .and_then(|_| resolve_marker(skipped_py));
-                    resume_marker_pred_by_jit_pc.push((pos, marker));
-                }
+            // Op-start tier: predecessor scan, markers EXCLUDED. Reuse the
+            // deduped `pred_by_off` so the resume-marker twin matches the other
+            // op-start twins entry-for-entry (offset-sorted, no post-sort).
+            for (&pos, &py) in pred_by_off.iter() {
+                let skipped_py =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                let marker = first_jit_pc_by_py_pc
+                    .get(skipped_py)
+                    .and_then(|_| resolve_marker(skipped_py));
+                resume_marker_pred_by_jit_pc.push((pos, marker));
             }
-            resume_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Marker tier: exact-match, block-head precedence. Compose the
             // runtime after-residual path's trivia skip and semantic
             // fallthrough before resolving the resume marker.
