@@ -952,7 +952,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ]),
         );
         crate::baseobjspace::setdictvalue(impl_obj, "hexversion", w_int_new(0x030e06f0));
-        crate::baseobjspace::setdictvalue(impl_obj, "cache_tag", w_str_new("pyre-3.14"));
+        crate::baseobjspace::setdictvalue(impl_obj, "cache_tag", w_str_new("pyre-314"));
         crate::baseobjspace::setdictvalue(impl_obj, "_multiarch", w_str_new(""));
         module_ns_store(ns, "implementation", impl_obj);
     }
