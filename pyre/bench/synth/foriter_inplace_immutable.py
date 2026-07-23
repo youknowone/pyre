@@ -2,7 +2,7 @@
 
 
 class StatefulDecoder:
-    def __init__(self):
+    def __init__(self) -> None:
         self.buffer = bytearray()
 
     def process_word(self):
