@@ -1455,10 +1455,23 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         && args_all_builtin_integer
         && fbw_callee_body_has_binary_op_residual(body.code, callee_descr_refs)
     {
-        let safe_root_bridge = !ctx.fbw_mode.carrier_resume
+        // A depth-1 carrier-resume sub-walk (`drive_bridge_frame_subwalk`) drives
+        // its reconstructed frame as the sub-walk root with an empty framestack,
+        // so it is uniform with a plain root bridge for the multiframe seed —
+        // admit it too so a rare guard-bridge continuation inlines its nested
+        // int-arith calls instead of residualizing them (the gh#343 branchy-callee
+        // cost).
+        let root_bridge = !ctx.fbw_mode.carrier_resume
             && !ctx.fbw_mode.inline_subwalk
             && !ctx.fbw_mode.snapshot_sym.is_null()
             && ctx.session.borrow().framestack.is_empty();
+        // A carrier-resume sub-walk (`drive_bridge_frame_subwalk`) drives its
+        // reconstructed frame(s) forward through the same metainterp the initial
+        // trace uses, so its inline of a nested int-arith call is the SAME as a
+        // primary trace's — admit it (any inline depth) so the rare guard-bridge
+        // continuation inlines instead of residualizing.
+        let subwalk_admit = ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
+        let safe_root_bridge = root_bridge || subwalk_admit;
         if !(fbw_bridge_rec_inline_enabled() && safe_root_bridge) {
             return Ok(None);
         }
