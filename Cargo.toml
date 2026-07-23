@@ -7,7 +7,10 @@ homepage = "https://github.com/youknowone/pyre"
 
 [workspace]
 resolver = "2"
-exclude = ["wasmi", "cel-rust"]
+# pyre-wasm-runner path-depends on the nested `wasmi` fork (majit-jit tier),
+# which lives outside the outer workspace, so it is built on its own, not as a
+# member — otherwise `cargo metadata` fails wherever that fork is absent (CI).
+exclude = ["wasmi", "cel-rust", "pyre/pyre-wasm-runner"]
 default-members = ["pyre/pyrex"]
 members = [
     # majit
@@ -52,7 +55,6 @@ members = [
     "pyre/pyrex",
     "pyre/pyre-wasm",
     "pyre/pyre-wasm-test",
-    "pyre/pyre-wasm-runner",
 ]
 
 [workspace.dependencies]
