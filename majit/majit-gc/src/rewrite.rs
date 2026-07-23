@@ -2869,6 +2869,15 @@ impl GcRewriterImpl {
     /// rewrite.py:988-1001 remove_bridge_exception: check a common
     /// case where SaveExcClass + SaveException + RestoreException
     /// appear at the start of a bridge and are unused. Strip them.
+    ///
+    /// rewrite.py:991 leaves an `XXX should check if the boxes are used
+    /// later; but we just assume they aren't for now`.  A routed
+    /// exception-guard handler bridge breaks that assumption: it records the
+    /// same prefix but keeps the SaveException result as `last_exc_value`
+    /// for handler code (`except E as e`), so stripping the prefix would
+    /// leave a dangling reference.  Do the deferred use-check — the
+    /// RESTORE_EXCEPTION carries the canonical class/value operands, so only
+    /// strip when no op after the prefix reuses either.
     fn remove_bridge_exception(ops: &[Op]) -> Vec<Op> {
         let mut start = 0;
         if ops
@@ -2882,10 +2891,24 @@ impl GcRewriterImpl {
             && ops[start + 1].opcode == OpCode::SaveException
             && ops[start + 2].opcode == OpCode::RestoreException
         {
-            let mut result = Vec::with_capacity(ops.len() - 3);
-            result.extend_from_slice(&ops[..start]);
-            result.extend_from_slice(&ops[start + 3..]);
-            return result;
+            let restore = &ops[start + 2];
+            let class_ref = restore.arg(0);
+            let value_ref = restore.arg(1);
+            let used_later = ops[start + 3..].iter().any(|op| {
+                (0..op.num_args()).any(|k| {
+                    let a = op.arg(k);
+                    a.same_box(&class_ref) || a.same_box(&value_ref)
+                }) || op.getfailargs().is_some_and(|fa| {
+                    fa.iter()
+                        .any(|a| a.same_box(&class_ref) || a.same_box(&value_ref))
+                })
+            });
+            if !used_later {
+                let mut result = Vec::with_capacity(ops.len() - 3);
+                result.extend_from_slice(&ops[..start]);
+                result.extend_from_slice(&ops[start + 3..]);
+                return result;
+            }
         }
         ops.to_vec()
     }
@@ -5486,5 +5509,56 @@ mod tests {
             !result.iter().any(|o| o.opcode == OpCode::LoadFromGcTable),
             "JIT_DEBUG must not route its ConstPtr through the gc_table"
         );
+    }
+
+    #[test]
+    fn remove_bridge_exception_strips_unused_prefix() {
+        use std::rc::Rc;
+        let class = Rc::new(Op::new(OpCode::SaveExcClass, &[]));
+        let value = Rc::new(Op::new(OpCode::SaveException, &[]));
+        let restore = Op::new(
+            OpCode::RestoreException,
+            &[
+                Operand::from_bound_op(&class),
+                Operand::from_bound_op(&value),
+            ],
+        );
+        let ops = vec![
+            Op::new(OpCode::SaveExcClass, &[]),
+            Op::new(OpCode::SaveException, &[]),
+            restore,
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let out = GcRewriterImpl::remove_bridge_exception(&ops);
+        // No op reuses the saved class/value, so the prefix is stripped.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].opcode, OpCode::Finish);
+    }
+
+    #[test]
+    fn remove_bridge_exception_keeps_prefix_when_value_reused() {
+        use std::rc::Rc;
+        let class = Rc::new(Op::new(OpCode::SaveExcClass, &[]));
+        let value = Rc::new(Op::new(OpCode::SaveException, &[]));
+        let restore = Op::new(
+            OpCode::RestoreException,
+            &[
+                Operand::from_bound_op(&class),
+                Operand::from_bound_op(&value),
+            ],
+        );
+        // A routed handler bridge keeps the saved value as `last_exc_value`
+        // for `except E as e`, so a later op still references it.
+        let consumer = Op::new(OpCode::SameAsR, &[Operand::from_bound_op(&value)]);
+        let ops = vec![
+            Op::new(OpCode::SaveExcClass, &[]),
+            Op::new(OpCode::SaveException, &[]),
+            restore,
+            consumer,
+        ];
+        let out = GcRewriterImpl::remove_bridge_exception(&ops);
+        // The reused value pins the whole prefix in place.
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].opcode, OpCode::SaveExcClass);
     }
 }
