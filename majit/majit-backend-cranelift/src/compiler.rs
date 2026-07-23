@@ -6751,11 +6751,19 @@ fn emit_guard_exit(
         }
     }
 
-    if info.can_have_bridge && !info.must_save_exception {
+    if info.can_have_bridge {
         // RPython/dynasm patched guards enter the bridge before failure
-        // recovery. Cranelift still has to publish failargs into jf_frame
-        // because bridge input locations are frame based, but a bridge hit
-        // should skip the deadframe-only gcmap/write-barrier/descr stores.
+        // recovery (`patch_jump_for_descr` rewrites the guard branch, so the
+        // failure-recovery stub never runs on a bridge hit).  Cranelift still
+        // has to publish failargs into jf_frame because bridge input locations
+        // are frame based, but a bridge hit should skip the deadframe-only
+        // gcmap/write-barrier/descr stores.  must_save_exception guards
+        // dispatch here too — BEFORE the exception staging below — so the
+        // pending-exception cells flow into the bridge intact and its entry
+        // flavor guard (GUARD_NO_EXCEPTION / GUARD_EXCEPTION,
+        // `prepare_resume_from_failure`) can check them; staging first would
+        // consume the exception and let the wrong-flavor entry run the
+        // recorded continuation on a NULL raised-call result.
         emit_attached_bridge_dispatch(
             builder,
             jf_ptr,

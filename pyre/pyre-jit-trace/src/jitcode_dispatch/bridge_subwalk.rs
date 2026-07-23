@@ -398,6 +398,20 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
             seed.catch_target
         } else {
+            // `_prepare_exception_resumption` null-exception arm
+            // (pyjitpl.py:3152-3154) + `prepare_resume_from_failure`
+            // (pyjitpl.py:3156-3171): every exception-guard bridge re-checks
+            // its entry flavor.  With no pending exception at walk time,
+            // `clear_exception()` + `handle_possible_exception()` record
+            // GUARD_NO_EXCEPTION at the bridge start, so the OTHER failure
+            // flavor — a pending exception whose class the source guard's
+            // expected class does not match — deopts to the blackhole at
+            // bridge entry instead of running the recorded no-exception
+            // continuation on a NULL raised-call result.
+            if wc.trace_ctx.is_bridge_trace && wc.trace_ctx.bridge_source_is_exception_guard() {
+                wc.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                walker_capture_snapshot_for_last_guard(&mut wc, position)?;
+            }
             seed_vstack_mirror(&mut wc, sym, position);
             position
         };

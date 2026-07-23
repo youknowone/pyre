@@ -2780,6 +2780,14 @@ pub fn trace_and_compile_from_bridge(
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
 
+    // compile.py:950-953 `ResumeGuardForcedDescr.handle_fail`: "Failures of
+    // a GUARD_NOT_FORCED are never compiled, but always just blackholed."
+    // A bridge walked from one force flavor (pure force, live call result)
+    // would also be entered for forced-and-raised failures whose call result
+    // is NULL — its result-class guard then dereferences NULL.
+    if descr_arc.is_guard_forced() {
+        return BridgeResolution::ResumeBlackhole;
+    }
     let Some((green_key, trace_id, fail_index)) = bridge_source_identity_from_descr(descr_arc)
     else {
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
