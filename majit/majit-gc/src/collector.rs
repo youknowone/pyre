@@ -3460,6 +3460,12 @@ impl GcAllocator for MiniMarkGC {
     /// forced — old-gen is non-moving — so this is safe on unrooted
     /// host/interpreter paths. The end-of-major recompute corrects any drift.
     fn charge_oldgen_external(&mut self, obj_addr: usize, bytes: usize) {
+        // Nursery objects are the common case on this path and never old-gen;
+        // answer them with the O(1) range check instead of the old-gen
+        // membership probe (arena scan + rawmalloc hash lookup).
+        if self.nursery.contains(obj_addr) {
+            return;
+        }
         if self.oldgen.contains(obj_addr) {
             self.oldgen_external_bytes = self.oldgen_external_bytes.saturating_add(bytes);
         }
