@@ -3515,7 +3515,7 @@ impl<'a> Lowering<'a> {
             Rvalue::BinaryOp(op_json, lhs, rhs) => {
                 let lhs_v = self.resolve_operand(mir_bb, lhs)?;
                 let rhs_v = self.resolve_operand(mir_bb, rhs)?;
-                let op_label = binop_label(&op_json)?;
+                let mut op_label = binop_label(&op_json)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -3527,6 +3527,23 @@ impl<'a> Lowering<'a> {
                     ValueType::Float => ValueType::Float,
                     _ => ValueType::Int,
                 };
+                // Rust `/` (MIR `Div`) lowers to the `floordiv` opname
+                // (`canonical_binop_label`) — the correct label for
+                // integer truncating division. Over floats `/` is true
+                // division; `pairtype(SomeFloat, SomeFloat)` registers
+                // `truediv` but not `floordiv` (`binaryop.py:440-443`),
+                // the same distinction RPython's flowspace makes by
+                // emitting the `truediv` opname for `/` at graph
+                // construction. Re-label the float result so the prepass
+                // annotator dispatches `truediv(SomeFloat, SomeFloat)`
+                // instead of walling on the unregistered `floordiv`.
+                // Downstream is unchanged: `codewriter::jtransform` funnels
+                // both labels to `float_truediv` and the rtyper maps
+                // `(FloatRepr, "truediv")` / `(FloatRepr, "div")` to the
+                // same `rtype_template("truediv")`.
+                if result_ty == ValueType::Float && op_label == "floordiv" {
+                    op_label = "truediv".to_string();
+                }
                 Ok((
                     Some(OpKind::BinOp {
                         op: op_label,

@@ -5262,9 +5262,13 @@ fn canonical_float_arith_binop(op: &str) -> Option<&'static str> {
         // `front::mir::canonical_binop_label` collapses Rust `/`
         // (MIR `Div`) to "floordiv"; over floats that operator is
         // true division, so both labels land on `float_truediv`.
+        // The front end re-labels a float-result `/` to "truediv"
+        // (mirroring RPython's flowspace opname) before the prepass
+        // annotator, so this arm also accepts the already-canonical
+        // "truediv" / "inplace_truediv" spellings.
         // Integer "floordiv" never reaches this arm — the guard
         // requires a float operand or a Float result.
-        "div" | "div_assign" | "floordiv" => Some("div"),
+        "div" | "div_assign" | "floordiv" | "truediv" | "inplace_truediv" => Some("div"),
         _ => None,
     }
 }
