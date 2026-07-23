@@ -615,10 +615,42 @@ impl JitCodeRuntimeExt for JitCode {
     }
 }
 
+/// The encoded width of a jitcode **register operand**: exactly one byte.
+///
+/// A register operand occupies a single byte in the jitcode stream — the
+/// canonical encoding (`chr(reg.index)` when assembling, `ord(code[position])`
+/// when decoding). The 256-per-kind register limit, the `num_regs < 256`
+/// assemble-time decline, and every register decode site all rest on this
+/// width. Encode register operands with `JitCodeBuilder::push_reg_u8` and
+/// decode them with [`read_reg`] / `next_reg`, so the width lives in one place.
+///
+/// ⚠️ This MUST remain `u8`. Do NOT widen it to `u16` (or any wider type):
+/// doing so silently desyncs the encoder from the 1-byte register decoders and
+/// reintroduces exactly the register-width divergence this alias exists to
+/// prevent. Non-register operands (descr / field / array indexes) are `u16`
+/// and are deliberately NOT covered by this alias.
+pub type JitcodeReg = u8;
+
+/// The register-operand value that encodes "no register" / "no return slot"
+/// (e.g. a `recursive_call_void` result slot, or an `inline_call` with no
+/// caller destination). It is [`JitcodeReg::MAX`], safe as a sentinel because
+/// `try_finish` declines any JitCode with `num_regs >= 256`, so every real
+/// register index is `<= 254`. Encode and decode both reference this constant
+/// so the sentinel never drifts.
+pub(crate) const NO_RETURN_REG: JitcodeReg = JitcodeReg::MAX;
+
 pub(crate) fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");
     *cursor += 1;
     value
+}
+
+/// Read one register operand ([`JitcodeReg`]) from `code` at `*cursor`,
+/// advancing past it. Use this — never a bare `read_u8` — wherever the byte
+/// is a register index, so the 1-byte register width stays enforced in one
+/// place. See [`JitcodeReg`].
+pub(crate) fn read_reg(code: &[u8], cursor: &mut usize) -> JitcodeReg {
+    read_u8(code, cursor)
 }
 
 pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {

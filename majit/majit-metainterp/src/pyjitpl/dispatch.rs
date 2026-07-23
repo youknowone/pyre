@@ -2139,7 +2139,7 @@ where
     ///
     /// Payload (little-endian, emitted by
     /// `JitCodeBuilder::recursive_call_int` and siblings):
-    ///   jd_index:u16, result_dst:u8 (`u8::MAX` = no result / void),
+    ///   jd_index:u16, result_dst:u8 (`NO_RETURN_REG` = no result / void),
     ///   num_green:u16, (green_kind:u8, green_src:u8) × num_green,
     ///   num_args:u16, (kind:u8, caller_src:u8, callee_dst:u8) × num_args.
     ///
@@ -2175,8 +2175,8 @@ where
         let (jd_index, result_dst, green_srcs, arg_triples) = {
             let frame = self.frames.current_mut();
             let jd_index = frame.next_u16() as usize;
-            let result_dst_raw = frame.next_u8() as usize;
-            let result_dst = if result_dst_raw == u8::MAX as usize {
+            let result_dst_raw = frame.next_reg() as usize;
+            let result_dst = if result_dst_raw == crate::jitcode::NO_RETURN_REG as usize {
                 None
             } else {
                 Some(result_dst_raw)
@@ -2185,15 +2185,15 @@ where
             let mut green_srcs = Vec::with_capacity(num_green);
             for _ in 0..num_green {
                 let kind = JitArgKind::decode(frame.next_u8());
-                let src = frame.next_u8() as usize;
+                let src = frame.next_reg() as usize;
                 green_srcs.push((kind, src));
             }
             let num_args = frame.next_u16() as usize;
             let mut arg_triples = Vec::with_capacity(num_args);
             for _ in 0..num_args {
                 let kind = JitArgKind::decode(frame.next_u8());
-                let caller_src = frame.next_u8() as usize;
-                let callee_dst = frame.next_u8() as usize;
+                let caller_src = frame.next_reg() as usize;
+                let callee_dst = frame.next_reg() as usize;
                 arg_triples.push((kind, caller_src, callee_dst));
             }
             // Caller-side result-slot bookkeeping (BC_INLINE_CALL:3298-3300).
@@ -2665,7 +2665,7 @@ where
             // `i` = u8 register index (`assembler.py:165-167`).
             jitcode::insns::BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u8() as usize;
+                let dest = self.frames.current_mut().next_reg() as usize;
                 let opref = sym
                     .state_field_ref(field_idx)
                     .expect("state field not initialized");
@@ -2676,7 +2676,7 @@ where
             }
             jitcode::insns::BC_STORE_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, value) = self.read_int_reg(src);
                 sym.set_state_field_ref(field_idx, opref);
                 sym.set_state_field_value(field_idx, value);
@@ -2687,7 +2687,7 @@ where
             // real ref base. Argcodes: `d` = u16 field index, `r` = ref reg.
             jitcode::insns::BC_LOAD_STATE_FIELD_REF => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u8() as usize;
+                let dest = self.frames.current_mut().next_reg() as usize;
                 let opref = sym
                     .state_ref_field_ref(field_idx)
                     .expect("ref state field not initialized");
@@ -2698,15 +2698,15 @@ where
             }
             jitcode::insns::BC_STORE_STATE_FIELD_REF => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, value) = self.read_ref_reg(src);
                 sym.set_state_ref_field_ref(field_idx, opref);
                 sym.set_state_ref_field_value(field_idx, value);
             }
             jitcode::insns::BC_LOAD_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u8() as usize;
-                let dest = self.frames.current_mut().next_u8() as usize;
+                let index_reg = self.frames.current_mut().next_reg() as usize;
+                let dest = self.frames.current_mut().next_reg() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
                 let opref = sym.state_array_ref(array_idx, elem_idx);
@@ -2723,8 +2723,8 @@ where
             }
             jitcode::insns::BC_STORE_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u8() as usize;
-                let src = self.frames.current_mut().next_u8() as usize;
+                let index_reg = self.frames.current_mut().next_reg() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
                 let (opref, value) = self.read_int_reg(src);
@@ -2894,9 +2894,9 @@ where
                 //   [descr_idx u16]
                 let (base_reg, ea_reg, value_reg, descr_idx) = {
                     let frame = self.frames.current_mut();
-                    let base_reg = frame.next_u8() as usize;
-                    let ea_reg = frame.next_u8() as usize;
-                    let value_reg = frame.next_u8() as usize;
+                    let base_reg = frame.next_reg() as usize;
+                    let ea_reg = frame.next_reg() as usize;
+                    let value_reg = frame.next_reg() as usize;
                     let descr_idx = frame.next_u16() as usize;
                     (base_reg, ea_reg, value_reg, descr_idx)
                 };
@@ -2956,10 +2956,10 @@ where
                 //   [BC_RAW_LOAD_I][base_reg u8][ea_reg u8][descr_idx u16][dst u8]
                 let (base_reg, ea_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
-                    let base_reg = frame.next_u8() as usize;
-                    let ea_reg = frame.next_u8() as usize;
+                    let base_reg = frame.next_reg() as usize;
+                    let ea_reg = frame.next_reg() as usize;
                     let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     (base_reg, ea_reg, descr_idx, dst)
                 };
                 let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
@@ -3193,9 +3193,9 @@ where
             jitcode::insns::BC_ARRAYLEN_GC => {
                 let (array_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
-                    let array_reg = frame.next_u8() as usize;
+                    let array_reg = frame.next_reg() as usize;
                     let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     (array_reg, descr_idx, dst)
                 };
                 let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
@@ -3236,10 +3236,10 @@ where
             jitcode::insns::BC_GETARRAYITEM_GC_I => {
                 let (array_reg, index_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
-                    let array_reg = frame.next_u8() as usize;
-                    let index_reg = frame.next_u8() as usize;
+                    let array_reg = frame.next_reg() as usize;
+                    let index_reg = frame.next_reg() as usize;
                     let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     (array_reg, index_reg, descr_idx, dst)
                 };
                 let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
@@ -3428,10 +3428,10 @@ where
             jitcode::insns::BC_GETARRAYITEM_GC_R_RID => {
                 let (array_reg, index_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
-                    let array_reg = frame.next_u8() as usize;
-                    let index_reg = frame.next_u8() as usize;
+                    let array_reg = frame.next_reg() as usize;
+                    let index_reg = frame.next_reg() as usize;
                     let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     (array_reg, index_reg, descr_idx, dst)
                 };
                 let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
@@ -3487,9 +3487,9 @@ where
             | jitcode::insns::BC_SETARRAYITEM_GC_F => {
                 let (array_reg, index_reg, value_reg, descr_idx) = {
                     let frame = self.frames.current_mut();
-                    let array_reg = frame.next_u8() as usize;
-                    let index_reg = frame.next_u8() as usize;
-                    let value_reg = frame.next_u8() as usize;
+                    let array_reg = frame.next_reg() as usize;
+                    let index_reg = frame.next_reg() as usize;
+                    let value_reg = frame.next_reg() as usize;
                     let descr_idx = frame.next_u16() as usize;
                     (array_reg, index_reg, value_reg, descr_idx)
                 };
@@ -3724,7 +3724,7 @@ where
                 self.set_int_reg(dest, Some(result), Some(len as i64));
             }
             jitcode::insns::BC_HINT_FORCE_VIRTUALIZABLE => {
-                let vable_reg = self.frames.current_mut().next_u8() as usize;
+                let vable_reg = self.frames.current_mut().next_reg() as usize;
                 let vable_opref = self.resolve_vable_box(vable_reg);
                 ctx.gen_store_back_in_vable(vable_opref);
             }
@@ -3786,7 +3786,7 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -3814,7 +3814,7 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -3844,8 +3844,8 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -3884,8 +3884,8 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -3913,8 +3913,8 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -3945,7 +3945,7 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -3994,7 +3994,7 @@ where
                     let opcode_pc = frame.code_cursor - 1;
                     (
                         opcode_pc,
-                        frame.next_u8() as usize,
+                        frame.next_reg() as usize,
                         frame.next_u16() as usize,
                     )
                 };
@@ -4025,7 +4025,7 @@ where
                 let _target = self.frames.current_mut().next_u16();
             }
             jitcode::insns::BC_LAST_EXCEPTION => {
-                let dst = self.frames.current_mut().next_u8() as usize;
+                let dst = self.frames.current_mut().next_reg() as usize;
                 let exc_value = self.last_exception_value;
                 // pyjitpl.py:1707-1714 opimpl_last_exception:
                 //     exc_value = self.metainterp.last_exc_value
@@ -4046,7 +4046,7 @@ where
                 self.set_int_reg(dst, Some(ctx.const_int(typeptr)), Some(typeptr));
             }
             jitcode::insns::BC_LAST_EXC_VALUE => {
-                let dst = self.frames.current_mut().next_u8() as usize;
+                let dst = self.frames.current_mut().next_reg() as usize;
                 // pyjitpl.py:1716-1719 opimpl_last_exc_value:
                 //     exc_value = self.metainterp.last_exc_value
                 //     assert exc_value
@@ -4082,7 +4082,7 @@ where
                 // Canonical `iL` encoding: [vtable:u8][target:u16].
                 let (vtable_idx, target) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u8() as usize, frame.next_u16() as usize)
+                    (frame.next_reg() as usize, frame.next_u16() as usize)
                 };
                 let exc_value = self.last_exception_value;
                 assert!(
@@ -4111,7 +4111,7 @@ where
             jitcode::insns::BC_RVMPROF_CODE => {
                 let (leaving_idx, unique_id_idx) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u8() as usize, frame.next_u8() as usize)
+                    (frame.next_reg() as usize, frame.next_reg() as usize)
                 };
                 let leaving = self.frames.current_mut().int_values[leaving_idx].unwrap_or(0);
                 let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
@@ -4138,7 +4138,7 @@ where
                 // swap (dispatch.rs:850) finds that `-live-` at
                 // `mp_opcode_pc - SIZE_LIVE_OP`.
                 let mp_opcode_pc = frame.code_cursor - 1;
-                let jdindex_byte = frame.next_u8();
+                let jdindex_byte = frame.next_reg();
                 // RPython `blackhole.py:112-123` argcode discrimination:
                 //
                 //     if argcode == 'i':
@@ -4253,7 +4253,7 @@ where
                     let max = max_regs[slot];
                     let is_green_slot = slot < 3;
                     for _ in 0..count {
-                        let reg = frame.next_u8();
+                        let reg = frame.next_reg();
                         let reg_idx = reg as usize;
                         if capture_walk_reds && slot >= 3 {
                             match slot {
@@ -4824,7 +4824,7 @@ where
                 // rather than reading the slot byte as the index directly,
                 // mirroring `blackhole.py:120 self.registers_i[ord(code[pos])]`.
                 let frame = self.frames.current_mut();
-                let jdindex_byte = frame.next_u8();
+                let jdindex_byte = frame.next_reg();
                 let slot = jdindex_byte as usize;
                 let jdindex = frame.int_values.get(slot).copied().flatten().expect(
                     "BC_LOOP_HEADER (i form): jdindex register slot \
@@ -4858,13 +4858,13 @@ where
                     let mut arg_triples = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let caller_src = frame.next_u8() as usize;
-                        let callee_dst = frame.next_u8() as usize;
+                        let caller_src = frame.next_reg() as usize;
+                        let callee_dst = frame.next_reg() as usize;
                         arg_triples.push((kind, caller_src, callee_dst));
                     }
                     let decode_return_slot = |f: &mut MIFrame| {
-                        let dst = f.next_u8() as usize;
-                        if dst == u8::MAX as usize {
+                        let dst = f.next_reg() as usize;
+                        if dst == crate::jitcode::NO_RETURN_REG as usize {
                             None
                         } else {
                             Some(dst)
@@ -5005,7 +5005,7 @@ where
             // RPython `self.last_exc_value = lltype.nullptr(...)`).
             jitcode::insns::BC_INT_RETURN => {
                 self.clear_exception();
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let target = self.frames.current_mut().return_i;
                 if target.is_none() {
@@ -5069,7 +5069,7 @@ where
             }
             jitcode::insns::BC_REF_RETURN => {
                 self.clear_exception();
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let target = self.frames.current_mut().return_r;
                 if target.is_none() {
@@ -5099,7 +5099,7 @@ where
             }
             jitcode::insns::BC_FLOAT_RETURN => {
                 self.clear_exception();
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let target = self.frames.current_mut().return_f;
                 if target.is_none() {
@@ -5169,24 +5169,24 @@ where
 
                 let (target, args_i, args_r, args_f, calldescr) = {
                     let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_u8() as u16;
+                    let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
                     if has_int {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
-                            args_i.push(JitCallArg::int(frame.next_u8() as u16));
+                            args_i.push(JitCallArg::int(frame.next_reg() as u16));
                         }
                     }
                     let mut args_r: Vec<JitCallArg> = Vec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_u8() as u16));
+                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
                     let mut args_f: Vec<JitCallArg> = Vec::new();
                     if has_float {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
-                            args_f.push(JitCallArg::float(frame.next_u8() as u16));
+                            args_f.push(JitCallArg::float(frame.next_reg() as u16));
                         }
                     }
                     let calldescr_idx = frame.next_u16();
@@ -5488,28 +5488,28 @@ where
 
                 let (target, args_i, args_r, args_f, calldescr, dst) = {
                     let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_u8() as u16;
+                    let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
                     if has_int {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
-                            args_i.push(JitCallArg::int(frame.next_u8() as u16));
+                            args_i.push(JitCallArg::int(frame.next_reg() as u16));
                         }
                     }
                     let mut args_r: Vec<JitCallArg> = Vec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_u8() as u16));
+                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
                     let mut args_f: Vec<JitCallArg> = Vec::new();
                     if has_float {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
-                            args_f.push(JitCallArg::float(frame.next_u8() as u16));
+                            args_f.push(JitCallArg::float(frame.next_reg() as u16));
                         }
                     }
                     let calldescr_idx = frame.next_u16();
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     let calldescr = frame
                         .jitcode
                         .descr_at(calldescr_idx as usize)
@@ -5787,28 +5787,28 @@ where
 
                 let (target, args_i, args_r, args_f, calldescr, dst) = {
                     let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_u8() as u16;
+                    let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
                     if has_int {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
-                            args_i.push(JitCallArg::int(frame.next_u8() as u16));
+                            args_i.push(JitCallArg::int(frame.next_reg() as u16));
                         }
                     }
                     let mut args_r: Vec<JitCallArg> = Vec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_u8() as u16));
+                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
                     let mut args_f: Vec<JitCallArg> = Vec::new();
                     if has_float {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
-                            args_f.push(JitCallArg::float(frame.next_u8() as u16));
+                            args_f.push(JitCallArg::float(frame.next_reg() as u16));
                         }
                     }
                     let calldescr_idx = frame.next_u16();
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     let calldescr = frame
                         .jitcode
                         .descr_at(calldescr_idx as usize)
@@ -6040,24 +6040,24 @@ where
             jitcode::insns::BC_RESIDUAL_CALL_IRF_F => {
                 let (target, args_i, args_r, args_f, calldescr, dst) = {
                     let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_u8() as u16;
+                    let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
                     let count_i = frame.next_u8() as usize;
                     for _ in 0..count_i {
-                        args_i.push(JitCallArg::int(frame.next_u8() as u16));
+                        args_i.push(JitCallArg::int(frame.next_reg() as u16));
                     }
                     let mut args_r: Vec<JitCallArg> = Vec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_u8() as u16));
+                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
                     let mut args_f: Vec<JitCallArg> = Vec::new();
                     let count_f = frame.next_u8() as usize;
                     for _ in 0..count_f {
-                        args_f.push(JitCallArg::float(frame.next_u8() as u16));
+                        args_f.push(JitCallArg::float(frame.next_reg() as u16));
                     }
                     let calldescr_idx = frame.next_u16();
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     let calldescr = frame
                         .jitcode
                         .descr_at(calldescr_idx as usize)
@@ -6306,7 +6306,7 @@ where
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u8();
+                        let reg = frame.next_reg();
                         arg_regs.push(JitCallArg {
                             kind,
                             reg: reg as u16,
@@ -6384,13 +6384,13 @@ where
             | jitcode::insns::BC_RECORD_KNOWN_RESULT_REF => {
                 let (first_reg, fn_ptr_idx, arg_regs, dst) = {
                     let frame = self.frames.current_mut();
-                    let first_reg = frame.next_u8() as u16;
+                    let first_reg = frame.next_reg() as u16;
                     let fn_ptr_idx = frame.next_u16() as usize;
                     let num_args = frame.next_u8() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u8();
+                        let reg = frame.next_reg();
                         arg_regs.push(JitCallArg {
                             kind,
                             reg: reg as u16,
@@ -6401,7 +6401,7 @@ where
                         jitcode::insns::BC_COND_CALL_VALUE_INT
                             | jitcode::insns::BC_COND_CALL_VALUE_REF
                     ) {
-                        Some(frame.next_u8() as u16)
+                        Some(frame.next_reg() as u16)
                     } else {
                         None
                     };
@@ -6522,7 +6522,7 @@ where
             jitcode::insns::BC_MOVE_I => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u8() as usize, frame.next_u8() as usize)
+                    (frame.next_reg() as usize, frame.next_reg() as usize)
                 };
                 let (value, concrete) = self.read_int_reg(src);
                 self.set_int_reg(dst, Some(value), Some(concrete));
@@ -6534,7 +6534,7 @@ where
             jitcode::insns::BC_MOVE_I_C => {
                 let (value, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u8() as i8 as i64, frame.next_u8() as usize)
+                    (frame.next_u8() as i8 as i64, frame.next_reg() as usize)
                 };
                 self.set_int_reg(dst, Some(OpRef::ConstInt(value)), Some(value));
             }
@@ -6550,12 +6550,12 @@ where
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u8();
+                        let reg = frame.next_reg();
                         arg_regs.push(JitCallArg {
                             kind,
                             reg: reg as u16,
@@ -6610,7 +6610,7 @@ where
             jitcode::insns::BC_MOVE_R => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u8() as usize, frame.next_u8() as usize)
+                    (frame.next_reg() as usize, frame.next_reg() as usize)
                 };
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
@@ -6623,12 +6623,12 @@ where
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u8();
+                        let reg = frame.next_reg();
                         arg_regs.push(JitCallArg {
                             kind,
                             reg: reg as u16,
@@ -6683,7 +6683,7 @@ where
             jitcode::insns::BC_MOVE_F => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
-                    (frame.next_u8() as usize, frame.next_u8() as usize)
+                    (frame.next_reg() as usize, frame.next_reg() as usize)
                 };
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
@@ -6696,12 +6696,12 @@ where
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
+                    let dst = frame.next_reg() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u8();
+                        let reg = frame.next_reg();
                         arg_regs.push(JitCallArg {
                             kind,
                             reg: reg as u16,
@@ -6774,7 +6774,7 @@ where
                 let (src, opcode_pc) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
-                    (frame.next_u8() as usize, opcode_pc)
+                    (frame.next_reg() as usize, opcode_pc)
                 };
                 let (opref, concrete) = self.read_int_reg(src);
                 let const_ref = ctx.const_int(concrete);
@@ -6795,7 +6795,7 @@ where
             // `heap_cache.is_nullity_known` + bumps `HEAPCACHED_OPS`
             // on cache hit per pyjitpl.py:387-388.
             jitcode::insns::BC_ASSERT_NOT_NONE => {
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 ctx.trace_assert_not_none(opref, concrete);
             }
@@ -6808,8 +6808,8 @@ where
             // blackhole.py:616 `@arguments("r", "i")` and remains the
             // ConstInt vtable address that RPython passes as `clsbox`.
             jitcode::insns::BC_RECORD_EXACT_CLASS => {
-                let src = self.frames.current_mut().next_u8() as usize;
-                let cls = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
+                let cls = self.frames.current_mut().next_reg() as usize;
                 let (box_opref, _) = self.read_ref_reg(src);
                 let (cls_opref, _) = self.read_int_reg(cls);
                 ctx.trace_record_exact_class(box_opref, cls_opref);
@@ -6819,7 +6819,7 @@ where
                 let (src, opcode_pc) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
-                    (frame.next_u8() as usize, opcode_pc)
+                    (frame.next_reg() as usize, opcode_pc)
                 };
                 let (opref, concrete) = self.read_ref_reg(src);
                 let const_ref = ctx.const_ref(concrete);
@@ -6838,7 +6838,7 @@ where
                 let (src, opcode_pc) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
-                    (frame.next_u8() as usize, opcode_pc)
+                    (frame.next_reg() as usize, opcode_pc)
                 };
                 let (opref, concrete) = self.read_float_reg(src);
                 let const_ref = ctx.const_float(concrete);
@@ -6871,7 +6871,7 @@ where
                 // of opimpl_raise itself — what `generate_guard(...,
                 // resumepc=orgpc)` records.
                 let opcode_pc = self.frames.current_mut().code_cursor - 1;
-                let src = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_reg() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 if concrete == 0 {
                     return TraceAction::Abort;
@@ -6976,14 +6976,14 @@ where
                 let count = frame.next_u8() as usize;
                 let mut regs = Vec::with_capacity(count);
                 for _ in 0..count {
-                    regs.push(frame.next_u8() as usize);
+                    regs.push(frame.next_reg() as usize);
                 }
                 regs
             };
             let args_i = has_i_list.then(|| read_list(frame)).unwrap_or_default();
             let args_r = read_list(frame);
             let args_f = has_f_list.then(|| read_list(frame)).unwrap_or_default();
-            let result_dst = return_kind.map(|_| frame.next_u8() as usize);
+            let result_dst = return_kind.map(|_| frame.next_reg() as usize);
             frame._result_argcode = match return_kind {
                 Some(JitArgKind::Int) => b'i',
                 Some(JitArgKind::Ref) => b'r',
@@ -7224,9 +7224,9 @@ where
         // `bhhandler_ii_i!` blackhole decoder.
         let (lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
-            let lhs_idx = frame.next_u8() as usize;
-            let rhs_idx = frame.next_u8() as usize;
-            let dst = frame.next_u8() as usize;
+            let lhs_idx = frame.next_reg() as usize;
+            let rhs_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
         let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
@@ -7261,8 +7261,8 @@ where
         // `code[position+1]=dst`).
         let (src_idx, dst) = {
             let frame = self.frames.current_mut();
-            let src_idx = frame.next_u8() as usize;
-            let dst = frame.next_u8() as usize;
+            let src_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
             (src_idx, dst)
         };
         let (src, src_value) = self.read_int_reg(src_idx);
@@ -7283,9 +7283,9 @@ where
     fn trace_binop_r_to_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
-            let lhs_idx = frame.next_u8() as usize;
-            let rhs_idx = frame.next_u8() as usize;
-            let dst = frame.next_u8() as usize;
+            let lhs_idx = frame.next_reg() as usize;
+            let rhs_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
         let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
@@ -7312,8 +7312,8 @@ where
     fn trace_ptr_nullity(&mut self, ctx: &mut TraceCtx, nonzero: bool) {
         let (src_idx, dst) = {
             let frame = self.frames.current_mut();
-            let src_idx = frame.next_u8() as usize;
-            let dst = frame.next_u8() as usize;
+            let src_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
             (src_idx, dst)
         };
         let (src, src_value) = self.read_ref_reg(src_idx);
@@ -7339,9 +7339,9 @@ where
     fn trace_binop_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
-            let lhs_idx = frame.next_u8() as usize;
-            let rhs_idx = frame.next_u8() as usize;
-            let dst = frame.next_u8() as usize;
+            let lhs_idx = frame.next_reg() as usize;
+            let rhs_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
@@ -7357,8 +7357,8 @@ where
         // `bhhandler_f_f!` blackhole decoder.
         let (src_idx, dst) = {
             let frame = self.frames.current_mut();
-            let src_idx = frame.next_u8() as usize;
-            let dst = frame.next_u8() as usize;
+            let src_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
             (src_idx, dst)
         };
         let (src, src_value) = self.read_float_reg(src_idx);

@@ -232,6 +232,13 @@ impl MIFrame {
         read_u8(&self.jitcode.code, &mut self.code_cursor)
     }
 
+    /// Read one register operand ([`crate::jitcode::JitcodeReg`]); register
+    /// operands are always one byte. Use this at register reads instead of
+    /// `next_u8` so the 1-byte register width stays enforced in one place.
+    pub fn next_reg(&mut self) -> crate::jitcode::JitcodeReg {
+        self.next_u8()
+    }
+
     pub fn next_u16(&mut self) -> u16 {
         read_u16(&self.jitcode.code, &mut self.code_cursor)
     }

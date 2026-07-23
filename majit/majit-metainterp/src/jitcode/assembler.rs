@@ -2457,8 +2457,8 @@ impl JitCodeBuilder {
 
     /// Void-result sibling of [`Self::recursive_call_int`]
     /// (`opimpl_recursive_call_v`).  Carries no result register — the
-    /// `result_dst` slot is emitted as the `u8::MAX` "no result" sentinel the
-    /// dispatcher decodes to `None`.
+    /// `result_dst` slot is emitted as the [`jitcode::NO_RETURN_REG`] "no
+    /// result" sentinel the dispatcher decodes to `None`.
     pub fn recursive_call_void(
         &mut self,
         jd_index: u16,
@@ -2480,7 +2480,7 @@ impl JitCodeBuilder {
         }
         self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_VOID);
         self.push_u16(jd_index);
-        self.push_u8(u8::MAX);
+        self.push_u8(jitcode::NO_RETURN_REG);
         self.push_u16(greens.len() as u16);
         for &(kind, src) in greens {
             self.push_u8(kind.encode());
@@ -2821,7 +2821,7 @@ impl JitCodeBuilder {
     fn push_return_slot(&mut self, ret: Option<u16>) {
         match ret {
             Some(caller_dst) => self.push_reg_u8(caller_dst, "inline_call return"),
-            None => self.push_u8(u8::MAX),
+            None => self.push_u8(jitcode::NO_RETURN_REG),
         }
     }
 
@@ -4671,14 +4671,18 @@ impl JitCodeBuilder {
         self.code.push(value);
     }
 
+    /// Emit a single register operand ([`jitcode::JitcodeReg`], one byte).
+    /// A register index that does not fit a byte latches the overflow flag so
+    /// `try_finish` declines the JitCode. See [`jitcode::JitcodeReg`] — the
+    /// register width is deliberately fixed at `u8`.
     fn push_reg_u8(&mut self, reg: u16, _context: &'static str) {
-        if reg > u8::MAX as u16 {
+        if reg > jitcode::JitcodeReg::MAX as u16 {
             // The placeholder exists only in the transient builder;
             // `try_finish` observes the latch and declines the JitCode.
             self.encoding_overflow = true;
             self.push_u8(0);
         } else {
-            self.push_u8(reg as u8);
+            self.push_u8(reg as jitcode::JitcodeReg);
         }
     }
 
@@ -5156,10 +5160,10 @@ impl JitCodeBuilder {
             };
             let slot = base + pool_idx;
             assert!(
-                slot <= u8::MAX as u16,
+                slot <= jitcode::JitcodeReg::MAX as u16,
                 "patch_const_u8_refs: slot {slot} (base={base} + pool_idx={pool_idx}) overflows u8"
             );
-            self.code[offset] = slot as u8;
+            self.code[offset] = slot as jitcode::JitcodeReg;
         }
     }
 }
