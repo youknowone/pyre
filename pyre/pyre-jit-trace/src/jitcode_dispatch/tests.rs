@@ -5687,6 +5687,159 @@ fn int_unop_folds_a_const_int_operand_without_recording() {
     );
 }
 
+/// [`run_hint_step`] companion for float-bank steps: same lean harness
+/// with caller-supplied `registers_f` (and `registers_i` for the
+/// `ff>i` compares).
+fn run_float_step(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_f: &mut [OpRef],
+    regs_i: &mut [OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let outer_jitcode_index = test_outer_resume_jitcode_index();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: regs_i,
+        registers_f: regs_f,
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: tc,
+        done_with_this_frame_descr_ref: done_descr_ref_for_tests(),
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(code, 0, &mut wc)
+}
+
+#[test]
+fn float_binop_folds_two_const_float_operands_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("float_add/ff>f")
+        .expect("`float_add/ff>f` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02]; // `ff>f`: src1=0, src2=1, dst=2
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_float((40.0f64).to_bits() as i64);
+    let rhs = tc.const_float((2.0f64).to_bits() as i64);
+    let mut regs_f = [lhs, rhs, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut [])
+        .expect("float_add on two const floats must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const operands fold without recording a FloatAdd",
+    );
+    assert_eq!(
+        regs_f[2].inline_const_to_value(),
+        Some(majit_ir::Value::Float(42.0)),
+        "dst must hold the folded ConstFloat",
+    );
+}
+
+#[test]
+fn float_unop_folds_a_const_float_operand_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("float_neg/f>f")
+        .expect("`float_neg/f>f` must be in insns table");
+    let code = [byte, 0x00, 0x01]; // `f>f`: src=0, dst=1
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_float((1.5f64).to_bits() as i64);
+    let mut regs_f = [operand, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut [])
+        .expect("float_neg on a const float must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a const operand folds without recording a FloatNeg",
+    );
+    assert_eq!(
+        regs_f[1].inline_const_to_value(),
+        Some(majit_ir::Value::Float(-1.5)),
+        "dst must hold the folded ConstFloat",
+    );
+}
+
+#[test]
+fn float_compare_folds_two_const_float_operands_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("float_lt/ff>i")
+        .expect("`float_lt/ff>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x00]; // `ff>i`: f-src1=0, f-src2=1, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_float((1.0f64).to_bits() as i64);
+    let rhs = tc.const_float((2.0f64).to_bits() as i64);
+    let mut regs_f = [lhs, rhs];
+    let mut regs_i = [OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("float_lt on two const floats must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const operands fold without recording a FloatLt",
+    );
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(1)),
+        "1.0 < 2.0 folds to ConstInt(1)",
+    );
+}
+
+#[test]
+fn fused_float_compare_folds_const_operands_without_guards() {
+    // The fused float compares route their condbox through
+    // `self.execute(rop.FLOAT_*, b1, b2)` — all-const operands fold and the
+    // `Const` condbox emits no guard.
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_float_lt/ffL")
+        .expect("`goto_if_not_float_lt/ffL` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_float((1.0f64).to_bits() as i64);
+    let rhs = tc.const_float((2.0f64).to_bits() as i64);
+    let mut regs_f = [lhs, rhs];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut [])
+        .expect("a const float compare has a static direction");
+    assert_eq!(next_pc, code.len(), "1.0 < 2.0 falls through");
+    assert_eq!(
+        tc.num_ops(),
+        0,
+        "const float compare records no FloatLt and no guard"
+    );
+}
+
 #[test]
 fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
     let byte = *insns_opname_to_byte()

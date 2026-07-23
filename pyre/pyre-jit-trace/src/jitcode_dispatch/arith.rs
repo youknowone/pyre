@@ -646,6 +646,20 @@ pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
     let b = read_float_reg(code, op, 1, ctx)?;
+    // All-`Const` operands fold without recording (`execute_and_record`'s
+    // `_all_constants` short-circuit; FLOAT_LT..FLOAT_GE are ALWAYS_PURE).
+    // No `a == b` fast path: float compares are not `FASTPATHS_SAME_BOXES`
+    // members (`x == x` is false for a NaN).
+    if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        let folded =
+            majit_metainterp::eval_float_cmp(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        let result = ctx.trace_ctx.const_int(folded);
+        let dst = code[op.pc + 3] as usize;
+        write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (matches dispatch.rs GOTO_IF_NOT_FLOAT_* + trace_float_compare).
@@ -669,9 +683,18 @@ pub(crate) fn record_float_cmp<Sym: WalkSym>(
     a: OpRef,
     b: OpRef,
 ) -> OpRef {
-    // Mirrors `self.execute(rop.<CMP>, b1, b2)` but does not pre-fold
-    // `_all_constants` / `b1 is b2` (`pyjitpl.py`);
-    // the recorded compare and downstream guard are optimizer-folded/strengthened.
+    // Mirrors `self.execute(rop.<CMP>, b1, b2)`: all-`Const` operands fold
+    // without recording (`execute_and_record`'s `_all_constants`
+    // short-circuit), and `opimpl_goto_if_not` emits no guard for a `Const`
+    // condbox.  No `b1 is b2` fast path: the fused float compares are
+    // generated with `if False and b1 is b2` (`x == x` is false for a NaN).
+    if let (Some(Value::Float(fa)), Some(Value::Float(fb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        let folded =
+            majit_metainterp::eval_float_cmp(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        return ctx.trace_ctx.const_int(folded);
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -764,6 +787,28 @@ pub(crate) fn binop_float_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
     let b = read_float_reg(code, op, 1, ctx)?;
+    // All-`Const` operands fold without recording (`execute_and_record`'s
+    // `_all_constants` short-circuit; FLOAT_ADD..FLOAT_TRUEDIV are
+    // ALWAYS_PURE).
+    if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        let bits = majit_metainterp::eval_binop_f(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
+        let result = ctx.trace_ctx.const_float(bits);
+        let dst = code[op.pc + 3] as usize;
+        let len = ctx.registers_f.len();
+        let slot = ctx
+            .registers_f
+            .get_mut(dst)
+            .ok_or(DispatchError::RegisterOutOfRange {
+                pc: op.pc,
+                reg: dst,
+                len,
+                bank: "f",
+            })?;
+        *slot = result;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (matches dispatch.rs trace_binop_f).
@@ -800,6 +845,26 @@ pub(crate) fn unop_float_record<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
+    // A `Const` operand folds without recording (`execute_and_record`'s
+    // `_all_constants` short-circuit; FLOAT_NEG / FLOAT_ABS are
+    // ALWAYS_PURE).
+    if let Some(majit_ir::Value::Float(fa)) = a.inline_const_to_value() {
+        let bits = majit_metainterp::eval_unary_f(opcode, fa.to_bits() as i64);
+        let result = ctx.trace_ctx.const_float(bits);
+        let dst = code[op.pc + 2] as usize;
+        let len = ctx.registers_f.len();
+        let slot = ctx
+            .registers_f
+            .get_mut(dst)
+            .ok_or(DispatchError::RegisterOutOfRange {
+                pc: op.pc,
+                reg: dst,
+                len,
+                bank: "f",
+            })?;
+        *slot = result;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     // Box(value) parity: stamp the unary float result (matches dispatch.rs
     // trace_unary_f — FloatNeg / FloatAbs).
