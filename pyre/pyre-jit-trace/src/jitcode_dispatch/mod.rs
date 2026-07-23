@@ -4510,6 +4510,7 @@ struct FbwStoreJournalRootArea {
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
+    single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
 }
 
 thread_local! {
@@ -4524,6 +4525,7 @@ thread_local! {
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
+        single_frame_blackhole: single_frame_blackhole_cell_ptr(),
     };
 }
 
@@ -4773,6 +4775,18 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     if let Some(undo) = escape_undo.as_mut() {
         for slot in undo.slots.iter_mut() {
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
+    }
+    // C3 S1: the force-time MIFrame survives the dispatch unwind in TLS.
+    // Its Option<i64> Ref bank is not visible to the collector, so forward
+    // every populated color until the walk-end handler takes the latch.
+    let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
+    if let Some(latched) = single_frame_blackhole.as_mut() {
+        for value in latched.miframe.ref_values.iter_mut().flatten() {
+            visitor(unsafe { &mut *(value as *mut i64).cast() });
+        }
+        if latched.last_exc_value != 0 {
+            visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
         }
     }
     // gh#467: the latched forward-flush operand stack (callable + args) is
@@ -5139,6 +5153,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
         call_descr,
         recorded,
         pc,
+        None,
     )?;
     // A decline leaves the call recorded symbolically WITHOUT running it, so
     // the walk-end no-replay commit must stay off for this trace.

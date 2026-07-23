@@ -1627,6 +1627,183 @@ fn seed_loop_entry_ref_slots(
     }
 }
 
+fn apply_single_frame_blackhole_crn(
+    frame: usize,
+    jitcode_index: i32,
+    terminal: &mut majit_metainterp::SingleFrameBlackholeResult,
+    resume_py_pc: usize,
+) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(stack_base) = crate::state::concrete_nlocals(frame) else {
+        return false;
+    };
+    let pf = unsafe { &mut *(frame as *mut pyre_interpreter::PyFrame) };
+    let w_code = pf.pycode;
+    if w_code.is_null() {
+        return false;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let Some(stack_depth) = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(resume_py_pc)
+        .copied()
+    else {
+        return false;
+    };
+    let live_end = stack_base + stack_depth as usize;
+    if pf.locals_w().as_slice().len() < live_end {
+        return false;
+    }
+    let pcdep = crate::state::pcdep_trivia_at(jitcode_index, terminal.last_opcode_position as i32)
+        .or_else(|| crate::state::pcdep_trivia_at(jitcode_index, terminal.position as i32));
+    let Some(pcdep) = pcdep else {
+        return false;
+    };
+
+    // Validate every mapped color and every live operand-stack slot before
+    // writing anything.  Dead locals may retain their old heap value; each
+    // stack slot at the merge point must have an authoritative color.
+    let mut writes: Vec<(usize, u8, usize)> = Vec::new();
+    for &(bank, color, slot) in &pcdep {
+        let slot = slot as usize;
+        if slot >= live_end {
+            continue;
+        }
+        let color = color as usize;
+        let present = match bank {
+            0 => color < terminal.registers_i.len(),
+            1 => color < terminal.registers_r.len(),
+            2 => color < terminal.registers_f.len(),
+            _ => false,
+        };
+        if !present {
+            return false;
+        }
+        if !writes.iter().any(|(existing, _, _)| *existing == slot) {
+            writes.push((slot, bank, color));
+        }
+    }
+    if (stack_base..live_end).any(|slot| !writes.iter().any(|(s, _, _)| *s == slot)) {
+        return false;
+    }
+
+    let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(terminal.registers_r.as_mut_slice());
+    }
+    for (slot, bank, color) in writes {
+        let value = match bank {
+            0 => majit_ir::Value::Int(terminal.registers_i[color]),
+            1 => majit_ir::Value::Ref(majit_ir::GcRef(terminal.registers_r[color] as usize)),
+            2 => majit_ir::Value::Float(f64::from_bits(terminal.registers_f[color] as u64)),
+            _ => unreachable!("validated blackhole register bank"),
+        };
+        pf.locals_w_mut()[slot] = crate::state::boxed_slot_value_for_type(value.get_type(), &value);
+    }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+    pf.valuestackdepth = live_end;
+    pf.last_instr = resume_py_pc as isize - 1;
+    true
+}
+
+fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
+    let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
+        return false;
+    };
+    let jitcode_index = match i32::try_from(latched.miframe.jitcode.index()) {
+        Ok(index) => index,
+        Err(_) => return false,
+    };
+    let virtualizable_info = ctx
+        .virtualizable_info()
+        .map(std::sync::Arc::as_ptr)
+        .unwrap_or(std::ptr::null());
+    if virtualizable_info.is_null() {
+        return false;
+    }
+    let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
+        return false;
+    };
+    let mut terminal = majit_metainterp::drive_single_frame_blackhole(
+        &mut latched.miframe,
+        majit_metainterp::blackhole::StateFieldLayout::default(),
+        virtualizable_info,
+        cf_addr as i64,
+        stack_base,
+        ctx.metainterp_sd().as_ref(),
+        latched.last_exc_value,
+        latched.raising_exception,
+    );
+
+    let adopted = match terminal.outcome {
+        majit_metainterp::jitexc::JitException::ContinueRunningNormally {
+            ref green_int, ..
+        } => {
+            let Some(&resume_py_pc) = green_int.first() else {
+                return false;
+            };
+            let resume_py_pc = resume_py_pc as usize;
+            if !apply_single_frame_blackhole_crn(
+                cf_addr,
+                jitcode_index,
+                &mut terminal,
+                resume_py_pc,
+            ) {
+                return false;
+            }
+            WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(value) => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Int(
+                value,
+            ));
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(value) => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Ref(
+                value.as_usize() as pyre_object::PyObjectRef,
+            ));
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(value) => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Float(
+                value,
+            ));
+            true
+        }
+        majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
+            crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
+                value.as_usize() as pyre_object::PyObjectRef,
+            ));
+            true
+        }
+    };
+    if adopted {
+        let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
+        crate::jitcode_dispatch::discard_escape_flush_undo();
+        crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+        WALK_END_FLUSH_COMMITTED.with(|slot| slot.set(true));
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-blackhole] adopted single-frame terminal at jitcode_index={} \
+                 position={} last_opcode_position={}",
+                jitcode_index, terminal.position, terminal.last_opcode_position,
+            );
+        }
+    }
+    adopted
+}
+
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -2326,23 +2503,35 @@ fn run_perfn_walk<Sym: WalkSym>(
         // predicate as the CloseLoop end-flush above.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
+        let single_frame_blackhole_adopted = matches!(
+            &walk_result,
+            Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+        ) && try_adopt_single_frame_blackhole(ctx, cf_addr);
         if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() == Some(std::ffi::OsStr::new("0")) {
             // Opt-out: never adopt the escape flush — drop the commit and put
             // the pre-flush frame back so the legacy replay sees pristine
             // state.
-            if matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            ) {
+            if !single_frame_blackhole_adopted
+                && matches!(
+                    &walk_result,
+                    Err(
+                        crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+                    )
+                )
+            {
                 let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
                 crate::jitcode_dispatch::restore_escape_flush_undo();
             }
         } else {
-            if matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            ) && let Some(resume_py_pc) =
-                crate::jitcode_dispatch::take_committed_frame_escape_pc()
+            if !single_frame_blackhole_adopted
+                && matches!(
+                    &walk_result,
+                    Err(
+                        crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+                    )
+                )
+                && let Some(resume_py_pc) =
+                    crate::jitcode_dispatch::take_committed_frame_escape_pc()
             {
                 crate::jitcode_dispatch::discard_escape_flush_undo();
                 // The force-time escape flush wrote the resume state into the
@@ -2750,7 +2939,12 @@ fn run_perfn_walk<Sym: WalkSym>(
         )
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some()
         && !crate::jitcode_dispatch::fbw_has_unjournaled_effect();
-    if !terminate_no_replay {
+    let blackhole_terminal_no_replay = matches!(
+        &walk_result,
+        Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+    ) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
+        && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
+    if !terminate_no_replay && !blackhole_terminal_no_replay {
         crate::jitcode_dispatch::fbw_finish_concrete_reset();
     }
 
@@ -3434,6 +3628,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::reset_single_frame_blackhole();
     crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
     crate::jitcode_dispatch::fbw_executed_body_residual_reset();
     crate::jitcode_dispatch::fbw_abort_outer_resume_reset();

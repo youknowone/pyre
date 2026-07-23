@@ -877,6 +877,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             call_descr,
             ca_result,
             op.pc,
+            None,
         )?
     };
     // A decline leaves the CALL_ASSEMBLER recorded symbolically WITHOUT
@@ -1122,6 +1123,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         call_descr,
         ca_result,
         op.pc,
+        None,
     )?;
     let exec_raised = match exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),

@@ -62,6 +62,143 @@ impl std::ops::DerefMut for BackEdgeBhBuilder {
     }
 }
 
+/// Terminal state from a single-frame tracing-abort blackhole run.
+///
+/// The terminal interpreter is kept logically alive by moving out its three
+/// register banks, matching the back-edge resume path below: a
+/// ContinueRunningNormally handoff needs the full color-indexed bank, not only
+/// the declared red subset carried by the exception.
+pub struct SingleFrameBlackholeResult {
+    pub outcome: crate::jitexc::JitException,
+    pub registers_i: Vec<i64>,
+    pub registers_r: Vec<i64>,
+    pub registers_f: Vec<i64>,
+    pub position: usize,
+    pub last_opcode_position: usize,
+}
+
+fn bh_jitdrivers_sd(
+    metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
+) -> Vec<crate::blackhole::BhJitDriverSd> {
+    metainterp_sd
+        .jitdrivers_sd
+        .iter()
+        .map(|jd| {
+            let result_type = match jd.result_type {
+                majit_ir::Type::Int => crate::blackhole::BhReturnType::Int,
+                majit_ir::Type::Ref => crate::blackhole::BhReturnType::Ref,
+                majit_ir::Type::Float => crate::blackhole::BhReturnType::Float,
+                majit_ir::Type::Void => crate::blackhole::BhReturnType::Void,
+            };
+            let portal_runner_ptr = (jd.portal_runner_adr != 0).then(|| unsafe {
+                std::mem::transmute::<usize, extern "C" fn(i64, i64, i64, i64, i64) -> i64>(
+                    jd.portal_runner_adr as usize,
+                )
+            });
+            let mainjitcode_calldescr = jd
+                .portal_calldescr
+                .as_ref()
+                .and_then(|descr| descr.as_call_descr())
+                .map(majit_translate::jitcode::BhCallDescr::from_call_descr)
+                .unwrap_or_default();
+            crate::blackhole::BhJitDriverSd {
+                result_type,
+                portal_runner_ptr,
+                mainjitcode_calldescr,
+            }
+        })
+        .collect()
+}
+
+/// Run one tracing MIFrame forward in the already-ported blackhole.
+///
+/// This is the single-frame counterpart of the structured back-edge template
+/// at the call site below.  `copy_data_from_miframe` deliberately copies only
+/// the typed register values and pc, so all interpreter-global / frame-global
+/// state is supplied explicitly here.
+pub fn drive_single_frame_blackhole(
+    miframe: &mut crate::pyjitpl::MIFrame,
+    state_field_layout: crate::blackhole::StateFieldLayout,
+    virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
+    virtualizable_ptr: i64,
+    virtualizable_stack_base: usize,
+    metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
+    last_exc_value: i64,
+    raising_exception: bool,
+) -> SingleFrameBlackholeResult {
+    // The MIFrame is handed here from a force-time TLS latch.  Publish its Ref
+    // values before leasing/building the interpreter because first use of the
+    // pooled builder may allocate.  Option<i64> is not a contiguous root area,
+    // so keep an index-parallel packed root vector and copy forwarding updates
+    // back before copy_data_from_miframe reads the MIFrame.
+    let mut ref_roots: Vec<(usize, i64)> = miframe
+        .ref_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.map(|value| (index, value)))
+        .collect();
+    let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    let mut packed_ref_roots: Vec<i64> = ref_roots.iter().map(|(_, value)| *value).collect();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
+    }
+
+    let mut builder = BackEdgeBhBuilder::lease();
+    builder.setup_cached_control_opcodes(
+        metainterp_sd.op_live as i32,
+        metainterp_sd.op_catch_exception as i32,
+        metainterp_sd.op_rvmprof_code as i32,
+    );
+    for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
+        *value = *forwarded;
+        miframe.ref_values[*index] = Some(*forwarded);
+    }
+
+    let mut bh = builder.acquire_interp();
+    bh.copy_data_from_miframe(miframe);
+    bh.state_field_layout = state_field_layout;
+    bh.virtualizable_info = virtualizable_info;
+    bh.virtualizable_ptr = virtualizable_ptr;
+    bh.virtualizable_stack_base = virtualizable_stack_base;
+    bh.jitdrivers_sd = bh_jitdrivers_sd(metainterp_sd);
+
+    // The blackhole may allocate/collect while executing.  Its Ref bank is the
+    // authoritative live register file and must be forwarded in place.
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(bh.registers_r.as_mut_slice());
+    }
+    let current_exc = if raising_exception {
+        last_exc_value
+    } else {
+        bh.exception_last_value = last_exc_value;
+        0
+    };
+    let outcome = match bh.resume_mainloop(current_exc) {
+        Err(jit_exc) => jit_exc,
+        Ok(propagated) => {
+            debug_assert!(
+                bh.nextblackholeinterp.is_some(),
+                "single-frame bottom blackhole returned to a missing caller"
+            );
+            crate::jitexc::JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
+                propagated as usize,
+            ))
+        }
+    };
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+
+    let result = SingleFrameBlackholeResult {
+        outcome,
+        registers_i: std::mem::take(&mut bh.registers_i),
+        registers_r: std::mem::take(&mut bh.registers_r),
+        registers_f: std::mem::take(&mut bh.registers_f),
+        position: bh.position,
+        last_opcode_position: bh.last_opcode_position,
+    };
+    builder.release_interp(bh);
+    result
+}
+
 fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     state: &mut S,
     layout: &crate::blackhole::StateFieldLayout,

@@ -42,6 +42,12 @@ thread_local! {
     /// loses nothing.
     static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, u64, usize)>> =
         const { std::cell::Cell::new(None) };
+    /// C3 S1 force-time image of the single live tracing frame.  The
+    /// color-indexed concrete banks cease to exist when dispatch unwinds, so
+    /// the MIFrame must be assembled beside `tracing_after_residual_call` and
+    /// carried to the walk-end VableEscaped leg.
+    static FBW_SINGLE_FRAME_BLACKHOLE: std::cell::RefCell<Option<LatchedSingleFrameBlackhole>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) struct EscapeFlushUndo {
@@ -49,6 +55,96 @@ pub(crate) struct EscapeFlushUndo {
     last_instr: isize,
     valuestackdepth: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+}
+
+pub(crate) struct LatchedSingleFrameBlackhole {
+    pub(crate) miframe: majit_metainterp::MIFrame,
+    pub(crate) last_exc_value: i64,
+    pub(crate) raising_exception: bool,
+}
+
+pub(crate) fn single_frame_blackhole_cell_ptr()
+-> *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>> {
+    FBW_SINGLE_FRAME_BLACKHOLE.with(|cell| cell as *const _)
+}
+
+pub(crate) fn take_single_frame_blackhole() -> Option<LatchedSingleFrameBlackhole> {
+    FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| slot.borrow_mut().take())
+}
+
+pub(crate) fn reset_single_frame_blackhole() {
+    FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+fn single_frame_blackhole_resume_enabled() -> bool {
+    std::env::var_os("PYRE_FBW_BLACKHOLE_RESUME").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+fn build_single_frame_miframe<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    resume_pc: usize,
+    lastop_result: Option<(char, usize, i64)>,
+) -> Option<majit_metainterp::MIFrame> {
+    let live = crate::state::frame_liveness_reg_indices_by_bank_at(
+        i32::try_from(jitcode.index()).ok()?,
+        i32::try_from(resume_pc).ok()?,
+    );
+    let mut miframe = majit_metainterp::MIFrame::new(jitcode.clone(), resume_pc);
+
+    // pyjitpl.py make_result_of_lastop: the residual returned before its
+    // ordinary dispatcher writeback, while `resume_pc` already points past
+    // the call.  Stamp the just-produced value first: its destination is
+    // normally live at `resume_pc`, but the concrete shadow still contains
+    // Null/old data and must not make the all-live-color pass decline.
+    if let Some((bank, color, value)) = lastop_result {
+        match bank {
+            'i' => *miframe.int_values.get_mut(color)? = Some(value),
+            'r' => *miframe.ref_values.get_mut(color)? = Some(value),
+            'f' => *miframe.float_values.get_mut(color)? = Some(value),
+            'v' => {}
+            _ => return None,
+        }
+    }
+
+    for &color in &live.int {
+        let color = color as usize;
+        if miframe.int_values.get(color).copied().flatten().is_some() {
+            continue;
+        }
+        let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
+            return None;
+        };
+        *miframe.int_values.get_mut(color)? = Some(value);
+    }
+    for &color in &live.ref_ {
+        let color = color as usize;
+        if miframe.ref_values.get(color).copied().flatten().is_some() {
+            continue;
+        }
+        let ConcreteValue::Ref(value) = ctx.concrete_registers_r.get(color).copied()? else {
+            // ConcreteValue::Null is the walker's "unknown" sentinel, not a
+            // proven Python null.  S1 declines the whole image rather than
+            // manufacturing a hole in a live Ref color.
+            return None;
+        };
+        *miframe.ref_values.get_mut(color)? = Some(value as i64);
+    }
+    for &color in &live.float {
+        let color = color as usize;
+        if miframe.float_values.get(color).copied().flatten().is_some() {
+            continue;
+        }
+        let opref = ctx.registers_f.get(color).copied()?;
+        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            return None;
+        };
+        *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
+    }
+
+    Some(miframe)
 }
 
 /// TLS cell pointer for the store-journal root area: the undo stays armed
@@ -255,6 +351,10 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
 
 pub fn take_committed_frame_escape_pc() -> Option<usize> {
     COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.take())
+}
+
+fn committed_frame_escape_pc() -> Option<usize> {
+    COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.get())
 }
 
 /// Withdraw a committed escape resume pc: the residual that escaped also ran
@@ -782,6 +882,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
     op_pc: usize,
+    blackhole_result: Option<(usize, char, usize)>,
 ) -> Result<ResidualExecOutcome, DispatchError> {
     // `execute_varargs` clears the metainterp exception slot at residual-call
     // entry, before the helper can either run or leave the call recorded
@@ -1375,6 +1476,51 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             {
                 cancel_committed_frame_escape_pc();
                 restore_escape_flush_undo();
+            }
+            // C3 S1: the writes-live-heap force shape cannot safely resume AT
+            // this opcode, but a top-level one-frame walk can resume PAST it
+            // through the existing blackhole when every live color has a
+            // concrete value.  Build here, before WalkContext's concrete banks
+            // disappear, and consume only in run_perfn_walk's VableEscaped
+            // epilogue.  Every condition is additive under an exact opt-in;
+            // failure leaves the pre-existing escape/replay path untouched.
+            let odometer_unchanged = heap_write_odometer_before
+                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() == before);
+            if single_frame_blackhole_resume_enabled()
+                && writes_live_heap
+                && odometer_unchanged
+                && committed_frame_escape_pc().is_none()
+                && !ctx.fbw_mode.inline_subwalk
+                && !ctx.trace_ctx.is_bridge_trace
+                && ctx.session.borrow().framestack.is_empty()
+                && let Some((resume_pc, result_bank, result_color)) = blackhole_result
+                && !ctx.fbw_mode.snapshot_sym.is_null()
+            {
+                let jitcode = unsafe {
+                    let sym = &*ctx.fbw_mode.snapshot_sym;
+                    (!sym.jitcode().is_null()).then(|| (&(*sym.jitcode()).payload).jitcode.clone())
+                };
+                if let Some(jitcode) = jitcode {
+                    let (lastop_result, last_exc_value, raising_exception) = match exec_result {
+                        Ok(value) => (
+                            (result_bank != 'v').then_some((result_bank, result_color, value)),
+                            0,
+                            false,
+                        ),
+                        Err(exc) => (None, exc, true),
+                    };
+                    if let Some(miframe) =
+                        build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
+                    {
+                        FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
+                            *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
+                                miframe,
+                                last_exc_value,
+                                raising_exception,
+                            });
+                        });
+                    }
+                }
             }
             // On a kept commit the undo stays armed: the abort epilogue
             // consumes it — discard on adoption, restore when the flush is
@@ -2529,6 +2675,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             call_descr,
             recorded,
             op.pc,
+            Some((op.next_pc, dst_bank, dst)),
         )?;
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
@@ -3323,6 +3470,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             call_descr,
             recorded,
             op.pc,
+            Some((op.next_pc, dst_bank, dst)),
         )?;
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
@@ -3543,6 +3691,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             call_descr,
             recorded,
             op.pc,
+            Some((op.next_pc, dst_bank, dst)),
         )?;
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
