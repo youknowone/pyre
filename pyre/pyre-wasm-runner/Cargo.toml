@@ -1,7 +1,7 @@
 [package]
 name = "pyre-wasm-runner"
-version.workspace = true
-edition.workspace = true
+version = "0.0.2"
+edition = "2024"
 publish = false
 description = "Native wasmtime host that runs the wasm32 build of pyre, satisfying the JIT host-import contract"
 
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # wasmtime vendors its own error type (`wasmtime::Error`) and re-exports a
 # `Context` trait, so the runner needs no separate `anyhow` dependency.
-wasmtime = { workspace = true }
+wasmtime = "45"
 # Disassemble a trace module to WAT when it fails to compile, gated by
 # PYRE_WASM_DUMP_BAD_TRACE — used to debug JIT codegen bugs. Pinned to the
 # version wasmtime already resolves in the lockfile.

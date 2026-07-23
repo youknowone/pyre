@@ -143,6 +143,15 @@ CARGO_CONFIG = {
 # wasm-bindgen).
 WASM_BUILD_OUTPUT = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm"
 WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm"
+# `pyre-wasm-runner` is excluded from the outer workspace (root `Cargo.toml`):
+# it path-depends on the nested `wasmi` fork (`wasmi/crates/wasmi`, majit-jit
+# tier) that lives outside the workspace and is absent in CI. So it is built
+# from its own manifest (`--manifest-path`, not `-p`) and only where that fork
+# is present. Both paths are anchored at the repo root (this file is
+# `pyre/check.py`).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+WASM_RUNNER_MANIFEST = _REPO_ROOT / "pyre" / "pyre-wasm-runner" / "Cargo.toml"
+WASM_RUNNER_FORK = _REPO_ROOT / "wasmi" / "crates" / "wasmi" / "Cargo.toml"
 # The JIT's trace-abort signal (InvalidLoop / speculative-fold failure) is
 # propagated as a `Result`/deferred flag through the optimizer rather than a
 # panic, so the build needs neither unwinding nor `-Z build-std`: it runs on the
@@ -613,10 +622,23 @@ def _wasm_target_installed():
     return proc.returncode == 0 and "wasm32-unknown-unknown" in proc.stdout.split()
 
 
-# wasm joins the defaults only where its target is installed, so a plain
-# `check.py` on an unconfigured machine still runs just the native backends.
+def _wasm_runner_fork_present():
+    """Whether the nested `wasmi` fork the runner path-depends on is present.
+
+    `pyre-wasm-runner` path-depends on the in-tree `wasmi` fork at
+    `wasmi/crates/wasmi` (majit-jit tier), which the root `Cargo.toml` excludes
+    from the outer workspace and which is absent in CI. Without it the runner
+    cannot be built, so the wasm backend stays out of the default set there.
+    """
+    return WASM_RUNNER_FORK.is_file()
+
+
+# wasm joins the defaults only where its wasm32 target is installed AND the
+# nested `wasmi` fork the runner needs is present, so a plain `check.py` on an
+# unconfigured machine — or CI, where the fork is absent — still runs just the
+# native backends.
 DEFAULT_BACKENDS = ("dynasm", "cranelift")
-if _wasm_target_installed():
+if _wasm_target_installed() and _wasm_runner_fork_present():
     DEFAULT_BACKENDS = (*DEFAULT_BACKENDS, "wasm")
 
 # ── Check runner ─────────────────────────────────────────────────────
@@ -924,12 +946,27 @@ class Check:
                     "RUSTFLAGS": WASM_RUSTFLAGS,
                 },
             ),
-            (
-                "pyre-wasm-runner (native wasmtime host)",
-                ["cargo", "build", "--release", "-p", "pyre-wasm-runner"],
-                None,
-            ),
         ]
+        # `pyre-wasm-runner` is excluded from the outer workspace, so it is built
+        # from its own manifest (`--manifest-path`, not `-p`), with the artifacts
+        # redirected into the shared `./target` so `default_binary("wasm")` finds
+        # the binary. It path-depends on the nested `wasmi` fork; when that fork
+        # is absent (CI) the runner cannot be built, so skip it with a note — the
+        # wasm backend is already kept out of the default set there.
+        if _wasm_runner_fork_present():
+            steps.append((
+                "pyre-wasm-runner (native wasmtime host)",
+                [
+                    "cargo", "build", "--release",
+                    "--manifest-path", str(WASM_RUNNER_MANIFEST),
+                ],
+                {**os.environ, "CARGO_TARGET_DIR": str(_REPO_ROOT / "target")},
+            ))
+        else:
+            print(
+                "Skipping pyre-wasm-runner build: nested `wasmi` fork absent at "
+                f"{WASM_RUNNER_FORK.parent} (excluded from the outer workspace)."
+            )
         for label, cmd, env in steps:
             print(f"Building {label}...")
             print("  $ " + " ".join(cmd))
