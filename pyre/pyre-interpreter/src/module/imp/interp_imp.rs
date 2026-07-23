@@ -210,5 +210,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "check_hash_based_pycs",
         pyre_object::w_str_new("default"),
     );
-    crate::module_ns_store(ns, "pyc_magic_number_token", pyre_object::w_int_new(3495));
+    // `MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')`
+    // (_bootstrap_external.py) — low half is the 3.14 magic 3627, high half
+    // the `\r\n` marker so the number breaks when read as text.  Cache
+    // files are already segregated by `sys.implementation.cache_tag`.
+    crate::module_ns_store(
+        ns,
+        "pyc_magic_number_token",
+        pyre_object::w_int_new(0x0A0D_0E2B),
+    );
 }
