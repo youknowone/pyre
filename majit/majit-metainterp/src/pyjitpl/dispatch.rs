@@ -3598,11 +3598,19 @@ where
                     jitcode::insns::BC_SETARRAYITEM_GC_F => self.read_float_reg(value_reg),
                     _ => self.read_int_reg(value_reg),
                 };
+                let descr_index = descr.index();
                 ctx.record_op_with_descr(
                     OpCode::SetarrayitemGc,
                     &[array_opref, index_opref, value_opref],
                     descr,
                 );
+                // execute_setarrayitem_gc (pyjitpl.py:2744): update the trace
+                // heap cache after the store so a later getarrayitem of the same
+                // (array, const index) reads the stored value, not a stale
+                // cached element.  Key on descr.index() (the canonical resolved
+                // descr index the getarrayitem read path uses), not the raw
+                // bytecode operand descr_idx.
+                ctx.heapcache_setarrayitem(array_opref, index_opref, descr_index, value_opref);
                 if array_addr != 0 {
                     let item_addr = (array_addr as usize)
                         .wrapping_add(base_size)
