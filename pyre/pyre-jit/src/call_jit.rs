@@ -625,6 +625,60 @@ pub(crate) fn drain_backend_jit_exc() {
     majit_backend_wasm::jit_exc_clear();
 }
 
+/// #73 measurement gate. When `PYRE_M73_LASTINSTR_AUDIT` is set, the three
+/// blackhole traceback sites compare the production inversion
+/// `python_pc_for_jitcode_pc_public(last_opcode_position)` (= `orgpc`, the
+/// raising op's python pc) against the forward candidate `frame.last_instr + 1`
+/// (the JIT-vable resume convention normalized to `orgpc`). Divergence means the
+/// forward datum is stale/off-by-one and cannot yet replace the inversion; a
+/// clean corpus (zero divergences) would mean the forward carry is already
+/// exact. Pure telemetry — never changes production output.
+fn m73_lastinstr_audit_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("PYRE_M73_LASTINSTR_AUDIT").is_some())
+}
+
+fn m73_lastinstr_audit(
+    site: &str,
+    jitcode_index: Option<i32>,
+    opcode_position: i32,
+    frame_ptr: *const PyFrame,
+) {
+    if !m73_lastinstr_audit_enabled() || frame_ptr.is_null() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static DIVERGE: AtomicU64 = AtomicU64::new(0);
+    static NONE: AtomicU64 = AtomicU64::new(0);
+    let inv = jitcode_index.and_then(|index| {
+        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(index, opcode_position)
+    });
+    let fwd = unsafe { (*frame_ptr).last_instr as i64 } + 1;
+    let hits = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if hits == 1 {
+        // Per-process heartbeat: confirms the site was exercised even when no
+        // divergence prints (each check.py test is a fresh process).
+        eprintln!("[M73-LASTINSTR] first-hit site={site}");
+    }
+    match inv {
+        Some(iv) => {
+            let iv = iv as i64;
+            if iv != fwd {
+                let d = DIVERGE.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[M73-LASTINSTR] diverge site={site} inv={iv} fwd={fwd} delta={} (proc hits={hits} diverge={d} none={})",
+                    iv - fwd,
+                    NONE.load(Ordering::Relaxed)
+                );
+            }
+        }
+        None => {
+            NONE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(crate) extern "C" fn record_caught_blackhole_traceback(
     exc_value: i64,
     frame_value: i64,
@@ -638,6 +692,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     let last_instruction =
         pyre_jit_trace::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position)
             .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    m73_lastinstr_audit("caught", Some(jitcode_index), opcode_position, frame_ptr);
     unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             exc_value as PyObjectRef,
@@ -2226,6 +2281,12 @@ pub fn blackhole_resume_via_rd_numb(
                                 )
                             })
                             .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+                        m73_lastinstr_audit(
+                            "exit_guard_exc",
+                            jitcode_index,
+                            last_opcode_position as i32,
+                            frame_ptr,
+                        );
                         unsafe {
                             pyre_interpreter::pytraceback::record_application_traceback(
                                 err.exc_object,
@@ -2366,6 +2427,12 @@ pub fn blackhole_resume_via_rd_numb(
                             )
                         })
                         .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+                    m73_lastinstr_audit(
+                        "exit_got_exc",
+                        jitcode_index,
+                        last_opcode_position as i32,
+                        frame_ptr,
+                    );
                     unsafe {
                         pyre_interpreter::pytraceback::record_application_traceback(
                             err.exc_object,
