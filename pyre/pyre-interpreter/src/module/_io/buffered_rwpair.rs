@@ -2,7 +2,7 @@
 
 use pyre_object::*;
 
-const DEFAULT_BUFFER_SIZE: i64 = 8192;
+use super::DEFAULT_BUFFER_SIZE;
 
 #[crate::pyre_class("_io.BufferedRWPair")]
 pub struct W_BufferedRWPair {

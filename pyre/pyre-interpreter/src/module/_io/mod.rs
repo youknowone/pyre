@@ -14,6 +14,10 @@ pub use buffered_writer::W_BufferedWriter;
 mod buffered_rwpair;
 pub use buffered_rwpair::W_BufferedRWPair;
 
+// CPython 3.14 raised the public and constructor default from 8 KiB to
+// 128 KiB.  Keep one module-owned value shared by every buffered type.
+pub(super) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
+
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
 // runtime semantic state must not be duplicated in TLS.
@@ -606,7 +610,7 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
         let data = call_method_result(
             pyre_object::gc_roots::shadow_stack_get(sp),
             "read",
-            &[w_int_new(8192)],
+            &[w_int_new(DEFAULT_BUFFER_SIZE)],
         )?;
         if unsafe { pyre_object::is_none(data) } {
             if output.is_empty() {
@@ -863,7 +867,7 @@ fn call_method_result(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> cra
 crate::py_module! {
     "_io",
     interpleveldefs: {
-        "DEFAULT_BUFFER_SIZE" => w_int_new(8192),
+        "DEFAULT_BUFFER_SIZE" => w_int_new(DEFAULT_BUFFER_SIZE),
     },
     // BytesIO / StringIO are the pure-Python in-memory streams: pickle's
     // Pickler/Unpickler use BytesIO; logging / traceback / csv use StringIO.

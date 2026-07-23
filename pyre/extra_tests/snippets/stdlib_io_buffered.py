@@ -1,5 +1,7 @@
 import io
 
+assert io.DEFAULT_BUFFER_SIZE == 128 * 1024
+
 
 class ChunkRaw(io.RawIOBase):
     def __init__(self, chunks):
@@ -39,6 +41,24 @@ class ChunkRaw(io.RawIOBase):
             self.chunks.insert(0, chunk[count:])
         self.position += count
         return count
+
+
+class SizingRaw(io.RawIOBase):
+    def __init__(self):
+        super().__init__()
+        self.request_size = None
+
+    def readable(self):
+        return True
+
+    def readinto(self, target):
+        self.request_size = len(target)
+        return 0
+
+
+raw = SizingRaw()
+assert io.BufferedReader(raw).read(1) == b""
+assert raw.request_size == io.DEFAULT_BUFFER_SIZE
 
 
 raw = ChunkRaw([b"abc", b"d", b"efg"])

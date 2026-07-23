@@ -2,7 +2,7 @@
 
 use pyre_object::*;
 
-const DEFAULT_BUFFER_SIZE: i64 = 8192;
+use super::DEFAULT_BUFFER_SIZE;
 const STATE_ZERO: i64 = 0;
 const STATE_OK: i64 = 1;
 const STATE_DETACHED: i64 = 2;
