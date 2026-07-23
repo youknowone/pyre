@@ -5974,17 +5974,6 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
-/// Multi-frame bridge drain (`PYRE_P2_DRAIN`, default ON; `=0` restores the
-/// framestack-walk bridge): routes a multi-frame carrier resume to the blackhole
-/// safety floor. The drain is now the default because the framestack-walk
-/// cross-frame bridge miscompiles a branchy inlined-callee continuation (a
-/// module-scope two-level inline with a mid-function branch), while the drain is
-/// net-positive on the full suite. The escape hatch keeps the framestack walk
-/// reachable pending the orthodox multi-frame reconstruction fix (#343).
-pub(crate) fn p2_drain_enabled() -> bool {
-    std::env::var_os("PYRE_P2_DRAIN").as_deref() != Some(std::ffi::OsStr::new("0"))
-}
-
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///

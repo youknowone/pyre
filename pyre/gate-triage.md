@@ -67,9 +67,10 @@ opt-in dead code.
 **Deferred, not retired** (active on other branches; touching them on pc-map
 would only manufacture conflicts):
 
-- **PYRE_P2_DRAIN** — sole live P2 gate left from the former P2 quintet.
-  It remains keep-WIP while epic #343 is open; the other four P2 gates retired
-  when the compile/framestack legs went production-default in PR#607 / PR#374.
+- **PYRE_P2_DRAIN** — RETIRED. The drain became the only bridge-carrier
+  consumer once it compiled N-deep carriers (recipes 1..=7); the buggy
+  framestack-walk escape hatch it gated was deleted. The remaining branchy
+  inlined-callee continuation gap stays with epic #343.
 
 **Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam
 of the vable-owner rework toward `direct_assembler_call` scalar args).
@@ -162,10 +163,10 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (2 remaining)** — triaged in §1b/§1c (4 retired
-  in the 2026-07-05 pass, 8 retired since then, 1 kept as a WIP parity port,
-  1 deferred to its owning epic):
-  `PYRE_FBW_VABLE_SCALAR_CA` (keep); `PYRE_P2_DRAIN` (epic #343).
+- **Default-OFF experiments (1 remaining)** — triaged in §1b/§1c (4 retired
+  in the 2026-07-05 pass, 8 retired since then, 1 kept as a WIP parity port;
+  `PYRE_P2_DRAIN` retired with the framestack-walk deletion):
+  `PYRE_FBW_VABLE_SCALAR_CA` (keep).
 - **Config / value / master switches (~18)** — tuning, paths, modes; keep:
   `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,

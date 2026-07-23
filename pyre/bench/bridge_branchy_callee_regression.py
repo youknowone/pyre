@@ -17,10 +17,11 @@
 # The gap: the straight compute chain inlines and runs compiled; the moment
 # compute() branches, the rare arm's guard failure compiles no bridge and every
 # crossing deopts to the blackhole (bridges_compiled=0, loops_aborted grows). The
-# framestack-walk path does compile the bridge but is correctness-buggy for this
-# shape and stays gated off behind PYRE_P2_DRAIN=0; the drain that replaced it is
-# a blackhole safety floor that does not compile. Closing the gap means
-# reconstructing the callee frame orthodoxly, not flipping that default.
+# multi-frame drain compiles straight value-returning inline chains (recipes
+# 1..=7) but not a branchy inlined-callee continuation, so the rare arm still
+# deopts. (The old framestack-walk path compiled this shape but miscompiled it,
+# and was retired.) Closing the gap means reconstructing the branchy callee frame
+# orthodoxly (#343).
 #
 # Structural JIT stats do NOT catch this class reliably: a declined green key can
 # read bridges_compiled>=1 with a low abort count yet still run ~200x slow,
