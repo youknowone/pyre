@@ -3463,19 +3463,23 @@ impl<M: Clone> MetaInterp<M> {
     /// as `self.jitdriver_sd` (pyjitpl.py:3291) for callers that need
     /// `virtualizable_info` and the related metadata together.
     ///
-    /// Prefers the trace-bound `active_jitdriver_sd` and validates it
-    /// carries `virtualizable_info`; otherwise scans for the first
-    /// registered slot with `virtualizable_info` populated. Returns
-    /// `None` when no driver carries `virtualizable_info` yet (the
-    /// caller should bail out — RPython would have early-returned
-    /// from the `vinfo is None` branch in `initialize_virtualizable`).
+    /// pyjitpl.py:3291 `vinfo = self.jitdriver_sd.virtualizable_info` — the
+    /// vinfo is STRICTLY that of the elected active driver. When a driver is
+    /// elected, use its own vinfo: `Some(idx)` if it carries one, else `None`
+    /// so `initialize_virtualizable` bails (RPython's `vinfo is None` early
+    /// return). A novable active driver (jd1 `unpackiterable_driver`,
+    /// `virtualizable_info=None`) must NOT borrow another driver's vinfo — that
+    /// would capture a phantom jd0-shaped vable section in its novable trace's
+    /// resume data. Only when no driver is elected yet (init-time / test
+    /// caller) fall back to scanning for the first vinfo-bearing slot.
     fn resolve_active_jitdriver_sd_with_vinfo(&self) -> Option<usize> {
         if let Some(idx) = self.active_jitdriver_sd {
-            if let Some(jd) = self.staticdata.jitdrivers_sd.get(idx) {
-                if jd.virtualizable_info.is_some() {
-                    return Some(idx);
-                }
-            }
+            return self
+                .staticdata
+                .jitdrivers_sd
+                .get(idx)
+                .filter(|jd| jd.virtualizable_info.is_some())
+                .map(|_| idx);
         }
         self.staticdata
             .jitdrivers_sd

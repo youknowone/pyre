@@ -5013,6 +5013,92 @@ fn drive_unpack_iterable_trace(
         };
         eprintln!("[jd1] force_start_tracing -> {name}");
     }
+    // A2 live-path enter (experimental, gated PYRE_JD1_ENTER): on RunCompiled,
+    // run the compiled drain loop with the shared `(w_iterator, items)` reds so
+    // it drains `items` in compiled code (residual `next`/`append` executed on
+    // the live path). `items` is a shared heap list, so the drain lands in
+    // place. A guard failure is resumed in the blackhole interpreter
+    // (compile.py:710-716) so the in-flight iteration completes instead of being
+    // dropped; `ContinueRunningNormally` re-enters the compiled loop, and the
+    // drain ends at the StopIteration guard exit. The interp `ln` loop then
+    // exits on its own next `next()` (StopIteration). Uses the values-based
+    // runner + the frameless `resume_in_blackhole_from_exit_layout` because jd1
+    // is novable with raw `(w_iterator, items)` reds, not a PyFrame the
+    // frame-projecting `execute_assembler`/`handle_fail` path expects.
+    if matches!(action, BackEdgeAction::RunCompiled) && std::env::var_os("PYRE_JD1_ENTER").is_some()
+    {
+        // Root the shared reds across the compiled run (it may collect).
+        // `items` is already pinned by `ln`; re-pinning is a harmless dup that
+        // pops with `ln`'s root scope. `w_iterator` is a bare `ln` local.
+        pyre_object::gc_roots::pin_root(w_iterator);
+        pyre_object::gc_roots::pin_root(items);
+        let before = unsafe { pyre_object::listobject::w_list_len(items) };
+        loop {
+            // Extract owned copies so the `&mut meta` borrow held by the
+            // `CompileResult` is released before the blackhole resume (which
+            // re-acquires `driver_pair()`).
+            let Some((is_finish, fail_index, has_storage, values, exit_layout, guard_exc)) = meta
+                .run_compiled_detailed_with_values(green_key, &live_values)
+                .map(|r| {
+                    (
+                        r.is_finish,
+                        r.fail_index,
+                        r.exit_layout.storage.is_some(),
+                        r.values.clone(),
+                        r.exit_layout.clone(),
+                        r.exception.exc_value,
+                    )
+                })
+            else {
+                // No compiled loop / backend refused — leave the rest to `ln`.
+                break;
+            };
+            if is_finish {
+                break;
+            }
+            // A normal back-edge JUMP (`fail_index == u32::MAX`) or a guard exit
+            // that carries no resume storage cannot be blackhole-resumed; hand
+            // the rest to `ln` rather than panic in the resume decoder.
+            if fail_index == u32::MAX || !has_storage {
+                break;
+            }
+            // compile.py:710-716 resume_in_blackhole: complete the in-flight
+            // `next()`/`append` and run forward to the next merge point.
+            let bh = resume_in_blackhole_from_exit_layout(&values, &exit_layout, guard_exc, true);
+            match bh {
+                // Merge point reached: re-enter the compiled drain.
+                crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => continue,
+                crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
+                    // StopIteration = drain complete; `ln` re-derives its own
+                    // loop-exit StopIteration on its next `next()`. A genuine
+                    // drain-time exception is left for `ln` to re-raise (the
+                    // exhaustion-stable iterators jd1 triggers on re-raise it).
+                    let _ = err;
+                    break;
+                }
+                crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
+                | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
+                | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
+                | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => break,
+                // Blackhole could not resume; leave the rest to `ln`.
+                crate::call_jit::BlackholeResult::Failed => break,
+            }
+        }
+        if dbg {
+            let after = unsafe { pyre_object::listobject::w_list_len(items) };
+            eprintln!(
+                "[jd1] enter: drained {} items ({}→{})",
+                after - before,
+                before,
+                after
+            );
+        }
+        // Discard any pending compiled-side StopIteration; `ln` re-derives its
+        // own loop exit.
+        let _ = pyre_interpreter::stack_check::drain_jit_pending_exception();
+        let _ = crate::call_jit::take_ca_exception();
+        return;
+    }
     if !matches!(action, BackEdgeAction::StartedTracing) {
         return;
     }
@@ -6939,6 +7025,10 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
+    // True when the failing guard belongs to a novable jitdriver (jd1
+    // `unpackiterable_driver`): its resume data has no vable section, so the
+    // decode must not consume one. jd0 guards pass `false`.
+    novable: bool,
 ) -> crate::call_jit::BlackholeResult {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -6975,6 +7065,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             Some(&storage.rd_virtuals),
             deadframe_types.as_deref(),
             guard_exc,
+            novable,
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -7247,8 +7338,12 @@ fn execute_assembler(
                 HandleFailOutcome::BridgeRaised(err) => Some(LoopResult::Done(Err(err))),
                 HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-                    let bh_result =
-                        resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
+                    let bh_result = resume_in_blackhole_from_exit_layout(
+                        raw_values,
+                        exit_layout,
+                        guard_exc,
+                        false,
+                    );
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -7570,8 +7665,12 @@ fn bound_reached(
                     return Some(LoopResult::Done(Err(err)));
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result =
-                        resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
+                    let bh_result = resume_in_blackhole_from_exit_layout(
+                        raw_values,
+                        exit_layout,
+                        guard_exc,
+                        false,
+                    );
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -7762,8 +7861,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     return Some(Err(err));
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result =
-                        resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
+                    let bh_result = resume_in_blackhole_from_exit_layout(
+                        raw_values,
+                        exit_layout,
+                        guard_exc,
+                        false,
+                    );
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
