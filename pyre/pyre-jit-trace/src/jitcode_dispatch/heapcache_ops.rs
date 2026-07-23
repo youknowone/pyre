@@ -38,6 +38,63 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
 
+    // `_opimpl_getarrayitem_gc_pure_any`: directly-constant array and
+    // index operands bypass the heapcache completely — execute the load
+    // now and substitute a `Const`, with no profiler counts (the bypass
+    // calls `executor.execute`, not `execute_and_record`).
+    let is_pure = matches!(
+        opcode,
+        OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemGcPureF
+    );
+    if is_pure && array.is_constant() && index.is_constant() {
+        let load_type = match opcode {
+            OpCode::GetarrayitemGcPureI => majit_ir::Type::Int,
+            OpCode::GetarrayitemGcPureR => majit_ir::Type::Ref,
+            _ => majit_ir::Type::Float,
+        };
+        if let (Some(majit_ir::Value::Ref(array_ref)), Some(majit_ir::Value::Int(index_value))) = (
+            ctx.trace_ctx.box_value(array),
+            ctx.trace_ctx.box_value(index),
+        ) {
+            let array_ptr = array_ref.0 as i64;
+            if array_ptr != 0 && array_ptr != usize::MAX as i64 {
+                let folded =
+                    match ctx
+                        .trace_ctx
+                        .array_sanity_load(array_ptr, index_value, &descr, load_type)
+                    {
+                        Some(majit_ir::Value::Int(n)) => Some(ctx.trace_ctx.const_int(n)),
+                        Some(majit_ir::Value::Ref(r)) => Some(ctx.trace_ctx.const_ref(r.0 as i64)),
+                        Some(majit_ir::Value::Float(f)) => {
+                            Some(ctx.trace_ctx.const_float(f.to_bits() as i64))
+                        }
+                        Some(majit_ir::Value::Void) | None => None,
+                    };
+                if let Some(folded) = folded {
+                    let dst = code[op.pc + 5] as usize;
+                    let concrete = concrete_from_recorded_opref(ctx, folded);
+                    match dst_bank {
+                        'i' => write_int_reg(ctx, op.pc, dst, folded, concrete)?,
+                        'r' => write_ref_reg(ctx, op.pc, dst, folded, concrete)?,
+                        _ => {
+                            let len = ctx.registers_f.len();
+                            let slot = ctx.registers_f.get_mut(dst).ok_or(
+                                DispatchError::RegisterOutOfRange {
+                                    pc: op.pc,
+                                    reg: dst,
+                                    len,
+                                    bank: "f",
+                                },
+                            )?;
+                            *slot = folded;
+                        }
+                    }
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+
     let result = if let Some(cached) =
         ctx.trace_ctx
             .heapcache_getarrayitem(array, index, descr_index)
@@ -511,12 +568,21 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         // struct pointer is known (Const, vable shadow, or stamped),
         // mirroring `pyjitpl.py resbox = execute_with_descr(...);
         // upd.getfield_now_known(resbox)`.
+        // The `_pure` jitcode spellings alias `opimpl_getfield_gc_*`
+        // upstream, so the profiler always sees the plain opnum even
+        // when the pure opcode is what gets recorded.
+        let profiled_opcode = match opcode {
+            OpCode::GetfieldGcPureI => OpCode::GetfieldGcI,
+            OpCode::GetfieldGcPureR => OpCode::GetfieldGcR,
+            OpCode::GetfieldGcPureF => OpCode::GetfieldGcF,
+            other => other,
+        };
         ctx.trace_ctx
             .profiler()
-            .count_ops(opcode, majit_metainterp::counters::OPS);
+            .count_ops(profiled_opcode, majit_metainterp::counters::OPS);
         ctx.trace_ctx
             .profiler()
-            .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+            .count_ops(profiled_opcode, majit_metainterp::counters::RECORDED_OPS);
         let resbox = ctx
             .trace_ctx
             .record_op_with_descr(opcode, &[obj], descr.clone());

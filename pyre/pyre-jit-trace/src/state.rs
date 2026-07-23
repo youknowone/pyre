@@ -3023,10 +3023,14 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     } else {
         OpCode::GetfieldGcI
     };
+    // The `_pure` spelling aliases this opimpl upstream, so the
+    // profiler always sees the plain GETFIELD_GC_I opnum.
     ctx.profiler()
-        .count_ops(opcode, majit_metainterp::counters::OPS);
-    ctx.profiler()
-        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+        .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetfieldGcI,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // `resbox` carries the loaded value; pair the recorded opref with
@@ -3125,10 +3129,14 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     } else {
         OpCode::GetfieldGcR
     };
+    // The `_pure` spelling aliases this opimpl upstream, so the
+    // profiler always sees the plain GETFIELD_GC_R opnum.
     ctx.profiler()
-        .count_ops(opcode, majit_metainterp::counters::OPS);
-    ctx.profiler()
-        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+        .count_ops(OpCode::GetfieldGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetfieldGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // Pair the recorded opref with the live ref so subsequent

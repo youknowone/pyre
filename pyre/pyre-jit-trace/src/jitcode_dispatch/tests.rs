@@ -10309,6 +10309,151 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
     assert_eq!(dst_post, last.pos.get());
 }
 
+/// Backend stub for the pure-getarrayitem bypass test: the required
+/// methods are unreachable; `bh_getarrayitem_gc_*` trait defaults read
+/// the real backing memory.
+struct PureArrayTestCpu;
+impl majit_backend::Backend for PureArrayTestCpu {
+    fn compile_loop(
+        &mut self,
+        _inputargs: &[majit_ir::InputArg],
+        _ops: &[majit_ir::OpRc],
+        _token: &majit_backend::JitCellToken,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("PureArrayTestCpu::compile_loop")
+    }
+    fn compile_bridge(
+        &mut self,
+        _fail_descr: &dyn majit_ir::FailDescr,
+        _inputargs: &[majit_ir::InputArg],
+        _ops: &[majit_ir::OpRc],
+        _original_token: &majit_backend::JitCellToken,
+        _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
+        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("PureArrayTestCpu::compile_bridge")
+    }
+    fn execute_token(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _args: &[majit_ir::Value],
+    ) -> majit_backend::DeadFrame {
+        unimplemented!("PureArrayTestCpu::execute_token")
+    }
+    fn get_latest_descr<'a>(
+        &'a self,
+        _frame: &'a majit_backend::DeadFrame,
+    ) -> &'a dyn majit_ir::FailDescr {
+        unimplemented!("PureArrayTestCpu::get_latest_descr")
+    }
+    fn get_latest_descr_arc(
+        &self,
+        _frame: &majit_backend::DeadFrame,
+    ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+        unimplemented!("PureArrayTestCpu::get_latest_descr_arc")
+    }
+    fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+        unimplemented!("PureArrayTestCpu::get_int_value")
+    }
+    fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+        unimplemented!("PureArrayTestCpu::get_float_value")
+    }
+    fn get_ref_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> majit_ir::GcRef {
+        unimplemented!("PureArrayTestCpu::get_ref_value")
+    }
+    fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+        unimplemented!("PureArrayTestCpu::invalidate_loop")
+    }
+}
+
+/// `_opimpl_getarrayitem_gc_pure_any`: directly-constant array and index
+/// operands bypass the heapcache — the load executes now, the result is
+/// a `Const`, nothing is recorded, and no profiler bucket counts (the
+/// bypass calls `executor.execute`, not `execute_and_record`).
+#[test]
+fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
+    let byte = *insns_opname_to_byte()
+        .get("getarrayitem_gc_i_pure/rid>i")
+        .expect("`getarrayitem_gc_i_pure/rid>i` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let cpu = PureArrayTestCpu;
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    // Fake GcArray block: length prefix at offset 0, items from
+    // base_size 8 → item[1] == 9.
+    let storage: Box<[usize; 3]> = Box::new([2, 7, 9]);
+    let ptr = storage.as_ref().as_ptr() as i64;
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    regs_i[3] = tc.const_int(1);
+    let descr = crate::descr::make_array_descr(8, 8, Some(0), majit_ir::Type::Int, true);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let ops_before = tc.num_ops();
+    let prof_before = tc.profiler().snapshot();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        done_with_this_frame_descr_ref: frame_done,
+        done_with_this_frame_descr_int: make_fail_descr(101),
+        done_with_this_frame_descr_float: make_fail_descr(102),
+        done_with_this_frame_descr_void: make_fail_descr(103),
+        exit_frame_with_exception_descr_ref: make_fail_descr(2),
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_i_pure must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    let dst_post = wc.registers_i[5];
+    drop(wc);
+    assert!(dst_post.is_constant(), "the bypass substitutes a Const");
+    assert_eq!(
+        dst_post.inline_const_to_value(),
+        Some(majit_ir::Value::Int(9)),
+        "item[1] of the backing array"
+    );
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the bypass records no ArrayitemGc op"
+    );
+    let prof_after = tc.profiler().snapshot();
+    assert_eq!(prof_after.ops, prof_before.ops);
+    assert_eq!(prof_after.recorded_ops, prof_before.recorded_ops);
+    assert_eq!(prof_after.heapcached_ops, prof_before.heapcached_ops);
+    drop(storage);
+}
+
 #[test]
 fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
     // Pre-cache (array, index, descr) →
