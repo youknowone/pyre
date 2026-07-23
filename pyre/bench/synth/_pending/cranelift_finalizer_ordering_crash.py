@@ -13,7 +13,8 @@
 `finalizer_children` was dereferencing an already-moved object.
 
 Root cause (confirmed by deterministic bisection): the generator resume paths
-skipped `generator.py` `send_ex`'s `finally: frame.f_backref = jit.vref_None`,
+skipped `generator.py` `_invoke_execute_frame`'s
+`finally: frame.f_backref = jit.vref_None`,
 so the exhausted genexp that `sorted(...)` below fully consumes kept its last
 resumer's dead frame reachable through the finalizer graph (the genexp carries
 a finalizer via its exception table).  A later minor collection that moved one
