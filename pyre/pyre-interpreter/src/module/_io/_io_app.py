@@ -384,6 +384,25 @@ class IncrementalNewlineDecoder:
     _CRLF = 4
 
     def __init__(self, decoder, translate, errors="strict"):
+        if errors is None:
+            errors = "strict"
+        elif not isinstance(errors, str):
+            raise TypeError(
+                "TextIOWrapper() argument 'errors' must be str or None, not %s"
+                % type(errors).__name__
+            )
+        else:
+            # io_check_errors minus the dev-mode handler lookup — a codecs
+            # import here would recurse through decode_source.
+            errors.encode("utf-8", "strict")
+        if not isinstance(translate, int):
+            try:
+                translate = translate.__index__()
+            except AttributeError:
+                raise TypeError(
+                    "'%s' object cannot be interpreted as an integer"
+                    % type(translate).__name__
+                ) from None
         self.errors = errors
         self.translate = translate
         self.decoder = decoder
@@ -395,7 +414,9 @@ class IncrementalNewlineDecoder:
         if self.decoder is None:
             output = input
         else:
-            output = self.decoder.decode(input, final=final)
+            output = self.decoder.decode(input, final)
+        if not isinstance(output, str):
+            raise TypeError("decoder should return a string result")
         if self.pendingcr and (output or final):
             output = "\r" + output
             self.pendingcr = False

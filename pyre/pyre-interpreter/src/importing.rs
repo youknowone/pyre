@@ -1086,7 +1086,9 @@ fn fix_up_source_module_spec(
     };
     let fix_slot = shadow_stack_len();
     pin_root(fix);
-    if crate::call::call_function_impl_result(
+    // An error raised by `_fix_up_module` itself propagates — the appexec
+    // at importing.py:293-298 does not shield the call.
+    crate::call::call_function_impl_result(
         shadow_stack_get(fix_slot),
         &[
             shadow_stack_get(ns_slot),
@@ -1094,11 +1096,7 @@ fn fix_up_source_module_spec(
             shadow_stack_get(path_slot),
             shadow_stack_get(cpath_slot),
         ],
-    )
-    .is_err()
-    {
-        return Ok(false);
-    }
+    )?;
     Ok(true)
 }
 
@@ -1165,22 +1163,25 @@ pub fn init_sys_path(script_dir: &Path) {
             }
         }
         // PYTHONPATH entries follow the script/cwd seed and precede the
-        // lazily-detected stdlib (pathconfig.c). Honoured regardless of the
-        // safe-path flag, which only suppresses the script/cwd seed. The
-        // sandbox interpreter takes its search path from the controller, so it
-        // does not read the host environment here.
+        // stdlib (pathconfig.c), split on the platform path-list separator.
+        // Honoured regardless of the safe-path flag, which only suppresses the
+        // script/cwd seed, but skipped under `-E` / `-I` (ignore_environment),
+        // which ignore every `PYTHON*` variable. The sandbox interpreter takes
+        // its search path from the controller, so it does not read the host
+        // environment here.
         #[cfg(not(feature = "sandbox"))]
-        if let Ok(pythonpath) = host_os::var("PYTHONPATH") {
-            for entry in pythonpath.split(':').filter(|e| !e.is_empty()) {
-                let pb = PathBuf::from(entry);
-                if !path.contains(&pb) {
-                    path.push(pb);
-                }
+        if !ignore_environment_flag() {
+            if let Ok(pythonpath) = host_os::var("PYTHONPATH") {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                // Empty components are preserved — an empty `sys.path` entry
+                // denotes the current directory (app_main.setup_and_fix_paths
+                // extends with the raw split).
+                path.extend(pythonpath.split(sep).map(PathBuf::from));
             }
         }
-        // The stdlib path is detected lazily on first stdlib import to avoid
-        // spawning a python3 subprocess on every startup.
-        // See find_module() → ensure_stdlib_path().
+        // The stdlib entry is appended when the `sys` module is created —
+        // `create_sys_path_list` forces `ensure_stdlib_path` before flushing
+        // this seed into `sys.path`.
     });
 }
 
@@ -1795,8 +1796,7 @@ fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
             // at startup. Until the `nt` registration lands, a live-list miss
             // falls back to the native seed so the stdlib stays importable.
             #[cfg(windows)]
-            let found =
-                found.or_else(|| SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())));
+            let found = found.or_else(|| SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())));
             found
         }
         None => SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())),
