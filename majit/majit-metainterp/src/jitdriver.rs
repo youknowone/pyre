@@ -6480,8 +6480,14 @@ mod tests {
         let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
         drop(failure);
 
-        let started =
-            driver.start_bridge_tracing(&descr_arc, &mut NonTraceableState, &(), &fail_values, 0);
+        let started = driver.start_bridge_tracing(
+            &descr_arc,
+            &mut NonTraceableState,
+            &(),
+            &fail_values,
+            0,
+            0,
+        );
         assert!(!started);
         assert!(!driver.meta.is_tracing());
     }
