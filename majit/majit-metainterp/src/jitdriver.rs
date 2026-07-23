@@ -2582,11 +2582,11 @@ impl<S: JitState> JitDriver<S> {
                         let current_ops = ctx.num_ops();
                         current_ops == start_ops
                             || (current_ops == start_ops + 1
-                                && ctx.ops().get(start_ops).is_some_and(|op| {
-                                    op.opcode == majit_ir::OpCode::GetfieldRawI
-                                }))
-                    })
-                {
+                                && ctx
+                                    .ops()
+                                    .get(start_ops)
+                                    .is_some_and(|op| op.opcode == majit_ir::OpCode::GetfieldRawI))
+                    }) {
                     self.meta
                         .bridge_info_cloned()
                         .map(|bridge| bridge.source_descr)

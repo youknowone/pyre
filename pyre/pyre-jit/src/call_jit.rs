@@ -2906,7 +2906,9 @@ pub fn trace_and_compile_from_bridge(
             .as_deref()
             .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
         if last_bridge_is_exception_guard || has_pending_fields {
-            driver.meta_interp_mut().record_declined_bridge_guard(descr_arc);
+            driver
+                .meta_interp_mut()
+                .record_declined_bridge_guard(descr_arc);
         }
         return BridgeResolution::ResumeBlackhole;
     }

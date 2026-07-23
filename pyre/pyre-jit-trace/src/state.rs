@@ -6459,8 +6459,7 @@ fn prepare_bridge_pending_fields(
         let Some(descr) = pending.descr.as_ref() else {
             continue;
         };
-        let is_exc_channel =
-            pending.item_index < 0 && std::sync::Arc::ptr_eq(descr, &target_descr);
+        let is_exc_channel = pending.item_index < 0 && std::sync::Arc::ptr_eq(descr, &target_descr);
 
         // resume.py:1002-1005: both operands use the same tagged decoder as
         // frame boxes.  Decode the target as well as the fieldbox so virtual
