@@ -529,7 +529,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_type_issubtype",
         w_type_issubtype as *const (),
     );
-    // `lookup_exc_class_for_kind` reads the TLS `EXC_CLASS_BY_KIND`
+    // `lookup_exc_class_for_kind` reads the process-global `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
     push_alias_pair(

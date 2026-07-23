@@ -614,13 +614,13 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
 /// PyPy's equivalent is the `space.w_TypeError` / `space.w_ValueError`
 /// / ... attributes on `ObjSpace`.
 ///
-/// Stored as `thread_local!` because pyre's `W_TypeObject` identities
-/// are also per-thread (each cargo test thread re-runs
-/// `init_typeobjects` and gets its own `W_TypeObject` pointers via
-/// `TYPEOBJECT_CACHE`). A global `AtomicPtr` cache on
-/// `PyType.instantiate` would let one test thread's write race ahead
-/// of another's, causing `exception_match` on thread A to compare
-/// against thread B's W_TypeObject identity — they'd never match.
+/// The builtin `W_TypeObject` identities and this registry are process-global.
+/// A class installed by one execution-context thread must therefore be the
+/// same class used to stamp and match exceptions on every other thread.
+/// Registration is first-writer-wins so rebuilding a builtins dictionary
+/// cannot replace a canonical class. The pointer is stored as `usize` because
+/// `PyObjectRef` itself is neither `Send` nor `Sync`; builtin type objects are
+/// immortal and process-global.
 /// One slot per `ExcKind` variant.  Indexed by `kind as u8 as usize`,
 /// so `EXC_KIND_COUNT - 1` is the largest valid index.  Public so
 /// downstream crates (e.g. pyre-jit's GC init) can size per-kind
@@ -629,33 +629,41 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
 /// enum extends the bound automatically.
 pub const EXC_KIND_COUNT: usize = (ExcKind::StopAsyncIteration as u8 as usize) + 1;
 
-thread_local! {
-    static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
-        const { std::cell::Cell::new([PY_NULL; EXC_KIND_COUNT]) };
+static EXC_CLASS_BY_KIND: [std::sync::atomic::AtomicUsize; EXC_KIND_COUNT] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; EXC_KIND_COUNT];
+
+/// Register `cls` for `kind` if the process-global slot is empty and return
+/// the canonical class selected by the first writer.
+pub fn register_exc_class_for_kind(kind: ExcKind, cls: PyObjectRef) -> PyObjectRef {
+    let slot = &EXC_CLASS_BY_KIND[kind as u8 as usize];
+    match slot.compare_exchange(
+        0,
+        cls as usize,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => cls,
+        Err(canonical) => canonical as PyObjectRef,
+    }
 }
 
-pub fn register_exc_class_for_kind(kind: ExcKind, cls: PyObjectRef) {
-    EXC_CLASS_BY_KIND.with(|cell| {
-        let mut table = cell.get();
-        table[kind as u8 as usize] = cls;
-        cell.set(table);
-    });
-}
-
-/// Reads the thread-local `EXC_CLASS_BY_KIND`, a runtime-mutable root
-/// the tracer cannot type; the JIT residualises the read instead of
-/// tracing into it (`@dont_look_inside`, `rlib/jit.py:139`). The residual
-/// call resolves its address by qualified path in `jit_trace_fnaddrs`.
+/// Reads the process-global `EXC_CLASS_BY_KIND`, a runtime-mutable root the
+/// tracer cannot type; the JIT residualises the read instead of tracing into
+/// it (`@dont_look_inside`, `rlib/jit.py:139`). The residual call resolves its
+/// address by qualified path in `jit_trace_fnaddrs`.
 #[majit_macros::dont_look_inside]
 pub fn lookup_exc_class_for_kind(kind: ExcKind) -> PyObjectRef {
-    EXC_CLASS_BY_KIND.with(|cell| cell.get()[kind as u8 as usize])
+    EXC_CLASS_BY_KIND[kind as u8 as usize].load(std::sync::atomic::Ordering::Acquire) as PyObjectRef
 }
 
-/// True when `cls` is one of the canonical per-kind builtin exception
+/// True when `cls` is one of the canonical process-global builtin exception
 /// classes registered via `register_exc_class_for_kind` — i.e. its
 /// constructor is the Rust `descr_init` (no Python `__init__`).
 pub fn is_canonical_exc_class(cls: PyObjectRef) -> bool {
-    !cls.is_null() && EXC_CLASS_BY_KIND.with(|cell| cell.get().contains(&cls))
+    !cls.is_null()
+        && EXC_CLASS_BY_KIND
+            .iter()
+            .any(|slot| slot.load(std::sync::atomic::Ordering::Acquire) == cls as usize)
 }
 
 /// `interp_exceptions.py:153 W_BaseException.descr_getargs` parity —

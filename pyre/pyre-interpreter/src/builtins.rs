@@ -5353,6 +5353,9 @@ fn make_exc_type_with_init(
     init_fn: Option<crate::gateway::BuiltinCodeFn>,
     base: PyObjectRef,
 ) -> PyObjectRef {
+    if let Some(cls) = lookup_exc_class(name) {
+        return cls;
+    }
     let cls = crate::typedef::make_builtin_type_with_base(
         name,
         move |ns| {
@@ -5554,8 +5557,7 @@ fn make_exc_type_with_init(
     );
     // Record the class so typedef::r#type can map a raised exception
     // back to its specific builtin class (TypeError, ValueError, ...).
-    register_exc_class(name, cls);
-    cls
+    register_exc_class(name, cls)
 }
 
 /// Build a builtin exception class with more than one base, e.g.
@@ -5569,6 +5571,9 @@ pub(crate) fn make_exc_type_multi(
     new_fn: crate::gateway::BuiltinCodeFn,
     bases: &[PyObjectRef],
 ) -> PyObjectRef {
+    if let Some(cls) = lookup_exc_class(name) {
+        return cls;
+    }
     let cls = crate::typedef::make_builtin_type_with_bases(
         name,
         move |ns| {
@@ -5582,8 +5587,7 @@ pub(crate) fn make_exc_type_multi(
         },
         bases,
     );
-    register_exc_class(name, cls);
-    cls
+    register_exc_class(name, cls)
 }
 
 const EG_MESSAGE_KEY: &str = "__pyre_exception_group_message";
@@ -6071,6 +6075,9 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObjectRef {
+    if let Some(cls) = lookup_exc_class(name) {
+        return cls;
+    }
     let cls = crate::typedef::make_builtin_type_with_bases(
         name,
         move |ns| {
@@ -6130,13 +6137,14 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
         },
         bases,
     );
-    register_exc_class(name, cls);
-    cls
+    register_exc_class(name, cls)
 }
 
-/// Thread-local registry from exception class name (as used by
+/// Process-global registry from exception class name (as used by
 /// `ExcKind → exc_kind_name`) to the W_TypeObject exposed in the builtins
-/// namespace. Populated at init-builtins time via `make_exc_type`.
+/// namespace. Populated at init-builtins time via `make_exc_type`. Entries are
+/// first-writer-wins so every execution context installs the same canonical
+/// class hierarchy in its builtins dictionary.
 ///
 /// Also propagates into `pyre_object::interp_exceptions`'s kind-indexed
 /// registry so `w_exception_new(kind, ...)` populates
@@ -6144,20 +6152,29 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
 /// builtin-raised exception then satisfies
 /// `space.type(w_exc) == registered class` per `baseobjspace.py
 /// exception_getclass`.
-fn register_exc_class(name: &'static str, cls: PyObjectRef) {
-    EXC_CLASS_REGISTRY.with(|r| {
-        r.borrow_mut().insert(name, cls);
-    });
+fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
+    let registry =
+        EXC_CLASS_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let canonical = *registry.entry(name).or_insert(cls as usize) as PyObjectRef;
     if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(name) {
-        pyre_object::interp_exceptions::register_exc_class_for_kind(kind, cls);
+        let by_kind = pyre_object::interp_exceptions::register_exc_class_for_kind(kind, canonical);
+        debug_assert_eq!(by_kind, canonical);
     }
+    canonical
 }
 
 /// Look up a builtin exception class by its `ExcKind` name. Returns
 /// `None` if the registry hasn't been populated yet (e.g. before
 /// install_default_builtins).
 pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
-    EXC_CLASS_REGISTRY.with(|r| r.borrow().get(name).copied())
+    let registry = EXC_CLASS_REGISTRY.get()?;
+    let registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.get(name).copied().map(|cls| cls as PyObjectRef)
 }
 
 /// Look up the reusable prebuilt instance for a builtin exception
@@ -6178,10 +6195,9 @@ pub fn lookup_exc_instance(name: &str) -> Option<PyObjectRef> {
     Some(pyre_object::interp_exceptions::standard_exc_instance(kind))
 }
 
-thread_local! {
-    static EXC_CLASS_REGISTRY: std::cell::RefCell<std::collections::HashMap<&'static str, PyObjectRef>>
-        = std::cell::RefCell::new(std::collections::HashMap::new());
-}
+static EXC_CLASS_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
+> = std::sync::OnceLock::new();
 
 /// `__build_class__(body, name, *bases)` — class creation.
 ///

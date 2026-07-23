@@ -941,12 +941,13 @@ pub(crate) fn create_builtin_module(
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     // `import builtins` must resolve to `space.builtin`, the one Module every
-    // frame uses for its LOAD_GLOBAL fallback. A fresh `load_builtin_module`
-    // would rerun `install_default_builtins`, minting a second exception
-    // hierarchy and overwriting the name→class registry, so a caught
-    // `except KeyError` would then compare against the wrong `BaseException`.
-    // `load_part` routes the name this way; the `_imp.create_builtin` entry
-    // point must too.
+    // frame uses for its LOAD_GLOBAL fallback. Historically a fresh
+    // `load_builtin_module` reran `install_default_builtins`, minted a second
+    // exception hierarchy, and overwrote the name→class registry. The
+    // process-global get-or-mint registry now prevents that identity
+    // clobbering even on another fresh-dictionary path, while this guard still
+    // preserves the builtins Module identity. `load_part` routes the name this
+    // way; the `_imp.create_builtin` entry point must too.
     if name == "builtins" && !execution_context.is_null() {
         let module = unsafe { (*execution_context).get_builtin() };
         set_sys_module(name, module);
