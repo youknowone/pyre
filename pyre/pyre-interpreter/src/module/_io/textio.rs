@@ -380,6 +380,16 @@ impl W_TextIOWrapper {
         Ok(value)
     }
 
+    /// `encoding="locale"` selects the current locale's encoding; the sandbox
+    /// and default environment resolve that to UTF-8.
+    fn resolve_locale_encoding(encoding: String) -> String {
+        if encoding == "locale" {
+            "utf-8".to_string()
+        } else {
+            encoding
+        }
+    }
+
     /// PyPy `_io.interp_iobase.unwrap_newline`.
     fn unwrap_newline(newline: PyObjectRef) -> Result<Option<String>, crate::PyError> {
         unsafe {
@@ -802,7 +812,8 @@ impl W_TextIOWrapper {
         self.w_buffer = PY_NULL;
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
 
-        let encoding = Self::checked_text0(encoding, "utf-8", "encoding")?;
+        let encoding =
+            Self::resolve_locale_encoding(Self::checked_text0(encoding, "utf-8", "encoding")?);
         let errors = Self::checked_text0(errors, "strict", "errors")?;
         let newline_value = Self::unwrap_newline(newline)?;
         let codec = Self::lookup_text_codec(&encoding)?;
@@ -1346,12 +1357,7 @@ impl W_TextIOWrapper {
             None
         } else {
             let value = Self::checked_text(encoding, "", "encoding")?;
-            let value = if value == "locale" {
-                "utf-8".to_string()
-            } else {
-                value
-            };
-            Some(value)
+            Some(Self::resolve_locale_encoding(value))
         };
         let new_errors = if unsafe { pyre_object::is_none(errors) } {
             None

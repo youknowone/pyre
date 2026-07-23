@@ -177,7 +177,7 @@ impl W_BufferedWriter {
         if unsafe { pyre_object::is_none(result) } {
             return Err(make_write_blocking_error(0));
         }
-        let written = crate::baseobjspace::int_w(result)?;
+        let written = crate::builtins::space_index_w(result)?;
         if written < 0 || written as usize > data.len() {
             return Err(crate::PyError::os_error(
                 "raw write() returned invalid length",
@@ -405,7 +405,8 @@ impl W_BufferedWriter {
 
     fn readable(&self) -> Result<PyObjectRef, crate::PyError> {
         self.check_init()?;
-        super::call_method_result(self.w_raw, "readable", &[])
+        // A writer never reports readable, even over a bidirectional raw.
+        Ok(pyre_object::w_bool_from(false))
     }
 
     fn writable(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -445,6 +446,10 @@ impl W_BufferedWriter {
             return Err(crate::PyError::value_error(format!(
                 "whence must be between 0 and 2, not {whence}"
             )));
+        }
+        let seekable = super::call_method_result(self.w_raw, "seekable", &[])?;
+        if !crate::baseobjspace::is_true(seekable)? {
+            return Err(super::unsupported("File or stream is not seekable."));
         }
         self.with_lock(|this| {
             this.writer_flush_unlocked()?;

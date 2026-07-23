@@ -263,7 +263,8 @@ impl W_Random {
             let r = self.rnd.genrand32() >> (32 - k);
             return Ok(w_int_new(r as i64));
         }
-        let nbytes = (((k - 1) / 32 + 1) * 4) as usize;
+        let nbytes = usize::try_from(((k - 1) / 32 + 1) * 4)
+            .map_err(|_| crate::PyError::memory_error(""))?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(nbytes)

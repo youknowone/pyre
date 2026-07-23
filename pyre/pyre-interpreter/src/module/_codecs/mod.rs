@@ -785,6 +785,18 @@ fn decode_with_name(
     Ok(w_tuple_new(vec![decoded, w_int_new(consumed as i64)]))
 }
 
+/// Acquire the read-only bytes of a decoder input, reporting a decode-context
+/// TypeError (rather than the file-write helper's own wording) when the object
+/// is not a bytes-like buffer.
+fn decode_input_bytes(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    unsafe { crate::builtins::file_write_buffer_bytes(w_obj) }.map_err(|_| {
+        crate::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            crate::type_methods::arg_type_name(w_obj)
+        ))
+    })
+}
+
 /// PyPy `interp_codecs.utf_{16,32}_ex_decode`: the three-value entry point
 /// used by the stdlib incremental decoders.  Unlike `bytes.decode`, this must
 /// leave an incomplete code unit unconsumed while `final` is false.
@@ -802,7 +814,7 @@ fn utf16_32_ex_decode_impl(
     } else {
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
-    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_obj)? };
+    let data = decode_input_bytes(w_obj)?;
     let fixed_be = match byteorder {
         0 => None,
         -1 => Some(false),
@@ -842,7 +854,7 @@ fn utf16_32_decode_impl(
     } else {
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
-    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_obj)? };
+    let data = decode_input_bytes(w_obj)?;
     let (decoded, consumed, _) = crate::type_methods::decode_utf16_32_helper(
         &data,
         is32,
@@ -872,7 +884,7 @@ fn utf8_decode_impl(
     } else {
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
-    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_obj)? };
+    let data = decode_input_bytes(w_obj)?;
     let (decoded, consumed) = crate::typedef::decode_utf8_with_errors_incremental(
         &data,
         errors,

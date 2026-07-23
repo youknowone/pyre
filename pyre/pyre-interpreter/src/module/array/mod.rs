@@ -460,9 +460,12 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
             len as i64,
         )?;
         let n = slice_length(start, stop, step);
-        if n != 0 {
-            array_check_resize(obj)?;
+        if n == 0 {
+            // No elements removed: leave the backing storage (and any exported
+            // views over it) untouched rather than rebuilding the buffer.
+            return Ok(pyre_object::w_none());
         }
+        array_check_resize(obj)?;
         // Collect element indices to drop, then rebuild the buffer.
         let mut drop_set: Vec<usize> = Vec::with_capacity(n as usize);
         let mut i = start;

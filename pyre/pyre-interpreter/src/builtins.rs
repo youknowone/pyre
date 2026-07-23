@@ -11260,7 +11260,10 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let mode = unsafe { pyre_object::w_str_get_value(w_mode).to_string() };
     let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
         .unwrap_or_else(|| w_int_new(-1));
-    let mut buffering = crate::baseobjspace::index_int_w_preserve_negative(w_buffering)?;
+    // A buffering value outside the machine-int range is an OverflowError, not a
+    // silent fallback to default buffering, so index through `space_index_w`
+    // rather than the negative-preserving sentinel converter.
+    let mut buffering = crate::builtins::space_index_w(w_buffering)?;
     let w_encoding =
         bind_pos_or_kw(positional, kwargs, 3, "encoding", "open", 4)?.unwrap_or_else(w_none);
     let w_errors =

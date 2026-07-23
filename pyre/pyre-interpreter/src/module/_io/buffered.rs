@@ -278,8 +278,11 @@ impl W_BufferedReader {
                 }
                 break;
             }
-            if !unsafe { pyre_object::bytesobject::is_bytes_like(data) } {
-                return Err(crate::PyError::type_error("read() should return bytes"));
+            if !unsafe { pyre_object::bytesobject::is_bytes(data) } {
+                return Err(crate::PyError::type_error(format!(
+                    "expected bytes, got {} object",
+                    crate::type_methods::arg_type_name(data)
+                )));
             }
             let chunk = unsafe { pyre_object::bytesobject::bytes_like_data(data) };
             if chunk.is_empty() {
