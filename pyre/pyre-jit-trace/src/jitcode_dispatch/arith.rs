@@ -12,6 +12,24 @@
 
 use super::*;
 
+/// `execute_and_record` profiler entry — `profiler.count_ops(opnum)` fires
+/// before the `_all_constants` fold check, so a folded op still lands in the
+/// base `OPS` bucket.  The `b1 is b2` fast paths return from the opimpl
+/// before `self.execute` runs and count nothing.
+fn count_ops_executed<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, opcode: OpCode) {
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(opcode, majit_metainterp::counters::OPS);
+}
+
+/// `_record_helper` profiler half — `count_ops(opnum, Counters.RECORDED_OPS)`
+/// fires exactly when the op is recorded.
+fn count_ops_recorded<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, opcode: OpCode) {
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+}
+
 /// Generic int-bank binop handler. Reads `registers_i[src1]` and
 /// `registers_i[src2]`, records `record_op(opcode, [a, b])`, writes
 /// the recorder's result OpRef into `registers_i[dst]`. Operand
@@ -44,6 +62,7 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
+    count_ops_executed(ctx, opcode);
     // All-`Const` operands fold to a result constant without recording —
     // `execute_and_record` short-circuits `_record_helper` via
     // `executor.wrap_constant(resvalue)` when `_all_constants(*argboxes)`
@@ -57,6 +76,7 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
         write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
@@ -111,6 +131,7 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
         });
         return ctx.trace_ctx.const_int(folded);
     }
+    count_ops_executed(ctx, opcode);
     if let (Some(Value::Int(la)), Some(Value::Int(rb))) =
         (a.inline_const_to_value(), b.inline_const_to_value())
     {
@@ -118,6 +139,7 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
             .trace_ctx
             .const_int(majit_metainterp::eval_binop_i(opcode, la, rb));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -137,11 +159,13 @@ pub(crate) fn record_int_unary<Sym: WalkSym>(
     opcode: OpCode,
     a: OpRef,
 ) -> OpRef {
+    count_ops_executed(ctx, opcode);
     if let Some(Value::Int(la)) = a.inline_const_to_value() {
         return ctx
             .trace_ctx
             .const_int(majit_metainterp::eval_unary_i(opcode, la));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     if let Some(majit_ir::Value::Int(la)) = ctx.trace_ctx.box_value(a) {
         let folded = majit_metainterp::eval_unary_i(opcode, la);
@@ -181,9 +205,11 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
         OpCode::IntMulOvf => (v1.wrapping_mul(v2), v1.checked_mul(v2).is_none()),
         _ => unreachable!("record_int_ovf requires an IntAddOvf/IntSubOvf/IntMulOvf opcode"),
     };
+    count_ops_executed(ctx, opcode);
     if b1.is_constant() && b2.is_constant() {
         return Ok((ctx.trace_ctx.const_int(wrapping_result), overflow));
     }
+    count_ops_recorded(ctx, opcode);
     let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
     ctx.trace_ctx
         .set_opref_concrete(resbox, Value::Int(wrapping_result));
@@ -275,6 +301,7 @@ pub(crate) fn execute_pure_binop_i<Sym: WalkSym>(
     a: OpRef,
     b: OpRef,
 ) -> OpRef {
+    count_ops_executed(ctx, opcode);
     if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
         (a.inline_const_to_value(), b.inline_const_to_value())
     {
@@ -282,6 +309,7 @@ pub(crate) fn execute_pure_binop_i<Sym: WalkSym>(
         return ctx.trace_ctx.const_int(folded);
     }
 
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Int(va)), Some(majit_ir::Value::Int(vb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -309,8 +337,10 @@ pub(crate) fn unop_int_record<Sym: WalkSym>(
     // A `Const` operand folds without recording (`execute_and_record`'s
     // `_all_constants` short-circuit) — except `int_same_as`, whose
     // `opimpl_int_same_as` calls `_record_helper` unconditionally to
-    // force the result into a Box.
+    // force the result into a Box (bypassing `execute_and_record`, so it
+    // skips the base `OPS` count too).
     if opcode != OpCode::SameAsI {
+        count_ops_executed(ctx, opcode);
         if let Some(majit_ir::Value::Int(n)) = a.inline_const_to_value() {
             let folded = majit_metainterp::eval_unary_i(opcode, n);
             let result = ctx.trace_ctx.const_int(folded);
@@ -319,6 +349,7 @@ pub(crate) fn unop_int_record<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     // Box(value) parity: stamp the unary result from the operand's
     // Box.value carrier (matches dispatch.rs trace_unary_i).  The
@@ -364,6 +395,7 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
         write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    count_ops_executed(ctx, opcode);
     // Distinct all-`Const` ref operands fold to a result constant without
     // recording — `execute_and_record` const-folds any pure op whose operands
     // are all `Const`, and the sibling `record_ptr_cmp` already does this. Two
@@ -382,6 +414,7 @@ pub(crate) fn binop_ref_to_int_record<Sym: WalkSym>(
         write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Stamp the bool result from the operands' concrete carriers: the
     // `box_value` carrier first, then the `concrete_registers_r` shadow. The
@@ -434,6 +467,7 @@ pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
             .unwrap_or_else(|| unreachable!("record_ptr_cmp requires PtrEq or PtrNe"));
         return ctx.trace_ctx.const_int(folded);
     }
+    count_ops_executed(ctx, opcode);
     if let (Some(Value::Ref(la)), Some(Value::Ref(rb))) =
         (a.inline_const_to_value(), b.inline_const_to_value())
     {
@@ -443,6 +477,7 @@ pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
             _ => unreachable!("record_ptr_cmp requires PtrEq or PtrNe"),
         });
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     let folded = if let (Some(majit_ir::Value::Ref(la)), Some(majit_ir::Value::Ref(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -497,6 +532,12 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
     nonzero: bool,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let box_ = read_ref_reg(code, op, 0, ctx)?;
+    let opcode = if nonzero {
+        OpCode::PtrNe
+    } else {
+        OpCode::PtrEq
+    };
+    count_ops_executed(ctx, opcode);
     // A `Const` box folds without recording: `CONST_NULL` is a `Const`, so
     // `_all_constants` holds and `execute_and_record` answers the nullity
     // from the constant's own address.
@@ -508,11 +549,7 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     let null_const = ctx.trace_ctx.const_null();
-    let opcode = if nonzero {
-        OpCode::PtrNe
-    } else {
-        OpCode::PtrEq
-    };
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[box_, null_const]);
     // Concrete stamp: prefer the box's own value carrier (constant pool /
     // standard-virtualizable shadow / `set_opref_concrete` stamp).  When the
@@ -658,6 +695,7 @@ pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
     let b = read_float_reg(code, op, 1, ctx)?;
+    count_ops_executed(ctx, opcode);
     // All-`Const` operands fold without recording (`execute_and_record`'s
     // `_all_constants` short-circuit; FLOAT_LT..FLOAT_GE are ALWAYS_PURE).
     // No `a == b` fast path: float compares are not `FASTPATHS_SAME_BOXES`
@@ -672,6 +710,7 @@ pub(crate) fn binop_float_to_int_record<Sym: WalkSym>(
         write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (matches dispatch.rs GOTO_IF_NOT_FLOAT_* + trace_float_compare).
@@ -700,6 +739,7 @@ pub(crate) fn record_float_cmp<Sym: WalkSym>(
     // short-circuit), and `opimpl_goto_if_not` emits no guard for a `Const`
     // condbox.  No `b1 is b2` fast path: the fused float compares are
     // generated with `if False and b1 is b2` (`x == x` is false for a NaN).
+    count_ops_executed(ctx, opcode);
     if let (Some(Value::Float(fa)), Some(Value::Float(fb))) =
         (a.inline_const_to_value(), b.inline_const_to_value())
     {
@@ -707,6 +747,7 @@ pub(crate) fn record_float_cmp<Sym: WalkSym>(
             majit_metainterp::eval_float_cmp(opcode, fa.to_bits() as i64, fb.to_bits() as i64);
         return ctx.trace_ctx.const_int(folded);
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
@@ -734,6 +775,7 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let dst = code[op.pc + 2] as usize;
+    count_ops_executed(ctx, opcode);
     match opcode {
         // `cast_int_to_float/i>f`: Int-bank → Float-bank. Stamp the
         // result with the operand's Box.value as an f64 so downstream
@@ -746,6 +788,7 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
             let result = if let Some(majit_ir::Value::Int(n)) = a.inline_const_to_value() {
                 ctx.trace_ctx.const_float((n as f64).to_bits() as i64)
             } else {
+                count_ops_recorded(ctx, opcode);
                 let result = ctx.trace_ctx.record_op(opcode, &[a]);
                 if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
                     ctx.trace_ctx
@@ -777,6 +820,7 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
         // invalidates.  Keep recording both.
         OpCode::CastIntToPtr => {
             let a = read_int_reg(code, op, 0, ctx)?;
+            count_ops_recorded(ctx, opcode);
             let result = ctx.trace_ctx.record_op(opcode, &[a]);
             if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
                 ctx.trace_ctx
@@ -788,6 +832,7 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
         // operand's Box.value (`BoxRef(p)` → `BoxInt(p as i64)`).
         OpCode::CastPtrToInt => {
             let a = read_ref_reg(code, op, 0, ctx)?;
+            count_ops_recorded(ctx, opcode);
             let result = ctx.trace_ctx.record_op(opcode, &[a]);
             if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(a) {
                 ctx.trace_ctx
@@ -815,6 +860,7 @@ pub(crate) fn binop_float_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
     let b = read_float_reg(code, op, 1, ctx)?;
+    count_ops_executed(ctx, opcode);
     // All-`Const` operands fold without recording (`execute_and_record`'s
     // `_all_constants` short-circuit; FLOAT_ADD..FLOAT_TRUEDIV are
     // ALWAYS_PURE).
@@ -837,6 +883,7 @@ pub(crate) fn binop_float_record<Sym: WalkSym>(
         *slot = result;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (matches dispatch.rs trace_binop_f).
@@ -873,6 +920,7 @@ pub(crate) fn unop_float_record<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_float_reg(code, op, 0, ctx)?;
+    count_ops_executed(ctx, opcode);
     // A `Const` operand folds without recording (`execute_and_record`'s
     // `_all_constants` short-circuit; FLOAT_NEG / FLOAT_ABS are
     // ALWAYS_PURE).
@@ -893,6 +941,7 @@ pub(crate) fn unop_float_record<Sym: WalkSym>(
         *slot = result;
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     // Box(value) parity: stamp the unary float result (matches dispatch.rs
     // trace_unary_f — FloatNeg / FloatAbs).

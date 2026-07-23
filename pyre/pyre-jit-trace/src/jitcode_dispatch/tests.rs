@@ -5841,6 +5841,54 @@ fn fused_float_compare_folds_const_operands_without_guards() {
 }
 
 #[test]
+fn profiler_counts_ops_and_recorded_ops_like_execute_and_record() {
+    // `execute_and_record` counts `OPS` before the `_all_constants` fold
+    // and `_record_helper` adds `RECORDED_OPS` only when the op records;
+    // the `b1 is b2` fast path returns before `self.execute` and counts
+    // neither.
+    let byte = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02];
+
+    // Record path: non-const operands -> OPS + RECORDED_OPS.
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let mut regs_i = [
+        OpRef::input_arg_int(0),
+        OpRef::input_arg_int(1),
+        OpRef::None,
+    ];
+    run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i).expect("int_add must record");
+    let snap = tc.profiler().snapshot();
+    assert_eq!(snap.ops, 1, "recorded int_add lands in the OPS bucket");
+    assert_eq!(snap.recorded_ops, 1, "recorded int_add adds RECORDED_OPS");
+
+    // Fold path: all-const operands -> OPS only.
+    let mut fold_tc = fresh_trace_ctx();
+    let lhs = fold_tc.const_int(1);
+    let rhs = fold_tc.const_int(2);
+    let mut fold_regs = [lhs, rhs, OpRef::None];
+    run_hint_step(&code, &mut fold_tc, &mut [], &mut [], &mut fold_regs)
+        .expect("int_add must fold");
+    let snap = fold_tc.profiler().snapshot();
+    assert_eq!(snap.ops, 1, "a folded op still lands in the OPS bucket");
+    assert_eq!(snap.recorded_ops, 0, "a folded op is not RECORDED_OPS");
+
+    // Same-box fast path: neither counter.
+    let eq_byte = *insns_opname_to_byte()
+        .get("int_eq/ii>i")
+        .expect("`int_eq/ii>i` must be in insns table");
+    let eq_code = [eq_byte, 0x00, 0x00, 0x01];
+    let mut same_tc = TraceCtx::for_test_types(&[Type::Int]);
+    let mut same_regs = [OpRef::input_arg_int(0), OpRef::None];
+    run_hint_step(&eq_code, &mut same_tc, &mut [], &mut [], &mut same_regs)
+        .expect("same-box int_eq must fold");
+    let snap = same_tc.profiler().snapshot();
+    assert_eq!(snap.ops, 0, "the same-box fast path skips self.execute");
+    assert_eq!(snap.recorded_ops, 0);
+}
+
+#[test]
 fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
     let byte = *insns_opname_to_byte()
         .get("float_add/ff>f")
