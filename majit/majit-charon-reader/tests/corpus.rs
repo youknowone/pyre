@@ -23,8 +23,9 @@ fn loads_fixture_corpus() {
     // parse_one, desugar_mix, tuple_roundtrip) + `bool_then_closure` and
     // the two local fns Charon emits for its `|| x + 1` closure (the
     // closure body and its transparent `<Impl>::call_once` inherent method)
-    // + `option_source` and `option_question_mark` (the Option `?` fixture).
-    assert_eq!(local_count, 11, "11 local fns expected");
+    // + `option_source` and `option_question_mark` (the Option `?` fixture)
+    // + `bool_then_some` (the eager `then_some` sibling, no closure).
+    assert_eq!(local_count, 12, "12 local fns expected");
 }
 
 #[test]
