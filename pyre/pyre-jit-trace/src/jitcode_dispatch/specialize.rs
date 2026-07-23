@@ -417,24 +417,6 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // intobject.py `_make_generic_descr_binop`: the machine-int fast path
-    // exits through `_make_ovf2long` when `ovfcheck(op(x, y))` raises.
-    // This walker specialization represents only the no-overflow arm.  When
-    // the concrete walk is already on the overflow arm, defer before emitting
-    // any IR so the generic residual records the authentic W_Long result.
-    // Emitting INT_*_OVF + GUARD_NO_OVERFLOW here would contradict that
-    // result: the bridge would immediately try to prove the freshly boxed
-    // W_IntObject is a W_LongObject and abort on every retry.
-    let overflowed = match op_code {
-        OpCode::IntAddOvf => la.checked_add(rb).is_none(),
-        OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
-        OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
-        _ => false,
-    };
-    if overflowed {
-        return Ok(None);
-    }
-
     // intobject.py range validation (mirror the former int fast path's
     // needs_concrete_check): bail to the generic leg when the bare-IR-op
     // emission would be unsound (zero / INT_MIN-overflow divisor, oversized
@@ -478,22 +460,24 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         }
     }
 
-    // A concretely overflowing Add/Sub/Mul produced a W_Long from the
-    // helper, so the specialization's unconditional guard_no_overflow would
-    // fail on every execution recorded from this state — including a bridge
-    // traced from that very guard, which re-speculates identically and is
-    // stillborn, re-minting a new bridge each trace_eagerness failures.
     // pyjitpl.py:1881 handle_possible_overflow_error follows the concrete
-    // outcome instead. Route to the generic leg, which carries the authentic
-    // bignum result with no overflow guard at all.
-    if has_overflow {
-        let overflows = match op_code {
+    // Add/Sub/Mul outcome. The overflowing arm mirrors intobject.py:494
+    // _make_ovf2long: guard_overflow, call the elidable raw-int bigint helper
+    // (rbigint.py:717/788/873), guard the newlong demote attempt, and inline
+    // the W_LongObject box instead of falling through to the generic
+    // CallMayForceR BINARY_OP leg.
+    let overflows = has_overflow
+        && match op_code {
             OpCode::IntAddOvf => la.checked_add(rb).is_none(),
             OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
             OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
             _ => false,
         };
-        if overflows {
+    if overflows {
+        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+        if boxed_result_obj == pyre_object::PY_NULL
+            || !unsafe { pyre_object::is_long(boxed_result_obj) }
+        {
             return Ok(None);
         }
     }
@@ -505,6 +489,78 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+    if overflows {
+        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+        let concrete_value = match op_code {
+            OpCode::IntAddOvf => la.wrapping_add(rb),
+            OpCode::IntSubOvf => la.wrapping_sub(rb),
+            OpCode::IntMulOvf => la.wrapping_mul(rb),
+            _ => unreachable!("overflow arm requires Add/Sub/Mul"),
+        };
+        let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(raw_result, majit_ir::Value::Int(concrete_value));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardOverflow, &[])?;
+
+        let payload_concrete = unsafe {
+            *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+                as *const i64)
+        };
+        let payload_fn = match op_code {
+            OpCode::IntAddOvf => pyre_object::longobject::jit_bigint_add_int_int as *const (),
+            OpCode::IntSubOvf => pyre_object::longobject::jit_bigint_sub_int_int as *const (),
+            OpCode::IntMulOvf => pyre_object::longobject::jit_bigint_mul_int_int as *const (),
+            _ => unreachable!("overflow arm requires Add/Sub/Mul"),
+        };
+        let concrete_args = [
+            majit_ir::Value::Int(payload_fn as usize as i64),
+            majit_ir::Value::Int(la),
+            majit_ir::Value::Int(rb),
+        ];
+        let payload = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+            OpCode::CallR,
+            payload_fn,
+            &[lhs_raw, rhs_raw],
+            &[majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Ref,
+            majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            &concrete_args,
+            majit_ir::Value::Ref(majit_ir::GcRef(payload_concrete as usize)),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            payload,
+            majit_ir::Value::Ref(majit_ir::GcRef(payload_concrete as usize)),
+        );
+        if payload.inline_const_to_value().is_none() {
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+        }
+
+        let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+        let fits = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            fits_fn,
+            &[payload],
+            &[majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            majit_metainterp::cannot_raise_effect_info(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(fits, majit_ir::Value::Int(0));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
+
+        let result = crate::helpers::emit_box_long_inline(
+            ctx.trace_ctx,
+            payload,
+            crate::descr::w_long_size_descr(),
+            crate::descr::long_value_descr(),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            result,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+        );
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        return Ok(Some(()));
+    }
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
             // rint.py _ovf_zer guards: int_eq(rhs,0)→guard_false +

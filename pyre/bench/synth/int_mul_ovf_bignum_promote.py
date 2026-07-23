@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=10
+# pyre-check: max-pypy-ratio=8
 
 # Overflow-crossing int multiply on a JIT-hot path. The inner loop is traced
 # while `scale` is small (a*a stays in machine-int range, so the recorded
