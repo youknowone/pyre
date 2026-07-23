@@ -653,22 +653,25 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
-    // Read each operand's immutable `value` payload (`GetfieldGcPure`), then call
-    // the elidable `rbigint` op on the bare `*const BigInt` payloads. Passing the
-    // payloads (not the wrappers) keeps the call pure on the immutable bigints, so
-    // the optimizer forwards the field read and never reorders this elidable call
-    // ahead of the boxing `setfield_gc` below — which would otherwise read the
-    // freshly-allocated result wrapper's uninitialized `value` (the function-loop
-    // unroll exposed exactly that reorder). The result is a GC-managed
-    // `*mut BigInt`, Ref-typed so the JIT gcmap roots it across the collecting
-    // boxing NEW. Every op allocates (`EF_ELIDABLE_OR_MEMORYERROR`) or divides
-    // (`EF_ELIDABLE_CAN_RAISE`), so a trailing `GuardNoException` follows
-    // (`pyjitpl.py`).
+    // Read each operand's immutable `value` payload, then call the
+    // elidable `rbigint` op on the bare `*const BigInt` payloads. Passing
+    // the payloads (not the wrappers) keeps the call pure on the immutable
+    // bigints, so the optimizer forwards the field read and never reorders
+    // this elidable call ahead of the boxing `setfield_gc` below — which
+    // would otherwise read the freshly-allocated result wrapper's
+    // uninitialized `value` (the function-loop unroll exposed exactly that
+    // reorder). The forwarding is descr-keyed (`long_value_descr()` is
+    // immutable), so the plain `GETFIELD_GC_R` opnum gets identical OptHeap
+    // treatment — there is no pure getfield opnum. The result is a
+    // GC-managed `*mut BigInt`, Ref-typed so the JIT gcmap roots it across
+    // the collecting boxing NEW. Every op allocates
+    // (`EF_ELIDABLE_OR_MEMORYERROR`) or divides (`EF_ELIDABLE_CAN_RAISE`),
+    // so a trailing `GuardNoException` follows (`pyjitpl.py`).
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let lhs_payload = unsafe { *((lhs_obj as *const u8).add(off) as *const i64) };
     let rhs_payload = unsafe { *((rhs_obj as *const u8).add(off) as *const i64) };
     let lhs_pl = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcPureR,
+        OpCode::GetfieldGcR,
         &[lhs],
         crate::descr::long_value_descr(),
     );
@@ -677,7 +680,7 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(lhs_payload as usize)),
     );
     let rhs_pl = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcPureR,
+        OpCode::GetfieldGcR,
         &[rhs],
         crate::descr::long_value_descr(),
     );

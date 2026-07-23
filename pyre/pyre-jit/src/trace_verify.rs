@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unbox_int_ops_use_pure_reads_for_immutable_descrs() {
+    fn test_unbox_int_ops_read_immutable_descrs_as_plain_getfield() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef::input_arg_ref(0);
         let _intval = crate::trace_unbox_int(
@@ -145,13 +145,14 @@ mod tests {
             immutable_intval_descr(),
         );
         let ops = get_ops(ctx);
-        // Immutable intval descr → GetfieldGcPureI for the value read.
-        // GuardClass takes the object directly (no pre-read of ob_type).
-        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcPureI]);
+        // The tracer records the plain GetfieldGcI even for an immutable
+        // descr; OptHeap re-derives purity from the descr. GuardClass takes
+        // the object directly (no pre-read of ob_type).
+        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcI]);
     }
 
     #[test]
-    fn test_unbox_float_ops_use_pure_reads_for_immutable_descrs() {
+    fn test_unbox_float_ops_read_immutable_descrs_as_plain_getfield() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef::input_arg_ref(0);
         let _floatval = crate::trace_unbox_float(
@@ -162,7 +163,7 @@ mod tests {
             immutable_floatval_descr(),
         );
         let ops = get_ops(ctx);
-        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcPureF]);
+        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcF]);
     }
 
     #[test]

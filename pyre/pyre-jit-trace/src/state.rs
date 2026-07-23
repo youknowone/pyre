@@ -3076,20 +3076,17 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
             }
         }
     }
-    let opcode = if descr.is_always_pure() {
-        OpCode::GetfieldGcPureI
-    } else {
-        OpCode::GetfieldGcI
-    };
-    // The `_pure` spelling aliases this opimpl upstream, so the
-    // profiler always sees the plain GETFIELD_GC_I opnum.
+    // `opimpl_getfield_gc_i` records the plain GETFIELD_GC_I opnum
+    // regardless of `descr.is_always_pure()`; purity is re-derived from
+    // the descr by OptHeap (const fold + invalidation-exempt field
+    // cache). There is no pure getfield opnum.
     ctx.profiler()
         .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::OPS);
     ctx.profiler().count_ops(
         OpCode::GetfieldGcI,
         majit_metainterp::counters::RECORDED_OPS,
     );
-    let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    let result = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], descr.clone());
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // `resbox` carries the loaded value; pair the recorded opref with
     // the live int from `field_sanity_load` so subsequent
@@ -3182,20 +3179,16 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
             }
         }
     }
-    let opcode = if descr.is_always_pure() {
-        OpCode::GetfieldGcPureR
-    } else {
-        OpCode::GetfieldGcR
-    };
-    // The `_pure` spelling aliases this opimpl upstream, so the
-    // profiler always sees the plain GETFIELD_GC_R opnum.
+    // `opimpl_getfield_gc_r` records the plain GETFIELD_GC_R opnum
+    // regardless of `descr.is_always_pure()`; purity is re-derived from
+    // the descr by OptHeap. There is no pure getfield opnum.
     ctx.profiler()
         .count_ops(OpCode::GetfieldGcR, majit_metainterp::counters::OPS);
     ctx.profiler().count_ops(
         OpCode::GetfieldGcR,
         majit_metainterp::counters::RECORDED_OPS,
     );
-    let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    let result = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[obj], descr.clone());
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // Pair the recorded opref with the live ref so subsequent
     // `box_value(result)` mirrors RPython's executor-returned Box.
@@ -11827,7 +11820,7 @@ mod tests {
             if op.opcode == OpCode::GuardClass {
                 saw_guard_nonnull_class = true;
             }
-            if op.opcode == OpCode::GetfieldGcPureI
+            if op.opcode == OpCode::GetfieldGcI
                 && op
                     .getarglist()
                     .iter()
@@ -11844,7 +11837,7 @@ mod tests {
         );
         assert!(
             saw_pure_payload,
-            "int payload fast path should read the immutable payload with GetfieldGcPureI"
+            "int payload fast path should read the immutable payload with GetfieldGcI"
         );
     }
 
@@ -11873,14 +11866,15 @@ mod tests {
         };
 
         let recorder = ctx.into_recorder();
-        // A boxed W_Int reads its immutable payload with GetfieldGcPureI. The
+        // A boxed W_Int reads its immutable payload with the plain
+        // GetfieldGcI (purity re-derived from the descr by OptHeap). The
         // lowbit tag-discrimination guard (rtagged.py:155) is elided because
         // `obj` is a Const (pyjitpl.py:2583 generate_guard const-skip), so no
         // guard is emitted at all.
         let payload_op = recorder
             .get_op_by_pos(payload)
             .expect("payload op should be present");
-        assert_eq!(payload_op.opcode, OpCode::GetfieldGcPureI);
+        assert_eq!(payload_op.opcode, OpCode::GetfieldGcI);
         for pos in 1..(1 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;

@@ -6577,12 +6577,10 @@ fn walker_record_getfield_gc_i_uncached<Sym: WalkSym>(
     obj: OpRef,
     descr: DescrRef,
 ) -> OpRef {
-    let opcode = if descr.is_always_pure() {
-        OpCode::GetfieldGcPureI
-    } else {
-        OpCode::GetfieldGcI
-    };
-    ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr)
+    // Plain GETFIELD_GC_I regardless of purity; OptHeap re-derives
+    // purity from the descr. There is no pure getfield opnum.
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::GetfieldGcI, &[obj], descr)
 }
 
 fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(
@@ -6590,12 +6588,10 @@ fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(
     obj: OpRef,
     descr: DescrRef,
 ) -> OpRef {
-    let opcode = if descr.is_always_pure() {
-        OpCode::GetfieldGcPureR
-    } else {
-        OpCode::GetfieldGcR
-    };
-    ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr)
+    // Plain GETFIELD_GC_R regardless of purity; OptHeap re-derives
+    // purity from the descr. There is no pure getfield opnum.
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::GetfieldGcR, &[obj], descr)
 }
 
 /// True only when this `LoadAttr` residual is immediately consumed by the

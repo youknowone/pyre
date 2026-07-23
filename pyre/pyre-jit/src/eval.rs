@@ -11431,7 +11431,7 @@ mod tests {
             if op.opcode == OpCode::GuardClass {
                 saw_guard_nonnull_class = true;
             }
-            if op.opcode == OpCode::GetfieldGcPureI
+            if op.opcode == OpCode::GetfieldGcI
                 && op
                     .getarglist()
                     .iter()
@@ -11449,7 +11449,7 @@ mod tests {
         );
         assert!(
             saw_pure_payload,
-            "int payload fast path should read the immutable payload with GetfieldGcPureI: {:?}",
+            "int payload fast path should read the immutable payload with GetfieldGcI: {:?}",
             recorded_ops
         );
     }
