@@ -4672,8 +4672,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     let name_obj = w_str_new(name);
                     match get_and_call_function(slot, obj, w_type, &[name_obj]) {
                         Ok(v) => return Ok(v),
+                        // A replacement `__getattribute__` has taken over the
+                        // whole lookup, so the PEP 562 module-dict tail no
+                        // longer applies; `descroperation.py:242-245` falls
+                        // back to the receiver type's `__getattr__` (and
+                        // re-raises when there is none).
                         Err(e) if e.kind == PyErrorKind::AttributeError => {
-                            return module_getattr_hook_or_err(obj, name, e, call_getattr);
+                            return instance_getattr_hook_or_err(w_type, obj, name, e);
                         }
                         Err(e) => return Err(e),
                     }
