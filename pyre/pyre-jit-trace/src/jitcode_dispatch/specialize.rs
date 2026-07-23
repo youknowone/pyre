@@ -478,6 +478,26 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         }
     }
 
+    // A concretely overflowing Add/Sub/Mul produced a W_Long from the
+    // helper, so the specialization's unconditional guard_no_overflow would
+    // fail on every execution recorded from this state — including a bridge
+    // traced from that very guard, which re-speculates identically and is
+    // stillborn, re-minting a new bridge each trace_eagerness failures.
+    // pyjitpl.py:1881 handle_possible_overflow_error follows the concrete
+    // outcome instead. Route to the generic leg, which carries the authentic
+    // bignum result with no overflow guard at all.
+    if has_overflow {
+        let overflows = match op_code {
+            OpCode::IntAddOvf => la.checked_add(rb).is_none(),
+            OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
+            OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
+            _ => false,
+        };
+        if overflows {
+            return Ok(None);
+        }
+    }
+
     // --- emit the specialized IR (walker-native) ---
     // bool and int share `intval`; guard each operand against its own vtable
     // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
