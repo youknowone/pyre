@@ -1054,6 +1054,29 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
 }
 
 #[test]
+fn fused_int_is_zero_folds_a_const_operand_without_recording() {
+    // `opimpl_goto_if_not_int_is_zero`'s condbox comes from
+    // `self.execute(rop.INT_IS_ZERO, box)` — a `Const` operand folds the
+    // condition without recording, and `opimpl_goto_if_not` emits no guard
+    // for a `Const` condbox.
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_int_is_zero/iL")
+        .expect("`goto_if_not_int_is_zero/iL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_int(5);
+    let mut regs_i = [operand];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("a const int_is_zero condition has a static direction");
+    assert_eq!(next_pc, 9, "is_zero(5) = 0 takes the not-taken label");
+    assert_eq!(
+        tc.num_ops(),
+        0,
+        "const int_is_zero records no IntIsZero and no guard"
+    );
+}
+
+#[test]
 fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_eq/rrL")
@@ -5605,6 +5628,62 @@ fn ptr_eq_folds_two_distinct_const_refs_without_recording() {
         tc.concrete_of_opref(regs_i[0]),
         Some(majit_ir::Value::Int(0)),
         "distinct const refs are not identical -> PtrEq folds to 0",
+    );
+}
+
+#[test]
+fn int_binop_folds_two_const_int_operands_without_recording() {
+    // `execute_and_record` const-folds a pure op whose operands are all
+    // `Const` (`_all_constants` short-circuit) — the int binop loop routes
+    // through `self.execute`, so an all-const `int_add` never records.
+    let byte = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02]; // `ii>i`: src1=0, src2=1, dst=2
+    let mut tc = fresh_trace_ctx();
+    let lhs = tc.const_int(40);
+    let rhs = tc.const_int(2);
+    let mut regs_i = [lhs, rhs, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("int_add on two const ints must fold");
+    assert_eq!(next_pc, 4);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const operands fold without recording an IntAdd",
+    );
+    assert_eq!(
+        regs_i[2].inline_const_to_value(),
+        Some(majit_ir::Value::Int(42)),
+        "dst must hold the folded ConstInt",
+    );
+}
+
+#[test]
+fn int_unop_folds_a_const_int_operand_without_recording() {
+    // The unary loop (`int_neg` / `int_invert` / `int_is_true`) also routes
+    // through `self.execute`, so a `Const` operand folds without recording.
+    let byte = *insns_opname_to_byte()
+        .get("int_neg/i>i")
+        .expect("`int_neg/i>i` must be in insns table");
+    let code = [byte, 0x00, 0x01]; // `i>i`: src=0, dst=1
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_int(7);
+    let mut regs_i = [operand, OpRef::None];
+    let ops_before = tc.num_ops();
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("int_neg on a const int must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a const operand folds without recording an IntNeg",
+    );
+    assert_eq!(
+        regs_i[1].inline_const_to_value(),
+        Some(majit_ir::Value::Int(-7)),
+        "dst must hold the folded ConstInt",
     );
 }
 

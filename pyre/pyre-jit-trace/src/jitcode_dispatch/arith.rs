@@ -44,6 +44,19 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
+    // All-`Const` operands fold to a result constant without recording —
+    // `execute_and_record` short-circuits `_record_helper` via
+    // `executor.wrap_constant(resvalue)` when `_all_constants(*argboxes)`
+    // holds for a pure op, and every opname routed here is ALWAYS_PURE.
+    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
+        (a.inline_const_to_value(), b.inline_const_to_value())
+    {
+        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        let result = ctx.trace_ctx.const_int(folded);
+        let dst = code[op.pc + 3] as usize;
+        write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
@@ -124,6 +137,11 @@ pub(crate) fn record_int_unary<Sym: WalkSym>(
     opcode: OpCode,
     a: OpRef,
 ) -> OpRef {
+    if let Some(Value::Int(la)) = a.inline_const_to_value() {
+        return ctx
+            .trace_ctx
+            .const_int(majit_metainterp::eval_unary_i(opcode, la));
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     if let Some(majit_ir::Value::Int(la)) = ctx.trace_ctx.box_value(a) {
         let folded = majit_metainterp::eval_unary_i(opcode, la);
@@ -288,6 +306,19 @@ pub(crate) fn unop_int_record<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
+    // A `Const` operand folds without recording (`execute_and_record`'s
+    // `_all_constants` short-circuit) — except `int_same_as`, whose
+    // `opimpl_int_same_as` calls `_record_helper` unconditionally to
+    // force the result into a Box.
+    if opcode != OpCode::SameAsI {
+        if let Some(majit_ir::Value::Int(n)) = a.inline_const_to_value() {
+            let folded = majit_metainterp::eval_unary_i(opcode, n);
+            let result = ctx.trace_ctx.const_int(folded);
+            let dst = code[op.pc + 2] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     // Box(value) parity: stamp the unary result from the operand's
     // Box.value carrier (matches dispatch.rs trace_unary_i).  The
