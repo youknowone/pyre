@@ -1433,8 +1433,15 @@ impl JitCellToken {
 
     /// Mark this loop as invalidated. Any subsequent execution of
     /// GUARD_NOT_INVALIDATED in the compiled code will fail.
+    /// `model.py:145 invalidate_loop`: activates the guards in the loop AND
+    /// all its attached bridges, so every bridge-generation flag minted so
+    /// far is set too. A bridge compiled after this call mints a fresh clear
+    /// flag and starts valid.
     pub fn invalidate(&self) {
         self.invalidated.store(true, Ordering::Release);
+        for flag in self.bridge_invalidation_flags.lock().iter() {
+            flag.store(true, Ordering::Release);
+        }
     }
 
     /// Load the compiled entry address written at backend `compile_loop`
@@ -3321,16 +3328,23 @@ mod tests {
     #[test]
     fn bridge_invalidation_flags_are_independent_generations() {
         let token = JitCellToken::new(42);
+        // A bridge attached before an invalidation is activated by it
+        // (model.py:145: "all GUARD_NOT_INVALIDATED in the loop and its
+        // attached bridges").
+        let pre_flag = token.mint_bridge_invalidation_flag();
         token.invalidate();
+        assert!(pre_flag.load(std::sync::atomic::Ordering::Acquire));
 
+        // A bridge compiled after the invalidation starts valid.
         let bridge_flag = token.mint_bridge_invalidation_flag();
         assert!(token.is_invalidated());
         assert!(!bridge_flag.load(std::sync::atomic::Ordering::Acquire));
 
         let flags = token.all_invalidation_flags();
-        assert_eq!(flags.len(), 2);
+        assert_eq!(flags.len(), 3);
         assert!(Arc::ptr_eq(&flags[0], &token.invalidation_flag()));
-        assert!(Arc::ptr_eq(&flags[1], &bridge_flag));
+        assert!(Arc::ptr_eq(&flags[1], &pre_flag));
+        assert!(Arc::ptr_eq(&flags[2], &bridge_flag));
         assert!(Arc::ptr_eq(
             &token.latest_bridge_invalidation_flag().unwrap(),
             &bridge_flag
