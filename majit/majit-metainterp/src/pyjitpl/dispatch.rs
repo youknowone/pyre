@@ -3508,6 +3508,12 @@ where
                             }
                         }
                     }
+                    // A ref store adds a heap edge array→value; notify the GC on
+                    // the container so a young value survives a minor collection
+                    // triggered later in the walk (mirrors bh_setarrayitem_gc_r).
+                    if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(array_addr as usize));
+                    }
                 }
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {

@@ -983,7 +983,12 @@ impl PyJitCode {
         code_ptr: *const pyre_interpreter::CodeObject,
         has_abort: bool,
     ) -> Self {
-        Self::from_parts(jitcode, PyJitCodeMetadata::degenerate(), code_ptr, has_abort)
+        Self::from_parts(
+            jitcode,
+            PyJitCodeMetadata::degenerate(),
+            code_ptr,
+            has_abort,
+        )
     }
 }
 
