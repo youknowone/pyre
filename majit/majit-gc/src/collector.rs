@@ -1425,13 +1425,36 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py:1259 `get_possibly_forwarded_tid`: header access that
+    /// follows the forwarding pointer when a young object was already moved
+    /// by this collection. A forwarded nursery header holds FORWARDED_MARKER,
+    /// whose all-ones flag region fakes every flag (IGNORE_FINALIZER
+    /// included), so a raw read there would silently drop a finalizer entry.
+    ///
+    /// Latent today: every finalizer-queue registrant (instances, generators)
+    /// is stable-allocated, so a queued object is never in the nursery. It
+    /// becomes load-bearing when instance allocation converges back to the
+    /// movable nursery (see `alloc_instance_object`).
+    fn get_possibly_forwarded_header(&self, obj_addr: usize) -> *const GcHeader {
+        let hdr = unsafe { header_of(obj_addr) };
+        if self.is_nursery_object_start(obj_addr) && unsafe { (*hdr).is_forwarded() } {
+            let fwd_addr = unsafe { GcHeader::forwarding_address(hdr) };
+            unsafe { header_of(fwd_addr) }
+        } else {
+            hdr
+        }
+    }
+
     /// incminimark.py:2914-2926 `deal_with_young_objects_with_finalizers`.
     fn deal_with_young_objects_with_finalizers(&mut self) {
         while let Some((obj_addr, fq_index)) =
             self.probably_young_objects_with_finalizers.pop_front()
         {
             let current = if self.is_nursery_object_start(obj_addr) {
-                let hdr = unsafe { header_of(obj_addr) };
+                // incminimark.py:2918: the IGNORE_FINALIZER read must go
+                // through `get_possibly_forwarded_tid` — the object may have
+                // been forwarded by an earlier root walk this collection.
+                let hdr = self.get_possibly_forwarded_header(obj_addr);
                 if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
                     continue;
                 }
