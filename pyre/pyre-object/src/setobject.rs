@@ -670,18 +670,27 @@ pub unsafe fn w_set_update_from_set(
     ) {
         return Ok(());
     }
-    // `src`'s keys are read one index at a time rather than collected: an
+    // Both tables are captured once for the whole merge — `update` unerases
+    // `d_obj` up front (`setobject.py:1396`) and `d_obj.update(d_other)` runs
+    // `ll_dict_update(dic1, dic2)` on those two tables (`rordereddict.py:1379`).
+    // A callback that clears either set swaps its live storage; the merge keeps
+    // reading the captured source and inserting into the captured destination,
+    // both now orphaned snapshots.
+    //
+    // `src`'s keys are still read one index at a time rather than collected: an
     // `eq_w` raised from the bucket probe below can move every element, and
     // the collector rewrites the `obj` slots inside the two tables in place
     // (`set_object_custom_trace`) — a `Vec` of keys lifted out of them would
     // not be walked and would be left holding stale pointers.
+    let _roots = crate::gc_roots::push_roots();
+    let dst_items = capture_set_items(dst);
+    let src_items = capture_set_items(src);
     let mut i = 0;
     loop {
-        let src_items = (*(src as *const W_SetObject)).items;
         let Some((&key, _)) = (*src_items).get_index(i) else {
             break;
         };
-        w_set_insert_key_checked(dst, key)?;
+        w_set_insert_key_into(dst, dst_items, key)?;
         i += 1;
     }
     Ok(())
@@ -715,6 +724,19 @@ unsafe fn w_set_insert_key_reentrant(
 ) -> Result<(), SetUpdateError> {
     let _roots = crate::gc_roots::push_roots();
     let items = capture_set_items(dst);
+    w_set_insert_key_into(dst, items, key)
+}
+
+/// Probe-and-insert half of [`w_set_insert_key_reentrant`] against a storage
+/// box the caller already captured and pinned.  `w_set_update_from_set` passes
+/// the box it captured for the whole merge so every source key targets the same
+/// (possibly orphaned) table, the way `ll_dict_update` keeps inserting into its
+/// captured `dic1`.
+unsafe fn w_set_insert_key_into(
+    dst: PyObjectRef,
+    items: *mut SetItemsStorage,
+    key: crate::dictmultiobject::ObjectKey,
+) -> Result<(), SetUpdateError> {
     let (found, key) = scan_set_key_reentrant(items, key).map_err(SetUpdateError::Key)?;
     if found.is_some() {
         return Ok(());

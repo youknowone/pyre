@@ -82,6 +82,26 @@ def build_dict():
     return owner
 
 
+def run_update(clear_target):
+    # `update` unerases both tables once for the whole merge
+    # (`d_obj.update(d_other)` -> `ll_dict_update(dic1, dic2)`), so a clear of
+    # either side mid-merge orphans that table: with dst cleared every remaining
+    # source key is inserted into the dropped box, and with src cleared the
+    # merge keeps iterating the full orphaned source.
+    owner = [None, None]
+    dst = set()
+    src = set()
+    owner[0] = dst if clear_target == "dst" else src
+    owner[1] = Key("Q", 90, owner)
+    dst.add(Key("B", 50, owner))
+    dst.add(Key("A", 1, owner))
+    src.add(Key("P1", 99, owner))
+    src.add(Key("P2", 77, owner))
+    src.add(Key("P3", 55, owner))
+    dst.update(src)
+    return sorted(k.tag for k in dst), sorted(k.tag for k in src)
+
+
 def run_dict(operation):
     owner = build_dict()
     container = owner[0]
@@ -116,6 +136,8 @@ def hot_loop():
 def main():
     for operation in ("add", "contains", "discard"):
         print("set", operation, run_set(operation))
+    for target in ("dst", "src"):
+        print("set update clear", target, run_update(target))
     for operation in ("setitem", "getitem", "setdefault", "pop"):
         print("dict", operation, run_dict(operation))
     print("hot", hot_loop())
