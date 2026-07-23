@@ -37,6 +37,14 @@ class Key:
             self.value = 2
             container, replacement = self.owner[0], self.owner[1]
             if isinstance(container, dict):
+                if len(self.owner) > 2:
+                    # Drain every entry first so the table is EMPTY when
+                    # `clear()` runs, then restore the candidate at its
+                    # original index.  Neither PyPy nor pyre restarts here —
+                    # the probe completes and misses — which pins pyre's
+                    # non-empty gate on the clear generation bump.
+                    del container[self.owner[2]]
+                    del container[self]
                 container.clear()
                 container[replacement] = 0
                 container[self] = 0
@@ -118,6 +126,19 @@ def run_dict(operation):
     return sorted(k.tag for k in container), hit
 
 
+def run_dict_drain():
+    owner = [None, None, None]
+    container = {}
+    owner[0] = container
+    owner[1] = Key("Q", 99, owner)
+    b = Key("B", 50, owner)
+    owner[2] = b
+    container[b] = 0
+    container[Key("A", 1, owner)] = 0
+    hit = container.get(Key("P", 99, owner), "miss")
+    return sorted(k.tag for k in container), hit
+
+
 def hot_loop():
     # Keep the reentrant-clear probe on a hot path so the JIT-compiled residual
     # takes the same restart (dict) / orphaned-snapshot (set) decision as the
@@ -140,6 +161,7 @@ def main():
         print("set update clear", target, run_update(target))
     for operation in ("setitem", "getitem", "setdefault", "pop"):
         print("dict", operation, run_dict(operation))
+    print("dict drain+clear getitem", run_dict_drain())
     print("hot", hot_loop())
 
 
