@@ -2894,18 +2894,14 @@ pub fn trace_and_compile_from_bridge(
         // This pre-walk decline returns before the `trace_bytecode` walk, so the
         // walk-time `TraceAction::Abort` recorder below never runs for it. Record
         // the guard here so `must_compile_with_values` does not re-enter this
-        // structurally-undecidable bridge every ~`trace_eagerness` failures. Gate
-        // to the guard-invariant subset: an exception guard always carries the
-        // exception (a deterministic decline while the exc-edge bridge is off),
-        // and a pending-field guard is exactly the subset the removed eager
-        // decline suppressed. A `GUARD_NOT_FORCED` whose `pending_exc` is
-        // runtime-conditional and carries no pending fields could still bridge on
-        // a non-raising failure, so it is left unrecorded.
-        let has_pending_fields = exit_layout
-            .storage
-            .as_deref()
-            .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
-        if last_bridge_is_exception_guard || has_pending_fields {
+        // structurally-undecidable bridge every ~`trace_eagerness` failures. Only
+        // an exception guard is recorded: its `pending_exc` is guard-invariant, so
+        // the decline is deterministic while the exc-edge bridge is off. A
+        // `GUARD_NOT_FORCED` (even one carrying pending fields) has a
+        // runtime-conditional `pending_exc` and can still bridge on a later
+        // non-raising failure via the pending-field prologue, so blacklisting it
+        // after one raising failure would defeat that; leave it unrecorded.
+        if last_bridge_is_exception_guard {
             driver
                 .meta_interp_mut()
                 .record_declined_bridge_guard(descr_arc);
