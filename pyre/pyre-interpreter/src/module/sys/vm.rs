@@ -1529,7 +1529,15 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let writable = fd != 0;
     let to_stderr = fd == 2;
-    let stream = pyre_object::w_instance_new(crate::builtins::text_io_wrapper_type());
+    let stream = crate::module::_io::W_TextIOWrapper::allocate_stdio(
+        name,
+        "utf-8",
+        if to_stderr {
+            "backslashreplace"
+        } else {
+            "strict"
+        },
+    );
     crate::baseobjspace::setdictvalue(stream, "name", w_str_new(name));
     crate::baseobjspace::setdictvalue(stream, "encoding", w_str_new("utf-8"));
     // `pylifecycle.c init_set_builtins_open`/`init_sys_streams`: stderr uses the

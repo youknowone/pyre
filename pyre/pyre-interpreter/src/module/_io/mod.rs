@@ -15,6 +15,12 @@ mod buffered_rwpair;
 pub use buffered_rwpair::W_BufferedRWPair;
 mod buffered_random;
 pub use buffered_random::W_BufferedRandom;
+mod textio;
+pub use textio::W_TextIOWrapper;
+
+pub fn text_io_wrapper_type() -> PyObjectRef {
+    textio::type_object()
+}
 
 // CPython 3.14 raised the public and constructor default from 8 KiB to
 // 128 KiB.  Keep one module-owned value shared by every buffered type.

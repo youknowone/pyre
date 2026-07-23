@@ -591,6 +591,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (136, Some(0)),
     (137, Some(0)),
     (138, Some(0)),
+    (139, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

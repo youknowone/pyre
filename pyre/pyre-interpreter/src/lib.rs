@@ -896,6 +896,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(136, typed::<crate::module::_io::W_BufferedWriter>()),
         subclass_range_alias(137, typed::<crate::module::_io::W_BufferedRWPair>()),
         subclass_range_alias(138, typed::<crate::module::_io::W_BufferedRandom>()),
+        subclass_range_alias(139, typed::<crate::module::_io::W_TextIOWrapper>()),
     ]
 }
 
