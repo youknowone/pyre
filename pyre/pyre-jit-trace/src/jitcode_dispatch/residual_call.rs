@@ -2826,6 +2826,30 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             maybe_walker_vable_and_vrefs_before_residual_call(ctx);
         }
 
+        // pyjitpl.py:2669-2682 `execute_and_record_varargs`; may-force
+        // calls use `history.record_nospec` and therefore count nothing.
+        if matches!(
+            call_opcode,
+            OpCode::CallI
+                | OpCode::CallR
+                | OpCode::CallF
+                | OpCode::CallN
+                | OpCode::CallPureI
+                | OpCode::CallPureR
+                | OpCode::CallPureF
+                | OpCode::CallPureN
+                | OpCode::CallLoopinvariantI
+                | OpCode::CallLoopinvariantR
+                | OpCode::CallLoopinvariantF
+                | OpCode::CallLoopinvariantN
+        ) {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
@@ -3635,6 +3659,28 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             maybe_walker_vable_and_vrefs_before_residual_call(ctx);
         }
 
+        if matches!(
+            call_opcode,
+            OpCode::CallI
+                | OpCode::CallR
+                | OpCode::CallF
+                | OpCode::CallN
+                | OpCode::CallPureI
+                | OpCode::CallPureR
+                | OpCode::CallPureF
+                | OpCode::CallPureN
+                | OpCode::CallLoopinvariantI
+                | OpCode::CallLoopinvariantR
+                | OpCode::CallLoopinvariantF
+                | OpCode::CallLoopinvariantN
+        ) {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
@@ -3845,6 +3891,28 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             maybe_walker_vable_and_vrefs_before_residual_call(ctx);
         }
 
+        if matches!(
+            call_opcode,
+            OpCode::CallI
+                | OpCode::CallR
+                | OpCode::CallF
+                | OpCode::CallN
+                | OpCode::CallPureI
+                | OpCode::CallPureR
+                | OpCode::CallPureF
+                | OpCode::CallPureN
+                | OpCode::CallLoopinvariantI
+                | OpCode::CallLoopinvariantR
+                | OpCode::CallLoopinvariantF
+                | OpCode::CallLoopinvariantN
+        ) {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());

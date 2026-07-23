@@ -3518,8 +3518,19 @@ pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index:
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
     if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
+        // pyjitpl.py:640-663 `_do_getarrayitem_gc_any` cache hit.
+        ctx.profiler().count_ops(
+            OpCode::GetarrayitemGcR,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return cached;
     }
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
     if let Some(live_value) = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
@@ -3568,6 +3579,13 @@ pub(crate) fn trace_raw_array_getitem_value(
     if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
         return cached;
     }
+    // pyjitpl.py:640-663 `_do_getarrayitem_gc_any` record leg.
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
     if let Some(live_value) = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
@@ -3599,6 +3617,12 @@ pub(crate) fn trace_items_block_getitem_value(
     if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
         return cached;
     }
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr.clone());
     if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
@@ -3630,6 +3654,13 @@ pub(crate) fn trace_items_block_getitem_value_pure(
     index: OpRef,
 ) -> OpRef {
     let descr = pyobject_gcarray_descr();
+    // Pure jitcode spellings alias the plain opimpl for profiling.
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result =
         ctx.record_op_with_descr(OpCode::GetarrayitemGcPureR, &[block, index], descr.clone());
     if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref) {
@@ -3648,6 +3679,12 @@ pub(crate) fn trace_items_block_setitem_value(
 ) {
     let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
+    ctx.profiler()
+        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::SetarrayitemGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
     // pyjitpl.py:980 `upd.setarrayitem(valuebox)` — cache stores the
     // Box identity (`value` OpRef); cache-hit readers resolve the
@@ -3665,6 +3702,12 @@ pub(crate) fn trace_raw_array_setitem_value(
 ) {
     let descr = pyobject_array_descr();
     let descr_idx = descr.index();
+    ctx.profiler()
+        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::SetarrayitemGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
     // pyjitpl.py:980 `upd.setarrayitem(valuebox)` parity — cache
     // stores the Box identity (`value` OpRef); cache-hit readers
@@ -3687,6 +3730,12 @@ pub(crate) fn trace_int_block_getitem_value(
     if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
         return cached;
     }
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcI, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcI,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcI, &[block, index], descr.clone());
     if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Int) {
         ctx.set_opref_concrete(result, live_value);
@@ -3706,6 +3755,12 @@ pub(crate) fn trace_int_block_setitem_value(
 ) {
     let descr = int_gcarray_descr();
     let descr_idx = descr.index();
+    ctx.profiler()
+        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::SetarrayitemGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
@@ -3723,6 +3778,12 @@ pub(crate) fn trace_float_block_getitem_value(
     if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
         return cached;
     }
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcF, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcF,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcF, &[block, index], descr.clone());
     if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Float)
     {
@@ -3742,6 +3803,12 @@ pub(crate) fn trace_float_block_setitem_value(
 ) {
     let descr = float_gcarray_descr();
     let descr_idx = descr.index();
+    ctx.profiler()
+        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::SetarrayitemGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
@@ -6066,6 +6133,13 @@ fn emit_stroruni_oopspec_call(
     let mut call_args = Vec::with_capacity(1 + args.len());
     call_args.push(func_const);
     call_args.extend_from_slice(args);
+    // resume.py:1143-1160 `execute_and_record_varargs(CALL_R, ...)`.
+    ctx.profiler()
+        .count_ops(majit_ir::OpCode::CallR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        majit_ir::OpCode::CallR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     ctx.record_op_with_descr(majit_ir::OpCode::CallR, &call_args, calldescr.clone())
 }
 
@@ -6812,6 +6886,12 @@ fn prepare_bridge_pending_fields(
                 cache,
             );
             if pending.item_index < 0 {
+                // resume.py `_prepare_pendingfields` replays through
+                // `execute_and_record`.
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(OpCode::SetfieldGc, &[target_op, value_op], descr.clone());
                 // resume.py:1004 _prepare_pendingfields replays through
                 // execute_setfield_gc, which seeds heapcache.setfield after
@@ -6826,6 +6906,12 @@ fn prepare_bridge_pending_fields(
                 ctx.heapcache_setfield_cached(target_op, descr.index(), value_op);
             } else {
                 let index_op = ctx.const_int(pending.item_index as i64);
+                ctx.profiler()
+                    .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+                ctx.profiler().count_ops(
+                    OpCode::SetarrayitemGc,
+                    majit_metainterp::counters::RECORDED_OPS,
+                );
                 ctx.record_op_with_descr(
                     OpCode::SetarrayitemGc,
                     &[target_op, index_op, value_op],
@@ -7940,6 +8026,12 @@ fn materialize_bridge_virtual(
             // stable_field_index.
             let field_descr =
                 crate::descr::make_field_descr_with_parent(parent_descr.clone(), fd_info.offset);
+            // resume.py:1111-1122 materializer operations use
+            // `execute_and_record`.
+            ctx.profiler()
+                .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::RECORDED_OPS);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
             // Bridge virtual rematerialisation — `upd.setfield(valuebox)`
             // parity: cache stores the Box identity (`value` OpRef).
@@ -7967,6 +8059,12 @@ fn materialize_bridge_virtual(
                 return OpRef::NONE;
             };
             // resume.py:619 decoder.allocate_with_vtable(descr=self.descr)
+            ctx.profiler()
+                .count_ops(OpCode::NewWithVtable, majit_metainterp::counters::OPS);
+            ctx.profiler().count_ops(
+                OpCode::NewWithVtable,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
             let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:620 decoder.virtuals_cache.set_ptr(index, struct)
@@ -8002,6 +8100,10 @@ fn materialize_bridge_virtual(
                 return OpRef::NONE;
             };
             // resume.py:635 decoder.allocate_struct(self.typedescr)
+            ctx.profiler()
+                .count_ops(OpCode::New, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(OpCode::New, majit_metainterp::counters::RECORDED_OPS);
             let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:636 decoder.virtuals_cache.set_ptr(index, struct)
@@ -8055,6 +8157,10 @@ fn materialize_bridge_virtual(
             // resume.py:645 AbstractVArrayInfo.__init__ asserts arraydescr is
             // not None; resume.py:652 allocate reads self.arraydescr directly.
             let array_descr = arraydescr.clone().expect("VArrayInfo: arraydescr is None");
+            ctx.profiler()
+                .count_ops(alloc_opcode, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(alloc_opcode, majit_metainterp::counters::RECORDED_OPS);
             let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
@@ -8076,6 +8182,10 @@ fn materialize_bridge_virtual(
                 }
                 let idx_ref = ctx.const_int(i as i64);
                 // resume.py:660/665/670 setarrayitem_{ref,float,int}
+                ctx.profiler()
+                    .count_ops(set_opcode, majit_metainterp::counters::OPS);
+                ctx.profiler()
+                    .count_ops(set_opcode, majit_metainterp::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(
                     set_opcode,
                     &[new_op, idx_ref, value],
@@ -8107,6 +8217,12 @@ fn materialize_bridge_virtual(
             let array_descr = arraydescr
                 .as_ref()
                 .expect("VArrayStructInfo: arraydescr is None");
+            ctx.profiler()
+                .count_ops(OpCode::NewArrayClear, majit_metainterp::counters::OPS);
+            ctx.profiler().count_ops(
+                OpCode::NewArrayClear,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
@@ -8192,6 +8308,10 @@ fn materialize_bridge_virtual(
             //   [func, size], calldescr). A missing entry surfaces here, as the
             // calldescr is consumed by the CALL_I op, not as a separate lookup
             // assertion.
+            ctx.profiler()
+                .count_ops(OpCode::CallI, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(OpCode::CallI, majit_metainterp::counters::RECORDED_OPS);
             let buffer = ctx.record_op_with_descr(
                 OpCode::CallI,
                 &[func_ref, size_ref],
@@ -8232,6 +8352,10 @@ fn materialize_bridge_virtual(
                     di.is_signed,
                 );
                 let offset_ref = ctx.const_int(off as i64);
+                ctx.profiler()
+                    .count_ops(OpCode::RawStore, majit_metainterp::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::RawStore, majit_metainterp::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(
                     OpCode::RawStore,
                     &[buffer, offset_ref, item],
@@ -8260,6 +8384,10 @@ fn materialize_bridge_virtual(
             let base_buffer = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
             // resume.py:726: buffer = decoder.int_add_const(base_buffer, self.offset)
             let offset_ref = ctx.const_int(*offset as i64);
+            ctx.profiler()
+                .count_ops(OpCode::IntAdd, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(OpCode::IntAdd, majit_metainterp::counters::RECORDED_OPS);
             let buffer = ctx.record_op(OpCode::IntAdd, &[base_buffer, offset_ref]);
             // resume.py:727: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
@@ -8300,6 +8428,10 @@ fn materialize_bridge_virtual(
                 (OpCode::Newstr, OpCode::Strsetitem)
             };
             // resume.py:769: string = decoder.allocate_string(length)
+            ctx.profiler()
+                .count_ops(alloc_opcode, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(alloc_opcode, majit_metainterp::counters::RECORDED_OPS);
             let string = ctx.record_op(alloc_opcode, &[length_ref]);
             // resume.py:770: decoder.virtuals_cache.set_ptr(index, string)
             cache.set_ptr(vidx, string);
@@ -8316,6 +8448,10 @@ fn materialize_bridge_virtual(
                     continue;
                 }
                 let idx_ref = ctx.const_int(i as i64);
+                ctx.profiler()
+                    .count_ops(set_opcode, majit_metainterp::counters::OPS);
+                ctx.profiler()
+                    .count_ops(set_opcode, majit_metainterp::counters::RECORDED_OPS);
                 ctx.record_op(set_opcode, &[string, idx_ref, charbox]);
             }
             if majit_metainterp::majit_log_enabled() {
@@ -8406,6 +8542,10 @@ fn materialize_bridge_virtual(
             let start = decode_fieldnum(ctx, fieldnums[1], rd_virtuals, resume_data, cache);
             let length = decode_fieldnum(ctx, fieldnums[2], rd_virtuals, resume_data, cache);
             // resume.py:1157-1158 / :1185-1186: stopbox = INT_ADD(startbox, lengthbox)
+            ctx.profiler()
+                .count_ops(OpCode::IntAdd, majit_metainterp::counters::OPS);
+            ctx.profiler()
+                .count_ops(OpCode::IntAdd, majit_metainterp::counters::RECORDED_OPS);
             let stop = ctx.record_op(OpCode::IntAdd, &[start, length]);
             let oopspec = if is_unicode {
                 majit_ir::effectinfo::OopSpecIndex::UniSlice

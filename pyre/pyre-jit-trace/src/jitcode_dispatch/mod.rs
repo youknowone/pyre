@@ -3138,6 +3138,14 @@ fn dispatch_switch_id<Sym: WalkSym>(
         };
         for &key in switchdict.const_keys_in_order() {
             let keybox = ctx.trace_ctx.const_int(key);
+            // pyjitpl.py:609-613 `opimpl_switch` miss uses
+            // `execute(INT_EQ, ...)` for each key.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::IntEq, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::IntEq, majit_metainterp::counters::RECORDED_OPS);
             let eqbox = ctx.trace_ctx.record_op(OpCode::IntEq, &[valuebox, keybox]);
             if let Some(v) = valuebox_concrete {
                 ctx.trace_ctx
@@ -7183,6 +7191,15 @@ fn emit_namespace_cell_store_fold<Sym: WalkSym>(
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
     } else {
+        // pyjitpl.py:974-988 `_opimpl_setfield_gc_any` record leg.
+        ctx.trace_ctx.profiler().count_ops(
+            majit_ir::OpCode::SetfieldGc,
+            majit_metainterp::counters::OPS,
+        );
+        ctx.trace_ctx.profiler().count_ops(
+            majit_ir::OpCode::SetfieldGc,
+            majit_metainterp::counters::RECORDED_OPS,
+        );
         ctx.trace_ctx.record_op_with_descr(
             majit_ir::OpCode::SetfieldGc,
             &[cell_opref, raw_int],
@@ -8309,6 +8326,13 @@ fn handle<Sym: WalkSym>(
             let base = read_int_reg(code, op, 0, ctx)?;
             let offset = read_int_reg(code, op, 1, ctx)?;
             let descr = read_descr(code, op, 2, ctx)?;
+            // pyjitpl.py:1025-1027 `opimpl_raw_load_i`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawLoadI, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawLoadI, majit_metainterp::counters::RECORDED_OPS);
             let result =
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::RawLoadI, &[base, offset], descr);
@@ -8331,6 +8355,13 @@ fn handle<Sym: WalkSym>(
             let offset = read_int_reg(code, op, 1, ctx)?;
             let value = read_int_reg(code, op, 2, ctx)?;
             let descr = read_descr(code, op, 3, ctx)?;
+            // pyjitpl.py:1018-1022 `_opimpl_raw_store`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawStore, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawStore, majit_metainterp::counters::RECORDED_OPS);
             ctx.trace_ctx
                 .record_op_with_descr(OpCode::RawStore, &[base, offset, value], descr);
             Ok((DispatchOutcome::Continue, op.next_pc))
@@ -8384,6 +8415,14 @@ fn handle<Sym: WalkSym>(
             let value = read_ref_reg(code, op, 2, ctx)?;
             let descr = read_descr(code, op, 3, ctx)?;
             let descr_index = descr.index();
+            // pyjitpl.py:736-744 `_opimpl_setarrayitem_gc_any`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::SetarrayitemGc,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
             ctx.trace_ctx.record_op_with_descr(
                 OpCode::SetarrayitemGc,
                 &[array, index, value],
@@ -8462,6 +8501,13 @@ fn handle<Sym: WalkSym>(
         // vtable word, so nothing is known about its class.
         "new/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            // pyjitpl.py:624-629 `execute_new`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::New, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::New, majit_metainterp::counters::RECORDED_OPS);
             let resbox = ctx.trace_ctx.record_op_with_descr(OpCode::New, &[], descr);
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             let dst = code[op.pc + 3] as usize;
@@ -8483,6 +8529,14 @@ fn handle<Sym: WalkSym>(
             // `class_now_known` takes the vtable address: pyre tracks the
             // concrete class pointer where upstream only raises HF_KNOWN_CLASS.
             let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
+            // pyjitpl.py:624-629 `execute_new_with_vtable`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::NewWithVtable, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::NewWithVtable,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
             let resbox = ctx
                 .trace_ctx
                 .record_op_with_descr(OpCode::NewWithVtable, &[], descr);
@@ -8519,6 +8573,14 @@ fn handle<Sym: WalkSym>(
             let is_ref_array = descr
                 .as_array_descr()
                 .map_or(false, |a| a.is_array_of_pointers());
+            // pyjitpl.py:631-637 `_opimpl_new_array`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::NewArrayClear, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::NewArrayClear,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
             let resbox =
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::NewArrayClear, &[length], descr);

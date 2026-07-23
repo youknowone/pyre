@@ -1671,6 +1671,15 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                         continue;
                     }
                     let idx = ctx.trace_ctx.const_int(slot as i64);
+                    // pyjitpl.py:3489-3521 `gen_store_back_in_vable`
+                    // escape flush uses the standard recorded store path.
+                    ctx.trace_ctx
+                        .profiler()
+                        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+                    ctx.trace_ctx.profiler().count_ops(
+                        OpCode::SetarrayitemGc,
+                        majit_metainterp::counters::RECORDED_OPS,
+                    );
                     ctx.trace_ctx.record_op_with_descr(
                         OpCode::SetarrayitemGc,
                         &[locals_array, idx, operand],
