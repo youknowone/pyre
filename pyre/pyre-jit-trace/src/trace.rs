@@ -139,16 +139,22 @@ pub fn walk_active_sym_exc_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     // forwarded pointer back — matching the accepted `jit_driver_pair_from_root_area`
     // convention in `pyre-jit`.
     let sym = unsafe { &*sym_ptr };
-    let mut mark = |p: pyre_object::PyObjectRef| {
-        if !p.is_null() {
-            let mut gcref = majit_ir::GcRef(p as usize);
-            visitor(&mut gcref);
+    let carriers = [sym.last_exc_value, sym.current_exc_value];
+    for p in carriers
+        .into_iter()
+        .chain(sym.trace_built_exc.values().copied())
+    {
+        if p.is_null() {
+            continue;
         }
-    };
-    mark(sym.last_exc_value);
-    mark(sym.current_exc_value);
-    for exc in sym.trace_built_exc.values() {
-        mark(*exc);
+        let mut gcref = majit_ir::GcRef(p as usize);
+        visitor(&mut gcref);
+        // The carrier is non-moving, so a minor's root visitor no-ops on it
+        // and never reaches its fields: young children (tracebacks/args built
+        // while tracing) would be left dangling across the minor. Forward the
+        // raw child slots explicitly; the writes land in the exception
+        // object, not the sym, so the shared-read contract above holds.
+        unsafe { pyre_interpreter::eval::walk_raw_exception_roots(p, visitor) };
     }
 }
 
@@ -486,7 +492,20 @@ fn try_commit_midbody_abort(
         };
         frame.locals_w_mut().as_mut_slice()[stack_base + rel] = *value;
     }
+    // The array is old-gen from birth (`FrameLocalsArrayAllocation::OldGenGc`)
+    // and `FrameLocalsRoot` only forwards the field slot, not the items: the
+    // young refs just stored need the remembered set to survive the boxing
+    // allocations below, and each minor consumes the entry, so re-arm after
+    // every batch that follows a possible collection.
+    crate::state::frame_array_write_barrier(
+        frame.as_mut_ptr() as *mut u8,
+        frame.locals_w_mut() as *mut _,
+    );
     for (slot, value) in current.live_locals.iter().enumerate() {
+        crate::state::frame_array_write_barrier(
+            frame.as_mut_ptr() as *mut u8,
+            frame.locals_w_mut() as *mut _,
+        );
         frame.locals_w_mut().as_mut_slice()[slot] = match value {
             None => pyre_object::PY_NULL,
             Some(crate::state::ConcreteValue::Ref(value)) => *value,
@@ -499,6 +518,10 @@ fn try_commit_midbody_abort(
             }
         };
     }
+    crate::state::frame_array_write_barrier(
+        frame.as_mut_ptr() as *mut u8,
+        frame.locals_w_mut() as *mut _,
+    );
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = words.callee_py_pc as isize - 1;
     let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };

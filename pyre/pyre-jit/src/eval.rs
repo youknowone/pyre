@@ -3228,11 +3228,41 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     }
     // A GC-managed exception (post-#18) marked here has its registered child
     // offsets traced by the collector; the exception is oldgen-stable so a
-    // bare mark suffices. (The off-GC child-walk fallback is intentionally
-    // omitted — it only matters with no collector installed, and reaching the
-    // private `walk_raw_exception_roots` from this crate is unnecessary.)
+    // bare mark suffices.
     let mut gcref = majit_ir::GcRef(exc as usize);
     visitor(&mut gcref);
+    // The carrier is non-moving (oldgen-stable / malloc_typed), so a minor
+    // collection's root visitor no-ops on it and never reaches its fields
+    // (`drag_out_root` returns for non-nursery starts): young children —
+    // tracebacks appended by the raise in flight, args — would be left
+    // dangling inside the exception across the minor. Forward the raw child
+    // slots explicitly, as the EC root walk does for `sys_exc_value`.
+    unsafe {
+        pyre_interpreter::eval::walk_raw_exception_roots(
+            gcref.0 as pyre_object::PyObjectRef,
+            visitor,
+        )
+    };
+}
+
+/// Root the blackhole-published exception (`BH_LAST_EXC_VALUE`): a can-raise
+/// blackhole helper parks the exception's raw pointer there until the
+/// dispatcher drains it (`bhimpl_abort_permanent` / handler dispatch); in that
+/// window the exception is reachable only through the raw TLS `i64`. Same
+/// carrier/children split as [`walk_jit_exc_value`].
+fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+    if exc == 0 {
+        return;
+    }
+    let mut gcref = majit_ir::GcRef(exc as usize);
+    visitor(&mut gcref);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_exception_roots(
+            gcref.0 as pyre_object::PyObjectRef,
+            visitor,
+        )
+    };
 }
 
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
@@ -3241,6 +3271,7 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_pyframe_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_jit_exc_value);
+    majit_gc::shadow_stack::register_extra_root_walker(walk_bh_last_exc_value);
     // Stored `PyError` carriers whose GC refs the precise collector cannot
     // reach through their raw TLS cells: the call-assembler FFI stash and the
     // no-handler trace→portal stash. Mirrors `walk_pending_call_error`.
@@ -6974,6 +7005,23 @@ fn execute_assembler(
             entry_pc,
             debug_first_arg_int(frame_root.frame()),
         );
+    }
+
+    // The interpreter may have left nursery-young refs in the frame's
+    // locals/stack array; compiled execution runs the virtualizable detached
+    // from the walked frame chain, so no minor re-traces those items unless
+    // the frame/array sits in the remembered set. Arm it once at entry
+    // (upstream every interpreter store runs under the translated write
+    // barrier, so the array is always covered there).
+    {
+        let f = frame_root.frame() as *mut PyFrame as *mut u8;
+        let arr = unsafe { (*(f as *mut PyFrame)).locals_cells_stack_w };
+        if pyre_object::gc_hook::try_gc_owns_object(arr as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(arr as *mut u8);
+        }
+        if pyre_object::gc_hook::try_gc_owns_object(f) {
+            pyre_object::gc_hook::try_gc_write_barrier(f);
+        }
     }
 
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe

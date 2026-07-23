@@ -1064,6 +1064,14 @@ impl VirtualizableInfo {
                 Type::Ref => {
                     let ptr = obj_ptr.add(field.offset) as *mut usize;
                     *ptr = value as usize;
+                    // The ref may be nursery-young while the virtualizable is
+                    // old-gen and runs detached from the walked frame chain;
+                    // upstream's write_boxes stores run under the translated
+                    // write barrier (virtualizable.py:101-113), so arm the
+                    // object in the remembered set here.
+                    if majit_gc::gc_owns_object(obj_ptr as usize) {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
+                    }
                 }
                 // Word-sized `Signed` field (`isize`/`usize`): 4 bytes on
                 // wasm32. Writing 8 bytes would clobber the adjacent field.
@@ -1168,6 +1176,18 @@ impl VirtualizableInfo {
                 Type::Ref => {
                     let ptr = array_ptr.add(item_offset) as *mut usize;
                     *ptr = value as usize;
+                    // The ref may be nursery-young while the array/frame are
+                    // old-gen and run detached from the walked frame chain
+                    // (virtualizable.py:101-113 write_boxes runs under the
+                    // translated write barrier). Arm whichever side the GC
+                    // owns: a GC array re-traces its own items; a stationary
+                    // block is re-walked through the owning frame's custom
+                    // trace.
+                    if majit_gc::gc_owns_object(array_ptr as usize) {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(array_ptr as usize));
+                    } else if majit_gc::gc_owns_object(obj_ptr as usize) {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
+                    }
                 }
                 _ => {
                     let ptr = array_ptr.add(item_offset) as *mut i64;

@@ -3859,6 +3859,28 @@ fn live_frame_array_values(
         .collect()
 }
 
+/// Re-arm the write barrier on a frame + its `locals_cells_stack_w` array
+/// after a JIT-side flush stored refs into them raw. The stored values may
+/// be nursery-young while the frame/array are old-gen, and after the flush
+/// the frame can run detached from the walked frame chain (virtualizable),
+/// so no minor re-traces the items unless an owner sits in the remembered
+/// set (virtualizable.py:136 `write_boxes` stores run under the translated
+/// write barrier; `remember_frame_locals_array` is the creation-time twin).
+/// A GC-owned array re-traces its own items; a stationary `std::alloc`
+/// array is only re-walked through its owning frame's custom trace — arm
+/// whichever side the GC owns.
+pub(crate) fn frame_array_write_barrier(
+    frame: *mut u8,
+    arr_ptr: *mut pyre_object::FixedObjectArray,
+) {
+    if pyre_object::gc_hook::try_gc_owns_object(arr_ptr as *mut u8) {
+        pyre_object::gc_hook::try_gc_write_barrier(arr_ptr as *mut u8);
+    }
+    if pyre_object::gc_hook::try_gc_owns_object(frame) {
+        pyre_object::gc_hook::try_gc_write_barrier(frame);
+    }
+}
+
 /// Write one decoded Ref back into the live frame's locals_cells_stack_w
 /// (the GC-rooted virtualizable array), re-asserting the resume-decoded
 /// vable image after the guard-failure vsd correction cleared root slots
@@ -3881,6 +3903,7 @@ fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: majit_ir::V
         return;
     }
     arr.as_mut_slice()[slot] = r.as_usize() as pyre_object::PyObjectRef;
+    frame_array_write_barrier(vable_ptr as *mut u8, lp);
 }
 
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
@@ -4291,6 +4314,7 @@ fn flush_walk_end_state_to_frame_inner(
             pf.last_instr = body_pc as isize - 1;
         }
     }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
     true
 }
 
@@ -4424,6 +4448,7 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
         pf.valuestackdepth = end_vsd;
         pf.last_instr = call_py_pc as isize - 1;
     }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
     true
 }
 
@@ -4522,6 +4547,7 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }
     }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
     true
 }
 
@@ -4564,6 +4590,7 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
         pf.valuestackdepth = nlocals + 1;
         pf.last_instr = post_call_py_pc as isize - 1;
     }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
     true
 }
 

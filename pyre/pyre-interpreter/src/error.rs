@@ -411,6 +411,11 @@ impl PyError {
         forward(&mut self.exc_object);
         forward(&mut self.w_name_context);
         forward(&mut self.w_obj_context);
+        // The exception carrier is non-moving (stable/malloc_typed), so root
+        // visitors no-op on it during a minor and never reach its fields;
+        // forward the raw child slots so young tracebacks/args parked across
+        // a collection stay valid.
+        unsafe { crate::eval::walk_raw_exception_roots(self.exc_object, visitor) };
     }
 }
 
