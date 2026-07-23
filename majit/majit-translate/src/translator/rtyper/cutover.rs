@@ -2151,10 +2151,15 @@ pub(crate) fn register_unsafe_fn_stubs(
 ///   `Void` result.
 /// - `core::cell::Cell::<T>::set(&self, val)` returns `()` — an
 ///   in-place store into the cell, `Void` result.
-/// - `core::f64::<Impl>::is_infinite` / `core::slice::<Impl>::is_empty`
-///   return `bool` — `Bool` result.
-/// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` return `f64` —
-///   `Float` result.
+/// - `core::f64::<Impl>::is_infinite` / `core::f64::<Impl>::is_nan` /
+///   `core::slice::<Impl>::is_empty` return `bool` — `Bool` result.
+/// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` /
+///   `core::f64::<Impl>::abs` return `f64` — `Float` result.
+/// - `core::f64::<Impl>::NAN` / `core::f64::<Impl>::INFINITY` are the
+///   associated `f64` constants, reached as zero-arg `FunctionPath`
+///   accessors — `Float` result, empty arg list. These plus the `f64`
+///   predicates above close the complex-division (`_Py_c_quot` /
+///   `_Py_c_prod`) foreign-leaf cluster.
 /// - `core::f64::<Impl>::to_bits` returns `u64` reinterpreted as `i64` —
 ///   `Signed` result.
 ///
@@ -2198,6 +2203,22 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["core", "f64", "<Impl>", "to_bits"],
         &["self"],
         LowLevelType::Signed,
+    ),
+    (
+        &["core", "f64", "<Impl>", "abs"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+    (
+        &["core", "f64", "<Impl>", "is_nan"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (&["core", "f64", "<Impl>", "NAN"], &[], LowLevelType::Float),
+    (
+        &["core", "f64", "<Impl>", "INFINITY"],
+        &[],
+        LowLevelType::Float,
     ),
 ];
 
