@@ -1056,6 +1056,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "exec_prefix", w_str_new(""));
     module_ns_store(ns, "base_prefix", w_str_new(""));
     module_ns_store(ns, "base_exec_prefix", w_str_new(""));
+    // FrozenImporter uses the resolved stdlib root to reconstruct source
+    // filenames for frozen stdlib modules.
+    #[cfg(feature = "host_env")]
+    let stdlib_dir = crate::importing::detect_stdlib_path()
+        .and_then(|path| path.to_str().map(w_str_new))
+        .unwrap_or_else(w_none);
+    #[cfg(not(feature = "host_env"))]
+    let stdlib_dir = w_none();
+    module_ns_store(ns, "_stdlib_dir", stdlib_dir);
     // sys._framework — macOS framework name (empty string on non-framework builds)
     module_ns_store(ns, "_framework", w_str_new(""));
     // sys._jit — namespace with is_enabled/is_available methods.

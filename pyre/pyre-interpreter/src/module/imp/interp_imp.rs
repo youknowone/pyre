@@ -3,12 +3,189 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use crate::importing::BUILTIN_MODULES;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-/// _imp stub — PyPy: pypy/module/imp/
-///
-/// Minimal subset required by importlib._bootstrap to decide which loader
-/// handles a name. We report every name we know about as a builtin so
-/// pyre's own registrations remain authoritative.
+struct FrozenModule {
+    name: &'static str,
+    origname: Option<&'static str>,
+    is_package: bool,
+    source: FrozenSource,
+}
+
+enum FrozenSource {
+    Stdlib(&'static str),
+    Literal(&'static str),
+}
+
+static FROZEN_MODULES: &[FrozenModule] = &[
+    FrozenModule {
+        name: "_frozen_importlib",
+        origname: Some("importlib._bootstrap"),
+        is_package: false,
+        source: FrozenSource::Stdlib("importlib/_bootstrap.py"),
+    },
+    FrozenModule {
+        name: "_frozen_importlib_external",
+        origname: Some("importlib._bootstrap_external"),
+        is_package: false,
+        source: FrozenSource::Stdlib("importlib/_bootstrap_external.py"),
+    },
+    FrozenModule {
+        name: "zipimport",
+        origname: Some("zipimport"),
+        is_package: false,
+        source: FrozenSource::Stdlib("zipimport.py"),
+    },
+    FrozenModule {
+        name: "__hello__",
+        origname: Some("__hello__"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__hello__.py"),
+    },
+    FrozenModule {
+        name: "__hello_alias__",
+        origname: Some("__hello__"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__hello__.py"),
+    },
+    FrozenModule {
+        name: "__phello_alias__",
+        origname: Some("__hello__"),
+        is_package: true,
+        source: FrozenSource::Stdlib("__hello__.py"),
+    },
+    FrozenModule {
+        name: "__phello_alias__.spam",
+        origname: Some("__hello__"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__hello__.py"),
+    },
+    FrozenModule {
+        name: "__phello__",
+        origname: Some("__phello__"),
+        is_package: true,
+        source: FrozenSource::Stdlib("__phello__/__init__.py"),
+    },
+    FrozenModule {
+        name: "__phello__.__init__",
+        origname: Some("<__phello__"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__phello__/__init__.py"),
+    },
+    FrozenModule {
+        name: "__phello__.ham",
+        origname: Some("__phello__.ham"),
+        is_package: true,
+        source: FrozenSource::Stdlib("__phello__/ham/__init__.py"),
+    },
+    FrozenModule {
+        name: "__phello__.ham.__init__",
+        origname: Some("<__phello__.ham"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__phello__/ham/__init__.py"),
+    },
+    FrozenModule {
+        name: "__phello__.ham.eggs",
+        origname: Some("__phello__.ham.eggs"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__phello__/ham/eggs.py"),
+    },
+    FrozenModule {
+        name: "__phello__.spam",
+        origname: Some("__phello__.spam"),
+        is_package: false,
+        source: FrozenSource::Stdlib("__phello__/spam.py"),
+    },
+    FrozenModule {
+        name: "__hello_only__",
+        origname: None,
+        is_package: false,
+        source: FrozenSource::Literal("initialized = True\n"),
+    },
+];
+
+static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(0);
+
+fn frozen_module(name: &str) -> Option<&'static FrozenModule> {
+    FROZEN_MODULES.iter().find(|entry| entry.name == name)
+}
+
+fn is_bootstrap_frozen(name: &str) -> bool {
+    matches!(
+        name,
+        "_frozen_importlib" | "_frozen_importlib_external" | "zipimport"
+    )
+}
+
+fn frozen_module_served(entry: &FrozenModule) -> bool {
+    let mode = FROZEN_OVERRIDE.load(Ordering::Relaxed);
+    mode > 0 || (mode <= 0 && is_bootstrap_frozen(entry.name))
+}
+
+fn served_frozen_module(name: &str) -> Option<&'static FrozenModule> {
+    frozen_module(name).filter(|entry| frozen_module_served(entry))
+}
+
+fn frozen_name(args: &[pyre_object::PyObjectRef], function: &str) -> Result<String, crate::PyError> {
+    let Some(&name) = args.first() else {
+        return Err(crate::PyError::type_error(format!(
+            "{function} expected at least 1 argument, got 0"
+        )));
+    };
+    if !unsafe { pyre_object::is_str(name) } {
+        return Err(crate::PyError::type_error(format!(
+            "{function}() argument 1 must be str"
+        )));
+    }
+    Ok(unsafe { pyre_object::w_str_get_value(name) }.to_owned())
+}
+
+fn missing_frozen_error(name: &str) -> crate::PyError {
+    crate::PyError::import_error_name_path(
+        format!("No such frozen object named {name:?}"),
+        pyre_object::w_str_new(name),
+        pyre_object::w_none(),
+    )
+}
+
+fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyError> {
+    match entry.source {
+        FrozenSource::Literal(source) => Ok((source.to_owned(), "frozen_only".to_owned())),
+        FrozenSource::Stdlib(relative) => {
+            #[cfg(feature = "host_env")]
+            {
+                let stdlib = crate::importing::detect_stdlib_path().ok_or_else(|| {
+                    crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        format!("cannot resolve source for frozen module {:?}", entry.name),
+                    )
+                })?;
+                let path = stdlib.join(relative);
+                let source = crate::importing::read_source_to_string(&path).map_err(|error| {
+                    crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        format!("cannot read '{}': {error}", path.display()),
+                    )
+                })?;
+                let code_name = entry
+                    .origname
+                    .unwrap_or(entry.name)
+                    .strip_prefix('<')
+                    .unwrap_or(entry.origname.unwrap_or(entry.name));
+                Ok((source, code_name.to_owned()))
+            }
+            #[cfg(not(feature = "host_env"))]
+            {
+                let _ = relative;
+                Err(crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("cannot resolve source for frozen module {:?}", entry.name),
+                ))
+            }
+        }
+    }
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -37,7 +214,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "is_frozen",
         crate::make_builtin_function_with_arity(
             "is_frozen",
-            |_| Ok(pyre_object::w_bool_from(false)),
+            |args| {
+                let name = frozen_name(args, "is_frozen")?;
+                Ok(pyre_object::w_bool_from(
+                    served_frozen_module(&name).is_some(),
+                ))
+            },
             1,
         ),
     );
@@ -46,7 +228,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "is_frozen_package",
         crate::make_builtin_function_with_arity(
             "is_frozen_package",
-            |_| Ok(pyre_object::w_bool_from(false)),
+            |args| {
+                let name = frozen_name(args, "is_frozen_package")?;
+                let entry =
+                    served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
+                Ok(pyre_object::w_bool_from(entry.is_package))
+            },
             1,
         ),
     );
@@ -54,51 +241,71 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "_frozen_module_names",
         crate::make_builtin_function("_frozen_module_names", |_| {
-            Ok(pyre_object::w_list_new(Vec::new()))
+            Ok(pyre_object::w_list_new(
+                FROZEN_MODULES
+                    .iter()
+                    .filter(|entry| frozen_module_served(entry))
+                    .map(|entry| pyre_object::w_str_new(entry.name))
+                    .collect(),
+            ))
         }),
     );
-    // `_imp.find_frozen(name)` — `FrozenImporter.find_spec` calls this and
-    // treats None as "not a frozen module". Pyre has no frozen modules, so
-    // every name resolves to None and the import falls through to the next
-    // finder on `sys.meta_path`.
     crate::module_ns_store(
         ns,
         "find_frozen",
         crate::make_builtin_function_with_arity(
             "find_frozen",
-            |_| Ok(pyre_object::w_none()),
+            |args| {
+                let name = frozen_name(args, "find_frozen")?;
+                let Some(entry) = served_frozen_module(&name) else {
+                    return Ok(pyre_object::w_none());
+                };
+                let origname = entry
+                    .origname
+                    .map(pyre_object::w_str_new)
+                    .unwrap_or_else(pyre_object::w_none);
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_none(),
+                    pyre_object::w_bool_from(entry.is_package),
+                    origname,
+                ]))
+            },
             1,
         ),
     );
-    // `_imp._override_frozen_modules_for_tests(value)` — the CPython test
-    // harness (`test.support.import_helper`) toggles frozen-module
-    // overriding.  Pyre has no frozen modules, so accept and ignore.
     crate::module_ns_store(
         ns,
         "_override_frozen_modules_for_tests",
-        crate::make_builtin_function("_override_frozen_modules_for_tests", |_| {
+        crate::make_builtin_function("_override_frozen_modules_for_tests", |args| {
+            let Some(&value) = args.first() else {
+                return Err(crate::PyError::type_error(
+                    "_override_frozen_modules_for_tests expected at least 1 argument, got 0",
+                ));
+            };
+            let value = crate::baseobjspace::gateway_int_w(value)?;
+            FROZEN_OVERRIDE.store(value, Ordering::Relaxed);
             Ok(pyre_object::w_none())
         }),
     );
-    // `_imp.get_frozen_object(name, data=None)` — pyre has no frozen modules,
-    // so every name is unknown and `set_frozen_error(FROZEN_NOT_FOUND)` raises
-    // `ImportError("No such frozen object named %R")`.
     crate::module_ns_store(
         ns,
         "get_frozen_object",
         crate::make_builtin_function_with_arity(
             "get_frozen_object",
             |args| {
-                let Some(&name) = args.first() else {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::TypeError,
-                        "get_frozen_object expected at least 1 argument, got 0".to_string(),
-                    ));
-                };
-                let name_repr = unsafe { crate::display::py_repr(name)? };
-                Err(crate::PyError::new(
-                    crate::PyErrorKind::ImportError,
-                    format!("No such frozen object named {name_repr}"),
+                let name = frozen_name(args, "get_frozen_object")?;
+                let entry =
+                    served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
+                let (source, code_name) = frozen_source(entry)?;
+                let filename = format!("<frozen {code_name}>");
+                let code = crate::compile::compile_source_with_filename(
+                    &source,
+                    crate::compile::Mode::Exec,
+                    &filename,
+                )
+                .map_err(|error| crate::builtins::compile_err_to_syntax_error(error, &source))?;
+                Ok(crate::w_code_new(
+                    Box::into_raw(Box::new(code)) as *const ()
                 ))
             },
             1,

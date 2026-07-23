@@ -2192,12 +2192,69 @@ fn install_importlib_bootstrap(
     )?;
     crate::call::call_function_impl_result(install_external, &[])?;
 
+    if let Some(external) = check_sys_modules("_frozen_importlib_external") {
+        set_frozen_alias_metadata(
+            external,
+            "_frozen_importlib_external",
+            shadow_stack_get(module_slot),
+        )?;
+    }
+
     // `_install_external_importers` imports `_frozen_importlib_external`,
     // which aliases that name onto the loaded submodule; the bootstrap module
     // itself is only reached under its submodule name, so it never picks up
     // the matching alias. Register it once both installs have succeeded, so a
     // body that raised leaves no alias behind.
     set_sys_module("_frozen_importlib", shadow_stack_get(module_slot));
+    set_frozen_alias_metadata(
+        shadow_stack_get(module_slot),
+        "_frozen_importlib",
+        shadow_stack_get(module_slot),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "host_env")]
+fn set_frozen_alias_metadata(
+    module: PyObjectRef,
+    name: &str,
+    bootstrap: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let module_slot = shadow_stack_len();
+    pin_root(module);
+    let bootstrap_slot = shadow_stack_len();
+    pin_root(bootstrap);
+
+    let loader =
+        crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "FrozenImporter")?;
+    let loader_slot = shadow_stack_len();
+    pin_root(loader);
+    let find_spec = crate::baseobjspace::getattr_str(shadow_stack_get(loader_slot), "find_spec")?;
+    let find_spec_slot = shadow_stack_len();
+    pin_root(find_spec);
+    let w_name = pyre_object::w_str_new(name);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let spec = crate::call::call_function_impl_result(
+        shadow_stack_get(find_spec_slot),
+        &[shadow_stack_get(name_slot)],
+    )?;
+    let spec_slot = shadow_stack_len();
+    pin_root(spec);
+
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(module_slot),
+        "__loader__",
+        shadow_stack_get(loader_slot),
+    )?;
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(module_slot),
+        "__spec__",
+        shadow_stack_get(spec_slot),
+    )?;
     Ok(())
 }
 
