@@ -156,6 +156,11 @@ fn allowed_syscalls() -> Vec<u32> {
         libc::SYS_lseek,
         libc::SYS_fstat,
         libc::SYS_fcntl,
+        // Python 3.14's standard-stream construction probes the inherited
+        // descriptors with isatty(), which glibc implements as ioctl(TCGETS).
+        // The sandbox cannot open host paths, so this is limited to descriptors
+        // inherited from the controller or returned by the marshalling seam.
+        libc::SYS_ioctl,
         libc::SYS_getcwd,
         libc::SYS_dup,
         libc::SYS_dup3,
