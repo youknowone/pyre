@@ -2621,6 +2621,49 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     Ok(Some(shadow_stack_get(mod_slot)))
 }
 
+/// `interp_import.py:98` — `e.remove_traceback_module_frames('<frozen
+/// importlib._bootstrap>', '<frozen importlib._bootstrap_external>', ...)`:
+/// drop the leading traceback entries that belong to the importlib bootstrap
+/// so an import error does not expose its internal `__import__` /
+/// `_find_and_load` machinery. pyre runs the bootstrap from the on-disk
+/// `importlib/_bootstrap{,_external}.py` sources, so match those filenames as
+/// well as the frozen pseudo-names. Only leading (outermost, contiguous)
+/// bootstrap frames are removed; a user frame stops the walk, keeping real
+/// application frames intact.
+fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
+    use pyre_object::interp_exceptions::{w_exception_get_traceback, w_exception_set_traceback};
+
+    fn is_bootstrap_filename(path: &str) -> bool {
+        let norm = path.replace('\\', "/");
+        norm.ends_with("importlib/_bootstrap.py")
+            || norm.ends_with("importlib/_bootstrap_external.py")
+            || norm == "<frozen importlib._bootstrap>"
+            || norm == "<frozen importlib._bootstrap_external>"
+    }
+
+    let exc = err.to_exc_object();
+    if exc.is_null() {
+        return err;
+    }
+    unsafe {
+        let mut tb = w_exception_get_traceback(exc);
+        while !tb.is_null() && !is_none(tb) {
+            let w_code = crate::pytraceback::w_pytraceback_get_w_code(tb);
+            let is_bootstrap = !w_code.is_null()
+                && crate::pycode::code_get_field(w_code, "co_filename")
+                    .ok()
+                    .filter(|f| pyre_object::is_str(*f))
+                    .is_some_and(|f| is_bootstrap_filename(&pyre_object::w_str_get_value(f)));
+            if !is_bootstrap {
+                break;
+            }
+            tb = crate::pytraceback::w_pytraceback_get_w_next(tb);
+        }
+        w_exception_set_traceback(exc, tb);
+    }
+    err
+}
+
 /// `builtins.__import__` — `interp___import__`: a fast path answering
 /// absolute imports from initialised `sys.modules` entries, the app-level
 /// `_bootstrap.__import__` (the full `sys.meta_path` / `sys.path_hooks`
@@ -2745,7 +2788,8 @@ pub fn dunder_import(
                     shadow_stack_get(call_fromlist_slot),
                     shadow_stack_get(level_slot),
                 ],
-            );
+            )
+            .map_err(strip_bootstrap_traceback_frames);
         }
     }
     importhook(
