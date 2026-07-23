@@ -222,6 +222,72 @@ mod literal_for_unroll {
     }
 }
 
+mod float_state_field_shape {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD_FLOAT;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    const OP_TOUCH_F: u8 = 9;
+
+    struct FloatDispatchState {
+        f: f64,
+    }
+
+    #[majit_macros::jit_interp(
+        state = FloatDispatchState,
+        env = Bytecode,
+        state_fields = { f: float },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_float_field(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<FloatDispatchState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = FloatDispatchState { f: 0.0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_TOUCH_F => state.f = state.f + 2.5,
+                _ => break,
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn dispatch_arm_subjitcode_lowers_float_state_field_write() {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![], vec![], vec![0]);
+        __prebuild_jitcode_liveness_dispatch_float_field(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_dispatch_float_field(&mut asm, 0i64)
+            .expect("float dispatch lower must succeed");
+        let sub_jitcodes = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .collect::<Vec<_>>();
+        assert!(
+            sub_jitcodes
+                .iter()
+                .any(|sub| sub.code.iter().any(|&b| b == BC_STORE_STATE_FIELD_FLOAT)),
+            "state.f update must lower to store_state_field_float; sub codes: {:?}",
+            sub_jitcodes
+                .iter()
+                .map(|sub| sub.code.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 mod or_pattern {
     use super::{Bytecode, OP_INC_A, OP_NOP};
     use majit_metainterp::jitcode::insns::BC_INLINE_CALL;

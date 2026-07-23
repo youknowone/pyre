@@ -261,9 +261,7 @@ pub enum VableArrayLayoutDecl {
 
 /// State field declaration for register/tape machines.
 ///
-/// Syntax: `state_fields = { a: int, regs: [int], ... }`
-///
-/// Current implementation supports only `int` and `[int]`.
+/// Syntax: `state_fields = { a: int, x: float, regs: [int], ... }`
 pub struct StateFieldsConfig {
     pub fields: Vec<StateFieldDecl>,
 }
@@ -282,7 +280,8 @@ pub struct StateFieldDecl {
 pub enum StateFieldKind {
     /// Scalar value.
     ///
-    /// Syntax: `a: int` (default i64 storage) or `a: int(usize)` /
+    /// Syntax: `a: int` (default i64 storage), `x: float` (default f64
+    /// storage), or `a: int(usize)` /
     /// `a: int(i32)` to declare a different Rust storage type. RPython
     /// parity: `lltype.Signed` is i64 word-sized, `lltype.Unsigned` is
     /// usize word-sized — both render to a single Int register in IR
@@ -862,8 +861,8 @@ fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
 
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
 ///
-/// Parse `state_fields = { name: type, ... }` where type is `int`, `[int]`,
-/// `[int; virt]`, or `opaque(TypePath)`.
+/// Parse `state_fields = { name: type, ... }` where type is `int`, `float`,
+/// `[int]`, `[int; virt]`, `[float; virt]`, or `opaque(TypePath)`.
 fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
     let content;
     braced!(content in input);
@@ -874,16 +873,16 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
         content.parse::<Token![:]>()?;
 
         let kind = if content.peek(syn::token::Bracket) {
-            // Array: [int] or virtualizable: [int; virt]
+            // Array: [int]/[float] or virtualizable: [int; virt]/[float; virt]
             let inner;
             bracketed!(inner in content);
             let item_type: Ident = inner.parse()?;
-            if item_type != "int" {
+            if item_type != "int" && item_type != "float" {
                 return Err(syn::Error::new(
                     item_type.span(),
                     format!(
                         "state_fields array `{name}` uses unsupported item type `{item_type}`; \
-                         only `int` is currently supported"
+                         supported item types: `int`, `float`"
                     ),
                 ));
             }
@@ -913,16 +912,18 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
             let type_path: syn::Path = inner.parse()?;
             StateFieldKind::Ref(type_path)
         } else {
-            // Scalar forms: `int`, `int(<TypePath>)`, or `opaque(TypePath)`.
+            // Scalar forms: `int`, `int(<TypePath>)`, `float`,
+            // `float(<TypePath>)`, or `opaque(TypePath)`.
             let head: Ident = content.parse()?;
             if head == "opaque" {
                 let inner;
                 syn::parenthesized!(inner in content);
                 let type_path: syn::Path = inner.parse()?;
                 StateFieldKind::Opaque(type_path)
-            } else if head == "int" {
+            } else if head == "int" || head == "float" {
                 // RPython parity: optional `int(<TypePath>)` declares the
-                // Rust storage type when it differs from i64.
+                // Rust storage type when it differs from i64. `float(<Path>)`
+                // mirrors that shape; bare `float` stores as f64.
                 let rust_type = if content.peek(syn::token::Paren) {
                     let inner;
                     syn::parenthesized!(inner in content);
@@ -939,7 +940,8 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
                     head.span(),
                     format!(
                         "state_fields scalar `{name}` uses unsupported type `{head}`; \
-                         supported: `int`, `int(<TypePath>)`, `opaque(TypePath)`"
+                         supported: `int`, `int(<TypePath>)`, `float`, \
+                         `float(<TypePath>)`, `opaque(TypePath)`"
                     ),
                 ));
             }

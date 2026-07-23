@@ -229,6 +229,19 @@ impl<'c> Lowerer<'c> {
             );
             return Some(());
         }
+        if let Some(&field_index) = config.state_float_scalars.get(&member_name) {
+            let fi = field_index as u16;
+            let binding = self.lower_value_expr(&assign.right)?;
+            if !matches!(binding.kind, BindingKind::Float) {
+                return None;
+            }
+            let src = binding.reg;
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![Register::float(src)], vec![]),
+                quote! { __builder.store_state_field_float(#fi, #src); },
+            );
+            return Some(());
+        }
         None
     }
 
@@ -664,6 +677,25 @@ impl<'c> Lowerer<'c> {
             return Some(Binding {
                 reg,
                 kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: None,
+            });
+        }
+        if let Some(&field_index) = config.state_float_scalars.get(&member_name) {
+            let fi = field_index as u16;
+            let reg = self.alloc_reg();
+            let slot = config.float_identity_base() + fi;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![Register::float(slot)],
+                    vec![Register::float(reg)],
+                ),
+                quote! { __builder.load_state_field_float(#fi, #reg); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Float,
                 depends_on_stack: false,
                 struct_type: None,
             });

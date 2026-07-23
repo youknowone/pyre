@@ -316,7 +316,19 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     }
 
     if length_f != 0 {
-        let _ = LivenessIterator::new(offset, length_f, all_liveness);
+        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+        for reg_idx in &mut it {
+            let reg_idx = reg_idx as usize;
+            let scalars_end = layout.float_scalar_base + layout.num_float_scalars;
+            if (layout.float_scalar_base..scalars_end).contains(&reg_idx) {
+                if let Some(value) = bh.registers_f.get(reg_idx).copied() {
+                    state.writeback_live_float_scalar_state_field(
+                        reg_idx - layout.float_scalar_base,
+                        value,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3646,10 +3658,13 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                             if layout.num_virt_arrays == 0 {
-                                state.restore_banked(
+                                let float_base =
+                                    layout.float_scalar_base.min(bh.registers_f.len());
+                                state.restore_banked3(
                                     &compiled_meta,
                                     &bh.registers_i[int_base..],
                                     &bh.registers_r[ref_base..],
+                                    &bh.registers_f[float_base..],
                                 );
                             } else {
                                 writeback_live_state_scalars_from_blackhole(
@@ -3702,10 +3717,12 @@ impl<S: JitState> JitDriver<S> {
                             let layout = state.state_field_layout();
                             let int_base = layout.int_scalar_base.min(bh.registers_i.len());
                             let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                            state.restore_banked(
+                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                            state.restore_banked3(
                                 &compiled_meta,
                                 &bh.registers_i[int_base..],
                                 &bh.registers_r[ref_base..],
+                                &bh.registers_f[float_base..],
                             );
                             Some(usize::MAX)
                         }
@@ -6818,7 +6835,7 @@ mod tests {
         // Build the canonical liveness exactly the way the macro expansion
         // does (orth-6 helper + orth-2 _encode_liveness + insns
         // registration mirroring `assembler.py:222 self.insns[key] = opnum`).
-        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0);
+        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0, 0, 0);
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
         asm._encode_liveness(&live_i, &live_r, &live_f, &mut scratch);

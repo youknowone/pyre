@@ -331,22 +331,38 @@ pub trait JitState: Sized {
         self.restore(meta, int_values);
     }
 
+    /// Restore from all three typed register banks separately. The default
+    /// preserves existing int/ref interpreters by forwarding to
+    /// [`restore_banked`] and ignoring the float slice.
+    fn restore_banked3(
+        &mut self,
+        meta: &Self::Meta,
+        int_values: &[i64],
+        ref_values: &[i64],
+        _float_values: &[i64],
+    ) {
+        self.restore_banked(meta, int_values, ref_values);
+    }
+
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
         // Split the canonical-order typed values into the int and ref
         // register banks (preserving per-type order) so ref-typed state
-        // fields route to `restore_banked`'s ref slice. Float/Void ride the
-        // int bank — no float/void state fields exist today.
+        // fields route to `restore_banked3`'s ref slice and float-typed state
+        // fields route to its float slice. Invariant: no non-state-field
+        // `Value::Float` rides this live stream today; adding a general float
+        // red here must extend the positional restore contract explicitly.
         let mut ints: Vec<i64> = Vec::with_capacity(values.len());
         let mut refs: Vec<i64> = Vec::new();
+        let mut floats: Vec<i64> = Vec::new();
         for value in values {
             match value {
                 Value::Int(v) => ints.push(*v),
-                Value::Float(v) => ints.push(v.to_bits() as i64),
+                Value::Float(v) => floats.push(v.to_bits() as i64),
                 Value::Ref(r) => refs.push(r.as_usize() as i64),
                 Value::Void => ints.push(0),
             }
         }
-        self.restore_banked(meta, &ints, &refs);
+        self.restore_banked3(meta, &ints, &refs, &floats);
     }
 
     fn restore_guard_failure_values(
@@ -404,6 +420,11 @@ pub trait JitState: Sized {
 
     /// Ref-bank sibling of [`writeback_live_scalar_state_field`].
     fn writeback_live_ref_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}
+
+    /// Float-bank sibling of [`writeback_live_scalar_state_field`]. `value`
+    /// is the raw f64 bit carrier from `registers_f`; generated impls convert
+    /// with `f64::from_bits`.
+    fn writeback_live_float_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}
 
     /// Whole-circuit single-pass: write the walk's loop-carried virtualizable
     /// array element values (captured at close time by the trace ctx's

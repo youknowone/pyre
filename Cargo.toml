@@ -38,6 +38,7 @@ members = [
     "majit/examples/celpolicy",
     "majit/examples/celcolumn",
     "majit/examples/celcolscalar",
+    "majit/examples/celfloat",
     "majit/examples/spcount",
     # pyre
     "pyre/pyre-object",

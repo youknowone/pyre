@@ -172,8 +172,8 @@ pub const BC_LOAD_STATE_FIELD: u8 = 56;
 pub const BC_STORE_STATE_FIELD: u8 = 57;
 pub const BC_LOAD_STATE_ARRAY: u8 = 58;
 pub const BC_STORE_STATE_ARRAY: u8 = 59;
-// (bytes 60/61 were freed when the raw state-varray path was retired; virt
-// arrays now lower through the standard vable opcodes.)
+pub const BC_LOAD_STATE_FIELD_FLOAT: u8 = 60;
+pub const BC_STORE_STATE_FIELD_FLOAT: u8 = 61;
 pub const BC_GETFIELD_VABLE_I: u8 = 62;
 pub const BC_GETFIELD_VABLE_R: u8 = 63;
 pub const BC_GETFIELD_VABLE_F: u8 = 64;
@@ -1180,6 +1180,8 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     m.insert("store_state_field_ref/dr", BC_STORE_STATE_FIELD_REF);
     m.insert("load_state_field/di", BC_LOAD_STATE_FIELD);
     m.insert("store_state_field/di", BC_STORE_STATE_FIELD);
+    m.insert("load_state_field_float/df", BC_LOAD_STATE_FIELD_FLOAT);
+    m.insert("store_state_field_float/df", BC_STORE_STATE_FIELD_FLOAT);
     m.insert("load_state_array/dii", BC_LOAD_STATE_ARRAY);
     m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
     // TODO: pyre nested-bytecode `inline_call`.

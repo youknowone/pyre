@@ -271,6 +271,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "celfloat"
+version = "0.0.2"
+dependencies = [
+ "majit-ir",
+ "majit-macros",
+ "majit-metainterp",
+]
+
+[[package]]
 name = "celpolicy"
 version = "0.0.2"
 dependencies = [

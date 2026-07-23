@@ -2572,7 +2572,7 @@ mod tests {
             (0, vec![], 0),
         ] {
             let layout = StateFieldLayout::new(s, a.clone(), v, 0);
-            let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0);
+            let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0, 0, 0);
             assert_eq!(layout.total_slots(), live_i.len());
             assert!(live_r.is_empty() && live_f.is_empty());
         }
@@ -2591,7 +2591,8 @@ mod tests {
         assert_eq!(layout.total_slots(), 3);
         assert_eq!(layout.total_live_values(), 4);
         assert_eq!(layout.ref_scalar_slot(0), 1);
-        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(3, &[], 0, 1, 1, 0);
+        let (live_i, live_r, live_f) =
+            crate::live_slots_for_state_field_jit(3, &[], 0, 1, 1, 0, 0, 0);
         assert_eq!(layout.total_slots(), live_i.len());
         assert_eq!(layout.num_ref_scalars, live_r.len());
         assert_eq!(live_r, vec![1]);
@@ -4467,6 +4468,12 @@ pub struct StateFieldLayout {
     /// blackhole re-executes ops that read those argument registers, so
     /// the identity slots cannot alias them.
     pub ref_scalar_base: usize,
+    /// Float-typed scalar state fields. They live in the SEPARATE float
+    /// register bank at `registers_f[float_scalar_base ..
+    /// float_scalar_base + num_float_scalars]`, carrying raw f64 bits.
+    pub num_float_scalars: usize,
+    /// First float-bank register of the float-scalar identity slots.
+    pub float_scalar_base: usize,
     /// First int-bank register of the scalar/array identity slots —
     /// the int-bank mirror of `ref_scalar_base`. The dispatch JitCode's
     /// int argument (`pc` at i0) sits below it; an identity slot
@@ -4489,6 +4496,8 @@ impl StateFieldLayout {
             num_virt_arrays,
             num_ref_scalars: 0,
             ref_scalar_base: 0,
+            num_float_scalars: 0,
+            float_scalar_base: 0,
             int_scalar_base,
         }
     }
@@ -4509,8 +4518,23 @@ impl StateFieldLayout {
             num_virt_arrays,
             num_ref_scalars,
             ref_scalar_base,
+            num_float_scalars: 0,
+            float_scalar_base: 0,
             int_scalar_base,
         }
+    }
+
+    /// Add float-typed scalar fields in the float bank, starting at
+    /// `float_scalar_base`. Kept as a setter so existing int/ref constructor
+    /// call sites do not churn.
+    pub fn with_float_scalars(
+        mut self,
+        num_float_scalars: usize,
+        float_scalar_base: usize,
+    ) -> Self {
+        self.num_float_scalars = num_float_scalars;
+        self.float_scalar_base = float_scalar_base;
+        self
     }
 
     /// Total int register slots — equals the `live_slots_for_state_field_jit`
@@ -4525,7 +4549,7 @@ impl StateFieldLayout {
     /// run-compiled gate validates the flat live-value vector against this
     /// count (int slots flow to `registers_i`, ref scalars to `registers_r`).
     pub fn total_live_values(&self) -> usize {
-        self.total_slots() + self.num_ref_scalars
+        self.total_slots() + self.num_ref_scalars + self.num_float_scalars
     }
 
     /// Flat slot of scalar `field_idx` (scalars occupy
@@ -4551,6 +4575,19 @@ impl StateFieldLayout {
             self.num_ref_scalars
         );
         self.ref_scalar_base + field_idx
+    }
+
+    /// Float register slot of float-typed scalar `field_idx`. Float scalars
+    /// are densely packed in the float register bank starting at
+    /// `float_scalar_base`, in the same order the resume reader seeds the
+    /// float fail-args.
+    pub fn float_scalar_slot(&self, field_idx: usize) -> usize {
+        debug_assert!(
+            field_idx < self.num_float_scalars,
+            "float scalar field_idx {field_idx} out of range (num_float_scalars={})",
+            self.num_float_scalars
+        );
+        self.float_scalar_base + field_idx
     }
 
     /// First flat slot of fixed array `array_idx`.
@@ -4640,6 +4677,34 @@ fn handler_store_state_field_ref_dr(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
     bh.registers_r[slot] = bh.registers_r[src];
+    Ok(position + 3)
+}
+
+/// `load_state_field_float/df` — `registers_f[dest] = registers_f[float_slot(field_idx)]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 dest float register = 3 bytes.
+fn handler_load_state_field_float_df(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let dest = code[position + 2] as usize;
+    let slot = bh.state_field_layout.float_scalar_slot(field_idx);
+    bh.registers_f[dest] = bh.registers_f[slot];
+    Ok(position + 3)
+}
+
+/// `store_state_field_float/df` — `registers_f[float_slot(field_idx)] = registers_f[src]`.
+/// Encoding: 1× u16 `field_idx` + 1× u8 src float register = 3 bytes.
+fn handler_store_state_field_float_df(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let src = code[position + 2] as usize;
+    let slot = bh.state_field_layout.float_scalar_slot(field_idx);
+    bh.registers_f[slot] = bh.registers_f[src];
     Ok(position + 3)
 }
 
@@ -7021,6 +7086,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             majit_translate::insns::BC_STORE_STATE_FIELD,
         ),
         (
+            "load_state_field_float/df",
+            majit_translate::insns::BC_LOAD_STATE_FIELD_FLOAT,
+        ),
+        (
+            "store_state_field_float/df",
+            majit_translate::insns::BC_STORE_STATE_FIELD_FLOAT,
+        ),
+        (
             "load_state_array/dii",
             majit_translate::insns::BC_LOAD_STATE_ARRAY,
         ),
@@ -7441,6 +7514,14 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("store_state_field_ref/dr", handler_store_state_field_ref_dr);
     builder.wire_handler("load_state_field/di", handler_load_state_field_di);
     builder.wire_handler("store_state_field/di", handler_store_state_field_di);
+    builder.wire_handler(
+        "load_state_field_float/df",
+        handler_load_state_field_float_df,
+    );
+    builder.wire_handler(
+        "store_state_field_float/df",
+        handler_store_state_field_float_df,
+    );
     builder.wire_handler("load_state_array/dii", handler_load_state_array_dii);
     builder.wire_handler("store_state_array/dii", handler_store_state_array_dii);
 

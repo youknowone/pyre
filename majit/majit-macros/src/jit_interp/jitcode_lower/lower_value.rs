@@ -133,6 +133,24 @@ impl<'c> Lowerer<'c> {
                     struct_type: None,
                 })
             }
+            Expr::Lit(ExprLit {
+                lit: Lit::Float(float_lit),
+                ..
+            }) => {
+                let value = float_lit.base10_parse::<f64>().ok()?;
+                let bits = value.to_bits() as i64;
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstF, vec![], vec![Register::float(reg)]),
+                    quote! { __builder.load_const_f_value(#reg, #bits); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Float,
+                    depends_on_stack: false,
+                    struct_type: None,
+                })
+            }
             // Bool comparisons (`stackok == false`) ride the int channel:
             // bool bindings are IntLt/IntLe/… results carrying 0/1.
             Expr::Lit(ExprLit {
@@ -252,6 +270,40 @@ impl<'c> Lowerer<'c> {
     /// byte offset); the op writes an int result.
     fn lower_raw_load_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let segments = canonical_expr_segments(&call.func)?;
+        if segments.last()?.as_str() == "majit_raw_load_f" {
+            if call.args.len() != 2 {
+                return None;
+            }
+            let base = self.lower_value_expr(&call.args[0])?;
+            let ea = self.lower_value_expr(&call.args[1])?;
+            if !matches!(base.kind, BindingKind::Int) || !matches!(ea.kind, BindingKind::Int) {
+                return None;
+            }
+            let (base_reg, ea_reg) = (base.reg, ea.reg);
+            let dst = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::RawLoad,
+                    vec![Register::int(base_reg), Register::int(ea_reg)],
+                    vec![Register::float(dst)],
+                ),
+                quote! {
+                    let __raw_descr = __builder.add_raw_float_array_descr();
+                    __builder.raw_load_f(
+                        #dst as u16,
+                        #base_reg as u16,
+                        #ea_reg as u16,
+                        __raw_descr,
+                    );
+                },
+            );
+            return Some(Binding {
+                reg: dst,
+                kind: BindingKind::Float,
+                depends_on_stack: base.depends_on_stack || ea.depends_on_stack,
+                struct_type: None,
+            });
+        }
         let (item_size, is_signed) = match segments.last()?.as_str() {
             "majit_raw_load_i8" => (1usize, true),
             "majit_raw_load_u8" => (1usize, false),
@@ -1785,6 +1837,26 @@ impl<'c> Lowerer<'c> {
     fn lower_binary(&mut self, expr: &ExprBinary) -> Option<Binding> {
         let lhs = self.lower_value_expr(&expr.left)?;
         let rhs = self.lower_value_expr(&expr.right)?;
+        if matches!(lhs.kind, BindingKind::Float) && matches!(rhs.kind, BindingKind::Float) {
+            let opcode = opcode_for_binop_f(&expr.op)?;
+            let reg = self.alloc_reg();
+            let lhs_reg = lhs.reg;
+            let rhs_reg = rhs.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopF,
+                    Register::floats(&[lhs_reg, rhs_reg]),
+                    vec![Register::float(reg)],
+                ),
+                binop_f_emit_tokens(reg, &opcode, lhs_reg, rhs_reg),
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Float,
+                depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+                struct_type: None,
+            });
+        }
         if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
             return None;
         }

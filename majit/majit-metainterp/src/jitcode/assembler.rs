@@ -403,6 +403,24 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
+    /// Load a float-typed scalar state field into a float register. The
+    /// concrete shadow is carried as raw f64 bits in the float register bank.
+    /// `d` = u16 field index, `f` = float register.
+    pub fn load_state_field_float(&mut self, field_idx: u16, dest: u16) {
+        self.touch_float_reg(dest);
+        self.write_insn("load_state_field_float/df");
+        self.push_u16(field_idx);
+        self.push_u8(dest as u8);
+    }
+
+    /// Store a float register value into a float-typed scalar state field.
+    pub fn store_state_field_float(&mut self, field_idx: u16, src: u16) {
+        self.touch_float_reg(src);
+        self.write_insn("store_state_field_float/df");
+        self.push_u16(field_idx);
+        self.push_u8(src as u8);
+    }
+
     /// Load an array state field element into an int register.
     /// The element index comes from another int register.
     pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
@@ -1463,6 +1481,25 @@ impl JitCodeBuilder {
         })
     }
 
+    /// Add a descriptor for a raw native f64 array. The runtime raw-load-f
+    /// path carries the loaded f64 through `registers_f` as raw bits.
+    pub fn add_raw_float_array_descr(&mut self) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::Array {
+            base_size: 0,
+            itemsize: 8,
+            len_offset: None,
+            type_id: 0,
+            item_type: majit_ir::value::Type::Float,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+            is_gc_managed: false,
+        })
+    }
+
     /// Emit `raw_load_i/iid>i` (`blackhole.py:1512-1518 bhimpl_raw_load_i`):
     /// read an int from raw memory at `registers_i[base_reg] +
     /// registers_i[ea_reg]` (byte offset) into `dst`.  `jtransform.py:1165-1171
@@ -1480,6 +1517,20 @@ impl JitCodeBuilder {
         self.push_reg_u8(ea_reg, "raw_load_i ea");
         self.push_u16(descr_idx);
         self.push_reg_u8(dst, "raw_load_i dst");
+    }
+
+    /// Emit `raw_load_f/iid>f`: read an f64 from raw memory at
+    /// `registers_i[base_reg] + registers_i[ea_reg]` into float register
+    /// `dst`, preserving the exact bit pattern in the float bank.
+    pub fn raw_load_f(&mut self, dst: u16, base_reg: u16, ea_reg: u16, descr_idx: u16) {
+        self.touch_reg(base_reg);
+        self.touch_reg(ea_reg);
+        self.touch_float_reg(dst);
+        self.write_insn("raw_load_f/iid>f");
+        self.push_reg_u8(base_reg, "raw_load_f base");
+        self.push_reg_u8(ea_reg, "raw_load_f ea");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "raw_load_f dst");
     }
 
     /// Emit `raw_store_i/iiid` (`blackhole.py:1504-1506 bhimpl_raw_store_i`):
@@ -5337,6 +5388,8 @@ pub fn live_slots_for_state_field_jit(
     num_virt_arrays: usize,
     num_ref_scalars: usize,
     ref_scalar_base: usize,
+    num_float_scalars: usize,
+    float_scalar_base: usize,
     int_scalar_base: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let total_slots: usize = num_scalars + array_lens.iter().sum::<usize>() + 2 * num_virt_arrays;
@@ -5369,13 +5422,22 @@ pub fn live_slots_for_state_field_jit(
         "live_slots_for_state_field_jit: ref_scalar_base={ref_scalar_base} + \
          num_ref_scalars={num_ref_scalars} exceeds the u8 register-index limit",
     );
+    let float_scalar_end = float_scalar_base + num_float_scalars;
+    assert!(
+        float_scalar_end <= 256,
+        "live_slots_for_state_field_jit: float_scalar_base={float_scalar_base} + \
+         num_float_scalars={num_float_scalars} exceeds the u8 register-index limit",
+    );
     let live_i: Vec<u8> = (int_scalar_base as u32..int_scalar_end as u32)
         .map(|i| i as u8)
         .collect();
     let live_r: Vec<u8> = (ref_scalar_base as u32..ref_scalar_end as u32)
         .map(|i| i as u8)
         .collect();
-    (live_i, live_r, Vec::new())
+    let live_f: Vec<u8> = (float_scalar_base as u32..float_scalar_end as u32)
+        .map(|i| i as u8)
+        .collect();
+    (live_i, live_r, live_f)
 }
 
 #[cfg(test)]
@@ -5935,7 +5997,7 @@ mod tests {
     #[test]
     fn state_field_canonical_slots_empty_state() {
         // No scalars, no arrays, no virt arrays — empty triple.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(0, &[], 0, 0, 0, 0);
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(0, &[], 0, 0, 0, 0, 0, 0);
         assert!(live_i.is_empty());
         assert!(live_r.is_empty());
         assert!(live_f.is_empty());
@@ -5945,7 +6007,8 @@ mod tests {
     fn state_field_canonical_slots_ref_scalars_populate_live_r() {
         // 2 int scalars + 2 ref scalars at base 0: live_i = [0,1] (int
         // bank), live_r = [0,1] (ref bank), live_f empty.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(2, &[], 0, 2, 0, 0);
+        let (live_i, live_r, live_f) =
+            super::live_slots_for_state_field_jit(2, &[], 0, 2, 0, 0, 0, 0);
         assert_eq!(live_i, vec![0u8, 1]);
         assert_eq!(live_r, vec![0u8, 1]);
         assert!(live_f.is_empty());
@@ -5956,7 +6019,8 @@ mod tests {
         // ref_scalar_base shifts the ref bank past the dispatch JitCode's
         // ref arguments (program at r0): 2 ref scalars at base 1 occupy
         // r1..r3 while the int bank stays 0-based.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(2, &[], 0, 2, 1, 0);
+        let (live_i, live_r, live_f) =
+            super::live_slots_for_state_field_jit(2, &[], 0, 2, 1, 0, 0, 0);
         assert_eq!(live_i, vec![0u8, 1]);
         assert_eq!(live_r, vec![1u8, 2]);
         assert!(live_f.is_empty());
@@ -5967,7 +6031,8 @@ mod tests {
         // int_scalar_base shifts the int bank past the dispatch JitCode's
         // int arguments (pc at i0): 2 int scalars at base 1 occupy
         // i1..i3 while the ref bank stays at its own base.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(2, &[], 0, 2, 1, 1);
+        let (live_i, live_r, live_f) =
+            super::live_slots_for_state_field_jit(2, &[], 0, 2, 1, 0, 0, 1);
         assert_eq!(live_i, vec![1u8, 2]);
         assert_eq!(live_r, vec![1u8, 2]);
         assert!(live_f.is_empty());
@@ -5979,7 +6044,7 @@ mod tests {
         // virt array (`stack`, ptr+len) plus a synthetic 3-element
         // flattened array.  total_slots = 1 + 3 + 2 = 6, so
         // live_i = [0, 1, 2, 3, 4, 5] and ref/float banks are empty.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0);
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0, 0, 0);
         assert_eq!(live_i, vec![0u8, 1, 2, 3, 4, 5]);
         assert!(live_r.is_empty());
         assert!(live_f.is_empty());
@@ -5989,7 +6054,8 @@ mod tests {
     fn state_field_canonical_slots_fills_max_index_255() {
         // End-exclusive boundary: base 1 + 255 scalars → int_scalar_end = 256,
         // filling indices i1..=i255 (the highest u8). This must NOT panic.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(255, &[], 0, 0, 0, 1);
+        let (live_i, live_r, live_f) =
+            super::live_slots_for_state_field_jit(255, &[], 0, 0, 0, 0, 0, 1);
         assert_eq!(live_i.len(), 255);
         assert_eq!(*live_i.last().unwrap(), 255u8);
         assert!(live_r.is_empty());
@@ -6006,7 +6072,7 @@ mod tests {
         // triples.
         let mut asm = Assembler::new();
         let mut builder = JitCodeBuilder::new();
-        let (li, lr, lf) = super::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0);
+        let (li, lr, lf) = super::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0, 0, 0);
         builder.live(&mut asm, &li, &lr, &lf);
         // Header bytes = 3 (len_i, len_r, len_f).  live_i has 3 indices
         // (0, 1, 2) all in the first bitset byte.  live_r/live_f empty.
@@ -6022,7 +6088,7 @@ mod tests {
         // 257 slots needs index 256, past the u8 register-index ceiling the
         // jitcode bytes are written through (assembler.py:241); 256 slots
         // (end-exclusive, indices 0..=255) is the valid maximum.
-        let _ = super::live_slots_for_state_field_jit(257, &[], 0, 0, 0, 0);
+        let _ = super::live_slots_for_state_field_jit(257, &[], 0, 0, 0, 0, 0, 0);
     }
 
     #[test]

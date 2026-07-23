@@ -391,6 +391,38 @@ pub trait JitCodeSym {
     /// Update a ref-typed scalar state field's concrete value.
     fn set_state_ref_field_value(&mut self, _field_idx: usize, _value: i64) {}
 
+    // -- Float-typed scalar state field support -------------
+    //
+    // Float state fields live in the float register bank and carry raw f64
+    // bits in their concrete shadows.
+
+    /// Read a float-typed scalar state field's current OpRef.
+    fn state_float_field_ref(&self, _field_idx: usize) -> Option<OpRef> {
+        None
+    }
+
+    /// Update a float-typed scalar state field's OpRef.
+    fn set_state_float_field_ref(&mut self, _field_idx: usize, _value: OpRef) {}
+
+    /// Read a float-typed scalar state field's current concrete bit pattern.
+    fn state_float_field_value(&self, _field_idx: usize) -> Option<i64> {
+        None
+    }
+
+    /// Update a float-typed scalar state field's concrete bit pattern.
+    fn set_state_float_field_value(&mut self, _field_idx: usize, _value: i64) {}
+
+    /// First float-bank register used as a canonical float identity slot.
+    fn float_identity_slots_base(&self) -> usize {
+        0
+    }
+
+    /// One past the last float-bank register used as a canonical float
+    /// identity slot.
+    fn float_identity_slots_end(&self) -> usize {
+        0
+    }
+
     /// One past the last ref-bank register used as a canonical
     /// ref-scalar identity slot (`StateFieldLayout::ref_scalar_slot`).
     /// `record_state_guard` saves/restores `ref_regs[..end]` around the
@@ -2703,6 +2735,24 @@ where
                 sym.set_state_ref_field_ref(field_idx, opref);
                 sym.set_state_ref_field_value(field_idx, value);
             }
+            jitcode::insns::BC_LOAD_STATE_FIELD_FLOAT => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u8() as usize;
+                let opref = sym
+                    .state_float_field_ref(field_idx)
+                    .expect("float state field not initialized");
+                let value = sym
+                    .state_float_field_value(field_idx)
+                    .expect("float state field concrete value not initialized");
+                self.set_float_reg(dest, Some(opref), Some(value));
+            }
+            jitcode::insns::BC_STORE_STATE_FIELD_FLOAT => {
+                let field_idx = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
+                let (opref, value) = self.read_float_reg(src);
+                sym.set_state_float_field_ref(field_idx, opref);
+                sym.set_state_float_field_value(field_idx, value);
+            }
             jitcode::insns::BC_LOAD_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u8() as usize;
@@ -2998,6 +3048,46 @@ where
                     }
                 };
                 self.set_int_reg(dst, Some(opref), Some(concrete));
+            }
+            jitcode::insns::BC_RAW_LOAD_F => {
+                // f64 sibling of BC_RAW_LOAD_I: read an f64 from raw native
+                // memory at `base + ea` (byte offset) into the FLOAT register
+                // bank, preserving the exact bit pattern. Record RawLoadF and
+                // perform the concrete read while tracing.
+                //
+                // Encoding (`assembler.rs raw_load_f`), identical to raw_load_i:
+                //   [BC_RAW_LOAD_F][base_reg u8][ea_reg u8][descr_idx u16][dst u8]
+                let (base_reg, ea_reg, descr_idx, dst) = {
+                    let frame = self.frames.current_mut();
+                    let base_reg = frame.next_u8() as usize;
+                    let ea_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
+                    (base_reg, ea_reg, descr_idx, dst)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((_base_size, itemsize, _is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (base_opref, base_addr) = self.read_int_reg(base_reg);
+                let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
+                let opref =
+                    ctx.record_op_with_descr(OpCode::RawLoadF, &[base_opref, ea_opref], descr);
+                // Concrete eval: an 8-byte f64 read at `base + ea`, carried as
+                // raw bits in the float bank (set_float_reg takes i64 bits).
+                //
+                // SAFETY: the kernel clamps `ea` to an in-bounds byte offset,
+                // so `base_addr + ea_value` is within the allocation.
+                let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
+                let concrete_bits = match itemsize {
+                    8 => unsafe { core::ptr::read_unaligned(item_addr as *const i64) },
+                    other => panic!("BC_RAW_LOAD_F: unsupported itemsize = {other}"),
+                };
+                self.set_float_reg(dst, Some(opref), Some(concrete_bits));
             }
             jitcode::insns::BC_GETFIELD_GC_I
             | jitcode::insns::BC_GETFIELD_GC_R
