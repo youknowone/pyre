@@ -13652,6 +13652,8 @@ impl CodeWriter {
         let mut result_color_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut depth_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut depth_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec<(usize, u32)> = Vec::new();
+        let mut after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec<(usize, u32)> = Vec::new();
         let mut forward_py_pc_marker_by_jit_pc: Vec<(usize, u32)> = Vec::new();
         let mut forward_py_pc_pred_by_jit_pc: Vec<(usize, u32)> = Vec::new();
         let mut after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)> =
@@ -13790,10 +13792,16 @@ impl CodeWriter {
                 result_color_after_residual_marker_by_jit_pc
                     .push((off, result_color_at_pc.get(ft_rc).copied()));
                 depth_after_residual_marker_by_jit_pc.push((off, static_depth.get(ft_rc).copied()));
+                // Same RAW-py fallthrough as result_color/depth: the caller
+                // frame's after-residual resume py = fallthrough(python pc of
+                // the call op). Carries the coordinate forward so the runtime
+                // read need not invert call_jit_pc.
+                after_residual_fallthrough_py_pc_marker_by_jit_pc.push((off, ft_rc as u32));
             }
             after_residual_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_after_residual_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             depth_after_residual_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            after_residual_fallthrough_py_pc_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
@@ -13808,11 +13816,13 @@ impl CodeWriter {
                         .push((pos, result_color_at_pc.get(ft_rc).copied()));
                     depth_after_residual_pred_by_jit_pc
                         .push((pos, static_depth.get(ft_rc).copied()));
+                    after_residual_fallthrough_py_pc_pred_by_jit_pc.push((pos, ft_rc as u32));
                 }
             }
             after_residual_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_after_residual_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             depth_after_residual_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            after_residual_fallthrough_py_pc_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Post-residual-call catch marker twin: source values from the
             // same sparse construction inputs, while resolving its key
             // with the exact block-head / predecessor-op-start split of the
@@ -13887,6 +13897,8 @@ impl CodeWriter {
             result_color_after_residual_pred_by_jit_pc,
             depth_after_residual_marker_by_jit_pc,
             depth_after_residual_pred_by_jit_pc,
+            after_residual_fallthrough_py_pc_marker_by_jit_pc,
+            after_residual_fallthrough_py_pc_pred_by_jit_pc,
             has_color_map: !pcdep_color_slots.is_empty(),
             portal_frame_reg,
             portal_ec_reg,

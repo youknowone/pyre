@@ -203,6 +203,14 @@ pub struct PyJitCodeMetadata {
     /// Empty for skeleton / fixture.
     pub depth_after_residual_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub depth_after_residual_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
+    /// After-residual-call resume python pc for the inline-CALLER frame, keyed
+    /// by a JitCode byte offset with the same exact-marker / predecessor-op-start
+    /// split as `depth_after_residual_*`. Value = `semantic_fallthrough_pc(py)`
+    /// for the RAW resolving py — the coordinate the runtime otherwise obtains
+    /// by inverting `call_jit_pc` then taking the fallthrough. Empty for
+    /// skeleton / fixture.
+    pub after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec<(usize, u32)>,
+    pub after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec<(usize, u32)>,
     /// Whether codewriter register allocation assigned non-identity frame
     /// colors. Skeleton and portal metadata leave this false.
     pub has_color_map: bool,
@@ -812,6 +820,41 @@ impl PyJitCode {
             || !self.metadata.depth_after_residual_pred_by_jit_pc.is_empty()
     }
 
+    /// After-residual-call resume python pc for the inline-caller frame,
+    /// resolved by JitCode byte offset with the same exact-marker /
+    /// predecessor-op-start tiers as `python_pc_for_jitcode_pc`. `None` when the
+    /// twin is empty (skeleton / fixture) — distinguish via
+    /// [`Self::after_residual_fallthrough_py_pc_populated`].
+    pub fn after_residual_fallthrough_py_pc_for_jitcode_pc(&self, jit_pc: usize) -> Option<u32> {
+        let marker = &self
+            .metadata
+            .after_residual_fallthrough_py_pc_marker_by_jit_pc;
+        let pred = &self
+            .metadata
+            .after_residual_fallthrough_py_pc_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return Some(marker[i].1);
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| pred[i].1)
+    }
+
+    /// Whether the after-residual fallthrough-py twin carries entries. `false`
+    /// for skeleton / fixture installs.
+    pub fn after_residual_fallthrough_py_pc_populated(&self) -> bool {
+        !self
+            .metadata
+            .after_residual_fallthrough_py_pc_marker_by_jit_pc
+            .is_empty()
+            || !self
+                .metadata
+                .after_residual_fallthrough_py_pc_pred_by_jit_pc
+                .is_empty()
+    }
+
     /// Post-`residual_call` catch resume marker keyed by a JitCode byte
     /// offset, resolved with the SAME exact-marker / predecessor-op-start
     /// tiers as `python_pc_for_jitcode_pc`.
@@ -950,6 +993,8 @@ impl PyJitCode {
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
                 depth_after_residual_marker_by_jit_pc: Vec::new(),
                 depth_after_residual_pred_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
                 // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
                 // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both

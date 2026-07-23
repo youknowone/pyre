@@ -11648,6 +11648,8 @@ mod tests {
                 result_color_after_residual_pred_by_jit_pc: Vec::new(),
                 depth_after_residual_marker_by_jit_pc: Vec::new(),
                 depth_after_residual_pred_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
                 has_color_map: false,
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,

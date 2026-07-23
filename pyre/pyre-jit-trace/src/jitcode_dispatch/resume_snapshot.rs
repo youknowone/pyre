@@ -1218,6 +1218,19 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
+        // #73 Slice 4 (twin-first): certify the forward `after_residual_fallthrough`
+        // twin reproduces the inverted-then-fallthrough coordinate before any
+        // consumer cuts over to it.
+        if pcmap_afterresidual_audit_enabled()
+            && jc.payload.after_residual_fallthrough_py_pc_populated()
+        {
+            assert_eq!(
+                jc.payload
+                    .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc),
+                Some(fallthrough),
+                "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc} (call_py {call_py})"
+            );
+        }
         (
             jc.index as u32,
             fallthrough,
