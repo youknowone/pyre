@@ -1787,7 +1787,18 @@ fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
 #[cfg(feature = "host_env")]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
     match python_sys_path_dirs() {
-        Some(dirs) => find_in_dirs(partname, &dirs),
+        Some(dirs) => {
+            let found = find_in_dirs(partname, &dirs);
+            // Windows: pyre still registers the `posix` builtin (never `nt`),
+            // so `os.path` is posixpath and `site.removeduppaths()` rewrites
+            // every drive-letter `sys.path` entry into `<cwd>/D:\...` garbage
+            // at startup. Until the `nt` registration lands, a live-list miss
+            // falls back to the native seed so the stdlib stays importable.
+            #[cfg(windows)]
+            let found =
+                found.or_else(|| SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())));
+            found
+        }
         None => SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())),
     }
 }
