@@ -1153,9 +1153,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     //    Integer-strategy, so `w_list_int_set_len` can rewind it.  Capture the
     //    pre-extend length; the success arm journals it so the abort rollback
     //    undoes the one extend and the deliver re-applies it exactly once.
-    //  * an immutable receiver (`int`/`bool`/`float`/`tuple`) — `+=` yields a
-    //    FRESH object and rebinds the journaled local, so a plain deliver re-run
-    //    is exact with no journaling.
+    //  * an immutable receiver (`int`/`bool`/`float`/`tuple`/`str`/`bytes`) —
+    //    `+=` yields a FRESH object and rebinds the journaled local, so a plain
+    //    deliver re-run is exact with no journaling.
     //
     // Any OTHER *exact builtin* receiver — an object-/float-strategy list,
     // `bytearray`, `set`, `dict`, `array`, a mixed `int-list += non-ints` that
@@ -1188,6 +1188,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     || pyre_object::pyobject::is_bool(lhs)
                     || pyre_object::pyobject::is_float(lhs)
                     || pyre_object::pyobject::is_tuple(lhs)
+                    || pyre_object::unicodeobject::is_str(lhs)
+                    || pyre_object::bytesobject::is_bytes(lhs)
                 {
                     None
                 } else if pyre_object::pyobject::is_exact_builtin_instance(lhs) {
