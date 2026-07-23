@@ -6548,13 +6548,11 @@ fn prepare_bridge_pending_fields(
             );
             if pending.item_index < 0 {
                 ctx.record_op_with_descr(OpCode::SetfieldGc, &[target_op, value_op], descr.clone());
-                if let Some(field_descr) = descr.as_field_descr() {
-                    ctx.heapcache_setfield_cached(
-                        target_op,
-                        field_descr.index_in_parent() as u32,
-                        value_op,
-                    );
-                }
+                // No walker field-heapcache seed: the replayed SETFIELD_GC runs at
+                // bridge entry, but the prologue does not mutate the live heap, so a
+                // getfield that hit a seeded entry would resolve against the stale
+                // pre-write field. (The array branch below can seed because its
+                // getarrayitem hit returns the cached value without a sanity load.)
             } else {
                 let index_op = ctx.const_int(pending.item_index as i64);
                 ctx.record_op_with_descr(
@@ -6562,6 +6560,13 @@ fn prepare_bridge_pending_fields(
                     &[target_op, index_op, value_op],
                     descr.clone(),
                 );
+                // resume.py:1211-1223 _setarrayitem replays through
+                // execute_setarrayitem_gc, which seeds the heapcache after
+                // recording (pyjitpl.py:2741-2744) so a later same-element
+                // getarrayitem folds against this write. The pending array
+                // container is always non-virtual, so the read hits the plain
+                // getarrayitem path (no on-hit sanity load).
+                ctx.heapcache_setarrayitem(target_op, index_op, descr.index(), value_op);
             }
         }
     }
