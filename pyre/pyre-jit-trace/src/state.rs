@@ -857,18 +857,24 @@ fn m73_backxlat_twin_audit_enabled() -> bool {
 /// predecessor entry, so they are delegated straight to `backxlat_py_pc`, which
 /// resolves them identically to the pre-cutover call.
 pub fn forward_py_pc_or_backxlat(jitcode_index: i32, pc_word: i32) -> i32 {
-    let live = backxlat_py_pc(jitcode_index, pc_word);
-    if pc_word >= 0 && m73_backxlat_twin_audit_enabled() {
-        if let Some(twin) = pyjitcode_for_jitcode_index(jitcode_index)
-            .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(pc_word as usize))
-        {
-            assert_eq!(
-                twin as i32, live,
-                "PYRE_M73_BACKXLAT_TWIN_AUDIT: forward py_pc twin diverged at jitcode {jitcode_index} pc {pc_word}"
-            );
-        }
+    if pc_word < 0 {
+        return backxlat_py_pc(jitcode_index, pc_word);
     }
-    live
+    match pyjitcode_for_jitcode_index(jitcode_index)
+        .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(pc_word as usize))
+    {
+        Some(twin) => {
+            if m73_backxlat_twin_audit_enabled() {
+                assert_eq!(
+                    twin as i32,
+                    backxlat_py_pc(jitcode_index, pc_word),
+                    "PYRE_M73_BACKXLAT_TWIN_AUDIT: forward py_pc twin diverged at jitcode {jitcode_index} pc {pc_word}"
+                );
+            }
+            twin as i32
+        }
+        None => backxlat_py_pc(jitcode_index, pc_word),
+    }
 }
 
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
