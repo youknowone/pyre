@@ -146,10 +146,11 @@ pub use pyjitpl::{
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
     MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
     call_int_function, call_ref_function, call_void_function, counters,
-    record_application_traceback_for_recording, record_inline_application_traceback_for_recording,
-    set_record_application_traceback_hook, set_record_inline_application_traceback_hook,
-    struct_fields_write_effect_info, trace_jitcode, trace_jitcode_from_merge_point,
-    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    record_application_traceback_for_recording, record_application_traceback_hook_address,
+    record_inline_application_traceback_for_recording,
+    record_inline_application_traceback_hook_address, set_record_application_traceback_hook,
+    set_record_inline_application_traceback_hook, struct_fields_write_effect_info, trace_jitcode,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::BridgeInlineCarrier;

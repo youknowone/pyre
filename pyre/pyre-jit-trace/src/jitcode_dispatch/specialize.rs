@@ -4294,6 +4294,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     // The normalized publish result is the same flat builtin instance;
     // forward the inline-built exc OpRef (carrying its concrete shadow)
     // to the dst that feeds the following `raise/r`.
+    fbw_built_exc_insert(exc_op);
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', exc_op)?;
     Ok(Some(()))
 }

@@ -682,9 +682,18 @@ fn m73_lastinstr_audit(
 pub(crate) extern "C" fn record_caught_blackhole_traceback(
     exc_value: i64,
     frame_value: i64,
-    jitcode_index: i32,
-    opcode_position: i32,
+    jitcode_index: i64,
+    opcode_position: i64,
 ) {
+    let Ok(jitcode_index) = i32::try_from(jitcode_index) else {
+        return;
+    };
+    let Ok(opcode_position) = i32::try_from(opcode_position) else {
+        return;
+    };
+    if pyre_jit_trace::state::jitcode_pc_is_bare_reraise(jitcode_index, opcode_position) {
+        return;
+    }
     let frame_ptr = frame_value as *mut PyFrame;
     if frame_ptr.is_null() || exc_value == 0 {
         return;
@@ -706,9 +715,15 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     exc_value: i64,
     w_code_value: i64,
     w_globals_value: i64,
-    jitcode_index: i32,
-    opcode_position: i32,
+    jitcode_index: i64,
+    opcode_position: i64,
 ) {
+    let Ok(jitcode_index) = i32::try_from(jitcode_index) else {
+        return;
+    };
+    let Ok(opcode_position) = i32::try_from(opcode_position) else {
+        return;
+    };
     if exc_value == 0 || w_code_value == 0 {
         return;
     }
@@ -2397,7 +2412,17 @@ pub fn blackhole_resume_via_rd_numb(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
-            let last_caught_exception_value = bh.last_caught_exception_value;
+            let bare_reraise = bh
+                .jitcode
+                .code
+                .get(last_opcode_position)
+                .is_some_and(|opcode| *opcode == majit_metainterp::jitcode::insns::BC_RERAISE)
+                || jitcode_index.is_some_and(|index| {
+                    pyre_jit_trace::state::jitcode_pc_is_bare_reraise(
+                        index,
+                        last_opcode_position as i32,
+                    )
+                });
             release_bh_rd(bh);
             let Some(mut caller_bh) = next.map(|b| *b) else {
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
@@ -2415,8 +2440,7 @@ pub fn blackhole_resume_via_rd_numb(
                         "blackhole exception (null exc_value)",
                     )
                 };
-                let caught_reraise = exc_value != 0 && last_caught_exception_value == exc_value;
-                if caught_reraise {
+                if bare_reraise {
                     err.attach_tb = false;
                 } else if !frame_ptr.is_null() {
                     let last_instruction = jitcode_index

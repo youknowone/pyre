@@ -2474,6 +2474,97 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     field_descr_from_group(group, 3)
 }
 
+/// Field descriptor for `W_BaseException.w_traceback`, sharing the
+/// per-kind exception allocation descriptor with the other exception slots.
+pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    field_descr_from_group(cache[idx].as_ref().unwrap(), 5)
+}
+
+static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_interpreter::pytraceback::{
+        PYTRACEBACK_FRAME_OFFSET, PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_LASTI_OFFSET,
+        PYTRACEBACK_LINENO_OFFSET, PYTRACEBACK_OBJECT_SIZE, PYTRACEBACK_TYPE,
+        PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
+    };
+
+    build_object_descr_group_with_def_path(
+        PYTRACEBACK_OBJECT_SIZE,
+        PYTRACEBACK_GC_TYPE_ID,
+        &PYTRACEBACK_TYPE as *const _ as usize,
+        &[
+            (
+                "PyTraceback.w_class",
+                W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyTraceback.frame",
+                PYTRACEBACK_FRAME_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyTraceback.lasti",
+                PYTRACEBACK_LASTI_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "PyTraceback.w_next",
+                PYTRACEBACK_W_NEXT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyTraceback.lineno",
+                PYTRACEBACK_LINENO_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "PyTraceback.w_code",
+                PYTRACEBACK_W_CODE_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "",
+        "",
+    )
+});
+
+pub fn pytraceback_size_descr() -> DescrRef {
+    PYTRACEBACK_DESCR_GROUP.size_descr.clone()
+}
+
+pub fn pytraceback_field_descr(index: usize) -> DescrRef {
+    field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
+}
+
 /// Cached field descriptor for a raw reference slot selected by the
 /// exception attribute fold.  Indices are those of `build_w_exception_group`;
 /// no parallel descriptor is constructed.

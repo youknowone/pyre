@@ -260,12 +260,7 @@ pub struct BlackholeInterpreter {
     /// an exception-table handler is entered.  The generic blackhole carries
     /// only raw frame/exception references; portal integrations install the
     /// callback that understands their frame and JitCode-PC layouts.
-    pub record_caught_exception: Option<extern "C" fn(i64, i64, i32, i32)>,
-    /// Exception most recently delivered to an in-frame handler.  If that same
-    /// object later leaves through the handler cleanup's `reraise`, its frame
-    /// traceback was already recorded on handler entry and must not be added a
-    /// second time at the bottommost blackhole exit.
-    pub last_caught_exception_value: i64,
+    pub record_caught_exception: Option<extern "C" fn(i64, i64, i64, i64)>,
     /// blackhole.py bhimpl_getfield_vable_*: pointer to the virtualizable
     /// object (e.g. PyFrame). Used by jitcode::BC_GETFIELD_VABLE_* bytecodes.
     /// Set during blackhole setup from the guard failure's virtualizable ptr.
@@ -353,7 +348,6 @@ impl Default for BlackholeInterpreter {
             last_opcode_position: 0,
             exception_last_value: 0,
             record_caught_exception: None,
-            last_caught_exception_value: 0,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
             jitdrivers_sd: Vec::new(),
@@ -371,7 +365,6 @@ impl BlackholeInterpreter {
         self.got_exception = false;
         self.last_opcode_position = position;
         self.exception_last_value = 0;
-        self.last_caught_exception_value = 0;
     }
 
     fn init_register_file_from_i64s(
@@ -1169,16 +1162,20 @@ impl BlackholeInterpreter {
             return false;
         }
         let target = (code[catch_pos + 1] as usize) | ((code[catch_pos + 2] as usize) << 8);
-        if let Some(record) = self.record_caught_exception {
+        // pyopcode.py raise_varargs records the raising instruction before
+        // handler lookup; RaiseWithExplicitTraceback skips it for bare
+        // reraise.
+        if self.jitcode.code[self.last_opcode_position] != jitcode::insns::BC_RERAISE
+            && let Some(record) = self.record_caught_exception
+        {
             record(
                 exc_value,
                 self.virtualizable_ptr,
-                self.jitcode.try_index().map_or(-1, |index| index as i32),
-                self.last_opcode_position as i32,
+                self.jitcode.try_index().map_or(-1, |index| index as i64),
+                self.last_opcode_position as i64,
             );
         }
         self.exception_last_value = exc_value;
-        self.last_caught_exception_value = exc_value;
         self.position = target;
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // A residual `bh_call` that raised published the exception into BOTH

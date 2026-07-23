@@ -1720,23 +1720,22 @@ where
             }
             if handled {
                 let frame = self.frames.current_mut();
-                super::record_application_traceback(
-                    self.last_exception_value,
-                    ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                    frame,
-                );
-                frame.last_caught_exception_value = self.last_exception_value;
-                return TraceAction::Continue;
-            }
-            {
-                let frame = self.frames.current_mut();
-                if frame.last_caught_exception_value != self.last_exception_value {
+                if frame.jitcode.code[frame.last_opcode_position] != jitcode::insns::BC_RERAISE {
                     super::record_application_traceback(
                         self.last_exception_value,
                         ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
                         frame,
                     );
                 }
+                return TraceAction::Continue;
+            }
+            {
+                let frame = self.frames.current_mut();
+                super::record_application_traceback(
+                    self.last_exception_value,
+                    ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
+                    frame,
+                );
             }
             self.pop_exception_frame(ctx);
         }
@@ -6896,13 +6895,13 @@ where
                 self.class_of_last_exc_is_const = true;
                 {
                     let frame = self.frames.current_mut();
-                    if frame.last_caught_exception_value != concrete {
-                        super::record_application_traceback(
-                            concrete,
-                            ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                            frame,
-                        );
-                    }
+                    // pyopcode.py raise_varargs: RAISE_VARARGS with an
+                    // explicit value records at the raising instruction.
+                    super::record_application_traceback(
+                        concrete,
+                        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
+                        frame,
+                    );
                 }
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);
@@ -6911,16 +6910,8 @@ where
                 if self.last_exception_value == 0 {
                     return TraceAction::Abort;
                 }
-                {
-                    let frame = self.frames.current_mut();
-                    if frame.last_caught_exception_value != self.last_exception_value {
-                        super::record_application_traceback(
-                            self.last_exception_value,
-                            ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                            frame,
-                        );
-                    }
-                }
+                // RaiseWithExplicitTraceback is the bare-reraise path and
+                // deliberately skips record_application_traceback.
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);
             }

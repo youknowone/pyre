@@ -803,6 +803,23 @@ pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Optio
     )
 }
 
+/// Whether a JitCode exception exit came from the Python bare-reraise
+/// instruction path. `RAISE_VARARGS 0` and `RERAISE` both use
+/// RaiseWithExplicitTraceback and skip record_application_traceback.
+pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
+    let Some(raw_code) = raw_code_for_jitcode_index(jitcode_index) else {
+        return false;
+    };
+    let Some(py_pc) = python_pc_for_jitcode_pc_public(jitcode_index, offset) else {
+        return false;
+    };
+    match unsafe { pyre_interpreter::decode_instruction_at(&*raw_code, py_pc as usize) } {
+        Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
+        Some((Instruction::Reraise { .. }, _)) => true,
+        _ => false,
+    }
+}
+
 /// Advance a Python instruction coordinate past resume trivia when code is available.
 pub fn skip_python_trivia_forward_public(
     jitcode_index: i32,

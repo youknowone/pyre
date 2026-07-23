@@ -66,7 +66,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             unsafe { (*sym.jitcode()).index as i32 }
         };
         walk_session.recording_opcode_position = position;
-        walk_session.last_caught_exception_value = 0;
     }
 
     // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,

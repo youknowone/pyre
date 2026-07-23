@@ -1512,8 +1512,8 @@ pub struct JitHooks {
 /// metainterpreter is executing the one-shot recording iteration.  The host
 /// owns the application frame and the jitcode-to-source-position mapping, so
 /// majit keeps only this crate-neutral ABI hook.
-pub type RecordApplicationTraceback = extern "C" fn(i64, i64, i32, i32);
-pub type RecordInlineApplicationTraceback = extern "C" fn(i64, i64, i64, i32, i32);
+pub type RecordApplicationTraceback = extern "C" fn(i64, i64, i64, i64);
+pub type RecordInlineApplicationTraceback = extern "C" fn(i64, i64, i64, i64, i64);
 
 static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1534,6 +1534,14 @@ pub fn set_record_inline_application_traceback_hook(
         hook.map_or(0, |callback| callback as usize),
         std::sync::atomic::Ordering::Release,
     );
+}
+
+pub fn record_application_traceback_hook_address() -> *const () {
+    RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+}
+
+pub fn record_inline_application_traceback_hook_address() -> *const () {
+    RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
 }
 
 fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MIFrame) {
@@ -1566,7 +1574,12 @@ pub fn record_application_traceback_for_recording(
     // Safety: the only stored values come from a RecordApplicationTraceback
     // function pointer in set_record_application_traceback_hook.
     let callback: RecordApplicationTraceback = unsafe { std::mem::transmute(callback) };
-    callback(exc_value, frame_ptr, jitcode_index, opcode_position);
+    callback(
+        exc_value,
+        frame_ptr,
+        i64::from(jitcode_index),
+        i64::from(opcode_position),
+    );
 }
 
 /// Invoke the host callback for an inlined recording frame represented by its
@@ -1588,7 +1601,13 @@ pub fn record_inline_application_traceback_for_recording(
     // Safety: the only stored values come from a
     // RecordInlineApplicationTraceback function pointer.
     let callback: RecordInlineApplicationTraceback = unsafe { std::mem::transmute(callback) };
-    callback(exc_value, w_code, w_globals, jitcode_index, opcode_position);
+    callback(
+        exc_value,
+        w_code,
+        w_globals,
+        i64::from(jitcode_index),
+        i64::from(opcode_position),
+    );
 }
 
 /// framework.py `root_walker.walk_roots` per-op helper: visit every
@@ -12521,16 +12540,16 @@ impl<M: Clone> MetaInterp<M> {
             }
             if handled {
                 let frame = self.framestack.current_mut();
-                record_application_traceback(excvalue, self.vable_ptr, frame);
-                frame.last_caught_exception_value = excvalue;
-                // pyjitpl.py:2522: raise ChangeFrame
+                if frame.jitcode.code[frame.last_opcode_position]
+                    != crate::jitcode::insns::BC_RERAISE
+                {
+                    record_application_traceback(excvalue, self.vable_ptr, frame);
+                }
                 return Err(FinishframeExceptionSignal::ChangeFrame);
             }
             {
                 let frame = self.framestack.current_mut();
-                if frame.last_caught_exception_value != excvalue {
-                    record_application_traceback(excvalue, self.vable_ptr, frame);
-                }
+                record_application_traceback(excvalue, self.vable_ptr, frame);
             }
             self.popframe(true);
         }
