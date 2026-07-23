@@ -18,6 +18,7 @@ use super::cdata;
 use super::stginfo::{self, StgInfoData};
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
+use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign};
 use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 
@@ -975,7 +976,7 @@ fn meta_mul(args: &[PyObjectRef]) -> PyResult {
     }
     if unsafe { pyre_object::is_long(count) } {
         let big = unsafe { pyre_object::longobject::w_long_get_value(count) };
-        if big.sign() == malachite_bigint::Sign::Minus {
+        if big.sign() == RBigIntSign::Minus {
             return Err(crate::PyError::value_error(
                 "array length must not be negative",
             ));
@@ -1069,7 +1070,7 @@ fn cfield_new(
         pyre_object::w_dict_setitem_str(d, "byte_offset", pyre_object::w_int_new(offset as i64));
         pyre_object::w_dict_setitem_str(d, "size", pyre_object::w_int_new(size as i64));
         pyre_object::w_dict_setitem_str(d, "byte_size", pyre_object::w_int_new(size as i64));
-        let bit_size = malachite_bigint::BigInt::from(size) * malachite_bigint::BigInt::from(8u8);
+        let bit_size = BigInt::from(size) * BigInt::from(8u8);
         pyre_object::w_dict_setitem_str(
             d,
             "bit_size",
@@ -1197,9 +1198,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                     };
                     return Ok(pyre_object::w_int_new(signed));
                 }
-                return Ok(pyre_object::longobject::w_long_new(
-                    malachite_bigint::BigInt::from(raw),
-                ));
+                return Ok(pyre_object::longobject::w_long_new(BigInt::from(raw)));
             }
             Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
                 &tc,
@@ -1622,7 +1621,7 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
             }
             let n = if unsafe { pyre_object::is_long(v) } {
                 let big = unsafe { pyre_object::longobject::w_long_get_value(v) };
-                if big.sign() == malachite_bigint::Sign::Minus {
+                if big.sign() == RBigIntSign::Minus {
                     return Err(crate::PyError::value_error(
                         "The '_length_' attribute must not be negative",
                     ));

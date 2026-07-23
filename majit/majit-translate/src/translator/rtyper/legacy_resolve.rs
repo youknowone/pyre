@@ -394,6 +394,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => ConcreteType::Signed,
+        ConstValue::Int128(_) | ConstValue::UInt128(_) => ConcreteType::Unknown,
         ConstValue::Float(_) => ConcreteType::Float,
         ConstValue::Placeholder => ConcreteType::Unknown,
         ConstValue::Atom(_)

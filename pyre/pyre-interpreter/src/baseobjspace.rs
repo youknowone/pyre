@@ -13,7 +13,7 @@
 // additional unsafe block adds noise without safety benefit.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use malachite_bigint::BigInt;
+use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1864,12 +1864,12 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     // merely until the first match.  Keep the counter unbounded like PyPy's
     // wrapped integer accumulator.
     let it = iter(obj)?;
-    let mut count = malachite_bigint::BigInt::from(0);
+    let mut count = BigInt::from(0);
     loop {
         match next(it) {
             Ok(item) => {
                 if is_true(compare(item, needle, CompareOp::Eq)?)? {
-                    count += malachite_bigint::BigInt::from(1);
+                    count += BigInt::from(1);
                 }
             }
             Err(e) if e.kind == PyErrorKind::StopIteration => break,
@@ -6934,7 +6934,7 @@ pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
     // W_LongObject.uint_w — num.touint().
     if unsafe { pyre_object::pyobject::is_long(obj) } {
         let big = unsafe { crate::builtins::obj_to_bigint(obj) };
-        if big.sign() == malachite_bigint::Sign::Minus {
+        if big.sign() == RBigIntSign::Minus {
             return Err(PyError::value_error(
                 "cannot convert negative integer to unsigned int",
             ));
@@ -10516,7 +10516,7 @@ pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
         Ok(index) => Ok(index),
         Err(e) if e.kind == PyErrorKind::OverflowError => {
             let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
-            if big.sign() == malachite_bigint::Sign::Minus {
+            if big.sign() == RBigIntSign::Minus {
                 Ok(i64::MIN)
             } else {
                 Ok(i64::MAX)
@@ -12554,12 +12554,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         Some(next) => eo::w_enumerate_set_index(obj, next),
                         None => {
                             // Promote to bigint slot per `:299-302`.
-                            let w_idx =
-                                pyre_object::w_long_new(::malachite_bigint::BigInt::from(index));
+                            let w_idx = pyre_object::w_long_new(BigInt::from(index));
                             pyre_object::gc_roots::pin_root(w_idx);
                             let w_idx_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                            let one =
-                                pyre_object::w_long_new(::malachite_bigint::BigInt::from(1i64));
+                            let one = pyre_object::w_long_new(BigInt::from(1i64));
                             pyre_object::gc_roots::pin_root(one);
                             let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                             let bumped = add(

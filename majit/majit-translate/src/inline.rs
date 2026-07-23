@@ -419,6 +419,8 @@ pub(crate) fn remap_op_kind(
             class_root: class_root.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
+        OpKind::ConstInt128(v) => OpKind::ConstInt128(*v),
+        OpKind::ConstUInt128(v) => OpKind::ConstUInt128(*v),
         OpKind::ConstBool(v) => OpKind::ConstBool(*v),
         OpKind::ConstSymbolic { tag, ty } => OpKind::ConstSymbolic {
             tag: *tag,
@@ -861,6 +863,8 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
@@ -1135,6 +1139,8 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // dependency-routing classification.
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         // `_we_are_jitted` symbolic const — a pure `Constant`, removable
         // when its result is unread (folded to a real const by

@@ -3912,12 +3912,13 @@ pub(crate) fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -
         // `pyopcode.rs:347-353` — promote bigints to W_LongObject just
         // like `load_const_value` does before invoking the trait.
         ConstantData::Integer { value } => {
-            if pyre_object::longobject::jit_bigint_to_i64_fits(value) != 0 {
+            let value = crate::compiler_bigint_to_rbigint(value);
+            if pyre_object::longobject::jit_bigint_to_i64_fits(&value) != 0 {
                 pyre_object::intobject::w_int_new(pyre_object::longobject::jit_bigint_to_i64_value(
-                    value,
+                    &value,
                 ))
             } else {
-                pyre_object::longobject::w_long_new(value.clone())
+                pyre_object::longobject::w_long_new(value)
             }
         }
         // `eval.rs:1309-1311 float_constant`.

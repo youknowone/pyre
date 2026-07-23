@@ -816,3 +816,50 @@ assert result == 80, result
         "function/type name gc stress program failed",
     );
 }
+
+/// rbigint.py's process-global `_parts_cache` owns the powers used by recursive
+/// non-binary formatting. Its cached digit arrays must be forwarded as roots
+/// across moving collections, and extending the shared list later must retain
+/// every previously cached rbigint object.
+#[test]
+fn rbigint_format_parts_cache_survives_and_grows_across_full_collection() {
+    const PROGRAM: &str = r#"
+import gc
+
+def run():
+    x = 10 ** 600 + 123456789
+    expected_x = "1" + "0" * (600 - 9) + "123456789"
+
+    # Populate `_parts_cache_10`, then repeatedly consume its cached powers
+    # only after a moving full collection has forwarded their digit arrays.
+    assert str(x) == expected_x
+    i = 0
+    while i < 40:
+        gc.collect()
+        assert str(x) == expected_x
+        assert str(-x) == "-" + expected_x
+        i = i + 1
+
+    # Grow the same shared parts list after its old prefix has survived those
+    # collections, then exercise both the old and new levels after more moves.
+    y = 10 ** 2400 + 987654321
+    expected_y = "1" + "0" * (2400 - 9) + "987654321"
+    assert str(y) == expected_y
+    i = 0
+    while i < 40:
+        gc.collect()
+        assert str(x) == expected_x
+        assert str(y) == expected_y
+        i = i + 1
+    return len(str(x)) + len(str(y))
+
+result = run()
+assert result == 3002, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<rbigint_format_parts_cache_gc_stress>",
+        "rbigint formatter cache survival checks",
+        "rbigint formatter cache gc stress program failed",
+    );
+}

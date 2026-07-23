@@ -454,14 +454,23 @@ impl LowLevelType {
                         | ConstValue::InheritanceId { .. }
                 )
             }
-            // upstream `Unsigned` / long-long primitives accept Python
-            // `int` (range checking upstream; pyre's `ConstValue::Int` is
-            // already i64, so the only check left is category match).
+            // Upstream checks `typeOf(value)` against the exact Number
+            // primitive (`lltype.py:194-197`).  The word and 64-bit
+            // integer families historically share pyre's i64
+            // `ConstValue::Int` carrier.  The 128-bit families have their
+            // own carriers so values outside i64/u64 remain lossless; keep
+            // accepting `Int` there as the legacy representation of small
+            // typed constants while requiring the matching signedness for
+            // the full-width carriers.
             LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
-            | LowLevelType::SignedLongLongLong
-            | LowLevelType::UnsignedLongLong
-            | LowLevelType::UnsignedLongLongLong => matches!(value, ConstValue::Int(_)),
+            | LowLevelType::UnsignedLongLong => matches!(value, ConstValue::Int(_)),
+            LowLevelType::SignedLongLongLong => {
+                matches!(value, ConstValue::Int(_) | ConstValue::Int128(_))
+            }
+            LowLevelType::UnsignedLongLongLong => {
+                matches!(value, ConstValue::Int(_) | ConstValue::UInt128(_))
+            }
             // upstream `Float` / `SingleFloat` / `LongFloat` accept
             // Python `float`.
             LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
@@ -6556,6 +6565,10 @@ mod tests {
         assert!(LowLevelType::Signed.contains_value(&ConstValue::Int(42)));
         assert!(LowLevelType::Unsigned.contains_value(&ConstValue::Int(42)));
         assert!(LowLevelType::SignedLongLong.contains_value(&ConstValue::Int(42)));
+        assert!(LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int128(i128::MIN)));
+        assert!(LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));
+        assert!(!LowLevelType::SignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));
+        assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::Int128(i128::MIN)));
         assert!(!LowLevelType::Signed.contains_value(&ConstValue::Bool(true)));
 
         // RPython `Float` / `SingleFloat` / `LongFloat` accept Python float.

@@ -3500,25 +3500,42 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )? {
                             Some(()) => Some(()),
-                            // W_LongObject (bigint) operands: take the long
-                            // fast path before falling to float so two-long
-                            // operands keep bigint arithmetic.
-                            None => match try_walker_specialize_binary_op_long(
+                            // longobject.py `_make_generic_descr_binop` and
+                            // `descr_sub` use the rbigint.int_* family for
+                            // mixed Long/Int operands.
+                            None => match try_walker_specialize_binary_op_long_int(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )? {
                                 Some(()) => Some(()),
-                                // Two-long true-divide → float fast path
-                                // (CallPureF + wrapfloat), before the generic
-                                // float leg which only handles float operands.
-                                None => match try_walker_specialize_truediv_op_long(
+                                // `_make_descr_binop` gives shifts with an Int
+                                // count their own `_int_lshift` /
+                                // `_int_rshift` path before Long/Long.
+                                None => match try_walker_specialize_binary_op_long_int_shift(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
                                 )? {
                                     Some(()) => Some(()),
-                                    None => try_walker_specialize_binary_op_float(
+                                    // W_LongObject operands take the long fast
+                                    // path before float so bigint arithmetic
+                                    // retains its payload representation.
+                                    None => match try_walker_specialize_binary_op_long(
                                         ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                         dst_bank,
-                                    )?,
+                                    )? {
+                                        Some(()) => Some(()),
+                                        // Two-long true-divide → float fast
+                                        // path (CallPureF + wrapfloat).
+                                        None => match try_walker_specialize_truediv_op_long(
+                                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
+                                            dst, dst_bank,
+                                        )? {
+                                            Some(()) => Some(()),
+                                            None => try_walker_specialize_binary_op_float(
+                                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
+                                                dst, dst_bank,
+                                            )?,
+                                        },
+                                    },
                                 },
                             },
                         }
@@ -3550,13 +3567,19 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                     )? {
                         Some(()) => Some(()),
-                        None => match try_walker_specialize_compare_op_long(
+                        None => match try_walker_specialize_compare_op_long_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )? {
                             Some(()) => Some(()),
-                            None => try_walker_specialize_compare_op_float(
+                            None => match try_walker_specialize_compare_op_long(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?,
+                            )? {
+                                Some(()) => Some(()),
+                                None => try_walker_specialize_compare_op_float(
+                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
+                                    dst_bank,
+                                )?,
+                            },
                         },
                     }
                 };

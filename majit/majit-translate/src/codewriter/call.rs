@@ -6233,6 +6233,12 @@ fn collect_readwrite_effects(
                             }
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                            crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
+                                panic!(
+                                    "getkind: 128-bit array item type is too large \
+                                     (history.py:62)"
+                                )
+                            }
                         };
                         array_read_descrs.push(cc.arraydescrof(
                             idx,
@@ -6279,6 +6285,12 @@ fn collect_readwrite_effects(
                             }
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                            crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
+                                panic!(
+                                    "getkind: 128-bit array item type is too large \
+                                     (history.py:62)"
+                                )
+                            }
                         };
                         // descr.py:359-362 + ARRAY_INSIDE._hints.get(
                         // 'nolength', False): the producer-side bit
@@ -6980,6 +6992,8 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: same_as, cast_*, hint → cannot raise
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
@@ -7130,6 +7144,8 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         ValueType::Void => 3,
         ValueType::State => 4,
         ValueType::Unknown => 5,
+        ValueType::Int128 => 6,
+        ValueType::UInt128 => 7,
     }
 }
 

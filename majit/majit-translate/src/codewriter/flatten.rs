@@ -1431,6 +1431,9 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => 'i',
+        ConstValue::Int128(_) | ConstValue::UInt128(_) => {
+            panic!("getkind: 128-bit integer constant is too large (history.py:62)")
+        }
         ConstValue::Float(_) => 'f',
         ConstValue::None
         | ConstValue::ByteStr(_)

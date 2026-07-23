@@ -1,7 +1,7 @@
 //! `pypy/module/__builtin__/functional.py` line-by-line ports for built-in iterator functionals.
 
 use crate::pyobject::*;
-use malachite_bigint::BigInt;
+use crate::rbigint::RBigInt as BigInt;
 use pyre_macros::pyre_class;
 
 // ── functional.rs ─────────────────────────────────────────────
@@ -848,7 +848,6 @@ pub unsafe fn w_range_length_i64(obj: PyObjectRef) -> Option<i64> {
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
-    use num_traits::Zero;
     unsafe { !range_obj_to_bigint(w_range_length(obj)).is_zero() }
 }
 
@@ -887,7 +886,6 @@ pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
-    use num_traits::One;
     unsafe {
         if let (Some((start, _stop, step)), Some(len)) =
             (w_range_fields_i64(obj), w_range_length_i64(obj))
@@ -926,7 +924,6 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<PyObjectRef> {
-    use num_traits::Zero;
     unsafe {
         let (start, _stop, step) = w_range_fields(obj);
         let len_b = range_obj_to_bigint(w_range_length(obj));
@@ -947,7 +944,6 @@ pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<P
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_contains_bigint(obj: PyObjectRef, item: &BigInt) -> bool {
-    use num_traits::Zero;
     unsafe {
         let (start, stop, step) = w_range_fields(obj);
         let start_b = range_obj_to_bigint(start);
@@ -990,7 +986,6 @@ pub unsafe fn w_range_index_of(obj: PyObjectRef, item: &BigInt) -> PyObjectRef {
 /// # Safety
 /// `a` and `b` must point to valid `W_Range` objects.
 pub unsafe fn w_range_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
-    use num_traits::One;
     unsafe {
         let la = range_obj_to_bigint(w_range_length(a));
         let lb = range_obj_to_bigint(w_range_length(b));
@@ -1030,7 +1025,6 @@ pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
 
 /// Bignum `compute_range_length` — always non-negative.
 pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
-    use num_traits::{One, Zero};
     let zero = BigInt::zero();
     if *step > zero {
         if *start < *stop {

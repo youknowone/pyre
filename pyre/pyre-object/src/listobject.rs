@@ -15,8 +15,8 @@ use crate::object_array::{
 use crate::pyobject::*;
 use crate::{
     FloatArray, IntArray, floatobject::w_float_get_value, floatobject::w_float_new,
-    intobject::w_int_get_value, intobject::w_int_new, longobject::w_long_fits_int,
-    longobject::w_long_get_value, tupleobject::is_plain_float_strict,
+    intobject::w_int_get_value, intobject::w_int_new, longobject::jit_bigint_to_i64_value,
+    longobject::w_long_fits_int, longobject::w_long_get_value, tupleobject::is_plain_float_strict,
 };
 
 #[repr(u8)]
@@ -363,13 +363,11 @@ pub(crate) unsafe fn plain_int_w(item: PyObjectRef) -> i64 {
     if is_int(item) {
         w_int_get_value(item)
     } else {
-        i64::try_from(w_long_get_value(item)).unwrap_or_else(|_| {
-            panic!(
-                "plain_int_w: W_LongObject out of i64 range — \
-                 is_plain_int1/_fits_int precondition violated \
-                 (listobject.py:2394 / longobject.py:157)"
-            )
-        })
+        // `is_plain_int1` has already performed the upstream `_fits_int`
+        // guard.  Keep the same guard→`toint` split used by
+        // `W_LongObject._int_w`; in particular, do not expose Rust's
+        // `Result<i64, RBigIntError>` carrier to the translated graph.
+        jit_bigint_to_i64_value(w_long_get_value(item))
     }
 }
 

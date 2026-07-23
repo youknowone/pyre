@@ -725,10 +725,22 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // elidable effect already lowers the callsite to CALL_PURE and never
     // looks inside the body.  Harvest the elidable set from the same
     // vector so `stamp_return_token` can stamp the matching FUNC.RESULT
-    // token, gated on `PYRE_ELIDABLE_RESIDUALIZE`.
+    // token. `PYRE_ELIDABLE_RESIDUALIZE=0` is only a diagnostic kill switch
+    // for the upstream-default opaque-elidable policy.
     let elidable_residual: std::collections::HashSet<String> = harvested
         .iter()
         .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
+        .map(|(path, _)| path.clone())
+        .collect();
+    // `objectmodel.py:267 @not_rpython` sets `func._not_rpython_`; the
+    // flowspace refuses that function before executing its body
+    // (`flowspace/objspace.py:21-22 assert_rpythonic`).  Apply the same gate
+    // before MIR lowering, which also prevents host-only carrier types (for
+    // example rbigint.fromlong's i128 test surface) from becoming spurious
+    // translated graph-coverage failures.
+    let not_rpython: std::collections::HashSet<String> = harvested
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "not_rpython"))
         .map(|(path, _)| path.clone())
         .collect();
     let mut functions = Vec::new();
@@ -761,6 +773,14 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             None => (String::new(), stripped),
         };
         if !should_lower_module(module_filter, &module_path) {
+            continue;
+        }
+        let fn_path = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{module_path}::{name}")
+        };
+        if not_rpython.contains(&fn_path) {
             continue;
         }
         // A single function whose body the driver does not yet handle
@@ -831,11 +851,6 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
         // codewriter surface stays restricted to opaque stubs; every
         // other fn keeps the declared-void default.
-        let fn_path = if module_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{module_path}::{name}")
-        };
         // A trait default body is registered as the `<default methods of
         // Trait>` family sentinel and picked as the Indirect-dispatch
         // witness (`getcalldescr`'s indirect arm reads its `return_type` as
@@ -1769,32 +1784,6 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
                 &lo.closure_select_sites,
             )
         };
-        // The `bigint::BigInt::div_rem()` producer rewrite
-        // (`front::bigint_div_rem`) splices the residual `div_rem` call in
-        // place with `jit_bigint_div` / `jit_bigint_rem` residuals + a
-        // synthetic-`Tuple` `(quotient, remainder)` aggregate.  It touches no
-        // control flow (no fresh blocks, no detached edges), so it does not
-        // gate the reachability sweep; fail-safe, so a structural mismatch
-        // leaves the residual call (rtyper Skip).
-        if !lo.bigint_div_rem_sites.is_empty() {
-            crate::front::bigint_div_rem::rewire_bigint_div_rem_call_sites(
-                &mut lo.graph,
-                &lo.bigint_div_rem_sites,
-            );
-        }
-        // The `bigint::BigInt::div_mod_floor()` producer rewrite
-        // (`front::bigint_div_mod_floor`) splices the residual `div_mod_floor`
-        // call in place with `jit_bigint_div_floor` / `jit_bigint_mod_floor`
-        // residuals + a synthetic-`Tuple` floored `(quotient, modulus)`
-        // aggregate.  It touches no control flow (no fresh blocks, no detached
-        // edges), so it does not gate the reachability sweep; fail-safe, so a
-        // structural mismatch leaves the residual call (rtyper Skip).
-        if !lo.bigint_div_mod_floor_sites.is_empty() {
-            crate::front::bigint_div_mod_floor::rewire_bigint_div_mod_floor_call_sites(
-                &mut lo.graph,
-                &lo.bigint_div_mod_floor_sites,
-            );
-        }
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
         // the residual `contains` method call in place with native
         // `bitand(le(a, x), ge(b, x))` compares and removes the paired
@@ -2211,16 +2200,6 @@ struct Lowering<'a> {
     /// resolved ctor/method owners the arms need (see
     /// [`crate::front::bool_then::BoolThenSite`]).
     bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
-    /// `bigint::BigInt::div_rem()` call sites recorded for the modeled
-    /// `(quotient, remainder)` tuple producer the `front::bigint_div_rem`
-    /// post-pass synthesizes (see
-    /// [`crate::front::bigint_div_rem::BigIntDivRemSite`]).
-    bigint_div_rem_sites: Vec<crate::front::bigint_div_rem::BigIntDivRemSite>,
-    /// `bigint::BigInt::div_mod_floor()` call sites recorded for the modeled
-    /// floored `(quotient, modulus)` tuple producer the
-    /// `front::bigint_div_mod_floor` post-pass synthesizes (see
-    /// [`crate::front::bigint_div_mod_floor::BigIntDivModFloorSite`]).
-    bigint_div_mod_floor_sites: Vec<crate::front::bigint_div_mod_floor::BigIntDivModFloorSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -2427,8 +2406,6 @@ impl<'a> Lowering<'a> {
             checked_arith_call_results: Vec::new(),
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
-            bigint_div_rem_sites: Vec::new(),
-            bigint_div_mod_floor_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -3573,12 +3550,21 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                // f64 arithmetic stays in the Float bank (`float_add`/
-                // `float_mod`...); everything else — comparisons (bool),
-                // integer math, and checked-arithmetic `(int, bool)`
-                // tuple destinations — is Int.
+                // Preserve the source scalar width through flow-graph
+                // construction.  PyPy's rbigint `_x_divrem` performs its
+                // intermediates in `LONG_TYPE` / `ULONG_TYPE`
+                // (`SignedLongLongLong` / `UnsignedLongLongLong`), so
+                // collapsing an i128/u128 destination to the word-sized
+                // `Int` carrier here loses the exact RPython low-level type
+                // before the rtyper can see it.  f64 similarly stays Float;
+                // comparisons (bool), ordinary integer math, and
+                // checked-arithmetic `(int, bool)` tuple destinations use
+                // the word-sized Int carrier.
                 let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
                     ValueType::Float => ValueType::Float,
+                    ValueType::Unsigned => ValueType::Unsigned,
+                    ValueType::Int128 => ValueType::Int128,
+                    ValueType::UInt128 => ValueType::UInt128,
                     _ => ValueType::Int,
                 };
                 // Rust `/` (MIR `Div`) lowers to the `floordiv` opname
@@ -3640,10 +3626,10 @@ impl<'a> Lowering<'a> {
                 // encodes the conversion.  Genuine `Neg` / `Not` arithmetic
                 // keeps a real scalar `OpKind::UnaryOp`.
                 if unary_op_is_cast(&op_json) {
-                    // Signedness-aware source classification — `operand_value_kind`
-                    // (`tyref_to_value_type`) collapses `uN` and `iN` both to
-                    // `Int`, hiding a `usize as i64` flip; `tyref_to_attr_value_type`
-                    // keeps the signed/unsigned split.
+                    // Signedness-aware source classification.  Both the
+                    // value projection and the attribute projection preserve
+                    // `uN` as Unsigned; the latter remains the source of
+                    // truth for wrapped/field place types.
                     let src_attr = match &operand {
                         Operand::Copy(p) | Operand::Move(p) => {
                             Some(tyref_to_attr_value_type(&p.ty, self.llbc))
@@ -3680,6 +3666,32 @@ impl<'a> Lowering<'a> {
                                 },
                                 args: vec![arg],
                                 result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
+                    // The opposite signedness flip is RPython's
+                    // `rarithmetic.r_uint(v)`: it keeps the machine word
+                    // bits but changes the annotation/repr to Unsigned.
+                    if matches!(src_attr, Some(ValueType::Int))
+                        && matches!(
+                            tyref_to_attr_value_type(dest_ty, self.llbc),
+                            ValueType::Unsigned
+                        )
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                                        .into_iter()
+                                        .map(str::to_string)
+                                        .collect(),
+                                },
+                                args: vec![arg],
+                                result_ty: ValueType::Unsigned,
                             }),
                             res,
                         ));
@@ -3777,12 +3789,15 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                // `Neg` on f64 stays in the Float bank (`float_neg`);
-                // everything else is Int.  A hardcoded Int here mistyped
-                // float negation and produced cross-bank link renamings
-                // downstream.
+                // Preserve f64 and 128-bit arithmetic destinations exactly.
+                // The latter match RPython's LONG_TYPE/ULONG_TYPE carrier
+                // through annotation/rtyping even though the JIT codewriter
+                // deliberately has no 128-bit register kind.
                 let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
                     ValueType::Float => ValueType::Float,
+                    ValueType::Unsigned => ValueType::Unsigned,
+                    ValueType::Int128 => ValueType::Int128,
+                    ValueType::UInt128 => ValueType::UInt128,
                     _ => ValueType::Int,
                 };
                 Ok((
@@ -4267,6 +4282,8 @@ impl<'a> Lowering<'a> {
     ) -> Result<Variable, LowerError> {
         let op = match decode_constant(self.llbc, value)? {
             DecodedConst::Int(n) => OpKind::ConstInt(n),
+            DecodedConst::Int128(n) => OpKind::ConstInt128(n),
+            DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
             DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
             // String / char / byte-string constants — no
@@ -5160,6 +5177,8 @@ impl<'a> Lowering<'a> {
         }
         match decode_literal(found?).ok()? {
             DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+            DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
+            DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
             DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
             DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
             // A `const NAME: &str = "..."` global reads as a named-const
@@ -5357,8 +5376,11 @@ impl<'a> Lowering<'a> {
         }
         let init_id = g.rest.get("init")?.as_u64()?;
         let fd = self.llbc.fn_by_id(init_id)?;
-        let u = fd.unstructured()?;
-        const_eval_init_body(self.llbc, &u)
+        if let Some(u) = fd.unstructured() {
+            const_eval_init_body(self.llbc, &u)
+        } else {
+            const_eval_core_num_associated_const(self.llbc, def_id).and_then(const_lit_to_op)
+        }
     }
 
     /// Fold a `NamedConst` global whose initializer is exactly
@@ -6385,6 +6407,24 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
+                // Rust's shallow `Clone` shim has no RPython operation:
+                // `rbigint` values are immutable GC references, so cloning a
+                // reference is an identity assignment. Preserve that exact
+                // owner shape instead of descending into field copies of a
+                // classdef-less external declaration.
+                if args.len() == 1
+                    && segments.last().is_some_and(|leaf| leaf == "clone")
+                    && first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+                    && tyref_is_rbigint(&call.dest.ty, self.llbc)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,
@@ -6434,17 +6474,14 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                // `<BigInt as {One,Zero}>::{one,zero}()` — a 0-arg associated
-                // fn returning a fresh `BigInt` constant.  Emit `BigInt::from(1)`
-                // / `BigInt::from(0)` (a `ConstInt` operand feeding the
-                // `["BigInt", "from"]` residual-external) instead of leaving the
-                // owner-resolved `["bigint", "BigInt", <leaf>]` call unregistered.
-                // `BigInt::from(1i64)` == `Integer::ONE` and `from(0i64)` ==
-                // `Integer::ZERO`, so the constants are byte-identical.
+                // `RBigInt::{one,zero}()` — a 0-arg constructor returning the
+                // translated one-GC-reference bigint. Emit the same constant
+                // through the pointer-ABI `rbigint.fromint` residual instead
+                // of exposing Rust's by-value struct return ABI.
                 if args.is_empty()
                     && let [.., owner_a, owner_b, leaf] = segments.as_slice()
-                    && owner_a == "bigint"
-                    && owner_b == "BigInt"
+                    && owner_a == "rbigint"
+                    && owner_b == "RBigInt"
                     && matches!(leaf.as_str(), "one" | "zero")
                 {
                     let n = if leaf == "one" { 1 } else { 0 };
@@ -6462,7 +6499,11 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["BigInt".to_string(), "from".to_string()],
+                                segments: vec![
+                                    "pyre_object".to_string(),
+                                    "longobject".to_string(),
+                                    "jit_bigint_from_i64".to_string(),
+                                ],
                             },
                             args: vec![cst],
                             result_ty: ValueType::Ref(None),
@@ -6812,9 +6853,9 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
-        // Retarget a foreign BigInt binary-operator call (`<BigInt as
-        // BitAnd>::bitand`, …) to its `#[dont_look_inside]` `jit_bigint_*`
-        // residual.  The malachite operator body is Opaque, and both operands
+        // Retarget an RBigInt Rust trait-operator call (`<RBigInt as
+        // BitAnd>::bitand`, …) to its elidable `jit_bigint_*`
+        // residual. The trait shell obscures the RPython method, and both operands
         // and the result are the classdef-less `*mut BigInt` GcRef the front
         // models a `BigInt` as, so the i64-ABI residual is a faithful pointer
         // pass.  Guarded on both operands resolving to the opaque `BigInt` ADT
@@ -6822,20 +6863,23 @@ impl<'a> Lowering<'a> {
         // pure target swap (args + result var unchanged), fail-safe by
         // construction (a non-BigInt / unlisted operator leaves the residual
         // `<Impl>` call the census Skips).
-        let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
-            args,
-            ..
-        } = &op_kind
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+                .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && second_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
-            && let Some(residual) = crate::front::bigint_binop::bigint_binop_residual_path(segments)
-        {
+                .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
+            && let Some(residual) = match target {
+                CallTarget::FunctionPath { segments } => {
+                    crate::front::bigint_binop::bigint_binop_residual_path(segments)
+                }
+                CallTarget::Method { name, .. } => {
+                    crate::front::bigint_binop::bigint_binop_residual_for_method(name)
+                }
+                _ => None,
+            } {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },
                 args: args.clone(),
@@ -6845,29 +6889,250 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
-        // Retarget a foreign BigInt shift call (`<BigInt as Shl<usize>>::shl`,
+        // PyPy W_LongObject dispatches a mixed long/int add, subtract,
+        // multiply, or bitwise operation directly to rbigint.int_* with the
+        // W_IntObject's signed machine word. Preserve that one-GCREF +
+        // one-Signed call shape: dependent-crate LLBC keeps RBigInt opaque,
+        // so following the inherent Rust method would otherwise either Skip
+        // or force a temporary RBigInt conversion. The exact I64 gate avoids
+        // silently narrowing Rust's i128/u128 carriers, which RPython's JIT
+        // cannot place in a register.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
+            && let Some(residual) = match target {
+                CallTarget::FunctionPath { segments } => segments.last().and_then(|leaf| {
+                    crate::front::rbigint_call::int_binop_residual_for_method(leaf)
+                }),
+                CallTarget::Method { name, .. } => {
+                    crate::front::rbigint_call::int_binop_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Mixed W_LongObject/W_IntObject comparisons use rbigint.int_* in
+        // both operand orders (the int-left descriptor reverses the relation).
+        // The receiver remains one RBigInt GCREF, the other operand is exactly
+        // Signed, and the result occupies the bool/int bank.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
+            && let Some(residual) = match target {
+                CallTarget::FunctionPath { segments } => segments.last().and_then(|leaf| {
+                    crate::front::rbigint_call::int_comparison_residual_for_method(leaf)
+                }),
+                CallTarget::Method { name, .. } => {
+                    crate::front::rbigint_call::int_comparison_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Bool,
+            }
+        } else {
+            op_kind
+        };
+
+        // Retarget an RBigInt Rust trait shift call (`<RBigInt as Shl<usize>>::shl`,
         // …) to its `jit_bigint_{shl,shr}` residual.  Split from the binary
         // retarget above because the shift amount is a machine integer, not a
         // `BigInt`: the guard requires the first operand to be the opaque
         // `BigInt` ADT and the second to be an integer, so the residual reads
         // `b` as the shift count rather than as a `*mut BigInt` pointer.  Same
         // pure-target-swap, fail-safe contract.
-        let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
-            args,
-            ..
-        } = &op_kind
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+                .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && second_arg_ty.as_ref().is_some_and(|t| {
                 matches!(
                     tyref_to_value_type(t, self.llbc),
                     ValueType::Int | ValueType::Unsigned
                 )
             })
-            && let Some(residual) = crate::front::bigint_binop::bigint_shift_residual_path(segments)
+            && let Some(residual) = match target {
+                CallTarget::FunctionPath { segments } => {
+                    crate::front::bigint_binop::bigint_shift_residual_path(segments)
+                }
+                CallTarget::Method { name, .. } => {
+                    crate::front::bigint_binop::bigint_shift_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Retarget an RBigInt Rust trait unary call (`<RBigInt as Neg>::neg`)
+        // to its `jit_bigint_neg` residual.  Split from the binary retarget
+        // above because the operator takes a single `BigInt` operand: the guard
+        // requires the sole operand to be the opaque `BigInt` ADT.  Same
+        // pure-target-swap, fail-safe contract.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
+            && let Some(residual) = match target {
+                CallTarget::FunctionPath { segments } => {
+                    crate::front::bigint_binop::bigint_unop_residual_path(segments)
+                }
+                CallTarget::Method { name, .. } => {
+                    crate::front::bigint_binop::bigint_unop_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // RBigInt comparisons are `@jit.elidable` scalar residuals in
+        // RPython. Keep the two GCREF operands and return an integer-bank
+        // boolean instead of following Rust's trait shim into a classless
+        // receiver method.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && let Some(residual) = match target {
+                CallTarget::FunctionPath { segments } => {
+                    crate::front::bigint_binop::bigint_comparison_residual_path(segments)
+                }
+                CallTarget::Method { name, .. } => {
+                    crate::front::bigint_binop::bigint_comparison_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Bool,
+            }
+        } else {
+            op_kind
+        };
+
+        // Scalar rbigint queries are pure residuals over one GCREF. This is
+        // especially important for dependent-crate LLBCs, where Charon keeps
+        // the nominal RBigInt type opaque and a Method getattr cannot inspect
+        // its fields.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && let Some((segments, scalar_result)) = match target {
+                CallTarget::FunctionPath { segments } => segments
+                    .last()
+                    .and_then(|leaf| crate::front::rbigint_call::scalar_residual_for_method(leaf)),
+                CallTarget::Method { name, .. } => {
+                    crate::front::rbigint_call::scalar_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            let result_ty = match scalar_result {
+                crate::front::rbigint_call::ScalarResult::Int => ValueType::Int,
+                crate::front::rbigint_call::ScalarResult::Bool => ValueType::Bool,
+            };
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args: args.clone(),
+                result_ty,
+            }
+        } else {
+            op_kind
+        };
+
+        // `rbigint.fromint` is `@jit.elidable` in RPython and returns one
+        // GC reference. Retarget word-sized Rust constructors to wrappers
+        // whose C ABI returns `*mut RBigInt`; never narrow i128/u128, which
+        // RPython's JIT deliberately has no register kind for.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && tyref_is_rbigint(&call.dest.ty, self.llbc)
+            && let Some(arg_ty) = first_arg_ty.as_ref()
+        {
+            let signed = matches!(
+                self.tyref_literal_int_atom(arg_ty),
+                Some("I8" | "I16" | "I32" | "I64" | "Isize")
+            );
+            let unsigned = matches!(
+                self.tyref_literal_uint_atom(arg_ty),
+                Some("U8" | "U16" | "U32" | "U64" | "Usize")
+            );
+            if (signed || unsigned)
+                && let Some(residual) =
+                    crate::front::rbigint_call::constructor_residual_path(segments, unsigned)
+            {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments: residual },
+                    args: args.clone(),
+                    result_ty: ValueType::Ref(None),
+                }
+            } else {
+                op_kind
+            }
+        } else {
+            op_kind
+        };
+
+        // The interpreter has already rejected a zero divisor before these
+        // quotient/remainder projections. Retarget their direct RBigInt
+        // results to the two pointer-ABI halves of upstream `divmod`.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && tyref_is_rbigint(&call.dest.ty, self.llbc)
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && let Some(residual) =
+                crate::front::rbigint_call::divmod_projection_residual_path(segments)
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },
@@ -6878,21 +7143,72 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
-        // Retarget a foreign BigInt unary-operator call (`<BigInt as Neg>::neg`)
-        // to its `jit_bigint_neg` residual.  Split from the binary retarget
-        // above because the operator takes a single `BigInt` operand: the guard
-        // requires the sole operand to be the opaque `BigInt` ADT.  Same
-        // pure-target-swap, fail-safe contract.
+        // Keep the RustPython compiler's foreign BigInt at the fixed
+        // LOAD_CONST seam.  The conversion result is the same translated
+        // one-GC-reference RBigInt shape as every local constructor.
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
         } = &op_kind
             && args.len() == 1
+            && tyref_is_rbigint(&call.dest.ty, self.llbc)
+            && let Some(residual) =
+                crate::front::rbigint_call::compiler_bigint_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Rust carries `rbigint.pow(..., None)` through
+        // `Result<RBigInt, PyError>` in the interpreter source. RPython's
+        // translated shape is instead one GCREF result plus an implicit
+        // MemoryError edge. Retarget the exact host helper to that pointer ABI;
+        // the Result-of-PyError capture immediately below rewires the compiler
+        // generated `?` diamond into LastException exits.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
             && first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
-            && let Some(residual) = crate::front::bigint_binop::bigint_unop_residual_path(segments)
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && let Some(residual) = crate::front::rbigint_call::pow_nomod_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Rust carries the fallible allocation of `rbigint.lshift` through a
+        // `Result<RBigInt, PyError>`. RPython has a direct GCREF result plus
+        // an implicit MemoryError edge, so retarget the validated
+        // machine-count helper to that pointer ABI before `result_exc` erases
+        // the Result diamond.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && let Some(residual) = crate::front::rbigint_call::lshift_count_residual_path(segments)
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },
@@ -7004,44 +7320,6 @@ impl<'a> Lowering<'a> {
             && let Some(site) = self.recognize_bool_then_some_site(&call.dest.ty, &result_var)
         {
             self.bool_then_sites.push(site);
-        }
-        // Capture `bigint::BigInt::div_rem()` sites for the modeled
-        // `(quotient, remainder)` tuple producer `front::bigint_div_rem`
-        // synthesizes.  Opaque foreign 2-arg FunctionPath (numerator,
-        // denominator); the `(BigInt, BigInt)` tuple owner is the synthetic
-        // `"Tuple"` constant, so only the result var is recorded.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["bigint", "BigInt", "div_rem"])
-        {
-            self.bigint_div_rem_sites
-                .push(crate::front::bigint_div_rem::BigIntDivRemSite {
-                    result_var: result_var.clone(),
-                });
-        }
-        // Capture `bigint::BigInt::div_mod_floor()` sites for the modeled floored
-        // `(quotient, modulus)` tuple producer `front::bigint_div_mod_floor`
-        // synthesizes.  Opaque foreign 2-arg FunctionPath (numerator,
-        // denominator); the `(BigInt, BigInt)` tuple owner is the synthetic
-        // `"Tuple"` constant, so only the result var is recorded.  A distinct
-        // leaf name from `div_rem`, so this arm coexists with it.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["bigint", "BigInt", "div_mod_floor"])
-        {
-            self.bigint_div_mod_floor_sites.push(
-                crate::front::bigint_div_mod_floor::BigIntDivModFloorSite {
-                    result_var: result_var.clone(),
-                },
-            );
         }
         // Capture `RangeInclusive::new(lo, hi)` sites for the
         // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
@@ -7441,16 +7719,15 @@ impl<'a> Lowering<'a> {
                     return None;
                 }
                 let td = self.llbc.type_by_id(adt_def_id)?;
-                // A foreign opaque owner (`malachite_bigint::BigInt`,
-                // `Sign`, …) has no extracted body, so the annotator never
+                // An opaque owner from a dependency artefact has no extracted
+                // body in that LLBC, so the annotator never
                 // mints a `ClassDef` for it — the receiver lands as a
                 // classdef-less `SomeInstance` and a `CallTarget::Method`
                 // getattr panics ("SomeInstance.getattr on classdef-less
                 // instance").  The interpreter's overflow→long arms are the
                 // cold `@jit.dont_look_inside` bailouts that operate on this
-                // opaque value (`bigint_add`/`bigint_sub`/… call
-                // `<BigInt as Add>::add` etc.), so the faithful treatment is
-                // to residualize the call, not trace into the foreign body —
+                // opaque value, so the faithful treatment is to residualize
+                // the call, not trace into an unavailable body —
                 // the `register_external` analog.  Declining the Method hint
                 // routes the call through the `FunctionPath` form, which the
                 // call registry resolves to an opaque external
@@ -9209,8 +9486,8 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Lower the runtime-fallible `i64::try_from(&BigInt)`
-    /// (`malachite_bigint::bigint::<Impl>::try_from`, Opaque in the LLBC)
+    /// Lower the runtime-fallible `i64::try_from(&RBigInt)`
+    /// (a trait shell in the LLBC)
     /// into its decomposed runtime-discriminant `Result` shape: a
     /// `__discriminant` tag driven by `rbigint.fits_int()` and a
     /// `__pos_0` payload holding the narrowed value.  Callers narrow a
@@ -9220,8 +9497,8 @@ impl<'a> Lowering<'a> {
     ///
     /// The arg type — not the module path — is the robust discriminator
     /// (same philosophy as the BigInt binary-operator retarget), so this
-    /// guards on the opaque `BigInt` ADT rather than hard-matching
-    /// `malachite_bigint`.
+    /// guards on the exact `RBigInt` ADT identity rather than hard-matching a
+    /// dependency path spelling.
     ///
     /// # Eager-payload panic hazard
     /// [`Self::emit_tagged_pair_aggregate`] writes `__pos_0 = payload`
@@ -9271,7 +9548,7 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        if !tyref_is_opaque_bigint(src, self.llbc) {
+        if !tyref_is_rbigint(src, self.llbc) {
             return Ok(false);
         }
         // Resolve the destination `Result` decl so the FieldWrite owner
@@ -11207,8 +11484,7 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
 
 /// Collect, from the lowered MIR, `(path-segments, Signature, result
 /// ValueType)` for every method whose impl-owner is a **foreign opaque**
-/// ADT (`malachite_bigint::bigint::BigInt`, …) and whose result type can
-/// be modeled faithfully.
+/// ADT and whose result type can be modeled faithfully.
 ///
 /// An opaque owner has no extracted body, so the annotator never mints a
 /// `ClassDef` for it; the receiver lands as a classdef-less
@@ -11753,7 +12029,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 
 /// Project a Charon [`TyRef`] to the JIT-visible [`ValueType`].
 ///
-/// Numeric scalars → `Int` / `Float`, bool → `Bool`, unit → `Void`,
+/// Numeric scalars → `Int` / `Unsigned` / `Float`, bool → `Bool`, unit → `Void`,
 /// everything else (structs, pointers, references) → `Ref`.  The
 /// TyRef's serialized form is the source of truth —
 /// `TyRef::label()` produces a compact short form
@@ -11779,6 +12055,8 @@ fn value_type_bank(ty: &ValueType) -> u8 {
         ValueType::Void => 3,
         ValueType::State => 4,
         ValueType::Unknown => 5,
+        ValueType::Int128 => 6,
+        ValueType::UInt128 => 7,
     }
 }
 
@@ -11865,8 +12143,16 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             };
         }
         if let Some(lit_obj) = lit.as_object() {
+            if lit_obj.get("Int").and_then(serde_json::Value::as_str) == Some("I128") {
+                return ValueType::Int128;
+            }
+            if lit_obj.get("UInt").and_then(serde_json::Value::as_str) == Some("U128") {
+                return ValueType::UInt128;
+            }
+            if lit_obj.contains_key("UInt") {
+                return ValueType::Unsigned;
+            }
             if lit_obj.contains_key("Int")
-                || lit_obj.contains_key("UInt")
                 || lit_obj.contains_key("Integer")
                 || lit_obj.contains_key("Char")
             {
@@ -11887,15 +12173,11 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
-    // Non-`Literal` (ADT / pointer / tuple) shapes only.  Atomic wrappers
-    // type as their inner value; integer widths collapse to `Int` here,
-    // matching the literal-int handling above.  Checked after the cheap
-    // `Literal` fast-path so primitive operands never pay the lookup.
+    // Non-`Literal` (ADT / pointer / tuple) shapes only. Atomic wrappers
+    // type as their inner value, including signedness. Checked after the
+    // cheap `Literal` fast-path so primitive operands never pay the lookup.
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
-        return match inner {
-            ValueType::Unsigned => ValueType::Int,
-            other => other,
-        };
+        return inner;
     }
     // `OpArg` is the transparent `struct OpArg(u32)` raw-operand wrapper;
     // its external decl is `Opaque`, so it would otherwise fall to
@@ -11981,6 +12263,8 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Bool => "bool",
         ValueType::Int => "i64",
         ValueType::Unsigned => "u64",
+        ValueType::Int128 => "i128",
+        ValueType::UInt128 => "u128",
         ValueType::Float => "f64",
         // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
         // caller reading the returned object's fields rtypes against the real
@@ -11996,19 +12280,22 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
-/// foreign opaque `malachite_bigint::bigint::BigInt` ADT.  Guards the
-/// BigInt binary-operator retarget (`front::bigint_binop`) so a same-named
+/// exact `pyre_object::rbigint::RBigInt` ADT. Guards the
+/// RBigInt binary-operator retarget (`front::bigint_binop`) so a same-named
 /// operator (`BitAnd`/`Sub`/`Mul`/…) on any other type is never redirected to
-/// a `jit_bigint_*` residual that would misread its non-BigInt pointer.
-fn tyref_is_opaque_bigint(ty: &TyRef, llbc: &Llbc) -> bool {
+/// a `jit_bigint_*` residual that would misread its non-RBigInt pointer.
+///
+/// In `pyre-object.ullbc` the declaration is the local struct whose bodies
+/// stay available to source translation. In dependent-crate LLBCs Charon
+/// records that same nominal type as an external/opaque declaration. The
+/// qualified identity is therefore the invariant; requiring either storage
+/// kind would make the rewrite depend on which crate owns the caller.
+fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            matches!(td.kind, TypeDeclKind::Opaque)
-                && td.item_meta.name_path().ends_with("bigint::BigInt")
-        })
+        .is_some_and(|td| td.item_meta.name_path().ends_with("rbigint::RBigInt"))
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
@@ -12061,9 +12348,9 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
 /// class the annotator pre-fills into `FORCE_ATTRIBUTES_INTO_CLASSES`.
 ///
-/// Unlike [`tyref_to_value_type`] (which collapses every integer width to
-/// `Int`), this keeps the signed/unsigned split: `{"Literal": {"UInt":
-/// …}}` shells to [`ValueType::Unsigned`] so `valuetype_to_someshell`
+/// Like [`tyref_to_value_type`], this keeps the signed/unsigned split:
+/// `{"Literal": {"UInt": …}}` shells to [`ValueType::Unsigned`] so
+/// `valuetype_to_someshell`
 /// picks `SomeInteger { unsigned: true }`, matching the per-field shells
 /// the syn classifier produced for `u8`..`usize`.  `char` and every
 /// signed width fold to `Int`; `bool`/`float` keep their classes; every
@@ -12090,6 +12377,12 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             };
         }
         if let Some(lit_obj) = lit.as_object() {
+            if lit_obj.get("Int").and_then(serde_json::Value::as_str) == Some("I128") {
+                return ValueType::Int128;
+            }
+            if lit_obj.get("UInt").and_then(serde_json::Value::as_str) == Some("U128") {
+                return ValueType::UInt128;
+            }
             if lit_obj.contains_key("UInt") {
                 return ValueType::Unsigned;
             }
@@ -13200,15 +13493,15 @@ pub(crate) fn dyn_indirect_enabled() -> bool {
 
 /// Residualize a `#[majit_macros::elidable]` graph — stamp its return-kind
 /// FUNC.RESULT token and prefill a signature-only stub instead of lifting
-/// the body — mirroring `@elidable` + `look_inside_graph=False` (the
-/// callsite already lowers to CALL_PURE via the codewriter's elidable
-/// effect; the body is never looked inside).  Default-OFF —
-/// `PYRE_ELIDABLE_RESIDUALIZE=1` opts in; every other value (unset
-/// included) keeps the elidable body lifted as today.
+/// the body — mirroring `JitPolicy._reject_function()` in
+/// `rpython/jit/codewriter/policy.py`: explicitly elidable functions are
+/// always opaque, while the callsite lowers to `CALL_PURE` through the
+/// elidable effect.  This is the upstream default.  The environment variable
+/// is only a diagnostic kill switch for comparing the pre-parity behaviour.
 pub(crate) fn elidable_residualize_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("PYRE_ELIDABLE_RESIDUALIZE").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("0") | Ok("false")
     )
 }
 
@@ -13751,6 +14044,8 @@ fn rvalue_variant_name(rv: &Rvalue) -> &'static str {
 /// emit. Widen as the corpus grows past `straight_line_add`.
 enum DecodedConst {
     Int(i64),
+    Int128(i128),
+    UInt128(u128),
     Bool(bool),
     Float(u64),
     /// String / char / byte-string literals. The IR has no dedicated
@@ -13769,11 +14064,17 @@ enum DecodedConst {
 #[derive(Clone, Copy)]
 enum ConstLit {
     Int(i64),
+    /// Unsigned integer bits.  Keeping this distinct is required while
+    /// evaluating const initializers: `(1_u64 << 63) - 1` cannot be
+    /// evaluated correctly after prematurely reinterpreting the first
+    /// shift result as a negative `i64`.
+    UInt(u64),
     Bool(bool),
     Float(u64),
     /// `*Checked` binop result `(value, overflowed)`; read back via
     /// `Field[Tuple 2, 0|1]` projections.
     Checked(i64, bool),
+    CheckedUInt(u64, bool),
 }
 
 /// Evaluate a global's single-value init body over literal locals.
@@ -13788,12 +14089,51 @@ enum ConstLit {
 /// const-checked the initializer), and bail to the residual `Call`
 /// lowering on any other shape.
 fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
+    const_lit_to_op(const_eval_init_body_lit(llbc, u, 0)?)
+}
+
+fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<ConstLit> {
+    if depth > 32 {
+        return None;
+    }
     let mut locals: std::collections::HashMap<u64, ConstLit> = std::collections::HashMap::new();
     let eval_operand =
         |locals: &std::collections::HashMap<u64, ConstLit>, op: &Operand| -> Option<ConstLit> {
             match op {
                 Operand::Copy(place) | Operand::Move(place) => match &place.kind {
                     PlaceKind::Local(n) => locals.get(n).copied(),
+                    // RPython hands already-folded module constants to the
+                    // flowspace.  Charon instead leaves a `Place::Global`
+                    // inside computed const MIR (`MASK = (1 << SHIFT) - 1`).
+                    // Evaluate an immutable NamedConst initializer
+                    // recursively so the resulting flow graph still carries
+                    // one literal Constant rather than a synthetic accessor
+                    // call.
+                    PlaceKind::Global { id, .. } => {
+                        let global = llbc.global_by_id(*id)?;
+                        if global
+                            .rest
+                            .get("global_kind")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("NamedConst")
+                        {
+                            return None;
+                        }
+                        let init_id = global.rest.get("init")?.as_u64()?;
+                        let init = llbc.fn_by_id(init_id)?;
+                        if let Some(body) = init.unstructured() {
+                            const_eval_init_body_lit(llbc, &body, depth + 1)
+                        } else {
+                            // Foreign primitive associated constants
+                            // (`i64::MAX`, etc.) have an opaque stdlib
+                            // initializer in Charon. RPython's flowspace sees
+                            // their already-evaluated host value, so recover
+                            // that literal from the primitive type and
+                            // associated-const leaf instead of materialising
+                            // a non-existent accessor call.
+                            const_eval_core_num_associated_const(llbc, *id)
+                        }
+                    }
                     // `checked_pair.0` / `.1` — the only projection an
                     // init body needs (`(1i64 << 62) - 1` reads its
                     // `SubChecked` result back field-wise).
@@ -13801,25 +14141,17 @@ fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
                         let PlaceKind::Local(n) = inner.kind else {
                             return None;
                         };
-                        let ConstLit::Checked(v, o) = locals.get(&n).copied()? else {
-                            return None;
-                        };
-                        match const_tuple_field_index(elem)? {
-                            0 => Some(ConstLit::Int(v)),
-                            1 => Some(ConstLit::Bool(o)),
+                        match (locals.get(&n).copied()?, const_tuple_field_index(elem)?) {
+                            (ConstLit::Checked(v, _), 0) => Some(ConstLit::Int(v)),
+                            (ConstLit::Checked(_, o), 1) => Some(ConstLit::Bool(o)),
+                            (ConstLit::CheckedUInt(v, _), 0) => Some(ConstLit::UInt(v)),
+                            (ConstLit::CheckedUInt(_, o), 1) => Some(ConstLit::Bool(o)),
                             _ => None,
                         }
                     }
                     _ => None,
                 },
-                Operand::Const(value) => match decode_constant(llbc, value).ok()? {
-                    DecodedConst::Int(n) => Some(ConstLit::Int(n)),
-                    DecodedConst::Bool(b) => Some(ConstLit::Bool(b)),
-                    DecodedConst::Float(bits) => Some(ConstLit::Float(bits)),
-                    // Strings / fn pointers keep the existing Call
-                    // shapes the operand-constant lowering uses.
-                    DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
-                },
+                Operand::Const(value) => decode_const_lit(value),
             }
         };
     let mut bb = 0usize;
@@ -13852,14 +14184,7 @@ fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
             }
         }
         match block.term().ok()? {
-            TermKind::Return => {
-                return match locals.get(&0)? {
-                    ConstLit::Int(n) => Some(OpKind::ConstInt(*n)),
-                    ConstLit::Bool(b) => Some(OpKind::ConstBool(*b)),
-                    ConstLit::Float(bits) => Some(OpKind::ConstFloat(*bits)),
-                    ConstLit::Checked(..) => None,
-                };
-            }
+            TermKind::Return => return locals.get(&0).copied(),
             TermKind::Goto { target } => bb = target as usize,
             TermKind::Assert { assert, target, .. } => {
                 let ConstLit::Bool(cond) = eval_operand(&locals, &assert.cond)? else {
@@ -13874,6 +14199,108 @@ fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
         }
     }
     None
+}
+
+fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
+    let literal = value.get("kind")?.get("Literal")?;
+    if let Some(scalar) = literal.get("Scalar").and_then(serde_json::Value::as_object) {
+        for (kind, payload) in scalar {
+            let pair = payload.as_array()?;
+            let text = pair.get(1)?.as_str()?;
+            return match kind.as_str() {
+                "Signed" | "Isize" => text.parse::<i64>().ok().map(ConstLit::Int),
+                "Unsigned" | "Usize" => text.parse::<u64>().ok().map(ConstLit::UInt),
+                _ => None,
+            };
+        }
+    }
+    if let Some(value) = literal.get("Bool").and_then(serde_json::Value::as_bool) {
+        return Some(ConstLit::Bool(value));
+    }
+    if let Some(value) = literal
+        .get("Float")
+        .and_then(|float| float.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| text.parse::<f64>().ok())
+    {
+        return Some(ConstLit::Float(value.to_bits()));
+    }
+    None
+}
+
+/// Evaluate the integer `MIN` / `MAX` associated constants declared by
+/// `core::num`.
+///
+/// Charon records foreign standard-library bodies as `Opaque`, including the
+/// initializer behind `i64::MAX`. RPython's flowspace receives module
+/// constants as live host values, so an expression such as pyre's
+/// `MASK: Signed = i64::MAX` must likewise become one literal Constant in the
+/// translated graph. Restrict this recovery to the exact `core::num::<Impl>`
+/// owner, the `MIN` / `MAX` leaves, and a primitive fixed-width integer type;
+/// user constants and target-width `isize` / `usize` remain residual.
+fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<ConstLit> {
+    let global = llbc.global_by_id(def_id)?;
+    if global
+        .rest
+        .get("global_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("NamedConst")
+    {
+        return None;
+    }
+    let path = global.item_meta.name_path();
+    let leaf = path.rsplit("::").next()?;
+    if !path.starts_with("core::num::<Impl>::") || !matches!(leaf, "MIN" | "MAX") {
+        return None;
+    }
+
+    let tyref = global.rest.get("ty")?;
+    let ty = if let Some(id) = tyref
+        .get("Deduplicated")
+        .and_then(serde_json::Value::as_u64)
+    {
+        llbc.dedup_body(id)?
+    } else if let Some(pair) = tyref
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+    {
+        pair.get(1)?
+    } else {
+        tyref
+    };
+    let literal = ty.get("Literal")?.as_object()?;
+
+    if let Some(width) = literal.get("Int").and_then(serde_json::Value::as_str) {
+        let (min, max) = match width {
+            "I8" => (i8::MIN as i64, i8::MAX as i64),
+            "I16" => (i16::MIN as i64, i16::MAX as i64),
+            "I32" => (i32::MIN as i64, i32::MAX as i64),
+            "I64" => (i64::MIN, i64::MAX),
+            _ => return None,
+        };
+        return Some(ConstLit::Int(if leaf == "MIN" { min } else { max }));
+    }
+    if let Some(width) = literal.get("UInt").and_then(serde_json::Value::as_str) {
+        let max = match width {
+            "U8" => u8::MAX as u64,
+            "U16" => u16::MAX as u64,
+            "U32" => u32::MAX as u64,
+            "U64" => u64::MAX,
+            _ => return None,
+        };
+        return Some(ConstLit::UInt(if leaf == "MIN" { 0 } else { max }));
+    }
+    None
+}
+
+fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
+    match value {
+        ConstLit::Int(n) => Some(OpKind::ConstInt(n)),
+        ConstLit::UInt(n) => Some(OpKind::ConstInt(n as i64)),
+        ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
+        ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
+        ConstLit::Checked(..) | ConstLit::CheckedUInt(..) => None,
+    }
 }
 
 /// Charon serializes an operator as an atom string (`"Add"`) or a
@@ -13921,6 +14348,7 @@ fn const_eval_unop(kind: &serde_json::Value, v: ConstLit) -> Option<ConstLit> {
         ("Neg", ConstLit::Int(n)) => n.checked_neg().map(ConstLit::Int),
         ("Not", ConstLit::Bool(b)) => Some(ConstLit::Bool(!b)),
         ("Not", ConstLit::Int(n)) => Some(ConstLit::Int(!n)),
+        ("Not", ConstLit::UInt(n)) => Some(ConstLit::UInt(!n)),
         ("Cast", ConstLit::Int(n)) => {
             // Scalar int→int cast: truncate / re-extend to the target
             // width so `expr as uN` folds exactly.
@@ -14004,6 +14432,49 @@ fn const_eval_binop(kind: &serde_json::Value, lhs: ConstLit, rhs: ConstLit) -> O
             "MulChecked" => {
                 let (v, o) = a.overflowing_mul(b);
                 Some(ConstLit::Checked(v, o))
+            }
+            "Lt" => Some(ConstLit::Bool(a < b)),
+            "Le" => Some(ConstLit::Bool(a <= b)),
+            "Gt" => Some(ConstLit::Bool(a > b)),
+            "Ge" => Some(ConstLit::Bool(a >= b)),
+            "Eq" => Some(ConstLit::Bool(a == b)),
+            "Ne" => Some(ConstLit::Bool(a != b)),
+            _ => None,
+        },
+        (ConstLit::UInt(a), ConstLit::UInt(b)) => match name {
+            // Width is intentionally not flattened to signedness, but the
+            // literal carrier does not retain whether this was u8/u16/u32.
+            // Rust's checked forms are only exact at u64 width, while plain
+            // non-wrapping operations in a valid const initializer are exact
+            // whenever they do not overflow u64.
+            "Add" | "Sub" | "Mul" if operator_mode(kind) == Some("Wrap") => None,
+            "Add" => a.checked_add(b).map(ConstLit::UInt),
+            "Sub" => a.checked_sub(b).map(ConstLit::UInt),
+            "Mul" => a.checked_mul(b).map(ConstLit::UInt),
+            "Div" => a.checked_div(b).map(ConstLit::UInt),
+            "Rem" => a.checked_rem(b).map(ConstLit::UInt),
+            "Shl" => u32::try_from(b)
+                .ok()
+                .and_then(|shift| a.checked_shl(shift))
+                .map(ConstLit::UInt),
+            "Shr" => u32::try_from(b)
+                .ok()
+                .and_then(|shift| a.checked_shr(shift))
+                .map(ConstLit::UInt),
+            "BitAnd" => Some(ConstLit::UInt(a & b)),
+            "BitOr" => Some(ConstLit::UInt(a | b)),
+            "BitXor" => Some(ConstLit::UInt(a ^ b)),
+            "AddChecked" => {
+                let (value, overflow) = a.overflowing_add(b);
+                Some(ConstLit::CheckedUInt(value, overflow))
+            }
+            "SubChecked" => {
+                let (value, overflow) = a.overflowing_sub(b);
+                Some(ConstLit::CheckedUInt(value, overflow))
+            }
+            "MulChecked" => {
+                let (value, overflow) = a.overflowing_mul(b);
+                Some(ConstLit::CheckedUInt(value, overflow))
             }
             "Lt" => Some(ConstLit::Bool(a < b)),
             "Le" => Some(ConstLit::Bool(a <= b)),
@@ -14106,7 +14577,18 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
             let v_str = arr[1].as_str().ok_or_else(|| {
                 LowerError::Schema(format!("Scalar {k}: value not a string: {payload}"))
             })?;
+            let width = arr[0].as_str().unwrap_or_default();
             return Ok(match k.as_str() {
+                "Signed" if width == "I128" => DecodedConst::Int128(
+                    v_str
+                        .parse()
+                        .map_err(|e| LowerError::Schema(format!("Scalar I128 parse: {e}")))?,
+                ),
+                "Unsigned" if width == "U128" => DecodedConst::UInt128(
+                    v_str
+                        .parse()
+                        .map_err(|e| LowerError::Schema(format!("Scalar U128 parse: {e}")))?,
+                ),
                 "Signed" | "Isize" => DecodedConst::Int(
                     v_str
                         .parse()
@@ -16292,8 +16774,34 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 #[cfg(test)]
 mod tests {
     use super::harden_duplicate_leaf_metadata;
-    use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_type_value_to_ast_string};
+    use super::{
+        DecodedConst, cast_kind_is_raw_ptr, cast_pointer_marker_op,
+        charon_type_value_to_ast_string, decode_literal,
+    };
     use majit_charon_reader::Llbc;
+
+    #[test]
+    fn decode_scalar_i128_and_u128_preserves_full_width() {
+        let signed = serde_json::json!({
+            "Scalar": {
+                "Signed": ["I128", i128::MIN.to_string()]
+            }
+        });
+        assert!(matches!(
+            decode_literal(&signed).expect("decode I128"),
+            DecodedConst::Int128(value) if value == i128::MIN
+        ));
+
+        let unsigned = serde_json::json!({
+            "Scalar": {
+                "Unsigned": ["U128", u128::MAX.to_string()]
+            }
+        });
+        assert!(matches!(
+            decode_literal(&unsigned).expect("decode U128"),
+            DecodedConst::UInt128(value) if value == u128::MAX
+        ));
+    }
 
     #[test]
     fn type_arg_splits_per_instantiation_defers_only_float_unit_empty() {

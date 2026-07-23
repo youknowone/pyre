@@ -1970,15 +1970,15 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             // `b.lshift(IDTAG_SHIFT).int_or_(IDTAG_INT)`; the shifted
             // value is even, so `| IDTAG_INT` equals `+ IDTAG_INT`.
             let b = (pyre_object::functional::range_obj_to_bigint(obj) << IDTAG_SHIFT as usize)
-                + malachite_bigint::BigInt::from(IDTAG_INT);
+                + pyre_object::rbigint::RBigInt::from(IDTAG_INT);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
         if is_exact_type(obj, &FLOAT_TYPE) {
             // `float2longlong(float_w(self))` reinterprets the f64 bits as
             // a signed i64; the same `| IDTAG_FLOAT` == `+ IDTAG_FLOAT`.
             let bits = pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64;
-            let b = (malachite_bigint::BigInt::from(bits) << IDTAG_SHIFT as usize)
-                + malachite_bigint::BigInt::from(IDTAG_FLOAT);
+            let b = (pyre_object::rbigint::RBigInt::from(bits) << IDTAG_SHIFT as usize)
+                + pyre_object::rbigint::RBigInt::from(IDTAG_FLOAT);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
         if is_exact_type(obj, &COMPLEX_TYPE) {
@@ -1989,10 +1989,10 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             // `+`.
             let real_bits = pyre_object::complexobject::w_complex_get_real(obj).to_bits() as i64;
             let imag_bits = pyre_object::complexobject::w_complex_get_imag(obj).to_bits();
-            let combined = (malachite_bigint::BigInt::from(real_bits) << 64usize)
-                + malachite_bigint::BigInt::from(imag_bits);
-            let b =
-                (combined << IDTAG_SHIFT as usize) + malachite_bigint::BigInt::from(IDTAG_COMPLEX);
+            let combined = (pyre_object::rbigint::RBigInt::from(real_bits) << 64usize)
+                + pyre_object::rbigint::RBigInt::from(imag_bits);
+            let b = (combined << IDTAG_SHIFT as usize)
+                + pyre_object::rbigint::RBigInt::from(IDTAG_COMPLEX);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
         if is_exact_type(obj, &TUPLE_TYPE) {

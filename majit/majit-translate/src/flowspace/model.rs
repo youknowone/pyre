@@ -2355,6 +2355,12 @@ pub enum ConstValue {
     /// `test_model.py`. Phase 3 generalises this to arbitrary
     /// Python values.
     Int(i64),
+    /// RPython `r_longlonglong` constant. Kept separate from `Int`
+    /// because a 128-bit primitive cannot be represented by the
+    /// word-sized flowspace carrier without truncation.
+    Int128(i128),
+    /// RPython `r_ulonglonglong` constant.
+    UInt128(u128),
     /// Python float constant. RPython stores the `f64` directly on
     /// `Constant.value`; Rust carries it as `f64::to_bits()` so the
     /// enum keeps its `Eq + Hash` derivation (IEEE 754 NaN violates
@@ -2456,6 +2462,8 @@ impl PartialEq for ConstValue {
             (ConstValue::Atom(a), ConstValue::Atom(b)) => a == b,
             (ConstValue::Placeholder, ConstValue::Placeholder) => true,
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
+            (ConstValue::Int128(a), ConstValue::Int128(b)) => a == b,
+            (ConstValue::UInt128(a), ConstValue::UInt128(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
             (ConstValue::Dict(a), ConstValue::Dict(b)) => a == b,
             (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) => a == b,
@@ -2507,6 +2515,8 @@ impl std::fmt::Display for ConstValue {
             ConstValue::Atom(atom) => write!(f, "{atom}"),
             ConstValue::Placeholder => f.write_str("<placeholder>"),
             ConstValue::Int(value) => write!(f, "{value}"),
+            ConstValue::Int128(value) => write!(f, "{value}"),
+            ConstValue::UInt128(value) => write!(f, "{value}"),
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
             ConstValue::ByteStr(value) => write!(f, "b{:?}", String::from_utf8_lossy(value)),
             ConstValue::UniStr(value) => write!(f, "u{value:?}"),
@@ -2536,6 +2546,8 @@ impl Hash for ConstValue {
             ConstValue::Atom(atom) => atom.hash(state),
             ConstValue::Placeholder => {}
             ConstValue::Int(value) => value.hash(state),
+            ConstValue::Int128(value) => value.hash(state),
+            ConstValue::UInt128(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
             ConstValue::Dict(items) => {
                 // HashMap iteration order is nondeterministic; hash
@@ -3206,6 +3218,8 @@ impl ConstValue {
         match self {
             ConstValue::Placeholder => None,
             ConstValue::Int(n) => Some(*n != 0),
+            ConstValue::Int128(n) => Some(*n != 0),
+            ConstValue::UInt128(n) => Some(*n != 0),
             // Python `bool(float)` is `float != 0.0` (including -0.0
             // which equals 0.0 under IEEE 754).
             ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
@@ -3296,7 +3310,9 @@ impl ConstValue {
     /// current flow-space port.
     pub fn class_of(&self) -> Option<HostObject> {
         match self {
-            ConstValue::Int(_) => HOST_ENV.lookup_builtin("int"),
+            ConstValue::Int(_) | ConstValue::Int128(_) | ConstValue::UInt128(_) => {
+                HOST_ENV.lookup_builtin("int")
+            }
             ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
             ConstValue::Bool(_) => HOST_ENV.lookup_builtin("bool"),
             ConstValue::ByteStr(_) => HOST_ENV.lookup_builtin("str"),
@@ -3967,6 +3983,30 @@ impl std::fmt::Debug for HostCall {
     }
 }
 
+/// Exact translated values used by RPython's `func._always_inline_`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AlwaysInline {
+    /// The attribute is absent (`getattr(..., None)`).
+    #[default]
+    Absent,
+    /// Literal `True`: force the inline and fail if it cannot be performed.
+    True,
+    /// String `'try'`: prefer the inline but tolerate a failed attempt.
+    Try,
+}
+
+impl AlwaysInline {
+    #[inline]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+
+    #[inline]
+    pub fn is_strict(self) -> bool {
+        matches!(self, Self::True)
+    }
+}
+
 /// Stand-in for the Python function object attached to
 /// `FunctionGraph.func`.
 #[derive(Clone, Debug)]
@@ -4028,10 +4068,11 @@ pub struct GraphFunc {
     pub _dont_reach_me_in_del_: bool,
     /// Upstream `func._always_inline_`, consumed by
     /// `translator/backendopt/inline.py:604-606 always_inline`.
-    /// Set by the `@always_inline` decorator at upstream
-    /// `rpython/rlib/objectmodel.py`. `false` mirrors the
-    /// "attribute absent" upstream default.
-    pub _always_inline_: bool,
+    ///
+    /// RPython distinguishes literal `True` from the truthy string `'try'`:
+    /// both select the candidate at zero cost, but only literal `True` makes
+    /// an unsuccessful inline fatal (`inline.py:703-709`).
+    pub _always_inline_: AlwaysInline,
     /// Upstream `func._dont_inline_` (read off the live Python
     /// callable via `getattr(funcobj._callable, '_dont_inline_',
     /// False)` at `inline.py:563-564` /
@@ -4140,7 +4181,7 @@ impl GraphFunc {
             _jit_look_inside_: None,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
-            _always_inline_: false,
+            _always_inline_: AlwaysInline::Absent,
             _dont_inline_: false,
             _no_release_gil_: false,
             _gctransformer_hint_close_stack_: false,

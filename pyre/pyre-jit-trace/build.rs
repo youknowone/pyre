@@ -421,7 +421,13 @@ fn real_main() {
 
     let cache_key = codegen_cache_key(manifest_dir, &repo_root, &source_paths);
     let cache_dir = codegen_cache_dir(&repo_root, &cache_key);
-    if restore_codegen_cache(&cache_dir, &out_dir) {
+    // The verbose prepass is a census over every attempted graph. Restoring
+    // generated outputs would skip the analysis entirely and leave no
+    // `PREPASS phaseA/phaseB fail` lines, contradicting the documented
+    // `PYRE_RTYPER_VERBOSE=1` workflow. The generated artifacts themselves do
+    // not depend on verbosity, so an ordinary build may still reuse the cache.
+    let verbose_prepass = std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|value| value == "1");
+    if !verbose_prepass && restore_codegen_cache(&cache_dir, &out_dir) {
         eprintln!(
             "[pyre-jit-trace build.rs] restored generated JIT trace artifacts from cache {}",
             cache_key
@@ -606,6 +612,7 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
+    println!("cargo::rerun-if-env-changed=PYRE_RTYPER_VERBOSE");
     // The mir-frontend analysis derives `jit_trace_gen.rs` from
     // the workspace LLBC artefacts or the `PYRE_MIR_FRONTEND_LLBC`
     // override. Track both so re-extracting LLBC or repointing the override

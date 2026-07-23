@@ -777,14 +777,82 @@ pub use gateway::{
     make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
 };
 pub use jit_fnaddr::*;
-pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;
 pub use pycode::*;
 pub use pyframe::*;
 pub use pyopcode::*;
+pub use pyre_object::rbigint::RBigInt as PyBigInt;
 pub use pytraceback::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
+
+/// RustPython's compiler and marshal crates expose their serialized integer
+/// constants as `malachite_bigint::BigInt`.  Convert at that fixed API seam;
+/// interpreter objects and every arithmetic operation use RPython's rbigint.
+#[majit_macros::dont_look_inside]
+pub(crate) fn compiler_bigint_to_rbigint(value: &malachite_bigint::BigInt) -> PyBigInt {
+    let (sign, bytes) = value.to_bytes_le();
+    let sign = match sign {
+        malachite_bigint::Sign::Minus => pyre_object::rbigint::RBigIntSign::Minus,
+        malachite_bigint::Sign::NoSign => pyre_object::rbigint::RBigIntSign::NoSign,
+        malachite_bigint::Sign::Plus => pyre_object::rbigint::RBigIntSign::Plus,
+    };
+    PyBigInt::from_bytes_le(sign, &bytes)
+}
+
+/// Pointer-ABI residual for the immutable compiler-constant seam above.
+///
+/// The code object's compiler BigInt is green/stable and the conversion is a
+/// pure function of its bytes.  RPython's LOAD_CONST reads a prebuilt bigint
+/// reference; in pyre's current compiler API shape, CALL_PURE/CSE of this
+/// residual supplies the equivalent single GC reference without tracing into
+/// Malachite internals.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_compiler_bigint_to_rbigint(value: i64) -> *mut PyBigInt {
+    let value = value as *const malachite_bigint::BigInt;
+    let converted = unsafe { compiler_bigint_to_rbigint(&*value) };
+    pyre_object::longobject::alloc_bigint_nursery_collecting(converted)
+}
+
+pub(crate) fn rbigint_to_compiler_bigint(value: &PyBigInt) -> malachite_bigint::BigInt {
+    let sign = match value.sign() {
+        pyre_object::rbigint::RBigIntSign::Minus => malachite_bigint::Sign::Minus,
+        pyre_object::rbigint::RBigIntSign::NoSign => malachite_bigint::Sign::NoSign,
+        pyre_object::rbigint::RBigIntSign::Plus => malachite_bigint::Sign::Plus,
+    };
+    let magnitude = value.abs();
+    let nbytes = (magnitude
+        .bit_length()
+        .expect("an allocated 64-bit RBigInt cannot overflow Signed bit_length")
+        + 7)
+        / 8;
+    let bytes = magnitude
+        .tobytes(nbytes, "little", false)
+        .expect("unsigned magnitude always fits its exact byte length");
+    malachite_bigint::BigInt::from_bytes_le(sign, &bytes)
+}
+
+#[cfg(test)]
+mod bigint_seam_tests {
+    use super::*;
+
+    #[test]
+    fn compiler_bigint_byte_seam_round_trips_sign_and_large_magnitude() {
+        for source in [
+            "0",
+            "1",
+            "-1",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "12345678901234567890123456789012345678901234567890",
+        ] {
+            let compiler: malachite_bigint::BigInt = source.parse().unwrap();
+            let rbigint = compiler_bigint_to_rbigint(&compiler);
+            assert_eq!(rbigint.str(0).unwrap(), source);
+            assert_eq!(rbigint_to_compiler_bigint(&rbigint), compiler);
+        }
+    }
+}
 
 /// PyPy `@unwrap_spec(...)` equivalent.  See `pyre-macros/src/lib.rs`.
 pub use pyre_macros::pyre_function;

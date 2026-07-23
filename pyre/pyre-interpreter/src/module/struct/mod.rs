@@ -10,8 +10,8 @@
 //! is `space.new_exception_class("struct.error", space.w_Exception)`
 //! (`interp_struct.py:20 Cache`).
 
-use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
+use pyre_object::rbigint::RBigInt as BigInt;
 use pyre_object::*;
 
 /// True on a big-endian build; the native (`@` / no-prefix) byte order.

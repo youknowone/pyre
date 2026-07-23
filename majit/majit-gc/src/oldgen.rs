@@ -2,6 +2,7 @@
 
 use std::alloc::{self, Layout};
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ptr;
 
 use crate::flags;
@@ -21,6 +22,38 @@ struct RawMallocedObject {
     layout: Layout,
 }
 
+/// `rpython.memory.support.mangle_hash` / `memory/lldict.py:_hash`.
+///
+/// AddressDict hashes aligned addresses as `i ^ (i >> 4)`.  Rust's default
+/// HashSet uses SipHash, which changes the translated AddressDict's hot-path
+/// cost substantially during every major root walk.
+#[derive(Default)]
+struct AddressHasher {
+    hash: u64,
+}
+
+impl Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // AddressSet only hashes `usize`, whose Hash implementation calls
+        // write_usize. Keep a deterministic fallback for the Hasher contract.
+        let mut value = 0_u64;
+        for (shift, byte) in bytes.iter().copied().take(8).enumerate() {
+            value |= (byte as u64) << (shift * 8);
+        }
+        self.hash = value ^ (value >> 4);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.hash = (value ^ (value >> 4)) as u64;
+    }
+}
+
+type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
+
 pub struct OldGen {
     ac: ArenaCollection,
     old_rawmalloced_objects: Vec<RawMallocedObject>,
@@ -33,7 +66,7 @@ pub struct OldGen {
     /// shape upstream uses when it needs exact rawmalloc membership:
     /// incminimark.py:1219-1221 and 2153-2158.  Unlike the removed F2-era
     /// payload side table, it has no entry for ordinary arena survivors.
-    rawmalloced_payloads: HashSet<usize>,
+    rawmalloced_payloads: AddressSet,
     rawmalloced_total_size: usize,
     /// llarena debug-fill parity for old-generation allocations.  The same
     /// opt-in detector covers both recycled arena blocks and rawmalloc blocks.
@@ -52,7 +85,7 @@ impl OldGen {
             ),
             old_rawmalloced_objects: Vec::new(),
             raw_malloc_might_sweep: Vec::new(),
-            rawmalloced_payloads: HashSet::new(),
+            rawmalloced_payloads: AddressSet::default(),
             rawmalloced_total_size: 0,
             poison_on_alloc: std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some(),
         }

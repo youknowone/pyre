@@ -750,6 +750,8 @@ pub fn builtin_bool(
         let truthy = match c {
             ConstValue::Bool(b) => *b,
             ConstValue::Int(n) => *n != 0,
+            ConstValue::Int128(n) => *n != 0,
+            ConstValue::UInt128(n) => *n != 0,
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
             ConstValue::ByteStr(s) => !s.is_empty(),
             ConstValue::UniStr(s) => !s.is_empty(),

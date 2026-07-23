@@ -650,6 +650,8 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)

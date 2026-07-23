@@ -32,6 +32,16 @@ pub enum ValueType {
     /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
     /// `rarithmetic.py:600`.
     Unsigned,
+    /// RPython `r_longlonglong` / `lltype.SignedLongLongLong`.
+    ///
+    /// This is a translation-level 128-bit primitive used by
+    /// `rbigint` when `SHIFT == 63`. It deliberately remains distinct
+    /// from the word-sized `Int`: PyPy's source translator and rtyper
+    /// preserve it, while `history.getkind` rejects it at the JIT
+    /// codewriter boundary because it occupies 16 bytes.
+    Int128,
+    /// RPython `r_ulonglonglong` / `lltype.UnsignedLongLongLong`.
+    UInt128,
     /// RPython `SomeBool` (`annotator/model.py:185-198`): a Python `bool`
     /// at the annotator level.  Distinct from `Int` (RPython `SomeInteger`,
     /// `:200-264`) because PyPy's flowspace `UNARY_NOT` (`flowcontext.py:531-538`,
@@ -500,6 +510,12 @@ pub enum OpKind {
         class_root: Option<String>,
     },
     ConstInt(i64),
+    /// Translation-time `r_longlonglong` constant. This carrier may
+    /// appear in flow/rtyping graphs but must never be coerced into a
+    /// JIT register-kind `ConstInt`.
+    ConstInt128(i128),
+    /// Translation-time `r_ulonglonglong` constant.
+    ConstUInt128(u128),
     /// RPython `flowmodel.py:Constant(bool_value)` — a bool constant
     /// whose `concretetype` is `lltype.Bool`. The codewriter folds Bool
     /// into kind `'int'` (`rpython/jit/codewriter/flatten.py:getkind`),
@@ -4564,31 +4580,6 @@ impl FunctionGraph {
     /// `ConcreteType::Unknown`.
     pub fn alloc_value_var(&mut self) -> crate::flowspace::model::Variable {
         self.alloc_value_var_with_type(ConcreteType::Unknown)
-    }
-
-    /// The `__pos_N` field owner an existing read/write of `result_var`
-    /// already uses — the per-shape tuple classdef the projection side minted
-    /// (`Tuple<…>` under `PYRE_TUPLE_PER_SHAPE_CLASSDEF`, else bare `Tuple`).
-    /// A front synth that rebuilds a tuple bound to `result_var` keys its
-    /// `FieldWrite` owner off this so writes match the destructure reads
-    /// whether the per-shape suffix is on or off. Defaults to `"Tuple"` when
-    /// no positional access of `result_var` is present.
-    pub(crate) fn tuple_owner_for_var(
-        &self,
-        result_var: &crate::flowspace::model::Variable,
-    ) -> String {
-        self.blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .find_map(|op| match &op.kind {
-                OpKind::FieldRead { base, field, .. }
-                    if base == result_var && field.name.starts_with("__pos_") =>
-                {
-                    field.owner_root.clone()
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| "Tuple".to_string())
     }
 
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its

@@ -866,7 +866,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // int rather than a machine word.
             let (start, stop, step) = pyre_object::w_range_fields(obj);
             let step_is_one =
-                pyre_object::range_obj_to_bigint(step) == malachite_bigint::BigInt::from(1);
+                pyre_object::range_obj_to_bigint(step) == pyre_object::rbigint::RBigInt::from(1);
             if step_is_one {
                 format!("range({}, {})", py_repr(start)?, py_repr(stop)?)
             } else {

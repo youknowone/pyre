@@ -7,6 +7,8 @@
 /// - #[unroll_safe]: rlib/jit.py:150 — Safe to unroll loops
 /// - #[loop_invariant]: rlib/jit.py:161 — Loop-invariant function
 /// - #[not_in_trace]: rlib/jit.py:260 — Disappears from final assembler
+/// - #[always_inline]: objectmodel.py:174 — Backend optimizer must inline
+/// - #[not_rpython]: objectmodel.py:267 — Reject from RPython flow graphs
 ///
 /// majit-specific extensions:
 /// - #[jit_driver]: Annotate an interpreter's main dispatch loop
@@ -1562,6 +1564,28 @@ pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStrea
 pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_ts = proc_macro2::TokenStream::from(item);
     if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
+        // `syn::ItemFn` accepts a `self` receiver even though such a function
+        // is only legal inside an impl, so receiver methods arrive through
+        // this branch before the `ImplItemFn` fallback below. They cannot emit
+        // a sibling associated const in trait impls; leave a body-local marker
+        // that Charon promotes under the method path instead.
+        if func.sig.receiver().is_some() {
+            let attrs = &func.attrs;
+            let vis = &func.vis;
+            let sig = &func.sig;
+            let block = &func.block;
+            let marker = format_ident!("_elidable_function_{}", sig.ident);
+            return quote! {
+                #(#attrs)*
+                #vis #sig {
+                    #[doc(hidden)]
+                    #[allow(non_upper_case_globals, dead_code)]
+                    const #marker: bool = true;
+                    #block
+                }
+            }
+            .into();
+        }
         let vis = &func.vis;
         let rpython_attribute_const = rpython_attribute_const_for("jit_elidable", &func.sig, vis);
         return quote! {
@@ -1571,11 +1595,197 @@ pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     if let Ok(method) = syn::parse2::<syn::ImplItemFn>(item_ts.clone()) {
-        return quote! { #method }.into();
+        // An impl method cannot emit the module-level siblings used by
+        // `expand_elidable_attribute`: trait impls reject extra associated
+        // items, and the residual-call trampoline cannot live inside an impl.
+        // Keep the method ABI untouched and leave the RPython attribute as a
+        // body-local const instead. Charon promotes local consts to
+        // `global_decls` under the method path; `front::llbc_hints` recognizes
+        // that nested spelling and attaches `elidable` to the parent method.
+        let attrs = &method.attrs;
+        let vis = &method.vis;
+        let defaultness = &method.defaultness;
+        let sig = &method.sig;
+        let block = &method.block;
+        let marker = format_ident!("_elidable_function_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #defaultness #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
     }
     syn::Error::new_spanned(
         item_ts,
         "#[jit_elidable] supports free functions and impl methods",
+    )
+    .to_compile_error()
+    .into()
+}
+
+/// Force backend-optimizer inlining, matching
+/// `rpython.rlib.objectmodel.always_inline` / a function's
+/// `_always_inline_ = True` attribute.
+///
+/// This is a pure metadata decorator: it preserves the Rust ABI and emits a
+/// body-local marker so it works for inherent and trait methods as well as
+/// free functions. Charon promotes the marker under the owning function path;
+/// `front::llbc_hints` restores the `always_inline` hint and the flowspace
+/// adapter places it on `graph.func._always_inline_`.
+#[proc_macro_attribute]
+pub fn always_inline(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item_ts = proc_macro2::TokenStream::from(item);
+    if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
+        let attrs = &func.attrs;
+        let vis = &func.vis;
+        let sig = &func.sig;
+        let block = &func.block;
+        let marker = format_ident!("_always_inline_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
+    }
+    if let Ok(method) = syn::parse2::<syn::ImplItemFn>(item_ts.clone()) {
+        let attrs = &method.attrs;
+        let vis = &method.vis;
+        let defaultness = &method.defaultness;
+        let sig = &method.sig;
+        let block = &method.block;
+        let marker = format_ident!("_always_inline_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #defaultness #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
+    }
+    syn::Error::new_spanned(
+        item_ts,
+        "#[always_inline] supports free functions and impl methods",
+    )
+    .to_compile_error()
+    .into()
+}
+
+/// Request best-effort backend-optimizer inlining, matching a function's
+/// `_always_inline_ = 'try'` attribute.
+///
+/// RPython treats this value as truthy when selecting zero-cost inline
+/// candidates, but unlike literal `True` it does not turn a failed inline into
+/// `CannotInline` (`translator/backendopt/inline.py:703-709`).
+#[proc_macro_attribute]
+pub fn always_inline_try(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item_ts = proc_macro2::TokenStream::from(item);
+    if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
+        let attrs = &func.attrs;
+        let vis = &func.vis;
+        let sig = &func.sig;
+        let block = &func.block;
+        let marker = format_ident!("_always_inline_try_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
+    }
+    if let Ok(method) = syn::parse2::<syn::ImplItemFn>(item_ts.clone()) {
+        let attrs = &method.attrs;
+        let vis = &method.vis;
+        let defaultness = &method.defaultness;
+        let sig = &method.sig;
+        let block = &method.block;
+        let marker = format_ident!("_always_inline_try_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #defaultness #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
+    }
+    syn::Error::new_spanned(
+        item_ts,
+        "#[always_inline_try] supports free functions and impl methods",
+    )
+    .to_compile_error()
+    .into()
+}
+
+/// Mark a host-only function as ineligible for RPython flow-graph building.
+///
+/// RPython parity: `rpython.rlib.objectmodel.not_rpython` sets
+/// `func._not_rpython_ = True`; `flowspace/objspace.py:21-22`
+/// `assert_rpythonic()` rejects the function before constructing a graph.
+///
+/// This is metadata-only and preserves the native Rust ABI. A body-local
+/// `_not_rpython_<NAME>` marker works for both free functions and impl methods;
+/// Charon promotes it into `global_decls`, `front::llbc_hints` restores the
+/// marker, and the MIR frontend excludes the function before lowering its
+/// body.
+#[proc_macro_attribute]
+pub fn not_rpython(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item_ts = proc_macro2::TokenStream::from(item);
+    if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
+        let attrs = &func.attrs;
+        let vis = &func.vis;
+        let sig = &func.sig;
+        let block = &func.block;
+        let marker = format_ident!("_not_rpython_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
+    }
+    if let Ok(method) = syn::parse2::<syn::ImplItemFn>(item_ts.clone()) {
+        let attrs = &method.attrs;
+        let vis = &method.vis;
+        let defaultness = &method.defaultness;
+        let sig = &method.sig;
+        let block = &method.block;
+        let marker = format_ident!("_not_rpython_{}", sig.ident);
+        return quote! {
+            #(#attrs)*
+            #vis #defaultness #sig {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #marker: bool = true;
+                #block
+            }
+        }
+        .into();
+    }
+    syn::Error::new_spanned(
+        item_ts,
+        "#[not_rpython] supports free functions and impl methods",
     )
     .to_compile_error()
     .into()

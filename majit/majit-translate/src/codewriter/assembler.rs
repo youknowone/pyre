@@ -2465,6 +2465,8 @@ impl Assembler {
             match kind {
                 OpKind::Input { .. } => "Input",
                 OpKind::ConstInt(_) => "ConstInt",
+                OpKind::ConstInt128(_) => "ConstInt128",
+                OpKind::ConstUInt128(_) => "ConstUInt128",
                 OpKind::ConstBool(_) => "ConstBool",
                 OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
@@ -2877,6 +2879,9 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         ValueType::Ref(_) => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
+        ValueType::Int128 | ValueType::UInt128 => {
+            panic!("getkind: 128-bit integer type is too large (history.py:62)")
+        }
     }
 }
 
@@ -3699,6 +3704,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
         OpKind::ConstInt(_) => "int_copy".into(),
+        OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => {
+            panic!("getkind: 128-bit integer constant is too large (history.py:62)")
+        }
         // RPython folds `lltype.Bool` into kind `'int'`
         // (`flatten.py:getkind`), so the bool constant materialises
         // through the same `int_copy` path as `ConstInt`.

@@ -20,8 +20,8 @@
 //! * `OP_WEIGHTS` (`:470-476`) → `op_weight()` helper.
 //! * `block_weight(block)` (`:478-488`).
 //! * `static_instruction_count(graph)` (`:532-536`).
-//! * `always_inline(graph)` (`:604-606`) — TODO: pyre's `GraphFunc`
-//!   lacks the `_always_inline_` slot.
+//! * `always_inline(graph)` (`:604-606`) — reads
+//!   `GraphFunc._always_inline_`.
 //! * `inlinable_static_callers` (`:546-567`).
 //! * `measure_median_execution_cost(graph)` (`:491-530`) — uses
 //!   [`crate::tool::algo::sparsemat::SparseMatrix`] and
@@ -438,9 +438,8 @@ pub fn any_call_to_raising_graphs(
 // Auto-inlining heuristics — pure read-only graph cost model.
 // `OP_WEIGHTS` / `block_weight` / `static_instruction_count` /
 // `inlinable_static_callers` / `always_inline`. The
-// `_dont_inline_` / `_always_inline_` flag
-// reads default to upstream's `getattr(..., default)` fallback —
-// pyre's `GraphFunc` does not yet surface either flag.
+// `_dont_inline_` / `_always_inline_` flag reads default to upstream's
+// `getattr(..., default)` fallback.
 // ============================================================
 
 /// `OP_WEIGHTS` at `inline.py:470-476`. Per-opname weight table
@@ -558,7 +557,9 @@ pub fn static_instruction_count(graph: &GraphRef) -> f64 {
 /// attribute or no `_always_inline_` attribute.
 pub fn always_inline(graph: &GraphRef) -> bool {
     let g = graph.borrow();
-    g.func.as_ref().is_some_and(|f| f._always_inline_)
+    g.func
+        .as_ref()
+        .is_some_and(|f| f._always_inline_.is_enabled())
 }
 
 /// Captures the `(parent, callee)` /
@@ -2648,7 +2649,12 @@ pub fn auto_inlining(
         .filter(|(k, _)| {
             key_to_graph
                 .get(k)
-                .map(|g| always_inline(g))
+                .map(|g| {
+                    g.borrow()
+                        .func
+                        .as_ref()
+                        .is_some_and(|f| f._always_inline_.is_strict())
+                })
                 .unwrap_or(false)
         })
         .map(|(k, v)| (*k, v.clone()))
@@ -2764,8 +2770,8 @@ pub fn auto_inline_graphs(
 mod tests {
     use super::*;
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
-        Variable,
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+        SpaceOperation, Variable,
     };
     use std::cell::RefCell;
 
@@ -3071,11 +3077,26 @@ mod tests {
     }
 
     #[test]
-    fn always_inline_returns_false_until_flag_lands() {
+    fn always_inline_reads_graph_func_attribute() {
         let g = int_add_graph("f");
-        // TODO: pyre's GraphFunc has no `_always_inline_` slot, so
-        // the helper is structurally always-False today.
         assert!(!always_inline(&g));
+        let mut func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+        func._always_inline_ = crate::flowspace::model::AlwaysInline::True;
+        g.borrow_mut().func = Some(func);
+        assert!(always_inline(&g));
+
+        let mut func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+        func._always_inline_ = crate::flowspace::model::AlwaysInline::Try;
+        g.borrow_mut().func = Some(func);
+        assert!(always_inline(&g));
+        assert!(
+            crate::flowspace::model::AlwaysInline::True.is_strict(),
+            "RPython _always_inline_=True must make a failed inline fatal"
+        );
+        assert!(
+            !crate::flowspace::model::AlwaysInline::Try.is_strict(),
+            "RPython _always_inline_='try' must tolerate a failed inline"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Harvest JIT-hint markers from the ullbc surrogate consts the
 //! `majit_macros` proc-macros emit (`_elidable_function_<NAME>`,
 //! `_jit_look_inside_<NAME>`, `_jit_loop_invariant_<NAME>`,
-//! `_jit_unroll_safe_<NAME>`, `oopspec_<NAME>`).
+//! `_jit_unroll_safe_<NAME>`, `_not_rpython_<NAME>`, `oopspec_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -29,10 +29,17 @@ use std::collections::HashMap;
 /// `dont_look_inside`).
 const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     ("_elidable_function_", &["elidable"]),
+    // Keep this before `_always_inline_`: the best-effort marker retains the
+    // common prefix and would otherwise be attributed to `try_<function>`.
+    ("_always_inline_try_", &["always_inline_try"]),
+    ("_always_inline_", &["always_inline"]),
     ("_jit_elidable_cannot_raise_", &["elidable_cannot_raise"]),
     ("_jit_elidable_or_memerror_", &["elidable_or_memerror"]),
     ("_jit_loop_invariant_", &["loopinvariant"]),
     ("_jit_unroll_safe_", &["unroll_safe"]),
+    // objectmodel.py:267 `not_rpython` sets `_not_rpython_ = True`;
+    // flowspace/objspace.py:21 rejects the function before graph building.
+    ("_not_rpython_", &["not_rpython"]),
 ];
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
@@ -141,7 +148,20 @@ fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
 fn marker_path_to_fn_path(marker_path: &str, prefix: &str) -> String {
     let stripped = strip_crate_prefix(marker_path);
     match stripped.rsplit_once("::") {
-        Some((module, leaf)) => format!("{module}::{}", leaf.strip_prefix(prefix).unwrap_or(leaf)),
+        Some((module, leaf)) => {
+            let fn_leaf = leaf.strip_prefix(prefix).unwrap_or(leaf);
+            // `#[jit_elidable]` on an impl method cannot emit a module-level
+            // sibling const (trait impls reject foreign associated items).
+            // The macro therefore emits a body-local marker, which Charon
+            // promotes under `<method>::_elidable_function_<method>`.
+            // In that spelling the parent already is the function path; do
+            // not append the leaf a second time.
+            if module.rsplit("::").next() == Some(fn_leaf) {
+                module.to_string()
+            } else {
+                format!("{module}::{fn_leaf}")
+            }
+        }
         None => stripped
             .strip_prefix(prefix)
             .unwrap_or(&stripped)

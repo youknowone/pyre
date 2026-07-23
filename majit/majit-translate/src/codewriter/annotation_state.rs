@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::annotator::model::{SomeFloat, SomeInstance, SomeInteger, SomeValue};
+use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue};
 use crate::model::ValueType;
 
 /// RPython `SomeValue` lattice projection of the legacy `ValueType`.
@@ -47,6 +47,14 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         // arms downstream.
         ValueType::Int => Some(SomeValue::Integer(SomeInteger::default())),
         ValueType::Unsigned => Some(SomeValue::Integer(SomeInteger::new(false, true))),
+        ValueType::Int128 => Some(SomeValue::Integer(SomeInteger::new_with_knowntype(
+            false,
+            KnownType::LongLongLong,
+        ))),
+        ValueType::UInt128 => Some(SomeValue::Integer(SomeInteger::new_with_knowntype(
+            false,
+            KnownType::ULongLongLong,
+        ))),
         // RPython `SomeBool` (`annotator/model.py:185-198`) is a
         // distinct lattice node from `SomeInteger`; the rtyper picks
         // `BoolRepr` (`rmodel.rs::BoolRepr`) which lowers to LL `Bool`
@@ -120,7 +128,11 @@ fn ref_fallback_instance() -> SomeValue {
 /// `SomeValue` directly.
 pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
     match s {
-        SomeValue::Integer(_) => ValueType::Int,
+        SomeValue::Integer(integer) => match integer.base.knowntype {
+            KnownType::LongLongLong => ValueType::Int128,
+            KnownType::ULongLongLong => ValueType::UInt128,
+            _ => ValueType::Int,
+        },
         SomeValue::Bool(_) => ValueType::Bool,
         SomeValue::Float(_) | SomeValue::LongFloat(_) => ValueType::Float,
         // `getkind(SingleFloat) == 'int'` (history.py:53): singlefloats

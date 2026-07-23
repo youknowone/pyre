@@ -238,6 +238,12 @@ impl Repr for IntegerRepr {
             ConstValue::AddressOffset(_) => value.clone(),
             ConstValue::InheritanceId { .. } => value.clone(),
             ConstValue::Int(_) => value.clone(),
+            // RPython's `typeOf(value)` sees `r_longlonglong` /
+            // `r_ulonglonglong` as `lltype.Number` too.  Keep their
+            // dedicated carriers intact so `i128::MIN` / `u128::MAX`
+            // survive `convert_const` without first narrowing through
+            // pyre's legacy i64 integer carrier.
+            ConstValue::Int128(_) | ConstValue::UInt128(_) => value.clone(),
             ConstValue::Bool(value) => ConstValue::Int(i64::from(*value)),
             _ => return Err(TyperError::message(format!("not an integer: {value:?}"))),
         };
@@ -1357,6 +1363,126 @@ mod tests {
         let r = signed_repr();
         let err = r.convert_const(&ConstValue::byte_str("x")).unwrap_err();
         assert!(err.to_string().contains("not an integer"));
+    }
+
+    #[test]
+    fn integer_repr_convert_const_preserves_full_width_carriers() {
+        for (repr, value, expected_lltype) in [
+            (
+                signedlonglonglong_repr(),
+                ConstValue::Int128(i128::MIN),
+                LowLevelType::SignedLongLongLong,
+            ),
+            (
+                unsignedlonglonglong_repr(),
+                ConstValue::UInt128(u128::MAX),
+                LowLevelType::UnsignedLongLongLong,
+            ),
+        ] {
+            let converted = repr
+                .convert_const(&value)
+                .expect("wide Number constant converts");
+            assert_eq!(converted.value, value);
+            assert_eq!(converted.concretetype, Some(expected_lltype));
+        }
+    }
+
+    #[test]
+    fn wide_integer_conversions_and_binops_use_rpython_lllong_families() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+
+        // rint.py:202-213 — word-sized inputs promoted for an rbigint
+        // LONG_TYPE/ULONG_TYPE operation go through the generic
+        // `cast_primitive` arm with the exact 128-bit result lltype.
+        for (from, to, source_lltype, expected_lltype) in [
+            (
+                signed_repr(),
+                signedlonglonglong_repr(),
+                LowLevelType::Signed,
+                LowLevelType::SignedLongLongLong,
+            ),
+            (
+                unsigned_repr(),
+                unsignedlonglonglong_repr(),
+                LowLevelType::Unsigned,
+                LowLevelType::UnsignedLongLongLong,
+            ),
+        ] {
+            let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+            let source = Variable::new();
+            source.set_concretetype(Some(source_lltype));
+            let converted = pair_integer_integer_convert_from_to(
+                from.as_ref(),
+                to.as_ref(),
+                &Hlvalue::Variable(source),
+                &mut llops,
+            )
+            .expect("word-to-wide conversion rtypes")
+            .expect("word-to-wide conversion returns a value");
+            assert_eq!(llops.ops.len(), 1);
+            assert_eq!(llops.ops[0].opname, "cast_primitive");
+            assert_eq!(
+                hlvalue_concretetype(&converted),
+                Some(expected_lltype),
+                "cast_primitive must retain the exact wide result type"
+            );
+        }
+
+        // rint.py:314-338 — arithmetic itself selects the result repr's
+        // `lllong_` / `ulllong_` prefix, never the word-sized `int_` family.
+        for (known, repr, expected_opname) in [
+            (
+                KnownType::LongLongLong,
+                signedlonglonglong_repr(),
+                "lllong_add",
+            ),
+            (
+                KnownType::ULongLongLong,
+                unsignedlonglonglong_repr(),
+                "ulllong_add",
+            ),
+        ] {
+            let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+            let v_left = Variable::new();
+            v_left.set_concretetype(Some(repr.lowleveltype().clone()));
+            let v_right = Variable::new();
+            v_right.set_concretetype(Some(repr.lowleveltype().clone()));
+            let v_result = Variable::new();
+            v_result.set_concretetype(Some(repr.lowleveltype().clone()));
+            let hop = HighLevelOp::new(
+                rtyper.clone(),
+                SpaceOperation::new(
+                    "add",
+                    vec![Hlvalue::Variable(v_left), Hlvalue::Variable(v_right)],
+                    Hlvalue::Variable(v_result),
+                ),
+                Vec::new(),
+                llops.clone(),
+            );
+            let s_integer = SomeValue::Integer(SomeInteger::new_with_knowntype(false, known));
+            let repr_dyn = repr.clone() as Arc<dyn Repr>;
+            hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+            hop.args_s
+                .borrow_mut()
+                .extend([s_integer.clone(), s_integer.clone()]);
+            hop.args_r
+                .borrow_mut()
+                .extend([Some(repr_dyn.clone()), Some(repr_dyn.clone())]);
+            *hop.s_result.borrow_mut() = Some(s_integer);
+            *hop.r_result.borrow_mut() = Some(repr_dyn);
+
+            let result = rtype_template(&hop, "add")
+                .expect("wide add rtypes")
+                .expect("wide add returns a value");
+            assert_eq!(
+                hlvalue_concretetype(&result),
+                Some(repr.lowleveltype().clone())
+            );
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 1);
+            assert_eq!(ops.ops[0].opname, expected_opname);
+        }
     }
 
     #[test]

@@ -221,6 +221,8 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => ValueType::Int,
+        ConstValue::Int128(_) => ValueType::Int128,
+        ConstValue::UInt128(_) => ValueType::UInt128,
         ConstValue::Float(_) => ValueType::Float,
         ConstValue::Placeholder => ValueType::Unknown,
         // RPython `Constant(None)` is annotated as `SomeNone`
@@ -263,6 +265,8 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
+        OpKind::ConstInt128(_) => ValueType::Int128,
+        OpKind::ConstUInt128(_) => ValueType::UInt128,
         OpKind::ConstBool(_) => ValueType::Bool,
         // `_we_are_jitted` symbolic carries its own concretetype
         // (`Bool` for `we_are_jitted() -> bool`).

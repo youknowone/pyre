@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use pyre_object::pyobject::*;
+use pyre_object::rbigint::RBigInt as BigInt;
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -7730,7 +7731,7 @@ fn slice_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate
 }
 
 /// sliceobject.py:148 `W_SliceObject.descr_indices`.
-fn slice_eval_index_big(value: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyError> {
+fn slice_eval_index_big(value: PyObjectRef) -> Result<BigInt, crate::PyError> {
     match crate::baseobjspace::space_index(value) {
         Ok(indexed) => Ok(unsafe { pyre_object::range_obj_to_bigint(indexed) }),
         Err(error) if error.kind == crate::PyErrorKind::TypeError => {
@@ -7761,8 +7762,8 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         pyre_object::gc_roots::shadow_stack_get(roots + 1)
     })?;
     let length = unsafe { pyre_object::range_obj_to_bigint(indexed_length) };
-    let zero = malachite_bigint::BigInt::from(0);
-    let one = malachite_bigint::BigInt::from(1);
+    let zero = BigInt::from(0);
+    let one = BigInt::from(1);
     if length < zero {
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
@@ -13420,10 +13421,22 @@ fn init_int_type(ns: PyObjectRef) {
                     // absolute value, so long/bigint operands must route
                     // through their magnitude rather than the i64 fast path
                     // (which leaves out-of-range values at 0).
-                    let bits = if !args.is_empty()
-                        && unsafe { pyre_object::pyobject::is_int_or_long(args[0]) }
-                    {
-                        unsafe { crate::builtins::obj_to_bigint(args[0]).bits() }
+                    let bits = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
+                        pyre_object::rbigint::bit_length_int(unsafe {
+                            pyre_object::w_int_get_value(args[0])
+                        }) as u64
+                    } else if !args.is_empty() && unsafe { pyre_object::is_long(args[0]) } {
+                        match unsafe { crate::builtins::obj_to_bigint(args[0]).bit_length() } {
+                            Ok(bits) => bits as u64,
+                            Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+                                return Err(crate::PyError::overflow_error(
+                                    "too many digits in integer",
+                                ));
+                            }
+                            Err(_) => {
+                                unreachable!("rbigint.bit_length only raises OverflowError")
+                            }
+                        }
                     } else {
                         0
                     };
@@ -13451,14 +13464,16 @@ fn init_int_type(ns: PyObjectRef) {
                         // Small-int fast path — `@jit.elidable` `_bit_count`.
                         pyre_object::int_bit_count(unsafe { pyre_object::w_int_get_value(args[0]) })
                     } else if unsafe { pyre_object::pyobject::is_int_or_long(args[0]) } {
-                        // long/bigint: population count of the magnitude, so the
-                        // i64 fast path (which leaves out-of-range values at 0)
-                        // does not undercount.
-                        unsafe {
-                            crate::builtins::obj_to_bigint(args[0])
-                                .iter_u32_digits()
-                                .map(|d| d.count_ones() as i64)
-                                .sum()
+                        match unsafe { crate::builtins::obj_to_bigint(args[0]).bit_count() } {
+                            Ok(count) => count,
+                            Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+                                return Err(crate::PyError::overflow_error(
+                                    "too many digits in integer",
+                                ));
+                            }
+                            Err(_) => {
+                                unreachable!("rbigint.bit_count only raises OverflowError")
+                            }
                         }
                     } else {
                         0
@@ -13505,7 +13520,7 @@ fn init_int_type(ns: PyObjectRef) {
                 {
                     unsafe { crate::builtins::obj_to_bigint(pos[0]) }
                 } else {
-                    malachite_bigint::BigInt::from(0)
+                    BigInt::from(0)
                 };
                 let length_obj = pos
                     .get(1)
@@ -13520,17 +13535,16 @@ fn init_int_type(ns: PyObjectRef) {
                         "length argument must be non-negative",
                     ));
                 }
-                let length = length_i as usize;
-                let little_endian = match pos
+                let byteorder = match pos
                     .get(2)
                     .copied()
                     .or_else(|| crate::builtins::kwarg_get(kwargs, "byteorder"))
                 {
-                    None => false,
+                    None => "big",
                     Some(o) if unsafe { pyre_object::is_str(o) } => {
                         match unsafe { pyre_object::w_str_get_value(o) } {
-                            "little" => true,
-                            "big" => false,
+                            "little" => "little",
+                            "big" => "big",
                             _ => {
                                 return Err(crate::PyError::value_error(
                                     "byteorder must be either 'little' or 'big'",
@@ -13549,42 +13563,29 @@ fn init_int_type(ns: PyObjectRef) {
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
-                let bits = length * 8;
-                let zero = malachite_bigint::BigInt::from(0);
-                let limit = malachite_bigint::BigInt::from(1) << bits;
-                let encoded = if bits == 0 {
-                    if val != zero {
-                        return Err(crate::PyError::overflow_error("int too big to convert"));
-                    }
-                    zero.clone()
-                } else if signed {
-                    let half = if bits == 0 {
-                        malachite_bigint::BigInt::from(0)
-                    } else {
-                        malachite_bigint::BigInt::from(1) << (bits - 1)
-                    };
-                    if val < -half.clone() || val >= half {
-                        return Err(crate::PyError::overflow_error("int too big to convert"));
-                    }
-                    if val < zero { val + &limit } else { val }
-                } else {
-                    if val < zero {
-                        return Err(crate::PyError::overflow_error(
-                            "can't convert negative int to unsigned",
-                        ));
-                    }
-                    if val >= limit {
-                        return Err(crate::PyError::overflow_error("int too big to convert"));
-                    }
-                    val
-                };
-                let mut bytes = vec![0u8; length];
-                use num_traits::ToPrimitive;
-                for i in 0..length {
-                    let shift = if little_endian { i } else { length - 1 - i } * 8;
-                    let byte = (&encoded >> shift) & malachite_bigint::BigInt::from(0xff);
-                    bytes[i] = byte.to_u8().unwrap_or(0);
-                }
+                // intobject.py:129-141 `descr_to_bytes`: route directly through
+                // rbigint.tobytes.  Besides preserving its exact exception
+                // contract, this is linear in the output length; shifting the
+                // whole bigint once per output byte is quadratic.
+                let bytes =
+                    val.tobytes(length_i, byteorder, signed)
+                        .map_err(|error| match error {
+                            pyre_object::rbigint::RBigIntError::InvalidEndianness => {
+                                crate::PyError::value_error(
+                                    "byteorder must be either 'little' or 'big'",
+                                )
+                            }
+                            pyre_object::rbigint::RBigIntError::InvalidSignedness
+                            | pyre_object::rbigint::RBigIntError::NegativeToUnsigned => {
+                                crate::PyError::overflow_error(
+                                    "can't convert negative int to unsigned",
+                                )
+                            }
+                            pyre_object::rbigint::RBigIntError::Overflow => {
+                                crate::PyError::overflow_error("int too big to convert")
+                            }
+                            _ => unreachable!("rbigint.tobytes returned an unrelated error"),
+                        })?;
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
             }),
         )
@@ -14344,7 +14345,8 @@ fn init_float_type(ns: PyObjectRef) {
                                 crate::PyError::value_error("cannot convert NaN to integer ratio")
                             }
                         })?;
-                    let to_pyint = |b: malachite_bigint::BigInt| {
+                    let to_pyint = |b| {
+                        let b = crate::compiler_bigint_to_rbigint(&b);
                         if pyre_object::jit_bigint_to_i64_fits(&b) != 0 {
                             pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&b))
                         } else {
@@ -14631,7 +14633,7 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
         FloatToIntMode::Ceil => v.ceil(),
     };
     use num_traits::FromPrimitive;
-    let big = malachite_bigint::BigInt::from_f64(reduced).expect("finite already checked");
+    let big = BigInt::from_f64(reduced).expect("finite already checked");
     if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {
         Ok(pyre_object::w_int_new(
             pyre_object::jit_bigint_to_i64_value(&big),
@@ -17525,12 +17527,12 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // `byteorder='text'` unwraps through `space.text_w`; a non-str value is a
     // TypeError, and only a str that is neither 'little'/'big' is a ValueError.
-    let little_endian = match byteorder_pos.or(byteorder_kw) {
-        None => false,
+    let byteorder = match byteorder_pos.or(byteorder_kw) {
+        None => "big",
         Some(b) if unsafe { pyre_object::is_str(b) } => {
             match unsafe { pyre_object::w_str_get_value(b) } {
-                "little" => true,
-                "big" => false,
+                "little" => "little",
+                "big" => "big",
                 _ => {
                     return Err(crate::PyError::value_error(
                         "byteorder must be either 'little' or 'big'",
@@ -17549,31 +17551,26 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    let mut val = malachite_bigint::BigInt::from(0);
-    if little_endian {
-        for &b in bytes.iter().rev() {
-            val = (val << 8) + malachite_bigint::BigInt::from(b);
+    // intobject.py:81-91 first tries the machine-word helper, then falls back
+    // to the same linear rbigint.frombytes implementation for large input.
+    let w_result = match pyre_object::rbigint::frombytes_int(&bytes, byteorder, signed) {
+        Ok(value) => pyre_object::w_int_new(value),
+        Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+            let value =
+                BigInt::frombytes(&bytes, byteorder, signed).map_err(|error| match error {
+                    pyre_object::rbigint::RBigIntError::InvalidEndianness => {
+                        crate::PyError::value_error("byteorder must be either 'little' or 'big'")
+                    }
+                    _ => unreachable!("validated rbigint.frombytes returned an unrelated error"),
+                })?;
+            pyre_object::w_long_new(value)
         }
-    } else {
-        for &b in &bytes {
-            val = (val << 8) + malachite_bigint::BigInt::from(b);
+        Err(pyre_object::rbigint::RBigIntError::InvalidEndianness) => {
+            return Err(crate::PyError::value_error(
+                "byteorder must be either 'little' or 'big'",
+            ));
         }
-    }
-    let n = bytes.len();
-    if signed && n > 0 {
-        let sign_probe = if little_endian {
-            bytes[n - 1]
-        } else {
-            bytes[0]
-        };
-        if sign_probe & 0x80 != 0 {
-            val -= malachite_bigint::BigInt::from(1) << (8 * n);
-        }
-    }
-    let w_result = if pyre_object::jit_bigint_to_i64_fits(&val) != 0 {
-        pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&val))
-    } else {
-        pyre_object::w_long_new(val)
+        Err(_) => unreachable!("frombytes_int returned an unrelated error"),
     };
     let base = crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
     if cls.is_null() || crate::baseobjspace::is_w(cls, base) {

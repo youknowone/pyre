@@ -1253,7 +1253,7 @@ fn u64_to_pyobject(u: u64) -> PyObjectRef {
     if u <= i64::MAX as u64 {
         pyre_object::w_int_new(u as i64)
     } else {
-        pyre_object::longobject::w_long_new(malachite_bigint::BigInt::from(u))
+        pyre_object::longobject::w_long_new(pyre_object::rbigint::RBigInt::from(u))
     }
 }
 

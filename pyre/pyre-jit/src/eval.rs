@@ -69,22 +69,6 @@ fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> *mut
     majit_gc::alloc_nursery_collecting_typed(type_id, size).0 as *mut u8
 }
 
-/// Trampoline for off-heap memory-pressure charges — routes pyre-object's
-/// memory-pressure hook to the backend's GC. The bignum collecting-alloc site
-/// charges its limb-`Vec` bytes here so minor cadence reflects true footprint;
-/// the charge may force a minor, safe because the caller is the same gcmap-rooted
-/// residual call as [`pyre_object_gc_alloc_collecting_trampoline`].
-fn pyre_object_gc_charge_memory_pressure_trampoline(bytes: usize) {
-    majit_gc::charge_memory_pressure(bytes);
-}
-
-/// Old-gen external-byte charge trampoline. Bridges a host stable bignum alloc
-/// (`alloc_bigint_stable`) to the active backend's major threshold without
-/// forcing a minor.
-fn pyre_object_gc_charge_oldgen_external_trampoline(obj_addr: usize, bytes: usize) {
-    majit_gc::charge_oldgen_external(obj_addr, bytes);
-}
-
 /// `gc.collect()` (interp_gc.py:7-26) trampoline. Bridges
 /// pyre-object's `try_gc_collect` to `majit_gc::collect_full`, which
 /// fans out to the active backend's `dynasm_collect_full` /
@@ -2613,21 +2597,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         );
         pytype_to_tid.insert(mv_descr.pytype_ptr as usize, mv_tid);
     }
-    // Raw `BigInt` payload backing every `W_LongObject.value` (and the JIT
-    // `jit_w_long_*_raw` results). Not an `rclass.OBJECT` instance — a bare
-    // payload with no gc-pointer fields (malachite's limb `Vec` is off-GC),
-    // carrying a lightweight destructor that runs `BigInt`'s drop glue so
-    // the limbs are freed instead of leaked when the collector reclaims a
-    // dead bigint. Registered at runtime id (no fixed const) and published
-    // to pyre-object via `set_bigint_gc_type_id`; the id is never embedded
-    // in a JIT descr (bigints are host-allocated, never `NewWithVtable`'d).
-    let bigint_tid = gc.register_type(
-        TypeInfo::with_destructor(
-            pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
-            pyre_object::longobject::bigint_destructor,
-        )
-        .with_external_size(pyre_object::longobject::bigint_external_size),
-    );
+    // RPython `rbigint` payload backing every `W_LongObject.value` (and JIT
+    // raw arithmetic result). It is a plain GC object with one traced edge to
+    // `_digits: Ptr(GcArray(Signed))`; unlike the removed Malachite payload it
+    // has no off-GC limb Vec, destructor, or external-memory accounting.
+    let bigint_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
+        vec![pyre_object::rbigint::RBIGINT_DIGITS_OFFSET],
+    ));
     pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
     // PyPy's FrameDebugData is a plain GC object. It owns three PyObjectRef
     // fields; once the frame custom trace greys the payload, the ordinary
@@ -3265,6 +3242,17 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     };
 }
 
+/// Root PyPy's process-global `rbigint._parts_cache`. The object crate exposes
+/// its raw `_digits` slots without depending on majit-ir; this adapter performs
+/// the `GcRef` conversion and writes back a forwarded address.
+fn walk_rbigint_parts_cache(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_object::rbigint::walk_rbigint_cache_digit_slots(|slot| {
+        let mut root = majit_ir::GcRef(*slot as usize);
+        visitor(&mut root);
+        *slot = root.0 as *mut u8;
+    });
+}
+
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
 /// mapdict side table, etc.).  Called on first eval entry, after the
 /// interpreter is initialized.
@@ -3272,6 +3260,7 @@ fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_pyframe_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_jit_exc_value);
     majit_gc::shadow_stack::register_extra_root_walker(walk_bh_last_exc_value);
+    majit_gc::shadow_stack::register_extra_root_walker(walk_rbigint_parts_cache);
     // Stored `PyError` carriers whose GC refs the precise collector cannot
     // reach through their raw TLS cells: the call-assembler FFI stash and the
     // no-handler trace→portal stash. Mirrors `walk_pending_call_error`.
@@ -3352,12 +3341,6 @@ fn install_pyre_object_hooks() {
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
         pyre_object_gc_alloc_collecting_trampoline,
     );
-    pyre_object::gc_hook::register_gc_charge_memory_pressure_hook(
-        pyre_object_gc_charge_memory_pressure_trampoline,
-    );
-    pyre_object::gc_hook::register_gc_charge_oldgen_external_hook(
-        pyre_object_gc_charge_oldgen_external_trampoline,
-    );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
     pyre_object::gc_hook::register_gc_set_enabled_hook(pyre_object_gc_set_enabled_trampoline);
@@ -3432,6 +3415,10 @@ pub fn reset_gc_fresh_for_test() {
 /// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
+    // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
+    // translated prebuilt equivalent before any collector root walk rather
+    // than lazily manufacturing it from inside the walker.
+    pyre_object::rbigint::initialize_rbigint_parts_cache();
     if !GC_TLS_INSTALLED.with(|c| c.get()) {
         majit_gc::gc_sync::register_thread();
         majit_gc::shadow_stack::register_mutator();

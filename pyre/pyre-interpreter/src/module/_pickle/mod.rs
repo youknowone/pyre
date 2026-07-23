@@ -16,8 +16,8 @@
 //! `PicklingError`, `UnpicklingError` — so `from _pickle import (...)`
 //! resolves and the accelerated path engages.
 
-use malachite_bigint::{BigInt, Sign};
 use pyre_object::PyObjectRef;
+use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
 
 use crate::PyError;
 

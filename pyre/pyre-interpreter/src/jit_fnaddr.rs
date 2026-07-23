@@ -701,23 +701,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
     );
-    // The interp-alloc boxing tail's two GC-hook toucher residuals: `note_alloc`
-    // bumps the runtime-mutable `ALLOC_SINCE_GC` atomic, and
-    // `try_gc_charge_oldgen_external` dispatches through a thread-local `Cell`.
-    // Neither is a build-time constant, so both carry `#[dont_look_inside]` and
-    // bind their `()`-returning `fn` directly by qualified path (siblings of
-    // `try_gc_alloc_stable_raw` / `gc_interp::enabled`).
+    // The interp-alloc boxing tail's GC-hook toucher residual: `note_alloc`
+    // bumps the runtime-mutable `ALLOC_SINCE_GC` atomic. It is not a build-time
+    // constant, so it carries `#[dont_look_inside]` and binds its `()`-returning
+    // function directly by qualified path.
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_interp::note_alloc",
         "pyre_object::note_alloc",
         pyre_object::gc_interp::note_alloc as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::gc_hook::try_gc_charge_oldgen_external",
-        "pyre_object::try_gc_charge_oldgen_external",
-        pyre_object::gc_hook::try_gc_charge_oldgen_external as *const (),
     );
     // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
     // side effect on per-type state, not a build-time constant, so it carries
@@ -862,10 +854,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::safepoint",
         pyre_object::gc_interp::safepoint as *const (),
     );
-    // `jit_bigint_div` / `jit_bigint_rem` residualize the `div_rem()` tuple
-    // synth (`front::bigint_div_rem`): the foreign malachite `div_rem` returns
-    // a `(BigInt, BigInt)` the tracer models as a `__pos_0`/`__pos_1` tuple
-    // sourced from these two `#[dont_look_inside]` calls, bound by path.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::jit_compiler_bigint_to_rbigint",
+        crate::jit_compiler_bigint_to_rbigint as *const (),
+    );
+    // Truncated `_divrem` projections used by Rust operator shims.
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_div",
@@ -876,11 +870,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
         crate::objspace::descroperation::jit_bigint_rem as *const (),
     );
-    // `jit_bigint_div_floor` / `jit_bigint_mod_floor` residualize the
-    // `div_mod_floor()` tuple synth (`front::bigint_div_mod_floor`): the foreign
-    // malachite `div_mod_floor` returns a floored `(BigInt, BigInt)` the tracer
-    // models as a `__pos_0`/`__pos_1` tuple sourced from these two
-    // `#[dont_look_inside]` calls, bound by path.
+    // Floored `divmod` projections used by the zero-checked interpreter seams.
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_div_floor",
@@ -891,7 +881,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
         crate::objspace::descroperation::jit_bigint_mod_floor as *const (),
     );
-    // `jit_bigint_{and,or,xor,sub,mul}` residualize the foreign BigInt binary
+    // `jit_bigint_{and,or,xor,sub,mul}` residualize the Rust RBigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
     // (`front::bigint_binop`) redirects when both operands are the opaque
     // `BigInt` ADT.  Each returns a fresh `*mut BigInt` (as i64), bound by path.
@@ -924,6 +914,79 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_add",
         crate::objspace::descroperation::jit_bigint_add as *const (),
+    );
+    // Mixed W_LongObject/W_IntObject descriptors call the dedicated
+    // rbigint.int_* operations, preserving PyPy's no-temporary-bigint path.
+    for (path, addr) in [
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_add",
+            crate::objspace::descroperation::jit_bigint_int_add as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_sub",
+            crate::objspace::descroperation::jit_bigint_int_sub as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_mul",
+            crate::objspace::descroperation::jit_bigint_int_mul as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_and",
+            crate::objspace::descroperation::jit_bigint_int_and as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_or",
+            crate::objspace::descroperation::jit_bigint_int_or as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_xor",
+            crate::objspace::descroperation::jit_bigint_int_xor as *const (),
+        ),
+    ] {
+        push_fnaddr(&mut entries, path, addr);
+    }
+    for (path, addr) in [
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_eq",
+            crate::objspace::descroperation::jit_bigint_int_eq as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_ne",
+            crate::objspace::descroperation::jit_bigint_int_ne as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_lt",
+            crate::objspace::descroperation::jit_bigint_int_lt as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_le",
+            crate::objspace::descroperation::jit_bigint_int_le as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_gt",
+            crate::objspace::descroperation::jit_bigint_int_gt as *const (),
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::jit_bigint_int_ge",
+            crate::objspace::descroperation::jit_bigint_int_ge as *const (),
+        ),
+    ] {
+        push_fnaddr(&mut entries, path, addr);
+    }
+    // `bigint_pow_nomod(...)?` is source-level `Result` syntax for
+    // RPython's implicit MemoryError edge. The MIR front removes that shell
+    // and binds the elidable pointer-ABI payload call here.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_pow_nomod",
+        crate::objspace::descroperation::jit_bigint_pow_nomod as *const (),
+    );
+    // `bigint_lshift_count(...)?` carries the same implicit MemoryError shape
+    // for RPython's lshift allocation.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_count",
+        crate::objspace::descroperation::jit_bigint_lshift_count as *const (),
     );
     // `jit_bigint_neg` residualizes the unary `<BigInt as Neg>::neg` operator;
     // a single operand pointer.
@@ -1017,6 +1080,94 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::longobject::jit_bigint_to_i64_fits",
         "pyre_object::jit_bigint_to_i64_fits",
         pyre_object::jit_bigint_to_i64_fits as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_from_i64",
+        "pyre_object::jit_bigint_from_i64",
+        pyre_object::jit_bigint_from_i64 as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_from_u64",
+        "pyre_object::jit_bigint_from_u64",
+        pyre_object::jit_bigint_from_u64 as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_eq",
+        "pyre_object::jit_bigint_eq",
+        pyre_object::jit_bigint_eq as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_ne",
+        "pyre_object::jit_bigint_ne",
+        pyre_object::jit_bigint_ne as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_lt",
+        "pyre_object::jit_bigint_lt",
+        pyre_object::jit_bigint_lt as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_le",
+        "pyre_object::jit_bigint_le",
+        pyre_object::jit_bigint_le as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_gt",
+        "pyre_object::jit_bigint_gt",
+        pyre_object::jit_bigint_gt as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_ge",
+        "pyre_object::jit_bigint_ge",
+        pyre_object::jit_bigint_ge as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_bits",
+        "pyre_object::jit_bigint_bits",
+        pyre_object::jit_bigint_bits as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_is_zero",
+        "pyre_object::jit_bigint_is_zero",
+        pyre_object::jit_bigint_is_zero as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_is_one",
+        "pyre_object::jit_bigint_is_one",
+        pyre_object::jit_bigint_is_one as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_tobool",
+        "pyre_object::jit_bigint_tobool",
+        pyre_object::jit_bigint_tobool as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_hash",
+        "pyre_object::jit_bigint_hash",
+        pyre_object::jit_bigint_hash as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_bit_length",
+        crate::objspace::descroperation::jit_bigint_bit_length as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_bit_count",
+        crate::objspace::descroperation::jit_bigint_bit_count as *const (),
     );
     push_alias_pair(
         &mut entries,

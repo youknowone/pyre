@@ -583,9 +583,13 @@ pub unsafe fn typed_items_block_capacity(block: *mut TypedItemsBlock) -> usize {
 }
 
 fn typed_items_block_layout(cap: usize) -> Layout {
-    let total = TYPED_ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<u64>();
-    Layout::from_size_align(total, std::mem::align_of::<TypedItemsBlock>())
-        .expect("TypedItemsBlock layout")
+    try_typed_items_block_layout(cap).expect("TypedItemsBlock layout")
+}
+
+fn try_typed_items_block_layout(cap: usize) -> Option<Layout> {
+    let items_size = cap.checked_mul(std::mem::size_of::<u64>())?;
+    let total = TYPED_ITEMS_BLOCK_ITEMS_OFFSET.checked_add(items_size)?;
+    Layout::from_size_align(total, std::mem::align_of::<TypedItemsBlock>()).ok()
 }
 
 /// Allocate a fresh zero-filled `TypedItemsBlock` with the given capacity, as a
@@ -605,9 +609,90 @@ fn typed_items_block_layout(cap: usize) -> Layout {
 /// `int_items.block` / `float_items.block` owner slot is marked-live by
 /// `list_object_custom_trace`.
 pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBlock {
+    unsafe {
+        try_alloc_typed_items_block(cap, tid)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
+    }
+}
+
+/// Allocate a scalar GcArray in the no-collect moving nursery.
+///
+/// This is the RPython `rbigint._digits` allocation shape.  Bigint arithmetic
+/// may hold several unboxed Rust `RBigInt` handles at once, so the allocator
+/// must not trigger a collection while those raw digit pointers are live.
+/// The completed result's digit edge is explicitly rooted when its RBigInt
+/// payload is boxed by `alloc_rbigint_nursery_collecting`.
+pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut TypedItemsBlock {
+    unsafe {
+        try_alloc_typed_items_block_nursery(cap, tid)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
+    }
+}
+
+/// Fallible companion of [`alloc_typed_items_block_nursery`].
+pub unsafe fn try_alloc_typed_items_block_nursery(
+    cap: usize,
+    tid: u32,
+) -> Option<*mut TypedItemsBlock> {
     let cap = cap.max(1);
+    let layout = try_typed_items_block_layout(cap)?;
+    if itemsblock_gc_enabled()
+        && let Some(raw) = crate::gc_hook::try_gc_alloc(tid, layout.size())
+        && !raw.is_null()
+    {
+        let block = raw as *mut TypedItemsBlock;
+        unsafe {
+            (*block).capacity = cap;
+            std::ptr::write_bytes(
+                typed_items_block_items_base(block),
+                0,
+                cap * std::mem::size_of::<u64>(),
+            );
+        }
+        return Some(block);
+    }
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            return None;
+        }
+        let block = raw as *mut TypedItemsBlock;
+        (*block).capacity = cap;
+        Some(block)
+    }
+}
+
+/// Allocate a headerless, process-lifetime `GcArray(Signed/Float)` body.
+///
+/// This is only for translated prebuilt objects whose module-global owner is
+/// itself immortal (not for ordinary arrays). The layout remains the exact
+/// `[length][items...]` GcArray shape seen by generated code, while the hybrid
+/// collector deliberately treats the address as non-managed. PyPy's prebuilt
+/// `rbigint` digit lists have the same process lifetime.
+pub unsafe fn alloc_typed_items_block_immortal(cap: usize) -> *mut TypedItemsBlock {
+    let cap = cap.max(1);
+    let layout = typed_items_block_layout(cap);
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let block = raw as *mut TypedItemsBlock;
+        (*block).capacity = cap;
+        block
+    }
+}
+
+/// Fallible `gc_malloc_array` surface used where the RPython caller exposes
+/// allocation failure as `MemoryError` (notably `rbigint.lshift`).  The
+/// ordinary translated allocation path above remains infallible at the Rust
+/// type level, matching RPython's implicit exception edge; this entry point
+/// makes that edge explicit for Rust methods that already return `Result`.
+pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut TypedItemsBlock> {
+    let cap = cap.max(1);
+    let layout = try_typed_items_block_layout(cap)?;
+    let payload = layout.size();
     if itemsblock_gc_enabled() {
-        let payload = TYPED_ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<u64>();
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, payload);
         if !raw.is_null() {
             let block = raw as *mut TypedItemsBlock;
@@ -619,18 +704,17 @@ pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBl
                     cap * std::mem::size_of::<u64>(),
                 );
             }
-            return block;
+            return Some(block);
         }
     }
-    let layout = typed_items_block_layout(cap);
     unsafe {
         let raw = alloc_zeroed(layout);
         if raw.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            return None;
         }
         let block = raw as *mut TypedItemsBlock;
         (*block).capacity = cap;
-        block
+        Some(block)
     }
 }
 

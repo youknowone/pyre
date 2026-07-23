@@ -4,6 +4,7 @@
 //!
 //! All functions delegate to `pymath::math` for CPython-exact results.
 
+use pyre_object::rbigint::{RBigInt as BigInt, RBigIntError};
 use pyre_object::*;
 
 /// Infallible f64 extraction with a `0.0` fallback for a non-convertible
@@ -113,6 +114,17 @@ fn map_int_err(e: pymath::Error) -> crate::PyError {
     match e {
         pymath::Error::EDOM => crate::PyError::value_error("math domain error"),
         pymath::Error::ERANGE => crate::PyError::overflow_error("math range error"),
+    }
+}
+
+fn map_rbigint_err(e: RBigIntError) -> crate::PyError {
+    match e {
+        RBigIntError::Memory => crate::PyError::memory_error(""),
+        RBigIntError::Overflow | RBigIntError::FloatDivisionOverflow => {
+            crate::PyError::overflow_error("math range error")
+        }
+        RBigIntError::DivisionByZero => crate::PyError::zero_division("integer division by zero"),
+        _ => crate::PyError::value_error("math domain error"),
     }
 }
 
@@ -360,61 +372,30 @@ pub fn trunc(args: &[PyObjectRef]) -> PyResult {
 ///     return func(x) + e * SHIFT * func(2.0)
 ///
 /// Here we pick SHIFT=1 so `e` is the number of bits shifted off.
-fn bigint_log(n: &malachite_bigint::BigInt, base: f64) -> Result<f64, crate::PyError> {
-    use num_traits::{Signed, ToPrimitive};
-    if !n.is_positive() {
+fn bigint_log(n: &BigInt, base: f64) -> Result<f64, crate::PyError> {
+    if n.int_le(0) {
         return Err(crate::PyError::value_error("math domain error"));
     }
-    // Extract bit length and shift down so the value fits in an f64 mantissa.
-    let bits = n.bits() as usize;
-    let shift = if bits > 60 { bits - 60 } else { 0 };
-    let shifted = n >> shift;
-    let x: f64 = jit_bigint_to_f64_or_inf(&shifted);
-    if !x.is_finite() {
-        return Err(crate::PyError::overflow_error("int too large"));
-    }
-    // log(n) = log(x) + shift * log(2)
-    let log_x = if base == 10.0 {
-        x.log10()
-    } else if base == 2.0 {
-        x.log2()
-    } else {
-        x.ln()
-    };
-    let log_two = if base == 10.0 {
-        2f64.log10()
-    } else if base == 2.0 {
-        1.0 // log2(2) = 1
-    } else {
-        2f64.ln()
-    };
-    let mut result = log_x + shift as f64 * log_two;
-    // If base != 0 and != {e, 10, 2}, divide by log(base).
-    if base != 0.0 && base != 10.0 && base != 2.0 {
-        result /= base.ln();
-    }
-    Ok(result)
+    n.log(base).map_err(map_rbigint_err)
 }
 
 /// Special-case integer arguments to avoid overflow, and give the domain
 /// error the value-carrying message except for an int argument, whose error
 /// carries no value.
 fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
-    use num_traits::Signed;
     unsafe {
         if pyre_object::is_bool(w_x) || pyre_object::is_int(w_x) || pyre_object::is_long(w_x) {
             let num_owned;
-            let num: &malachite_bigint::BigInt = if pyre_object::is_long(w_x) {
+            let num: &BigInt = if pyre_object::is_long(w_x) {
                 pyre_object::w_long_get_value(w_x)
             } else if pyre_object::is_bool(w_x) {
-                num_owned =
-                    malachite_bigint::BigInt::from(pyre_object::w_bool_get_value(w_x) as i64);
+                num_owned = BigInt::from(pyre_object::w_bool_get_value(w_x) as i64);
                 &num_owned
             } else {
-                num_owned = malachite_bigint::BigInt::from(pyre_object::w_int_get_value(w_x));
+                num_owned = BigInt::from(pyre_object::w_int_get_value(w_x));
                 &num_owned
             };
-            if !num.is_positive() {
+            if num.int_le(0) {
                 return Err(crate::PyError::value_error("expected a positive input"));
             }
             return Ok(floatobject::w_float_new(bigint_log(num, base)?));
@@ -565,7 +546,6 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn factorial(args: &[PyObjectRef]) -> PyResult {
-    use malachite_bigint::BigInt;
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "factorial() takes exactly 1 argument",
@@ -581,8 +561,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
         }
     }
     let n_big = get_bigint(args[0])?;
-    use num_traits::Signed;
-    if n_big.is_negative() {
+    if n_big.int_lt(0) {
         return Err(crate::PyError::value_error(
             "factorial() not defined for negative values",
         ));
@@ -594,19 +573,45 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
             "factorial() argument should not exceed i64::MAX",
         ));
     };
-    // Straightforward BigInt multiplication; overflow impossible with
-    // arbitrary precision. Faster algorithms (binary split) exist in
-    // pypy/module/math/app_math.py but structural correctness is what
-    // matters here.
-    let mut result = BigInt::from(1);
-    for i in 2..=n {
-        result *= BigInt::from(i);
+
+    // pypy/module/math/app_math.py:factorial — balanced odd-product tree.
+    fn fac_odd(low: i64, high: i64, gap: i64) -> BigInt {
+        if low + gap >= high {
+            let mut result = BigInt::one();
+            let mut i = low;
+            while i < high {
+                result = result.int_mul(i);
+                i += 2;
+            }
+            return result;
+        }
+        let mid = ((low + high) >> 1) | 1;
+        fac_odd(low, mid, gap).mul(&fac_odd(mid, high, gap))
     }
-    if jit_bigint_to_i64_fits(&result) != 0 {
-        Ok(w_int_new(jit_bigint_to_i64_value(&result)))
+    fn fac1(x: i64, gap: i64) -> (BigInt, BigInt, i64) {
+        if x <= 2 {
+            return (BigInt::one(), BigInt::one(), x - 1);
+        }
+        let x2 = x >> 1;
+        let (f, mut g, shift) = fac1(x2, gap);
+        g = g.mul(&fac_odd((x2 + 1) | 1, x + 1, gap));
+        (f.mul(&g), g, shift + x2)
+    }
+
+    let result = if n <= 100 {
+        let mut result = BigInt::one();
+        let mut i = 2;
+        while i <= n {
+            result = result.int_mul(i);
+            i += 1;
+        }
+        result
     } else {
-        Ok(w_long_new(result))
-    }
+        let gap = 100.max(n >> 7);
+        let (result, _, shift) = fac1(n, gap);
+        result.lshift(shift).map_err(map_rbigint_err)?
+    };
+    Ok(bigint_to_pyint(result))
 }
 
 /// Convert any int/long/bool to a BigInt for math.gcd/lcm/factorial
@@ -614,8 +619,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
 /// W_IntObject/W_LongObject/W_BoolObject union and materializes rbigint.
 /// Raises TypeError for non-integer inputs via `__index__` dunder, matching
 /// CPython's `_PyLong_FromNbIndexOrNbInt`.
-fn get_bigint(obj: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyError> {
-    use malachite_bigint::BigInt;
+fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
     unsafe {
         if pyre_object::is_long(obj) {
             return Ok(pyre_object::w_long_get_value(obj).clone());
@@ -665,51 +669,42 @@ fn get_bigint(obj: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyErr
 }
 
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
-    use malachite_bigint::BigInt;
-    let refs: Vec<BigInt> = args
-        .iter()
-        .map(|&a| get_bigint(a))
-        .collect::<Result<Vec<_>, _>>()?;
-    let ref_slices: Vec<&BigInt> = refs.iter().collect();
-    let result = pymath::math::integer::gcd(&ref_slices);
-    if jit_bigint_to_i64_fits(&result) != 0 {
-        Ok(w_int_new(jit_bigint_to_i64_value(&result)))
-    } else {
-        Ok(w_long_new(result))
+    let mut result = BigInt::zero();
+    for &arg in args {
+        result = result.gcd(&get_bigint(arg)?).map_err(map_rbigint_err)?;
     }
+    Ok(bigint_to_pyint(result))
 }
 
 pub fn lcm(args: &[PyObjectRef]) -> PyResult {
-    use malachite_bigint::BigInt;
-    let refs: Vec<BigInt> = args
-        .iter()
-        .map(|&a| get_bigint(a))
-        .collect::<Result<Vec<_>, _>>()?;
-    let ref_slices: Vec<&BigInt> = refs.iter().collect();
-    let result = pymath::math::integer::lcm(&ref_slices);
-    if jit_bigint_to_i64_fits(&result) != 0 {
-        Ok(w_int_new(jit_bigint_to_i64_value(&result)))
-    } else {
-        Ok(w_long_new(result))
+    if args.is_empty() {
+        return Ok(w_int_new(1));
     }
+    let mut result = get_bigint(args[0])?;
+    for &arg in &args[1..] {
+        let value = get_bigint(arg)?;
+        if result.is_zero() || value.is_zero() {
+            return Ok(w_int_new(0));
+        }
+        let divisor = result.gcd(&value).map_err(map_rbigint_err)?;
+        result = result
+            .floordiv(&divisor)
+            .map_err(map_rbigint_err)?
+            .mul(&value)
+            .abs();
+    }
+    Ok(bigint_to_pyint(result.abs()))
 }
 
 /// `w_int_new` when the value fits an i64, else `w_long_new`.
-fn bigint_to_pyint(b: malachite_bigint::BigInt) -> PyObjectRef {
-    use num_traits::ToPrimitive;
+fn bigint_to_pyint(b: BigInt) -> PyObjectRef {
     match b.to_i64() {
         Some(i) => w_int_new(i),
         None => w_long_new(b),
     }
 }
 
-fn biguint_to_pyint(b: malachite_bigint::BigUint) -> PyObjectRef {
-    bigint_to_pyint(malachite_bigint::BigInt::from(b))
-}
-
 pub fn comb(args: &[PyObjectRef]) -> PyResult {
-    use num_traits::{Signed, ToPrimitive};
-
     if args.len() != 2 {
         return Err(crate::PyError::type_error(
             "comb() takes exactly two arguments",
@@ -718,65 +713,51 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     let n_big = get_bigint(args[0])?;
     let k_big = get_bigint(args[1])?;
 
-    if n_big.is_negative() {
+    if n_big.int_lt(0) {
         return Err(crate::PyError::value_error(
             "n must be a non-negative integer",
         ));
     }
-    if k_big.is_negative() {
+    if k_big.int_lt(0) {
         return Err(crate::PyError::value_error(
             "k must be a non-negative integer",
         ));
     }
 
-    // Fast path: n fits in i64.
-    if let Some(ni) = n_big.to_i64() {
-        // k out of range [0, n] means the result is 0.
-        let ki = match k_big.to_i64() {
-            Some(k) if (0..=ni).contains(&k) => k,
-            _ => return Ok(w_int_new(0)),
-        };
-        // Symmetry C(n, k) == C(n, n-k): compute with the smaller index.
-        let ki = ki.min(ni - ki);
-        if ki > 1 {
-            let v = pymath::math::integer::comb(ni, ki).map_err(map_int_err)?;
-            return Ok(biguint_to_pyint(v));
-        }
-        if ki == 0 {
-            return Ok(w_int_new(1));
-        }
-        return Ok(bigint_to_pyint(n_big)); // ki == 1
-    }
-
-    // BigInt path: n does not fit i64. Reduce by symmetry, then the smaller
-    // index must fit u64 for the divide-and-conquer product.
-    let n_minus_k = &n_big - &k_big;
-    if n_minus_k.is_negative() {
+    if k_big.gt(&n_big) {
         return Ok(w_int_new(0));
     }
-    let effective_k = if n_minus_k < k_big {
-        &n_minus_k
+
+    let n_minus_k = &n_big - &k_big;
+    let k = if n_minus_k.lt(&k_big) {
+        n_minus_k
     } else {
-        &k_big
+        k_big
     };
-    // `comb_bigint` takes the smaller factor as a `u64`; a value past
-    // `u64::MAX` is unreachable for any computable input (the product would
-    // need >2**64 multiplications) and is rejected rather than truncated.
-    let ki: u64 = match effective_k.to_u64() {
-        Some(k) => k,
-        None => {
-            return Err(crate::PyError::overflow_error(format!(
-                "min(n - k, k) must not exceed {}",
-                u64::MAX
-            )));
+    if k.is_zero() {
+        return Ok(w_int_new(1));
+    }
+
+    // pypy/module/math/app_math.py:comb — preserve its occasional fraction
+    // reduction, including a bigint loop index.
+    let mut numerator = n_big.clone();
+    let mut denominator = BigInt::one();
+    let mut i = BigInt::one();
+    while i.lt(&k) {
+        numerator = numerator.mul(&n_big.sub(&i));
+        denominator = denominator.mul(&i.int_add(1));
+        if i.int_and_(15).is_zero() {
+            numerator = numerator.floordiv(&denominator).map_err(map_rbigint_err)?;
+            denominator = BigInt::one();
         }
-    };
-    Ok(biguint_to_pyint(pymath::math::comb_bigint(&n_big, ki)))
+        i = i.int_add(1);
+    }
+    Ok(bigint_to_pyint(
+        numerator.floordiv(&denominator).map_err(map_rbigint_err)?,
+    ))
 }
 
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
-    use num_traits::{Signed, ToPrimitive};
-
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "perm() takes at least 1 argument",
@@ -788,7 +769,7 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let n_big = get_bigint(args[0])?;
-    if n_big.is_negative() {
+    if n_big.int_lt(0) {
         return Err(crate::PyError::value_error(
             "n must be a non-negative integer",
         ));
@@ -800,7 +781,7 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         None
     };
     if let Some(ref k_val) = k_big {
-        if k_val.is_negative() {
+        if k_val.int_lt(0) {
             return Err(crate::PyError::value_error(
                 "k must be a non-negative integer",
             ));
@@ -809,23 +790,37 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_int_new(0));
         }
     }
-    // k (falling-factorial length) must fit u64 for the product.
-    let ki: u64 = match &k_big {
-        None => n_big.to_u64().ok_or_else(|| {
-            crate::PyError::overflow_error(format!("n must not exceed {}", u64::MAX))
-        })?,
-        Some(k_val) => k_val.to_u64().ok_or_else(|| {
-            crate::PyError::overflow_error(format!("k must not exceed {}", u64::MAX))
-        })?,
-    };
-    // Fast path: n fits in i64 and k > 1 uses the i64 kernel.
-    if let Some(ni) = n_big.to_i64() {
-        if ni >= 0 && ki > 1 {
-            let v = pymath::math::integer::perm(ni, Some(ki as i64)).map_err(map_int_err)?;
-            return Ok(biguint_to_pyint(v));
+    let k = k_big.unwrap_or_else(|| n_big.clone());
+
+    fn product_range(low: &BigInt, high: &BigInt, gap: &BigInt) -> Result<BigInt, RBigIntError> {
+        if low.add(gap).ge(high) {
+            let mut result = BigInt::one();
+            let mut i = low.clone();
+            while i.lt(high) {
+                result = result.mul(&i);
+                i = i.int_add(1);
+            }
+            return Ok(result);
         }
+        let mid = low.add(high).rshift(1, false)?;
+        Ok(product_range(low, &mid, gap)?.mul(&product_range(&mid, high, gap)?))
     }
-    Ok(biguint_to_pyint(pymath::math::perm_bigint(&n_big, ki)))
+
+    let low = n_big.sub(&k).int_add(1);
+    let high = n_big.int_add(1);
+    let result = if k.int_le(100) {
+        product_range(&low, &high, &BigInt::fromint(100))
+    } else {
+        let shifted = k.rshift(7, false).map_err(map_rbigint_err)?;
+        let gap = if shifted.int_lt(100) {
+            BigInt::fromint(100)
+        } else {
+            shifted
+        };
+        product_range(&low, &high, &gap)
+    }
+    .map_err(map_rbigint_err)?;
+    Ok(bigint_to_pyint(result))
 }
 
 pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
@@ -835,16 +830,10 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let n = get_bigint(args[0])?;
-    match pymath::math::integer::isqrt(&n) {
-        Ok(v) => {
-            use num_traits::ToPrimitive;
-            match v.to_i64() {
-                Some(i) => Ok(w_int_new(i)),
-                None => Ok(w_long_new(v)),
-            }
-        }
-        Err(e) => Err(map_int_err(e)),
-    }
+    let value = n
+        .isqrt()
+        .map_err(|_| crate::PyError::value_error("isqrt() argument must be nonnegative"))?;
+    Ok(bigint_to_pyint(value))
 }
 
 pub fn fsum(args: &[PyObjectRef]) -> PyResult {
@@ -981,7 +970,7 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
         Some(v) => v,
         None => {
             // Sign of the exponent decides the result shape.
-            if exp_big.sign() == malachite_bigint::Sign::Minus {
+            if exp_big.int_lt(0) {
                 let signed = if x.is_sign_positive() { 0.0 } else { -0.0 };
                 return Ok(floatobject::w_float_new(signed));
             }
@@ -1027,7 +1016,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
         Some(s) => {
             use num_traits::ToPrimitive;
             let b = get_bigint(s)?;
-            if b.sign() == malachite_bigint::Sign::Minus {
+            if b.int_lt(0) {
                 return Err(crate::PyError::value_error(
                     "steps must be a non-negative integer",
                 ));

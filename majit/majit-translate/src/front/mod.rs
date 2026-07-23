@@ -65,8 +65,6 @@
 //! treated as opaque ops.
 
 pub(crate) mod bigint_binop;
-pub(crate) mod bigint_div_mod_floor;
-pub(crate) mod bigint_div_rem;
 pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod iter_next;
@@ -80,6 +78,7 @@ pub(crate) mod option_unwrap;
 pub(crate) mod option_unwrap_or;
 pub(crate) mod range_contains;
 pub(crate) mod range_iter;
+pub(crate) mod rbigint_call;
 pub(crate) mod result_exc;
 pub mod semantic;
 pub mod typestr;

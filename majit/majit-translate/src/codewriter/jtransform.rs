@@ -729,7 +729,7 @@ impl<'a> Transformer<'a> {
             ValueType::Ref(_) => crate::codewriter::type_state::ConcreteType::GcRef,
             ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
             ValueType::Void => crate::codewriter::type_state::ConcreteType::Void,
-            ValueType::Unknown => return,
+            ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 => return,
         };
         self.stamp_value_kind(graph, value, ty);
     }
@@ -5242,6 +5242,9 @@ fn value_type_to_kind(ty: &ValueType) -> char {
         ValueType::Ref(_) | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
+        ValueType::Int128 | ValueType::UInt128 => {
+            panic!("getkind: 128-bit integer type is too large (history.py:62)")
+        }
     }
 }
 
@@ -5308,6 +5311,9 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
         ValueType::Ref(_) | ValueType::Unknown => majit_ir::value::Type::Ref,
         ValueType::Float => majit_ir::value::Type::Float,
         ValueType::Void => majit_ir::value::Type::Void,
+        ValueType::Int128 | ValueType::UInt128 => {
+            panic!("getkind: 128-bit integer type is too large (history.py:62)")
+        }
     }
 }
 
@@ -5391,6 +5397,8 @@ fn remap_op(
     let kind = match &op.kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
@@ -9287,6 +9295,8 @@ mod tests {
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
+            ValueType::Int128 => "i128",
+            ValueType::UInt128 => "u128",
         };
         let build_witness = |name: &str| {
             let g = build_impl(name);
@@ -9537,6 +9547,8 @@ mod tests {
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
+            ValueType::Int128 => "i128",
+            ValueType::UInt128 => "u128",
         };
         let build_witness = |name: &str| {
             let g = build_impl(name);

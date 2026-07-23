@@ -9,8 +9,8 @@
 //! Separated from space.rs to avoid bloating the hot-path compilation
 //! unit. Method functions are registered into TypeDef at startup.
 
-use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
+use pyre_object::rbigint::RBigInt as BigInt;
 use pyre_object::*;
 // `classify`/`case`/`identifier` back the `str` predicate and `casefold`
 // methods with the runtime-independent Unicode tables shared with the
@@ -2088,6 +2088,104 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
     }
 }
 
+fn separate_integer_digits(
+    mut magnitude: String,
+    interval: i32,
+    separator: char,
+    displayed_digits: i32,
+) -> String {
+    let magnitude_len = magnitude.len() as i32;
+    let offset = (displayed_digits % (interval + 1) == 0) as i32;
+    let displayed_digits = displayed_digits + offset;
+    let padding = displayed_digits - magnitude_len;
+    let separator_count = displayed_digits / (interval + 1);
+    let zero_count = padding - separator_count;
+    if zero_count > 0 {
+        magnitude = format!("{}{magnitude}", "0".repeat(zero_count as usize));
+    }
+    let separator_count = (magnitude.len() as i32 - 1) / interval;
+    let magnitude_len = magnitude.len() as i32;
+    for i in 1..=separator_count {
+        magnitude.insert((magnitude_len - interval * i) as usize, separator);
+    }
+    magnitude
+}
+
+/// `FormatSpec::format_int`, with RPython rbigint as the value owner.
+///
+/// The shared parser remains the authority for format-spec syntax and error
+/// ordering; radix conversion, grouping, signs, prefixes, and padding operate
+/// directly on rbigint digits.
+fn format_rbigint(num: &BigInt, spec: &str, type_name: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let parsed = rustpython_common::format::FormatSpec::parse(spec)
+        .map_err(|e| format_spec_err(e, spec, type_name, true))?;
+    let p = parse_spec(spec);
+    if p.precision.is_some() || p.fractional_grouping.is_some() {
+        return Err(crate::PyError::value_error(
+            "Precision not allowed in integer format specifier",
+        ));
+    }
+    let (radix, interval, upper, prefix) = match p.ty {
+        '\0' | 'd' => (10, 3, false, ""),
+        'b' => (2, 4, false, if p.alt_form { "0b" } else { "" }),
+        'o' => (8, 4, false, if p.alt_form { "0o" } else { "" }),
+        'x' => (16, 4, false, if p.alt_form { "0x" } else { "" }),
+        'X' => (16, 4, true, if p.alt_form { "0X" } else { "" }),
+        'n' => (10, 3, false, ""),
+        other => {
+            return Err(crate::PyError::value_error(format!(
+                "Unknown format code '{}' for object of type '{type_name}'",
+                unknown_code_display(other)
+            )));
+        }
+    };
+    if let Some(separator) = p.grouping {
+        let allowed = match separator {
+            ',' => radix == 10 && p.ty != 'n',
+            '_' => p.ty != 'n',
+            _ => false,
+        };
+        if !allowed {
+            let ty = if p.ty == '\0' { 'd' } else { p.ty };
+            return Err(crate::PyError::value_error(format!(
+                "Cannot specify '{separator}' with '{ty}'."
+            )));
+        }
+    }
+
+    // Keep the parsed value live so syntax validation cannot be optimized
+    // away independently from rendering.
+    let _ = parsed;
+    let mut magnitude = num.abs().to_str_radix(radix);
+    if upper {
+        magnitude.make_ascii_uppercase();
+    }
+    let sign = if num.int_lt(0) {
+        "-"
+    } else {
+        match p.sign {
+            Some('+') => "+",
+            Some(' ') => " ",
+            _ => "",
+        }
+    };
+    let sign_prefix = format!("{sign}{prefix}");
+    if let Some(separator) = p.grouping {
+        let displayed_digits = if p.fill == '0' && p.align == Some('=') {
+            (p.width as i32 - sign_prefix.len() as i32).max(magnitude.len() as i32)
+        } else {
+            magnitude.len() as i32
+        };
+        magnitude = separate_integer_digits(magnitude, interval, separator, displayed_digits);
+    }
+    Ok(Wtf8Buf::from_string(pad_to_width(
+        format!("{sign_prefix}{magnitude}"),
+        p.fill,
+        p.align.unwrap_or('>'),
+        p.width,
+    )))
+}
+
 /// A `&str` paired with its precomputed code-point count, adapting a
 /// str body to the `CharLen + Deref<str>` bound `FormatSpec::format_string`
 /// requires for width padding.
@@ -2325,11 +2423,8 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 }
                 return format_finite_float(f, spec);
             }
-            let parsed = parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
-            let s = parsed
-                .format_int(&big)
-                .map_err(|e| format_spec_err(e, spec, &type_name, true))?;
-            return Ok(Wtf8Buf::from_string(s));
+            parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
+            return format_rbigint(&big, spec, &type_name);
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);

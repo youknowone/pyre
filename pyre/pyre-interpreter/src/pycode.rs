@@ -1261,7 +1261,7 @@ pub(crate) unsafe fn obj_to_constant_data(
         }
         if is_int_or_long(obj) {
             return Ok(ConstantData::Integer {
-                value: crate::builtins::obj_to_bigint(obj),
+                value: crate::rbigint_to_compiler_bigint(&crate::builtins::obj_to_bigint(obj)),
             });
         }
         if is_float(obj) {

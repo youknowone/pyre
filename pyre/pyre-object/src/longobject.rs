@@ -1,18 +1,18 @@
-//! W_LongObject -- arbitrary-precision integer backed by `BigInt`.
+//! W_LongObject -- arbitrary-precision integer backed by RPython `rbigint`.
 //!
 //! Used when i64 overflow is detected in `W_IntObject` arithmetic.
 //! The JIT may specialize bigint operations by reading immutable `value`
 //! payloads, calling pure raw-payload helpers, and boxing the resulting payload
 //! with the same `W_LongObject` layout.
 
-use malachite_bigint::BigInt;
+use crate::rbigint::{RBigInt as BigInt, RBigIntSign};
 
 use crate::pyobject::*;
 
 /// Arbitrary-precision integer object.
 ///
-/// Layout: `[ob_type: *const PyType | value: *mut BigInt]`
-/// The `value` pointer references an immutable `BigInt` payload, usually
+/// Layout: `[ob_type: *const PyType | value: *mut RBigInt]`
+/// The `value` pointer references an immutable `rbigint` payload, usually
 /// GC-managed and occasionally leaked via `malloc_raw` before GC init.
 #[repr(C)]
 pub struct W_LongObject {
@@ -20,7 +20,7 @@ pub struct W_LongObject {
     pub value: *mut BigInt,
 }
 
-// Safety: BigInt is Send+Sync and W_LongObject only stores a raw pointer
+// Safety: RBigInt is Send+Sync and W_LongObject only stores a raw pointer
 // that is effectively owned.
 unsafe impl Send for W_LongObject {}
 unsafe impl Sync for W_LongObject {}
@@ -41,49 +41,28 @@ impl crate::lltype::GcType for W_LongObject {
     const SIZE: usize = W_LONG_OBJECT_SIZE;
 }
 
-/// Payload size of a raw `BigInt` GC object (the malachite struct only; its
-/// limb `Vec` lives in malachite's own heap and is freed by [`bigint_destructor`]).
-pub const BIGINT_PAYLOAD_SIZE: usize = std::mem::size_of::<BigInt>();
+/// Payload size of a raw `rbigint` GC object.
+pub const BIGINT_PAYLOAD_SIZE: usize = crate::rbigint::RBIGINT_PAYLOAD_SIZE;
 
-/// GC type id for the raw `BigInt` payload, published at JitDriver init by
+/// GC type id for the raw `rbigint` payload, published at JitDriver init by
 /// `set_bigint_gc_type_id`. `0` until then, in which case the alloc helpers
-/// fall back to the leaked `malloc_raw` (bare unit tests / pre-init bootstrap).
-///
-/// Unlike the `W_*` object ids this is set at runtime rather than a fixed
-/// const: the `BigInt` payload is never embedded in a JIT descr (it is only
-/// ever allocated by the host `try_gc_alloc` path, never `NewWithVtable`'d in a
-/// trace), so it needs no compile-time-stable value.
-static BIGINT_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// fall back to leaked raw allocations in bare tests / pre-init bootstrap.
 
-/// Record the GC type id registered for the `BigInt` payload (called once from
+/// Record the GC type id registered for the `rbigint` payload (called once from
 /// `pyre-jit::eval` after `gc.register_type`).
 pub fn set_bigint_gc_type_id(id: u32) {
-    BIGINT_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+    crate::rbigint::set_rbigint_gc_type_id(id);
 }
 
-/// Reads the runtime-assigned `BIGINT_GC_TYPE_ID` atomic (set once at init by
+/// Reads the runtime-assigned rbigint type id (set once at init by
 /// [`set_bigint_gc_type_id`]); the value is not a build-time constant, so the
 /// JIT residualises the read instead of tracing into it (`@dont_look_inside`).
 #[majit_macros::dont_look_inside]
 pub fn bigint_gc_type_id() -> u32 {
-    BIGINT_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+    crate::rbigint::rbigint_gc_type_id()
 }
 
-/// Lightweight GC destructor for the `BigInt` payload: run its drop glue so
-/// malachite's limb `Vec` is freed when the collector reclaims a dead bigint.
-/// Registered on [`BIGINT_GC_TYPE_ID`] via `TypeInfo::with_destructor`; the
-/// copying nursery would otherwise abandon the payload without dropping it,
-/// leaking the limbs (the `malloc_raw` leak this whole path replaces).
-///
-/// # Safety
-/// `addr` must point at a live, initialized `BigInt` payload the GC is
-/// reclaiming. The collector calls it exactly once, on the final dead copy
-/// (a survived/forwarded object is re-listed, never destructed).
-pub unsafe fn bigint_destructor(addr: usize) {
-    unsafe { std::ptr::drop_in_place(addr as *mut BigInt) }
-}
-
-/// Allocate `value` as a GC-managed `BigInt` in the nursery (no-collect host
+/// Allocate `value` as a GC-managed `rbigint` in the nursery (no-collect host
 /// path). For the JIT `*_raw` arithmetic helpers, whose result flows straight
 /// into the boxing `NewWithVtable` in the same trace — that collecting NEW
 /// gcmap-roots the returned pointer, so a young payload is forwarded/promoted
@@ -91,49 +70,10 @@ pub unsafe fn bigint_destructor(addr: usize) {
 /// is installed (bare unit tests, where the result is never traced).
 #[inline]
 pub fn alloc_bigint_nursery(value: BigInt) -> *mut BigInt {
-    let tid = bigint_gc_type_id();
-    if tid != 0 {
-        if let Some(raw) =
-            crate::gc_hook::try_gc_alloc(tid, BIGINT_PAYLOAD_SIZE).filter(|p| !p.is_null())
-        {
-            let external = bigint_external_bytes(&value);
-            unsafe {
-                std::ptr::write(raw as *mut BigInt, value);
-            }
-            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
-            return raw as *mut BigInt;
-        }
-    }
-    crate::lltype::malloc_raw(value)
+    crate::rbigint::alloc_rbigint_nursery(value)
 }
 
-/// The external (off-heap, GC-invisible) byte footprint of a `BigInt`'s limb
-/// `Vec` — `ceil(bits/64)` limbs of 8 bytes each. `bits()` is constant-time
-/// (reads only the top limb, no allocation). Values that fit one machine word
-/// (`bits <= 64`) are stored inline with no `Vec`, so they carry 0 external bytes.
-#[inline]
-fn bigint_external_bytes(value: &BigInt) -> usize {
-    let bits = value.bits();
-    if bits <= 64 {
-        0
-    } else {
-        ((bits + 63) / 64) as usize * 8
-    }
-}
-
-/// External (off-heap) byte footprint of a GC `BigInt` payload at `addr` — the
-/// payload base is the `BigInt` itself (see [`bigint_destructor`]). Registered
-/// as the type's `external_size` so the collector folds a promoted bigint's
-/// limb `Vec` into the major-collection threshold.
-///
-/// # Safety
-/// `addr` must point at a live, initialized `BigInt` payload (true for a
-/// promoted or surviving old-gen bigint the collector is accounting for).
-pub unsafe fn bigint_external_size(addr: usize) -> usize {
-    bigint_external_bytes(unsafe { &*(addr as *const BigInt) })
-}
-
-/// Allocate `value` as a GC-managed `BigInt` through the *collecting* nursery —
+/// Allocate `value` as a GC-managed `rbigint` through the collecting nursery.
 /// a minor collection fires when the nursery is full (reclaiming dead bigints)
 /// instead of spilling to old-gen unbounded. Only for the elidable bigint
 /// payload helpers (`jit_bigint_*`), which the walker emits as a residual
@@ -141,71 +81,21 @@ pub unsafe fn bigint_external_size(addr: usize) -> usize {
 /// payloads into a local sum before allocating — so nothing unrooted is held
 /// across the embedded minor cycle. Falls back to the no-collect path when no
 /// collecting hook is installed (other backends), then to `malloc_raw`.
-///
-/// Before allocating, the result's limb-`Vec` bytes are charged as off-heap
-/// memory pressure so the nursery's minor cadence reflects the bignum's true
-/// footprint, not just the 48-byte struct the bump pointer tracks (otherwise the
-/// last nursery generation of large bigints accumulates uncollected). The charge
-/// may itself force a minor; that is safe here because it runs before the fresh
-/// `value` is written into the nursery (it still lives only on the Rust stack and
-/// holds no nursery GC pointer) while the operand bigints are already boxed and
-/// gcmap-rooted at the residual call.
+/// The result's digits are an ordinary nursery `GcArray(Signed)`, so their bytes
+/// already participate in nursery pressure; no foreign/external-memory charge
+/// is needed.
 #[inline]
 pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
-    let tid = bigint_gc_type_id();
-    if tid != 0 {
-        // A few limbs of external bytes are noise next to the 48-byte struct
-        // the nursery already tracks; skip both charge crossings for them so
-        // small-bignum churn stays on the plain bump-alloc path. The
-        // end-of-major recompute absorbs the drift for survivors.
-        let external = bigint_external_bytes(&value);
-        let charge = external > SMALL_EXTERNAL_EXEMPT_BYTES;
-        if charge {
-            crate::gc_hook::try_gc_charge_memory_pressure(external);
-        }
-        if let Some(raw) = crate::gc_hook::try_gc_alloc_collecting(tid, BIGINT_PAYLOAD_SIZE)
-            .filter(|p| !p.is_null())
-        {
-            unsafe {
-                std::ptr::write(raw as *mut BigInt, value);
-            }
-            if charge {
-                crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
-            }
-            return raw as *mut BigInt;
-        }
-    }
-    alloc_bigint_nursery(value)
+    crate::rbigint::alloc_rbigint_nursery_collecting(value)
 }
 
-/// External-byte threshold below which [`alloc_bigint_nursery_collecting`]
-/// skips the memory-pressure / old-gen charge crossings (8 limbs).
-const SMALL_EXTERNAL_EXEMPT_BYTES: usize = 64;
-
-/// Allocate `value` as a GC-managed `BigInt` at a stable (old-gen, non-moving)
+/// Allocate `value` as a GC-managed `rbigint` at a stable (old-gen, non-moving)
 /// address, for host/interpreter callers (`w_long_new`) that hold the pointer
 /// on the Rust stack without rooting it. Mirrors `w_float_new`'s
 /// `try_gc_alloc_stable`. Falls back to the leaked `malloc_raw` pre-init.
 #[inline]
 pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
-    let tid = bigint_gc_type_id();
-    if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, BIGINT_PAYLOAD_SIZE);
-        if !raw.is_null() {
-            // Charge the limb-`Vec` bytes against the old-gen external total so a
-            // directly-old-gen bignum's footprint enters the major threshold now,
-            // not only at the next major's recompute. No minor is forced, so this
-            // is safe on the unrooted host/interpreter path (a memory-pressure
-            // charge here could force an unsafe moving minor).
-            let external = bigint_external_bytes(&value);
-            unsafe {
-                std::ptr::write(raw as *mut BigInt, value);
-            }
-            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
-            return raw as *mut BigInt;
-        }
-    }
-    crate::lltype::malloc_raw(value)
+    crate::rbigint::alloc_rbigint_stable(value)
 }
 
 /// Wrap an already heap-allocated `*mut BigInt` in a fresh W_LongObject
@@ -227,11 +117,10 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // The wrapper must be GC-managed whenever its `value` payload is: a
     // `BigInt` routed through the GC (`bigint_gc_type_id() != 0`, the
     // `alloc_bigint_*` condition) is reclaimed by collections, so an immortal
-    // `malloc_typed` wrapper — which the collector never traces — would let a
-    // major collection run the payload's destructor (freeing the limb `Vec`)
-    // while the wrapper still points at it. Tie the wrapper's GC path to the
-    // same predicate as the payload, not to `gc_interp::enabled()` alone
-    // (unlike int/float, whose payload is inline and carries no destructor).
+    // `malloc_typed` wrapper — which the collector never traces — would leave
+    // an untracked edge to a reclaimed RBigInt payload/digit array. Tie the
+    // wrapper's GC path to the same predicate as the payload, not to
+    // `gc_interp::enabled()` alone (unlike int/float, whose payload is inline).
     if crate::gc_interp::enabled() || bigint_gc_type_id() != 0 {
         // Pin the (possibly young) `value` payload across the wrapper malloc:
         // a minor collection inside `try_gc_alloc_stable` can move a young
@@ -298,6 +187,59 @@ pub fn box_bigint_constant(value: &BigInt) -> PyObjectRef {
     w_long_new(value.clone())
 }
 
+/// `rbigint.fromint()` (`rpython/rlib/rbigint.py:225`,
+/// `@jit.elidable`) with the translated one-GC-reference ABI.
+///
+/// Rust returns `RBigInt` by value, but RPython returns a GC reference.  The
+/// MIR front retargets machine-word constructor calls here so generated JIT
+/// code receives a rooted `*mut RBigInt` rather than a native Rust aggregate.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_from_i64(value: i64) -> *mut BigInt {
+    alloc_bigint_nursery_collecting(BigInt::fromint(value))
+}
+
+/// Unsigned machine-word companion of [`jit_bigint_from_i64`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_from_u64(value: u64) -> *mut BigInt {
+    alloc_bigint_nursery_collecting(BigInt::from_u128(value as u128))
+}
+
+macro_rules! bigint_comparison_residual {
+    ($name:ident, $method:ident) => {
+        #[doc = "Bare-RBigInt comparison residual using the translated GC-reference ABI."]
+        #[majit_macros::elidable_cannot_raise]
+        pub extern "C" fn $name(a: i64, b: i64) -> i64 {
+            let (a, b) = (a as *const BigInt, b as *const BigInt);
+            unsafe { BigInt::$method(&*a, &*b) as i64 }
+        }
+    };
+}
+
+bigint_comparison_residual!(jit_bigint_eq, eq);
+bigint_comparison_residual!(jit_bigint_ne, ne);
+bigint_comparison_residual!(jit_bigint_lt, lt);
+bigint_comparison_residual!(jit_bigint_le, le);
+bigint_comparison_residual!(jit_bigint_gt, gt);
+bigint_comparison_residual!(jit_bigint_ge, ge);
+
+macro_rules! bigint_scalar_residual {
+    ($name:ident, $body:expr) => {
+        #[doc = "Bare-RBigInt scalar residual using the translated GC-reference ABI."]
+        #[majit_macros::elidable_cannot_raise]
+        pub extern "C" fn $name(value: i64) -> i64 {
+            let value = value as *const BigInt;
+            let value = unsafe { &*value };
+            ($body)(value) as i64
+        }
+    };
+}
+
+bigint_scalar_residual!(jit_bigint_bits, |value: &BigInt| value.bits());
+bigint_scalar_residual!(jit_bigint_is_zero, |value: &BigInt| value.is_zero());
+bigint_scalar_residual!(jit_bigint_is_one, |value: &BigInt| value.is_one());
+bigint_scalar_residual!(jit_bigint_tobool, |value: &BigInt| value.tobool());
+bigint_scalar_residual!(jit_bigint_hash, |value: &BigInt| value.hash());
+
 /// `W_LongObject._fits_int()` — longobject.py:141 / rbigint.fits_int.
 /// True if the value fits in a machine-word integer (i64 on 64-bit).
 /// Used by `is_plain_int1` to accept long objects that are in the int range.
@@ -318,8 +260,7 @@ pub unsafe fn w_long_fits_int(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_LongObject`.
 #[inline]
 pub unsafe fn w_long_is_zero(obj: PyObjectRef) -> bool {
-    use malachite_bigint::Sign;
-    unsafe { w_long_get_value(obj).sign() == Sign::NoSign }
+    unsafe { w_long_get_value(obj).sign() == RBigIntSign::NoSign }
 }
 
 /// Extract a reference to the BigInt value from a known W_LongObject pointer.
@@ -394,7 +335,6 @@ pub fn jit_bigint_to_i64_value_or_zero(num: &BigInt) -> i64 {
 /// `Option<u64>` ABI. Companion of [`jit_bigint_to_u64_value`].
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_u64_fits(num: &BigInt) -> i64 {
-    use num_traits::ToPrimitive;
     num.to_u64().is_some() as i64
 }
 
@@ -402,38 +342,35 @@ pub fn jit_bigint_to_u64_fits(num: &BigInt) -> i64 {
 /// [`jit_bigint_to_u64_fits`]; a `None` here means that guard was violated.
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_u64_value(num: &BigInt) -> u64 {
-    use num_traits::ToPrimitive;
     num.to_u64().unwrap_or_else(|| {
         panic!("jit_bigint_to_u64_value: BigInt exceeds u64 range - fits guard violated")
     })
 }
 
 /// `rbigint.sign` / sign-digit use (`rpython/rlib/rbigint.py`) on a borrowed
-/// BigInt payload. Returns the scalar signum (-1, 0, +1) so the two-phase
-/// rtyper never has to model malachite's `Sign` enum ABI.
-#[majit_macros::dont_look_inside]
+/// RBigInt payload. Returns the scalar signum (-1, 0, +1) so the two-phase
+/// rtyper does not need a synthetic Rust enum ABI at this boundary.
+#[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_sign_i64(num: &BigInt) -> i64 {
     match num.sign() {
-        malachite_bigint::Sign::Minus => -1,
-        malachite_bigint::Sign::NoSign => 0,
-        malachite_bigint::Sign::Plus => 1,
+        RBigIntSign::Minus => -1,
+        RBigIntSign::NoSign => 0,
+        RBigIntSign::Plus => 1,
     }
 }
 
 /// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
 /// payload, with the caller's existing overflow sentinel folded into the
 /// scalar return.
-#[majit_macros::dont_look_inside]
+#[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_to_f64_or_inf(num: &BigInt) -> f64 {
-    use num_traits::ToPrimitive;
     num.to_f64().unwrap_or(f64::INFINITY)
 }
 
 /// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
 /// payload, preserving callers that intentionally collapse overflow to NaN.
-#[majit_macros::dont_look_inside]
+#[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_to_f64_or_nan(num: &BigInt) -> f64 {
-    use num_traits::ToPrimitive;
     num.to_f64().unwrap_or(f64::NAN)
 }
 
@@ -757,5 +694,23 @@ mod tests {
         unsafe {
             assert_eq!(*raw, BigInt::from(0));
         }
+    }
+
+    #[test]
+    fn test_bare_bigint_constructor_comparison_and_scalar_residuals() {
+        let a = jit_bigint_from_i64(-42);
+        let b = jit_bigint_from_u64(42);
+        unsafe {
+            assert_eq!(&*a, &BigInt::from(-42));
+            assert_eq!(&*b, &BigInt::from(42));
+        }
+        assert_eq!(jit_bigint_eq(a as i64, b as i64), 0);
+        assert_eq!(jit_bigint_lt(a as i64, b as i64), 1);
+        assert_eq!(jit_bigint_ge(b as i64, a as i64), 1);
+        assert_eq!(jit_bigint_sign_i64(unsafe { &*a }), -1);
+        assert_eq!(jit_bigint_is_zero(a as i64), 0);
+        assert_eq!(jit_bigint_tobool(a as i64), 1);
+        assert_eq!(jit_bigint_bits(b as i64), 6);
+        assert_eq!(jit_bigint_hash(b as i64), 42);
     }
 }

@@ -2484,6 +2484,12 @@ fn exitcase_to_hlvalue(exitcase: Option<&ExitCase>) -> Option<Hlvalue> {
 fn constant_from_constvalue(value: ConstValue) -> Constant {
     match value {
         ConstValue::Int(n) => Constant::with_concretetype(ConstValue::Int(n), LowLevelType::Signed),
+        ConstValue::Int128(n) => {
+            Constant::with_concretetype(ConstValue::Int128(n), LowLevelType::SignedLongLongLong)
+        }
+        ConstValue::UInt128(n) => {
+            Constant::with_concretetype(ConstValue::UInt128(n), LowLevelType::UnsignedLongLongLong)
+        }
         ConstValue::Bool(b) => Constant::with_concretetype(ConstValue::Bool(b), LowLevelType::Bool),
         ConstValue::Float(bits) => {
             Constant::with_concretetype(ConstValue::Float(bits), LowLevelType::Float)
@@ -2501,6 +2507,14 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         OpKind::ConstInt(n) => Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int(*n),
             LowLevelType::Signed,
+        ))),
+        OpKind::ConstInt128(n) => Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int128(*n),
+            LowLevelType::SignedLongLongLong,
+        ))),
+        OpKind::ConstUInt128(n) => Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::UInt128(*n),
+            LowLevelType::UnsignedLongLongLong,
         ))),
         OpKind::ConstBool(b) => Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Bool(*b),
@@ -3499,6 +3513,35 @@ mod tests {
                 assert!(!i.unsigned, "default SomeInteger.unsigned must be false");
             }
             other => panic!("ValueType::Int must lift to SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wide_valuetypes_and_constants_keep_exact_rpython_lowlevel_types() {
+        for (value_type, expected_known) in [
+            (ValueType::Int128, KnownType::LongLongLong),
+            (ValueType::UInt128, KnownType::ULongLongLong),
+        ] {
+            let s = valuetype_to_someshell(&value_type).expect("wide ValueType must project");
+            let SomeValue::Integer(integer) = s else {
+                panic!("wide ValueType must lift to SomeInteger")
+            };
+            assert_eq!(integer.knowntype(), expected_known);
+        }
+
+        for (value, expected_lltype) in [
+            (
+                ConstValue::Int128(i128::MIN),
+                LowLevelType::SignedLongLongLong,
+            ),
+            (
+                ConstValue::UInt128(u128::MAX),
+                LowLevelType::UnsignedLongLongLong,
+            ),
+        ] {
+            let constant = constant_from_constvalue(value.clone());
+            assert_eq!(constant.value, value);
+            assert_eq!(constant.concretetype, Some(expected_lltype));
         }
     }
 

@@ -1,8 +1,8 @@
 //! pypy/objspace/std/formatting.py — printf-style string formatting.
 #![allow(non_camel_case_types, non_snake_case)]
 
-use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
+use pyre_object::rbigint::RBigInt as BigInt;
 use rustpython_common::cformat::{
     CCharacterType, CConversionFlags, CFormatBytes, CFormatConversion, CFormatPart,
     CFormatPrecision, CFormatQuantity, CFormatSpec, CFormatSpecKeyed, CFormatType, CFormatWtf8,
@@ -206,6 +206,89 @@ unsafe fn bytes_format_is_mapping(obj: PyObjectRef) -> bool {
         && has_dunder(obj, "__getitem__")
 }
 
+/// `CFormatSpec::format_number` over RPython rbigint.
+fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> String {
+    let CFormatType::Number(number_type) = spec.format_type else {
+        unreachable!()
+    };
+    let (radix, upper, prefix) = match number_type {
+        CNumberType::DecimalD | CNumberType::DecimalI | CNumberType::DecimalU => (10, false, ""),
+        CNumberType::Octal => (
+            8,
+            false,
+            if spec.flags.contains(CConversionFlags::ALTERNATE_FORM) {
+                "0o"
+            } else {
+                ""
+            },
+        ),
+        CNumberType::HexLower => (
+            16,
+            false,
+            if spec.flags.contains(CConversionFlags::ALTERNATE_FORM) {
+                "0x"
+            } else {
+                ""
+            },
+        ),
+        CNumberType::HexUpper => (
+            16,
+            true,
+            if spec.flags.contains(CConversionFlags::ALTERNATE_FORM) {
+                "0X"
+            } else {
+                ""
+            },
+        ),
+    };
+    let mut magnitude = num.abs().to_str_radix(radix);
+    if upper {
+        magnitude.make_ascii_uppercase();
+    }
+    if let Some(CFormatPrecision::Quantity(CFormatQuantity::Amount(precision))) = spec.precision
+        && magnitude.len() < precision
+    {
+        magnitude = format!("{}{magnitude}", "0".repeat(precision - magnitude.len()));
+    }
+    let sign = if num.int_lt(0) {
+        "-"
+    } else {
+        spec.flags.sign_string()
+    };
+    let signed_prefix = format!("{sign}{prefix}");
+    let width = match spec.min_field_width {
+        Some(CFormatQuantity::Amount(width)) => width,
+        _ => 0,
+    };
+    if spec.flags.contains(CConversionFlags::ZERO_PAD) {
+        let fill = if spec.flags.contains(CConversionFlags::LEFT_ADJUST) {
+            ' '
+        } else {
+            '0'
+        };
+        let needed = width.saturating_sub(signed_prefix.len() + magnitude.len());
+        if spec.flags.contains(CConversionFlags::LEFT_ADJUST) {
+            format!(
+                "{signed_prefix}{magnitude}{}",
+                fill.to_string().repeat(needed)
+            )
+        } else {
+            format!(
+                "{signed_prefix}{}{magnitude}",
+                fill.to_string().repeat(needed)
+            )
+        }
+    } else {
+        let body = format!("{signed_prefix}{magnitude}");
+        let needed = width.saturating_sub(body.len());
+        if spec.flags.contains(CConversionFlags::LEFT_ADJUST) {
+            format!("{body}{}", " ".repeat(needed))
+        } else {
+            format!("{}{body}", " ".repeat(needed))
+        }
+    }
+}
+
 unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
     match &spec.format_type {
         CFormatType::String(conversion) => match conversion {
@@ -239,7 +322,7 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
                 }
                 _ => number_arg_integer(spec, obj)?,
             };
-            Ok(spec.format_number(&value).into_bytes())
+            Ok(cformat_rbigint(spec, &value).into_bytes())
         }
         CFormatType::Float(_) => {
             let value = crate::baseobjspace::float_w(obj).map_err(|e| {
@@ -338,7 +421,7 @@ unsafe fn spec_format_string(
                 }
                 _ => number_arg_integer(spec, obj)?,
             };
-            Ok(Wtf8Buf::from_string(spec.format_number(&value)))
+            Ok(Wtf8Buf::from_string(cformat_rbigint(spec, &value)))
         }
         CFormatType::Float(_) => {
             let value = crate::baseobjspace::float_w(obj)?;

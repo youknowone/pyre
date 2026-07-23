@@ -6,7 +6,6 @@
 //! this module maps `W_Root` objects to the shared wire implementation, and
 //! compiler-core serializes/deserializes the authoritative `CodeObject`.
 
-use malachite_bigint::BigInt;
 use num_complex::Complex64;
 use pyre_object::*;
 use rustpython_compiler_core::bytecode::{BasicBag, CodeObject, ConstantBag, ConstantData};
@@ -134,6 +133,7 @@ fn write_object(
             out.write_u8(b'.');
         } else if is_int_or_long(obj) {
             let value = crate::builtins::obj_to_bigint(obj);
+            let value = crate::rbigint_to_compiler_bigint(&value);
             wire::serialize_value::<_, ConstantData>(out, DumpableValue::Integer(&value))
                 .unwrap_or_else(|never| match never {});
         } else if is_float(obj) {
@@ -309,7 +309,8 @@ impl wire::MarshalBag for PyreMarshalBag {
         Rooted::new(bytesobject::w_bytes_from_bytes(value))
     }
 
-    fn make_int(&self, value: BigInt) -> Rooted {
+    fn make_int(&self, value: malachite_bigint::BigInt) -> Rooted {
+        let value = crate::compiler_bigint_to_rbigint(&value);
         let obj = if longobject::jit_bigint_to_i64_fits(&value) != 0 {
             w_int_new(longobject::jit_bigint_to_i64_value(&value))
         } else {

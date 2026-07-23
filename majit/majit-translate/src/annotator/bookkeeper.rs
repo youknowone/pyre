@@ -3198,6 +3198,22 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(ConstValue::Int(*i)));
                 Ok(SomeValue::Integer(s))
             }
+            ConstValue::Int128(i) => {
+                let mut s = SomeInteger::new_with_knowntype(
+                    *i >= 0,
+                    crate::annotator::model::KnownType::LongLongLong,
+                );
+                s.base.const_box = Some(Constant::new(ConstValue::Int128(*i)));
+                Ok(SomeValue::Integer(s))
+            }
+            ConstValue::UInt128(i) => {
+                let mut s = SomeInteger::new_with_knowntype(
+                    true,
+                    crate::annotator::model::KnownType::ULongLongLong,
+                );
+                s.base.const_box = Some(Constant::new(ConstValue::UInt128(*i)));
+                Ok(SomeValue::Integer(s))
+            }
             ConstValue::Float(_) => {
                 let mut s = SomeFloat::new();
                 s.base.const_box = Some(Constant::new(x.clone()));
@@ -4019,6 +4035,43 @@ mod tests {
         bk.classdefs.borrow_mut().push(classdef);
         // No attrs, no SomeInstance carries flags — walker must not panic.
         bk.check_no_flags_on_instances();
+    }
+
+    #[test]
+    fn immutablevalue_preserves_full_width_integer_known_types_and_constants() {
+        use crate::annotator::model::{KnownType, SomeObjectTrait};
+
+        for (value, expected_known, expected_nonneg) in [
+            (
+                ConstValue::Int128(i128::MIN),
+                KnownType::LongLongLong,
+                false,
+            ),
+            (ConstValue::Int128(i128::MAX), KnownType::LongLongLong, true),
+            (
+                ConstValue::UInt128(u128::MAX),
+                KnownType::ULongLongLong,
+                true,
+            ),
+        ] {
+            let s = bk()
+                .immutablevalue(&value)
+                .expect("wide integer constant annotates");
+            let SomeValue::Integer(integer) = s else {
+                panic!("wide integer constant must annotate as SomeInteger")
+            };
+            assert_eq!(integer.knowntype(), expected_known);
+            assert_eq!(integer.nonneg, expected_nonneg);
+            assert_eq!(
+                integer
+                    .base
+                    .const_box
+                    .as_ref()
+                    .map(|constant| &constant.value),
+                Some(&value),
+                "wide integer constant must remain lossless in the annotator"
+            );
+        }
     }
 
     #[test]

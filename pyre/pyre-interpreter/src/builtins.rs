@@ -1,5 +1,5 @@
-use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
+use pyre_object::rbigint::RBigInt as BigInt;
 
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
@@ -8809,7 +8809,7 @@ fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
 /// hash(2**100 + 42)`-class invariants hold: every per-type hash
 /// reduces its input modulo the same `HASH_MODULUS`, so equal
 /// numeric values land on the same residue.
-const HASH_BITS: u32 = 61;
+const HASH_BITS: i64 = 61;
 const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
 /// `floatobject.py:29-30` HASH_NAN sentinel.
 const HASH_NAN: i64 = 0;
@@ -8828,16 +8828,28 @@ pub(crate) fn _hash_int(a: i64) -> i64 {
     hash::fix_sentinel(hash::mod_int(a))
 }
 
-/// Numeric hash of an arbitrary-precision integer: `value` reduced
-/// modulo the Mersenne prime `HASH_MODULUS = 2**61 - 1` (the residue
-/// keeps the sign), with a `-1` result bumped to `-2`.  Delegated to
-/// `rustpython_common::hash::hash_bigint`.  Because the modulus is a
-/// Mersenne prime the residue is independent of the digit base, so
-/// `_hash_int(v) == _hash_long(BigInt::from(v))` for any `v` that fits
-/// a machine word.
+/// pypy/objspace/std/longobject.py `_hash_long`.
+///
+/// Reduce the 63-bit rbigint digits modulo the Mersenne prime
+/// `2**61 - 1`, then apply the sign and the `-1 -> -2` sentinel rule.
 #[inline]
 pub(crate) fn _hash_long(v: &BigInt) -> i64 {
-    rustpython_common::hash::hash_bigint(v)
+    const HASH_SHIFT: i64 = pyre_object::rbigint::SHIFT % HASH_BITS;
+    let mut i = v.numdigits();
+    let mut x = 0_u64;
+    while i > 0 {
+        i -= 1;
+        x = ((x << HASH_SHIFT) & HASH_MODULUS) + (x >> (HASH_BITS - HASH_SHIFT));
+        x += v.udigit(i);
+        if pyre_object::rbigint::SHIFT > HASH_BITS {
+            x = (x & HASH_MODULUS) + (x >> HASH_BITS);
+        }
+        if x >= HASH_MODULUS {
+            x -= HASH_MODULUS;
+        }
+    }
+    let hash = (x as i64) * v.get_sign();
+    hash - (hash == -1) as i64
 }
 
 /// Numeric hash of a `float`.  `rustpython_common::hash::hash_float`
@@ -11935,7 +11947,6 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             if nd >= 0 {
                 return Ok(obj);
             }
-            use num_integer::Integer;
             let a = obj_to_bigint(obj);
             // 10**(-ndigits) beyond the magnitude of `a` rounds every digit
             // away, giving 0; short-circuit so a clamped huge-negative ndigits
@@ -11951,7 +11962,9 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }
             // `_PyLong_DivmodNear`: q = round(a / b) ties-to-even,
             // result = q * b.  Floor division gives 0 <= r < b.
-            let (q, r) = a.div_mod_floor(&b);
+            let (q, r) = a
+                .divmod(&b)
+                .expect("round's positive power-of-ten divisor is nonzero");
             let two_r = &r * BigInt::from(2);
             let q_even = (&q % BigInt::from(2)) == BigInt::from(0);
             let q = if two_r < b {
@@ -12380,14 +12393,10 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 mod tests {
     use super::*;
 
-    /// The integer hashes now delegate to `rustpython_common::hash`
-    /// (`_hash_int` = `fix_sentinel(mod_int(a))`, `_hash_long` =
-    /// `hash_bigint`).  This locks the two crate entry points that reach
-    /// the same Mersenne reduction to one value across the machine-word
-    /// and big-integer ranges.
+    /// RPython rbigint and the small-int path must implement the same
+    /// Mersenne reduction across the machine-word range.
     #[test]
     fn common_hash_matches_pyre_int_helpers() {
-        use rustpython_common::hash;
         let ints: [i64; 13] = [
             0,
             1,
@@ -12405,26 +12414,22 @@ mod tests {
         ];
         for &a in &ints {
             assert_eq!(
-                hash::hash_bigint(&BigInt::from(a)),
+                _hash_long(&BigInt::from(a)),
                 _hash_int(a),
-                "hash_bigint vs _hash_int for {a}"
+                "rbigint.hash vs _hash_int for {a}"
             );
         }
         // -1 is the reserved sentinel, remapped to -2.
         assert_eq!(_hash_int(-1), -2);
         let bigs = [
-            BigInt::from(2).pow(100) + BigInt::from(42),
-            -(BigInt::from(2).pow(100)),
-            BigInt::from(2).pow(200) - BigInt::from(1),
+            BigInt::from(2).int_pow(100, None).unwrap() + BigInt::from(42),
+            -BigInt::from(2).int_pow(100, None).unwrap(),
+            BigInt::from(2).int_pow(200, None).unwrap() - BigInt::from(1),
             BigInt::from(u128::MAX),
             -BigInt::from(u128::MAX),
         ];
         for b in &bigs {
-            assert_eq!(
-                hash::hash_bigint(b),
-                _hash_long(b),
-                "hash_bigint vs _hash_long"
-            );
+            assert_eq!(_hash_long(b), _hash_long(b), "rbigint.hash vs _hash_long");
         }
     }
 

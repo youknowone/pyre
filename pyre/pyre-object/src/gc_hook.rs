@@ -165,67 +165,6 @@ pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut
         .map(|f| f(type_id, payload_size))
 }
 
-/// Signature of the host-side memory-pressure callback: charge `bytes` of
-/// off-heap, GC-invisible payload (a bignum's external limb `Vec`).
-pub type GcChargeMemoryPressureFn = fn(bytes: usize);
-
-majit_gc::global_hook!(static GC_CHARGE_MEMORY_PRESSURE_HOOK: GcChargeMemoryPressureFn);
-
-/// Install the memory-pressure callback.
-pub fn register_gc_charge_memory_pressure_hook(hook: GcChargeMemoryPressureFn) {
-    GC_CHARGE_MEMORY_PRESSURE_HOOK.set(Some(hook));
-}
-
-/// Remove the memory-pressure callback.
-pub fn clear_gc_charge_memory_pressure_hook() {
-    GC_CHARGE_MEMORY_PRESSURE_HOOK.set(None);
-}
-
-/// Charge `bytes` of off-heap memory pressure via the installed hook (no-op when
-/// none is installed, e.g. bare unit tests or backends without a generational GC).
-/// Only the bignum collecting-alloc site calls this, from a gcmap-rooted residual
-/// call where a forced minor is safe.
-#[inline]
-pub fn try_gc_charge_memory_pressure(bytes: usize) {
-    if let Some(f) = GC_CHARGE_MEMORY_PRESSURE_HOOK.get() {
-        f(bytes);
-    }
-}
-
-/// Signature of the host-side old-gen external-byte callback: add `bytes` of
-/// `obj_addr`'s off-heap payload to the major-collection threshold's external
-/// total when the object is old-gen.
-pub type GcChargeOldgenExternalFn = fn(obj_addr: usize, bytes: usize);
-
-majit_gc::global_hook!(static GC_CHARGE_OLDGEN_EXTERNAL_HOOK: GcChargeOldgenExternalFn);
-
-/// Install the old-gen external-byte callback.
-pub fn register_gc_charge_oldgen_external_hook(hook: GcChargeOldgenExternalFn) {
-    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.set(Some(hook));
-}
-
-/// Remove the old-gen external-byte callback.
-pub fn clear_gc_charge_oldgen_external_hook() {
-    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.set(None);
-}
-
-/// Charge `bytes` of `obj_addr`'s off-heap payload against the major threshold
-/// via the installed hook when the object is old-gen (no-op when none is
-/// installed). Unlike [`try_gc_charge_memory_pressure`] this never forces a
-/// minor, so it is safe after allocating an unrooted payload: a directly-old-gen
-/// bignum's limb `Vec` would otherwise stay invisible to the threshold until
-/// the next major's `recompute_oldgen_external_bytes`.
-// `dont_look_inside`: host hook dispatch (a process-global atomic fn-pointer cell)
-// stays opaque to the JIT — the `try_gc_add_root` / `try_gc_remove_root` /
-// `try_gc_write_barrier` twins; calls residualize via the registered fnaddr
-// (`rlib/jit.py:139`). A `()` return has no discriminant to erase.
-#[majit_macros::dont_look_inside]
-pub fn try_gc_charge_oldgen_external(obj_addr: usize, bytes: usize) {
-    if let Some(f) = GC_CHARGE_OLDGEN_EXTERNAL_HOOK.get() {
-        f(obj_addr, bytes);
-    }
-}
-
 /// Signature of the host-side full-collection callback. Used by
 /// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this hook.

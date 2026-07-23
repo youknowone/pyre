@@ -406,6 +406,8 @@ fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::Placeholder => false,
         ConstValue::Bool(flag) => *flag,
         ConstValue::Int(value) => *value != 0,
+        ConstValue::Int128(value) => *value != 0,
+        ConstValue::UInt128(value) => *value != 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
         ConstValue::ByteStr(text) => !text.is_empty(),
         ConstValue::UniStr(text) => !text.is_empty(),
