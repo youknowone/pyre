@@ -8256,6 +8256,20 @@ impl CodeWriter {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
                             let _ = compare_op_tag(op_kind);
+                            // `MIFrame.generate_guard()` captures resumedata at
+                            // the current jitcode pc (`pyjitpl.py:188-195`).
+                            // CompareOp specialization emits class/value guards
+                            // after consuming both Python operands, so retain
+                            // the opcode-start `-live-`; the pre-dispatch pcdep
+                            // snapshot supplies those operands on guard failure,
+                            // matching PyPy's per-frame register snapshot.
+                            record_graph_op(
+                                &current_block.block(),
+                                "-live-",
+                                Vec::new(),
+                                None,
+                                py_pc as i64,
+                            );
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
