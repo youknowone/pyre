@@ -2428,6 +2428,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         call_stack_len: arg_concretes.len(),
                         callee_jitcode_index: callee_pjc.jitcode.index() as u32,
                         abort_jitcode_pc: abort_pc,
+                        callee_py_pc,
                         w_code: w_code as pyre_object::PyObjectRef,
                         w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) },
                         x_arg,

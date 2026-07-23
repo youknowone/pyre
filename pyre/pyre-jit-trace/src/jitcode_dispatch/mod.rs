@@ -4491,6 +4491,10 @@ pub(crate) struct MidBodyPayload {
     /// interpreter flush boundary.
     pub callee_jitcode_index: u32,
     pub abort_jitcode_pc: usize,
+    /// Forward-carried Python instruction PC for `abort_jitcode_pc`, stamped
+    /// once at capture so the flush reads a scalar instead of re-inverting the
+    /// coordinate through the jitcode->py tables.
+    pub callee_py_pc: usize,
     pub w_code: pyre_object::PyObjectRef,
     pub w_globals: pyre_object::PyObjectRef,
     pub x_arg: pyre_object::PyObjectRef,
