@@ -261,6 +261,12 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_float_bitcast_call(call) {
                     return Some(binding);
                 }
+                // Unsigned compare intrinsics `majit_uint_lt(a, b)` /
+                // `majit_uint_le(a, b)` → uint_lt / uint_le (the signed opcode
+                // the generic binop path emits is wrong for uint).
+                if let Some(binding) = self.lower_uint_compare_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => {
@@ -334,6 +340,45 @@ impl<'c> Lowerer<'c> {
             }
             _ => None,
         }
+    }
+
+    /// Lower the unsigned integer comparison intrinsics `majit_uint_lt(a, b)` /
+    /// `majit_uint_le(a, b)` to `uint_lt` / `uint_le` (`bhimpl_uint_lt` /
+    /// `bhimpl_uint_le`). Both operands are read from the int bank as unsigned
+    /// 64-bit values; the op writes a `0`/`1` int result. `opcode_for_binop`
+    /// maps `<`/`<=` to the signed `IntLt`/`IntLe`, so an explicit intrinsic is
+    /// the only way to select the unsigned opcode from the tracing frontend.
+    fn lower_uint_compare_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let opcode_name = match canonical_expr_segments(&call.func)?.last()?.as_str() {
+            "majit_uint_lt" => "UintLt",
+            "majit_uint_le" => "UintLe",
+            _ => return None,
+        };
+        if call.args.len() != 2 {
+            return None;
+        }
+        let lhs = self.lower_value_expr(&call.args[0])?;
+        let rhs = self.lower_value_expr(&call.args[1])?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+        let (lhs_reg, rhs_reg) = (lhs.reg, rhs.reg);
+        let dst = self.alloc_reg();
+        let opcode = format_ident!("{opcode_name}");
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[lhs_reg, rhs_reg]),
+                vec![Register::int(dst)],
+            ),
+            binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+        );
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Int,
+            depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
+        })
     }
 
     /// Lower a raw native-memory load intrinsic
