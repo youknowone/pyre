@@ -33,6 +33,11 @@ dynasm = ["jit", "pyre-jit/dynasm"]
 # so mimalloc roughly halves bignum-heavy workloads (fib_loop beats PyPy).
 # Enable with e.g. `--features dynasm,mimalloc`.
 mimalloc = ["dep:mimalloc"]
+# Deterministic GC stress: forces a full collection at the start of every
+# allocation (opt in at runtime via MAJIT_GC_STRESS). Test/diagnostic only —
+# uncomment to build a GC-repro binary (see
+# bench/synth/_pending/cranelift_finalizer_ordering_crash.py).
+# gc_stress = ["pyre-jit/gc_stress"]
 # Build the interpreter as an RPython-style sandbox client: every mediated OS
 # call routes through host_seam's marshalling trampoline (see pyre-interpreter).
 sandbox = ["pyre-interpreter/sandbox"]
