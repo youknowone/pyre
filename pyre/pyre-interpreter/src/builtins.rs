@@ -2711,7 +2711,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
     });
     crate::module_ns_get_or_insert_with(ns, "__import__", || {
-        make_module_builtin_function("__import__", builtin_import_stub)
+        make_module_builtin_function("__import__", builtin_dunder_import)
     });
 
     // Descriptor types
@@ -12428,10 +12428,10 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
-/// — PyPy: `pypy/module/imp/importing.py:importhook`.
-fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.
+fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `__import__(name, globals, locals, fromlist, level)` — PyPy's gateway
-    // binds the five named slots before `importhook` runs.  Use the shared
+    // binds the five named slots before the import runs.  Use the shared
     // flat-ABI equivalent so duplicate positional/keyword values, unknown
     // keywords, and surplus positionals raise at the same boundary.
     let scope = bind_builtin_kwargs(
@@ -12446,6 +12446,7 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let globals = scope[1];
+    let locals = scope[2];
     let fromlist = scope[3];
     let level_obj = scope[4];
     // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
@@ -12463,7 +12464,7 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             unsafe { (*frame).execution_context }
         }
     });
-    crate::importing::importhook(name, globals, fromlist, level, exec_ctx)
+    crate::importing::dunder_import(name, globals, locals, fromlist, level, exec_ctx)
 }
 
 #[cfg(test)]

@@ -87,6 +87,11 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     };
     configure_sys_for_repl(sys_module);
 
+    // pylifecycle.c init_importlib before site — see run_source.
+    if let Err(e) = crate::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context)) {
+        eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
+    }
+
     crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
 
     let runtime = ReplRuntime {

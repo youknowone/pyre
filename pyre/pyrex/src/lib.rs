@@ -692,68 +692,27 @@ pub(crate) fn import_site(
 ///
 /// `_bootstrap._setup` (importlib/_bootstrap.py) reads the bootstrap builtins
 /// `_thread`/`_warnings`/`_weakref` from `sys.modules`, so import them first to
-/// seed `sys.modules` (otherwise `_setup` falls into `_builtin_from_name` →
-/// `_imp.create_builtin`, which the native importer does not implement).
-fn init_importlib_bootstrap(
+/// seed `sys.modules`; a name already present skips `_builtin_from_name` and
+/// keeps the natively-registered module object authoritative.
+pub(crate) fn init_importlib_bootstrap(
     canonical: pyre_object::PyObjectRef,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) -> Result<(), pyre_interpreter::PyError> {
     let import =
         |name: &str| importing::importhook(name, canonical, pyre_object::PY_NULL, 0, ec_ptr);
-    let call_checked = |func: pyre_object::PyObjectRef,
-                        args: &[pyre_object::PyObjectRef]|
-     -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-        let res = pyre_interpreter::call_function(func, args);
-        if res.is_null() {
-            return Err(
-                pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
-                    pyre_interpreter::PyError::new(
-                        pyre_interpreter::PyErrorKind::RuntimeError,
-                        "importlib bootstrap _install returned NULL without an exception",
-                    )
-                }),
-            );
-        }
-        Ok(res)
-    };
 
     for name in ["_thread", "_warnings", "_weakref"] {
         import(name)?;
     }
-    let sys_mod = import("sys")?;
-    let imp_mod = import("_imp")?;
+    import("sys")?;
+    import("_imp")?;
+    // Importing the bootstrap module fires `install_importlib_bootstrap`
+    // (the native load hook) as its body finishes: `_install(sys, _imp)`,
+    // `_install_external_importers()` — which imports and links
+    // `_frozen_importlib_external` — and the `_frozen_importlib` alias.
+    // A cached module skips the hook, so running this again (`-i` reaches
+    // the REPL after `run_source`) does not re-append the importers.
     import("importlib._bootstrap")?;
-    import("importlib._bootstrap_external")?;
-    let bootstrap = importing::get_sys_module("importlib._bootstrap").ok_or_else(|| {
-        pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::RuntimeError,
-            "importlib._bootstrap missing from sys.modules after import",
-        )
-    })?;
-    let bootstrap_ext =
-        importing::get_sys_module("importlib._bootstrap_external").ok_or_else(|| {
-            pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::RuntimeError,
-                "importlib._bootstrap_external missing from sys.modules after import",
-            )
-        })?;
-
-    // init_importlib: importlib._bootstrap._install(sys, _imp)
-    let install = pyre_interpreter::getattr(bootstrap, pyre_object::w_str_new("_install"))?;
-    call_checked(install, &[sys_mod, imp_mod])?;
-    // init_importlib_external: importlib._bootstrap_external._install(_bootstrap)
-    let install_ext = pyre_interpreter::getattr(bootstrap_ext, pyre_object::w_str_new("_install"))?;
-    call_checked(install_ext, &[bootstrap])?;
-    // importlib/__init__.py: _bootstrap._bootstrap_external = _bootstrap_external
-    // (`_install` only calls `_set_bootstrap_module`; the reverse link that
-    // `ModuleSpec.cached` / `_get_cached` reads is wired by importlib's package
-    // init, which the native importer does not run for `_bootstrap`).
-    pyre_interpreter::baseobjspace::setattr_str(bootstrap, "_bootstrap_external", bootstrap_ext)?;
-    // The bootstrap modules are exposed under their frozen names; modules such
-    // as `zipimport` import `_frozen_importlib{,_external}` directly. Register
-    // the same objects under the frozen names once `_install` has wired them.
-    importing::set_sys_module("_frozen_importlib", bootstrap);
-    importing::set_sys_module("_frozen_importlib_external", bootstrap_ext);
     Ok(())
 }
 
@@ -863,6 +822,15 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     // Import `sys` up front so its creation flushes the native search-path seed
     // into `sys.path` before `site` and user code read it.
     let _ = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr);
+
+    // pylifecycle.c init_importlib before site: install the importlib
+    // bootstrap so `builtins.__import__` routes imports through
+    // `sys.meta_path` / `sys.path_hooks` from the first user statement.
+    // A failure (no reachable stdlib) is non-fatal — the native importer
+    // keeps serving imports, the minimal-importer role.
+    if let Err(e) = init_importlib_bootstrap(canonical, ec_ptr) {
+        eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
+    }
 
     import_site(no_site, canonical, ec_ptr);
 
