@@ -1,16 +1,45 @@
+//! Float register machine — the honest fair-win probe for the float macro path.
+//!
+//! celfloat originally fused raw_load+add+i++ into ONE opcode; that made the
+//! clean interpreter a single-op memory-bandwidth-bound loop with no dispatch
+//! for the JIT to eliminate, so the JIT could not win (0.62x). That was a
+//! kernel artifact, not a float-JIT defect. This rewrite mirrors celcolumn's
+//! honest structure: a PER-OP bytecode machine whose clean interpreter pays
+//! real dispatch cost, so the win is attributable to compilation.
+//!
+//! Addressing (i, n, base_a, base_b) lives in SCALAR int state fields; values
+//! (column reads, accumulator) live in a `[float; virt]` register bank. Three
+//! programs sweep the compute:memory ratio:
+//!   ACC     — sum(a[i])              1 load,  1 float add   (memory-bound ref)
+//!   DOT     — sum(a[i]*b[i])         2 loads, 1 mul + 1 add
+//!   COMPUTE — sum(a*b - a*a + b*b)   2 loads, 5 float ops   (compute-bound)
+
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub type Code = [i64];
 
-const OP_COL_ACC_F: i64 = 0;
-const OP_JUMP_IF_ABOVE: i64 = 1;
-const OP_RETURN: i64 = 2;
+const OP_LOAD_A: i64 = 0; // [OP, dst]        regs[dst] = a[i]
+const OP_LOAD_B: i64 = 1; // [OP, dst]        regs[dst] = b[i]
+const OP_MUL: i64 = 2; // [OP, a, b, dst]  regs[dst] = regs[a] * regs[b]
+const OP_ADD: i64 = 3; // [OP, a, b, dst]  regs[dst] = regs[a] + regs[b]
+const OP_SUB: i64 = 4; // [OP, a, b, dst]  regs[dst] = regs[a] - regs[b]
+const OP_INC: i64 = 5; // [OP]             i += 1
+const OP_JUMP_IF: i64 = 6; // [OP, target]     if i < n jump to target
+const OP_RETURN: i64 = 7; // [OP, reg]        return regs[reg]
+
+const ACC: usize = 0;
+const R0: usize = 1;
+const R1: usize = 2;
+const R2: usize = 3;
+const R3: usize = 4;
+const R4: usize = 5;
+const R5: usize = 6;
+const R6: usize = 7;
+const NUM_REGS: usize = 8;
 
 const BODY_PC: usize = 0;
-const ACC: usize = 0;
-const NUM_REGS: usize = 1;
 
 const JIT_ON: u32 = 8;
 const JIT_OFF: u32 = u32::MAX;
@@ -18,6 +47,8 @@ const JIT_OFF: u32 = u32::MAX;
 pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
 pub static ABORTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
+/// macro (lowered to `raw_load_f`); at the interpreter tier this real fn runs.
 fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
     unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const f64) }
 }
@@ -25,7 +56,8 @@ fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
 struct VmState {
     i: i64,
     n: i64,
-    base: i64,
+    base_a: i64,
+    base_b: i64,
     regs: Vec<f64>,
 }
 
@@ -36,11 +68,12 @@ struct VmState {
     state_fields = {
         i: int,
         n: int,
-        base: int,
+        base_a: int,
+        base_b: int,
         regs: [float; virt],
     },
 )]
-fn mainloop(program: &Code, base: i64, n: i64, threshold: u32) -> f64 {
+fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) -> f64 {
     let mut driver: majit_metainterp::JitDriver<VmState> =
         majit_metainterp::JitDriver::new(threshold);
     driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
@@ -54,7 +87,8 @@ fn mainloop(program: &Code, base: i64, n: i64, threshold: u32) -> f64 {
     let mut state = VmState {
         i: 0,
         n,
-        base,
+        base_a,
+        base_b,
         regs: vec![0.0; NUM_REGS],
     };
 
@@ -69,55 +103,144 @@ fn mainloop(program: &Code, base: i64, n: i64, threshold: u32) -> f64 {
         jit_merge_point!();
         let opcode = program[pc];
         match opcode {
-            OP_COL_ACC_F => {
+            OP_LOAD_A => {
+                let dst = program[pc + 1] as usize;
                 let ea = state.i * 8;
-                let v = majit_raw_load_f(state.base, ea);
-                state.regs[ACC] = state.regs[ACC] + v;
+                state.regs[dst] = majit_raw_load_f(state.base_a, ea);
+                pc += 2;
+            }
+            OP_LOAD_B => {
+                let dst = program[pc + 1] as usize;
+                let ea = state.i * 8;
+                state.regs[dst] = majit_raw_load_f(state.base_b, ea);
+                pc += 2;
+            }
+            OP_MUL => {
+                let a = program[pc + 1] as usize;
+                let b = program[pc + 2] as usize;
+                let d = program[pc + 3] as usize;
+                state.regs[d] = state.regs[a] * state.regs[b];
+                pc += 4;
+            }
+            OP_ADD => {
+                let a = program[pc + 1] as usize;
+                let b = program[pc + 2] as usize;
+                let d = program[pc + 3] as usize;
+                state.regs[d] = state.regs[a] + state.regs[b];
+                pc += 4;
+            }
+            OP_SUB => {
+                let a = program[pc + 1] as usize;
+                let b = program[pc + 2] as usize;
+                let d = program[pc + 3] as usize;
+                state.regs[d] = state.regs[a] - state.regs[b];
+                pc += 4;
+            }
+            OP_INC => {
                 state.i += 1;
                 pc += 1;
             }
-            OP_JUMP_IF_ABOVE => {
+            OP_JUMP_IF => {
+                let tgt = program[pc + 1] as usize;
                 if state.n > state.i {
-                    can_enter_jit!(driver, BODY_PC, &mut state, program, || {});
-                    pc = BODY_PC;
+                    can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    pc = tgt;
                     continue;
                 }
-                pc += 1;
+                pc += 2;
             }
-            OP_RETURN => return state.regs[ACC],
+            OP_RETURN => return state.regs[program[pc + 1] as usize],
             _ => panic!("bad opcode {opcode}"),
         }
     }
 }
 
-fn clean_interp(program: &Code, base: i64, n: i64) -> f64 {
+/// Clean interpreter of the identical bytecode — the honest per-op non-JIT
+/// baseline. Same columns, same raw loads, same accumulate order (so bit-exact
+/// versus the JIT), only without any JIT machinery.
+fn clean_interp(program: &Code, base_a: i64, base_b: i64, n: i64) -> f64 {
     let mut i = 0i64;
     let mut regs = vec![0.0f64; NUM_REGS];
     let mut pc = 0usize;
     loop {
         match program[pc] {
-            OP_COL_ACC_F => {
-                let ea = i * 8;
-                let v = majit_raw_load_f(base, ea);
-                regs[ACC] = regs[ACC] + v;
+            OP_LOAD_A => {
+                regs[program[pc + 1] as usize] = majit_raw_load_f(base_a, i * 8);
+                pc += 2;
+            }
+            OP_LOAD_B => {
+                regs[program[pc + 1] as usize] = majit_raw_load_f(base_b, i * 8);
+                pc += 2;
+            }
+            OP_MUL => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
+                pc += 4;
+            }
+            OP_ADD => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize] + regs[program[pc + 2] as usize];
+                pc += 4;
+            }
+            OP_SUB => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize] - regs[program[pc + 2] as usize];
+                pc += 4;
+            }
+            OP_INC => {
                 i += 1;
                 pc += 1;
             }
-            OP_JUMP_IF_ABOVE => {
+            OP_JUMP_IF => {
+                let tgt = program[pc + 1] as usize;
                 if n > i {
-                    pc = BODY_PC;
+                    pc = tgt;
                 } else {
-                    pc += 1;
+                    pc += 2;
                 }
             }
-            OP_RETURN => return regs[ACC],
+            OP_RETURN => return regs[program[pc + 1] as usize],
             op => panic!("bad opcode {op}"),
         }
     }
 }
 
-fn program() -> Vec<i64> {
-    vec![OP_COL_ACC_F, OP_JUMP_IF_ABOVE, OP_RETURN]
+fn acc_program() -> Vec<i64> {
+    vec![
+        OP_LOAD_A, R0 as i64, // r0 = a[i]
+        OP_ADD, ACC as i64, R0 as i64, ACC as i64, // acc += r0
+        OP_INC,
+        OP_JUMP_IF, BODY_PC as i64,
+        OP_RETURN, ACC as i64,
+    ]
+}
+
+fn dot_program() -> Vec<i64> {
+    vec![
+        OP_LOAD_A, R0 as i64, // r0 = a[i]
+        OP_LOAD_B, R1 as i64, // r1 = b[i]
+        OP_MUL, R0 as i64, R1 as i64, R2 as i64, // r2 = a*b
+        OP_ADD, ACC as i64, R2 as i64, ACC as i64, // acc += r2
+        OP_INC,
+        OP_JUMP_IF, BODY_PC as i64,
+        OP_RETURN, ACC as i64,
+    ]
+}
+
+fn compute_program() -> Vec<i64> {
+    vec![
+        OP_LOAD_A, R0 as i64, // r0 = a[i]
+        OP_LOAD_B, R1 as i64, // r1 = b[i]
+        OP_MUL, R0 as i64, R1 as i64, R2 as i64, // r2 = a*b
+        OP_MUL, R0 as i64, R0 as i64, R3 as i64, // r3 = a*a
+        OP_MUL, R1 as i64, R1 as i64, R4 as i64, // r4 = b*b
+        OP_SUB, R2 as i64, R3 as i64, R5 as i64, // r5 = a*b - a*a
+        OP_ADD, R5 as i64, R4 as i64, R6 as i64, // r6 = r5 + b*b
+        OP_ADD, ACC as i64, R6 as i64, ACC as i64, // acc += r6
+        OP_INC,
+        OP_JUMP_IF, BODY_PC as i64,
+        OP_RETURN, ACC as i64,
+    ]
 }
 
 fn make_col(n: usize, seed: u64) -> Vec<f64> {
@@ -135,21 +258,21 @@ fn make_col(n: usize, seed: u64) -> Vec<f64> {
     out
 }
 
-fn run_gate(label: &str, n: i64, col: &[f64]) -> f64 {
-    let prog = program();
-    let base = col.as_ptr() as i64;
+fn run_gate(label: &str, prog: &Code, n: i64, col_a: &[f64], col_b: &[f64]) -> f64 {
+    let base_a = col_a.as_ptr() as i64;
+    let base_b = col_b.as_ptr() as i64;
 
     COMPILES.store(0, Ordering::Relaxed);
     ABORTS.store(0, Ordering::Relaxed);
-    let clean = clean_interp(&prog, base, n);
+    let clean = clean_interp(prog, base_a, base_b, n);
 
-    let off = mainloop(&prog, base, n, JIT_OFF);
+    let off = mainloop(prog, base_a, base_b, n, JIT_OFF);
     let off_c = COMPILES.load(Ordering::Relaxed);
     let off_a = ABORTS.load(Ordering::Relaxed);
 
     COMPILES.store(0, Ordering::Relaxed);
     ABORTS.store(0, Ordering::Relaxed);
-    let on = mainloop(&prog, base, n, JIT_ON);
+    let on = mainloop(prog, base_a, base_b, n, JIT_ON);
     let on_c = COMPILES.load(Ordering::Relaxed);
     let on_a = ABORTS.load(Ordering::Relaxed);
 
@@ -175,39 +298,57 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
-fn perf_probe(col: &[f64]) {
+fn perf_probe(label: &str, prog: &Code, col_a: &[f64], col_b: &[f64]) {
     let n = std::env::var("CELFLOAT_PERF_N")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(1_000_000);
-    let prog = program();
-    let base = col.as_ptr() as i64;
+    let base_a = col_a.as_ptr() as i64;
+    let base_b = col_b.as_ptr() as i64;
     let mut clean = Vec::new();
     let mut jit = Vec::new();
     for _ in 0..5 {
-        clean.push(time_ns_per_row(n, || clean_interp(&prog, base, n)));
-        jit.push(time_ns_per_row(n, || mainloop(&prog, base, n, JIT_ON)));
+        clean.push(time_ns_per_row(n, || clean_interp(prog, base_a, base_b, n)));
+        jit.push(time_ns_per_row(n, || mainloop(prog, base_a, base_b, n, JIT_ON)));
     }
     let clean = median(clean);
     let jit = median(jit);
     println!(
-        "[perf n={n}] jit={jit:.3} clean={clean:.3} ns/row clean/jit={:.2}x",
+        "[perf {label} n={n}] jit={jit:.3} clean={clean:.3} ns/row  => JIT is {:.2}x of naive",
         clean / jit
     );
 }
 
 fn main() {
     let max_n = 1_100_000usize;
-    let col = make_col(max_n, 0x2545_F491_4F6C_DD1D);
+    let col_a = make_col(max_n, 0x2545_F491_4F6C_DD1D);
+    let col_b = make_col(max_n, 0x9E37_79B9_7F4A_7C15);
 
-    let primary = run_gate("primary", 200_000, &col);
-    let resume = run_gate("guard-resume", 200_017, &col);
-    assert_ne!(
-        primary.to_bits(),
-        resume.to_bits(),
-        "guard-resume variant should use a distinct length"
-    );
+    // Bit-exact correctness gate on every program, plus a guard-resume length
+    // variant (steady-state accumulate never hits a float resume otherwise).
+    for (label, prog) in [
+        ("acc", acc_program()),
+        ("dot", dot_program()),
+        ("compute", compute_program()),
+    ] {
+        let primary = run_gate(label, &prog, 200_000, &col_a, &col_b);
+        let resume = run_gate(
+            &format!("{label}-resume"),
+            &prog,
+            200_017,
+            &col_a,
+            &col_b,
+        );
+        assert_ne!(
+            primary.to_bits(),
+            resume.to_bits(),
+            "{label}: guard-resume variant should use a distinct length"
+        );
+    }
 
-    perf_probe(&col);
-    black_box(col);
+    perf_probe("acc", &acc_program(), &col_a, &col_b);
+    perf_probe("dot", &dot_program(), &col_a, &col_b);
+    perf_probe("compute", &compute_program(), &col_a, &col_b);
+    black_box(col_a);
+    black_box(col_b);
 }
