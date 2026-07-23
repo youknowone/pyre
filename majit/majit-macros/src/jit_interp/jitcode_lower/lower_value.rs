@@ -1838,10 +1838,30 @@ impl<'c> Lowerer<'c> {
         let lhs = self.lower_value_expr(&expr.left)?;
         let rhs = self.lower_value_expr(&expr.right)?;
         if matches!(lhs.kind, BindingKind::Float) && matches!(rhs.kind, BindingKind::Float) {
-            let opcode = opcode_for_binop_f(&expr.op)?;
-            let reg = self.alloc_reg();
             let lhs_reg = lhs.reg;
             let rhs_reg = rhs.reg;
+            // A float comparison materializes a `0`/`1` int result (like the
+            // int compare path), so its operands stay float but the write is
+            // int-banked. `record_compare_f` emits `float_lt/ff>i` etc.
+            if let Some(opcode) = opcode_for_compare_f(&expr.op) {
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::BinopF,
+                        Register::floats(&[lhs_reg, rhs_reg]),
+                        vec![Register::int(reg)],
+                    ),
+                    quote! { __builder.record_compare_f(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
+                );
+                return Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+                    struct_type: None,
+                });
+            }
+            let opcode = opcode_for_binop_f(&expr.op)?;
+            let reg = self.alloc_reg();
             self.emit_op(
                 OpMeta::linear(
                     OpKind::BinopF,

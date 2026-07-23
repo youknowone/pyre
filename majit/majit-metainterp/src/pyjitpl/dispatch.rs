@@ -6846,6 +6846,12 @@ where
             jitcode::insns::BC_FLOAT_TRUEDIV => self.trace_binop_f(ctx, OpCode::FloatTrueDiv),
             jitcode::insns::BC_FLOAT_NEG => self.trace_unary_f(ctx, OpCode::FloatNeg),
             jitcode::insns::BC_FLOAT_ABS => self.trace_unary_f(ctx, OpCode::FloatAbs),
+            jitcode::insns::BC_FLOAT_LT => self.trace_compare_f(ctx, OpCode::FloatLt),
+            jitcode::insns::BC_FLOAT_LE => self.trace_compare_f(ctx, OpCode::FloatLe),
+            jitcode::insns::BC_FLOAT_EQ => self.trace_compare_f(ctx, OpCode::FloatEq),
+            jitcode::insns::BC_FLOAT_NE => self.trace_compare_f(ctx, OpCode::FloatNe),
+            jitcode::insns::BC_FLOAT_GT => self.trace_compare_f(ctx, OpCode::FloatGt),
+            jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
             // pyjitpl.py opimpl_int_guard_value → implement_guard_value
             // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
             jitcode::insns::BC_INT_GUARD_VALUE => {
@@ -7428,6 +7434,25 @@ where
         let opref = ctx.record_op(opcode, &[lhs, rhs]);
         ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
         self.set_float_reg(dst, Some(opref), Some(value));
+    }
+
+    /// Float comparison `float_lt/ff>i` etc.: two float operands, an int
+    /// (`0`/`1`) result written to the int bank. `[lhs][rhs][dst]` argcode
+    /// order matching the `bhhandler_ff_i!` decoder.
+    fn trace_compare_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
+        let (lhs_idx, rhs_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let lhs_idx = frame.next_u8() as usize;
+            let rhs_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (lhs_idx, rhs_idx, dst)
+        };
+        let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
+        let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+        let value = eval_float_cmp(opcode, lhs_value, rhs_value);
+        let opref = ctx.record_op(opcode, &[lhs, rhs]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        self.set_int_reg(dst, Some(opref), Some(value));
     }
 
     fn trace_unary_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {

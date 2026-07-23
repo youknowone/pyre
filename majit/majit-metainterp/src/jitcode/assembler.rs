@@ -4336,6 +4336,32 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// Float comparison producing a boolean int result — `float_lt/ff>i`
+    /// etc. The two operands are read from the float bank; the `0`/`1`
+    /// result lands in the int bank (`bhhandler_ff_i!` decode order
+    /// `[lhs][rhs][dst]`). `optimize_goto_if_not` only fuses a float
+    /// compare into a guard when it feeds a branch directly; a compare
+    /// whose result is consumed as a value (e.g. an `&&` operand) stays
+    /// in this value form.
+    pub fn record_compare_f(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
+        let key = match opcode {
+            OpCode::FloatLt => "float_lt/ff>i",
+            OpCode::FloatLe => "float_le/ff>i",
+            OpCode::FloatEq => "float_eq/ff>i",
+            OpCode::FloatNe => "float_ne/ff>i",
+            OpCode::FloatGt => "float_gt/ff>i",
+            OpCode::FloatGe => "float_ge/ff>i",
+            other => panic!("record_compare_f: unsupported opcode {other:?}"),
+        };
+        self.touch_reg(dst);
+        self.touch_float_reg(lhs);
+        self.touch_float_reg(rhs);
+        self.write_insn(key);
+        self.push_u8(lhs as u8);
+        self.push_u8(rhs as u8);
+        self.push_u8(dst as u8);
+    }
+
     /// RPython `blackhole.py:689-695` `bhimpl_float_{neg,abs}` per-opname handlers.
     /// `[src][dst]` byte layout per the canonical `bhhandler_f_f!` decoder.
     pub fn record_unary_f(&mut self, dst: u16, opcode: OpCode, src: u16) {

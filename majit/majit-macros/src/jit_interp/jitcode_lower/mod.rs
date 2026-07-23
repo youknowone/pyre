@@ -43,7 +43,7 @@ mod reexports {
         inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
         inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
         is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, opcode_for_binop_f,
-        stmt_has_loop_control, typed_call_arg_tokens,
+        opcode_for_compare_f, stmt_has_loop_control, typed_call_arg_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,

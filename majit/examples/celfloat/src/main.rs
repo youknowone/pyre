@@ -205,6 +205,177 @@ fn clean_interp(program: &Code, base_a: i64, base_b: i64, n: i64) -> f64 {
     }
 }
 
+// ── Float comparison policy machine ──────────────────────────────────────
+// Mirrors the real cel flagship shape: transient float column loads, a float
+// comparison MATERIALIZED to an int bool, and an int count — no float bank.
+// A separate `#[jit_interp]` machine lives in its own module (the macro emits
+// module-level items that would collide with the value machine above).
+mod count {
+    use super::*;
+
+const OP_COUNT_GE: i64 = 0; // if a[i] >= b[i] { count += 1 }
+const OP_JUMP_IF_C: i64 = 1; // [OP, target]  if i < n jump to target
+const OP_RETURN_COUNT: i64 = 2; // return count
+
+struct CountState {
+    i: i64,
+    n: i64,
+    base_a: i64,
+    base_b: i64,
+    count: i64,
+}
+
+#[majit_macros::jit_interp(
+    state = CountState,
+    env = Code,
+    greens = [pc, program],
+    state_fields = {
+        i: int,
+        n: int,
+        base_a: int,
+        base_b: int,
+        count: int,
+    },
+)]
+fn mainloop_count(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) -> i64 {
+    let mut driver: majit_metainterp::JitDriver<CountState> =
+        majit_metainterp::JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_green_key, _ob, _oa| {
+        COMPILES.fetch_add(1, Ordering::Relaxed);
+    });
+    driver.set_on_trace_abort(|_green_key, _permanent| {
+        ABORTS.fetch_add(1, Ordering::Relaxed);
+    });
+
+    let mut pc: usize = 0;
+    let mut state = CountState {
+        i: 0,
+        n,
+        base_a,
+        base_b,
+        count: 0,
+    };
+
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
+    loop {
+        jit_merge_point!();
+        let opcode = program[pc];
+        match opcode {
+            OP_COUNT_GE => {
+                let ea = state.i * 8;
+                let pa = majit_raw_load_f(state.base_a, ea);
+                let pb = majit_raw_load_f(state.base_b, ea);
+                // Float comparison materialized to an int bool, accumulated
+                // (the cel batch-policy shape: `count += policy_bool`, no
+                // conditional branch on the compare result).
+                state.count += (pa >= pb) as i64;
+                state.i += 1;
+                pc += 1;
+            }
+            OP_JUMP_IF_C => {
+                let tgt = program[pc + 1] as usize;
+                if state.n > state.i {
+                    can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    pc = tgt;
+                    continue;
+                }
+                pc += 2;
+            }
+            OP_RETURN_COUNT => return state.count,
+            _ => panic!("bad opcode {opcode}"),
+        }
+    }
+}
+
+fn clean_interp_count(program: &Code, base_a: i64, base_b: i64, n: i64) -> i64 {
+    let mut i = 0i64;
+    let mut count = 0i64;
+    let mut pc = 0usize;
+    loop {
+        match program[pc] {
+            OP_COUNT_GE => {
+                let ea = i * 8;
+                count += (majit_raw_load_f(base_a, ea) >= majit_raw_load_f(base_b, ea)) as i64;
+                i += 1;
+                pc += 1;
+            }
+            OP_JUMP_IF_C => {
+                let tgt = program[pc + 1] as usize;
+                if n > i {
+                    pc = tgt;
+                } else {
+                    pc += 2;
+                }
+            }
+            OP_RETURN_COUNT => return count,
+            op => panic!("bad opcode {op}"),
+        }
+    }
+}
+
+fn count_program() -> Vec<i64> {
+    vec![OP_COUNT_GE, OP_JUMP_IF_C, 0, OP_RETURN_COUNT]
+}
+
+pub(super) fn run_gate_count(label: &str, n: i64, col_a: &[f64], col_b: &[f64]) -> i64 {
+    let prog = count_program();
+    let base_a = col_a.as_ptr() as i64;
+    let base_b = col_b.as_ptr() as i64;
+
+    COMPILES.store(0, Ordering::Relaxed);
+    ABORTS.store(0, Ordering::Relaxed);
+    let clean = clean_interp_count(&prog, base_a, base_b, n);
+
+    let off = mainloop_count(&prog, base_a, base_b, n, JIT_OFF);
+    let off_c = COMPILES.load(Ordering::Relaxed);
+
+    COMPILES.store(0, Ordering::Relaxed);
+    ABORTS.store(0, Ordering::Relaxed);
+    let on = mainloop_count(&prog, base_a, base_b, n, JIT_ON);
+    let on_c = COMPILES.load(Ordering::Relaxed);
+    let on_a = ABORTS.load(Ordering::Relaxed);
+
+    assert_eq!(clean, off, "{label}: clean vs JIT-off count");
+    assert_eq!(clean, on, "{label}: clean vs JIT-on count");
+    assert_eq!(off_c, 0, "{label}: JIT-off must not compile");
+    assert!(on_c >= 1, "{label}: JIT-on must compile at least one trace");
+    println!("[{label} n={n}] count={on} compiles off={off_c} on={on_c} aborts on={on_a}");
+    on
+}
+
+pub(super) fn perf_probe_count(col_a: &[f64], col_b: &[f64]) {
+    let n = std::env::var("CELFLOAT_PERF_N")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1_000_000);
+    let prog = count_program();
+    let base_a = col_a.as_ptr() as i64;
+    let base_b = col_b.as_ptr() as i64;
+    let mut clean = Vec::new();
+    let mut jit = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        black_box(clean_interp_count(&prog, base_a, base_b, n));
+        clean.push(t.elapsed().as_nanos() as f64 / n as f64);
+        let t = Instant::now();
+        black_box(mainloop_count(&prog, base_a, base_b, n, JIT_ON));
+        jit.push(t.elapsed().as_nanos() as f64 / n as f64);
+    }
+    let clean = median(clean);
+    let jit = median(jit);
+    println!(
+        "[perf count n={n}] jit={jit:.3} clean={clean:.3} ns/row  => JIT is {:.2}x of naive",
+        clean / jit
+    );
+}
+} // mod count
+
 fn acc_program() -> Vec<i64> {
     vec![
         OP_LOAD_A, R0 as i64, // r0 = a[i]
@@ -346,9 +517,19 @@ fn main() {
         );
     }
 
+    // Float comparison policy: count rows where a[i] >= b[i]. Exercises a
+    // float compare materialized to an int bool (the cel flagship shape).
+    let count_primary = count::run_gate_count("count", 200_000, &col_a, &col_b);
+    let count_resume = count::run_gate_count("count-resume", 200_017, &col_a, &col_b);
+    assert_ne!(
+        count_primary, count_resume,
+        "count: guard-resume variant should use a distinct length"
+    );
+
     perf_probe("acc", &acc_program(), &col_a, &col_b);
     perf_probe("dot", &dot_program(), &col_a, &col_b);
     perf_probe("compute", &compute_program(), &col_a, &col_b);
+    count::perf_probe_count(&col_a, &col_b);
     black_box(col_a);
     black_box(col_b);
 }
