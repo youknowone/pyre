@@ -353,6 +353,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 if !jc.payload.code_ptr.is_null() {
                     let code = &*jc.payload.code_ptr;
                     py = skip_python_trivia_forward(code, py as usize) as u32;
+                    // Entry-resume capture: the carried coordinate is the
+                    // authority; take its forward-py twin (the same pairing
+                    // the decoder resolves) instead of the inversion above,
+                    // so the liveness/entry windows key exactly where the
+                    // decode will.
+                    if let Some(carried) = scope.carried_resume_jit_pc {
+                        if let Some(fwd) = jc.payload.forward_py_pc_for_jitcode_pc(carried) {
+                            py = fwd;
+                        }
+                    }
                     // after_residual_call=True (`pyjitpl.py`): the
                     // may-force call already executed in compiled code and
                     // consumed its Python stack operands. Resume at the NEXT
@@ -419,6 +429,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let resume_depth_twin: Option<u16> = unsafe {
                 let jc = &*sym.jitcode();
                 if loop_close_overshoot {
+                    None
+                } else if scope.carried_resume_jit_pc.is_some() {
+                    // Entry-resume capture: the depth twins are keyed for
+                    // op-START coordinates; keying them with an
+                    // already-advanced resume coordinate reads the depth of
+                    // the coordinate's KEY opcode (the call, with its
+                    // operands still on the stack) — an over-count whose
+                    // published `valuestackdepth` makes the resume read
+                    // garbage slots as Refs.  Fall back to the raw static
+                    // liveness at the resume py (the forward twin above),
+                    // exactly what the decode derives.
                     None
                 } else if after_residual_call {
                     jc.payload
@@ -703,7 +724,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // the entry coordinate, and for a non-branch guard
             // `op_pc != marker`
             // — the two windows diverge and the decoded box layout mismatches.
-            let guard_jitcode_pc: i32 = if let Some(guard_jc_pc) = scope.branch_guard_jitcode_pc {
+            let guard_jitcode_pc: i32 = if let Some(carried) = scope.carried_resume_jit_pc {
+                // Bridge-entry flavor guard: re-carry the source guard's own
+                // resume word verbatim (see `GuardCaptureScope`).  It is a
+                // decodable `-live-` startpoint by construction — the runtime
+                // resolved it to reach this walk.
+                carried as i32
+            } else if let Some(guard_jc_pc) = scope.branch_guard_jitcode_pc {
                 // The kept-stack branch guard's own `op.pc` (walker
                 // `MIFrame.pc`) — the ONE carried word not sourced from the
                 // resume-translation.

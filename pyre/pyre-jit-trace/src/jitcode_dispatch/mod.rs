@@ -4304,6 +4304,19 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// residuals fall back to the fallthrough resume even when this is set.
     pub residual_call_catch_resume: bool,
 
+    /// Bridge-entry flavor guard (`_prepare_exception_resumption`,
+    /// pyjitpl.py:3125-3173): the walk-entry `position` IS the resume
+    /// coordinate — the failing source guard's own carried word, already a
+    /// decodable `-live-` startpoint the runtime just resolved.  Carry it
+    /// verbatim and key the resume py off its forward twin.  The default
+    /// twin lookups compensate op-START keys (the after-residual advance,
+    /// the block-head re-key) and would move an already-advanced coordinate
+    /// a second time — on a call inside a try-block that lands on the
+    /// physically-following `except` handler block, so the entry guard's
+    /// own bridge resumes INSIDE the handler.  None outside the bridge-entry
+    /// captures.
+    pub carried_resume_jit_pc: Option<usize>,
+
     /// The branch guard's own jitcode `op.pc` for a kept-stack branch guard
     /// (#124). The snapshot helper is invoked with the *resume* coordinate
     /// (`other_target`, the not-taken arm), so the guard's own coordinate is
