@@ -4273,10 +4273,10 @@ fn flush_walk_end_state_to_frame_inner(
     }
     // Commit one slot at a time, re-reading the shadow entry per slot:
     // boxing an Int/Float slot allocates and may trigger a minor
-    // collection, which moves nursery objects — the trace-ctx forwarding
-    // hook keeps the shadow entries current, and each already-written
-    // slot is reachable from the (rooted) frame, so neither side goes
-    // stale across the loop.
+    // collection.  A nursery Ref already written into the detached frame
+    // array is forwarded only while the array is in the remembered set,
+    // and each minor consumes that entry, so re-arm the barrier after
+    // every store — before the next iteration's boxing can allocate.
     for abs in 0..live {
         let boxed = if abs >= nlocals && have_overrides {
             // The override is the authoritative caller CALL stack.  Its
@@ -4291,6 +4291,7 @@ fn flush_walk_end_state_to_frame_inner(
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }
+        frame_array_write_barrier(frame as *mut u8, arr_ptr);
     }
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
@@ -4424,16 +4425,16 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     }
     // Commit the operand stack FIRST: `call_stack` holds live nursery-resident
     // refs, and boxing an Int/Float local below can trigger a minor collection.
-    // Once written into the (rooted) frame array they are forwarded with it, so
-    // landing them before any allocation keeps them current.
+    // The detached frame array is forwarded only while it is in the remembered
+    // set, so arm the barrier once the stack refs are landed and again after
+    // every local store (each minor consumes the remembered entry).
     for (i, &value) in call_stack.iter().enumerate() {
         unsafe {
             (*arr_ptr).as_mut_slice()[nlocals + i] = value;
         }
     }
-    // Commit the locals from the shadow (re-reading per slot: boxing may move
-    // nursery objects, but each written slot is frame-reachable and the
-    // trace-ctx forwarding hook keeps the shadow current).
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
+    // Commit the locals from the shadow, re-reading per slot.
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
@@ -4442,6 +4443,7 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }
+        frame_array_write_barrier(frame as *mut u8, arr_ptr);
     }
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
@@ -4538,6 +4540,9 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
         return false;
     }
     let base = info.num_static_extra_boxes;
+    // Boxing an Int/Float slot allocates; the detached frame array is
+    // forwarded only while it is in the remembered set, and each minor
+    // consumes that entry, so re-arm the barrier after every store.
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
@@ -4546,6 +4551,7 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }
+        frame_array_write_barrier(frame as *mut u8, arr_ptr);
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
     true
@@ -4578,10 +4584,13 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
-    // Land the nursery-resident result before boxing locals can collect.
+    // Land the nursery-resident result, then arm the barrier before
+    // `write_back_outer_locals` boxes locals (an allocation that can
+    // collect the just-stored result if the array is not remembered).
     unsafe {
         (*arr_ptr).as_mut_slice()[nlocals] = retval;
     }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
     if !write_back_outer_locals(ctx, frame) {
         return false;
     }
