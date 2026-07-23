@@ -2867,6 +2867,25 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
         );
         return cached;
     }
+    // ARRAYLEN_GC is ALWAYS_PURE, so `execute_and_record` folds a `Const`
+    // array operand to the loaded length without recording
+    // (`_all_constants` — a GcArray block's length is fixed at
+    // allocation).  The folded box still feeds `arraylen_now_known`,
+    // matching `opimpl_arraylen_gc`'s unconditional cache write.
+    if array.is_constant() {
+        if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(array) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(majit_ir::Value::Int(len)) =
+                    ctx.arraylen_sanity_load(struct_ptr, &descr)
+                {
+                    let folded = ctx.const_int(len);
+                    ctx.heap_cache_mut().arraylen_now_known(array, folded);
+                    return folded;
+                }
+            }
+        }
+    }
     let result = ctx.record_op_with_descr(OpCode::ArraylenGc, &[array], descr.clone());
     // Box(value) parity: executor.py:188 do_arraylen_gc returns
     // BoxInt(cpu.bh_arraylen_gc(array, arraydescr)). Stamp the result
@@ -2885,12 +2904,26 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
 }
 
 pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
-    // pyjitpl.py:opimpl_getfield_gc_i parity: the tracer does NOT fold
-    // pure field reads on constant objects. Folding happens in the
-    // optimizer (heap.py:optimize_GETFIELD_GC_I → optimizer.constant_fold),
-    // which pyre ports in OptContext::execute_nonspec_const with correct
-    // type dispatch (Int/Float/Ref). The tracer only records the GC op.
-    //
+    // `_opimpl_getfield_gc_any_pureornot`: a `ConstPtr` receiver through an
+    // always-pure descr bypasses the heapcache completely — execute the
+    // load now and substitute the value as a `Const`, recording no op (the
+    // jitcode-dispatch twin `getfield_gc_via_heapcache` carries the same
+    // fast path).  For a non-pure descr the tracer only records; folding a
+    // constant object's mutable field read is the optimizer's job
+    // (heap.py:optimize_GETFIELD_GC_I → optimizer.constant_fold, ported in
+    // OptContext::execute_nonspec_const).
+    if obj.is_constant() && descr.is_always_pure() {
+        if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(majit_ir::Value::Int(n)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                {
+                    return ctx.const_int(n);
+                }
+            }
+        }
+    }
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
@@ -2997,10 +3030,23 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 }
 
 /// pyjitpl.py:874-882 `opimpl_getfield_gc_r`. Same shape as `_i`
-/// modulo the rop variant — folding lives in the optimizer
-/// (`optimize_GETFIELD_GC_R = optimize_GETFIELD_GC_I` per RPython's
-/// alias), so the tracer only records the GC op.
+/// modulo the rop variant: the `ConstPtr` + always-pure bypass folds to
+/// a `Const` without recording, and for non-pure descrs folding lives in
+/// the optimizer (`optimize_GETFIELD_GC_R = optimize_GETFIELD_GC_I` per
+/// RPython's alias).
 pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
+    if obj.is_constant() && descr.is_always_pure() {
+        if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(majit_ir::Value::Ref(loaded)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
+                {
+                    return ctx.const_ref(loaded.0 as i64);
+                }
+            }
+        }
+    }
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:934-945 cache-hit sanity check (ref arm).
@@ -10417,6 +10463,145 @@ mod tests {
         }
 
         assert_eq!(ConcreteValue::from_pyobj(obj), ConcreteValue::Ref(obj));
+    }
+
+    /// Minimal Backend for `field_sanity_load` / `arraylen_sanity_load`:
+    /// the default `bh_getfield_gc_*` trait methods read raw memory, and
+    /// `bh_arraylen_gc` mirrors the production overrides (the trait
+    /// default is a stub returning 0).  Compilation/execution entry
+    /// points are unreachable in these tests.
+    struct FieldLoadTestCpu;
+    impl majit_backend::Backend for FieldLoadTestCpu {
+        fn compile_loop(
+            &mut self,
+            _inputargs: &[majit_ir::InputArg],
+            _ops: &[majit_ir::OpRc],
+            _token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("FieldLoadTestCpu::compile_loop")
+        }
+        fn compile_bridge(
+            &mut self,
+            _fail_descr: &dyn majit_ir::FailDescr,
+            _inputargs: &[majit_ir::InputArg],
+            _ops: &[majit_ir::OpRc],
+            _original_token: &majit_backend::JitCellToken,
+            _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
+            _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("FieldLoadTestCpu::compile_bridge")
+        }
+        fn execute_token(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            _args: &[majit_ir::Value],
+        ) -> majit_backend::DeadFrame {
+            unimplemented!("FieldLoadTestCpu::execute_token")
+        }
+        fn get_latest_descr<'a>(
+            &'a self,
+            _frame: &'a majit_backend::DeadFrame,
+        ) -> &'a dyn majit_ir::FailDescr {
+            unimplemented!("FieldLoadTestCpu::get_latest_descr")
+        }
+        fn get_latest_descr_arc(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+        ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+            unimplemented!("FieldLoadTestCpu::get_latest_descr_arc")
+        }
+        fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+            unimplemented!("FieldLoadTestCpu::get_int_value")
+        }
+        fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+            unimplemented!("FieldLoadTestCpu::get_float_value")
+        }
+        fn get_ref_value(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+            _index: usize,
+        ) -> majit_ir::GcRef {
+            unimplemented!("FieldLoadTestCpu::get_ref_value")
+        }
+        fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+            unimplemented!("FieldLoadTestCpu::invalidate_loop")
+        }
+        fn bh_arraylen_gc(
+            &self,
+            array_ptr: i64,
+            arraydescr: &majit_translate::jitcode::BhDescr,
+        ) -> i64 {
+            let ofs = arraydescr
+                .array_len_offset()
+                .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
+            unsafe { *((array_ptr as *const u8).add(ofs) as *const usize) as i64 }
+        }
+    }
+
+    /// `_opimpl_getfield_gc_any_pureornot`: a `ConstPtr` receiver through
+    /// an always-pure descr bypasses the heapcache and folds to the loaded
+    /// value with no recorded op; a non-pure descr still records.
+    #[test]
+    fn getfield_gc_const_receiver_through_pure_descr_folds_without_recording() {
+        let cpu = FieldLoadTestCpu;
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        // Fake two-word struct: the field at offset 8 holds 77.
+        let storage: Box<[i64; 2]> = Box::new([0, 77]);
+        let ptr = storage.as_ref().as_ptr() as i64;
+        let obj = ctx.const_ref(ptr);
+
+        let pure_descr = crate::descr::make_immutable_field_descr(8, 8, majit_ir::Type::Int, true);
+        let ops_before = ctx.num_ops();
+        let result = opimpl_getfield_gc_i(&mut ctx, obj, pure_descr);
+        assert_eq!(
+            ctx.num_ops(),
+            ops_before,
+            "const receiver + always-pure descr records nothing"
+        );
+        assert_eq!(
+            result.inline_const_to_value(),
+            Some(majit_ir::Value::Int(77)),
+            "the fold substitutes the loaded value as a Const"
+        );
+
+        // Control: a non-pure descr on the same const receiver records.
+        let mutable_descr = crate::descr::make_field_descr(8, 8, majit_ir::Type::Int, true);
+        let recorded = opimpl_getfield_gc_i(&mut ctx, obj, mutable_descr);
+        assert_eq!(
+            ctx.num_ops(),
+            ops_before + 1,
+            "a non-pure field read on a const receiver still records"
+        );
+        assert!(!recorded.is_constant());
+    }
+
+    /// `opimpl_arraylen_gc` + `execute_and_record`: ARRAYLEN_GC is
+    /// ALWAYS_PURE, so a `Const` array operand folds to the loaded length
+    /// without recording.
+    #[test]
+    fn arraylen_gc_const_array_folds_to_the_loaded_length_without_recording() {
+        let cpu = FieldLoadTestCpu;
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        // Fake GcArray block: the length prefix at offset 0 holds 5.
+        let storage: Box<[usize; 2]> = Box::new([5, 0]);
+        let ptr = storage.as_ref().as_ptr() as i64;
+        let array = ctx.const_ref(ptr);
+        let descr = crate::descr::make_array_descr(8, 8, Some(0), majit_ir::Type::Int, true);
+
+        let ops_before = ctx.num_ops();
+        let result = opimpl_arraylen_gc(&mut ctx, array, descr);
+        assert_eq!(
+            ctx.num_ops(),
+            ops_before,
+            "a const array operand folds without recording an ArraylenGc"
+        );
+        assert_eq!(
+            result.inline_const_to_value(),
+            Some(majit_ir::Value::Int(5)),
+            "the fold substitutes the loaded length as a ConstInt"
+        );
     }
 
     fn ensure_test_callbacks() {

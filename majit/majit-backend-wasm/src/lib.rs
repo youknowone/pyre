@@ -1445,6 +1445,26 @@ impl majit_backend::Backend for WasmBackend {
         register_pending_call_assembler_target(token_number, input_types);
     }
 
+    /// model.py:254 bh_arraylen_gc(array, arraydescr): read the length
+    /// prefix at `lendescr.offset` (llmodel.py:585-588
+    /// `read_int_at_mem(array, ofs, WORD, 1)`), mirroring the native
+    /// backends' overrides.  The trait default is a stub returning 0,
+    /// which would feed a wrong length into trace-time concrete stamps
+    /// and `arraylen` const folds.
+    fn bh_arraylen_gc(
+        &self,
+        array_ptr: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        let ofs = arraydescr
+            .array_len_offset()
+            .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
+        // SAFETY: `array_ptr` is a GC-managed array pointer threaded
+        // through from the trace recorder / blackhole; `ofs` is the
+        // length-prefix offset its allocation wrote (see `bh_new_array`).
+        unsafe { *((array_ptr as *const u8).add(ofs) as *const usize) as i64 }
+    }
+
     // ── Blackhole allocation (llmodel.py:775-790) ──
     //
     // The blackhole interpreter materializes virtuals (e.g. a virtualized
