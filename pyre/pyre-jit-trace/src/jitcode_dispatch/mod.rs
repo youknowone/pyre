@@ -3209,6 +3209,23 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
         }
     }
 
+    if trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard() {
+        // Null arm (`pyjitpl.py:3152-3154`): the deadframe published NO
+        // exception, and for an exception-guard bridge that publish is the
+        // sole authority — `clear_exception()` on the fresh MetaInterp.
+        // Keeping a preseeded sym here would walk the exception-flavor
+        // continuation for a no-exception failure: a loop whose exception
+        // guard was recorded through a raising iteration then compiles the
+        // HANDLER as its no-exception bridge, and every non-raising
+        // iteration runs the handler body.
+        sym.set_current_exc_value(pyre_object::PY_NULL);
+        sym.set_current_exc_box(OpRef::NONE);
+        sym.set_last_exc_value(pyre_object::PY_NULL);
+        sym.set_last_exc_box(OpRef::NONE);
+        sym.set_class_of_last_exc_is_const(false);
+        return;
+    }
+
     if !sym.last_exc_box().is_none() {
         return;
     }
