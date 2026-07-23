@@ -5818,7 +5818,12 @@ fn handler_unreachable(
 #[inline]
 fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a BhDescr, usize) {
     let descr_idx = (code[pos] as usize) | ((code[pos + 1] as usize) << 8);
-    if let Some(entry) = bh.jitcode.exec.descrs.get(descr_idx) {
+    // `descr_at` resolves the per-jitcode `exec.descrs` first, then the
+    // process-global build-time descr pool — a build-time jitcode (jd1's drain
+    // and its inlined callees) carries an empty `exec.descrs` and names its
+    // `d`-arg descrs by their index in that shared pool, matching the trace
+    // walker's own `descr_at` resolution.
+    if let Some(entry) = bh.jitcode.descr_at(descr_idx) {
         let descr = entry.as_bh_descr().unwrap_or_else(|| {
             panic!("d-arg descrs[{descr_idx}] is not a BhDescr entry: {entry:?}")
         });
