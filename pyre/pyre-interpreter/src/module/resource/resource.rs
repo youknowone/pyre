@@ -3,18 +3,14 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 
-thread_local! {
-    /// `lib_pypy/resource.py:15-37 class struct_rusage(
-    /// metaclass=structseqtype)` — process-wide cached subclass-of-tuple
-    /// type.
-    static STRUCT_RUSAGE_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+/// `lib_pypy/resource.py:15-37 class struct_rusage(
+/// metaclass=structseqtype)` — process-wide cached subclass-of-tuple
+/// type.
+static STRUCT_RUSAGE_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn struct_rusage_type() -> pyre_object::PyObjectRef {
-    STRUCT_RUSAGE_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq(
+    *STRUCT_RUSAGE_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
                 "resource.struct_rusage",
                 &[
                     "ru_utime",
@@ -34,9 +30,8 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
                     "ru_nvcsw",
                     "ru_nivcsw",
                 ],
-            )
-        })
-    })
+            ) as usize
+    }) as pyre_object::PyObjectRef
 }
 
 /// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level

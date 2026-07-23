@@ -86,23 +86,18 @@ fn mmap_io_err(e: std::io::Error, ctx: &str) -> crate::PyError {
 }
 
 #[cfg(unix)]
-thread_local! {
-    static MMAP_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static MMAP_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 fn mmap_type() -> pyre_object::PyObjectRef {
-    MMAP_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("mmap", init_mmap_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            // A view dropped by the collector never reaches `__release_buffer__`,
-            // so the buffer layer needs a way back here to drop the count.
-            unsafe { pyre_object::buffer::set_external_release_hook(mmap_exports_decref) };
-            tp
-        })
-    })
+    *MMAP_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("mmap", init_mmap_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        // A view dropped by the collector never reaches `__release_buffer__`,
+        // so the buffer layer needs a way back here to drop the count.
+        unsafe { pyre_object::buffer::set_external_release_hook(mmap_exports_decref) };
+        tp as usize
+    }) as pyre_object::PyObjectRef
 }
 
 #[cfg(unix)]
@@ -207,20 +202,15 @@ fn mmap_get_attr_obj(obj: pyre_object::PyObjectRef, key: &str) -> pyre_object::P
 // generator as a dedicated iterator object holding the source mmap, a
 // cursor, and a step (`+1` forwards, `-1` for `reversed`).
 #[cfg(unix)]
-thread_local! {
-    static MMAP_ITER_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+static MMAP_ITER_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 fn mmap_iterator_type() -> pyre_object::PyObjectRef {
-    MMAP_ITER_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("mmap_iterator", init_mmap_iterator_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    *MMAP_ITER_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("mmap_iterator", init_mmap_iterator_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as pyre_object::PyObjectRef
 }
 
 #[cfg(unix)]

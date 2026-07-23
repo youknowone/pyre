@@ -20,11 +20,8 @@ use crate::host_seam::sys as libc;
 /// `st_blksize`/`st_blocks`/`st_rdev` block-device fields are named-only
 /// extras.
 fn stat_result_seq_type() -> PyObjectRef {
-    thread_local! {
-        static STAT_RESULT_SEQ_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    STAT_RESULT_SEQ_TYPE.with(|c| {
-        *c.get_or_init(|| {
+    static STAT_RESULT_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *STAT_RESULT_SEQ_TYPE.get_or_init(|| {
             crate::_structseq::make_struct_seq_with_extra(
                 // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
                 "os.stat_result",
@@ -69,68 +66,52 @@ fn stat_result_seq_type() -> PyObjectRef {
                     "st_mtime_ns",
                     "st_ctime_ns",
                 ],
-            )
-        })
-    })
+            ) as usize
+        }) as PyObjectRef
 }
 
 /// `os.terminal_size` structseq — `(columns, lines)`.
 fn terminal_size_seq_type() -> PyObjectRef {
-    thread_local! {
-        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    T.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
-        })
-    })
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]) as usize
+    }) as PyObjectRef
 }
 
 /// `os.uname_result` structseq — `(sysname, nodename, release, version,
 /// machine)`; repr renders "posix.uname_result(...)".
 fn uname_result_seq_type() -> PyObjectRef {
-    thread_local! {
-        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    T.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq(
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
                 "posix.uname_result",
                 &["sysname", "nodename", "release", "version", "machine"],
-            )
-        })
-    })
+            ) as usize
+    }) as PyObjectRef
 }
 
 /// `os.statvfs_result` structseq — 10 sequence slots with `f_fsid` as an
 /// extra named field (`n_sequence_fields=10`, `n_fields=11`).
 fn statvfs_result_seq_type() -> PyObjectRef {
-    thread_local! {
-        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    T.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq_with_extra(
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        crate::_structseq::make_struct_seq_with_extra(
                 "os.statvfs_result",
                 &[
                     "f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree",
                     "f_favail", "f_flag", "f_namemax",
                 ],
                 &["f_fsid"],
-            )
-        })
-    })
+            ) as usize
+    }) as PyObjectRef
 }
 
 /// `os.times_result` structseq — `(user, system, children_user,
 /// children_system, elapsed)`; repr renders "posix.times_result(...)".
 fn times_result_seq_type() -> PyObjectRef {
-    thread_local! {
-        static T: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    T.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq(
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
                 "posix.times_result",
                 &[
                     "user",
@@ -139,9 +120,8 @@ fn times_result_seq_type() -> PyObjectRef {
                     "children_system",
                     "elapsed",
                 ],
-            )
-        })
-    })
+            ) as usize
+    }) as PyObjectRef
 }
 
 /// Split `path` into the root and everything after it, the way
@@ -1537,29 +1517,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         Ok(pyre_object::w_str_new(&format!("<DirEntry {name:?}>")))
     }
     fn dir_entry_type() -> PyObjectRef {
-        thread_local! {
-            static CELL: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-        }
-        CELL.with(|c| {
-            *c.get_or_init(|| {
-                let tp = crate::typedef::make_builtin_type("DirEntry", |ns| {
-                    for (name, f) in [
-                        ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
-                        ("is_file", dir_entry_is_file),
-                        ("is_symlink", dir_entry_is_symlink),
-                        ("is_junction", dir_entry_is_junction),
-                        ("inode", dir_entry_inode),
-                        ("stat", dir_entry_stat),
-                        ("__fspath__", dir_entry_fspath),
-                        ("__repr__", dir_entry_repr),
-                    ] {
-                        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
-                    }
-                });
-                unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-                tp
-            })
-        })
+        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("DirEntry", |ns| {
+                for (name, f) in [
+                    ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
+                    ("is_file", dir_entry_is_file),
+                    ("is_symlink", dir_entry_is_symlink),
+                    ("is_junction", dir_entry_is_junction),
+                    ("inode", dir_entry_inode),
+                    ("stat", dir_entry_stat),
+                    ("__fspath__", dir_entry_fspath),
+                    ("__repr__", dir_entry_repr),
+                ] {
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
+                }
+            });
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp as usize
+        }) as PyObjectRef
     }
 
     fn scandir_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1584,26 +1560,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         Ok(item)
     }
     fn scandir_iter_type() -> PyObjectRef {
-        thread_local! {
-            static CELL: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-        }
-        CELL.with(|c| {
-            *c.get_or_init(|| {
-                let tp = crate::typedef::make_builtin_type("ScandirIterator", |ns| {
-                    for (name, f) in [
-                        ("__iter__", scandir_iter_self as crate::gateway::BuiltinCodeFn),
-                        ("__next__", scandir_iter_next),
-                        ("__enter__", scandir_iter_self),
-                        ("__exit__", scandir_iter_close),
-                        ("close", scandir_iter_close),
-                    ] {
-                        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
-                    }
-                });
-                unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-                tp
-            })
-        })
+        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("ScandirIterator", |ns| {
+                for (name, f) in [
+                    ("__iter__", scandir_iter_self as crate::gateway::BuiltinCodeFn),
+                    ("__next__", scandir_iter_next),
+                    ("__enter__", scandir_iter_self),
+                    ("__exit__", scandir_iter_close),
+                    ("close", scandir_iter_close),
+                ] {
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
+                }
+            });
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp as usize
+        }) as PyObjectRef
     }
 
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

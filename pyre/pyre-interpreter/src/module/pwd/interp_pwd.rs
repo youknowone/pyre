@@ -3,32 +3,27 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 #[cfg(unix)]
-thread_local! {
-    /// `app_pwd.py:3-19 class struct_passwd(metaclass=structseqtype)`.
-    /// Process-wide cached subclass-of-tuple type so every getpwuid /
-    /// getpwnam / getpwall result materialises into the same structseq.
-    static STRUCT_PASSWD_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+/// `app_pwd.py:3-19 class struct_passwd(metaclass=structseqtype)`.
+/// Process-wide cached subclass-of-tuple type so every getpwuid /
+/// getpwnam / getpwall result materialises into the same structseq.
+static STRUCT_PASSWD_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 fn struct_passwd_type() -> pyre_object::PyObjectRef {
-    STRUCT_PASSWD_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq(
-                "pwd.struct_passwd",
-                &[
-                    "pw_name",
-                    "pw_passwd",
-                    "pw_uid",
-                    "pw_gid",
-                    "pw_gecos",
-                    "pw_dir",
-                    "pw_shell",
-                ],
-            )
-        })
-    })
+    *STRUCT_PASSWD_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            "pwd.struct_passwd",
+            &[
+                "pw_name",
+                "pw_passwd",
+                "pw_uid",
+                "pw_gid",
+                "pw_gecos",
+                "pw_dir",
+                "pw_shell",
+            ],
+        ) as usize
+    }) as pyre_object::PyObjectRef
 }
 
 /// `interp_pwd.py:50-73 uid_converter` — narrow a python int to `uid_t`.

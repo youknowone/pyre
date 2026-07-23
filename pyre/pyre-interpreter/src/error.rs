@@ -1396,23 +1396,19 @@ impl PyError {
 }
 
 fn unraisable_hook_args_type() -> PyObjectRef {
-    thread_local! {
-        static TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
-    }
-    TYPE.with(|cell| {
-        *cell.get_or_init(|| {
-            crate::_structseq::make_struct_seq(
-                "sys.UnraisableHookArgs",
-                &[
-                    "exc_type",
-                    "exc_value",
-                    "exc_traceback",
-                    "err_msg",
-                    "object",
-                ],
-            )
-        })
-    })
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            "sys.UnraisableHookArgs",
+            &[
+                "exc_type",
+                "exc_value",
+                "exc_traceback",
+                "err_msg",
+                "object",
+            ],
+        ) as usize
+    }) as PyObjectRef
 }
 
 /// Resolve an exception instance's actual Python class name for display.

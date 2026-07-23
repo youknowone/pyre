@@ -8392,46 +8392,38 @@ fn init_union_type(ns: PyObjectRef) {
     };
 }
 
-thread_local! {
-    static GETSET_DESCRIPTOR_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef>
-        = const { std::cell::OnceCell::new() };
-}
+static GETSET_DESCRIPTOR_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn getset_descriptor_type() -> pyre_object::PyObjectRef {
-    GETSET_DESCRIPTOR_TYPE.with(|cell| {
-        *cell.get_or_init(|| {
-            // `typedef.py:444 GetSetProperty.typedef = TypeDef(
-            // "getset_descriptor", ...)`.  Pyre owns the static
-            // `GETSET_DESCRIPTOR_TYPE` PyType so GetSetProperty
-            // instances carry it as `ob_type` (not the catch-all
-            // `INSTANCE_TYPE`).  `make_builtin_type_with_layout`
-            // wires the layout so `setup_builtin_type` records the
-            // explicit typedef per `typeobject.py:1273-1280`.
-            let tp = make_builtin_type_with_layout(
-                "getset_descriptor",
-                init_getset_descriptor_type,
-                w_object(),
-                &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE as *const PyType,
-            );
-            // typedef.py:446 assert not GetSetProperty.typedef.acceptable_as_base_class
-            unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
-            // `init_typeobjects` would normally hand the W_TypeObject
-            // to `set_instantiate(pytype, w_typeobject)` so allocators
-            // can stamp `ob_header.w_class` at construction time
-            // (see typedef.rs around `for (pytype, w_type) in reg`).
-            // `getset_descriptor_type()` is called from inside the
-            // init loop *as* a builder for descriptors that other
-            // typedefs install, so the post-loop `set_instantiate`
-            // pass can race the first GetSetProperty alloc.
-            // Setting it eagerly here keeps `w_class` non-null for
-            // every descriptor regardless of allocation order.
-            pyre_object::pyobject::set_instantiate(
-                &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE,
-                tp,
-            );
-            tp
-        })
-    })
+    *GETSET_DESCRIPTOR_TYPE.get_or_init(|| {
+        // `typedef.py:444 GetSetProperty.typedef = TypeDef(
+        // "getset_descriptor", ...)`.  Pyre owns the static
+        // `GETSET_DESCRIPTOR_TYPE` PyType so GetSetProperty
+        // instances carry it as `ob_type` (not the catch-all
+        // `INSTANCE_TYPE`).  `make_builtin_type_with_layout`
+        // wires the layout so `setup_builtin_type` records the
+        // explicit typedef per `typeobject.py:1273-1280`.
+        let tp = make_builtin_type_with_layout(
+            "getset_descriptor",
+            init_getset_descriptor_type,
+            w_object(),
+            &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE as *const PyType,
+        );
+        // typedef.py:446 assert not GetSetProperty.typedef.acceptable_as_base_class
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
+        // `init_typeobjects` would normally hand the W_TypeObject
+        // to `set_instantiate(pytype, w_typeobject)` so allocators
+        // can stamp `ob_header.w_class` at construction time
+        // (see typedef.rs around `for (pytype, w_type) in reg`).
+        // `getset_descriptor_type()` is called from inside the
+        // init loop *as* a builder for descriptors that other
+        // typedefs install, so the post-loop `set_instantiate`
+        // pass can race the first GetSetProperty alloc.
+        // Setting it eagerly here keeps `w_class` non-null for
+        // every descriptor regardless of allocation order.
+        pyre_object::pyobject::set_instantiate(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE, tp);
+        tp as usize
+    }) as pyre_object::PyObjectRef
 }
 
 /// typedef.py:378-382 readonly_attribute
@@ -8694,12 +8686,11 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
     // __name__/__qualname__/__objclass__/__doc__) cannot be
     // installed inside this function — each one allocates a fresh
     // `GetSetProperty` via `make_getset_descriptor`, which
-    // funnels through `getset_descriptor_type()`'s OnceCell, and we
-    // are currently *inside* that OnceCell's init closure.
-    // Re-entering `OnceCell::get_or_init` is undefined behaviour
-    // (the cell is already mutably borrowed), so the post-init
+    // funnels through `getset_descriptor_type()`'s OnceLock, and we
+    // are currently *inside* that OnceLock's init closure.
+    // Re-entering `OnceLock::get_or_init` would deadlock, so the post-init
     // helper `patch_getset_descriptor_metadata` stamps them after
-    // the OnceCell finishes, mirroring how
+    // the OnceLock finishes, mirroring how
     // `patch_builtin_function_descriptors` patches the
     // BuiltinFunction `reqcls` slot.
 }

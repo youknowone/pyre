@@ -3,24 +3,19 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 #[cfg(unix)]
-thread_local! {
-    /// `lib_pypy/grp.py:14-20 class struct_group(metaclass=structseqtype)`
-    /// — process-wide cached subclass-of-tuple type so every getgrgid /
-    /// getgrnam / getgrall call materialises into the same structseq.
-    static STRUCT_GROUP_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
+/// `lib_pypy/grp.py:14-20 class struct_group(metaclass=structseqtype)`
+/// — process-wide cached subclass-of-tuple type so every getgrgid /
+/// getgrnam / getgrall call materialises into the same structseq.
+static STRUCT_GROUP_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 fn struct_group_type() -> pyre_object::PyObjectRef {
-    STRUCT_GROUP_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            crate::_structseq::make_struct_seq(
-                "grp.struct_group",
-                &["gr_name", "gr_passwd", "gr_gid", "gr_mem"],
-            )
-        })
-    })
+    *STRUCT_GROUP_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            "grp.struct_group",
+            &["gr_name", "gr_passwd", "gr_gid", "gr_mem"],
+        ) as usize
+    }) as pyre_object::PyObjectRef
 }
 
 /// grp module — `lib_pypy/grp.py` (PyPy keeps it app-level via

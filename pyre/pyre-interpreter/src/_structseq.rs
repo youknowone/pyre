@@ -26,7 +26,7 @@
 //!   f1=v1, ...)"` rendering.
 
 use indexmap::IndexMap;
-use std::cell::RefCell;
+use std::sync::{Mutex, OnceLock};
 
 use pyre_object::PyObjectRef;
 
@@ -39,7 +39,7 @@ use crate::PyError;
 struct StructSeqDescr {
     name: String,
     /// Field names in positional order.  Names starting with `_` are
-    /// CPython's "unnamed" placeholders (`_structseq.py:67-69`).
+    /// unnamed placeholders (`_structseq.py:67-69`).
     fields: Vec<String>,
     /// Named-only fields stored in the instance `__dict__` rather than the
     /// tuple body (`_structseq.py:31-37` — the `obj.__dict__[name]` arm).
@@ -52,12 +52,13 @@ struct StructSeqDescr {
     extra_fields: Vec<String>,
 }
 
-thread_local! {
-    /// `class_ptr → StructSeqDescr`.  Pyre keys by the subclass type
-    /// pointer because the GetSetProperty descriptor only carries a
-    /// `name` slot (`typedef.rs:174`), not the owning class.
-    static STRUCTSEQ_REGISTRY: RefCell<IndexMap<usize, StructSeqDescr>> =
-        RefCell::new(IndexMap::new());
+/// `class_ptr → StructSeqDescr`.  Pyre keys by the subclass type
+/// pointer because the GetSetProperty descriptor only carries a
+/// `name` slot (`typedef.rs:174`), not the owning class.
+static STRUCTSEQ_REGISTRY: OnceLock<Mutex<IndexMap<usize, StructSeqDescr>>> = OnceLock::new();
+
+fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {
+    STRUCTSEQ_REGISTRY.get_or_init(|| Mutex::new(IndexMap::new()))
 }
 
 /// `lib_pypy/_structseq.py:31-37 structseqfield.__get__` —
@@ -94,10 +95,12 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     // `_structseq.py:31-37` — an extra (dict-backed) field shadows a
     // same-named positional slot, so resolve those first.
-    let resolved = STRUCTSEQ_REGISTRY.with(|r| {
-        let map = r.borrow();
+    let resolved = {
+        let map = structseq_registry().lock().unwrap();
         let Some(entry) = map.get(&(cls as usize)) else {
-            return Resolved::Missing;
+            return Err(PyError::attribute_error(format!(
+                "structseq object has no field {name}"
+            )));
         };
         if entry.extra_fields.iter().any(|n| n == &name) {
             Resolved::Extra
@@ -106,7 +109,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         } else {
             Resolved::Missing
         }
-    });
+    };
     match resolved {
         Resolved::Extra => {
             let w_dict = crate::baseobjspace::getdict(inst);
@@ -137,12 +140,12 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         return Err(PyError::type_error("structseq __repr__ missing self"));
     }
     let cls = unsafe { (*inst).w_class };
-    let (name, fields) = STRUCTSEQ_REGISTRY.with(|r| -> (String, Vec<String>) {
-        let map = r.borrow();
+    let (name, fields) = {
+        let map = structseq_registry().lock().unwrap();
         map.get(&(cls as usize))
             .map(|d| (d.name.clone(), d.fields.clone()))
             .unwrap_or_default()
-    });
+    };
     let n = unsafe { pyre_object::w_tuple_len(inst) };
     let mut parts: Vec<String> = Vec::with_capacity(n);
     for i in 0..n {
@@ -227,12 +230,12 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cls = args[0];
     let n_seq = read_class_int(cls, "n_sequence_fields").unwrap_or(0) as usize;
     let n_fields = read_class_int(cls, "n_fields").unwrap_or(n_seq as i64) as usize;
-    let (name, extra_names) = STRUCTSEQ_REGISTRY.with(|r| {
-        let map = r.borrow();
+    let (name, extra_names) = {
+        let map = structseq_registry().lock().unwrap();
         map.get(&(cls as usize))
             .map(|d| (d.name.clone(), d.extra_fields.clone()))
             .unwrap_or_else(|| ("structseq".to_string(), Vec::new()))
-    });
+    };
 
     // `_structseq.py:95-101` — the optional second arg is a dict supplying
     // values for the named-only extra fields.
@@ -523,8 +526,8 @@ fn make_struct_seq_impl(
         unsafe { pyre_object::typeobject::w_type_set_hasdict(cls, true) };
     }
 
-    STRUCTSEQ_REGISTRY.with(|r| {
-        r.borrow_mut().insert(
+    {
+        structseq_registry().lock().unwrap().insert(
             cls as usize,
             StructSeqDescr {
                 name: name.to_string(),
@@ -532,7 +535,7 @@ fn make_struct_seq_impl(
                 extra_fields: owned_extra,
             },
         );
-    });
+    }
 
     cls
 }
