@@ -99,7 +99,13 @@ fn sandbox_reads_virtual_file_and_blocks_escapes() {
     std::fs::write(tmp.path().join("hello.txt"), b"sandbox-ok").unwrap();
 
     // 1. A file inside the virtual root reads back through the controller.
-    let (out, code) = interact(&pyre, tmp.path(), r#"print(open("/tmp/hello.txt").read())"#);
+    // Keep this VFS/seam probe binary: the controller intentionally mounts no
+    // stdlib, so text-mode open would additionally require `encodings`.
+    let (out, code) = interact(
+        &pyre,
+        tmp.path(),
+        r#"print(open("/tmp/hello.txt", "rb").read())"#,
+    );
     assert_eq!(code, 0, "virtual read exited non-zero");
     assert!(out.contains("sandbox-ok"), "virtual read produced: {out:?}");
 
