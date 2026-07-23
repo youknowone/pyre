@@ -2407,7 +2407,11 @@ impl<'a> Transformer<'a> {
                     OpKind::FieldRead { base, .. } => base.clone(),
                     _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
                 };
-                let itemsize = array_field.array_itemsize.unwrap_or(8);
+                // Vable arrays hold word-wide `PyObjectRef` items; the
+                // default must be the target word, not the build host's.
+                let itemsize = array_field
+                    .array_itemsize
+                    .unwrap_or_else(crate::layout::target_word_size);
                 let is_signed = array_field.array_is_signed.unwrap_or(false);
                 self.vable_array_vars
                     .insert(result, (base_var, array_field.index, itemsize, is_signed));

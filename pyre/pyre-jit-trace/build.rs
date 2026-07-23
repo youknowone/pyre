@@ -330,12 +330,14 @@ fn real_main() {
                     .map(|(name, idx)| {
                         // virtualizable.py:58 — VirtualizableInfo.array_descrs[i] =
                         // cpu.arraydescrof(getattr(VTYPE, name).TO). Python frame
-                        // locals are PyObjectRef pointers: itemsize=8, is_signed=false.
+                        // locals are PyObjectRef pointers: itemsize is one
+                        // target word (the build host's word would mis-stride
+                        // `FixedObjectArray` on a narrower target), is_signed=false.
                         majit_translate::VirtualizableFieldDescriptor::new_with_arraydescr(
                             *name,
                             Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
                             *idx,
-                            8,     // itemsize: PyObjectRef is a pointer
+                            majit_translate::layout::target_word_size(),
                             false, // is_signed: pointers are unsigned
                         )
                     })
