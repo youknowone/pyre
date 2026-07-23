@@ -3490,7 +3490,20 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_guard_no_exception_check();
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
-            OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
+            OpCode::GuardNoOverflow => {
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+            }
+            OpCode::GuardOverflow => {
+                // aarch64/opassembler.py:547-551 aliases GUARD_NO_OVERFLOW to
+                // guard_true and GUARD_OVERFLOW to guard_false. The overflow
+                // arithmetic producer leaves the no-overflow success CC in
+                // `guard_success_cc`, so invert it for the expected-overflow
+                // arm before the common guard emitter derives its fail CC.
+                let no_overflow_cc = self
+                    .guard_success_cc
+                    .take()
+                    .expect("GuardOverflow requires a preceding overflow operation");
+                self.guard_success_cc = Some(invert_cc(no_overflow_cc));
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
