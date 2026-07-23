@@ -2625,6 +2625,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }),
         );
 
+        // os.chmod(path, mode) -> None
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "chmod",
+            crate::make_builtin_function_with_arity(
+                "chmod",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
+                    }
+                    let path = extract_path(args[0])?;
+                    let mode = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u32;
+                    let c_path = std::ffi::CString::new(path.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                    let ret = unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) };
+                    if ret < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), &path));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
         // os.fchmod(fd, mode) -> None
         crate::module_ns_store(
             ns,
