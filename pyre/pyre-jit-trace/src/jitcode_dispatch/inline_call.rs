@@ -339,6 +339,29 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
     }
 }
 
+/// True iff `body_code` contains a `raise` op.  A callee that raises inline
+/// unwinds cleanly only at the top inline level (`inline_depth == 0`, directly
+/// under the real caller loop): a raise from a callee inlined BELOW another
+/// inlined frame must cross the suspended intermediate frame(s), which needs the
+/// cross-frame exception-unwind bridge (gh#343 / gh#467) the drain does not yet
+/// reconstruct — the trace instead drops the `NestedBreakBridgeResume` bridge
+/// and deopts the unwind to the blackhole.  Straight value-returning chains
+/// never raise, so they still inline to the full `fbw_max_multiframe_depth`; a
+/// raising callee is capped at the top level.
+pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname == "raise" {
+            return true;
+        }
+        pc = d.next_pc;
+    }
+    false
+}
+
 pub(crate) fn method_form_callee_body_supported(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -1545,12 +1568,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // (`pyjitpl.py`) unroll within `max_unroll_recursion`,
             // then fall back to the assembler-call path.  Default-on
             // (`fbw_rec_multiframe_enabled`): a primary trace spends the
-            // multiframe budget unrolling recursion below the depth bound
+            // recursion-unroll budget unrolling below `max_unroll_recursion`
+            // (`fbw_max_rec_unroll_depth`, a bound distinct from the
+            // straight-line chain-inline depth `fbw_max_multiframe_depth`)
             // before folding the deepest call to the recursive portal
             // `CALL_ASSEMBLER`.
             let unroll = fbw_rec_multiframe_enabled()
                 && !ctx.fbw_mode.carrier_resume
-                && ctx.session.borrow().framestack.len() < fbw_max_multiframe_depth();
+                && ctx.session.borrow().framestack.len() < fbw_max_rec_unroll_depth();
             if !unroll {
                 return Ok(None);
             }
@@ -1578,8 +1603,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
+    // A callee that raises inline is inlinable only at the top level: below an
+    // intermediate frame its unwind needs the cross-frame bridge (gh#343 /
+    // gh#467) the drain cannot yet build (`callee_body_contains_raise`).  A
+    // value-returning chain (no raise) inlines to the full depth.
+    let effective_multiframe_depth = if callee_body_contains_raise(body.code) {
+        1
+    } else {
+        fbw_max_multiframe_depth()
+    };
     let try_multiframe = multiframe_eligible
-        && inline_depth < fbw_max_multiframe_depth()
+        && inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
             callee_descr_refs,

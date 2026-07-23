@@ -18,25 +18,55 @@
 use super::*;
 
 /// Maximum inline depth the multiframe guard-snapshot path
-/// (`walker_capture_multi_frame_inline_snapshot`) unrolls before folding to
-/// the `CALL_ASSEMBLER` tail.  Bounded to 1: a depth-≥2 unroll of a tree
-/// recursion (e.g. `fib`, whose `n < 2` base-case guard fails per call) does
-/// not stay in compiled code — the unrolled trace guard-fails and deopts to
-/// the blackhole on essentially every recursive call (measured: two orders of
-/// magnitude more blackhole resumes than the folded path, ~20-30× slower).
-/// This mirrors `max_unroll_recursion` bounding the same runaway: past the
-/// bound the recursive call folds straight to `CALL_ASSEMBLER`
-/// (`_opimpl_recursive_call` → `do_recursive_call`, `pyjitpl.py`)
-/// rather than continuing to unroll the call tree.  `try_multiframe`
-/// (`inline_depth < fbw_max_multiframe_depth()`) therefore only fires at the
-/// top inline level by default. (The depth-≥2 blackhole-resume crash that
-/// previously blocked this path was a GC-rooting gap in the nested `run()`
-/// chain, fixed by rooting the whole pending `nextblackholeinterp` chain across
-/// `run()`; raising the bound is now a performance, not a soundness, question.)
+/// (`walker_capture_multi_frame_inline_snapshot`) unrolls a straight-line
+/// value-returning callee CHAIN before folding to the `CALL_ASSEMBLER` tail.
+/// Default 7: a deep value-returning chain (`b→c→…→h`) stays in compiled code
+/// and each extra inlined level removes a residual call — measured ~2.0–2.3×
+/// on the `depthN_inline_chain` fixtures with no regression elsewhere.
+///
+/// Deep unrolling is a loss for exactly two callee shapes, each capped
+/// separately so the chain depth can rise freely:
+///   - a self-recursive callee (tree recursion `fib`, whose `n < 2` base-case
+///     guard fails per call) — its unrolled copy guard-fails and deopts to the
+///     blackhole on essentially every recursive call (two orders of magnitude
+///     more blackhole resumes, ~20–30× slower).  Bounded by the distinct
+///     `max_unroll_recursion` limit (`fbw_max_rec_unroll_depth`, kept at 1).
+///   - a callee that raises inline below an intermediate frame — its unwind
+///     needs the cross-frame bridge (gh#343 / gh#467) the drain cannot yet
+///     build.  Capped to the top inline level by `callee_body_contains_raise`.
+/// This mirrors `max_unroll_recursion` folding a recursive call straight to
+/// `CALL_ASSEMBLER` (`_opimpl_recursive_call` → `do_recursive_call`,
+/// `pyjitpl.py`) past the bound rather than continuing to unroll the call tree.
+/// (The depth-≥2 blackhole-resume crash that previously blocked this path was a
+/// GC-rooting gap in the nested `run()` chain, fixed by rooting the whole
+/// pending `nextblackholeinterp` chain across `run()`; the bound is now a
+/// performance, not a soundness, question.)
 pub(crate) fn fbw_max_multiframe_depth() -> usize {
     static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
         std::env::var("PYRE_FBW_MULTIFRAME_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(7)
+            .clamp(1, 7)
+    })
+}
+
+/// `max_unroll_recursion`: how many levels a self-recursive callee unrolls
+/// before folding the deepest self-call to `CALL_ASSEMBLER`
+/// (`_opimpl_recursive_call` → `do_recursive_call`, `pyjitpl.py`).  This is a
+/// bound distinct from the straight-line inline depth
+/// (`fbw_max_multiframe_depth`): a value-returning callee CHAIN inlines deeply
+/// with a clean win, but unrolling a self-recursive callee past one level is a
+/// loss — the extra copy guard-fails / cannot materialize a residual self-call
+/// argument on the exception-unwind path and deopts (measured: a depth-2 unroll
+/// of `recur(depth-1, acc+check(...))` drops a bridge and runs ~13% slower).
+/// Kept at 1 so that raising the chain-inline depth never deepens recursion
+/// unrolling.  `PYRE_FBW_REC_UNROLL_DEPTH` overrides for A/B.
+pub(crate) fn fbw_max_rec_unroll_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("PYRE_FBW_REC_UNROLL_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
