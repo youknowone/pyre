@@ -3023,6 +3023,10 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     } else {
         OpCode::GetfieldGcI
     };
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::OPS);
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // `resbox` carries the loaded value; pair the recorded opref with
@@ -3121,6 +3125,10 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     } else {
         OpCode::GetfieldGcR
     };
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::OPS);
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
     let result = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // Pair the recorded opref with the live ref so subsequent
@@ -10580,6 +10588,9 @@ mod tests {
             Some(majit_ir::Value::Int(77)),
             "the fold substitutes the loaded value as a Const"
         );
+        let prof_folded = ctx.profiler().snapshot();
+        assert_eq!(prof_folded.ops, 0);
+        assert_eq!(prof_folded.recorded_ops, 0);
 
         // Control: a non-pure descr on the same const receiver records.
         let mutable_descr = crate::descr::make_field_descr(8, 8, majit_ir::Type::Int, true);
@@ -10590,6 +10601,9 @@ mod tests {
             "a non-pure field read on a const receiver still records"
         );
         assert!(!recorded.is_constant());
+        let prof_recorded = ctx.profiler().snapshot();
+        assert_eq!(prof_recorded.ops, 1);
+        assert_eq!(prof_recorded.recorded_ops, 1);
     }
 
     /// `opimpl_arraylen_gc` + `execute_and_record`: ARRAYLEN_GC is

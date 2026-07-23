@@ -56,6 +56,12 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
         );
         cached
     } else {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::OPS);
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
         let resbox = ctx
             .trace_ctx
             .record_op_with_descr(opcode, &[array, index], descr.clone());
@@ -177,6 +183,13 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
     let descr = read_descr(code, op, 3, ctx)?;
     let descr_index = descr.index();
 
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+    ctx.trace_ctx.profiler().count_ops(
+        OpCode::SetarrayitemGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
     // `upd.setarrayitem(valuebox)` (heapcache.py) parity — the
@@ -332,6 +345,12 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
     } else {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::OPS);
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::RECORDED_OPS);
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
         // Write-through with alias-clearing semantics
@@ -492,6 +511,12 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         // struct pointer is known (Const, vable shadow, or stamped),
         // mirroring `pyjitpl.py resbox = execute_with_descr(...);
         // upd.getfield_now_known(resbox)`.
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::OPS);
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
         let resbox = ctx
             .trace_ctx
             .record_op_with_descr(opcode, &[obj], descr.clone());
