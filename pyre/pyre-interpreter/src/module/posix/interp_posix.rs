@@ -2762,7 +2762,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
                     }
                     let path = extract_path(args[0])?;
-                    let mode = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u32;
+                    // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer
+                    // raises TypeError instead of reinterpreting its layout.
+                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
                     let c_path = std::ffi::CString::new(path.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) };
