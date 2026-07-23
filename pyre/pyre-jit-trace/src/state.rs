@@ -2867,6 +2867,11 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
         );
         return cached;
     }
+    // The cache miss routes through `execute_and_record`, which counts
+    // the base OPS bucket at entry — before the `_all_constants` fold
+    // check — so the fold and record paths below both count OPS.
+    ctx.profiler()
+        .count_ops(OpCode::ArraylenGc, majit_metainterp::counters::OPS);
     // ARRAYLEN_GC is ALWAYS_PURE, so `execute_and_record` folds a `Const`
     // array operand to the loaded length without recording
     // (`_all_constants` — a GcArray block's length is fixed at
@@ -2894,6 +2899,9 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
             }
         }
     }
+    // `_record_helper` adds RECORDED_OPS exactly when the op is recorded.
+    ctx.profiler()
+        .count_ops(OpCode::ArraylenGc, majit_metainterp::counters::RECORDED_OPS);
     let result = ctx.record_op_with_descr(OpCode::ArraylenGc, &[array], descr.clone());
     // Box(value) parity: executor.py:188 do_arraylen_gc returns
     // BoxInt(cpu.bh_arraylen_gc(array, arraydescr)). Stamp the result
@@ -10599,7 +10607,8 @@ mod tests {
         let descr = crate::descr::make_array_descr(8, 8, Some(0), majit_ir::Type::Int, true);
 
         let ops_before = ctx.num_ops();
-        let result = opimpl_arraylen_gc(&mut ctx, array, descr);
+        let prof_before = ctx.profiler().snapshot();
+        let result = opimpl_arraylen_gc(&mut ctx, array, descr.clone());
         assert_eq!(
             ctx.num_ops(),
             ops_before,
@@ -10610,6 +10619,41 @@ mod tests {
             Some(majit_ir::Value::Int(5)),
             "the fold substitutes the loaded length as a ConstInt"
         );
+        // execute_and_record counts OPS at entry even when `_all_constants`
+        // folds; RECORDED_OPS only accompanies an actual record.
+        let prof_folded = ctx.profiler().snapshot();
+        assert_eq!(prof_folded.ops, prof_before.ops + 1);
+        assert_eq!(prof_folded.recorded_ops, prof_before.recorded_ops);
+
+        // The heapcache skips Const keys both ways (`arraylen` /
+        // `arraylen_now_known`), so a repeat call re-folds: OPS counts
+        // again, still nothing recorded or heapcached.
+        let refolded = opimpl_arraylen_gc(&mut ctx, array, descr);
+        assert_eq!(refolded, result);
+        let prof_refolded = ctx.profiler().snapshot();
+        assert_eq!(prof_refolded.ops, prof_folded.ops + 1);
+        assert_eq!(prof_refolded.recorded_ops, prof_folded.recorded_ops);
+        assert_eq!(prof_refolded.heapcached_ops, prof_folded.heapcached_ops);
+    }
+
+    #[test]
+    fn arraylen_gc_nonconst_array_records_and_counts_ops() {
+        let mut ctx = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
+        let array = OpRef::input_arg_ref(0);
+        let descr = crate::descr::make_array_descr(8, 8, Some(0), majit_ir::Type::Int, true);
+
+        let ops_before = ctx.num_ops();
+        let prof_before = ctx.profiler().snapshot();
+        let result = opimpl_arraylen_gc(&mut ctx, array, descr);
+        assert!(!result.is_constant());
+        assert_eq!(
+            ctx.num_ops(),
+            ops_before + 1,
+            "a non-const array operand records an ArraylenGc"
+        );
+        let prof_after = ctx.profiler().snapshot();
+        assert_eq!(prof_after.ops, prof_before.ops + 1);
+        assert_eq!(prof_after.recorded_ops, prof_before.recorded_ops + 1);
     }
 
     fn ensure_test_callbacks() {
