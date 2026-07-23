@@ -672,3 +672,71 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
         "GUARD_ALWAYS_FAILS should side-exit unconditionally"
     );
 }
+
+#[test]
+fn test_int_binop_wide_immediate_is_not_truncated() {
+    // An immediate that does not fit in 32 bits must not use the imm32
+    // form: the encoder would truncate it and the CPU sign-extend the low
+    // half, so `x & 0xFFFF_FFFF_FFFF` degenerated to `x & -1` (a no-op).
+    // regloc.py:456-464 routes such immediates through the scratch register.
+    let mask = 0xFFFF_FFFF_FFFFi64;
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let mut token = JitCellToken::new(45);
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+
+    let and_op = Op::new(OpCode::IntAnd, &[rb(i0), rb(OpRef::const_int(mask))]);
+    and_op.pos.set(OpRef::int_op(1));
+
+    let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![Type::Int]);
+    finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
+
+    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(and_op), Rc::new(finish_op)];
+    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let frame = backend.execute_token(&token, &[Value::Int(-1)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        mask,
+        "-1 & 0xFFFF_FFFF_FFFF must keep only the low 48 bits"
+    );
+}
+
+#[test]
+fn test_int_add_wide_immediate_is_not_truncated() {
+    // Twin of the AND test for the LEA-form `int_add` emitter: a 2^32
+    // addend truncated to imm32 would add 0.
+    let addend = 1i64 << 32;
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let mut token = JitCellToken::new(46);
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+
+    let add_op = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(addend))]);
+    add_op.pos.set(OpRef::int_op(1));
+
+    let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![Type::Int]);
+    finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
+
+    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(add_op), Rc::new(finish_op)];
+    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        addend + 7,
+        "7 + 2^32 must not truncate the immediate"
+    );
+}

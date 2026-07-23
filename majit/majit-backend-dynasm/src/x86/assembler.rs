@@ -1470,7 +1470,18 @@ impl<'a> Assembler386<'a> {
                 }
             }
             Loc::Immed(i) => {
-                let v = i.value as i32;
+                // regloc.py:456-464 — an immediate that does not fit in 32
+                // bits cannot use the imm32 form (the encoder would truncate
+                // it and the CPU sign-extend the low half, e.g. an
+                // 0xFFFF_FFFF_FFFF mask becoming an all-ones no-op);
+                // materialize it into the scratch register and retry as the
+                // reg-reg form.
+                let Ok(v) = i32::try_from(i.value) else {
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG;
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(scratch.value), QWORD i.value);
+                    self.emit_binop_reg_loc(opcode, dst_reg, &Loc::Reg(scratch));
+                    return;
+                };
                 match opcode {
                     OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
                         dynasm!(self.mc ; .arch x64 ; add Rq(dst_reg), v);
@@ -1487,15 +1498,12 @@ impl<'a> Assembler386<'a> {
                     OpCode::IntXor => {
                         dynasm!(self.mc ; .arch x64 ; xor Rq(dst_reg), v);
                     }
-                    OpCode::IntMul | OpCode::IntMulOvf if i32::try_from(i.value).is_ok() => {
+                    OpCode::IntMul | OpCode::IntMulOvf => {
                         // imul r64, r64, imm32 (sign-extended) — one instruction
                         // instead of materializing the constant into a scratch reg.
                         dynasm!(self.mc ; .arch x64 ; imul Rq(dst_reg), Rq(dst_reg), v);
                     }
-                    _ => {
-                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD i.value ; imul Rq(dst_reg), Rq(scratch));
-                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -2989,15 +2997,22 @@ impl<'a> Assembler386<'a> {
                     match (a0, src) {
                         (Loc::Reg(a), Loc::Reg(s)) => dynasm!(self.mc ; .arch x64
                             ; lea Rq(dst.value), [Rq(a.value) + Rq(s.value)]),
-                        (Loc::Reg(a), Loc::Immed(i)) => {
-                            let v = i.value as i32;
-                            dynasm!(self.mc ; .arch x64
-                                ; lea Rq(dst.value), [Rq(a.value) + v])
-                        }
-                        (Loc::Immed(i), Loc::Reg(s)) => {
-                            let v = i.value as i32;
-                            dynasm!(self.mc ; .arch x64
-                                ; lea Rq(dst.value), [Rq(s.value) + v])
+                        (Loc::Reg(a), Loc::Immed(i)) | (Loc::Immed(i), Loc::Reg(a)) => {
+                            // The `_consider_lea` route guarantees a fitting
+                            // disp32, but the `consider_binop_symm` fallback
+                            // reaches this arm with an arbitrary 64-bit
+                            // constant (regloc.py:456-464); materialize a wide
+                            // one into the scratch register and use the
+                            // base+index form.
+                            if let Ok(v) = i32::try_from(i.value) {
+                                dynasm!(self.mc ; .arch x64
+                                    ; lea Rq(dst.value), [Rq(a.value) + v])
+                            } else {
+                                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                                dynasm!(self.mc ; .arch x64
+                                    ; mov Rq(scratch), QWORD i.value
+                                    ; lea Rq(dst.value), [Rq(a.value) + Rq(scratch)])
+                            }
                         }
                         (Loc::Immed(i0), Loc::Immed(i1)) => {
                             let sum = i0.value.wrapping_add(i1.value);
