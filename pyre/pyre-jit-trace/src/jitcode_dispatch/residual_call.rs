@@ -1110,7 +1110,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // making the fall-through abort-safe instead of a silent double.
     let list_append_journal: Option<(pyre_object::PyObjectRef, usize)> =
         if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ListAppendValue {
-            let list = args.first().map(|&a| a as usize as pyre_object::PyObjectRef);
+            let list = args
+                .first()
+                .map(|&a| a as usize as pyre_object::PyObjectRef);
             list.filter(|&l| !l.is_null() && unsafe { pyre_object::pyobject::is_list(l) })
                 .map(|l| (l, unsafe { pyre_object::w_list_len(l) }))
         } else {

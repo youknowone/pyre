@@ -1460,11 +1460,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if !(fbw_bridge_rec_inline_enabled() && safe_root_bridge) {
             return Ok(None);
         }
-        bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32")) && unsafe {
-            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject;
-            !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
-        };
+        bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32"))
+            && unsafe {
+                let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject;
+                !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
+            };
     }
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
@@ -2299,8 +2300,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // sub-walk's nested recursive residual from the self-recursive
             // nested-residual decline, mirroring the native `CALL_ASSEMBLER`
             // fold's `SELFREC_CA_FOLD_ACTIVE` exemption.
-            let _bridge_rec_selfrec_guard =
-                bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
+            let _bridge_rec_selfrec_guard = bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
             walk(body.code, 0, &mut sub_wc)
         };
         let midbody_abort = match &result {
