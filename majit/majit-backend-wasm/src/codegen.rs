@@ -2679,8 +2679,11 @@ fn build_function(
             // length's high bits — a silent wrong value on wasm, where offset is
             // valid linear memory and does not trap. pyre models strings/unicode
             // as Array(Char) and routes these through the descr-driven
-            // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops; decline
-            // them (interpreter fallback) rather than ship a wrong hardcoded read.
+            // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops (verified
+            // with PYRE_DUMP_PERFN_JITCODE: a str-subscript / len / compare / find
+            // hot loop traces to GETARRAYITEM, never STRGETITEM). Decline them
+            // (interpreter fallback) rather than ship a descr-driven lowering that
+            // no trace exercises — a valid but untestable path here.
             OpCode::Strlen | OpCode::Unicodelen | OpCode::Strgetitem | OpCode::Unicodegetitem => {
                 return Err(BackendError::Unsupported(format!(
                     "wasm codegen: string/unicode direct-memory op {:?} (no descr-driven layout)",
@@ -2945,7 +2948,12 @@ fn build_function(
                     // (pyobject.rs `PyType::subclassrange_min: AtomicI64`); read
                     // the full field width, not the wasm32 4-byte `usize`, or the
                     // guard truncates/sign-extends the object's min.
-                    emit_sized_int_load(&mut sink, offset2 as u64, std::mem::size_of::<i64>(), true);
+                    emit_sized_int_load(
+                        &mut sink,
+                        offset2 as u64,
+                        std::mem::size_of::<i64>(),
+                        true,
+                    );
                 } else {
                     // assembler.py:1957-1969 gcremovetypeptr path.
                     //     MOV32 loc_tmp, mem(loc_object, 0)
