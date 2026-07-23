@@ -568,6 +568,20 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     let Some(consts) = ctx.inline_callee_consts else {
         return;
     };
+    // A non-standard virtualizable frame in a bridge sub-walk carries the
+    // `GcRef(usize::MAX)` sentinel (or null) as `w_code` instead of a real
+    // `PyCode` — a synthetic frame with no Python code to anchor a node on.
+    // The host adapter (`record_inline_traceback_for_recording`) dereferences
+    // `w_code` through `createframe_obj`, so a sentinel / garbage pointer would
+    // SIGSEGV.  Skip null / sentinel / non-code; the null + sentinel checks run
+    // before `is_code`, whose `py_type_check` would deref the raw sentinel
+    // (`CAN_BE_TAGGED` is off).
+    if consts.w_code == 0 || consts.w_code == usize::MAX {
+        return;
+    }
+    if !unsafe { pyre_interpreter::pycode::is_code(consts.w_code as pyre_object::PyObjectRef) } {
+        return;
+    }
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
         return;
     };
