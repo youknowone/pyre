@@ -33,13 +33,26 @@ pub const W_MODULE_GC_TYPE_ID: u32 = 36;
 /// Fixed payload size (`framework.py:811`).
 pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
 
-/// Byte offset of the inline `w_dict: PyObjectRef` slot — the GC must
-/// trace the aliased `W_DictObject` (`pypy/interpreter/module.py:22
-/// self.w_dict = w_dict`) so a Module surviving a minor collection
-/// keeps the user-supplied dict alive.  `name`/`dict` are non-PyObject
-/// raw heap pointers and are intentionally absent; they are owned via
-/// `lltype::malloc_raw` and traced through their own type ids.
-pub const W_MODULE_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(Module, w_dict)];
+/// Byte offsets of the inline `PyObjectRef` slots the GC must trace.
+///
+/// `w_dict` — the aliased `W_DictObject` (`pypy/interpreter/module.py:22
+/// self.w_dict = w_dict`) so a Module surviving a collection keeps its
+/// dict alive.
+///
+/// `w_class` — the module's class. For a `types.ModuleType` subclass
+/// instance this is a heap-allocated (GC-managed, collectible)
+/// `W_TypeObject`; if the module were its only reference, an untraced
+/// slot would let a major collection sweep the class and leave
+/// `type(m)` / slot dispatch pointing at freed memory. `W_ObjectObject`
+/// traces its `w_class` for the same reason (`object_object_custom_trace`).
+///
+/// `name`/`dict` are non-PyObject raw heap pointers and are intentionally
+/// absent; they are owned via `lltype::malloc_raw` and traced through
+/// their own type ids.
+pub const W_MODULE_GC_PTR_OFFSETS: [usize; 2] = [
+    std::mem::offset_of!(Module, ob_header.w_class),
+    std::mem::offset_of!(Module, w_dict),
+];
 
 impl crate::lltype::GcType for Module {
     fn type_id() -> u32 {
