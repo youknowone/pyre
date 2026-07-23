@@ -2479,7 +2479,15 @@ impl TraceCtx {
     /// no longer used.
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
         let _ = num_live;
-        Self::do_record_guard(&mut self.recorder, opcode, args, None)
+        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
+        // pyjitpl.py:2581 `count_ops(opnum, Counters.GUARDS)` — counted
+        // here at the record chokepoint so every recording call site
+        // bumps the bucket exactly once. generate_guard's Const-box
+        // early return records nothing (pyjitpl.py:2559), and callers
+        // here likewise fold instead of calling record_guard, so
+        // "count once per recorded guard" matches upstream.
+        self.profiler().count_ops(opcode, crate::counters::GUARDS);
+        opref
     }
 
     /// Record a guard carrying a pre-minted `ResumeGuardDescr`.
@@ -2494,7 +2502,10 @@ impl TraceCtx {
         args: &[OpRef],
         descr: DescrRef,
     ) -> OpRef {
-        Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr))
+        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr));
+        // pyjitpl.py:2581 — see record_guard.
+        self.profiler().count_ops(opcode, crate::counters::GUARDS);
+        opref
     }
 
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage typed
@@ -2520,6 +2531,8 @@ impl TraceCtx {
     ) -> OpRef {
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
         self.recorder.set_last_op_fail_arg_types(fail_arg_types);
+        // pyjitpl.py:2581 — see record_guard.
+        self.profiler().count_ops(opcode, crate::counters::GUARDS);
         opref
     }
 
