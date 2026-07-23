@@ -18,7 +18,7 @@ pub use buffered_random::W_BufferedRandom;
 
 // CPython 3.14 raised the public and constructor default from 8 KiB to
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
-pub(super) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
+pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
 
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
@@ -822,6 +822,47 @@ fn raw_iobase_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// PyPy `space.gettypefor(W_FileIO)`: one process-global concrete raw type.
+///
+/// `open()` needs the same type object exported by `_io`, rather than a
+/// second wrapper-shaped allocation path.
+pub(crate) fn fileio_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "FileIO",
+            |type_ns| {
+                crate::builtins::init_file_wrapper_type(type_ns);
+                crate::builtins::init_fileio_type(type_ns);
+                type_method(
+                    type_ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
+                );
+            },
+            raw_iobase_type(),
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
+
+pub(crate) fn buffered_reader_type() -> PyObjectRef {
+    buffered::type_object()
+}
+
+pub(crate) fn buffered_writer_type() -> PyObjectRef {
+    buffered_writer::type_object()
+}
+
+pub(crate) fn buffered_random_type() -> PyObjectRef {
+    buffered_random::type_object()
+}
+
 pub(super) fn buffered_iobase_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
@@ -938,22 +979,7 @@ crate::py_module! {
         // test_io), so they must be real types, not function stubs.
         // `FileIO` derives from `_RawIOBase`; the buffered classes from
         // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
-        let file_io = crate::typedef::make_builtin_type_with_base(
-            "FileIO",
-            |type_ns| {
-                crate::builtins::init_file_wrapper_type(type_ns);
-                crate::builtins::init_fileio_type(type_ns);
-                type_method(
-                    type_ns,
-                    "__init__",
-                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
-                );
-            },
-            raw_base,
-        );
-        // W_IOBase carries a weakref lifeline; W_FileIO instances therefore
-        // accept weak references just like PyPy's concrete raw stream.
-        unsafe { pyre_object::w_type_set_weakrefable(file_io, true) };
+        let file_io = fileio_type();
         let buffered_reader = buffered::type_object();
         let buffered_writer = buffered_writer::type_object();
         let buffered_rwpair = buffered_rwpair::type_object();

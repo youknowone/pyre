@@ -433,8 +433,14 @@ impl W_BufferedWriter {
         Ok((self.raw_tell()? - self.raw_offset()).max(0))
     }
 
-    fn seek(&mut self, pos: i64, #[default(0)] whence: i64) -> Result<i64, crate::PyError> {
+    fn seek(
+        &mut self,
+        w_pos: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] w_whence: PyObjectRef,
+    ) -> Result<i64, crate::PyError> {
         self.check_closed("seek of closed file")?;
+        let pos = crate::builtins::space_index_w(w_pos)?;
+        let whence = crate::builtins::space_index_w(w_whence)?;
         if !(0..=2).contains(&whence) {
             return Err(crate::PyError::value_error(format!(
                 "whence must be between 0 and 2, not {whence}"

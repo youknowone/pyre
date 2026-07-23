@@ -10282,7 +10282,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         ));
     }
     let opener = bind_pos_or_kw(pos, kwargs, 4, "opener", "FileIO", 4)?.unwrap_or_else(w_none);
-    let opened = builtin_open(&[
+    let opened = open_raw_file(&[
         file,
         w_str_new(&raw_mode),
         w_int_new(-1),
@@ -10334,6 +10334,24 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         return Err(crate::PyError::runtime_error(
             "FileIO instance has no state dictionary",
         ));
+    }
+    // PyPy `W_FileIO.descr_init`: append streams are positioned at EOF
+    // immediately, rather than waiting for their first O_APPEND write.
+    if primary == 'a' {
+        if let Some(fd) = file_get_fd(self_obj) {
+            #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+            {
+                #[cfg(not(feature = "sandbox"))]
+                if unsafe { libc::lseek(fd, 0, libc::SEEK_END) } < 0 {
+                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                }
+                #[cfg(feature = "sandbox")]
+                crate::host_seam::ops::lseek(fd, 0, libc::SEEK_END)
+                    .map_err(|error| crate::host_seam::seam_os_err(error, ""))?;
+            }
+        } else {
+            file_set_pos(self_obj, file_get_data(self_obj).len());
+        }
     }
     Ok(w_none())
 }
@@ -11208,7 +11226,217 @@ fn fileio_close_owned_fd(fd: i32) {
     let _ = crate::host_seam::ops::close(fd);
 }
 
+/// `open()` — PyPy `pypy/module/_io/interp_io.py:open`.
+///
+/// Keep the upstream construction order literal: validate the mode, create a
+/// `FileIO`, choose exactly one buffered class, and only then add the text
+/// wrapper.  In particular, binary unbuffered I/O returns the raw `FileIO`.
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(
+        kwargs,
+        &[
+            "file",
+            "mode",
+            "buffering",
+            "encoding",
+            "errors",
+            "newline",
+            "closefd",
+            "opener",
+        ],
+        "open",
+    )?;
+    let file = bind_pos_or_kw(positional, kwargs, 0, "file", "open", 1)?
+        .ok_or_else(|| crate::PyError::type_error("open() missing 'file' argument"))?;
+    let w_mode =
+        bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
+    if unsafe { !pyre_object::is_str(w_mode) } {
+        return Err(crate::PyError::type_error(format!(
+            "open() argument 'mode' must be str, not {}",
+            crate::type_methods::arg_type_name(w_mode)
+        )));
+    }
+    let mode = unsafe { pyre_object::w_str_get_value(w_mode).to_string() };
+    let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
+        .unwrap_or_else(|| w_int_new(-1));
+    let mut buffering = crate::baseobjspace::index_int_w_preserve_negative(w_buffering)?;
+    let w_encoding =
+        bind_pos_or_kw(positional, kwargs, 3, "encoding", "open", 4)?.unwrap_or_else(w_none);
+    let w_errors =
+        bind_pos_or_kw(positional, kwargs, 4, "errors", "open", 5)?.unwrap_or_else(w_none);
+    let w_newline =
+        bind_pos_or_kw(positional, kwargs, 5, "newline", "open", 6)?.unwrap_or_else(w_none);
+    let w_closefd = bind_pos_or_kw(positional, kwargs, 6, "closefd", "open", 7)?
+        .unwrap_or_else(|| w_bool_from(true));
+    let w_opener =
+        bind_pos_or_kw(positional, kwargs, 7, "opener", "open", 8)?.unwrap_or_else(w_none);
+
+    for (name, value) in [
+        ("encoding", w_encoding),
+        ("errors", w_errors),
+        ("newline", w_newline),
+    ] {
+        if unsafe { !pyre_object::is_none(value) && !pyre_object::is_str(value) } {
+            return Err(crate::PyError::type_error(format!(
+                "open() argument '{name}' must be str or None, not {}",
+                crate::type_methods::arg_type_name(value)
+            )));
+        }
+    }
+
+    let mut reading = false;
+    let mut writing = false;
+    let mut appending = false;
+    let mut exclusive = false;
+    let mut updating = false;
+    let mut text = false;
+    let mut binary = false;
+    let mut seen = String::new();
+    for flag in mode.chars() {
+        if seen.contains(flag) {
+            return Err(crate::PyError::value_error(format!(
+                "invalid mode: '{mode}'"
+            )));
+        }
+        seen.push(flag);
+        match flag {
+            'r' => reading = true,
+            'w' => writing = true,
+            'a' => appending = true,
+            'x' => exclusive = true,
+            '+' => updating = true,
+            't' => text = true,
+            'b' => binary = true,
+            _ => {
+                return Err(crate::PyError::value_error(format!(
+                    "invalid mode: '{mode}'"
+                )));
+            }
+        }
+    }
+    if text && binary {
+        return Err(crate::PyError::value_error(
+            "can't have text and binary mode at once",
+        ));
+    }
+    if [reading, writing, appending, exclusive]
+        .into_iter()
+        .filter(|flag| *flag)
+        .count()
+        != 1
+    {
+        return Err(crate::PyError::value_error(
+            "must have exactly one of create/read/write/append mode",
+        ));
+    }
+    if binary && unsafe { !pyre_object::is_none(w_encoding) } {
+        return Err(crate::PyError::value_error(
+            "binary mode doesn't take an encoding argument",
+        ));
+    }
+    if binary && unsafe { !pyre_object::is_none(w_errors) } {
+        return Err(crate::PyError::value_error(
+            "binary mode doesn't take an errors argument",
+        ));
+    }
+    if binary && unsafe { !pyre_object::is_none(w_newline) } {
+        return Err(crate::PyError::value_error(
+            "binary mode doesn't take a newline argument",
+        ));
+    }
+
+    let primary = if reading {
+        'r'
+    } else if writing {
+        'w'
+    } else if appending {
+        'a'
+    } else {
+        'x'
+    };
+    let raw_mode = format!("{primary}{}", if updating { "+" } else { "" });
+    let raw = crate::call::call_function_impl_result(
+        crate::module::_io::fileio_type(),
+        &[file, w_str_new(&raw_mode), w_closefd, w_opener],
+    )?;
+    let roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(raw);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let isatty = crate::baseobjspace::call_method(
+        pyre_object::gc_roots::shadow_stack_get(raw_slot),
+        "isatty",
+        &[],
+    );
+    if isatty.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error("isatty failed")));
+    }
+    let line_buffering = buffering == 1 || (buffering < 0 && crate::baseobjspace::is_true(isatty)?);
+    if line_buffering {
+        buffering = -1;
+    }
+    if buffering < 0 {
+        buffering = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
+            "_blksize",
+        )
+        .ok()
+        .and_then(|value| crate::baseobjspace::int_w(value).ok())
+        .filter(|size| *size > 1)
+        .unwrap_or(crate::module::_io::DEFAULT_BUFFER_SIZE);
+    }
+    if buffering == 0 {
+        if !binary {
+            return Err(crate::PyError::value_error(
+                "can't have unbuffered text I/O",
+            ));
+        }
+        return Ok(pyre_object::gc_roots::shadow_stack_get(raw_slot));
+    }
+
+    let buffer_type = if updating {
+        crate::module::_io::buffered_random_type()
+    } else if writing || appending || exclusive {
+        crate::module::_io::buffered_writer_type()
+    } else {
+        crate::module::_io::buffered_reader_type()
+    };
+    let buffer = crate::call::call_function_impl_result(
+        buffer_type,
+        &[
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
+            w_int_new(buffering),
+        ],
+    )?;
+    pyre_object::gc_roots::pin_root(buffer);
+    let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if binary {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(buffer_slot));
+    }
+
+    let wrapper = crate::call::call_function_impl_result(
+        text_io_wrapper_type(),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            w_encoding,
+            w_errors,
+            w_newline,
+            w_bool_from(line_buffering),
+        ],
+    )?;
+    crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode))?;
+    drop(roots);
+    Ok(wrapper)
+}
+
+/// Low-level storage opener used by `W_FileIO.descr_init`.
+///
+/// This is pyre's `_open_fd`/raw-storage boundary.  It deliberately does not
+/// assemble buffered or text layers; public `open()` below does that after it
+/// has constructed the real `_io.FileIO` object.
+fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("open() missing 'file' argument"));
     }
@@ -11583,10 +11811,41 @@ fn textio_configure(
     let errors = str_arg(positional.get(2).copied())
         .or_else(|| str_arg(crate::builtins::kwarg_get(kwargs, "errors")))
         .unwrap_or_else(|| "strict".to_string());
+    let newline_obj = positional
+        .get(3)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "newline"))
+        .unwrap_or_else(w_none);
+    let newline = unsafe {
+        if pyre_object::is_none(newline_obj) {
+            None
+        } else if pyre_object::is_str(newline_obj) {
+            Some(pyre_object::w_str_get_value(newline_obj).to_string())
+        } else {
+            return Err(crate::PyError::type_error("illegal newline type"));
+        }
+    };
+    if !matches!(
+        newline.as_deref(),
+        None | Some("") | Some("\n") | Some("\r") | Some("\r\n")
+    ) {
+        return Err(crate::PyError::value_error(format!(
+            "illegal newline value: {}",
+            newline.as_deref().unwrap_or_default()
+        )));
+    }
+    let line_buffering_obj = positional
+        .get(4)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "line_buffering"))
+        .unwrap_or_else(|| w_bool_from(false));
+    let line_buffering = crate::baseobjspace::is_true(line_buffering_obj)?;
     crate::baseobjspace::setattr_str(self_obj, "__textio_buffer__", buffer)?;
+    crate::baseobjspace::setattr_str(self_obj, "__textio_newline__", newline_obj)?;
     crate::baseobjspace::setattr_str(self_obj, "closed", w_bool_from(false))?;
     crate::baseobjspace::setattr_str(self_obj, "encoding", w_str_new(&encoding))?;
     crate::baseobjspace::setattr_str(self_obj, "errors", w_str_new(&errors))?;
+    crate::baseobjspace::setattr_str(self_obj, "line_buffering", w_bool_from(line_buffering))?;
     if let Ok(name) = crate::baseobjspace::getattr_str(buffer, "name") {
         crate::baseobjspace::setattr_str(self_obj, "name", name)?;
     }
@@ -11665,6 +11924,56 @@ fn textio_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let _ = textio_call_buffer(args[0], "close", &[]);
     let _ = crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true));
     Ok(w_none())
+}
+
+fn textio_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    textio_call_buffer(args[0], "flush", &[])
+}
+
+fn textio_method_tell(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    textio_call_buffer(args[0], "tell", &[])
+}
+
+fn textio_method_seek(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let pos = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("seek() missing position"))?;
+    let pos_value = space_index_w(pos)?;
+    let whence = match args.get(2).copied() {
+        Some(value) => space_index_w(value)?,
+        None => 0,
+    };
+    if pos_value != 0 && whence == 1 {
+        return Err(crate::module::_io::unsupported(
+            "can't do nonzero cur-relative seeks",
+        ));
+    }
+    if pos_value != 0 && whence == 2 {
+        return Err(crate::module::_io::unsupported(
+            "can't do nonzero end-relative seeks",
+        ));
+    }
+    let seek_args = if args.len() > 2 {
+        &args[1..3]
+    } else {
+        &args[1..2]
+    };
+    textio_call_buffer(args[0], "seek", seek_args)
+}
+
+/// PyPy `W_TextIOWrapper.truncate_w`: flush the text layer, then delegate.
+fn textio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    textio_method_flush(&args[..1])?;
+    textio_call_buffer(args[0], "truncate", &args[1..])
+}
+
+fn textio_get_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    textio_buffer(self_obj)
 }
 
 /// Shared `_io.TextIOWrapper` type for text-mode file objects.
@@ -11751,7 +12060,31 @@ fn init_text_io_wrapper_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "flush",
-            make_builtin_function_with_arity("flush", |_| Ok(w_none()), 1),
+            make_builtin_function_with_arity("flush", textio_method_flush, 1),
+        )
+    };
+    for (name, function) in [
+        ("tell", textio_method_tell as crate::gateway::BuiltinCodeFn),
+        ("seek", textio_method_seek as crate::gateway::BuiltinCodeFn),
+        (
+            "truncate",
+            textio_method_truncate as crate::gateway::BuiltinCodeFn,
+        ),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, function),
+            )
+        };
+    }
+    let buffer_getter = make_builtin_function_with_arity("buffer", textio_get_buffer, 2);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "buffer",
+            crate::typedef::make_getset_descriptor_named(buffer_getter, "buffer"),
         )
     };
     unsafe {
@@ -12682,7 +13015,14 @@ mod tests {
             pyre_object::w_bool_get_value(crate::baseobjspace::getattr_str(file, "closed").unwrap())
         });
 
-        file_method_close(&[file]).unwrap();
+        let closed = crate::baseobjspace::call_method(file, "close", &[]);
+        assert!(!closed.is_null());
+
+        let raw = builtin_open(&[w_str_new(path_text), w_str_new("rb"), w_int_new(0)]).unwrap();
+        let raw_type = crate::typedef::r#type(raw).unwrap();
+        assert_eq!(unsafe { pyre_object::w_type_get_name(raw_type) }, "FileIO");
+        let closed = crate::baseobjspace::call_method(raw, "close", &[]);
+        assert!(!closed.is_null());
         std::fs::remove_file(path).unwrap();
     }
 
