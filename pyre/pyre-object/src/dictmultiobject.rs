@@ -2923,7 +2923,14 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     }) {
         return result;
     }
+    // `value` is a native local held across the scan; a mid-scan GC in a
+    // probing `__eq__` could move it before the identity check below, so pin
+    // and reload it alongside the container the scan returns.
+    let _value_root = crate::gc_roots::push_roots();
+    let value_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(value);
     let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
+    let value = crate::gc_roots::shadow_stack_get(value_slot);
     let Some(index) = found else {
         return Ok(false);
     };
