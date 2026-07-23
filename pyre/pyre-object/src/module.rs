@@ -94,11 +94,13 @@ pub fn w_module_new(name: &str) -> PyObjectRef {
 
 /// Python-visible module allocation (`types.ModuleType.__new__`).
 ///
-/// This is the ordinary RPython GC shape: the holder belongs to the collector,
-/// carries `W_MODULE_GC_TYPE_ID`, and is traced through
-/// `W_MODULE_GC_PTR_OFFSETS`, so a moving collection forwards `w_dict`.
+/// The holder belongs to the collector, carries `W_MODULE_GC_TYPE_ID`, and is
+/// traced through `W_MODULE_GC_PTR_OFFSETS`, so a minor collection forwards
+/// `w_dict`. The allocation itself is stable (non-moving old gen): module
+/// objects flow into JIT traces as promoted constants (globals lookups,
+/// attribute caches), and a baked pointer must survive later collections.
 pub fn w_module_new_managed(name: &str) -> PyObjectRef {
-    crate::lltype::malloc_typed_managed(module_value(name)) as PyObjectRef
+    crate::lltype::malloc_typed_stable(module_value(name)) as PyObjectRef
 }
 
 /// Allocate a `Module` aliasing a user-supplied `W_DictObject`.
