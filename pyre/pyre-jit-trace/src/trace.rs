@@ -1121,7 +1121,15 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         entry,
         &argboxes_r,
         local_concretes,
-        &[],
+        // Depth-2: tell the deepest sub-walk the middle frame is paused so its
+        // in-callee guard snapshots encode the full [deepest, middle, root]
+        // chain, not just [deepest, root] (else the blackhole rebuilds a
+        // framestack missing the middle on such a guard's deopt).
+        if carrier.recipes.len() == 2 && crate::jitcode_dispatch::fbw_max_multiframe_depth() >= 2 {
+            &carrier.recipes[..1]
+        } else {
+            &[]
+        },
     );
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
@@ -1135,25 +1143,40 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         _ => None,
     };
     if let Some(result) = subwalk_result {
-        if carrier.recipes.len() == 1 {
-            if inject_root_call_result(sym, root_pc, result) {
-                crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-                let root_py_pc =
-                    crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
-                        as usize;
-                // The sub-walk above already applied the callee's eager stores
-                // and journaled them; hand those journals to the root walk so
-                // its epilogue settles them exactly once.
-                return full_body_walk_trace(
-                    ctx,
-                    sym,
-                    w_code,
-                    root_py_pc,
-                    cf_addr,
-                    WalkJournals::Keep,
-                );
+        // Depth-2: after the deepest callee returns cleanly, drive the one
+        // paused MIDDLE frame (recipes[0]) forward, delivering the deepest
+        // SubReturn into its call-dst register (make_result_of_lastop) and
+        // rebinding `result` to the middle's own return.  A non-portable middle
+        // shape yields `None` and drops to the journal-rollback abort epilogue
+        // below, so a depth-2 carrier we cannot compile deopts cleanly.
+        let want_depth2 = carrier.recipes.len() == 2
+            && crate::jitcode_dispatch::fbw_max_multiframe_depth() >= 2;
+        let threaded = if want_depth2 {
+            drive_middle_frame_and_thread(ctx, &session, sym, root_pc, root_ec, carrier, result)
+        } else {
+            Some(result)
+        };
+        if let Some(result) = threaded {
+            if carrier.recipes.len() == 1 || want_depth2 {
+                if inject_root_call_result(sym, root_pc, result) {
+                    crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
+                    let root_py_pc =
+                        crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
+                            as usize;
+                    // The sub-walk above already applied the callee's eager
+                    // stores and journaled them; hand those journals to the root
+                    // walk so its epilogue settles them exactly once.
+                    return full_body_walk_trace(
+                        ctx,
+                        sym,
+                        w_code,
+                        root_py_pc,
+                        cf_addr,
+                        WalkJournals::Keep,
+                    );
+                }
+                crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
             }
-            crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
         }
     }
 
@@ -1191,6 +1214,79 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // eager store standing to be applied a second time).
     crate::jitcode_dispatch::fbw_store_journal_rollback();
     p2_drain_abort()
+}
+
+/// Depth-2 middle-frame drive for the DEFAULT drain: reconstruct the paused
+/// middle frame (`recipes[0]`), deliver the deepest callee's `child_result` into
+/// its residual-call return register (`make_result_of_lastop`), and walk it
+/// forward to its own `SubReturn`.  Returns the middle's result on a clean
+/// return, or `None` on any non-portable shape (recording a `P2Drain::*` census)
+/// so the caller falls through to the drain's journal-rollback abort epilogue.
+///
+/// Unlike the framestack twin (the `recipes.len() == 2` block in
+/// `drive_bridge_framestack_walk`) the failure arms do NOT cut/reset here: the
+/// drain's epilogue rolls the journal back (both the deepest and middle frames'
+/// eager stores) for the blackhole replay, so a reset would leave those stores
+/// double-applied.  Mirrors resume.py:1049-1056 `finishframe` delivering the
+/// child result into the parent's dst.
+#[allow(clippy::too_many_arguments)]
+fn drive_middle_frame_and_thread<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
+    sym: &mut Sym,
+    root_pc: usize,
+    root_ec: *const pyre_interpreter::PyExecutionContext,
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+    child_result: majit_ir::OpRef,
+) -> Option<majit_ir::OpRef> {
+    let middle = &carrier.recipes[0];
+    let Some((_pending, middle_argboxes_r)) =
+        crate::state::setup_reconstructed_callee_frame(ctx, middle, root_ec, Vec::new())
+    else {
+        crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
+        return None;
+    };
+    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+        crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
+        return None;
+    };
+    let middle_entry = select_recipe_entry(
+        middle.jitcode_index,
+        middle_pjc.jitcode.index() as i32,
+        middle.jitcode_pc,
+    );
+    let Some(middle_entry) = middle_entry else {
+        crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
+        return None;
+    };
+    let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
+    let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
+    let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
+    let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
+        ctx,
+        session,
+        sym,
+        root_pc,
+        &middle_pjc,
+        middle.code_ptr as usize,
+        middle_w_globals,
+        middle_entry,
+        &middle_argboxes_r,
+        middle_local_concretes,
+        child_result,
+    );
+    match middle_walk {
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                result: Some(mid_result),
+            },
+            _,
+        ))) => Some(mid_result),
+        _ => {
+            crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveFailed");
+            None
+        }
+    }
 }
 
 /// Shape A orthodox multi-frame bridge resume: the escape-hatch driver for a
