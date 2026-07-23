@@ -925,8 +925,37 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if ctx.vstack_valid {
         let caller_jitcode = unsafe { &*sym.jitcode() };
         let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
-        let call_py_pc = python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
-        let resume_py_pc = crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32;
+        // #73 Slice 4: forward after-residual fallthrough coordinate; the
+        // inversion survives only for the empty-twin class and as the audit
+        // oracle.
+        let legacy_resume_py_pc = || {
+            let call_py_pc =
+                python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
+            crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32
+        };
+        let resume_py_pc = match caller_jitcode
+            .payload
+            .after_residual_fallthrough_py_pc_populated()
+            .then(|| {
+                caller_jitcode
+                    .payload
+                    .after_residual_fallthrough_py_pc_for_jitcode_pc(op.pc)
+            })
+            .flatten()
+        {
+            Some(ft) => {
+                if pcmap_afterresidual_audit_enabled() {
+                    assert_eq!(
+                        ft,
+                        legacy_resume_py_pc(),
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: self-recursive CA vstack fallthrough-py twin diverged at jit_pc {}",
+                        op.pc
+                    );
+                }
+                ft
+            }
+            None => legacy_resume_py_pc(),
+        };
         let raw_depth = || {
             crate::liveness::liveness_for(caller_jitcode.payload.code_ptr)
                 .depth_at_py_pc()

@@ -71,9 +71,31 @@ pub(crate) fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<
             if pjc.code_ptr.is_null() {
                 return None;
             }
-            let call_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
-            let code = unsafe { &*pjc.code_ptr };
-            Some(crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32)
+            // #73 Slice 4: read the forward after-residual fallthrough twin. The
+            // inversion survives only for the empty-twin class (populated code
+            // with no Python map) and as the audit oracle.
+            let legacy = || {
+                let call_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+                let code = unsafe { &*pjc.code_ptr };
+                crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32
+            };
+            let twin = pjc
+                .after_residual_fallthrough_py_pc_populated()
+                .then(|| pjc.after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc))
+                .flatten();
+            match twin {
+                Some(ft) => {
+                    if pcmap_afterresidual_audit_enabled() {
+                        assert_eq!(
+                            ft,
+                            legacy(),
+                            "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: parent-resume fallthrough-py twin diverged at jit_pc {call_jit_pc}"
+                        );
+                    }
+                    Some(ft)
+                }
+                None => Some(legacy()),
+            }
         }
     }
 }
