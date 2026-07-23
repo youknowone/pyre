@@ -59,10 +59,17 @@ pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: 
 /// paths; it is never a panic.
 pub(crate) fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<u32> {
     match parent.resume_coord {
-        ParentResumeCoord::Backxlat(jitcode_pc) => Some(crate::state::backxlat_py_pc(
-            parent.jitcode_index as i32,
-            jitcode_pc as i32,
-        ) as u32),
+        ParentResumeCoord::Backxlat(jitcode_pc) => {
+            // #73: read the forward py_pc twin (a codewriter-built,
+            // trivia-normalized twin of `backxlat_py_pc`'s result — proven equal
+            // corpus-wide in Slice 3'). The inversion survives only for the
+            // empty-twin class (skeleton / fixture jitcodes).
+            let twin = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+                .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(jitcode_pc));
+            Some(twin.unwrap_or_else(|| {
+                crate::state::backxlat_py_pc(parent.jitcode_index as i32, jitcode_pc as i32) as u32
+            }))
+        }
         ParentResumeCoord::CallFallthrough(call_jit_pc) => {
             let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
             else {
