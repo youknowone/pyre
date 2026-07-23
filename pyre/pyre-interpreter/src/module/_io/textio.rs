@@ -4,11 +4,246 @@
 //! `W_TextIOWrapper`.  In particular, the buffer and the
 //! ZERO/OK/DETACHED state are not instance-dict side data.
 
+use num_traits::ToPrimitive;
 use pyre_object::*;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 const STATE_ZERO: i64 = 0;
 const STATE_OK: i64 = 1;
 const STATE_DETACHED: i64 = 2;
+
+/// PyPy `PositionCookie`.  Each field occupies one native unsigned word in
+/// the opaque integer returned by `tell()`.
+#[derive(Default)]
+struct PositionCookie {
+    start_pos: u64,
+    dec_flags: u64,
+    bytes_to_feed: u64,
+    chars_to_skip: u64,
+    need_eof: bool,
+}
+
+impl PositionCookie {
+    const BITS: usize = u64::BITS as usize;
+
+    fn unpack(mut value: malachite_bigint::BigInt) -> Result<Self, crate::PyError> {
+        if value < malachite_bigint::BigInt::from(0) {
+            return Err(crate::PyError::value_error("negative seek position"));
+        }
+        let mask =
+            (malachite_bigint::BigInt::from(1) << Self::BITS) - malachite_bigint::BigInt::from(1);
+        let mut take = || {
+            let field = (&value & &mask).to_u64().unwrap_or(0);
+            value >>= Self::BITS;
+            field
+        };
+        let start_pos = take();
+        let dec_flags = take();
+        let bytes_to_feed = take();
+        let chars_to_skip = take();
+        let need_eof = value != malachite_bigint::BigInt::from(0);
+        Ok(Self {
+            start_pos,
+            dec_flags,
+            bytes_to_feed,
+            chars_to_skip,
+            need_eof,
+        })
+    }
+
+    fn pack(&self) -> malachite_bigint::BigInt {
+        let mut result = malachite_bigint::BigInt::from(self.start_pos);
+        result |= malachite_bigint::BigInt::from(self.dec_flags) << Self::BITS;
+        result |= malachite_bigint::BigInt::from(self.bytes_to_feed) << (Self::BITS * 2);
+        result |= malachite_bigint::BigInt::from(self.chars_to_skip) << (Self::BITS * 3);
+        if self.need_eof {
+            result |= malachite_bigint::BigInt::from(1) << (Self::BITS * 4);
+        }
+        result
+    }
+
+    fn to_object(&self) -> PyObjectRef {
+        crate::objspace::descroperation::box_bigint_result(self.pack())
+    }
+}
+
+/// PyPy `PositionSnapshot`.
+struct PositionSnapshot {
+    flags: u64,
+    input: Vec<u8>,
+}
+
+/// PyPy `interp_textio.DecodeBuffer`.
+#[derive(Default)]
+struct DecodeBuffer {
+    text: Option<Wtf8Buf>,
+    pos: usize,
+    upos: usize,
+    ulen: usize,
+}
+
+impl DecodeBuffer {
+    fn set(&mut self, decoded: PyObjectRef) -> Result<(), crate::PyError> {
+        if unsafe { !pyre_object::is_str(decoded) } {
+            return Err(crate::PyError::type_error(format!(
+                "decoder should return a string result, not '{}'",
+                crate::type_methods::arg_type_name(decoded)
+            )));
+        }
+        let text = unsafe { pyre_object::w_str_get_wtf8(decoded) }.to_wtf8_buf();
+        self.ulen = text.code_points().count();
+        self.text = Some(text);
+        self.pos = 0;
+        self.upos = 0;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.text = None;
+        self.pos = 0;
+        self.upos = 0;
+        self.ulen = 0;
+    }
+
+    fn has_data(&self) -> bool {
+        self.text.is_some() && !self.exhausted()
+    }
+
+    fn exhausted(&self) -> bool {
+        self.text.as_ref().is_none_or(|text| self.pos >= text.len())
+    }
+
+    fn available(&self) -> usize {
+        self.ulen.saturating_sub(self.upos)
+    }
+
+    fn advance(&mut self) {
+        let text = self.text.as_ref().expect("DecodeBuffer text");
+        let cp = text[self.pos..]
+            .code_points()
+            .next()
+            .expect("advance requires available data");
+        self.pos += cp.len_wtf8();
+        self.upos += 1;
+    }
+
+    fn get_chars(&mut self, size: Option<usize>) -> Wtf8Buf {
+        let Some(text) = self.text.as_ref() else {
+            return Wtf8Buf::new();
+        };
+        let count = size.unwrap_or(self.available()).min(self.available());
+        let start = self.pos;
+        let end = text[start..]
+            .code_point_indices()
+            .nth(count)
+            .map_or(text.len(), |(offset, _)| start + offset);
+        let result = text[start..end].to_wtf8_buf();
+        self.pos = end;
+        self.upos += count;
+        result
+    }
+
+    fn find_char(&mut self, marker: u8, limit: Option<usize>) -> bool {
+        let mut scanned = 0;
+        while limit.is_none_or(|limit| scanned < limit) && !self.exhausted() {
+            let found = self
+                .text
+                .as_ref()
+                .expect("DecodeBuffer text")
+                .ascii_byte_at(self.pos)
+                == marker;
+            self.advance();
+            scanned += 1;
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_newline_universal(&mut self, limit: Option<usize>) -> bool {
+        let mut scanned = 0;
+        while limit.is_none_or(|limit| scanned < limit) && !self.exhausted() {
+            let byte = self
+                .text
+                .as_ref()
+                .expect("DecodeBuffer text")
+                .ascii_byte_at(self.pos);
+            self.advance();
+            scanned += 1;
+            if byte == b'\n' {
+                return true;
+            }
+            if byte == b'\r' {
+                if limit.is_some_and(|limit| scanned >= limit) || self.exhausted() {
+                    return true;
+                }
+                if self
+                    .text
+                    .as_ref()
+                    .expect("DecodeBuffer text")
+                    .ascii_byte_at(self.pos)
+                    == b'\n'
+                {
+                    self.advance();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_crlf(&mut self, limit: Option<usize>) -> bool {
+        let mut scanned = 0;
+        while limit.is_none_or(|limit| scanned < limit) && !self.exhausted() {
+            let byte = self
+                .text
+                .as_ref()
+                .expect("DecodeBuffer text")
+                .ascii_byte_at(self.pos);
+            if byte != b'\r' {
+                self.advance();
+                scanned += 1;
+                continue;
+            }
+            let saved_pos = self.pos;
+            let saved_upos = self.upos;
+            self.advance();
+            scanned += 1;
+            if limit.is_some_and(|limit| scanned >= limit) {
+                return false;
+            }
+            if self.exhausted() {
+                self.pos = saved_pos;
+                self.upos = saved_upos;
+                return false;
+            }
+            if self
+                .text
+                .as_ref()
+                .expect("DecodeBuffer text")
+                .ascii_byte_at(self.pos)
+                == b'\n'
+            {
+                self.advance();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn consumed_from(&self, start: usize) -> Wtf8Buf {
+        self.text
+            .as_ref()
+            .map_or_else(Wtf8Buf::new, |text| text[start..self.pos].to_wtf8_buf())
+    }
+
+    fn starts_with_lf(&self) -> bool {
+        self.text
+            .as_ref()
+            .is_some_and(|text| self.pos < text.len() && text.ascii_byte_at(self.pos) == b'\n')
+    }
+}
 
 #[crate::pyre_class("_io.TextIOWrapper")]
 pub struct W_TextIOWrapper {
@@ -18,14 +253,22 @@ pub struct W_TextIOWrapper {
     w_errors: PyObjectRef,
     w_newline: PyObjectRef,
     w_stdio_name: PyObjectRef,
+    w_encoder: PyObjectRef,
+    w_decoder: PyObjectRef,
     line_buffering: bool,
     write_through: bool,
-    has_read: bool,
-    decoded: String,
-    decoded_pos: usize,
-    decoded_loaded: bool,
-    encoder_fresh: bool,
-    suppress_bom: bool,
+    decoded: DecodeBuffer,
+    snapshot: Option<PositionSnapshot>,
+    pending_bytes: Option<Vec<Vec<u8>>>,
+    pending_bytes_count: usize,
+    chunk_size: i64,
+    b2cratio: f64,
+    has_read1: bool,
+    readuniversal: bool,
+    readtranslate: bool,
+    seekable_flag: bool,
+    telling: bool,
+    encoding_start_of_stream: bool,
 }
 
 impl Default for W_TextIOWrapper {
@@ -38,14 +281,22 @@ impl Default for W_TextIOWrapper {
             w_errors: PY_NULL,
             w_newline: PY_NULL,
             w_stdio_name: PY_NULL,
+            w_encoder: PY_NULL,
+            w_decoder: PY_NULL,
             line_buffering: false,
             write_through: false,
-            has_read: false,
-            decoded: String::new(),
-            decoded_pos: 0,
-            decoded_loaded: false,
-            encoder_fresh: true,
-            suppress_bom: false,
+            decoded: DecodeBuffer::default(),
+            snapshot: None,
+            pending_bytes: None,
+            pending_bytes_count: 0,
+            chunk_size: 8192,
+            b2cratio: 0.0,
+            has_read1: false,
+            readuniversal: false,
+            readtranslate: false,
+            seekable_flag: false,
+            telling: false,
+            encoding_start_of_stream: false,
         }
     }
 }
@@ -91,20 +342,6 @@ impl W_TextIOWrapper {
     fn call_buffer(&self, name: &str, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         self.check_attached()?;
         super::call_method_result(self.w_buffer, name, args)
-    }
-
-    fn encoding_errors(&self) -> (String, String) {
-        let read = |obj: PyObjectRef, default: &str| unsafe {
-            if !obj.is_null() && pyre_object::is_str(obj) {
-                pyre_object::w_str_get_value(obj).to_string()
-            } else {
-                default.to_string()
-            }
-        };
-        (
-            read(self.w_encoding, "utf-8"),
-            read(self.w_errors, "strict"),
-        )
     }
 
     /// PyPy `text0_or_none` / `io_check_errors` first route text through a
@@ -164,25 +401,6 @@ impl W_TextIOWrapper {
         }
     }
 
-    fn decode(&self, obj: PyObjectRef) -> Result<String, crate::PyError> {
-        let (encoding, errors) = self.encoding_errors();
-        let text = unsafe {
-            if pyre_object::bytesobject::is_bytes_like(obj) {
-                let decoded = crate::typedef::bytes_method_decode(&[
-                    obj,
-                    w_str_new(&encoding),
-                    w_str_new(&errors),
-                ])?;
-                pyre_object::w_str_get_value(decoded).to_string()
-            } else if pyre_object::is_str(obj) {
-                pyre_object::w_str_get_value(obj).to_string()
-            } else {
-                String::new()
-            }
-        };
-        Ok(text)
-    }
-
     fn configured_newline(&self) -> Option<&str> {
         unsafe {
             if pyre_object::is_none(self.w_newline) {
@@ -193,23 +411,10 @@ impl W_TextIOWrapper {
         }
     }
 
-    /// PyPy `DecodeBuffer` + `_read_chunk`.  The current backend fills the
-    /// decoded buffer in one chunk; keeping the decoded text and cursor on
-    /// the stream still preserves character-sized reads and newline
-    /// boundaries independently of the byte buffer's `readline` policy.
-    fn ensure_decoded(&mut self) -> Result<(), crate::PyError> {
-        if self.decoded_loaded {
-            return Ok(());
-        }
-        let raw = self.call_buffer("read", &[])?;
-        let mut text = self.decode(raw)?;
-        if self.configured_newline().is_none() {
-            text = text.replace("\r\n", "\n").replace('\r', "\n");
-        }
-        self.decoded = text;
-        self.decoded_pos = 0;
-        self.decoded_loaded = true;
-        Ok(())
+    /// PyPy `W_TextIOWrapper._set_newline`.
+    fn set_newline(&mut self, newline: Option<&str>) {
+        self.readuniversal = newline.is_none_or(str::is_empty);
+        self.readtranslate = newline.is_none();
     }
 
     fn size_limit(w_size: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
@@ -224,76 +429,290 @@ impl W_TextIOWrapper {
         }
     }
 
-    fn char_limit(text: &str, count: usize) -> usize {
-        text.char_indices()
-            .nth(count)
-            .map(|(index, _)| index)
-            .unwrap_or(text.len())
-    }
+    /// PyPy `W_TextIOWrapper._set_encoder_decoder`.
+    fn set_encoder_decoder(&mut self, codec: PyObjectRef) -> Result<(), crate::PyError> {
+        self.w_encoder = PY_NULL;
+        self.w_decoder = PY_NULL;
 
-    fn take_decoded(&mut self, byte_count: usize) -> PyObjectRef {
-        let end = self.decoded_pos + byte_count;
-        let value = w_str_new(&self.decoded[self.decoded_pos..end]);
-        self.decoded_pos = end;
-        value
-    }
+        if codec.is_null() {
+            return Ok(());
+        }
 
-    fn line_end(text: &str, newline: Option<&str>) -> usize {
-        match newline {
-            // Universal-newline translation has already changed every line
-            // ending to LF.
-            None | Some("\n") => text.find('\n').map_or(text.len(), |i| i + 1),
-            Some("\r") => text.find('\r').map_or(text.len(), |i| i + 1),
-            Some("\r\n") => text.find("\r\n").map_or(text.len(), |i| i + 2),
-            Some("") => {
-                let bytes = text.as_bytes();
-                for (i, byte) in bytes.iter().enumerate() {
-                    if *byte == b'\n' {
-                        return i + 1;
-                    }
-                    if *byte == b'\r' {
-                        return if bytes.get(i + 1) == Some(&b'\n') {
-                            i + 2
-                        } else {
-                            i + 1
-                        };
-                    }
-                }
-                text.len()
+        if crate::baseobjspace::is_true(super::call_method_result(self.w_buffer, "readable", &[])?)?
+        {
+            let mut decoder =
+                super::call_method_result(codec, "incrementaldecoder", &[self.w_errors])?;
+            if self.readuniversal {
+                let io = crate::importing::get_sys_module("_io").ok_or_else(|| {
+                    crate::PyError::runtime_error("_io module is not initialized")
+                })?;
+                let decoder_type =
+                    crate::baseobjspace::getattr_str(io, "IncrementalNewlineDecoder")?;
+                decoder = crate::call::call_function_impl_result(
+                    decoder_type,
+                    &[decoder, w_bool_from(self.readtranslate)],
+                )?;
             }
-            Some(_) => text.len(),
+            self.w_decoder = decoder;
+        }
+
+        if crate::baseobjspace::is_true(super::call_method_result(self.w_buffer, "writable", &[])?)?
+        {
+            self.w_encoder =
+                super::call_method_result(codec, "incrementalencoder", &[self.w_errors])?;
+        }
+        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        Ok(())
+    }
+
+    /// PyPy `_read_chunk` decoder-state validation.
+    fn decoder_getstate(&self) -> Result<(Vec<u8>, u64), crate::PyError> {
+        let state = super::call_method_result(self.w_decoder, "getstate", &[])?;
+        if unsafe { !pyre_object::is_tuple(state) || pyre_object::w_tuple_len(state) != 2 } {
+            return Err(crate::PyError::type_error("illegal decoder state"));
+        }
+        let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(state) };
+        if unsafe { !pyre_object::bytesobject::is_bytes(items[0]) } {
+            return Err(crate::PyError::type_error(format!(
+                "illegal decoder state: the first value should be a bytes object not '{}'",
+                crate::type_methods::arg_type_name(items[0])
+            )));
+        }
+        let flags = crate::builtins::space_index_w(items[1])?;
+        if flags < 0 {
+            return Err(crate::PyError::type_error("illegal decoder state"));
+        }
+        Ok((
+            unsafe { pyre_object::bytesobject::w_bytes_data(items[0]) }.to_vec(),
+            flags as u64,
+        ))
+    }
+
+    /// PyPy `_decoder_setstate`.
+    fn decoder_setstate(&self, cookie: &PositionCookie) -> Result<(), crate::PyError> {
+        if cookie.start_pos == 0 && cookie.dec_flags == 0 {
+            super::call_method_result(self.w_decoder, "reset", &[])?;
+        } else {
+            let state = w_tuple_new(vec![
+                pyre_object::bytesobject::w_bytes_empty(),
+                w_int_new(cookie.dec_flags as i64),
+            ]);
+            super::call_method_result(self.w_decoder, "setstate", &[state])?;
+        }
+        Ok(())
+    }
+
+    /// PyPy `_encoder_reset`.
+    fn encoder_reset(&mut self, start_of_stream: bool) -> Result<(), crate::PyError> {
+        if start_of_stream {
+            super::call_method_result(self.w_encoder, "reset", &[])?;
+            self.encoding_start_of_stream = true;
+        } else {
+            super::call_method_result(self.w_encoder, "setstate", &[w_int_new(0)])?;
+            self.encoding_start_of_stream = false;
+        }
+        Ok(())
+    }
+
+    /// PyPy `W_TextIOWrapper._read_chunk`.
+    fn read_chunk(&mut self, size_hint: usize) -> Result<bool, crate::PyError> {
+        if self.w_decoder.is_null() {
+            return Err(super::unsupported("not readable"));
+        }
+        let (dec_buffer, dec_flags) = if self.telling {
+            let (buffer, flags) = self.decoder_getstate()?;
+            (Some(buffer), flags)
+        } else {
+            (None, 0)
+        };
+        let scaled_hint = if size_hint == 0 {
+            0
+        } else {
+            (self.b2cratio.max(1.0) * size_hint as f64) as usize
+        };
+        let chunk_size = (self.chunk_size as usize).max(scaled_hint);
+        let method = if self.has_read1 { "read1" } else { "read" };
+        let input = self.call_buffer(method, &[w_int_new(chunk_size as i64)])?;
+        if unsafe { pyre_object::is_none(input) } {
+            return Err(super::buffered::make_blocking_error());
+        }
+        let input_bytes =
+            unsafe { crate::builtins::file_write_buffer_bytes(input) }.map_err(|_| {
+                crate::PyError::type_error(format!(
+                    "underlying {method}() should have returned a bytes-like object, not '{}'",
+                    crate::type_methods::arg_type_name(input)
+                ))
+            })?;
+        let nbytes = input_bytes.len();
+        let eof = nbytes == 0;
+        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&input_bytes);
+        let decoded =
+            super::call_method_result(self.w_decoder, "decode", &[bytes, w_bool_from(eof)])?;
+        self.decoded.set(decoded)?;
+        let nchars = self.decoded.ulen;
+        if nchars > 0 {
+            self.b2cratio = nbytes as f64 / nchars as f64;
+            if let Some(mut next_input) = dec_buffer {
+                next_input.extend_from_slice(&input_bytes);
+                self.snapshot = Some(PositionSnapshot {
+                    flags: dec_flags,
+                    input: next_input,
+                });
+            }
+            Ok(true)
+        } else {
+            self.b2cratio = 0.0;
+            if let Some(mut next_input) = dec_buffer {
+                next_input.extend_from_slice(&input_bytes);
+                self.snapshot = Some(PositionSnapshot {
+                    flags: dec_flags,
+                    input: next_input,
+                });
+            }
+            Ok(!eof)
         }
     }
 
+    /// PyPy `W_TextIOWrapper._ensure_data`.
+    fn ensure_data(&mut self, size_hint: usize) -> Result<bool, crate::PyError> {
+        while !self.decoded.has_data() {
+            if !self.read_chunk(size_hint)? {
+                self.decoded.reset();
+                self.snapshot = None;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn scan_line_ending(&mut self, limit: Option<usize>) -> bool {
+        if self.readtranslate {
+            return self.decoded.find_char(b'\n', limit);
+        }
+        if self.readuniversal {
+            return self.decoded.find_newline_universal(limit);
+        }
+        match self.configured_newline().unwrap_or("\n") {
+            "\r\n" => self.decoded.find_crlf(limit),
+            "\r" => self.decoded.find_char(b'\r', limit),
+            _ => self.decoded.find_char(b'\n', limit),
+        }
+    }
+
+    fn read_all(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let mut result = self.decoded.get_chars(None);
+        let input = self.call_buffer("read", &[])?;
+        if unsafe { pyre_object::is_none(input) } {
+            return Err(super::buffered::make_blocking_error());
+        }
+        let input_bytes =
+            unsafe { crate::builtins::file_write_buffer_bytes(input) }.map_err(|_| {
+                crate::PyError::type_error(format!(
+                    "underlying read() should have returned a bytes-like object, not '{}'",
+                    crate::type_methods::arg_type_name(input)
+                ))
+            })?;
+        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&input_bytes);
+        let decoded =
+            super::call_method_result(self.w_decoder, "decode", &[bytes, w_bool_from(true)])?;
+        if unsafe { !pyre_object::is_str(decoded) } {
+            return Err(crate::PyError::type_error(format!(
+                "decoder should return a string result, not '{}'",
+                crate::type_methods::arg_type_name(decoded)
+            )));
+        }
+        result.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(decoded) });
+        if self.snapshot.is_some() {
+            self.decoded.reset();
+            self.snapshot = None;
+        }
+        Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(result))
+    }
+
+    fn read_n(&mut self, size: usize) -> Result<PyObjectRef, crate::PyError> {
+        let mut remaining = size;
+        let mut result = Wtf8Buf::new();
+        while remaining > 0 {
+            if !self.ensure_data(remaining)? {
+                break;
+            }
+            let chars = self.decoded.get_chars(Some(remaining));
+            remaining -= chars.code_points().count();
+            result.push_wtf8(&chars);
+        }
+        Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(result))
+    }
+
+    fn readline_impl(&mut self, limit: Option<usize>) -> Result<PyObjectRef, crate::PyError> {
+        if limit == Some(0) {
+            return Ok(w_str_new(""));
+        }
+        let mut result = Wtf8Buf::new();
+        let mut pending_cr = false;
+        loop {
+            if !self.ensure_data(0)? {
+                if pending_cr {
+                    result.push_char('\r');
+                }
+                break;
+            }
+
+            if pending_cr {
+                result.push_char('\r');
+                pending_cr = false;
+                if self.decoded.starts_with_lf() {
+                    result.push_char('\n');
+                    self.decoded.advance();
+                    break;
+                }
+            }
+
+            let used = result.code_points().count();
+            let remaining = limit.map(|limit| limit.saturating_sub(used));
+            let start = self.decoded.pos;
+            let found = self.scan_line_ending(remaining);
+            result.push_wtf8(&self.decoded.consumed_from(start));
+
+            if found || limit.is_some_and(|limit| result.code_points().count() >= limit) {
+                break;
+            }
+
+            if !self.decoded.exhausted() {
+                let remnant = self.decoded.get_chars(None);
+                if self.configured_newline() == Some("\r\n")
+                    && remnant.code_points().count() == 1
+                    && remnant.ascii_byte_at(0) == b'\r'
+                {
+                    pending_cr = true;
+                } else {
+                    result.push_wtf8(&remnant);
+                }
+            }
+            self.decoded.reset();
+        }
+        Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(result))
+    }
+
+    /// PyPy `W_TextIOWrapper._fix_encoder_state`.
     fn reset_encoder_state(&mut self) {
-        self.encoder_fresh = true;
-        self.suppress_bom = false;
+        self.encoding_start_of_stream = false;
         if let Ok(w_seekable) = super::call_method_result(self.w_buffer, "seekable", &[]) {
             if crate::baseobjspace::is_true(w_seekable).unwrap_or(false) {
+                self.encoding_start_of_stream = true;
                 if let Ok(w_position) = super::call_method_result(self.w_buffer, "tell", &[]) {
                     if crate::builtins::space_index_w(w_position).unwrap_or(0) != 0 {
-                        self.suppress_bom = true;
+                        self.encoding_start_of_stream = false;
+                        if !self.w_encoder.is_null() {
+                            let _ = super::call_method_result(
+                                self.w_encoder,
+                                "setstate",
+                                &[w_int_new(0)],
+                            );
+                        }
                     }
                 }
             }
         }
-    }
-
-    fn strip_bom<'a>(&mut self, encoded: &'a [u8]) -> &'a [u8] {
-        let bom_len = if encoded.starts_with(&[0xef, 0xbb, 0xbf]) {
-            3
-        } else if encoded.starts_with(&[0xff, 0xfe, 0x00, 0x00])
-            || encoded.starts_with(&[0x00, 0x00, 0xfe, 0xff])
-        {
-            4
-        } else if encoded.starts_with(&[0xff, 0xfe]) || encoded.starts_with(&[0xfe, 0xff]) {
-            2
-        } else {
-            0
-        };
-        let strip = bom_len != 0 && (self.suppress_bom || !self.encoder_fresh);
-        self.encoder_fresh = false;
-        if strip { &encoded[bom_len..] } else { encoded }
     }
 
     fn size_args(w_size: PyObjectRef) -> Vec<PyObjectRef> {
@@ -304,17 +723,16 @@ impl W_TextIOWrapper {
         }
     }
 
-    fn validate_text_codec(encoding: &str) -> Result<(), crate::PyError> {
+    fn lookup_text_codec(encoding: &str) -> Result<PyObjectRef, crate::PyError> {
         // Normal interpreter startup installs an ExecutionContext before
         // Python-visible I/O can run.  A handful of Rust-level `open()` unit
         // tests deliberately exercise the builtin without booting an
         // interpreter; codec lookup cannot import `encodings` in that host
         // seam because no module globals owner exists yet.
         if crate::call::getexecutioncontext().is_null() {
-            return Ok(());
+            return Ok(PY_NULL);
         }
-        crate::module::_codecs::lookup_text_codec("open", encoding)?;
-        Ok(())
+        crate::module::_codecs::lookup_text_codec("open", encoding)
     }
 
     /// Allocate the typed payload used by the interpreter-created standard
@@ -331,14 +749,22 @@ impl W_TextIOWrapper {
             w_errors: w_str_new(errors),
             w_newline: w_none(),
             w_stdio_name: w_str_new(name),
+            w_encoder: PY_NULL,
+            w_decoder: PY_NULL,
             line_buffering: false,
             write_through: false,
-            has_read: false,
-            decoded: String::new(),
-            decoded_pos: 0,
-            decoded_loaded: false,
-            encoder_fresh: true,
-            suppress_bom: false,
+            decoded: DecodeBuffer::default(),
+            snapshot: None,
+            pending_bytes: None,
+            pending_bytes_count: 0,
+            chunk_size: 8192,
+            b2cratio: 0.0,
+            has_read1: false,
+            readuniversal: true,
+            readtranslate: true,
+            seekable_flag: false,
+            telling: false,
+            encoding_start_of_stream: false,
             ..Self::default()
         });
         crate::baseobjspace::setdictvalue(obj, "name", w_str_new(name));
@@ -378,8 +804,8 @@ impl W_TextIOWrapper {
 
         let encoding = Self::checked_text0(encoding, "utf-8", "encoding")?;
         let errors = Self::checked_text0(errors, "strict", "errors")?;
-        let _newline_value = Self::unwrap_newline(newline)?;
-        Self::validate_text_codec(&encoding)?;
+        let newline_value = Self::unwrap_newline(newline)?;
+        let codec = Self::lookup_text_codec(&encoding)?;
 
         self.w_buffer = buffer;
         self.w_encoding = w_str_new(&encoding);
@@ -387,10 +813,18 @@ impl W_TextIOWrapper {
         self.w_newline = newline;
         self.line_buffering = crate::baseobjspace::is_true(line_buffering)?;
         self.write_through = crate::baseobjspace::is_true(write_through)?;
-        self.has_read = false;
-        self.decoded.clear();
-        self.decoded_pos = 0;
-        self.decoded_loaded = false;
+        self.decoded.reset();
+        self.snapshot = None;
+        self.pending_bytes = None;
+        self.pending_bytes_count = 0;
+        self.chunk_size = 8192;
+        self.b2cratio = 0.0;
+        self.set_newline(newline_value.as_deref());
+        self.has_read1 = crate::baseobjspace::getattr_str(buffer, "read1").is_ok();
+        self.set_encoder_decoder(codec)?;
+        self.seekable_flag =
+            crate::baseobjspace::is_true(super::call_method_result(buffer, "seekable", &[])?)?;
+        self.telling = self.seekable_flag;
         self.state = STATE_OK;
         self.reset_encoder_state();
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
@@ -402,14 +836,14 @@ impl W_TextIOWrapper {
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
-        self.ensure_decoded()?;
-        self.has_read = true;
-        let remaining = &self.decoded[self.decoded_pos..];
-        let count = match Self::size_limit(w_size)? {
-            None => remaining.len(),
-            Some(limit) => Self::char_limit(remaining, limit),
-        };
-        Ok(self.take_decoded(count))
+        if self.w_decoder.is_null() {
+            return Err(super::unsupported("not readable"));
+        }
+        self.write_flush()?;
+        match Self::size_limit(w_size)? {
+            None => self.read_all(),
+            Some(size) => self.read_n(size),
+        }
     }
 
     fn readline(
@@ -417,69 +851,126 @@ impl W_TextIOWrapper {
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
-        self.ensure_decoded()?;
-        self.has_read = true;
-        let remaining = &self.decoded[self.decoded_pos..];
-        let mut count = Self::line_end(remaining, self.configured_newline());
-        if let Some(limit) = Self::size_limit(w_size)? {
-            count = count.min(Self::char_limit(remaining, limit));
+        if self.w_decoder.is_null() {
+            return Err(super::unsupported("not readable"));
         }
-        Ok(self.take_decoded(count))
+        self.write_flush()?;
+        self.readline_impl(Self::size_limit(w_size)?)
     }
 
     fn readlines(
         &mut self,
-        #[default(pyre_object::w_none())] _w_hint: PyObjectRef,
+        #[default(pyre_object::w_none())] w_hint: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        let mut lines = Vec::new();
-        loop {
-            let line = self.readline(w_none())?;
-            if unsafe { pyre_object::w_str_get_value(line).is_empty() } {
-                break;
-            }
-            lines.push(line);
+        super::iobase_readlines(&[self.self_obj(), w_hint])
+    }
+
+    /// PyPy `_writeflush_loop`; kept separate so the generated JIT can still
+    /// trace through the ordinary `write()` fast path.
+    fn write_flush_loop(&mut self) -> Result<(), crate::PyError> {
+        while self.pending_bytes.is_some() {
+            self.write_flush()?;
         }
-        Ok(w_list_new(lines))
+        Ok(())
+    }
+
+    /// PyPy `_writeflush` inlinable fast path.
+    fn write_flush(&mut self) -> Result<(), crate::PyError> {
+        if self.pending_bytes.is_none() {
+            return Ok(());
+        }
+        self.really_flush()
+    }
+
+    /// PyPy `_really_flush`: clear the pending list before invoking
+    /// `buffer.write`, so a reentrant `TextIOWrapper.write` starts a new list
+    /// which the outer `_writeflush_loop` can subsequently drain.
+    fn really_flush(&mut self) -> Result<(), crate::PyError> {
+        let chunks = self
+            .pending_bytes
+            .take()
+            .expect("write_flush only calls really_flush with pending bytes");
+        self.pending_bytes_count = 0;
+        let total = chunks.iter().map(Vec::len).sum();
+        let mut pending = Vec::with_capacity(total);
+        for chunk in chunks {
+            pending.extend_from_slice(&chunk);
+        }
+        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&pending);
+        self.call_buffer("write", &[bytes])?;
+        Ok(())
     }
 
     fn write(&mut self, text: PyObjectRef) -> Result<i64, crate::PyError> {
         self.check_closed()?;
-        if unsafe { !pyre_object::is_str(text) } {
-            return Err(crate::PyError::type_error("write() argument must be str"));
+        if self.w_encoder.is_null() {
+            return Err(super::unsupported("not writable"));
         }
-        let (encoding, errors) = self.encoding_errors();
+        if unsafe { !pyre_object::is_str(text) } {
+            return Err(crate::PyError::type_error(format!(
+                "unicode argument expected, got '{}'",
+                crate::type_methods::arg_type_name(text)
+            )));
+        }
         let nchars = unsafe { pyre_object::w_str_len(text) };
-        let configured_newline = unsafe {
-            if pyre_object::is_none(self.w_newline) {
-                None
-            } else {
-                pyre_object::w_str_get_value_opt(self.w_newline)
-            }
-        };
-        let translated;
-        let to_encode = if matches!(configured_newline, Some("\r") | Some("\r\n")) {
-            if let Some(value) = unsafe { pyre_object::w_str_get_value_opt(text) } {
-                translated = w_str_new(&value.replace('\n', configured_newline.unwrap()));
-                translated
-            } else {
-                text
-            }
-        } else {
-            text
-        };
-        let encoded = crate::type_methods::encode_object(to_encode, &encoding, &errors)?;
-        let encoded = self.strip_bom(&encoded);
-        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(encoded);
-        self.call_buffer("write", &[bytes])?;
+        let text_wtf8 = unsafe { pyre_object::w_str_get_wtf8(text) };
+        let has_lf = text_wtf8
+            .code_points()
+            .any(|cp| cp.to_u32() == b'\n' as u32);
+        let has_cr = text_wtf8
+            .code_points()
+            .any(|cp| cp.to_u32() == b'\r' as u32);
 
-        if self.line_buffering
-            && unsafe {
-                pyre_object::w_str_get_wtf8(text)
-                    .code_points()
-                    .any(|cp| matches!(cp.to_u32(), 0x0a | 0x0d))
+        let mut to_encode = text;
+        if has_lf {
+            if let Some(writenl) = self.configured_newline()
+                && matches!(writenl, "\r" | "\r\n")
+            {
+                to_encode = super::call_method_result(
+                    text,
+                    "replace",
+                    &[w_str_new("\n"), w_str_new(writenl)],
+                )?;
             }
-        {
-            super::call_method_result(self.self_obj(), "flush", &[])?;
+        }
+
+        let need_flush = self.line_buffering && (has_lf || has_cr);
+        let text_need_flush = self.write_through;
+        let encoded = super::call_method_result(self.w_encoder, "encode", &[to_encode])?;
+        if unsafe { !pyre_object::bytesobject::is_bytes(encoded) } {
+            return Err(crate::PyError::type_error(format!(
+                "encoder should return a bytes object, not '{}'",
+                crate::type_methods::arg_type_name(encoded)
+            )));
+        }
+        self.encoding_start_of_stream = false;
+        let bytes = unsafe { pyre_object::bytesobject::w_bytes_data(encoded) }.to_vec();
+
+        if bytes.len() >= self.chunk_size as usize && self.pending_bytes.is_some() {
+            self.write_flush_loop()?;
+        }
+        match self.pending_bytes.as_mut() {
+            Some(pending) => pending.push(bytes),
+            None => self.pending_bytes = Some(vec![bytes]),
+        }
+        self.pending_bytes_count += self
+            .pending_bytes
+            .as_ref()
+            .and_then(|pending| pending.last())
+            .map_or(0, Vec::len);
+
+        if self.pending_bytes_count >= self.chunk_size as usize || need_flush || text_need_flush {
+            self.write_flush()?;
+        }
+        if need_flush {
+            self.call_buffer("flush", &[])?;
+        }
+        if self.snapshot.is_some() {
+            self.decoded.reset();
+            self.snapshot = None;
+        }
+        if !self.w_decoder.is_null() {
+            super::call_method_result(self.w_decoder, "reset", &[])?;
         }
         Ok(nchars as i64)
     }
@@ -488,14 +979,35 @@ impl W_TextIOWrapper {
         super::iobase_writelines(&[self.self_obj(), lines])
     }
 
-    fn flush(&self) -> Result<PyObjectRef, crate::PyError> {
+    fn flush(&mut self) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
+        self.telling = self.seekable_flag;
+        self.write_flush()?;
         self.call_buffer("flush", &[])
     }
 
-    fn close(&self) -> Result<(), crate::PyError> {
+    fn close(&mut self) -> Result<(), crate::PyError> {
         self.check_attached()?;
-        if self.buffer_closed()? {
+        // Keep the original buffer alive across the user-overridable
+        // `closed` property.  CPython GH-142594: that property may reenter
+        // and detach this wrapper.
+        let buffer = self.w_buffer;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(buffer);
+        let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let closed = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            "closed",
+        )?;
+        if crate::baseobjspace::is_true(closed)? {
+            return Ok(());
+        }
+        if self.state == STATE_DETACHED {
+            super::call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+                "close",
+                &[],
+            )?;
             return Ok(());
         }
 
@@ -503,7 +1015,11 @@ impl W_TextIOWrapper {
         // is virtual, and a close failure replaces it while retaining the
         // flush exception as `__context__`.
         let flush_error = super::call_method_result(self.self_obj(), "flush", &[]).err();
-        let close_result = super::call_method_result(self.w_buffer, "close", &[]);
+        let close_result = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            "close",
+            &[],
+        );
         if let Err(mut close_error) = close_result {
             if let Some(mut flush_error) = flush_error {
                 let _roots = pyre_object::gc_roots::push_roots();
@@ -537,9 +1053,162 @@ impl W_TextIOWrapper {
         Ok(buffer)
     }
 
-    fn tell(&self) -> Result<PyObjectRef, crate::PyError> {
+    fn tell(&mut self) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
-        self.call_buffer("tell", &[])
+        if !self.seekable_flag {
+            return Err(super::unsupported("underlying stream is not seekable"));
+        }
+        if !self.telling {
+            return Err(crate::PyError::os_error(
+                "telling position disabled by next() call",
+            ));
+        }
+
+        self.write_flush()?;
+        super::call_method_result(self.self_obj(), "flush", &[])?;
+        let w_pos = self.call_buffer("tell", &[])?;
+        if self.w_decoder.is_null() || self.snapshot.is_none() {
+            return Ok(w_pos);
+        }
+
+        let w_index = crate::baseobjspace::space_index(w_pos)?;
+        let raw_pos = unsafe { crate::builtins::obj_to_bigint(w_index) };
+        let Some(raw_pos) = raw_pos.to_u64() else {
+            return Err(crate::PyError::overflow_error(
+                "Python int too large to convert to C unsigned long",
+            ));
+        };
+        let snapshot = self.snapshot.as_ref().expect("checked above");
+        if snapshot.input.len() as u64 > raw_pos {
+            return Ok(w_int_new(0));
+        }
+        let input = snapshot.input.clone();
+        let mut cookie = PositionCookie {
+            start_pos: raw_pos - input.len() as u64,
+            dec_flags: snapshot.flags,
+            ..PositionCookie::default()
+        };
+        if self.decoded.pos == 0 {
+            return Ok(cookie.to_object());
+        }
+
+        let mut chars_to_skip = self.decoded.upos as u64;
+        let saved_state = super::call_method_result(self.w_decoder, "getstate", &[])?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(saved_state);
+        let saved_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+        let result = (|| -> Result<PyObjectRef, crate::PyError> {
+            // PyPy's b2cratio heuristic searches backward for a decoder state
+            // with no buffered bytes.
+            let mut skip_bytes = ((self.b2cratio * chars_to_skip as f64) as usize).min(input.len());
+            let mut skip_back = 1usize;
+            while skip_bytes > 0 {
+                self.decoder_setstate(&cookie)?;
+                let decoded = super::call_method_result(
+                    self.w_decoder,
+                    "decode",
+                    &[pyre_object::bytesobject::w_bytes_from_bytes(
+                        &input[..skip_bytes],
+                    )],
+                )?;
+                if unsafe { !pyre_object::is_str(decoded) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "decoder should return a string result, not '{}'",
+                        crate::type_methods::arg_type_name(decoded)
+                    )));
+                }
+                let chars_decoded = unsafe { pyre_object::w_str_len(decoded) } as u64;
+                if chars_decoded <= chars_to_skip {
+                    let (dec_buffer, flags) = self.decoder_getstate()?;
+                    if dec_buffer.is_empty() {
+                        cookie.dec_flags = flags;
+                        chars_to_skip -= chars_decoded;
+                        break;
+                    }
+                    skip_bytes = skip_bytes.saturating_sub(dec_buffer.len());
+                    skip_back = 1;
+                } else {
+                    skip_bytes = skip_bytes.saturating_sub(skip_back);
+                    skip_back = skip_back.saturating_mul(2);
+                }
+            }
+            if skip_bytes == 0 {
+                self.decoder_setstate(&cookie)?;
+            }
+            cookie.start_pos += skip_bytes as u64;
+            cookie.chars_to_skip = chars_to_skip;
+            if chars_to_skip == 0 {
+                return Ok(cookie.to_object());
+            }
+
+            self.decoder_setstate(&cookie)?;
+            let mut chars_decoded = 0u64;
+            let mut i = skip_bytes;
+            while i < input.len() {
+                let decoded = super::call_method_result(
+                    self.w_decoder,
+                    "decode",
+                    &[pyre_object::bytesobject::w_bytes_from_bytes(
+                        &input[i..i + 1],
+                    )],
+                )?;
+                if unsafe { !pyre_object::is_str(decoded) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "decoder should return a string result, not '{}'",
+                        crate::type_methods::arg_type_name(decoded)
+                    )));
+                }
+                chars_decoded += unsafe { pyre_object::w_str_len(decoded) } as u64;
+                cookie.bytes_to_feed += 1;
+
+                let (dec_buffer, flags) = self.decoder_getstate()?;
+                if dec_buffer.is_empty() && chars_decoded <= chars_to_skip {
+                    cookie.start_pos += cookie.bytes_to_feed;
+                    chars_to_skip -= chars_decoded;
+                    cookie.dec_flags = flags;
+                    cookie.bytes_to_feed = 0;
+                    chars_decoded = 0;
+                }
+                if chars_decoded >= chars_to_skip {
+                    break;
+                }
+                i += 1;
+            }
+            if chars_decoded < chars_to_skip {
+                let decoded = super::call_method_result(
+                    self.w_decoder,
+                    "decode",
+                    &[pyre_object::bytesobject::w_bytes_empty(), w_bool_from(true)],
+                )?;
+                if unsafe { !pyre_object::is_str(decoded) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "decoder should return a string result, not '{}'",
+                        crate::type_methods::arg_type_name(decoded)
+                    )));
+                }
+                chars_decoded += unsafe { pyre_object::w_str_len(decoded) } as u64;
+                cookie.need_eof = true;
+                if chars_decoded < chars_to_skip {
+                    return Err(crate::PyError::os_error(
+                        "can't reconstruct logical file position",
+                    ));
+                }
+            }
+            cookie.chars_to_skip = chars_to_skip;
+            Ok(cookie.to_object())
+        })();
+
+        let restore = super::call_method_result(
+            self.w_decoder,
+            "setstate",
+            &[pyre_object::gc_roots::shadow_stack_get(saved_slot)],
+        );
+        match (result, restore) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(_)) => Ok(value),
+        }
     }
 
     fn seek(
@@ -548,19 +1217,97 @@ impl W_TextIOWrapper {
         #[default(0i64)] whence: i64,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
-        let position = crate::builtins::space_index_w(cookie)?;
-        if position != 0 && whence == 1 {
-            return Err(super::unsupported("can't do nonzero cur-relative seeks"));
+        if !self.seekable_flag {
+            return Err(super::unsupported("underlying stream is not seekable"));
         }
-        if position != 0 && whence == 2 {
-            return Err(super::unsupported("can't do nonzero end-relative seeks"));
+        let mut w_position = crate::baseobjspace::space_index(cookie)?;
+        let mut position = unsafe { crate::builtins::obj_to_bigint(w_position) };
+
+        if whence == 1 {
+            if position != malachite_bigint::BigInt::from(0) {
+                return Err(super::unsupported("can't do nonzero cur-relative seeks"));
+            }
+            w_position = super::call_method_result(self.self_obj(), "tell", &[])?;
+            let indexed = crate::baseobjspace::space_index(w_position)?;
+            position = unsafe { crate::builtins::obj_to_bigint(indexed) };
+        } else if whence == 2 {
+            if position != malachite_bigint::BigInt::from(0) {
+                return Err(super::unsupported("can't do nonzero end-relative seeks"));
+            }
+            super::call_method_result(self.self_obj(), "flush", &[])?;
+            self.decoded.reset();
+            self.snapshot = None;
+            if !self.w_decoder.is_null() {
+                super::call_method_result(self.w_decoder, "reset", &[])?;
+            }
+            let result = self.call_buffer("seek", &[w_position, w_int_new(whence)])?;
+            if !self.w_encoder.is_null() {
+                let at_start = crate::builtins::space_index_w(result)? == 0;
+                self.encoder_reset(at_start)?;
+            }
+            return Ok(result);
+        } else if whence != 0 {
+            return Err(crate::PyError::value_error(format!(
+                "invalid whence ({whence}, should be 0, 1 or 2)"
+            )));
         }
-        let result = self.call_buffer("seek", &[cookie, w_int_new(whence)])?;
-        self.decoded.clear();
-        self.decoded_pos = 0;
-        self.decoded_loaded = false;
-        self.has_read = false;
-        Ok(result)
+
+        let position_cookie = PositionCookie::unpack(position)?;
+        super::call_method_result(self.self_obj(), "flush", &[])?;
+        let start = crate::objspace::descroperation::box_bigint_result(
+            malachite_bigint::BigInt::from(position_cookie.start_pos),
+        );
+        self.call_buffer("seek", &[start])?;
+        self.decoded.reset();
+        self.snapshot = None;
+        if !self.w_decoder.is_null() {
+            self.decoder_setstate(&position_cookie)?;
+        }
+
+        if position_cookie.chars_to_skip != 0 {
+            let chunk =
+                self.call_buffer("read", &[w_int_new(position_cookie.bytes_to_feed as i64)])?;
+            if unsafe { !pyre_object::bytesobject::is_bytes(chunk) } {
+                return Err(crate::PyError::type_error(format!(
+                    "underlying read() should have returned a bytes object, not '{}'",
+                    crate::type_methods::arg_type_name(chunk)
+                )));
+            }
+            let input = unsafe { pyre_object::bytesobject::w_bytes_data(chunk) }.to_vec();
+            self.snapshot = Some(PositionSnapshot {
+                flags: position_cookie.dec_flags,
+                input,
+            });
+            let decoded = super::call_method_result(
+                self.w_decoder,
+                "decode",
+                &[chunk, w_bool_from(position_cookie.need_eof)],
+            )?;
+            if unsafe { !pyre_object::is_str(decoded) } {
+                return Err(crate::PyError::type_error(format!(
+                    "decoder should return a string result, not '{}'",
+                    crate::type_methods::arg_type_name(decoded)
+                )));
+            }
+            if unsafe { pyre_object::w_str_len(decoded) } < position_cookie.chars_to_skip as usize {
+                return Err(crate::PyError::os_error(
+                    "can't restore logical file position",
+                ));
+            }
+            self.decoded.set(decoded)?;
+            self.decoded
+                .get_chars(Some(position_cookie.chars_to_skip as usize));
+        } else {
+            self.snapshot = Some(PositionSnapshot {
+                flags: position_cookie.dec_flags,
+                input: Vec::new(),
+            });
+        }
+
+        if !self.w_encoder.is_null() {
+            self.encoder_reset(position_cookie.start_pos == 0 && position_cookie.dec_flags == 0)?;
+        }
+        Ok(w_position)
     }
 
     fn truncate(
@@ -585,7 +1332,7 @@ impl W_TextIOWrapper {
         #[default(pyre_object::w_none())] write_through: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         self.check_attached()?;
-        if self.has_read
+        if self.decoded.text.is_some()
             && (!unsafe { pyre_object::is_none(encoding) }
                 || !unsafe { pyre_object::is_none(errors) }
                 || !newline.is_null())
@@ -604,7 +1351,6 @@ impl W_TextIOWrapper {
             } else {
                 value
             };
-            Self::validate_text_codec(&value)?;
             Some(value)
         };
         let new_errors = if unsafe { pyre_object::is_none(errors) } {
@@ -612,9 +1358,11 @@ impl W_TextIOWrapper {
         } else {
             Some(Self::checked_text0(errors, "", "errors")?)
         };
-        if !newline.is_null() {
-            Self::unwrap_newline(newline)?;
-        }
+        let new_newline = if newline.is_null() {
+            None
+        } else {
+            Some(Self::unwrap_newline(newline)?)
+        };
         // CPython 3.14's clinic converter still uses the integer/index
         // protocol for these two flags (the CPython tests deliberately
         // distinguish it from truth testing).
@@ -628,19 +1376,35 @@ impl W_TextIOWrapper {
         } else {
             Some(crate::builtins::space_index_w(write_through)? != 0)
         };
+        let reset_codec = new_encoding.is_some() || new_errors.is_some() || new_newline.is_some();
+        // PyPy/CPython prepare the replacement codec before mutating the
+        // wrapper.  In particular, a failing codec lookup must leave
+        // `encoding`, `errors`, and the incremental encoder/decoder intact.
+        let new_codec = if reset_codec {
+            let encoding = new_encoding
+                .as_deref()
+                .unwrap_or_else(|| unsafe { pyre_object::w_str_get_value(self.w_encoding) });
+            Some(Self::lookup_text_codec(encoding)?)
+        } else {
+            None
+        };
 
         // CPython 3.14 `_textiowrapper_writeflush`: every reconfiguration
         // first commits pending output, even when every option is omitted.
         super::call_method_result(self.self_obj(), "flush", &[])?;
-        if !newline.is_null() {
+        if let Some(value) = new_newline.as_ref() {
             self.w_newline = newline;
+            self.set_newline(value.as_deref());
         }
-        if let Some(value) = new_encoding {
+        if let Some(value) = new_encoding.as_ref() {
             self.w_encoding = w_str_new(&value);
             self.w_errors = w_str_new(new_errors.as_deref().unwrap_or("strict"));
-            self.reset_encoder_state();
-        } else if let Some(value) = new_errors {
+        } else if let Some(value) = new_errors.as_ref() {
             self.w_errors = w_str_new(&value);
+        }
+        if let Some(codec) = new_codec {
+            self.set_encoder_decoder(codec)?;
+            self.reset_encoder_state();
         }
         if let Some(value) = new_line_buffering {
             self.line_buffering = value;
@@ -721,8 +1485,36 @@ impl W_TextIOWrapper {
 
     #[getter]
     fn newlines(&self) -> Result<PyObjectRef, crate::PyError> {
-        self.check_init()?;
-        Ok(w_none())
+        self.check_attached()?;
+        if self.w_decoder.is_null() {
+            return Ok(w_none());
+        }
+        match crate::baseobjspace::getattr_str(self.w_decoder, "newlines") {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Ok(w_none()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[getter]
+    #[allow(non_snake_case)]
+    fn _CHUNK_SIZE(&self) -> Result<i64, crate::PyError> {
+        self.check_attached()?;
+        Ok(self.chunk_size)
+    }
+
+    #[setter]
+    #[allow(non_snake_case)]
+    fn set__CHUNK_SIZE(&mut self, size: PyObjectRef) -> Result<(), crate::PyError> {
+        self.check_attached()?;
+        let size = crate::baseobjspace::int_w(size)?;
+        if size <= 0 {
+            return Err(crate::PyError::value_error(
+                "a strictly positive integer is required",
+            ));
+        }
+        self.chunk_size = size;
+        Ok(())
     }
 
     fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -731,7 +1523,7 @@ impl W_TextIOWrapper {
     }
 
     fn __exit__(
-        &self,
+        &mut self,
         _exc_type: PyObjectRef,
         _exc: PyObjectRef,
         _tb: PyObjectRef,
@@ -745,8 +1537,11 @@ impl W_TextIOWrapper {
     }
 
     fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        self.check_attached()?;
+        self.telling = false;
         let line = self.readline(w_none())?;
-        if unsafe { pyre_object::w_str_get_value(line).is_empty() } {
+        if unsafe { pyre_object::w_str_len(line) == 0 } {
+            self.telling = self.seekable_flag;
             Err(crate::PyError::stop_iteration())
         } else {
             Ok(line)

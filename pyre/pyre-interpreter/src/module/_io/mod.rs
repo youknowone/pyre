@@ -373,7 +373,7 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `interp_iobase.py:W_IOBase.readlines_w` — consume the stream iterator,
 /// stopping after the accumulated line lengths exceed a positive hint.
-fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
+pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     let self_obj = args
         .first()
         .copied()

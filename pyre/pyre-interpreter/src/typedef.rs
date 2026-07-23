@@ -17969,11 +17969,12 @@ fn invalid_cont_byte(b: u8) -> bool {
     (b as i8) >= -0x40 // equivalent: b < 0x80 || b > 0xBF
 }
 
-/// rutf8.py:339-343
-/// Surrogates (ED A0..BF) are always rejected — pyre's Rust String cannot
-/// hold surrogate codepoints; the error handler deals with surrogatepass.
-fn invalid_byte_2_of_3(ch1: u8, ch2: u8) -> bool {
-    invalid_cont_byte(ch2) || (ch1 == 0xE0 && ch2 < 0xA0) || (ch1 == 0xED && ch2 > 0x9F)
+/// rutf8.py `_invalid_byte_2_of_3`: reject surrogate encodings unless the
+/// caller selected the `surrogatepass` path.
+fn invalid_byte_2_of_3(ch1: u8, ch2: u8, allow_surrogates: bool) -> bool {
+    invalid_cont_byte(ch2)
+        || (ch1 == 0xE0 && ch2 < 0xA0)
+        || (ch1 == 0xED && ch2 > 0x9F && !allow_surrogates)
 }
 
 /// rutf8.py:345-348
@@ -17994,9 +17995,20 @@ pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
 /// unicodehelper.py:377-537 _str_decode_utf8_slowpath
 /// Structural port of PyPy's _utf8_code_length state machine.
 /// PyPy appends raw UTF-8 bytes to a StringBuilder; Rust reconstructs
-/// Unicode scalar values via char::from_u32.  Surrogates are always
-/// rejected by invalid_byte_2_of_3 and routed to the error handler.
+/// Unicode scalar values via `char::from_u32`, or a WTF-8 `CodePoint` for
+/// the `surrogatepass` path.
 fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate::PyError> {
+    decode_utf8_with_errors_incremental(data, err_mode, true).map(|(decoded, _)| decoded)
+}
+
+/// PyPy `unicodehelper.str_decode_utf8`: the incremental form additionally
+/// returns the byte position consumed and leaves a valid but incomplete
+/// trailing sequence untouched when `final_` is false.
+pub(crate) fn decode_utf8_with_errors_incremental(
+    data: &[u8],
+    err_mode: &str,
+    final_: bool,
+) -> Result<(Wtf8Buf, usize), crate::PyError> {
     // A custom error handler may replace exc.object; decoding then resumes
     // from the new bytes (`s`), re-evaluating `size` each iteration.  The
     // common path keeps the borrowed slice (no allocation).
@@ -18004,8 +18016,11 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
     let mut size = s.len();
     let mut result = Wtf8Buf::new();
     let mut pos = 0;
-    let final_ = true; // pyre always decodes complete buffers
-
+    // PyPy `interp_codecs.utf_8_decode` passes
+    // `allow_surrogates=True` specifically for `surrogatepass`, so a valid
+    // ED A0..BF 80..BF sequence is decoded directly and an incomplete one is
+    // retained for the next incremental chunk.
+    let allow_surrogates = err_mode == "surrogatepass";
     // Run a utf-8 error handler and rebind `s`/`size` when it returns
     // replacement bytes; then advance `pos` to the resume position.
     macro_rules! run_err {
@@ -18045,7 +18060,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             let ordch2 = s[pos + 1];
             if n == 3 {
                 // unicodehelper.py:417-434
-                if invalid_byte_2_of_3(ordch1, ordch2) {
+                if invalid_byte_2_of_3(ordch1, ordch2, allow_surrogates) {
                     run_err!(pos, pos + 1, "invalid continuation byte");
                     continue;
                 }
@@ -18096,7 +18111,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             // unicodehelper.py:484-503
             let ordch2 = s[pos + 1];
             let ordch3 = s[pos + 2];
-            if invalid_byte_2_of_3(ordch1, ordch2) {
+            if invalid_byte_2_of_3(ordch1, ordch2, allow_surrogates) {
                 run_err!(pos, pos + 1, "invalid continuation byte");
                 continue;
             }
@@ -18108,7 +18123,9 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             let cp = ((ordch1 as u32 & 0x0F) << 12)
                 | ((ordch2 as u32 & 0x3F) << 6)
                 | (ordch3 as u32 & 0x3F);
-            if let Some(c) = char::from_u32(cp) {
+            if (0xD800..=0xDFFF).contains(&cp) && allow_surrogates {
+                result.push(CodePoint::from_u32(cp).unwrap());
+            } else if let Some(c) = char::from_u32(cp) {
                 result.push_char(c);
             }
             pos += 3;
@@ -18140,7 +18157,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             pos += 4;
         }
     }
-    Ok(result)
+    Ok((result, pos))
 }
 
 /// bytesobject.py descr_decode → stringmethods.py:196 decode_object

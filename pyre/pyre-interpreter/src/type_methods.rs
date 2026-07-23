@@ -2794,6 +2794,17 @@ fn encode_utf8_with_errors(
         }
         let code = cp.to_u32();
         let index = i;
+        // PyPy `_utf8_encode_utf_8_deal_with_surrogates`: collect one
+        // high+low surrogate pair into a single error-handler call.
+        let error_end = if (0xD800..=0xDBFF).contains(&code)
+            && cps
+                .get(index + 1)
+                .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next.to_u32()))
+        {
+            index + 2
+        } else {
+            index + 1
+        };
         match err_mode {
             // surrogatepass_errors encode branch (interp_codecs.py:455-458):
             // emit the three-byte sequence for the surrogate code point.
@@ -2801,6 +2812,8 @@ fn encode_utf8_with_errors(
                 out.push(0xE0 | (code >> 12) as u8);
                 out.push(0x80 | ((code >> 6) & 0x3f) as u8);
                 out.push(0x80 | (code & 0x3f) as u8);
+                i += 1;
+                continue;
             }
             // surrogateescape_errors encode branch (interp_codecs.py:528-534):
             // a 0xDC80..0xDCFF surrogate maps back to the byte code-0xDC00;
@@ -2808,12 +2821,14 @@ fn encode_utf8_with_errors(
             "surrogateescape" => {
                 if (0xDC80..=0xDCFF).contains(&code) {
                     out.push((code - 0xDC00) as u8);
+                    i += 1;
+                    continue;
                 } else {
                     return Err(crate::typedef::unicode_encode_error(
                         "utf-8",
                         w_object,
                         index,
-                        index + 1,
+                        error_end,
                         "surrogates not allowed",
                     ));
                 }
@@ -2823,14 +2838,22 @@ fn encode_utf8_with_errors(
                     "utf-8",
                     w_object,
                     index,
-                    index + 1,
+                    error_end,
                     "surrogates not allowed",
                 ));
             }
             "ignore" => {}
-            "replace" => out.push(b'?'),
-            "backslashreplace" => out.extend_from_slice(format!("\\u{code:04x}").as_bytes()),
-            "xmlcharrefreplace" => out.extend_from_slice(format!("&#{code};").as_bytes()),
+            "replace" => out.extend(std::iter::repeat_n(b'?', error_end - index)),
+            "backslashreplace" => {
+                for cp in &cps[index..error_end] {
+                    out.extend_from_slice(format!("\\u{:04x}", cp.to_u32()).as_bytes());
+                }
+            }
+            "xmlcharrefreplace" => {
+                for cp in &cps[index..error_end] {
+                    out.extend_from_slice(format!("&#{};", cp.to_u32()).as_bytes());
+                }
+            }
             _ => {
                 let (rep, newpos) = call_registered_encode_error_handler(
                     err_mode,
@@ -2838,7 +2861,7 @@ fn encode_utf8_with_errors(
                     w_object,
                     cps.len(),
                     index,
-                    index + 1,
+                    error_end,
                     "surrogates not allowed",
                 )?;
                 match rep {
@@ -2849,7 +2872,7 @@ fn encode_utf8_with_errors(
                                     "utf-8",
                                     w_object,
                                     index,
-                                    index + 1,
+                                    error_end,
                                     "surrogates not allowed",
                                 ));
                             }
@@ -2862,7 +2885,7 @@ fn encode_utf8_with_errors(
                 continue;
             }
         }
-        i += 1;
+        i = error_end;
     }
     Ok(out)
 }
@@ -3399,24 +3422,42 @@ pub fn decode_utf16_32(
         "utf32be" => (true, Some(true), "utf-32-be"),
         _ => return None,
     };
-    Some(if is32 {
-        decode_utf32_impl(data, fixed_be, codec, err_mode)
-    } else {
-        decode_utf16_impl(data, fixed_be, codec, err_mode)
-    })
+    Some(
+        decode_utf16_32_helper(data, is32, fixed_be, codec, err_mode, true)
+            .map(|(decoded, _, _)| decoded),
+    )
 }
 
-/// Resolve endianness and the body start offset: a fixed `-le`/`-be`
-/// codec ignores any BOM, while the bare form consumes a leading BOM and
-/// otherwise defaults to little-endian.
-fn resolve_bom(data: &[u8], is32: bool, fixed_be: Option<bool>) -> (bool, usize) {
+/// PyPy `unicodehelper.str_decode_utf_{16,32}_helper`: decode one incremental
+/// chunk and return `(text, consumed, byteorder)`.  `fixed_be == None` is the
+/// native/BOM-detecting mode used by `_codecs.utf_{16,32}_ex_decode`;
+/// `Some(false/true)` is forced little/big endian.
+pub fn decode_utf16_32_helper(
+    data: &[u8],
+    is32: bool,
+    fixed_be: Option<bool>,
+    codec: &str,
+    err_mode: &str,
+    final_: bool,
+) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
+    if is32 {
+        decode_utf32_impl(data, fixed_be, codec, err_mode, final_)
+    } else {
+        decode_utf16_impl(data, fixed_be, codec, err_mode, final_)
+    }
+}
+
+/// Resolve endianness, body start offset, and PyPy's `bo` result.  A fixed
+/// `-le`/`-be` codec ignores any BOM, while native mode consumes a leading BOM
+/// and otherwise uses the platform byte order while leaving `bo == 0`.
+fn resolve_bom(data: &[u8], is32: bool, fixed_be: Option<bool>) -> (bool, usize, i32) {
     match fixed_be {
-        Some(be) => (be, 0),
-        None if is32 && data.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) => (false, 4),
-        None if is32 && data.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) => (true, 4),
-        None if !is32 && data.starts_with(&[0xFF, 0xFE]) => (false, 2),
-        None if !is32 && data.starts_with(&[0xFE, 0xFF]) => (true, 2),
-        None => (false, 0),
+        Some(be) => (be, 0, if be { 1 } else { -1 }),
+        None if is32 && data.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) => (false, 4, -1),
+        None if is32 && data.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) => (true, 4, 1),
+        None if !is32 && data.starts_with(&[0xFF, 0xFE]) => (false, 2, -1),
+        None if !is32 && data.starts_with(&[0xFE, 0xFF]) => (true, 2, 1),
+        None => (cfg!(target_endian = "big"), 0, 0),
     }
 }
 
@@ -3693,8 +3734,9 @@ fn decode_utf16_impl(
     fixed_be: Option<bool>,
     codec: &str,
     err_mode: &str,
-) -> Result<Wtf8Buf, crate::PyError> {
-    let (big_endian, mut pos) = resolve_bom(data, false, fixed_be);
+    final_: bool,
+) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
+    let (big_endian, mut pos, byteorder) = resolve_bom(data, false, fixed_be);
     // A custom error handler may replace exc.object; the loop then resumes
     // from the new bytes (`buf`), re-evaluating `len` each iteration.
     let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
@@ -3716,6 +3758,9 @@ fn decode_utf16_impl(
     }
     while pos < len {
         if len - pos < 2 {
+            if !final_ {
+                break;
+            }
             pos = run16!(pos, len, "truncated data");
             if len - pos < 2 {
                 break;
@@ -3735,6 +3780,9 @@ fn decode_utf16_impl(
         // high surrogate: a low surrogate must follow
         if len - pos < 2 {
             pos -= 2;
+            if !final_ {
+                break;
+            }
             pos = run16!(pos, len, "unexpected end of data");
         } else {
             let ch2 = read_code_unit(&buf, pos, 2, big_endian);
@@ -3747,7 +3795,7 @@ fn decode_utf16_impl(
             }
         }
     }
-    Ok(out)
+    Ok((out, pos, byteorder))
 }
 
 /// `unicodehelper.py str_decode_utf_32_helper` (runicode.py:762).  The
@@ -3758,8 +3806,9 @@ fn decode_utf32_impl(
     fixed_be: Option<bool>,
     codec: &str,
     err_mode: &str,
-) -> Result<Wtf8Buf, crate::PyError> {
-    let (big_endian, mut pos) = resolve_bom(data, true, fixed_be);
+    final_: bool,
+) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
+    let (big_endian, mut pos, byteorder) = resolve_bom(data, true, fixed_be);
     // A custom error handler may replace exc.object; the loop then resumes
     // from the new bytes (`buf`), re-evaluating `len` each iteration.
     let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
@@ -3779,6 +3828,9 @@ fn decode_utf32_impl(
     }
     while pos < len {
         if len - pos < 4 {
+            if !final_ {
+                break;
+            }
             pos = run32!(pos, len, "truncated data");
             if len - pos < 4 {
                 break;
@@ -3800,7 +3852,7 @@ fn decode_utf32_impl(
         out.push(CodePoint::from_u32(ch).unwrap());
         pos += 4;
     }
-    Ok(out)
+    Ok((out, pos, byteorder))
 }
 
 /// Map each scalar code point of `s` through `f`, appending to a

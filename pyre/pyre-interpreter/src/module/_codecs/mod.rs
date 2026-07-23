@@ -785,6 +785,105 @@ fn decode_with_name(
     Ok(w_tuple_new(vec![decoded, w_int_new(consumed as i64)]))
 }
 
+/// PyPy `interp_codecs.utf_{16,32}_ex_decode`: the three-value entry point
+/// used by the stdlib incremental decoders.  Unlike `bytes.decode`, this must
+/// leave an incomplete code unit unconsumed while `final` is false.
+fn utf16_32_ex_decode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+    byteorder: i64,
+    w_final: PyObjectRef,
+    is32: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let errors = if unsafe { pyre_object::is_none(errors) } {
+        "strict"
+    } else if unsafe { is_str(errors) } {
+        unsafe { w_str_get_value(errors) }
+    } else {
+        return Err(crate::PyError::type_error("errors must be str or None"));
+    };
+    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_obj)? };
+    let fixed_be = match byteorder {
+        0 => None,
+        -1 => Some(false),
+        _ => Some(true),
+    };
+    let codec = if is32 { "utf32" } else { "utf16" };
+    let (decoded, consumed, bo) = crate::type_methods::decode_utf16_32_helper(
+        &data,
+        is32,
+        fixed_be,
+        codec,
+        errors,
+        crate::baseobjspace::is_true(w_final)?,
+    )?;
+    Ok(w_tuple_new(vec![
+        w_str_from_wtf8_managed(decoded),
+        w_int_new(consumed as i64),
+        w_int_new(bo as i64),
+    ]))
+}
+
+/// PyPy `make_decoder_wrapper` for the two-value UTF-16/32 decoder entry
+/// points.  These share the helper used by the `*_ex_decode` functions but
+/// discard its byte-order result.
+fn utf16_32_decode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+    w_final: PyObjectRef,
+    is32: bool,
+    fixed_be: Option<bool>,
+    codec: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let errors = if unsafe { pyre_object::is_none(errors) } {
+        "strict"
+    } else if unsafe { is_str(errors) } {
+        unsafe { w_str_get_value(errors) }
+    } else {
+        return Err(crate::PyError::type_error("errors must be str or None"));
+    };
+    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_obj)? };
+    let (decoded, consumed, _) = crate::type_methods::decode_utf16_32_helper(
+        &data,
+        is32,
+        fixed_be,
+        codec,
+        errors,
+        crate::baseobjspace::is_true(w_final)?,
+    )?;
+    Ok(w_tuple_new(vec![
+        w_str_from_wtf8_managed(decoded),
+        w_int_new(consumed as i64),
+    ]))
+}
+
+/// PyPy `interp_codecs.utf_8_decode`, including its incremental consumed
+/// position.  The stdlib `BufferedIncrementalDecoder` retains
+/// `data[consumed:]` for the next call.
+fn utf8_decode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+    w_final: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let errors = if unsafe { pyre_object::is_none(errors) } {
+        "strict"
+    } else if unsafe { is_str(errors) } {
+        unsafe { w_str_get_value(errors) }
+    } else {
+        return Err(crate::PyError::type_error("errors must be str or None"));
+    };
+    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_obj)? };
+    let (decoded, consumed) = crate::typedef::decode_utf8_with_errors_incremental(
+        &data,
+        errors,
+        crate::baseobjspace::is_true(w_final)?,
+    )?;
+    Ok(w_tuple_new(vec![
+        w_str_from_wtf8_managed(decoded),
+        w_int_new(consumed as i64),
+    ]))
+}
+
 fn charmap_encode_impl(
     w_unicode: PyObjectRef,
     errors: PyObjectRef,
@@ -1821,9 +1920,9 @@ crate::py_module! {
         fn utf_8_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-8")
+            utf8_decode_impl(obj, errors, final_)
         }
         fn utf_16_encode(
             obj: PyObjectRef,
@@ -1834,9 +1933,17 @@ crate::py_module! {
         fn utf_16_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-16")
+            utf16_32_decode_impl(obj, errors, final_, false, None, "utf16")
+        }
+        fn utf_16_ex_decode(
+            obj: PyObjectRef,
+            #[default(w_str_new("strict"))] errors: PyObjectRef,
+            #[default(0i64)] byteorder: i64,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            utf16_32_ex_decode_impl(obj, errors, byteorder, final_, false)
         }
         fn utf_16_be_encode(
             obj: PyObjectRef,
@@ -1847,9 +1954,9 @@ crate::py_module! {
         fn utf_16_be_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-16-be")
+            utf16_32_decode_impl(obj, errors, final_, false, Some(true), "utf16-be")
         }
         fn utf_16_le_encode(
             obj: PyObjectRef,
@@ -1860,9 +1967,9 @@ crate::py_module! {
         fn utf_16_le_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-16-le")
+            utf16_32_decode_impl(obj, errors, final_, false, Some(false), "utf16-le")
         }
         fn utf_32_encode(
             obj: PyObjectRef,
@@ -1873,9 +1980,17 @@ crate::py_module! {
         fn utf_32_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-32")
+            utf16_32_decode_impl(obj, errors, final_, true, None, "utf32")
+        }
+        fn utf_32_ex_decode(
+            obj: PyObjectRef,
+            #[default(w_str_new("strict"))] errors: PyObjectRef,
+            #[default(0i64)] byteorder: i64,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            utf16_32_ex_decode_impl(obj, errors, byteorder, final_, true)
         }
         fn utf_32_be_encode(
             obj: PyObjectRef,
@@ -1886,9 +2001,9 @@ crate::py_module! {
         fn utf_32_be_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-32-be")
+            utf16_32_decode_impl(obj, errors, final_, true, Some(true), "utf32-be")
         }
         fn utf_32_le_encode(
             obj: PyObjectRef,
@@ -1899,9 +2014,9 @@ crate::py_module! {
         fn utf_32_le_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "utf-32-le")
+            utf16_32_decode_impl(obj, errors, final_, true, Some(false), "utf32-le")
         }
         fn raw_unicode_escape_encode(
             obj: PyObjectRef,

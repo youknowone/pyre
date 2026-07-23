@@ -29,8 +29,16 @@ fn stat_result_seq_type() -> PyObjectRef {
                 // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
                 // named-only extras, never indexable.
                 &[
-                    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
-                    "_integer_atime", "_integer_mtime", "_integer_ctime",
+                    "st_mode",
+                    "st_ino",
+                    "st_dev",
+                    "st_nlink",
+                    "st_uid",
+                    "st_gid",
+                    "st_size",
+                    "_integer_atime",
+                    "_integer_mtime",
+                    "_integer_ctime",
                 ],
                 // `app_posix.py:38-69` — named-only extras ordered by their
                 // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
@@ -98,8 +106,16 @@ fn statvfs_result_seq_type() -> PyObjectRef {
         crate::_structseq::make_struct_seq_with_extra(
                 "os.statvfs_result",
                 &[
-                    "f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree",
-                    "f_favail", "f_flag", "f_namemax",
+                    "f_bsize",
+                    "f_frsize",
+                    "f_blocks",
+                    "f_bfree",
+                    "f_bavail",
+                    "f_files",
+                    "f_ffree",
+                    "f_favail",
+                    "f_flag",
+                    "f_namemax",
                 ],
                 &["f_fsid"],
             ) as usize
@@ -430,8 +446,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "makedev",
         "get_inheritable",
         "set_inheritable",
-        "get_blocking",
-        "set_blocking",
         // "get_terminal_size" — implemented below
         "cpu_count",
         "getloadavg",
@@ -489,6 +503,99 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
         );
     }
+
+    // PyPy `interp_posix.get_blocking/set_blocking` → rposix
+    // `get_blocking/set_blocking`: inspect or update O_NONBLOCK with fcntl.
+    fn get_blocking(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        if args.len() != 1 {
+            return Err(crate::PyError::type_error(format!(
+                "get_blocking() takes exactly one argument ({} given)",
+                args.len()
+            )));
+        }
+        let fd = libc::c_int::try_from(crate::builtins::space_index_w(args[0])?)
+            .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let flags = loop {
+                let result = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if result >= 0 {
+                    break result;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
+                }
+            };
+            return Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0));
+        }
+        #[cfg(any(not(unix), feature = "sandbox"))]
+        {
+            let _ = fd;
+            Err(crate::PyError::not_implemented(
+                "get_blocking is unavailable on this target",
+            ))
+        }
+    }
+
+    fn set_blocking(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        if args.len() != 2 {
+            return Err(crate::PyError::type_error(format!(
+                "set_blocking() takes exactly two arguments ({} given)",
+                args.len()
+            )));
+        }
+        let fd = libc::c_int::try_from(crate::builtins::space_index_w(args[0])?)
+            .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
+        let blocking = crate::baseobjspace::is_true(args[1])?;
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let mut flags = loop {
+                let result = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if result >= 0 {
+                    break result;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
+                }
+            };
+            if blocking {
+                flags &= !libc::O_NONBLOCK;
+            } else {
+                flags |= libc::O_NONBLOCK;
+            }
+            loop {
+                let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+                if result >= 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
+                }
+            }
+            return Ok(pyre_object::w_none());
+        }
+        #[cfg(any(not(unix), feature = "sandbox"))]
+        {
+            let _ = (fd, blocking);
+            Err(crate::PyError::not_implemented(
+                "set_blocking is unavailable on this target",
+            ))
+        }
+    }
+
+    crate::module_ns_store(
+        ns,
+        "get_blocking",
+        crate::make_builtin_function("get_blocking", get_blocking),
+    );
+    crate::module_ns_store(
+        ns,
+        "set_blocking",
+        crate::make_builtin_function("set_blocking", set_blocking),
+    );
 
     // PyPy `space.fsencode_w` — promoted to `crate::gateway::fsencode_w`
     // so the `#[pyre_function]` / `#[pyre_methods]` `PyPath` alias and
@@ -571,7 +678,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                 }
                 #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                crate::host_seam::ops::close(fd)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_none())
             },
             1,
@@ -630,9 +738,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "readinto",
             |args| {
                 let fd_value = unsafe { pyre_object::w_int_get_value(args[0]) };
-                let fd = libc::c_int::try_from(fd_value).map_err(|_| {
-                    crate::PyError::overflow_error("fd is greater than maximum")
-                })?;
+                let fd = libc::c_int::try_from(fd_value)
+                    .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
                 let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
                 let target = unsafe { buffer.as_mut_slice() };
                 #[cfg(not(feature = "sandbox"))]
@@ -1145,11 +1252,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             } else {
                 libc::lstat(c.as_ptr(), &mut st)
             };
-            if rc == 0 {
-                st.st_flags
-            } else {
-                0
-            }
+            if rc == 0 { st.st_flags } else { 0 }
         }
     }
     #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
@@ -1259,7 +1362,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(unix)]
         let (st_blksize, st_blocks, st_rdev) = {
             use std::os::unix::fs::MetadataExt;
-            (meta.blksize() as i64, meta.blocks() as i64, meta.rdev() as i64)
+            (
+                meta.blksize() as i64,
+                meta.blocks() as i64,
+                meta.rdev() as i64,
+            )
         };
 
         // The 10 sequence slots are the integer fields (integer-seconds
@@ -1448,7 +1555,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         } else {
             host_fs::symlink_metadata(&path)
         };
-        Ok(pyre_object::w_bool_from(meta.map(|m| m.is_dir()).unwrap_or(false)))
+        Ok(pyre_object::w_bool_from(
+            meta.map(|m| m.is_dir()).unwrap_or(false),
+        ))
     }
     fn dir_entry_is_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let path = dir_entry_path(args[0])?;
@@ -1556,7 +1665,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
         let item = unsafe { pyre_object::w_list_getitem(entries, idx) }
             .ok_or_else(crate::PyError::stop_iteration)?;
-        let _ = crate::baseobjspace::setattr_str(self_obj, "_index", pyre_object::w_int_new(idx + 1));
+        let _ =
+            crate::baseobjspace::setattr_str(self_obj, "_index", pyre_object::w_int_new(idx + 1));
         Ok(item)
     }
     fn scandir_iter_type() -> PyObjectRef {
@@ -1600,7 +1710,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let _ = crate::baseobjspace::setattr_str(it, "_index", pyre_object::w_int_new(0));
         Ok(it)
     }
-    crate::module_ns_store(ns, "scandir", crate::make_builtin_function("scandir", scandir_fn));
+    crate::module_ns_store(
+        ns,
+        "scandir",
+        crate::make_builtin_function("scandir", scandir_fn),
+    );
     crate::module_ns_store(ns, "DirEntry", dir_entry_type());
 
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
@@ -1928,7 +2042,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let code = match args.first() {
                         Some(&o) => (unsafe { pyre_object::w_int_get_value(o) }) as i32,
                         None => {
-                            return Err(crate::PyError::type_error("strerror() requires 1 argument"));
+                            return Err(crate::PyError::type_error(
+                                "strerror() requires 1 argument",
+                            ));
                         }
                     };
                     #[cfg(feature = "sandbox")]
@@ -2185,8 +2301,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let pid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
                     let options = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                     let mut status: i32 = 0;
-                    let res =
-                        host_posix::waitpid(pid, &mut status, options).map_err(|e| io_err(e, ""))?;
+                    let res = host_posix::waitpid(pid, &mut status, options)
+                        .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_int_new(res as i64),
                         pyre_object::w_int_new(status as i64),
@@ -2204,8 +2320,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "wait",
                 |_| {
                     let mut status: i32 = 0;
-                    let res =
-                        host_posix::waitpid(-1, &mut status, 0).map_err(|e| io_err(e, ""))?;
+                    let res = host_posix::waitpid(-1, &mut status, 0).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_int_new(res as i64),
                         pyre_object::w_int_new(status as i64),
@@ -2224,7 +2339,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 |args| {
                     let code = match args.first() {
                         Some(&o) => (unsafe { pyre_object::w_int_get_value(o) }) as i32,
-                        None => return Err(crate::PyError::type_error("_exit() requires 1 argument")),
+                        None => {
+                            return Err(crate::PyError::type_error("_exit() requires 1 argument"));
+                        }
                     };
                     rustpython_host_env::os::exit(code)
                 },
@@ -2243,7 +2360,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         $name,
                         |args| {
                             let $s = match args.first() {
-                                Some(&o) => (unsafe { pyre_object::w_int_get_value(o) }) as libc::c_int,
+                                Some(&o) => {
+                                    (unsafe { pyre_object::w_int_get_value(o) }) as libc::c_int
+                                }
                                 None => {
                                     return Err(crate::PyError::type_error(concat!(
                                         $name,
@@ -2258,18 +2377,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 );
             };
         }
-        reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(libc::WIFEXITED(s)));
+        reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(libc::WIFEXITED(
+            s
+        )));
         reg_wstatus!("WEXITSTATUS", |s| pyre_object::w_int_new(
             libc::WEXITSTATUS(s) as i64
         ));
         reg_wstatus!("WIFSIGNALED", |s| pyre_object::w_bool_from(
             libc::WIFSIGNALED(s)
         ));
-        reg_wstatus!("WTERMSIG", |s| pyre_object::w_int_new(libc::WTERMSIG(s) as i64));
+        reg_wstatus!("WTERMSIG", |s| pyre_object::w_int_new(
+            libc::WTERMSIG(s) as i64
+        ));
         reg_wstatus!("WIFSTOPPED", |s| pyre_object::w_bool_from(
             libc::WIFSTOPPED(s)
         ));
-        reg_wstatus!("WSTOPSIG", |s| pyre_object::w_int_new(libc::WSTOPSIG(s) as i64));
+        reg_wstatus!("WSTOPSIG", |s| pyre_object::w_int_new(
+            libc::WSTOPSIG(s) as i64
+        ));
 
         // Wait option flags — override the `0` placeholders registered above
         // with their real libc values (os.WNOHANG must be non-zero for
@@ -2884,7 +3009,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // wrappers don't do manual retry (relies on PEP 475 OS-level retry),
         // matching pyre-wide convention rather than introducing a single
         // outlier.
-        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "sandbox")))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos"),
+            not(feature = "sandbox")
+        ))]
         crate::module_ns_store(
             ns,
             "sendfile",
@@ -3517,38 +3645,113 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
         for name in [
             // process creation / control
-            "fork", "forkpty", "system", "popen", "execv", "execve", "execvp",
-            "execvpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn",
-            "posix_spawnp", "abort", "_exit", "register_at_fork", "wait", "waitpid",
-            "kill", "killpg",
+            "fork",
+            "forkpty",
+            "system",
+            "popen",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "spawnv",
+            "spawnve",
+            "spawnvp",
+            "spawnvpe",
+            "posix_spawn",
+            "posix_spawnp",
+            "abort",
+            "_exit",
+            "register_at_fork",
+            "wait",
+            "waitpid",
+            "kill",
+            "killpg",
             // file-descriptor duplication / pipes / ttys / cross-fd copy +
             // inheritance control (set_inheritable would mutate a real fd).
-            "dup", "dup2", "dup3", "pipe", "pipe2", "openpty", "login_tty",
-            "sendfile", "set_inheritable",
+            "dup",
+            "dup2",
+            "dup3",
+            "pipe",
+            "pipe2",
+            "openpty",
+            "login_tty",
+            "sendfile",
+            "set_inheritable",
             // host filesystem mutation that bypasses the controller
-            "chmod", "fchmod", "lchmod", "chown", "fchown", "lchown", "chroot",
-            "chdir", "fchdir", "link", "symlink", "truncate", "ftruncate",
-            "rename", "replace", "rmdir", "mkfifo", "mknod",
+            "chmod",
+            "fchmod",
+            "lchmod",
+            "chown",
+            "fchown",
+            "lchown",
+            "chroot",
+            "chdir",
+            "fchdir",
+            "link",
+            "symlink",
+            "truncate",
+            "ftruncate",
+            "rename",
+            "replace",
+            "rmdir",
+            "mkfifo",
+            "mknod",
             // privilege / scheduling
-            "setuid", "setgid", "setreuid", "setregid", "setresuid", "setresgid",
-            "setgroups", "initgroups", "setsid", "setpgid", "setpgrp", "nice",
-            "setpriority", "sched_get_priority_max", "sched_get_priority_min",
+            "setuid",
+            "setgid",
+            "setreuid",
+            "setregid",
+            "setresuid",
+            "setresgid",
+            "setgroups",
+            "initgroups",
+            "setsid",
+            "setpgid",
+            "setpgrp",
+            "nice",
+            "setpriority",
+            "sched_get_priority_max",
+            "sched_get_priority_min",
             // durability + real process environment mutation
-            "sync", "fsync", "fdatasync", "setenv", "unsetenv", "putenv",
+            "sync",
+            "fsync",
+            "fdatasync",
+            "setenv",
+            "unsetenv",
+            "putenv",
             // host filesystem inspection that bypasses the controller VFS.
             // DirEntry is a type, but its is_dir/is_file/stat/inode methods stat
             // a guest-controlled `path` via host_fs, so neutralise it too (its
             // only producer, scandir, is already stubbed here).
-            "readlink", "scandir", "DirEntry", "statvfs", "fstatvfs",
+            "readlink",
+            "scandir",
+            "DirEntry",
+            "statvfs",
+            "fstatvfs",
             // host process / environment information leaks
-            "getpid", "getppid", "uname", "getlogin", "getloadavg",
-            "getpriority", "times", "umask", "getgroups", "cpu_count",
-            "_cpu_count", "getresuid", "getresgid",
+            "getpid",
+            "getppid",
+            "uname",
+            "getlogin",
+            "getloadavg",
+            "getpriority",
+            "times",
+            "umask",
+            "getgroups",
+            "cpu_count",
+            "_cpu_count",
+            "getresuid",
+            "getresgid",
             // host system-configuration probes; pathconf consults a
             // guest-controlled path on the real filesystem.
-            "pathconf", "fpathconf", "sysconf",
+            "pathconf",
+            "fpathconf",
+            "sysconf",
             // terminal / tty inspection + control
-            "tcgetpgrp", "tcsetpgrp", "get_terminal_size", "ttyname",
+            "tcgetpgrp",
+            "tcsetpgrp",
+            "get_terminal_size",
+            "ttyname",
         ] {
             crate::module_ns_store(
                 ns,
