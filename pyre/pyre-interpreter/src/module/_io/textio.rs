@@ -63,7 +63,7 @@ impl PositionCookie {
     }
 
     fn to_object(&self) -> PyObjectRef {
-        crate::objspace::descroperation::box_bigint_result(self.pack())
+        crate::objspace::descroperation::bigint_result(self.pack())
     }
 }
 
@@ -1265,9 +1265,9 @@ impl W_TextIOWrapper {
 
         let position_cookie = PositionCookie::unpack(position)?;
         super::call_method_result(self.self_obj(), "flush", &[])?;
-        let start = crate::objspace::descroperation::box_bigint_result(
-            malachite_bigint::BigInt::from(position_cookie.start_pos),
-        );
+        let start = crate::objspace::descroperation::bigint_result(malachite_bigint::BigInt::from(
+            position_cookie.start_pos,
+        ));
         self.call_buffer("seek", &[start])?;
         self.decoded.reset();
         self.snapshot = None;

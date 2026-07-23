@@ -4209,7 +4209,7 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 // Descroperation helpers (lookup_type_special, try_dispatch_binary_special,
 // try_int_long_pow_with_modulo, binary_builtin_type_error,
-// box_bigint_result, issubtype_w) live in `crate::baseobjspace` because
+// issubtype_w) live in `crate::baseobjspace` because
 // they are space-level semantics shared between the builtin module,
 // weakproxy wrappers, and any future opcode dispatch.
 

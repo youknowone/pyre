@@ -261,8 +261,10 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 
 /// The elidable `rbigint` payload helper + effect for a walker-specialised
 /// W_LongObject binary op (see [`long_binop_raw_helper`]). The bigint result is
-/// boxed by the caller as a `W_LongObject` after the pyre-specific fits-int
-/// demotion guard.
+/// boxed by the caller as a `W_LongObject` unconditionally (`newlong` never
+/// demotes); the shift ops additionally guard that the shift count fits a
+/// machine int, deopting a huge count to the generic leg (which produces the
+/// `space.newint` W_IntObject).
 /// True-divide is NOT here — it returns a float (`CallPureF` + `wrapfloat`), so
 /// it has its own specialisation ([`try_walker_specialize_truediv_op_long`]).
 pub(crate) struct LongBinopSpec {

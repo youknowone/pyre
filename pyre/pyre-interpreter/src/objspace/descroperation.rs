@@ -39,7 +39,7 @@ unsafe fn as_bigint(obj: PyObjectRef) -> BigInt {
 
 /// Box a BigInt result, demoting to W_IntObject if it fits in i64.
 
-fn bigint_result(value: BigInt) -> PyObjectRef {
+pub(crate) fn bigint_result(value: BigInt) -> PyObjectRef {
     if jit_bigint_to_i64_fits(&value) != 0 {
         w_int_new(jit_bigint_to_i64_value(&value))
     } else {
@@ -489,15 +489,15 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
 
 unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(bigint_add(as_bigint(a), as_bigint(b))))
+    Ok(w_long_new(bigint_add(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(bigint_sub(as_bigint(a), as_bigint(b))))
+    Ok(w_long_new(bigint_sub(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(bigint_mul(as_bigint(a), as_bigint(b))))
+    Ok(w_long_new(bigint_mul(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -509,7 +509,8 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
-    Ok(bigint_result(as_bigint(a).div_mod_floor(&vb).0))
+    // `_floordiv`/`_int_floordiv` both `newlong` the quotient, keeping a long.
+    Ok(w_long_new(as_bigint(a).div_mod_floor(&vb).0))
 }
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -520,7 +521,15 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Err(PyError::zero_division("integer modulo by zero"));
     }
     // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
-    Ok(bigint_result(as_bigint(a).div_mod_floor(&vb).1))
+    // `_int_mod` (machine-int RHS) returns `space.newint` — the remainder of a
+    // long by a machine int always fits — while `_mod` (long RHS) returns
+    // `newlong`. `a` is a long here, so the RHS kind decides.
+    let r = as_bigint(a).div_mod_floor(&vb).1;
+    if is_int_like(b) {
+        Ok(w_int_new(jit_bigint_to_i64_value(&r)))
+    } else {
+        Ok(w_long_new(r))
+    }
 }
 
 /// `rbigint.floordiv` payload half (`longobject.py:409 _floordiv` →
@@ -925,29 +934,31 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let fb = as_float(b);
         return Ok(w_float_new(float_pow_raw(fa, fb)?));
     }
-    // longobject.py:229: `if not exp_bigint: return int_pow(0)` → 1.
+    // longobject.py:229: `if not exp_bigint: return int_pow(0)` → 1. `descr_pow`
+    // wraps every branch as `W_LongObject`, so a long base keeps the long
+    // representation across these trivial-base short-circuits too.
     if pyre_object::longobject::jit_bigint_sign_i64(&vb) == 0 {
-        return Ok(w_int_new(1));
+        return Ok(w_long_new(BigInt::from(1)));
     }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
     // Short-circuit trivial bases before the u32 narrowing so that
     // 1 ** huge, (-1) ** huge, 0 ** huge succeed.
     let va = as_bigint(a);
     if pyre_object::longobject::jit_bigint_sign_i64(&va) == 0 {
-        return Ok(w_int_new(0));
+        return Ok(w_long_new(BigInt::from(0)));
     }
     if va == BigInt::from(1) {
-        return Ok(w_int_new(1));
+        return Ok(w_long_new(BigInt::from(1)));
     }
     if va == BigInt::from(-1) {
         let even = vb.clone() % BigInt::from(2) == BigInt::from(0);
-        return Ok(w_int_new(if even { 1 } else { -1 }));
+        return Ok(w_long_new(BigInt::from(if even { 1 } else { -1 })));
     }
     let exp = match vb.to_u32() {
         Some(v) => v,
         None => return Err(PyError::memory_error("exponent too large")),
     };
-    Ok(bigint_result(va.pow(exp)))
+    Ok(w_long_new(va.pow(exp)))
 }
 
 // ── Shift operations ─────────────────────────────────────────────────
@@ -998,11 +1009,12 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     } else {
         let va = as_bigint(a);
         if pyre_object::longobject::jit_bigint_sign_i64(&va) == 0 {
-            return Ok(w_int_new(0));
+            // `_lshift` returns `self` (a W_LongObject) for a zero base.
+            return Ok(w_long_new(BigInt::from(0)));
         }
         return Err(PyError::overflow_error("shift count too large"));
     };
-    Ok(bigint_result(checked_bigint_lshift(as_bigint(a), shift)?))
+    Ok(w_long_new(checked_bigint_lshift(as_bigint(a), shift)?))
 }
 
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1024,7 +1036,8 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             },
         ));
     };
-    Ok(bigint_result(bigint_rshift(as_bigint(a), shift)))
+    // `_rshift`/`_int_rshift` `newlong` the normal-count result, keeping a long.
+    Ok(w_long_new(bigint_rshift(as_bigint(a), shift)))
 }
 
 // ── bool-as-int helpers ──────────────────────────────────────────────
@@ -1062,15 +1075,15 @@ unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(bigint_and(as_bigint(a), as_bigint(b))))
+    Ok(w_long_new(bigint_and(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(bigint_or(as_bigint(a), as_bigint(b))))
+    Ok(w_long_new(bigint_or(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(bigint_xor(as_bigint(a), as_bigint(b))))
+    Ok(w_long_new(bigint_xor(as_bigint(a), as_bigint(b))))
 }
 
 // ── String operations ────────────────────────────────────────────────
@@ -2627,6 +2640,14 @@ pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if !is_true(b)? {
                 return Err(PyError::zero_division("division by zero"));
             }
+            // `_divmod`/`_int_divmod` both `newtuple2(newlong(div), newlong(mod))`
+            // — a long receiver keeps BOTH parts as W_LongObject, so bypass the
+            // remainder demote that `mod_` applies for an int RHS. An int
+            // receiver (or float) still routes through floordiv/mod.
+            if is_long(a) && is_int_or_long(b) {
+                let (q, r) = as_bigint(a).div_mod_floor(&as_bigint(b));
+                return Ok(w_tuple_new(vec![w_long_new(q), w_long_new(r)]));
+            }
             let q = floordiv(a, b)?;
             let r = mod_(a, b)?;
             return Ok(w_tuple_new(vec![q, r]));
@@ -2859,6 +2880,13 @@ pub(crate) fn try_int_long_pow_with_modulo(
             return Ok(None);
         }
 
+        // `descr_pow` wraps its 3-arg result as `W_LongObject` whenever the
+        // receiver is a long; the int path (`W_IntObject.descr_pow`) reaches
+        // that same long path via `_pow_ovf2long` when the exponent or modulus
+        // is a long. So the result stays a long unless all three operands are
+        // machine ints, in which case `space.newint` demotes it.
+        let all_int_like = is_int_like(base) && is_int_like(exp) && is_int_like(modulus);
+
         let base = crate::builtins::obj_to_bigint(base);
         let exp = crate::builtins::obj_to_bigint(exp);
         let modulus = crate::builtins::obj_to_bigint(modulus);
@@ -2890,13 +2918,13 @@ pub(crate) fn try_int_long_pow_with_modulo(
             if negative_modulus && bigint_gt(result.clone(), BigInt::from(0)) {
                 result = bigint_sub(result, abs_modulus);
             }
-            return Ok(Some(box_bigint_result(result)));
+            return Ok(Some(pow_mod_result(result, all_int_like)));
         }
         if bigint_eq(exp.clone(), BigInt::from(0)) {
-            return Ok(Some(box_bigint_result(bigint_mod(
-                BigInt::from(1),
-                modulus,
-            ))));
+            return Ok(Some(pow_mod_result(
+                bigint_mod(BigInt::from(1), modulus),
+                all_int_like,
+            )));
         }
 
         let negative_modulus = bigint_lt(modulus.clone(), BigInt::from(0));
@@ -2909,12 +2937,15 @@ pub(crate) fn try_int_long_pow_with_modulo(
         if negative_modulus && bigint_gt(result.clone(), BigInt::from(0)) {
             result = bigint_sub(result, abs_modulus);
         }
-        Ok(Some(box_bigint_result(result)))
+        Ok(Some(pow_mod_result(result, all_int_like)))
     }
 }
 
-pub(crate) fn box_bigint_result(value: BigInt) -> PyObjectRef {
-    if jit_bigint_to_i64_fits(&value) != 0 {
+/// Box a 3-arg `pow` result: `space.newint` (demote) when every operand was a
+/// machine int, else `W_LongObject` (a long receiver keeps the long
+/// representation). The demote arm always fits — `result < |modulus|`.
+fn pow_mod_result(value: BigInt, all_int_like: bool) -> PyObjectRef {
+    if all_int_like {
         w_int_new(jit_bigint_to_i64_value(&value))
     } else {
         w_long_new(value)
@@ -2997,6 +3028,12 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // for the PyPy 3.11 difference.
             if !is_true(b)? {
                 return Err(PyError::zero_division("division by zero"));
+            }
+            // A long receiver keeps both divmod parts as W_LongObject (see
+            // `divmod_builtin`); bypass the remainder demote for an int RHS.
+            if is_long(a) && is_int_or_long(b) {
+                let (q, r) = as_bigint(a).div_mod_floor(&as_bigint(b));
+                return Ok(w_tuple_new(vec![w_long_new(q), w_long_new(r)]));
             }
             let q = floordiv(a, b)?;
             let r = mod_(a, b)?;
@@ -3753,7 +3790,7 @@ pub fn pos(a: PyObjectRef) -> PyResult {
             return Ok(w_int_new(int_value(a)));
         }
         if is_long(a) {
-            return Ok(bigint_result(w_long_get_value(a).clone()));
+            return Ok(w_long_new(w_long_get_value(a).clone()));
         }
         if is_float(a) {
             return Ok(w_float_new(w_float_get_value(a)));
@@ -3792,7 +3829,7 @@ pub fn neg(a: PyObjectRef) -> PyResult {
             };
         }
         if is_long(a) {
-            return Ok(bigint_result(bigint_neg(w_long_get_value(a).clone())));
+            return Ok(w_long_new(bigint_neg(w_long_get_value(a).clone())));
         }
         if is_float(a) {
             return Ok(w_float_new(-w_float_get_value(a)));
@@ -3840,7 +3877,7 @@ the bitwise inversion of the underlying int.",
             return Ok(w_int_new(!int_value(a)));
         }
         if is_long(a) {
-            return Ok(bigint_result(bigint_invert(w_long_get_value(a).clone())));
+            return Ok(w_long_new(bigint_invert(w_long_get_value(a).clone())));
         }
         if let Some(result) = try_instance_unaryop(a, "__invert__")? {
             return Ok(result);
@@ -3945,14 +3982,16 @@ mod tests {
     }
 
     #[test]
-    fn test_long_demote_to_int() {
-        // long + long that fits back in i64 → W_IntObject
+    fn test_long_add_keeps_long_when_fits() {
+        // long + int whose sum fits back in i64 stays a W_LongObject: `newlong`
+        // never demotes (withsmalllong=False), so a shrunk long keeps the long
+        // representation.
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(-1);
         let result = add(a, b).unwrap();
         unsafe {
-            assert!(is_int(result));
-            assert_eq!(w_int_get_value(result), i64::MAX);
+            assert!(is_long(result));
+            assert_eq!(*w_long_get_value(result), BigInt::from(i64::MAX));
         }
     }
 
@@ -4163,7 +4202,11 @@ mod tests {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(0xFF);
         let result = and_(a, b).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 0) };
+        // long & int keeps a W_LongObject even when the result fits (newlong).
+        unsafe {
+            assert!(is_long(result));
+            assert_eq!(*w_long_get_value(result), BigInt::from(0));
+        }
     }
 
     #[test]

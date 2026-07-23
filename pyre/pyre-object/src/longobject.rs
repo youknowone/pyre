@@ -638,32 +638,6 @@ pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
     }
 }
 
-/// `bigint_result` — wrap the bigint produced by [`jit_w_long_add_raw`] in a
-/// Python int, demoting to `W_IntObject` when it fits in i64, otherwise
-/// reusing the `*mut BigInt` payload in a fresh `W_LongObject`. This is the
-/// `W_LongObject(...)` wrapper allocation that upstream keeps a residual `NEW`
-/// outside the elidable `rbigint.add` (the int fast path boxes the same way,
-/// via the `dont_look_inside` `jit_w_int_new`). Marked `dont_look_inside`, not
-/// elidable, so the wrapper object is never pure-CSE'd and each add yields a
-/// distinct boxed result, matching `W_LongObject(op(...))`.
-///
-/// The i64-range demotion to `W_IntObject` is pyre's two-class `int`
-/// representation (small-int fast object + bigint object); PyPy's default
-/// `newlong` (`longobject.py:495`, `withsmalllong=False`) keeps a
-/// `W_LongObject`. Both denote the same `int` value — this is a representation
-/// choice spanning every int path, not specific to this helper.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_bigint_result_box(num: i64) -> i64 {
-    let num = num as *mut BigInt;
-    unsafe {
-        if jit_bigint_to_i64_fits(&*num) != 0 {
-            crate::intobject::w_int_new(jit_bigint_to_i64_value(&*num)) as usize as i64
-        } else {
-            w_long_from_raw(num) as usize as i64
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,30 +747,15 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_bigint_result_box_keeps_long_out_of_range() {
-        // Sum out of i64 range boxes as W_LongObject, reusing the payload.
-        let a = w_long_new(BigInt::from(i64::MAX));
-        let b = w_long_new(BigInt::from(i64::MAX));
-        let raw = jit_w_long_add_raw(a as i64, b as i64);
-        let r = jit_bigint_result_box(raw) as PyObjectRef;
-        unsafe {
-            assert!(is_long(r));
-            assert_eq!(*w_long_get_value(r), BigInt::from(i64::MAX) * 2);
-        }
-    }
-
-    #[test]
-    fn test_jit_bigint_result_box_demotes_to_int_when_fits() {
-        // `bigint_result` parity: a sum that fits in i64 demotes to W_IntObject
-        // (so a later GuardClass(LONG_TYPE) on the result correctly side-exits).
+    fn test_jit_w_long_add_raw_keeps_payload_when_fits() {
+        // The raw helper never demotes: a sum that fits i64 still yields a
+        // `*mut BigInt` payload (the boxing NEW wraps it as a W_LongObject,
+        // matching `newlong` which does not demote).
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_long_new(BigInt::from(-1) - BigInt::from(i64::MAX));
-        let raw = jit_w_long_add_raw(a as i64, b as i64);
-        let r = jit_bigint_result_box(raw) as PyObjectRef;
+        let raw = jit_w_long_add_raw(a as i64, b as i64) as *mut BigInt;
         unsafe {
-            assert!(is_int(r));
-            assert!(!is_long(r));
-            assert_eq!(crate::intobject::w_int_get_value(r), 0);
+            assert_eq!(*raw, BigInt::from(0));
         }
     }
 }
