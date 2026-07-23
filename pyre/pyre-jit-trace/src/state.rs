@@ -2872,7 +2872,15 @@ pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrR
     // (`_all_constants` — a GcArray block's length is fixed at
     // allocation).  The folded box still feeds `arraylen_now_known`,
     // matching `opimpl_arraylen_gc`'s unconditional cache write.
-    if array.is_constant() {
+    //
+    // Not on wasm32: `WasmBackend` inherits the `bh_arraylen_gc` trait
+    // stub (returns 0), so the fold would bake a wrong `ConstInt(0)`
+    // length.  Overriding the stub to read the real length was tried and
+    // exposes a latent wasm-JIT defect (real arraylen concrete stamps
+    // change trace shapes: `synth/comprehension_object_append_hot` GC
+    // crash at `copy_nursery_object` + 2 wrong outputs), so the stub —
+    // and this gate — stay until that defect is fixed.
+    if !cfg!(target_arch = "wasm32") && array.is_constant() {
         if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(array) {
             let struct_ptr = struct_ref.0 as i64;
             if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
