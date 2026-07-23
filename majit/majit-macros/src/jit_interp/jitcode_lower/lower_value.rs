@@ -1827,22 +1827,31 @@ impl<'c> Lowerer<'c> {
         match op {
             UnOp::Neg(_) => {
                 let inner = self.lower_value_expr(expr)?;
-                if !matches!(inner.kind, BindingKind::Int) {
-                    return None;
-                }
                 let reg = self.alloc_reg();
                 let src_reg = inner.reg;
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::UnaryI,
+                // Negate on the int bank (`IntNeg`) and the float bank
+                // (`FloatNeg`) share the one-src/one-dst unary shape; the bank
+                // is carried by the `Register` tag, not the `OpKind`. A `Ref`
+                // operand aborts to the interpreter.
+                let (reads, writes, emit, kind) = match inner.kind {
+                    BindingKind::Int => (
                         vec![Register::int(src_reg)],
                         vec![Register::int(reg)],
+                        quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg); },
+                        BindingKind::Int,
                     ),
-                    quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg); },
-                );
+                    BindingKind::Float => (
+                        vec![Register::float(src_reg)],
+                        vec![Register::float(reg)],
+                        quote! { __builder.record_unary_f(#reg, majit_ir::OpCode::FloatNeg, #src_reg); },
+                        BindingKind::Float,
+                    ),
+                    BindingKind::Ref => return None,
+                };
+                self.emit_op(OpMeta::linear(OpKind::UnaryI, reads, writes), emit);
                 Some(Binding {
                     reg,
-                    kind: BindingKind::Int,
+                    kind,
                     depends_on_stack: inner.depends_on_stack,
                     struct_type: None,
                 })
