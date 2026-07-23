@@ -5776,7 +5776,25 @@ mod tests {
 
     #[test]
     fn test_default_pipeline_keeps_call_may_force_pairs_alive_when_results_are_used() {
-        let field_descr = Arc::new(TestDescr(91));
+        let field_group = majit_ir::descr::make_simple_descr_group(
+            91,
+            16,
+            1,
+            0,
+            &[majit_ir::descr::SimpleFieldDescrSpec {
+                index: 91,
+                name: "CallResult.field".to_string(),
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                flag: majit_ir::ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let field_descr = field_group.field_descrs[0].clone() as DescrRef;
         let call_descr_a = call_may_force_descr(81, majit_ir::Type::Ref);
         let call_descr_b = call_may_force_descr(82, majit_ir::Type::Ref);
         let mut ops = vec![
@@ -5790,7 +5808,7 @@ mod tests {
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
-                OpCode::GetfieldGcPureI,
+                OpCode::GetfieldGcI,
                 &[rooted_resop_operand(Type::Ref, 3)],
                 field_descr.clone(),
             ),
@@ -5804,7 +5822,7 @@ mod tests {
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
-                OpCode::GetfieldGcPureI,
+                OpCode::GetfieldGcI,
                 &[rooted_resop_operand(Type::Ref, 6)],
                 field_descr,
             ),
@@ -5848,7 +5866,39 @@ mod tests {
 
     #[test]
     fn test_default_pipeline_keeps_call_may_force_when_guard_fail_args_reference_results() {
-        let field_descr = Arc::new(TestDescr(101));
+        let field_group = majit_ir::descr::make_simple_descr_group(
+            101,
+            24,
+            2,
+            0,
+            &[
+                majit_ir::descr::SimpleFieldDescrSpec {
+                    index: 101,
+                    name: "CallResult.type".to_string(),
+                    offset: 0,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    is_immutable: true,
+                    is_quasi_immutable: false,
+                    flag: majit_ir::ArrayFlag::Signed,
+                    virtualizable: false,
+                    index_in_parent: 0,
+                },
+                majit_ir::descr::SimpleFieldDescrSpec {
+                    index: 102,
+                    name: "CallResult.value".to_string(),
+                    offset: 8,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    is_immutable: true,
+                    is_quasi_immutable: false,
+                    flag: majit_ir::ArrayFlag::Signed,
+                    virtualizable: false,
+                    index_in_parent: 1,
+                },
+            ],
+        );
+        let field_descr = field_group.field_descrs[0].clone() as DescrRef;
         // Distinct field so `get_a_val` is not CSE-folded into `get_a_type`:
         // it stays a live producer at its own position, which guard_b's fail
         // args reference (a fail arg pointing at a *folded* getfield would make
@@ -5856,7 +5906,7 @@ mod tests {
         // forwards to the survivor — the resolve_box_box divergence tripwire,
         // mod.rs:4750; binding to the real folded producer needs the oprc
         // driver, blocked here by CallMayForceR's void result position).
-        let field_descr_b = Arc::new(TestDescr(102));
+        let field_descr_b = field_group.field_descrs[1].clone() as DescrRef;
         let call_descr_a = call_may_force_descr(83, majit_ir::Type::Ref);
         let call_descr_b = call_may_force_descr(84, majit_ir::Type::Ref);
         let guard_types_a = vec![
@@ -5916,12 +5966,12 @@ mod tests {
         );
         guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
-            OpCode::GetfieldGcPureI,
+            OpCode::GetfieldGcI,
             &[rooted_resop_operand(Type::Ref, 3)],
             field_descr.clone(),
         );
         let get_a_val = Op::with_descr(
-            OpCode::GetfieldGcPureI,
+            OpCode::GetfieldGcI,
             &[rooted_resop_operand(Type::Ref, 3)],
             field_descr_b.clone(),
         );
@@ -5953,12 +6003,12 @@ mod tests {
         );
         guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
-            OpCode::GetfieldGcPureI,
+            OpCode::GetfieldGcI,
             &[rooted_resop_operand(Type::Ref, 7)],
             field_descr.clone(),
         );
         let get_b_val = Op::with_descr(
-            OpCode::GetfieldGcPureI,
+            OpCode::GetfieldGcI,
             &[rooted_resop_operand(Type::Ref, 7)],
             field_descr,
         );

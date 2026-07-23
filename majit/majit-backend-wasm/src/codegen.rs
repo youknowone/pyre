@@ -2502,7 +2502,7 @@ fn build_function(
             }
 
             // ── Field access (direct memory operations) ──
-            OpCode::GetfieldGcI | OpCode::GetfieldGcPureI | OpCode::GetfieldRawI => {
+            OpCode::GetfieldGcI | OpCode::GetfieldRawI => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr (i64)
@@ -2513,7 +2513,7 @@ fn build_function(
                     sink.local_set(1 + vi);
                 }
             }
-            OpCode::GetfieldGcR | OpCode::GetfieldGcPureR | OpCode::GetfieldRawR => {
+            OpCode::GetfieldGcR | OpCode::GetfieldRawR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
@@ -2560,7 +2560,7 @@ fn build_function(
             }
 
             // ── Float field access ──
-            OpCode::GetfieldGcF | OpCode::GetfieldGcPureF | OpCode::GetfieldRawF => {
+            OpCode::GetfieldGcF | OpCode::GetfieldRawF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());

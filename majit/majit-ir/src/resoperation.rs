@@ -2005,11 +2005,6 @@ pub enum OpCode {
     GetfieldRawR,
     GetfieldRawF,
 
-    // ── No side effect: pure field access (immutable) ──
-    GetfieldGcPureI,
-    GetfieldGcPureR,
-    GetfieldGcPureF,
-
     // ── Allocation ──
     New,
     NewWithVtable,
@@ -2201,20 +2196,12 @@ impl OpCode {
 
     pub fn is_always_pure(self) -> bool {
         let n = self.as_u16();
-        (ALWAYS_PURE_FIRST <= n && n <= ALWAYS_PURE_LAST)
-            || matches!(
-                self,
-                OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF
-            )
+        ALWAYS_PURE_FIRST <= n && n <= ALWAYS_PURE_LAST
     }
 
     pub fn has_no_side_effect(self) -> bool {
         let n = self.as_u16();
-        (NOSIDEEFFECT_FIRST <= n && n <= NOSIDEEFFECT_LAST)
-            || matches!(
-                self,
-                OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF
-            )
+        NOSIDEEFFECT_FIRST <= n && n <= NOSIDEEFFECT_LAST
     }
 
     pub fn is_malloc(self) -> bool {
@@ -2371,12 +2358,7 @@ impl OpCode {
     pub fn is_getfield(self) -> bool {
         matches!(
             self,
-            OpCode::GetfieldGcI
-                | OpCode::GetfieldGcR
-                | OpCode::GetfieldGcF
-                | OpCode::GetfieldGcPureI
-                | OpCode::GetfieldGcPureR
-                | OpCode::GetfieldGcPureF
+            OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
         )
     }
 
@@ -2746,9 +2728,6 @@ impl OpCode {
                 | OpCode::GetfieldRawI
                 | OpCode::GetfieldRawR
                 | OpCode::GetfieldRawF
-                | OpCode::GetfieldGcPureI
-                | OpCode::GetfieldGcPureR
-                | OpCode::GetfieldGcPureF
                 // Untyped setfield
                 | OpCode::SetfieldGc
                 | OpCode::SetfieldRaw
@@ -3021,9 +3000,6 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(GetfieldRawI, 1);
     set!(GetfieldRawR, 1);
     set!(GetfieldRawF, 1);
-    set!(GetfieldGcPureI, 1);
-    set!(GetfieldGcPureR, 1);
-    set!(GetfieldGcPureF, 1);
     // Allocation
     set!(New, 0);
     set!(NewWithVtable, 0);
@@ -3145,9 +3121,6 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         GetfieldRawI,
         GetfieldRawR,
         GetfieldRawF,
-        GetfieldGcPureI,
-        GetfieldGcPureR,
-        GetfieldGcPureF,
         // Allocation
         New,
         NewWithVtable,
@@ -3343,7 +3316,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         GetinteriorfieldGcI,
         GetfieldGcI,
         GetfieldRawI,
-        GetfieldGcPureI,
         Strhash,
         Unicodehash,
         CondCallValueI,
@@ -3391,7 +3363,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         GetinteriorfieldGcF,
         GetfieldGcF,
         GetfieldRawF,
-        GetfieldGcPureF,
         CallF,
         CallPureF,
         CallMayForceF,
@@ -3414,7 +3385,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         GetinteriorfieldGcR,
         GetfieldGcR,
         GetfieldRawR,
-        GetfieldGcPureR,
         New,
         NewWithVtable,
         NewArray,
@@ -3607,9 +3577,6 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         GetfieldRawI,
         GetfieldRawR,
         GetfieldRawF,
-        GetfieldGcPureI,
-        GetfieldGcPureR,
-        GetfieldGcPureF,
         New,
         NewWithVtable,
         NewArray,
@@ -3852,9 +3819,6 @@ mod tests {
             OpCode::GetfieldRawI,
             OpCode::GetfieldRawR,
             OpCode::GetfieldRawF,
-            OpCode::GetfieldGcPureI,
-            OpCode::GetfieldGcPureR,
-            OpCode::GetfieldGcPureF,
             OpCode::NewArray,
             OpCode::NewArrayClear,
             OpCode::Newstr,
@@ -4043,7 +4007,6 @@ mod tests {
             OpCode::IntMulOvf,
             OpCode::GetfieldGcI,
             OpCode::GetfieldRawI,
-            OpCode::GetfieldGcPureI,
             OpCode::GetarrayitemGcI,
             OpCode::GetarrayitemRawI,
             OpCode::GetarrayitemGcPureI,
@@ -4076,7 +4039,6 @@ mod tests {
             OpCode::SameAsF,
             OpCode::GetfieldGcF,
             OpCode::GetfieldRawF,
-            OpCode::GetfieldGcPureF,
             OpCode::GetarrayitemGcF,
             OpCode::GetarrayitemRawF,
             OpCode::GetarrayitemGcPureF,
@@ -4116,7 +4078,6 @@ mod tests {
             OpCode::GuardException,
             OpCode::GetfieldGcR,
             OpCode::GetfieldRawR,
-            OpCode::GetfieldGcPureR,
             OpCode::GetarrayitemGcR,
             OpCode::GetarrayitemRawR,
             OpCode::GetarrayitemGcPureR,
@@ -4200,7 +4161,6 @@ mod tests {
 
         assert!(OpCode::IntAdd.is_always_pure());
         assert!(OpCode::FloatMul.is_always_pure());
-        assert!(OpCode::GetfieldGcPureI.is_always_pure());
         assert!(!OpCode::SetfieldGc.is_always_pure());
 
         assert!(OpCode::IntAddOvf.is_ovf());
@@ -4650,9 +4610,6 @@ mod tests {
         assert!(OpCode::GetfieldGcI.is_getfield());
         assert!(OpCode::GetfieldGcR.is_getfield());
         assert!(OpCode::GetfieldGcF.is_getfield());
-        assert!(OpCode::GetfieldGcPureI.is_getfield());
-        assert!(OpCode::GetfieldGcPureR.is_getfield());
-        assert!(OpCode::GetfieldGcPureF.is_getfield());
         assert!(!OpCode::GetfieldRawI.is_getfield());
         assert!(!OpCode::IntAdd.is_getfield());
     }

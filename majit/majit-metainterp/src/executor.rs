@@ -549,14 +549,13 @@ pub fn execute_nonspec_const(
         if let Some(folded) = execute_cast_const(opnum, a) {
             return Ok(Some(folded));
         }
-        // GETFIELD_GC_{I,R,F} — withdescr arity-1, both spellings.
+        // GETFIELD_GC_{I,R,F} — withdescr arity-1.
         // The executor helper is registered under the plain opnum
         // (resoperation.py's table has no PURE getfield opnums; the
         // fold decision is the caller's, gated on
         // `descr.is_always_pure()` at `heap.py:641
         // optimize_GETFIELD_GC_I`), so the fold must accept the plain
-        // spelling too — pyre additionally records GetfieldGcPure*
-        // at trace time and both shapes reach `constant_fold`.
+        // spelling used for immutable fields.
         // `optimizer.py:829-832 protect_speculative_operation` has
         // validated the gcref is non-null and of a valid type for
         // `fielddescr.parent_descr` (`llmodel.py:555-567`); the
@@ -567,7 +566,7 @@ pub fn execute_nonspec_const(
         if let (Value::Ref(struct_ref), Some(d)) = (a, descr) {
             if let Some(fd) = d.as_field_descr() {
                 return Ok(Some(match opnum {
-                    OpCode::GetfieldGcPureI | OpCode::GetfieldGcI => match fd.field_size() {
+                    OpCode::GetfieldGcI => match fd.field_size() {
                         1 | 2 | 4 | 8 => Value::Int(cpu.bh_getfield_gc_i(struct_ref.0, fd)),
                         sz => unreachable!(
                             "GETFIELD_GC_I: unsupported field_size {} \
@@ -575,12 +574,8 @@ pub fn execute_nonspec_const(
                             sz
                         ),
                     },
-                    OpCode::GetfieldGcPureR | OpCode::GetfieldGcR => {
-                        Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd))
-                    }
-                    OpCode::GetfieldGcPureF | OpCode::GetfieldGcF => {
-                        Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd))
-                    }
+                    OpCode::GetfieldGcR => Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)),
+                    OpCode::GetfieldGcF => Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)),
                     _ => return Err(()),
                 }));
             }
@@ -1054,24 +1049,23 @@ mod execute_nonspec_const_tests {
     /// constant. A plain-only miss here surfaces as the
     /// `constant_fold` "no helper registered" panic.
     #[test]
-    fn getfield_gc_fold_accepts_plain_and_pure_spellings() {
+    fn getfield_gc_fold_accepts_plain_spelling() {
         let cpu = crate::cpu::default_cpu();
         // One-field struct layout: header word + i64 payload at offset 8.
         let storage: Box<[i64; 2]> = Box::new([0, 42]);
         let base = storage.as_ref().as_ptr() as usize;
         let descr: DescrRef = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Int, true));
-        for opnum in [OpCode::GetfieldGcI, OpCode::GetfieldGcPureI] {
-            let folded = execute_nonspec_const(
-                cpu.as_ref(),
-                opnum,
-                &[Value::Ref(majit_ir::GcRef(base))],
-                Some(&descr),
-                Type::Int,
-            );
-            match folded {
-                Ok(Some(Value::Int(42))) => {}
-                other => panic!("{opnum:?} must fold to Ok(Some(Int(42))), got {other:?}"),
-            }
+        let opnum = OpCode::GetfieldGcI;
+        let folded = execute_nonspec_const(
+            cpu.as_ref(),
+            opnum,
+            &[Value::Ref(majit_ir::GcRef(base))],
+            Some(&descr),
+            Type::Int,
+        );
+        match folded {
+            Ok(Some(Value::Int(42))) => {}
+            other => panic!("{opnum:?} must fold to Ok(Some(Int(42))), got {other:?}"),
         }
     }
 }

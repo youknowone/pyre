@@ -1166,9 +1166,6 @@ impl HeapCache {
             OpCode::GetfieldGcI
                 | OpCode::GetfieldGcR
                 | OpCode::GetfieldGcF
-                | OpCode::GetfieldGcPureI
-                | OpCode::GetfieldGcPureR
-                | OpCode::GetfieldGcPureF
                 | OpCode::PtrEq
                 | OpCode::PtrNe
                 | OpCode::InstancePtrEq

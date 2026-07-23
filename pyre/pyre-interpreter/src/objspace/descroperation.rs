@@ -671,7 +671,7 @@ fn bigint_rshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
 
 /// `rbigint.floordiv`/`mod`/`lshift`/`rshift` payload halves on bare
 /// `*const BigInt` operands — the divmod/shift the walker emits after reading
-/// each `W_LongObject` operand's immutable `value` via `GetfieldGcPure`. Taking
+/// each `W_LongObject` operand's immutable `value` via `GetfieldGc`. Taking
 /// the payloads (not the wrappers) keeps these elidable calls pure on the
 /// immutable bigints so the optimizer never reorders them ahead of the boxing
 /// `setfield_gc`. Allocates the result via the COLLECTING nursery (the call is a

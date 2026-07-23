@@ -4486,9 +4486,6 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
             | OpCode::GetfieldGcI
             | OpCode::GetfieldGcR
             | OpCode::GetfieldGcF
-            | OpCode::GetfieldGcPureI
-            | OpCode::GetfieldGcPureR
-            | OpCode::GetfieldGcPureF
             // SetfieldGc: store to [loc_ptr + offset]
             | OpCode::SetfieldGc
             // GetArrayItemGc / SetArrayItemGc: load/store from arrays
@@ -12667,10 +12664,7 @@ impl CraneliftBackend {
                 | OpCode::GetfieldGcF
                 | OpCode::GetfieldRawI
                 | OpCode::GetfieldRawR
-                | OpCode::GetfieldRawF
-                | OpCode::GetfieldGcPureI
-                | OpCode::GetfieldGcPureR
-                | OpCode::GetfieldGcPureF => {
+                | OpCode::GetfieldRawF => {
                     let descr = op.getdescr().expect("getfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
@@ -21045,7 +21039,7 @@ mod tests {
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(OpCode::GetfieldGcPureR, &[OpRef::input_arg_ref(0)], 1, fd),
+            mk_op_with_descr(OpCode::GetfieldGcR, &[OpRef::input_arg_ref(0)], 1, fd),
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
@@ -22911,7 +22905,7 @@ mod tests {
                 loop_descr.clone(),
             ),
             mk_op_with_descr(
-                OpCode::GetfieldGcPureI,
+                OpCode::GetfieldGcI,
                 &[OpRef::input_arg_ref(2)],
                 3,
                 int_field.clone(),

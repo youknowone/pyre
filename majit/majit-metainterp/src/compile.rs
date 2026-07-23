@@ -2727,7 +2727,7 @@ mod tests {
             &[rooted_inputarg_operand(Type::Ref, 0), op0_result.clone()],
         ));
         let op2: majit_ir::OpRc = {
-            let mut op = Op::new(OpCode::GetfieldGcPureI, &[op0_result]);
+            let mut op = Op::new(OpCode::GetfieldGcI, &[op0_result]);
             op.pos.set(OpRef::int_op(11));
             op.setdescr(majit_ir::descr::make_field_descr(
                 16,
@@ -2778,7 +2778,7 @@ mod tests {
             vec![OpRef::input_arg_ref(0), forwarded_same_as]
         );
 
-        assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcI);
         assert_eq!(
             ops[3]
                 .getarglist()

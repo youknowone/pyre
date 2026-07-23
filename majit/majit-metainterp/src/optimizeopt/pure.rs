@@ -214,7 +214,7 @@ impl RecentPureOpTable {
     }
 
     fn bucket_count() -> usize {
-        (OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 1) + 3
+        OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 1
     }
 
     fn bucket_index(opcode: OpCode) -> Option<usize> {
@@ -222,15 +222,6 @@ impl RecentPureOpTable {
             return Some(opcode as usize - OpCode::IntAddOvf as usize);
         }
         match opcode {
-            OpCode::GetfieldGcPureI => {
-                Some(OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 1)
-            }
-            OpCode::GetfieldGcPureR => {
-                Some(OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 2)
-            }
-            OpCode::GetfieldGcPureF => {
-                Some(OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 3)
-            }
             _ if opcode.is_always_pure() => Some(opcode as usize - OpCode::IntAdd as usize),
             _ => None,
         }
@@ -1302,21 +1293,6 @@ impl Optimization for OptPure {
     /// then this method transfers them into OptPure's preamble caches.
     fn install_preamble_pure_ops(&mut self, ctx: &OptContext) {
         for entry in &ctx.imported_short_pure_ops {
-            // heap.py:640-643: GetfieldGcPure on constant objects are
-            // handled by constant_fold in the heap optimizer. Skip these
-            // to avoid conflicting with the heap path. Non-constant
-            // GetfieldGcPure ops go through the pure cache normally.
-            if matches!(
-                entry.opcode,
-                OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF
-            ) {
-                let arg0_is_const = entry.args.first().map_or(false, |a| {
-                    matches!(a, crate::optimizeopt::ImportedShortPureArg::Const(..))
-                });
-                if arg0_is_const {
-                    continue;
-                }
-            }
             // The replay `preamble_op` was built by `ImportedShortPureOp::new`
             // from the same arg list with producer-bound operands
             // (shortpreamble.py:425 — the replay op carries the same Box
@@ -2269,147 +2245,85 @@ mod tests {
         assert_eq!(ovf_count, 0, "OVF(3,4) should be constant-folded");
     }
 
-    #[repr(C)]
-    struct TestIntFieldObject {
-        value: i64,
-    }
-
-    #[repr(C)]
-    struct TestFloatFieldObject {
-        value: f64,
-    }
-
-    #[repr(C)]
-    struct TestRefFieldObject {
-        value: usize,
+    fn run_immutable_getfield_cse(opcode: OpCode, index: u32, field_type: Type) -> Vec<Op> {
+        let flag = match field_type {
+            Type::Int => majit_ir::ArrayFlag::Signed,
+            Type::Float => majit_ir::ArrayFlag::Float,
+            Type::Ref => majit_ir::ArrayFlag::Unsigned,
+            _ => unreachable!("getfield CSE test requires a typed field"),
+        };
+        let group = majit_ir::descr::make_simple_descr_group(
+            index,
+            16,
+            1,
+            0,
+            &[majit_ir::descr::SimpleFieldDescrSpec {
+                index,
+                name: format!("CseField{index}"),
+                offset: 0,
+                field_size: 8,
+                field_type,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                flag,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let descr = group.field_descrs[0].clone() as majit_ir::DescrRef;
+        let base = crate::history::test_support::rooted_inputarg_operand(Type::Ref, 100);
+        let mut ops = vec![
+            Op::with_descr(opcode, &[base.clone()], descr.clone()),
+            Op::with_descr(opcode, &[base], descr),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::heap::OptHeap::new()));
+        opt.trace_inputargs = OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024)
     }
 
     #[test]
-    fn test_constant_fold_getfield_gc_pure_i_from_constant_object() {
-        let object = Box::new(TestIntFieldObject { value: 123 });
-        let ptr = Box::into_raw(object) as usize;
-
-        let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
-        let mut pass = OptPure::new();
-        let mut ctx = OptContext::with_num_inputs(4, 0);
-        // The struct operand is the canonical box materialized in ctx and made
-        // a Ref constant; the op carries that same box (no position-only mint).
-        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
-        ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[struct_box.clone()], descr);
-        op.pos.set(OpRef::int_op(0));
-        pass.setup();
-
-        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
-        // carries the canonical const box the pass reads via get_constant_box.
-        let resolved = ctx
-            .resolve_operand_operand_opt(&op.arg(0))
-            .expect("constant arg resolves");
-        op.setarg(0, resolved);
-
-        assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(OpRef::int_op(0))
-                .and_then(|cb| cb.const_int()),
-            Some(123)
-        );
-
-        unsafe {
-            drop(Box::from_raw(ptr as *mut TestIntFieldObject));
-        }
+    fn test_immutable_getfield_gc_i_cse_uses_heap_cache() {
+        let result = run_immutable_getfield_cse(OpCode::GetfieldGcI, 1, Type::Int);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     #[test]
-    fn test_constant_fold_getfield_gc_pure_f_from_constant_object() {
-        let object = Box::new(TestFloatFieldObject { value: 3.5 });
-        let ptr = Box::into_raw(object) as usize;
-
-        let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
-        let mut pass = OptPure::new();
-        let mut ctx = OptContext::with_num_inputs(4, 0);
-        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
-        ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[struct_box.clone()], descr);
-        op.pos.set(OpRef::float_op(0));
-        pass.setup();
-
-        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
-        // carries the canonical const box the pass reads via get_constant_box.
-        let resolved = ctx
-            .resolve_operand_operand_opt(&op.arg(0))
-            .expect("constant arg resolves");
-        op.setarg(0, resolved);
-
-        assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(OpRef::float_op(0))
-                .and_then(|b| ctx.get_constant_float_box(&b)),
-            Some(3.5)
-        );
-
-        unsafe {
-            drop(Box::from_raw(ptr as *mut TestFloatFieldObject));
-        }
+    fn test_immutable_getfield_gc_f_cse_uses_heap_cache() {
+        let result = run_immutable_getfield_cse(OpCode::GetfieldGcF, 2, Type::Float);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcF);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     #[test]
-    fn test_constant_fold_getfield_gc_pure_r_from_constant_object() {
-        let object = Box::new(TestRefFieldObject {
-            value: 0x1234_5678usize,
-        });
-        let ptr = Box::into_raw(object) as usize;
-
-        let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
-        let mut pass = OptPure::new();
-        let mut ctx = OptContext::with_num_inputs(4, 0);
-        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
-        ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[struct_box.clone()], descr);
-        op.pos.set(OpRef::ref_op(0));
-        pass.setup();
-
-        // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
-        // carries the canonical const box the pass reads via get_constant_box.
-        let resolved = ctx
-            .resolve_operand_operand_opt(&op.arg(0))
-            .expect("constant arg resolves");
-        op.setarg(0, resolved);
-
-        assert_eq!(
-            ctx.constant_fold(&op),
-            Some(Value::Ref(GcRef(0x1234_5678usize)))
-        );
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(OpRef::ref_op(0))
-                .and_then(|cb| cb.const_value()),
-            Some(Value::Ref(GcRef(0x1234_5678usize)))
-        );
-
-        unsafe {
-            drop(Box::from_raw(ptr as *mut TestRefFieldObject));
-        }
+    fn test_immutable_getfield_gc_r_cse_uses_heap_cache() {
+        let result = run_immutable_getfield_cse(OpCode::GetfieldGcR, 3, Type::Ref);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     #[test]
     #[should_panic(expected = "must be a gcref")]
-    fn test_constant_fold_getfield_gc_pure_does_not_treat_int_constant_as_gc_pointer() {
+    fn test_constant_fold_getfield_gc_does_not_treat_int_constant_as_gc_pointer() {
         // Upstream `optimizer.py:829-832 protect_speculative_operation`
         // derefs `op.getarg(0)` via `getref_base()` — only `ConstPtr`
-        // supports that.  RPython's type system makes a `GETFIELD_GC_
-        // PURE_I` with `ConstInt` arg0 unconstructible.  Pyre's
+        // supports that. RPython's type system makes a `GETFIELD_GC_I`
+        // with `ConstInt` arg0 unconstructible. Pyre's
         // strict-orthodoxy port panics on the variant mismatch instead
         // of returning `None`; this test pins that behavior.
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let arg_box = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[arg_box.clone()], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[arg_box.clone()], descr);
         op.pos.set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op

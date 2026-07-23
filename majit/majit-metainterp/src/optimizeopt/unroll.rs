@@ -3788,7 +3788,7 @@ impl OptUnroll {
         // NOT in `inputargs` (= originals there), so THIS leg is the sole mapper
         // that resolves them to jump_args. Measured LOAD-BEARING: 176 consumptions
         // across the check.py corpus on both backends, all GuardNonnullClass /
-        // GetfieldGcPure over ref inputargs (the redundant-guard / pure-getfield
+        // Immutable GetfieldGc over ref inputargs (the redundant-guard / field-read
         // elimination on loop-carried references). Dropping this leg routes those
         // args to the None → InvalidLoop arm below — correct, but it loses the loop
         // inlining for those traces. (The originals-domain seeding from the import
@@ -3989,11 +3989,11 @@ impl OptUnroll {
                 // already carries it). Overwriting the seed for such an op would
                 // make every later short op that reads the input resolve to this
                 // fresh, field-less allocation instead of the loop-carried box, so
-                // a `GetfieldGcPureI` over the aliased input reads an uninitialized
+                // a `GetfieldGcI` over the aliased input reads an uninitialized
                 // field. Skip the insert ONLY for those allocation ops
                 // (`is_malloc`: New..Newunicode) to preserve the seed. A colliding
                 // NON-allocation op (a pure read/compute whose result pos happens
-                // to alias a seed, e.g. `GetfieldGcPureI` producing an Int loop
+                // to alias a seed, e.g. `GetfieldGcI` producing an Int loop
                 // slot) is a genuine recomputation whose fresh result IS the
                 // correct binding — skipping it would strand the slot on the seed's
                 // Ref box and feed a Ref into an Int consumer (getintbound_handle
@@ -7127,7 +7127,7 @@ mod tests {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
-        let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
+        let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, true);
         // ConstPtr.value inline (history.py:314): the producer seeds the
         // inline variant that carries the pointer directly; the consumer
         // reads it back without any pool lookup.
@@ -7137,7 +7137,7 @@ mod tests {
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::with_descr(
-                        OpCode::GetfieldGcPureI,
+                        OpCode::GetfieldGcI,
                         &[Operand::from_opref(OpRef::const_ptr(ptr))],
                         field_descr.clone(),
                     );
@@ -7163,7 +7163,7 @@ mod tests {
             &mut ctx,
             None,
         );
-        // Both label args resolve to Int op slots (12 / 11 = GetfieldGcPureI base / result).
+        // Both label args resolve to Int op slots (12 / 11 = GetfieldGcI base / result).
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
         let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
@@ -7177,7 +7177,7 @@ mod tests {
         assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
         let expected = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx2,
-            OpCode::GetfieldGcPureI,
+            OpCode::GetfieldGcI,
             Some(field_descr.clone()),
             vec![crate::optimizeopt::ImportedShortPureArg::Const(
                 Value::Ref(ptr),
@@ -7975,16 +7975,14 @@ mod tests {
         // pre-replaced with OpRef::int_op(10) (the corresponding label_arg).
         let p2_ops = vec![
             {
-                let mut op = Op::new(
-                    OpCode::GetfieldGcPureI,
-                    &[rooted_resop_operand(Type::Int, 50)],
-                );
+                let mut op = Op::new(OpCode::GetfieldGcI, &[rooted_resop_operand(Type::Int, 50)]);
                 op.pos.set(OpRef::int_op(1));
-                op.setdescr(majit_ir::make_field_descr(
+                op.setdescr(majit_ir::descr::make_field_descr_full(
+                    0,
                     0,
                     8,
                     majit_ir::Type::Int,
-                    majit_ir::ArrayFlag::Signed,
+                    true,
                 ));
                 op
             },
@@ -8030,7 +8028,7 @@ mod tests {
             &[OpRef::int_op(10), extra_label_arg.to_opref()]
         );
         let body_getfield = &combined[label_idx + 1];
-        assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);
+        assert_eq!(body_getfield.opcode, OpCode::GetfieldGcI);
         assert_eq!(
             body_getfield
                 .getarglist()

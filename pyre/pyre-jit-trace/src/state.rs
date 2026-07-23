@@ -3209,7 +3209,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     result
 }
 
-// Note: pyre does not currently route GetfieldGcF/GetfieldGcPureF through
+// Note: pyre does not currently route GetfieldGcF through
 // state.rs. Float field unboxing goes via the codewriter-generated
 // `getfield_gc_f_pureornot` (majit-translate/src/codegen.rs),
 // which — matching RPython's pyjitpl.py opimpl_getfield_gc_f — records
@@ -5257,7 +5257,7 @@ impl PyreSym {
                     for (item_idx, bits) in items.iter().enumerate() {
                         // Seed a tagged-immediate local as the heap `W_IntObject`
                         // it stands for, so the recorded body reads it through the
-                        // flag-false `GuardClass`+`GetfieldGcPure` arm rather than
+                        // flag-false `GuardClass`+immutable `GetfieldGc` arm rather than
                         // the tagged `CastPtrToInt`+`IntAnd` arm. The runtime
                         // (`execute_assembler`) converts the live frame's local
                         // slots to heap boxes before the compiled loop reads them;

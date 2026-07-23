@@ -268,7 +268,7 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 pub(crate) struct LongBinopSpec {
     /// Pure `rbigint` op over the two bare `*const BigInt` *payloads*
     /// `[Ref, Ref] -> Ref`. The walker emits this after a
-    /// `GetfieldGcPure(value)` on each operand, so the elidable call is pure on
+    /// immutable `GetfieldGc(value)` on each operand, so the elidable call is pure on
     /// the immutable bigints (not the wrappers) and the optimizer never
     /// reorders it ahead of the boxing `setfield_gc` that initializes a fresh
     /// result wrapper.

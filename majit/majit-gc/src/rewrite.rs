@@ -2281,13 +2281,6 @@ impl GcRewriterImpl {
             return false;
         }
         // rewrite.py:246-247 GETFIELD_{GC,RAW}_{I,R,F}.
-        // Upstream excludes GETFIELD_GC_PURE_{I,R,F}: the pure variants
-        // are `is_always_pure` at `resoperation.rs:1228` and must retain
-        // their pure-op identity; lowering them to GC_LOAD_* would drop
-        // purity and let the optimizer CSE-fold them differently from
-        // their upstream siblings.  So the pure arm is intentionally
-        // not handled here and falls through to the main loop's default
-        // arm (which emits the op unchanged).
         if matches!(
             opnum,
             OpCode::GetfieldGcI
@@ -3709,36 +3702,6 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
         assert_eq!(result[0].arg(0).to_opref(), obj);
         assert_eq!(result[1].opcode, OpCode::GcStore);
-    }
-
-    // ── Parity guards against `transform_to_gc_load` over-reaching ──
-
-    #[test]
-    fn test_getfield_gc_pure_not_lowered() {
-        // rewrite.py:246-247 excludes GETFIELD_GC_PURE_{I,R,F} from the
-        // lowering arm — upstream only handles GETFIELD_GC_{I,R,F} and
-        // GETFIELD_RAW_{I,R,F}.  The pure variant is `is_always_pure`
-        // at `resoperation.rs:1228` and must retain that identity; a
-        // stray lowering to GC_LOAD_R would drop purity semantics.
-        let rw = make_rewriter();
-        let obj = OpRef::ref_op(0);
-        let ops = vec![Op::with_descr(
-            OpCode::GetfieldGcPureR,
-            &[ro(obj)],
-            ref_field_descr(),
-        )];
-
-        let result = rw.rewrite_for_gc(&ops);
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].opcode, OpCode::GetfieldGcPureR);
-        assert!(
-            !result.iter().any(|op| matches!(
-                op.opcode,
-                OpCode::GcLoadR | OpCode::GcLoadI | OpCode::GcLoadF
-            )),
-            "GETFIELD_GC_PURE_R must not be lowered to GC_LOAD_*"
-        );
     }
 
     #[test]

@@ -505,7 +505,7 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 /// `rbigint.add`/`sub`/`mul`/`and_`/`or_`/`xor_` (`rpython/rlib/rbigint.py`,
 /// each `@jit.elidable`) on bare `*const BigInt` payloads — the elidable
 /// arithmetic the walker emits after reading each operand's immutable `value`
-/// via `GetfieldGcPure`. Taking the payloads (not the `W_LongObject` wrappers)
+/// via an immutable `GetfieldGc`. Taking the payloads (not the `W_LongObject` wrappers)
 /// keeps the call's inputs the immutable bigints, so the optimizer forwards the
 /// field read and never reorders this elidable call ahead of the boxing
 /// `setfield_gc` that initializes the fresh result wrapper. Allocates the result

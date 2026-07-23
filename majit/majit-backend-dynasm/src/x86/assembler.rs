@@ -3392,9 +3392,6 @@ impl<'a> Assembler386<'a> {
             OpCode::GetfieldGcI
             | OpCode::GetfieldGcR
             | OpCode::GetfieldGcF
-            | OpCode::GetfieldGcPureI
-            | OpCode::GetfieldGcPureR
-            | OpCode::GetfieldGcPureF
             | OpCode::GetfieldRawI
             | OpCode::GetfieldRawR
             | OpCode::GetfieldRawF

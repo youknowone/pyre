@@ -6051,7 +6051,7 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
             // `GuardFalse` does not forward through the loop-close `SetfieldGc`,
             // so it would survive the unroll and pin a per-iteration rebox in the
             // steady loop. Skipping it yields the flag-false `GuardClass`+
-            // `GetfieldGcPure` shape (raw carry).
+            // immutable `GetfieldGc` shape (raw carry).
         }
     }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {

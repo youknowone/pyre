@@ -915,13 +915,8 @@ impl OptVirtualize {
             // heaptracker.py:66 typeptr exclusion: typeptr is excluded from
             // virtual fields but can be resolved from the SizeDescr vtable.
             // RPython doesn't need this because GUARD_CLASS reads the class
-            // directly from the object, not via a separate GetfieldGcPure.
-            if field_val.is_none()
-                && matches!(
-                    op.opcode,
-                    majit_ir::OpCode::GetfieldGcPureI | majit_ir::OpCode::GetfieldGcI
-                )
-            {
+            // directly from the object, not via a separate field read.
+            if field_val.is_none() && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI) {
                 let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
                 if is_typeptr {
                     let vtable = match &info {
@@ -1964,9 +1959,6 @@ impl Optimization for OptVirtualize {
             OpCode::GetfieldGcI
             | OpCode::GetfieldGcR
             | OpCode::GetfieldGcF
-            | OpCode::GetfieldGcPureI
-            | OpCode::GetfieldGcPureR
-            | OpCode::GetfieldGcPureF
             | OpCode::GetfieldRawI
             | OpCode::GetfieldRawR
             | OpCode::GetfieldRawF => self.optimize_getfield_gc(op, op_rc, ctx),
@@ -5343,7 +5335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_forced_virtual_pure_getfield() {
+    fn test_call_forced_virtual_immutable_getfield() {
         // RPython test_optimizeopt.py:test_forced_virtual_pure_getfield
         //
         // [p0]

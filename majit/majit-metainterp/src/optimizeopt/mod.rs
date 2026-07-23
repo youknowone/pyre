@@ -840,7 +840,7 @@ pub struct OptContext {
     /// upstream keys producers on `box._forwarded`, not a positional map).
     pub(crate) phase1_emit_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// Recorder trace ops that carry the input operands' producer `Op`
-    /// (e.g. the `IntLt`/`GetfieldGcPureI` operands of a recorded loop),
+    /// (e.g. the `IntLt`/immutable `GetfieldGcI` operands of a recorded loop),
     /// shared by `Rc` with the canonical stores but absent from
     /// `new_operations` / `phase1_emit_ops` / `resop_refs`. Seeded at
     /// optimizer setup from the recorder's `Rc<Op>` slice (`TreeLoop.ops`

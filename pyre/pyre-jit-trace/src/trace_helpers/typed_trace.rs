@@ -374,7 +374,7 @@ fn unbox_int_or_long_for_int_strategy<F: pyre_jit_trace::walker_frame_ops::Walke
 /// variants (`Cls_ii / Cls_ff / Cls_oo` per
 /// `pypy/objspace/std/specialisedtupleobject.py`) the trace dispatches
 /// on the runtime `ob_type` and emits a direct inline-field load —
-/// `value0` / `value1` are immutable so the `GetfieldGcPureI/F/R` op
+/// `value0` / `value1` are immutable so the `GetfieldGcI/F/R` op
 /// is constant-foldable.
 
 /// pyjitpl.py:767-776 opimpl_check_neg_index:

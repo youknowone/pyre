@@ -6899,7 +6899,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
 /// `GuardTrue(lowbit)` fails on every back-edge → deopt storm / hang. Converting
 /// the slot to a heap box here — at the concrete boundary, recording no IR —
 /// makes the compiled loop read heap `W_IntObject`, so the trace is the
-/// flag-false `GuardClass`+`GetfieldGcPure` shape that virtualizes to a raw
+/// flag-false `GuardClass`+immutable `GetfieldGc` shape that virtualizes to a raw
 /// carry with zero in-loop tag ops.
 ///
 /// Only the locals region (`0..nlocals`) is scanned; cell/free vars and stack
@@ -7549,7 +7549,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         let env = PyreEnv;
         // Same concrete boundary as `execute_assembler`: a function-entry
         // compiled trace reads its arg locals as heap `W_IntObject`
-        // (`GuardClass`+`GetfieldGcPure`, entry-local tag test omitted), but
+        // (`GuardClass`+immutable `GetfieldGc`, entry-local tag test omitted), but
         // this path never runs `execute_assembler`, so convert here too. A
         // recursive callee (`fib(n-1)`) arrives with a tagged-immediate arg
         // local; without this the compiled `GuardClass(n)` derefs the tag.
@@ -11935,7 +11935,7 @@ r = acc",
     /// RPython portal return type is always REF (warmspot.py:449).
     /// The self-recursive call uses CALL_ASSEMBLER_R, FINISH records with
     /// done_with_this_frame_descr_ref, and the caller unboxes via
-    /// GuardClass + GetfieldGcPureI (pyjitpl.py:3198-3220).
+    /// GuardClass + immutable GetfieldGcI (pyjitpl.py:3198-3220).
     ///
     /// A previous bug used CALL_ASSEMBLER_I + FINISH(Int) + forced unbox
     /// at the blackhole boundary, causing pointer-like-integer corruption

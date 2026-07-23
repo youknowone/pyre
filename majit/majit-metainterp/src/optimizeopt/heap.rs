@@ -2280,8 +2280,7 @@ impl OptHeap {
             ctx.structinfo_setfield(op, field_idx, op.pos.get());
         }
         // Virtualizable Ref fields (linked list head) need a null guard.
-        let is_vable_ref =
-            is_vable_field && matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR);
+        let is_vable_ref = is_vable_field && matches!(op.opcode, OpCode::GetfieldGcR);
         if is_vable_ref {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
@@ -3021,12 +3020,9 @@ impl OptHeap {
     ) -> OptimizationResult {
         match op.opcode {
             // ── Field reads ──
-            OpCode::GetfieldGcI
-            | OpCode::GetfieldGcR
-            | OpCode::GetfieldGcF
-            | OpCode::GetfieldGcPureI
-            | OpCode::GetfieldGcPureR
-            | OpCode::GetfieldGcPureF => self.optimize_getfield(op, op_rc, ctx),
+            OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
+                self.optimize_getfield(op, op_rc, ctx)
+            }
 
             // ── Raw field reads/writes ──
             // Keep these conservative. The standard heap.py cache/postprocess
