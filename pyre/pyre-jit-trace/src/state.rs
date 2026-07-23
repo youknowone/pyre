@@ -3985,7 +3985,21 @@ pub(crate) fn flush_walk_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None)
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None, false)
+}
+
+/// Merge-point handoff for `raise_continue_running_normally`.
+///
+/// A handler loop can carry a null saved-exception sentinel as a real live
+/// operand.  Accept it only when the recorded box independently resolves to
+/// that same concrete null; abort-point handoffs keep rejecting null shadow
+/// slots because their mid-expression operands may be unavailable.
+pub(crate) fn flush_walk_loop_end_state_to_frame(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+) -> bool {
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None, true)
 }
 
 /// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
@@ -4001,7 +4015,7 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     resume_py_pc: usize,
     push: Option<(PyObjectRef, usize)>,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None)
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None, false)
 }
 
 pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(
@@ -4010,7 +4024,15 @@ pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(
     resume_py_pc: usize,
     stack_overrides: &[(usize, PyObjectRef)],
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, stack_overrides, None)
+    flush_walk_end_state_to_frame_inner(
+        ctx,
+        frame,
+        resume_py_pc,
+        None,
+        stack_overrides,
+        None,
+        false,
+    )
 }
 
 /// `flush_walk_end_state_to_frame` with the COMPLETE operand stack supplied by
@@ -4031,7 +4053,7 @@ pub(crate) fn flush_walk_end_state_to_frame_with_full_stack(
     resume_py_pc: usize,
     stack: &[PyObjectRef],
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], Some(stack))
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], Some(stack), false)
 }
 
 fn flush_walk_end_state_to_frame_inner(
@@ -4041,6 +4063,7 @@ fn flush_walk_end_state_to_frame_inner(
     push: Option<(PyObjectRef, usize)>,
     stack_overrides: &[(usize, PyObjectRef)],
     full_stack: Option<&[PyObjectRef]>,
+    allow_known_null_stack: bool,
 ) -> bool {
     let decline = |why: &str| {
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -4126,14 +4149,16 @@ fn flush_walk_end_state_to_frame_inner(
             }
             continue;
         }
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+        let Some((opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return decline("no shadow entry for a live slot (validation)");
         };
         // An operand-STACK slot (`abs >= nlocals`) that resolves to a NULL Ref
-        // is an UNPOPULATED shadow slot, not a live value: the virtualizable
-        // shadow tracks locals/cells faithfully but its stack region is only
-        // valid at a merge point (loop header) where the walk's stack effects
-        // have settled.  At an arbitrary mid-opcode resume pc (an
+        // is normally an UNPOPULATED shadow slot, not a live value: the
+        // virtualizable shadow tracks locals/cells faithfully but its stack
+        // region is only generally valid at a merge point where the walk's
+        // stack effects have settled.  A merge-point handoff can also carry a
+        // real null sentinel when its recorded box proves the same concrete
+        // value.  At an arbitrary mid-opcode resume pc (an
         // `abort_permanent` marker reached partway through an opcode's stack
         // build — e.g. a MAKE_FUNCTION whose LOAD_CONST'd code object the walk
         // tracked symbolically, never writing it to the shadow) those slots
@@ -4143,7 +4168,13 @@ fn flush_walk_end_state_to_frame_inner(
         // frame from its start state instead.  A local slot may legitimately
         // be NULL (an unbound local), so this only guards the stack region.
         if abs >= nlocals && matches!(value, Value::Ref(r) if r.0 == 0) {
-            return decline("NULL operand-stack shadow slot (mid-expression)");
+            let recorded_null = matches!(
+                ctx.concrete_of_opref(opref),
+                Some(Value::Ref(r)) if r.0 == 0
+            );
+            if !allow_known_null_stack || !recorded_null {
+                return decline("NULL operand-stack shadow slot (mid-expression)");
+            }
         }
     }
     let arr_ptr = unsafe {
