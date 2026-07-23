@@ -1783,6 +1783,10 @@ def main():
             f"{B}/getframe_escape_flush_writethrough_regression.py",
             15,
         )
+        # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
+        # suite as bridge_branchy_callee.py, gated against pypy by
+        # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing
+        # interpreted (~34x) balloons the ratio past the limit.
 
     if not args.no_synthetic:
         print()
