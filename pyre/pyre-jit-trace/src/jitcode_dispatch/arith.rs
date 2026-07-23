@@ -487,7 +487,9 @@ pub(crate) fn record_ptr_cmp<Sym: WalkSym>(
 /// same `b1 is b2` short-circuit at `pyjitpl.py` for
 /// `opimpl_ptr_eq` but the nullity test against `CONST_NULL` cannot
 /// short-circuit because `box` is never the literal `CONST_NULL`
-/// constant (codewriter would have folded that).
+/// constant (codewriter would have folded that).  A `Const` box still
+/// folds through `execute_and_record`'s `_all_constants` short-circuit —
+/// `CONST_NULL` is itself a `Const`, so both operands are constant.
 pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -495,6 +497,16 @@ pub(crate) fn ptr_nullity_record<Sym: WalkSym>(
     nonzero: bool,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let box_ = read_ref_reg(code, op, 0, ctx)?;
+    // A `Const` box folds without recording: `CONST_NULL` is a `Const`, so
+    // `_all_constants` holds and `execute_and_record` answers the nullity
+    // from the constant's own address.
+    if let Some(majit_ir::Value::Ref(r)) = box_.inline_const_to_value() {
+        let folded = ((r.0 != 0) == nonzero) as i64;
+        let result = ctx.trace_ctx.const_int(folded);
+        let dst = code[op.pc + 2] as usize;
+        write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(folded))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let null_const = ctx.trace_ctx.const_null();
     let opcode = if nonzero {
         OpCode::PtrNe
@@ -728,11 +740,19 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
         // `box_value(result)` callers see the live value.
         OpCode::CastIntToFloat => {
             let a = read_int_reg(code, op, 0, ctx)?;
-            let result = ctx.trace_ctx.record_op(opcode, &[a]);
-            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
-                ctx.trace_ctx
-                    .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
-            }
+            // A `Const` operand folds without recording
+            // (`execute_and_record`'s `_all_constants` short-circuit;
+            // CAST_INT_TO_FLOAT is ALWAYS_PURE).
+            let result = if let Some(majit_ir::Value::Int(n)) = a.inline_const_to_value() {
+                ctx.trace_ctx.const_float((n as f64).to_bits() as i64)
+            } else {
+                let result = ctx.trace_ctx.record_op(opcode, &[a]);
+                if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
+                }
+                result
+            };
             let len = ctx.registers_f.len();
             let slot = ctx
                 .registers_f
@@ -747,6 +767,14 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
         }
         // `cast_int_to_ptr/i>r`: Int-bank → Ref-bank. Bit-cast the
         // operand's Box.value (`BoxInt(n)` → `BoxRef(n as ptr)`).
+        //
+        // No `_all_constants` fold for the two ptr casts: upstream's fold
+        // executes via `bhimpl_cast_int_to_ptr` / `bhimpl_cast_ptr_to_int`,
+        // which assert an odd (tagged) int the GC ignores.  Pyre's casts
+        // serve untagged pointer round-trips, so folding would bake a raw
+        // address into the trace as a `ConstPtr` the gcreftracer forwards
+        // as an object — or as an int a moving collection silently
+        // invalidates.  Keep recording both.
         OpCode::CastIntToPtr => {
             let a = read_int_reg(code, op, 0, ctx)?;
             let result = ctx.trace_ctx.record_op(opcode, &[a]);

@@ -6094,11 +6094,11 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
     // Operand encoding `r>i`: 1B r-reg + 1B i-reg-dst = 2B
     let code = [byte, 0, 0];
-    let mut tc = fresh_trace_ctx();
+    // A `Const` box folds (`_all_constants` — CONST_NULL is a `Const`), so
+    // the record path needs a genuinely non-const InputArg operand.
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let descr = done_descr_ref_for_tests();
-    // Seed `registers_r[0]` with a placeholder OpRef so the
-    // handler has something to read.
-    let box_opref = tc.const_ref(0xdeadbeef);
+    let box_opref = OpRef::input_arg_ref(0);
     let mut regs_r = [box_opref];
     let mut regs_i = [OpRef::None];
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -6174,6 +6174,71 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         Some(Type::Ref)
     );
     assert_ne!(wc.registers_i[0], OpRef::None);
+}
+
+#[test]
+fn ptr_nullity_folds_a_const_box_without_recording() {
+    // `execute(PTR_NE, box, CONST_NULL)` has all-`Const` operands when
+    // `box` is a `Const` — `_all_constants` folds the nullity answer
+    // without recording.
+    let byte = *insns_opname_to_byte()
+        .get("ptr_nonzero/r>i")
+        .expect("`ptr_nonzero/r>i` must be in insns table");
+    let code = [byte, 0, 0];
+
+    let mut tc = fresh_trace_ctx();
+    let nonnull = tc.const_ref(0xdeadbeef);
+    let mut regs_r = [nonnull];
+    let mut regs_i = [OpRef::None];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut [], &mut regs_i)
+        .expect("ptr_nonzero on a const ref must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const box folds without recording");
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(1)),
+        "a non-null const ref folds ptr_nonzero to 1",
+    );
+
+    let mut null_tc = fresh_trace_ctx();
+    let null = null_tc.const_null();
+    let mut null_regs_r = [null];
+    let mut null_regs_i = [OpRef::None];
+    let (_, _) = run_hint_step(
+        &code,
+        &mut null_tc,
+        &mut null_regs_r,
+        &mut [],
+        &mut null_regs_i,
+    )
+    .expect("ptr_nonzero on the null const must fold");
+    assert_eq!(null_tc.num_ops(), 0);
+    assert_eq!(
+        null_regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(0)),
+        "the null const folds ptr_nonzero to 0",
+    );
+}
+
+#[test]
+fn cast_int_to_float_folds_a_const_int_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("cast_int_to_float/i>f")
+        .expect("`cast_int_to_float/i>f` must be in insns table");
+    let code = [byte, 0x00, 0x00]; // `i>f`: i-src=0, f-dst=0
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_int(42);
+    let mut regs_i = [operand];
+    let mut regs_f = [OpRef::None];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("cast_int_to_float on a const int must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const operand folds without recording");
+    assert_eq!(
+        regs_f[0].inline_const_to_value(),
+        Some(majit_ir::Value::Float(42.0)),
+        "dst must hold the folded ConstFloat",
+    );
 }
 
 /// `abort/>r` is a pyre-only no-op result marker — the walker
