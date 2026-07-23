@@ -2359,20 +2359,20 @@ fn build_function(
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    // num_bytes (arg(1)) is always a compile-time constant;
-                    // resolve it like every other emit-time const so a genuine
-                    // pool miss panics via missing_emit_const instead of silently
-                    // defaulting to 8 (which zeroes the shift and skips the
-                    // narrowing, passing an un-truncated integer through).
+                    // The static shift below needs num_bytes (arg(1)) as an
+                    // emit-time constant. A non-constant width is still a valid
+                    // IR shape — int_signext/ii>i is a two-operand blackhole op
+                    // and the cranelift backend resolves arg(1) as a runtime
+                    // operand — just one this backend does not lower, so decline
+                    // for interpreter fallback rather than aborting the compile.
                     let arg1 = op.arg(1).to_opref();
-                    let num_bytes = const_operand_value(constants, arg1).unwrap_or_else(|| {
-                        panic!(
-                            "wasm int_signext: num_bytes operand (raw={}) is not a \
-                             resolvable compile-time constant",
+                    let Some(num_bytes) = const_operand_value(constants, arg1) else {
+                        return Err(BackendError::Unsupported(format!(
+                            "wasm int_signext: non-constant num_bytes operand (raw={})",
                             arg1.raw()
-                        )
-                    });
+                        )));
+                    };
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     let shift = 64 - num_bytes * 8;
                     if shift > 0 && shift < 64 {
                         sink.i64_const(shift);
@@ -2689,22 +2689,29 @@ fn build_function(
             }
 
             // ── GC memory ops ──
-            // GC_LOAD/GC_STORE and their indexed forms are produced only by the
-            // GC rewrite (majit-gc/src/rewrite.rs): the true semantics are
-            // offset=arg1, size=arg2 (load) / value=arg2, size=arg3 (store), with
-            // no FieldDescr attached. The wasm backend does not run the GC rewrite,
-            // so these never reach here. The prior lowering read a nonexistent
+            // The indexed forms are also wired as real frontend blackhole ops
+            // (blackhole.rs `gc_load_indexed_{i,f}` / `gc_store_indexed_{i,f}`),
+            // so an llop/buffer trace can carry them into the backend. This
+            // backend has no descr-driven lowering for them, so decline
+            // (interpreter fallback) rather than aborting the whole compile.
+            OpCode::GcLoadIndexedI
+            | OpCode::GcLoadIndexedR
+            | OpCode::GcLoadIndexedF
+            | OpCode::GcStoreIndexed => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: indexed GC op {:?} (no descr-driven layout)",
+                    op.opcode
+                )));
+            }
+            // The bare GC_LOAD/GC_STORE forms are produced only by the GC rewrite
+            // (majit-gc/src/rewrite.rs): the true semantics are offset=arg1,
+            // size=arg2 (load) / value=arg2, size=arg3 (store), with no FieldDescr
+            // attached. The wasm backend does not run the GC rewrite, so these
+            // never reach here. The prior lowering read a nonexistent
             // field_offset_from_descr (→ 0) and, for GcStore, stored arg(1) (the
             // offset operand) as the value — a silent miscompile. Panic loudly like
             // LoadFromGcTable rather than emit a wrong memory access.
-            OpCode::GcLoadI
-            | OpCode::GcLoadR
-            | OpCode::GcLoadF
-            | OpCode::GcLoadIndexedI
-            | OpCode::GcLoadIndexedR
-            | OpCode::GcLoadIndexedF
-            | OpCode::GcStore
-            | OpCode::GcStoreIndexed => {
+            OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF | OpCode::GcStore => {
                 panic!(
                     "wasm backend: {:?} is unsupported (GC_LOAD/GC_STORE); \
                      the GC rewrite must not run for wasm",
@@ -2934,12 +2941,11 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.i64_load(mem64(vtable_off as u64));
                     sink.i32_wrap_i64();
-                    emit_sized_int_load(
-                        &mut sink,
-                        offset2 as u64,
-                        std::mem::size_of::<usize>(),
-                        true,
-                    );
+                    // subclassrange_min is an 8-byte i64 on every target
+                    // (pyobject.rs `PyType::subclassrange_min: AtomicI64`); read
+                    // the full field width, not the wasm32 4-byte `usize`, or the
+                    // guard truncates/sign-extends the object's min.
+                    emit_sized_int_load(&mut sink, offset2 as u64, std::mem::size_of::<i64>(), true);
                 } else {
                     // assembler.py:1957-1969 gcremovetypeptr path.
                     //     MOV32 loc_tmp, mem(loc_object, 0)
@@ -2963,7 +2969,8 @@ fn build_function(
                     sink.i64_const((guard_gc_type_info.sizeof_ti + offset2) as i64);
                     sink.i64_add();
                     sink.i32_wrap_i64();
-                    emit_sized_int_load(&mut sink, 0, std::mem::size_of::<usize>(), true);
+                    // 8-byte i64 subclassrange_min (see the vtable path above).
+                    emit_sized_int_load(&mut sink, 0, std::mem::size_of::<i64>(), true);
                 }
                 // Stack: [..., loc_tmp (i64)]
 
