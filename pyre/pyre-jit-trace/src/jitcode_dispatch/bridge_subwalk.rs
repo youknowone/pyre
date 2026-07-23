@@ -931,6 +931,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     entry: usize,
     argboxes_r: &[OpRef],
     local_concretes: &[majit_ir::Value],
+    paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     child_result: OpRef,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
@@ -945,7 +946,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         argboxes_r,
         local_concretes,
         Some(child_result),
-        &[],
+        paused_parent_recipes,
     )
 }
 
