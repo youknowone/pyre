@@ -1199,6 +1199,10 @@ pub struct MetaInterp<M: Clone> {
     /// from the tracing green_key when cross-loop cut retargets to the
     /// inner loop's key (compile.py:269).
     pub(crate) last_compiled_key: Option<u64>,
+    /// Invalidation flag read by the most recently compiled loop or bridge.
+    /// Dependency registration uses the artifact generation rather than
+    /// always registering the root token's flag.
+    pub(crate) last_compiled_artifact_invalidation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// virtualizable.py:86 NUM_SCALAR_INPUTARGS: number of scalar inputargs
     /// (frame + static fields). Set by the interpreter at JIT init.
     pub num_scalar_inputargs: usize,
@@ -2355,6 +2359,7 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: 0,
             internal_compile_panics: 0,
             last_compiled_key: None,
+            last_compiled_artifact_invalidation_flag: None,
             num_scalar_inputargs: 0,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
@@ -3588,6 +3593,7 @@ impl<M: Clone> MetaInterp<M> {
 
     fn prepare_trace_start_runtime(&mut self) {
         self.last_compiled_key = None;
+        self.last_compiled_artifact_invalidation_flag = None;
         // pyjitpl.py:2884-2892 `compile_and_run_once` body, line-by-line:
         //   debug_start('jit-tracing')                  # OUTER open
         //   self.staticdata._setup_once()
@@ -6118,6 +6124,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
+                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
                 // compile.py:826-830 store_hash: assign jitcounter hashes.
                 self.assign_guard_hashes(token.as_ref());
                 // compile.py:566-567 send_loop_to_backend registers the token
@@ -7023,6 +7030,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
+                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
                 self.assign_guard_hashes(token.as_ref());
                 // `compile.py:237` / `compile.py:289` — every TargetToken
                 // whose LABEL or JUMP appears in `combined_ops` carries
@@ -7592,6 +7600,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_loop_result {
             Ok(_) => {
+                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
@@ -8088,6 +8097,13 @@ impl<M: Clone> MetaInterp<M> {
     /// for cross-loop cuts, otherwise the tracing key.
     pub fn last_compiled_key(&self) -> Option<u64> {
         self.last_compiled_key
+    }
+
+    /// Flag read by `GUARD_NOT_INVALIDATED` in the last successful artifact.
+    pub fn last_compiled_artifact_invalidation_flag(
+        &self,
+    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.last_compiled_artifact_invalidation_flag.clone()
     }
 
     /// Cranelift direct body-entry selector for the first compiled loop LABEL.
@@ -10358,6 +10374,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     ) -> bool {
+        self.last_compiled_artifact_invalidation_flag = None;
         crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -10863,6 +10880,8 @@ impl<M: Clone> MetaInterp<M> {
 
         match result {
             Ok(_) => {
+                self.last_compiled_artifact_invalidation_flag =
+                    source_jct.latest_bridge_invalidation_flag();
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled bridge at key={}, guard={}",

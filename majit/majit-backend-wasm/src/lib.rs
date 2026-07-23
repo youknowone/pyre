@@ -1264,14 +1264,20 @@ fn ca_max_frame_bytes(targets: &[(u64, CallAssemblerTarget)]) -> u32 {
         .expect("admitted CALL_ASSEMBLER targets must be non-empty")
 }
 
-fn mark_call_assembler_target_active(target: &CallAssemblerTarget, caller: &JitCellToken) {
+fn mark_call_assembler_target_active(
+    target: &CallAssemblerTarget,
+    caller_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    // `caller_flag` is the invalidation flag the calling artifact's
+    // `GUARD_NOT_INVALIDATED` reads — the token flag for a loop, the
+    // bridge-generation flag for a bridge — so a terminal decline of the
+    // callee invalidates exactly the artifact embedding the CA edge.
     // The target metadata is removed by `CompiledWasmLoop::drop`; compilation
     // is single-threaded, and callers only retain the pointer while the token
     // remains compiled. This is the same lifetime used by the deopt helper.
     let force_terminal_decline = unsafe {
         if let Some(loop_) = (target.compiled_ptr as *const CompiledWasmLoop).as_ref() {
             loop_.ca_active.set(true);
-            let caller_flag = caller.invalidation_flag();
             {
                 let mut callers = loop_.ca_callers.borrow_mut();
                 if !callers
@@ -1859,7 +1865,7 @@ impl majit_backend::Backend for WasmBackend {
         );
         if let Some(targets) = ca_targets.as_ref() {
             for (_, target) in targets {
-                mark_call_assembler_target_active(target, token);
+                mark_call_assembler_target_active(target, token.invalidation_flag());
             }
         }
 
@@ -1904,19 +1910,6 @@ impl majit_backend::Backend for WasmBackend {
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         let ops: &[Op] = &ops_owned;
         diag_bump(0); // compile_bridge entered
-
-        // PyPy patches every GUARD_NOT_INVALIDATED in a loop and its already
-        // attached bridges to their recovery stubs at invalidation time. A
-        // wasm guard reads the equivalent live token flag instead. Never add
-        // a new in-module bridge after that transition: in particular, a
-        // bridge attached to the newly failing invalidation guard could jump
-        // back into the same permanently-invalidated loop and form a closed
-        // loop↔bridge cycle without returning to the blackhole interpreter.
-        if original_token.is_invalidated() {
-            return Err(BackendError::Unsupported(
-                "wasm backend: cannot attach a bridge to an invalidated loop".into(),
-            ));
-        }
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
         // bridge whose re-entry target is plumbed via `external_jump_slot`.
@@ -2304,6 +2297,10 @@ impl majit_backend::Backend for WasmBackend {
         // This bridge's exit indices come from the global fail-index space,
         // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
         let base = fail_descr_base();
+        // `rpython/jit/backend/model.py:145`: a bridge compiled after an
+        // invalidation starts valid; only a later invalidation may kill its
+        // `GUARD_NOT_INVALIDATED` operations.
+        let bridge_flag = original_token.mint_bridge_invalidation_flag();
         let (wasm_bytes, guard_exits, _num_ref_homes, bridge_cells_base, bridge_cells_owner) =
             codegen::build_wasm_module(
                 inputargs,
@@ -2316,7 +2313,7 @@ impl majit_backend::Backend for WasmBackend {
                 alloc_array_fn_ptr,
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
-                Arc::as_ptr(&original_token.invalidated) as usize as u32,
+                Arc::as_ptr(&bridge_flag) as usize as u32,
                 base,
                 // A loop-closing bridge's terminal JUMP re-enters the target
                 // loop (own or sibling, resolved via `LABEL_TARGETS`) through
@@ -2412,7 +2409,7 @@ impl majit_backend::Backend for WasmBackend {
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
                 for (_, target) in targets {
-                    mark_call_assembler_target_active(target, original_token);
+                    mark_call_assembler_target_active(target, bridge_flag.clone());
                 }
             }
         }

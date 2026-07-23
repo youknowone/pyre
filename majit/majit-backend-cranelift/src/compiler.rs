@@ -15673,7 +15673,7 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-        let invalidated_arc = original_token.invalidated.clone();
+        let invalidated_arc = original_token.mint_bridge_invalidation_flag();
         let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
         let original_compiled = original_token
@@ -15726,7 +15726,7 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = self.do_compile(
             inputargs,
             ops,
-            Some(flag_ptr), // compile.py:186: bridges share parent's invalidation flag
+            Some(flag_ptr),
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
         );

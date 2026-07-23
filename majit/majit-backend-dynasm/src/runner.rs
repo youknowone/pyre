@@ -2264,7 +2264,8 @@ impl Backend for DynasmBackend {
         if let Some(table) = gc_table.as_ref() {
             asm.set_gc_table_base(table.base_addr());
         }
-        asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&original_token.invalidated) as usize);
+        let bridge_flag = original_token.mint_bridge_invalidation_flag();
+        asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&bridge_flag) as usize);
 
         let _orig_compiled = Self::get_compiled(original_token);
 

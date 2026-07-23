@@ -4480,6 +4480,13 @@ impl<S: JitState> JitDriver<S> {
         self.meta.last_compiled_key()
     }
 
+    /// Flag read by `GUARD_NOT_INVALIDATED` in the last successful artifact.
+    pub fn last_compiled_artifact_invalidation_flag(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.meta.last_compiled_artifact_invalidation_flag()
+    }
+
     /// warmstate.py:437-444 starting cell's green_key (the cell on which
     /// TRACING must be cleared in the finally block). Returns None when
     /// no trace is in progress.
@@ -5305,7 +5312,9 @@ impl<S: JitState> JitDriver<S> {
         // can force GUARD_NOT_INVALIDATED exits periodically.
         if let Some(token) = self.meta.get_loop_token(key_hash) {
             if let Ok(mut qmut) = self.epoch_qmut.lock() {
-                qmut.register(&token.invalidation_flag());
+                for flag in token.all_invalidation_flags() {
+                    qmut.register(&flag);
+                }
             }
         }
 

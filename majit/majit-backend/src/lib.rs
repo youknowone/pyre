@@ -1177,6 +1177,14 @@ pub struct JitCellToken {
     /// When set to `true`, any `GUARD_NOT_INVALIDATED` in the compiled
     /// code will fail, causing execution to bail out to the interpreter.
     pub invalidated: Arc<AtomicBool>,
+    /// Invalidation flags minted for bridges attached to this token. Each
+    /// bridge's `GUARD_NOT_INVALIDATED` reads its own generation's flag, so a
+    /// bridge compiled after an invalidation starts valid and only a later
+    /// invalidation can fail it. `rpython/jit/backend/model.py:145` requires a
+    /// repeated `invalidate_loop()` to invalidate newer guards, but not an old
+    /// guard that already has a bridge attached. The token owns the Arcs so
+    /// addresses baked into compiled artifacts remain valid for its lifetime.
+    bridge_invalidation_flags: parking_lot::Mutex<Vec<Arc<AtomicBool>>>,
     /// Alternative loop versions to compile immediately after the main loop.
     pub version_info: Option<LoopVersionInfo>,
     /// history.py:449: _keepalive_jitcell_tokens — set of other tokens
@@ -1341,6 +1349,7 @@ impl JitCellToken {
             outermost_jitdriver_index: None,
             compiled: OnceLock::new(),
             invalidated: Arc::new(AtomicBool::new(false)),
+            bridge_invalidation_flags: parking_lot::Mutex::new(Vec::new()),
             version_info: None,
             keepalive_tokens: parking_lot::Mutex::new(Vec::new()),
             // `rpython/jit/backend/x86/assembler.py:514` creates the
@@ -1516,6 +1525,27 @@ impl JitCellToken {
     /// Get a clone of the invalidated flag (for registering with QuasiImmut).
     pub fn invalidation_flag(&self) -> Arc<AtomicBool> {
         self.invalidated.clone()
+    }
+
+    /// Mint the clear invalidation flag owned by a newly compiled bridge.
+    pub fn mint_bridge_invalidation_flag(&self) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.bridge_invalidation_flags.lock().push(flag.clone());
+        flag
+    }
+
+    /// Return the root and all bridge-generation invalidation flags.
+    pub fn all_invalidation_flags(&self) -> Vec<Arc<AtomicBool>> {
+        let bridge_flags = self.bridge_invalidation_flags.lock();
+        let mut flags = Vec::with_capacity(1 + bridge_flags.len());
+        flags.push(self.invalidated.clone());
+        flags.extend(bridge_flags.iter().cloned());
+        flags
+    }
+
+    /// Return the most recently minted bridge-generation flag.
+    pub fn latest_bridge_invalidation_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.bridge_invalidation_flags.lock().last().cloned()
     }
 
     /// `pyjitpl.py:3898` `has_compiled_targets(token)` —
@@ -3286,6 +3316,25 @@ mod tests {
         // Reset
         token.reset_compiled();
         assert!(!token.has_compiled_code());
+    }
+
+    #[test]
+    fn bridge_invalidation_flags_are_independent_generations() {
+        let token = JitCellToken::new(42);
+        token.invalidate();
+
+        let bridge_flag = token.mint_bridge_invalidation_flag();
+        assert!(token.is_invalidated());
+        assert!(!bridge_flag.load(std::sync::atomic::Ordering::Acquire));
+
+        let flags = token.all_invalidation_flags();
+        assert_eq!(flags.len(), 2);
+        assert!(Arc::ptr_eq(&flags[0], &token.invalidation_flag()));
+        assert!(Arc::ptr_eq(&flags[1], &bridge_flag));
+        assert!(Arc::ptr_eq(
+            &token.latest_bridge_invalidation_flag().unwrap(),
+            &bridge_flag
+        ));
     }
 
     #[test]

@@ -4596,23 +4596,22 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 // source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
 
 /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
-/// Register the compiled loop's invalidation flag with all quasi-immutable
+/// Register the compiled artifact's invalidation flag with all quasi-immutable
 /// dependencies collected during optimization. The optimizer records
 /// namespace pointers in quasi_immutable_deps when processing
 /// QUASIIMMUT_FIELD ops. After compilation, this function reads them
 /// from MetaInterp and registers watchers so GUARD_NOT_INVALIDATED
 /// fails when the namespace mutates.
-fn register_quasi_immutable_deps(green_key: u64) {
+fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
     let deps: Vec<(u64, u32)> =
         std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
     if deps.is_empty() {
         return;
     }
-    let Some(token) = driver.get_loop_token(green_key) else {
+    let Some(flag) = driver.last_compiled_artifact_invalidation_flag() else {
         return;
     };
-    let flag = token.invalidation_flag();
     // `celldict.py:34 _immutable_fields_ = ["version?"]`: the global cell
     // fast path's `QUASIIMMUT_FIELD(ns, slot)` is keyed on the module
     // dict's `ModuleDictStrategy.version`, not a per-slot index, so every
