@@ -13033,14 +13033,17 @@ impl CodeWriter {
             spliced.insns = new_insns;
         }
         // Per-PC leading `-live-` (marker PRESENCE), scoped to FOR_ITER body
-        // PCs.  `jtransform.py` puts a `-live-` before every deopt-capable op;
-        // pyre emits `-live-` only trailing-after-calls, so a FOR_ITER body
-        // guard has no marker of its own: `derive_pc_live_indices_from_sparse`
-        // rounds its PC back to the header marker, whose resume coordinate is
-        // not the body's.  Give each FOR_ITER-body pc-carrying op its own
-        // leading marker so its PC resolves to itself.  While-loop body PCs
-        // are excluded — their existing header-folded marker is correct and
-        // giving them individual markers changes their resume layout, breaking
+        // PCs and attribute opcodes.  `jtransform.py` puts a `-live-` at each
+        // guard resume point (`rpython/jit/codewriter/flatten.py:258-260,
+        // 282-286`).  Pyre otherwise emits `-live-` only trailing-after-calls,
+        // so a FOR_ITER body guard or a LoadAttr/StoreAttr specialization
+        // guard can have no marker of its own:
+        // `derive_pc_live_indices_from_sparse` rounds its PC back to the
+        // preceding marker, whose Python coordinate and stack depth belong to
+        // another opcode.  Give these pc-carrying ops their own leading
+        // marker so their snapshots resume at the opcode they re-execute.
+        // Other while-loop body PCs remain excluded — giving all of them
+        // individual markers changes their resume layout and regresses
         // nbody/nested_loop/spectral_norm.
         {
             // Build the set of FOR_ITER body PCs: py_pc in
@@ -13072,7 +13075,15 @@ impl CodeWriter {
                 if py_pc < 0 {
                     continue;
                 }
-                if !foriter_body_pcs.contains(py_pc as usize) {
+                let py_pc = py_pc as usize;
+                let is_attr = matches!(
+                    pyre_interpreter::decode_instruction_at(code, py_pc),
+                    Some((
+                        Instruction::LoadAttr { .. } | Instruction::StoreAttr { .. },
+                        _
+                    ))
+                );
+                if !foriter_body_pcs.contains(py_pc) && !is_attr {
                     continue;
                 }
                 let already = pos
