@@ -119,7 +119,11 @@ fn is_bootstrap_frozen(name: &str) -> bool {
 
 fn frozen_module_served(entry: &FrozenModule) -> bool {
     let mode = FROZEN_OVERRIDE.load(Ordering::Relaxed);
-    mode > 0 || (mode <= 0 && is_bootstrap_frozen(entry.name))
+    // `_override_frozen_modules_for_tests`: 0 is the default (the normal
+    // frozen table is enabled), a positive value forces frozen modules on,
+    // and a negative value disables the non-essential ones, keeping only the
+    // essential bootstrap set frozen.
+    mode >= 0 || is_bootstrap_frozen(entry.name)
 }
 
 fn served_frozen_module(name: &str) -> Option<&'static FrozenModule> {
