@@ -692,6 +692,10 @@ struct SpamBlock {
     /// `EggBlock` has one incoming edge; pyre coalesces those eggs by handler
     /// PC, so widening the shared FrameState must rewrite every earlier edge.
     incoming_exception_links: Vec<super::flow::LinkRef>,
+    /// Whether this exception EggBlock receives a `raise value` edge.
+    /// Kept on the edge block so handler-entry policy follows link
+    /// provenance rather than scanning the surrounding code object.
+    explicit_raise_operand_edge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -704,6 +708,7 @@ impl SpamBlockRef {
             framestate,
             dead: false,
             incoming_exception_links: Vec::new(),
+            explicit_raise_operand_edge: false,
         })))
     }
 
@@ -725,6 +730,14 @@ impl SpamBlockRef {
 
     fn incoming_exception_links(&self) -> Vec<super::flow::LinkRef> {
         self.0.borrow().incoming_exception_links.clone()
+    }
+
+    fn mark_explicit_raise_operand_edge(&self) {
+        self.0.borrow_mut().explicit_raise_operand_edge = true;
+    }
+
+    fn has_explicit_raise_operand_edge(&self) -> bool {
+        self.0.borrow().explicit_raise_operand_edge
     }
 
     fn mark_dead(&self) {
@@ -5210,6 +5223,13 @@ fn decode_exception_catch_sites(
         let landing_label = assembler.new_label();
         catch_for_pc[py_pc] = Some(landing_label);
         let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+        if matches!(
+            pyre_interpreter::decode_instruction_at(code, py_pc),
+            Some((Instruction::RaiseVarargs { argc }, op_arg))
+                if argc.get(op_arg) as i64 >= 1
+        ) {
+            landing.mark_explicit_raise_operand_edge();
+        }
         catch_sites.push(ExceptionCatchSite {
             landing_label,
             handler_py_pc,
@@ -6157,6 +6177,16 @@ impl CodeWriter {
         let mut graph = new_shadow_graph_with_portal_inputs(code, frame_inputs);
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, &mut graph, code, num_instrs);
+        // A graph with a caught `raise value` edge needs the EggBlock
+        // link-argument path throughout its exception handlers: cleanup
+        // reraises can carry that same operand across several exception-table
+        // components before POP_EXCEPT restores the previous exception.
+        // Graphs whose exception edges are all implicit/bare retain the
+        // established reconstruction; there is no explicit operand identity
+        // for it to discard.
+        let preserve_exception_edge_states = catch_sites
+            .iter()
+            .any(|site| site.landing.has_explicit_raise_operand_edge());
         // `flowcontext.py:293 self.joinpoints = {}` — sparse-by-PC dict
         // keyed by `next_offset`, populated via `setdefault(...)` per
         // `flowcontext.py:426`.  Vec-of-Vec value preserves the candidate
@@ -7576,12 +7606,28 @@ impl CodeWriter {
                         if start_pc != py_pc {
                             break;
                         }
-                        if let Some(handler_state) = handler_entry_state_from_catch_sites(
+                        if preserve_exception_edge_states {
+                            // Each catch landing is the exception edge's
+                            // EggBlock: it constructs the handler stack from
+                            // its own link inputs, then `mergeblock` joins
+                            // those states through ordinary link arguments.
+                            // Keep that joined pending state while a caught
+                            // `raise value` can flow through this exception
+                            // graph, so PUSH_EXC_INFO retains the edge's
+                            // previous-exception identity.
+                            current_depth = current_state.stack.len() as u16;
+                            needs_fallthrough = false;
+                        } else if let Some(handler_state) = handler_entry_state_from_catch_sites(
                             code,
                             &mut graph,
                             &catch_sites,
                             py_pc,
                         ) {
+                            // Non-explicit edges do not carry a raised
+                            // operand whose identity must survive the handler
+                            // cleanup. Their reconstructed state is equivalent
+                            // to the incoming EggBlock values and preserves
+                            // the established bare-reraise graph shape.
                             current_depth = handler_state.stack.len() as u16;
                             current_state = handler_state;
                             needs_fallthrough = false;
