@@ -2142,7 +2142,20 @@ fn load_source_module(
     // a young module while only the dict entry is updated.
     if modulename == "importlib._bootstrap" {
         if let Some(loaded) = check_sys_modules(modulename) {
-            install_importlib_bootstrap(loaded, execution_context)?;
+            if let Err(e) = install_importlib_bootstrap(loaded, execution_context) {
+                // Unwind the partial install: `dunder_import` routes through
+                // `_bootstrap.__import__` whenever `importlib._bootstrap` is
+                // in `sys.modules`, and a half-installed bootstrap (module
+                // registered, PathFinder missing — e.g. `_bootstrap_external`
+                // needs the `nt` builtin on Windows) would then answer every
+                // import with no file finder installed. Dropping the entries
+                // keeps the native importer authoritative, the minimal-
+                // importer role the boot sequence already documents.
+                remove_sys_module(modulename);
+                remove_sys_module("_frozen_importlib");
+                remove_sys_module("_frozen_importlib_external");
+                return Err(e);
+            }
         }
     }
 
