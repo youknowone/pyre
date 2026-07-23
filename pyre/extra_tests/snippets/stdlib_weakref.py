@@ -23,6 +23,16 @@ b = ref(a)
 
 assert callable(b)
 assert b() is a
+assert repr(b).startswith("<weakref at ")
+proxy_repr_target = X()
+assert repr(proxy(proxy_repr_target)).startswith("<weakproxy at ")
+
+try:
+    weakref._remove_dead_weakref(X.__dict__, "missing")
+except TypeError:
+    pass
+else:
+    raise AssertionError("_remove_dead_weakref accepted a mappingproxy")
 
 # Test __callback__ property
 assert b.__callback__ is None, (

@@ -1,6 +1,7 @@
 import _opcode
 import dis
 import inspect
+import opcode
 import typing
 
 
@@ -80,5 +81,15 @@ for predicate in (
         pass
     else:
         raise AssertionError("opcode predicate accepted a missing opcode")
+
+assert _opcode.stack_effect(dis.opmap["NOP"], None) == 0
+try:
+    _opcode.stack_effect(dis.opmap["NOP"], 0, True)
+except TypeError:
+    pass
+else:
+    raise AssertionError("_opcode.stack_effect accepted positional jump")
+assert opcode._intrinsic_1_descs[0] == "INTRINSIC_1_INVALID"
+assert opcode._intrinsic_2_descs[0] == "INTRINSIC_2_INVALID"
 
 print("stdlib inspect ok")

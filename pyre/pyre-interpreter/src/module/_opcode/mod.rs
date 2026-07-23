@@ -55,6 +55,12 @@ fn has_exc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "stack_effect() takes at most 2 positional arguments ({} given)",
+            positional.len(),
+        )));
+    }
     let raw = positional
         .first()
         .copied()
@@ -64,16 +70,14 @@ fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .filter(|op| op.real().is_none_or(|real| real.deopt().is_none()))
         .ok_or_else(|| crate::PyError::value_error("invalid opcode or oparg"))?;
 
-    let oparg = positional
-        .get(1)
-        .copied()
-        .map(crate::baseobjspace::int_w)
-        .transpose()?
-        .unwrap_or(0);
+    let oparg = match positional.get(1).copied() {
+        Some(value) if unsafe { !is_none(value) } => crate::baseobjspace::int_w(value)?,
+        _ => 0,
+    };
     let oparg =
         u32::try_from(oparg).map_err(|_| crate::PyError::value_error("invalid opcode or oparg"))?;
 
-    let jump = crate::builtins::kwarg_get(kwargs, "jump").or_else(|| positional.get(2).copied());
+    let jump = crate::builtins::kwarg_get(kwargs, "jump");
     let effect = match jump {
         Some(value) if unsafe { !is_none(value) } => {
             if crate::baseobjspace::is_true(value)? {
@@ -90,19 +94,15 @@ fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn get_intrinsic1_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_list_new(
-        oparg::IntrinsicFunction1::iter()
-            .map(|value| w_str_new(value.desc()))
-            .collect(),
-    ))
+    let mut descriptions = vec![w_str_new("INTRINSIC_1_INVALID")];
+    descriptions.extend(oparg::IntrinsicFunction1::iter().map(|value| w_str_new(value.desc())));
+    Ok(w_list_new(descriptions))
 }
 
 fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_list_new(
-        oparg::IntrinsicFunction2::iter()
-            .map(|value| w_str_new(value.desc()))
-            .collect(),
-    ))
+    let mut descriptions = vec![w_str_new("INTRINSIC_2_INVALID")];
+    descriptions.extend(oparg::IntrinsicFunction2::iter().map(|value| w_str_new(value.desc())));
+    Ok(w_list_new(descriptions))
 }
 
 fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

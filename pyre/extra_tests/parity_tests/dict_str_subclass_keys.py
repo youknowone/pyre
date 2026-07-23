@@ -48,4 +48,31 @@ stored = next(iter(holder.__dict__))
 assert stored is instance_key
 assert type(stored) is MyStr
 
+# The non-str MapDictStrategy leg devolves to ObjectDictStrategy and must keep
+# the checked insertion contract across that transition.  Protocol-0 pickle's
+# BUILD opcode exposes this by hashing a state key once in the state dict and
+# again while assigning it into the new instance's __dict__.
+class HashError(Exception):
+    pass
+
+
+class RaisingKey:
+    remaining = 1
+
+    def __hash__(self):
+        if not self.remaining:
+            raise HashError
+        self.remaining -= 1
+        return 42
+
+
+raising_key = RaisingKey()
+state = {raising_key: None}
+try:
+    Holder().__dict__[raising_key] = state[raising_key]
+except HashError:
+    pass
+else:
+    raise AssertionError("MapDictStrategy swallowed the key's __hash__ error")
+
 print("OK")

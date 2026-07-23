@@ -1792,8 +1792,7 @@ unsafe fn try_compare_override(
     let b_type = crate::typedef::r#type(b);
     let a_ov = comparison_method(a, dunder);
     let mut b_ov = comparison_method(b, rdunder);
-    if dunder == rdunder
-        && matches!((a_type, b_type), (Some(at), Some(bt)) if std::ptr::eq(at, bt))
+    if dunder == rdunder && matches!((a_type, b_type), (Some(at), Some(bt)) if std::ptr::eq(at, bt))
     {
         // descroperation.py: for __eq__ and __ne__, objects of the same
         // class resolve the same method, so do not invoke it twice.

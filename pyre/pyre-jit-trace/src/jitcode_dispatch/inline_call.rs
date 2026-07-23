@@ -1651,6 +1651,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // (`pcdep_color_slots[0]`), not `r{i}`; an empty fixture map is identity.
     let entry_colors = crate::state::sub_jitcode_entry_param_colors(w_code);
     for i in 0..nparams {
+        // RPython passes the same RefFrontendOp into the callee MIFrame, so
+        // the Box keeps its recording-time pointer across the frame boundary.
+        // Pyre also carries a register-local concrete shadow; mirror that
+        // value back onto the canonical OpRef before constructing the callee
+        // register file.  Loop-sidecar locals in particular can have a live
+        // register concrete even when an intervening vable load returned a
+        // fresh, previously unstamped OpRef.
+        if let ConcreteValue::Ref(value) = callee_arg_concretes[i]
+            && !value.is_null()
+        {
+            ctx.trace_ctx.try_set_opref_concrete(
+                callee_args[i],
+                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+            );
+        }
         let reg = match &entry_colors {
             // Colored jitcode: seed param `i` at the register it occupies at
             // the callee entry PC.  A param dead at entry carries no entry
@@ -1828,7 +1843,48 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             );
 
             callee_regs_r[frame_reg as usize] = callee_frame;
-            callee_concrete_r[frame_reg as usize] = ConcreteValue::Null;
+            // `perform_call` creates one concrete frame per MIFrame before
+            // `setup_call` installs the argument boxes (pyjitpl.py:2445-2476,
+            // 1862-1874).  Mirror that recording-time object.  Root each
+            // freshly boxed argument immediately: `ConcreteValue::to_pyobj`
+            // can allocate, and a later argument must not collect an earlier
+            // one before the frame constructor takes ownership of the slice.
+            let arg_roots = pyre_object::gc_roots::push_roots();
+            let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
+            for concrete in callee_arg_concretes.iter().take(nparams).copied() {
+                pyre_object::gc_roots::pin_root(concrete.to_pyobj());
+            }
+            let concrete_args: Vec<pyre_object::PyObjectRef> = (0..nparams)
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
+                .collect();
+            let concrete_ec = sym.concrete_execution_context();
+            // Use a GC-managed frame, not `new_boxed`: the concrete pointer is
+            // stamped onto the active trace's frontend op below, and
+            // `MetaInterp::walk_active_trace_refs` is then its RPython-style
+            // GC root through optimization.  A scope-owned tracer snapshot
+            // would be freed when this function returns while the Box value
+            // still exists, leaving a dangling recording-time pointer.
+            let mut frame = pyre_interpreter::pyframe::FrameBox::new(
+                pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+                    w_code,
+                    &concrete_args,
+                    inline_consts.w_globals as pyre_object::PyObjectRef,
+                    concrete_ec,
+                    pyre_object::PY_NULL,
+                    pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+                ),
+            );
+            drop(arg_roots);
+            let concrete_frame_ptr = frame.as_mut_ptr();
+            callee_concrete_r[frame_reg as usize] =
+                ConcreteValue::Ref(concrete_frame_ptr as pyre_object::PyObjectRef);
+            ctx.trace_ctx.set_opref_concrete(
+                callee_frame,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+            );
+            // GC-managed FrameBox::drop intentionally relinquishes only the
+            // host handle; the frontend op above keeps the frame reachable.
+            drop(frame);
             callee_regs_r[ec_reg as usize] = callee_ec;
             callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
 

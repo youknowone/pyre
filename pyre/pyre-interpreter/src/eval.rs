@@ -469,6 +469,8 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                     &mut (*(w_type as *mut pyre_object::typeobject::W_TypeObject)).bases;
                 forward(bases_slot);
                 let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
+                forward(&mut t.w_name);
+                forward(&mut t.w_qualname);
                 // Heap and builtin types both hold a managed W_DictObject.
                 // Forward the field itself; the dict's custom trace walks its
                 // keys and values.

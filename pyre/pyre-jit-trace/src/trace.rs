@@ -1605,7 +1605,7 @@ fn seed_loop_entry_ref_slots(
     pcdep: &[(u8, u16, u16)],
     num_vable_scalars: usize,
     mut box_at: impl FnMut(usize) -> Option<majit_ir::OpRef>,
-    mut seed: impl FnMut(u8, majit_ir::OpRef),
+    mut seed: impl FnMut(u8, u16, majit_ir::OpRef),
 ) {
     for &(bank, color, slot) in pcdep {
         if bank != 1 {
@@ -1614,7 +1614,7 @@ fn seed_loop_entry_ref_slots(
         if let Some(opref) = box_at(num_vable_scalars + slot as usize)
             && !opref.is_none()
         {
-            seed(color as u8, opref);
+            seed(color as u8, slot, opref);
         }
     }
 }
@@ -1885,12 +1885,38 @@ fn run_perfn_walk<Sym: WalkSym>(
             if let Some(pcdep) =
                 crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, entry as i32)
             {
+                let mut live_slot_seeds = Vec::new();
                 seed_loop_entry_ref_slots(
                     &pcdep,
                     nvs,
                     |index| ctx.virtualizable_box_at(index),
-                    &mut seed,
+                    |color, slot, opref| live_slot_seeds.push((color, slot, opref)),
                 );
+                for (color, slot, opref) in live_slot_seeds {
+                    seed(color, opref);
+                    // RPython's MIFrame register is a Box carrying both its
+                    // symbolic identity and recording-time value.  The
+                    // sidecar reconstruction above restores the first half;
+                    // stamp the live PyFrame slot onto the same OpRef so an
+                    // inlined callee receives its concrete argument identity.
+                    // Without this, a dynamic call such as pickle's
+                    // dispatch[key](self) loses `self` at the loop header;
+                    // a raising callee then mutates concrete state but cannot
+                    // recover the exception class, aborting and replaying the
+                    // already-applied mutation.
+                    if cf_addr != 0 {
+                        let frame =
+                            unsafe { &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame) };
+                        if let Some(&value) = frame.locals_w().as_slice().get(slot as usize)
+                            && !value.is_null()
+                        {
+                            ctx.set_opref_concrete(
+                                opref,
+                                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+                            );
+                        }
+                    }
+                }
             }
         }
         // The pcdep inversion above is the complete loop-entry seed.  FOR_ITER
@@ -3702,7 +3728,7 @@ mod tests {
                     .checked_sub(crate::virtualizable_gen::NUM_VABLE_SCALARS)
                     .and_then(|slot| frame_boxes.get(slot).copied())
             },
-            |color, opref| seeded.push((color, opref)),
+            |color, _slot, opref| seeded.push((color, opref)),
         );
 
         assert_eq!(seeded, vec![(7, slot0), (4, slot2)]);

@@ -279,32 +279,36 @@ pub fn leak_layout(layout: Layout) -> *const Layout {
     crate::lltype::malloc_raw(layout)
 }
 
-thread_local! {
-    /// Builtin types (`w_type_new_builtin`) are created before the GC is
-    /// built and remain `malloc_typed` Box-immortal, so the collector never
-    /// fires their `W_TYPE_GC_TYPE_ID` custom trace.  Their namespaces can
-    /// still acquire young GC children after boot, including type-dict values
-    /// and subclass weakrefs. This registry
-    /// roots those children on each collection.  It also covers the rare
-    /// pre-GC immortal fallback from `w_type_new` when no GC hook is installed.
-    /// Heap types allocated after GC startup are GC-managed instead and are
-    /// rooted through their own `W_TYPE_GC_TYPE_ID` custom trace.
-    static BUILTIN_TYPE_NAMESPACE_ROOTS: std::cell::RefCell<Vec<usize>> =
-        std::cell::RefCell::new(Vec::new());
+/// Builtin types (`w_type_new_builtin`) are process-global, so their root
+/// registry must have the same owner.  A TLS registry loses types first made
+/// on a worker and makes a collection on another thread miss their children.
+static BUILTIN_TYPE_NAMESPACE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> =
+    std::sync::OnceLock::new();
+
+fn builtin_type_namespace_roots() -> &'static std::sync::Mutex<Vec<usize>> {
+    BUILTIN_TYPE_NAMESPACE_ROOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Record an immortal type for the collection-time namespace root walk.
+#[majit_macros::dont_look_inside]
 fn register_builtin_type_roots(addr: usize) {
     // Record the prebuilt-family store so the next minor collection scans it
     // (gc_roots.rs prebuilt-root write tracking).
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    BUILTIN_TYPE_NAMESPACE_ROOTS.with(|reg| reg.borrow_mut().push(addr));
+    builtin_type_namespace_roots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(addr);
 }
 
 /// Snapshot the registered immortal-type addresses for the root walker
 /// (`pyre_interpreter::eval::walk_builtin_type_dicts_gc`).
+#[majit_macros::dont_look_inside]
 pub fn snapshot_builtin_type_roots() -> Vec<usize> {
-    BUILTIN_TYPE_NAMESPACE_ROOTS.with(|reg| reg.borrow().clone())
+    builtin_type_namespace_roots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = true`.
@@ -815,6 +819,7 @@ pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
             full.rsplit('.').next().unwrap_or(full)
         };
         t.w_name = crate::w_str_new(bare);
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
     t.w_name
 }
@@ -841,6 +846,7 @@ pub unsafe fn w_type_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
     let t = &mut *(obj as *mut W_TypeObject);
     if t.w_qualname.is_null() {
         t.w_qualname = crate::w_str_new(&*t.qualname);
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
     t.w_qualname
 }

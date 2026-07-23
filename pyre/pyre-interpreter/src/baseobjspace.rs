@@ -8722,6 +8722,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         pyre_object::type_name_of(value)
                     )));
                 }
+                crate::builtins::check_surrogate(value)?;
                 pyre_object::w_type_set_qualname(obj, value);
                 mutated(obj, Some(name));
                 return Ok(w_none());
@@ -8754,6 +8755,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                             object_functionstr_type_name(value),
                         )));
                     }
+                    crate::builtins::check_surrogate(value)?;
                     pyre_object::w_type_set_qualname(obj, value);
                     return Ok(w_none());
                 }
@@ -14724,6 +14726,21 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
             Ok(true) => Ok(()),
             Ok(false) => Err(PyError::key_error_with_key(key)),
+            Err(_) => Err(take_pending_dict_key_error(key)),
+        }
+    }
+}
+
+/// PyPy `W_DictMultiObject.nondescr_delitem_if_value_is`: bypass subclass
+/// hooks and preserve the single-probe identity-checked deletion primitive.
+pub fn dict_delitem_if_value_is(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<bool, PyError> {
+    unsafe {
+        match pyre_object::dictmultiobject::w_dict_delitem_if_value_is_checked(obj, key, value) {
+            Ok(removed) => Ok(removed),
             Err(_) => Err(take_pending_dict_key_error(key)),
         }
     }

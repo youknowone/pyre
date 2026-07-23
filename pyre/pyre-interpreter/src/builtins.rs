@@ -3778,6 +3778,7 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
             crate::type_methods::arg_type_name(value),
         )));
     }
+    check_surrogate(value)?;
     unsafe {
         pyre_object::w_type_set_qualname(w_type, value);
         pyre_object::w_dict_delitem_str_no_proxy(ns, "__qualname__");

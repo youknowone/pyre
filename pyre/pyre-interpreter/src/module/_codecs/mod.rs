@@ -1609,6 +1609,154 @@ fn unicode_escape_decode_impl(
     ]))
 }
 
+/// `interp_codecs.py:1101 escape_decode` / `_PyString_DecodeEscape` — the
+/// bytes-to-bytes Python string-literal escape transform used by protocol-0
+/// pickle.
+fn escape_decode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let data = if unsafe { is_str(w_obj) } {
+        unsafe { w_str_get_wtf8(w_obj) }.as_bytes().to_vec()
+    } else if let Some(src) = crate::typedef::buffer_as_bytes_like(w_obj)? {
+        unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec()
+    } else {
+        return Err(crate::PyError::type_error(
+            "escape_decode() argument must be bytes-like or str",
+        ));
+    };
+    let errors_s = if unsafe { is_str(errors) } {
+        unsafe { w_str_get_value(errors) }
+    } else if unsafe { pyre_object::is_none(errors) } {
+        "strict"
+    } else {
+        return Err(crate::PyError::type_error("errors must be str or None"));
+    };
+
+    let mut out = Vec::with_capacity(data.len());
+    let mut pos = 0usize;
+    let mut first_escape_warning: Option<String> = None;
+    while pos < data.len() {
+        if data[pos] != b'\\' {
+            out.push(data[pos]);
+            pos += 1;
+            continue;
+        }
+
+        let escape_start = pos;
+        pos += 1;
+        if pos == data.len() {
+            return Err(crate::PyError::value_error("Trailing \\ in string"));
+        }
+        let ch = data[pos];
+        pos += 1;
+        match ch {
+            b'\n' => {}
+            b'\\' => out.push(b'\\'),
+            b'\'' => out.push(b'\''),
+            b'"' => out.push(b'"'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b'v' => out.push(0x0b),
+            b'a' => out.push(0x07),
+            b'0'..=b'7' => {
+                let octal_start = pos - 1;
+                while pos < data.len()
+                    && pos < octal_start + 3
+                    && (b'0'..=b'7').contains(&data[pos])
+                {
+                    pos += 1;
+                }
+                let raw = data[octal_start..pos]
+                    .iter()
+                    .fold(0u16, |value, digit| value * 8 + (digit - b'0') as u16);
+                if raw >= 256 && first_escape_warning.is_none() {
+                    first_escape_warning = Some(format!(
+                        "invalid octal escape sequence '\\{}'",
+                        String::from_utf8_lossy(&data[octal_start..pos])
+                    ));
+                }
+                out.push(raw as u8);
+            }
+            b'x' => {
+                let hi = data.get(pos).and_then(|byte| (*byte as char).to_digit(16));
+                let lo = data
+                    .get(pos + 1)
+                    .and_then(|byte| (*byte as char).to_digit(16));
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    pos += 2;
+                } else {
+                    match errors_s {
+                        "strict" => {
+                            return Err(crate::PyError::value_error(format!(
+                                "invalid \\x escape at position {escape_start}"
+                            )));
+                        }
+                        "replace" => out.push(b'?'),
+                        "ignore" => {}
+                        other => {
+                            return Err(crate::PyError::value_error(format!(
+                                "decoding error; unknown error handling code: {other}"
+                            )));
+                        }
+                    }
+                    if data.get(pos).is_some_and(u8::is_ascii_hexdigit) {
+                        pos += 1;
+                    }
+                }
+            }
+            other => {
+                out.push(b'\\');
+                pos -= 1;
+                if first_escape_warning.is_none() {
+                    first_escape_warning =
+                        Some(format!("invalid escape sequence '\\{}'", char::from(other)));
+                }
+            }
+        }
+    }
+
+    if let Some(message) = first_escape_warning {
+        crate::warn::warn_deprecation(&message)?;
+    }
+    Ok(w_tuple_new(vec![
+        w_bytes_from_bytes(&out),
+        w_int_new(data.len() as i64),
+    ]))
+}
+
+/// `interp_codecs.py:1092 escape_encode` / `string_escape_encode(data,
+/// quote=False)` — the inverse bytes transform.
+fn escape_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { is_bytes(w_obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "escape_encode() argument 1 must be bytes, not {}",
+            crate::type_methods::arg_type_name(w_obj)
+        )));
+    }
+    let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
+    let mut out = Vec::with_capacity(data.len());
+    for byte in data {
+        match *byte {
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\'' => out.extend_from_slice(b"\\'"),
+            0x20..=0x7e => out.push(*byte),
+            value => out.extend_from_slice(format!("\\x{value:02x}").as_bytes()),
+        }
+    }
+    Ok(w_tuple_new(vec![
+        w_bytes_from_bytes(&out),
+        w_int_new(data.len() as i64),
+    ]))
+}
+
 fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let Some(chars) = args.first().copied() else {
         return Err(crate::PyError::type_error(
@@ -1794,6 +1942,18 @@ crate::py_module! {
             #[default(w_bool_from(false))] _final: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             unicode_escape_decode_impl(obj, errors)
+        }
+        fn escape_decode(
+            obj: PyObjectRef,
+            #[default(w_str_new("strict"))] errors: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            escape_decode_impl(obj, errors)
+        }
+        fn escape_encode(
+            obj: PyObjectRef,
+            #[default(w_str_new("strict"))] _errors: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            escape_encode_impl(obj)
         }
         fn charmap_encode(
             obj: PyObjectRef,

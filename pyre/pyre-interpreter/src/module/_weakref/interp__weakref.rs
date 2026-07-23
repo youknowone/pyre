@@ -681,8 +681,11 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj = dereference(w_self);
     let type_name = unsafe {
         match crate::typedef::r#type(w_self) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => "weakref".to_string(),
+            Some(tp) if std::ptr::eq(tp, weakref_type()) => "weakref",
+            Some(tp) if std::ptr::eq(tp, proxy_type()) => "weakproxy",
+            Some(tp) if std::ptr::eq(tp, callable_proxy_type()) => "weakcallableproxy",
+            Some(tp) => pyre_object::w_type_get_name(tp),
+            None => "weakref",
         }
     };
     let state = if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
@@ -851,8 +854,20 @@ fn is_w_weakref(obj: PyObjectRef) -> bool {
 /// before deletion preserves the upstream atomic "delete only this weakref"
 /// contract if key comparison mutates the dictionary.
 pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let dict = args[0];
-    let key = args[1];
+    let dict = args
+        .first()
+        .copied()
+        .ok_or_else(|| PyError::type_error("_remove_dead_weakref() missing dict argument"))?;
+    let key = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| PyError::type_error("_remove_dead_weakref() missing key argument"))?;
+    if !unsafe { pyre_object::is_dict(dict) } {
+        return Err(PyError::type_error(format!(
+            "_remove_dead_weakref() argument 1 must be dict, not {}",
+            crate::baseobjspace::object_functionstr_type_name(dict),
+        )));
+    }
     let backing = crate::type_methods::resolve_dict_backing(dict);
     if backing.is_null() {
         return Err(PyError::type_error(format!(
@@ -869,9 +884,7 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
     if !dereference(stored).is_null() {
         return Ok(pyre_object::w_none());
     }
-    if crate::baseobjspace::finditem(backing, key)? == Some(stored) {
-        crate::baseobjspace::delitem_slot(backing, key)?;
-    }
+    crate::baseobjspace::dict_delitem_if_value_is(backing, key, stored)?;
     Ok(pyre_object::w_none())
 }
 

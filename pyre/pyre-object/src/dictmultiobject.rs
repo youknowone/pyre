@@ -2167,6 +2167,21 @@ unsafe fn w_dict_store_checked_inner(
         strategy.switch_to_object_strategy(obj);
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
+    if strategy.strategy_kind() == StrategyKind::Map {
+        // mapdict.py:1177-1183 MapDictStrategy.setitem — exact str keys stay
+        // as map nodes; every other key first devolves the instance __dict__
+        // to ObjectDictStrategy and then performs the ordinary fallible dict
+        // insertion.  Calling the trait's infallible `setitem` here would make
+        // that second leg use `object_key_for`, which deliberately consumes a
+        // `__hash__` exception.  Keep the checked W_DictMultiObject.setitem
+        // path checked across the strategy transition instead.
+        if crate::is_exact_type(key, &crate::STR_TYPE) {
+            strategy.setitem(obj, key, value);
+            return Ok(());
+        }
+        strategy.switch_to_object_strategy(obj);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+    }
     strategy.setitem(obj, key, value);
     if take_dict_key_error() {
         return Err(DictKeyError);
@@ -2805,6 +2820,82 @@ pub unsafe fn w_dict_delitem_checked(
         return Err(DictKeyError);
     }
     Ok(removed)
+}
+
+/// `dictmultiobject.py:213-219 W_DictMultiObject.nondescr_delitem_if_value_is`
+/// / `rordereddict.py:863 ll_dict_delitem_if_value_is`: perform one key probe
+/// and remove the matched entry only when its current value is pointer-identical
+/// to `value`.
+pub unsafe fn w_dict_delitem_if_value_is_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<bool, DictKeyError> {
+    if is_module_dict(obj) {
+        if !w_module_dict_is_object_strategy(obj) {
+            w_module_dict_switch_to_object_strategy(obj);
+        }
+        let object_key = object_key_for_checked(key)?;
+        if let Some(result) = callback_free_dict_op(|| {
+            let entries = w_module_dict_object_storage_mut(obj);
+            let Some(index) = entries.get_index_of(&object_key) else {
+                return false;
+            };
+            if entries
+                .get_index(index)
+                .is_none_or(|(_, stored)| *stored != value)
+            {
+                return false;
+            }
+            entries.shift_remove_index(index);
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
+            w_dict_bump_keys_version(obj);
+            true
+        }) {
+            return result;
+        }
+        return Err(DictKeyError);
+    }
+
+    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    if strategy.strategy_kind() != StrategyKind::Object {
+        strategy.switch_to_object_strategy(obj);
+    }
+    let object_key = object_key_for_checked(key)?;
+    if let Some(result) = callback_free_dict_op(|| {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let Some(index) = entries.get_index_of(&object_key) else {
+            return false;
+        };
+        if entries
+            .get_index(index)
+            .is_none_or(|(_, stored)| *stored != value)
+        {
+            return false;
+        }
+        entries.shift_remove_index(index);
+        dict.keys_version = dict.keys_version.wrapping_add(1);
+        true
+    }) {
+        return result;
+    }
+    let (found, _) = scan_dict_key_reentrant(obj, object_key)?;
+    let Some(index) = found else {
+        return Ok(false);
+    };
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    if entries
+        .get_index(index)
+        .is_none_or(|(_, stored)| *stored != value)
+    {
+        return Ok(false);
+    }
+    entries.shift_remove_index(index);
+    dict.keys_version = dict.keys_version.wrapping_add(1);
+    Ok(true)
 }
 
 /// Internal helper: `ObjectDictStrategy::delitem` body for pyre's
