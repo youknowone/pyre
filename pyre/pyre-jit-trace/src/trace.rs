@@ -553,6 +553,14 @@ pub fn trace_bytecode<Sym: WalkSym>(
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
     FBW_BRIDGE_DECLINED.with(|c| c.set(false));
+    // A prior walk's opcode-effect-window sample must not alias a same-pc
+    // opcode of this walk (the escape-flush latch gate reads it).
+    crate::jitcode_dispatch::escape_opcode_window_reset();
+    // Likewise drop any escape-flush undo a prior attempt failed to consume:
+    // "oldest capture wins" is only correct WITHIN one walk attempt — a
+    // leftover here would restore wrong-generation locals onto a frame many
+    // iterations ahead.
+    crate::jitcode_dispatch::discard_escape_flush_undo();
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
@@ -2253,13 +2261,42 @@ fn run_perfn_walk<Sym: WalkSym>(
         // predicate as the CloseLoop end-flush above.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
-        if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
+        if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            // Opt-out: never adopt the escape flush — drop the commit and put
+            // the pre-flush frame back so the legacy replay sees pristine
+            // state.
+            if matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            ) {
+                let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
+                crate::jitcode_dispatch::restore_escape_flush_undo();
+            }
+        } else {
             if matches!(
                 &walk_result,
                 Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
             ) && let Some(resume_py_pc) =
                 crate::jitcode_dispatch::take_committed_frame_escape_pc()
             {
+                crate::jitcode_dispatch::discard_escape_flush_undo();
+                // The force-time escape flush wrote the resume state into the
+                // LIVE frame (the frame the callee inspected).  The portal
+                // epilogue propagates `executed_frame` → live on a committed
+                // flush, so mirror the live frame's resume state into the walk
+                // snapshot to make that copy the identity.
+                let live = sym.live_vable_frame_addr();
+                if live != 0 && cf_addr != 0 && live != cf_addr {
+                    unsafe {
+                        (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
+                            &*(live as *const pyre_interpreter::PyFrame),
+                        );
+                    }
+                }
+                // The committed flush owns the iteration count (the resume pc
+                // is PAST the FOR_ITER consume); drop any in-flight item so
+                // the legacy deliver cannot re-apply one.
+                crate::jitcode_dispatch::fbw_foriter_inflight_clear();
                 WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
                 WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
             }

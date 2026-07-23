@@ -3802,7 +3802,7 @@ pub(crate) fn flush_walk_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[])
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None)
 }
 
 /// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
@@ -3818,7 +3818,7 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     resume_py_pc: usize,
     push: Option<(PyObjectRef, usize)>,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[])
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None)
 }
 
 pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(
@@ -3827,7 +3827,28 @@ pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(
     resume_py_pc: usize,
     stack_overrides: &[(usize, PyObjectRef)],
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, stack_overrides)
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, stack_overrides, None)
+}
+
+/// `flush_walk_end_state_to_frame` with the COMPLETE operand stack supplied by
+/// the caller as a contiguous slice for absolute slots
+/// `nlocals..nlocals + stack.len()`.  The mid-expression escape flush resolves
+/// the walk's operand-stack mirror to concrete refs, which the vable shadow
+/// cannot provide outside a merge point (its stack region reads NULL there).
+/// Declines (frame untouched) when the supplied height disagrees with the
+/// forward analysis's depth at `resume_py_pc`.
+///
+/// `stack` values are re-read per slot during the commit loop, whose Int/Float
+/// local boxing can trigger a minor collection — the caller must keep the
+/// slice registered as GC roots (`push_resume_ref_roots`) across the call so
+/// the slots are forwarded in place.
+pub(crate) fn flush_walk_end_state_to_frame_with_full_stack(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+    stack: &[PyObjectRef],
+) -> bool {
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], Some(stack))
 }
 
 fn flush_walk_end_state_to_frame_inner(
@@ -3836,15 +3857,22 @@ fn flush_walk_end_state_to_frame_inner(
     resume_py_pc: usize,
     push: Option<(PyObjectRef, usize)>,
     stack_overrides: &[(usize, PyObjectRef)],
+    full_stack: Option<&[PyObjectRef]>,
 ) -> bool {
+    let decline = |why: &str| {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-flush] DECLINE at py_pc={resume_py_pc}: {why}");
+        }
+        false
+    };
     if frame == 0 {
-        return false;
+        return decline("frame==0");
     }
     let Some(nlocals) = concrete_nlocals(frame) else {
-        return false;
+        return decline("no concrete_nlocals");
     };
     let Some(info) = ctx.virtualizable_info() else {
-        return false;
+        return decline("no virtualizable_info");
     };
     // Stack depth at the merge point from the cached forward analysis:
     // absolute vsd = stack_base + depth, stack_base = nlocals + ncells
@@ -3853,7 +3881,7 @@ fn flush_walk_end_state_to_frame_inner(
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
     if w_code.is_null() {
-        return false;
+        return decline("null w_code");
     }
     let raw_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
@@ -3864,8 +3892,13 @@ fn flush_walk_end_state_to_frame_inner(
         .get(resume_py_pc)
         .copied()
     else {
-        return false;
+        return decline("no depth_at_py_pc");
     };
+    if let Some(full) = full_stack
+        && full.len() != depth as usize
+    {
+        return decline("full-stack height != analysis depth");
+    }
     let end_vsd = nlocals + depth as usize;
     let live = end_vsd.max(nlocals);
     let base = info.num_static_extra_boxes;
@@ -3878,36 +3911,40 @@ fn flush_walk_end_state_to_frame_inner(
         .iter()
         .position(|f| f.name == "lastblock");
     let Some(lastblock_idx) = lastblock_static else {
-        return false;
+        return decline("no lastblock static field");
     };
     let Some((_opref, shadow_lastblock)) = ctx.virtualizable_entry_at(lastblock_idx) else {
-        return false;
+        return decline("no shadow lastblock entry");
     };
     let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
     match shadow_lastblock {
         Value::Ref(r) => {
             if r.0 != frame_lastblock {
-                return false;
+                return decline("lastblock changed during walk");
             }
         }
-        _ => return false,
+        _ => return decline("shadow lastblock not a Ref"),
     }
     // Validation pass first: it allocates nothing, so entry presence
     // cannot change under it.  Commit only when every live slot resolves.
     let stack_override_at = |abs: usize| -> Option<PyObjectRef> {
+        if let Some(full) = full_stack {
+            return full.get(abs - nlocals).copied();
+        }
         stack_overrides
             .iter()
             .find_map(|&(slot, value)| (slot == abs).then_some(value))
     };
+    let have_overrides = full_stack.is_some() || !stack_overrides.is_empty();
     for abs in 0..live {
-        if abs >= nlocals && !stack_overrides.is_empty() {
+        if abs >= nlocals && have_overrides {
             if stack_override_at(abs).is_none() {
-                return false;
+                return decline("stack override missing for a live slot");
             }
             continue;
         }
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
+            return decline("no shadow entry for a live slot (validation)");
         };
         // An operand-STACK slot (`abs >= nlocals`) that resolves to a NULL Ref
         // is an UNPOPULATED shadow slot, not a live value: the virtualizable
@@ -3923,7 +3960,7 @@ fn flush_walk_end_state_to_frame_inner(
         // frame from its start state instead.  A local slot may legitimately
         // be NULL (an unbound local), so this only guards the stack region.
         if abs >= nlocals && matches!(value, Value::Ref(r) if r.0 == 0) {
-            return false;
+            return decline("NULL operand-stack shadow slot (mid-expression)");
         }
     }
     let arr_ptr = unsafe {
@@ -3935,7 +3972,7 @@ fn flush_walk_end_state_to_frame_inner(
     // frame mutation (all-or-nothing).
     let need = if push.is_some() { live + 1 } else { live };
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < need {
-        return false;
+        return decline("frame stack array too small / null");
     }
     // Commit one slot at a time, re-reading the shadow entry per slot:
     // boxing an Int/Float slot allocates and may trigger a minor
@@ -3944,13 +3981,13 @@ fn flush_walk_end_state_to_frame_inner(
     // slot is reachable from the (rooted) frame, so neither side goes
     // stale across the loop.
     for abs in 0..live {
-        let boxed = if abs >= nlocals && !stack_overrides.is_empty() {
+        let boxed = if abs >= nlocals && have_overrides {
             // The override is the authoritative caller CALL stack.  Its
             // mid-opcode slots need not exist in the virtualizable shadow.
             stack_override_at(abs).expect("validated stack override")
         } else {
             let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-                return false;
+                return decline("no shadow entry for a live slot (commit)");
             };
             boxed_slot_value_for_type(Type::Ref, &value)
         };

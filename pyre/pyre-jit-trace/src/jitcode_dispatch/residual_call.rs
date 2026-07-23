@@ -20,23 +20,70 @@ use super::*;
 thread_local! {
     static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
+    static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
+        const { std::cell::RefCell::new(None) };
     static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
+    /// post-call commit withdrawal can put the live frame back.  The legacy
+    /// replay's correctness contract is "the live frame still holds pre-walk
+    /// state"; a committed force-flush breaks it, so every path that does NOT
+    /// adopt the committed resume pc must restore this first.
+    static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
+        const { std::cell::RefCell::new(None) };
+    /// Opcode-scoped effect window: `(py_pc, frame_entry_count,
+    /// executed_effect_count)` sampled at the FIRST residual of the Python
+    /// opcode currently being walked.  Re-executing a committed escape re-runs
+    /// the WHOLE opcode, so the latch gate must know whether any EARLIER
+    /// residual of the same opcode ran user bytecode or committed an effect —
+    /// not just the escaping one (rich-compare fallback chains run two
+    /// residuals in one opcode).  Reset at walk start; concrete effects only
+    /// happen through residuals, so anchoring the window at the first residual
+    /// loses nothing.
+    static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, u64, usize)>> =
         const { std::cell::Cell::new(None) };
 }
 
-struct ActiveFrameEscapeGuard(Option<(usize, usize)>);
+pub(crate) struct EscapeFlushUndo {
+    frame: usize,
+    last_instr: isize,
+    valuestackdepth: usize,
+    pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+}
+
+/// TLS cell pointer for the store-journal root area: the undo stays armed
+/// from force time until the abort epilogue consumes it, and its slots can be
+/// the ONLY reference to pre-walk locals the flush displaced — the area
+/// walker forwards them across any minor collection on that whole window
+/// (the resume-ref-roots stack cannot cover it: the residual's post-call
+/// `pop_resume_ref_roots_to` truncates past a force-time push).
+pub(crate) fn escape_flush_undo_cell_ptr() -> *const std::cell::RefCell<Option<EscapeFlushUndo>> {
+    ESCAPE_FLUSH_UNDO.with(|cell| cell as *const _)
+}
+
+struct ActiveFrameEscapeGuard {
+    prev: Option<(usize, usize)>,
+    prev_stack: Option<Vec<OpRef>>,
+}
 
 impl ActiveFrameEscapeGuard {
-    fn enter(frame: usize, py_pc: usize) -> Self {
+    fn enter(frame: usize, py_pc: usize, stack: Option<Vec<OpRef>>) -> Self {
         let current = (frame != 0).then_some((frame, py_pc));
         COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.set(None));
-        Self(ACTIVE_FRAME_ESCAPE.with(|slot| slot.replace(current)))
+        let latched = if current.is_some() { stack } else { None };
+        let prev_stack = ACTIVE_FRAME_ESCAPE_STACK
+            .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), latched));
+        Self {
+            prev: ACTIVE_FRAME_ESCAPE.with(|slot| slot.replace(current)),
+            prev_stack,
+        }
     }
 }
 
 impl Drop for ActiveFrameEscapeGuard {
     fn drop(&mut self) {
-        ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(self.0));
+        ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(self.prev));
+        ACTIVE_FRAME_ESCAPE_STACK.with(|slot| *slot.borrow_mut() = self.prev_stack.take());
     }
 }
 
@@ -52,8 +99,27 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
         if let Some((expected, py_pc)) = slot.get()
             && expected == frame as usize
         {
-            if crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc) {
+            // Force #2+ within this residual (`enter` resets the committed pc
+            // per residual): the live frame is already heap-authoritative
+            // from the first flush, and the callee may have legitimately
+            // mutated it since (an `f_locals` write-through) — re-flushing
+            // would overwrite that mutation with the same walk-end values.
+            // The token force is a no-op then too (`force_now` on
+            // TOKEN_NONE, virtualizable.py:248-260).
+            if COMMITTED_FRAME_ESCAPE_PC
+                .with(|committed| committed.get())
+                .is_some()
+            {
+                return true;
+            }
+            capture_escape_flush_undo(expected);
+            let flushed = flush_escape_state_with_latched_stack(ctx, expected, py_pc)
+                || crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc);
+            if flushed {
                 COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some(py_pc)));
+            } else {
+                // All-or-nothing decline: nothing was written, nothing to undo.
+                discard_escape_flush_undo();
             }
             return true;
         }
@@ -61,8 +127,141 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
     })
 }
 
+/// Snapshot the frame region a successful escape flush overwrites (the whole
+/// `locals_cells_stack_w` array plus `last_instr`/`valuestackdepth`).  GC:
+/// the store-journal root area walks the armed capture's slots in place (see
+/// [`escape_flush_undo_cell_ptr`]).  A second force in the same residual
+/// keeps the OLDEST capture (the true pre-flush state); staleness across walk
+/// attempts is impossible — the walk-start reset discards any leftover.
+fn capture_escape_flush_undo(frame: usize) {
+    ESCAPE_FLUSH_UNDO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            // Keep the oldest capture for the SAME frame (true pre-flush state).
+            Some(existing) if existing.frame == frame => return,
+            // A capture for a different frame is a stale leftover from an
+            // unwound path; its frame may be dead — drop without restoring.
+            Some(_) => *slot = None,
+            None => {}
+        }
+        let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        *slot = Some(EscapeFlushUndo {
+            frame,
+            last_instr: pf.last_instr,
+            valuestackdepth: pf.valuestackdepth,
+            slots: pf.locals_w().as_slice().to_vec(),
+        });
+    });
+}
+
+/// Put the pre-flush frame state back.  Called on every path that does not
+/// adopt the committed escape pc (commit withdrawal, an unforced or
+/// rootless continuation, the `PYRE_FBW_ABORT_FLUSH=0` opt-out) so the
+/// legacy replay re-enters a pristine frame.
+pub(crate) fn restore_escape_flush_undo() {
+    ESCAPE_FLUSH_UNDO.with(|slot| {
+        let Some(undo) = slot.borrow_mut().take() else {
+            return;
+        };
+        unsafe {
+            let pf = &mut *(undo.frame as *mut pyre_interpreter::PyFrame);
+            let dst = pf.locals_w_mut();
+            let n = undo.slots.len().min(dst.as_slice().len());
+            for (i, &v) in undo.slots.iter().take(n).enumerate() {
+                dst[i] = v;
+            }
+            pf.last_instr = undo.last_instr;
+            pf.valuestackdepth = undo.valuestackdepth;
+        }
+    });
+}
+
+pub(crate) fn discard_escape_flush_undo() {
+    ESCAPE_FLUSH_UNDO.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+/// Opcode-scoped effect window check (see [`ESCAPE_OPCODE_WINDOW`]): true iff
+/// no earlier residual of the CURRENT Python opcode entered a user frame or
+/// committed a concrete effect.  Opens the window on the first residual of
+/// each opcode.  Keyed on `py_pc` alone: an opcode revisited across walked
+/// inner-loop iterations compares against the FIRST visit's snapshot, so
+/// every revisit after any effect declines the latch — conservative (decline
+/// → legacy).  An unexplained latch-decline spike on nested-loop shapes is
+/// this; the refinement would reset the window on back-edge re-entry.
+fn escape_opcode_window_clean(py_pc: usize) -> bool {
+    let frames = pyre_interpreter::call::frame_entry_count();
+    let effects = fbw_executed_effect_count();
+    ESCAPE_OPCODE_WINDOW.with(|slot| match slot.get() {
+        Some((pc, f, e)) if pc == py_pc => f == frames && e == effects,
+        _ => {
+            slot.set(Some((py_pc, frames, effects)));
+            true
+        }
+    })
+}
+
+/// Reset the opcode window at walk start so a prior trace's sample cannot
+/// alias a same-pc opcode of the new walk.
+pub(crate) fn escape_opcode_window_reset() {
+    ESCAPE_OPCODE_WINDOW.with(|slot| slot.set(None));
+}
+
+/// Resolve the latched operand-stack mirror (`ActiveFrameEscapeGuard::enter`)
+/// to concrete refs and flush the walk-end state with the mid-expression
+/// stack the vable shadow cannot provide (its stack region is only valid at
+/// merge points).  The `_run_forever` continue-forward analog
+/// (`blackhole.py:1752`) for the escape abort: the resume state is the exact
+/// abort-point frame, so the walk's applied effects stand and nothing
+/// replays.  Returns false (no frame mutation) when no stack was latched or
+/// any slot lacks a concrete non-null Ref — the caller then falls back to the
+/// plain merge-point flush.
+fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize) -> bool {
+    ACTIVE_FRAME_ESCAPE_STACK.with(|slot| {
+        let latched = slot.borrow();
+        let Some(oprefs) = latched.as_ref() else {
+            return false;
+        };
+        let mut stack = Vec::with_capacity(oprefs.len());
+        for &opref in oprefs.iter() {
+            match ctx.concrete_of_opref(opref) {
+                Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
+                    let obj = r.as_usize() as pyre_object::PyObjectRef;
+                    if obj.is_null() {
+                        return false;
+                    }
+                    stack.push(obj);
+                }
+                _ => return false,
+            }
+        }
+        // The flush's Int/Float local boxing can trigger a minor collection;
+        // register the resolved refs as resume roots so they are forwarded in
+        // place across it (the same discipline as the vable root above).
+        let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                stack.as_mut_ptr() as *mut i64,
+                stack.len(),
+            ));
+        }
+        let committed =
+            crate::state::flush_walk_end_state_to_frame_with_full_stack(ctx, frame, py_pc, &stack);
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+        committed
+    })
+}
+
 pub fn take_committed_frame_escape_pc() -> Option<usize> {
     COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.take())
+}
+
+/// Withdraw a committed escape resume pc: the residual that escaped also ran
+/// user bytecode, so resuming AT its opcode would re-execute that user body —
+/// the legacy replay (whose journals roll back) is the never-double fallback.
+fn cancel_committed_frame_escape_pc() {
+    COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.set(None));
 }
 
 /// Reject a residual_call whose `allboxes` (funcbox + permuted args)
@@ -1098,8 +1297,39 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
+        // Latch the operand-stack mirror for the escape flush: at force time
+        // the walk-end flush needs the caller's mid-expression stack, which
+        // the vable shadow cannot provide (`reconstructed_all_ref_call_stack`
+        // resolves the same mirror for the inline-abort Entry carrier).  Only
+        // a non-writing residual is latched — a committed escape resumes AT
+        // this opcode and re-executes it in the interpreter, which must not
+        // re-apply a heap write.  The write gate is load-bearing beyond the
+        // obvious setters: forcing is NOT limited to frame-introspection
+        // reads (`hook_access_field`, rvirtualizable.py:49-53, forces on
+        // every redirected-field access, reads AND writes), and the mutating
+        // forcers — the `f_lineno`/`f_trace` setters, `sys.settrace`,
+        // `_warnings.warn` (forces the caller frame for `__name__`, then
+        // mutates `__warningregistry__` with no user frame entered) — are
+        // excluded here only because every Python-visible frame MUTATOR is a
+        // Void-returning store or a CALL-shaped helper.  What survives the
+        // gates is attribute/item READS of frame-family objects, which are
+        // idempotently re-executable (re-execution reads the same flushed
+        // values the first execution saw; a token re-force is a no-op).
+        // A sub-walk's mirror describes the callee frame, not the escape
+        // frame, so it is never latched (the nested unjournaled-residual
+        // decline above already aborts before this).
+        // Not latched on a bridge walk: its abort path bypasses the
+        // run_perfn_walk epilogue that adopts (or restores) a committed
+        // escape flush, so a commit there would strand a moved frame.
+        let escape_stack = (escape_frame != 0
+            && !writes_live_heap
+            && !ctx.fbw_mode.inline_subwalk
+            && !ctx.trace_ctx.is_bridge_trace
+            && ctx.vstack_valid
+            && escape_opcode_window_clean(ctx.vstack_cur_pypc as usize))
+        .then(|| ctx.vstack_boxes.clone());
         let _frame_escape =
-            ActiveFrameEscapeGuard::enter(escape_frame, ctx.vstack_cur_pypc as usize);
+            ActiveFrameEscapeGuard::enter(escape_frame, ctx.vstack_cur_pypc as usize, escape_stack);
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
@@ -1133,10 +1363,34 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
         if forced {
+            // The escaping residual also entered a user Python frame whose
+            // body may have committed irreversible effects; a committed
+            // escape resume would re-execute this opcode and re-run that
+            // body.  Withdraw the commit AND restore the pre-flush frame so
+            // the legacy replay re-enters pristine pre-walk state (the flush
+            // moved the live frame mid-iteration; replaying on top of it
+            // loses journal-rolled-back effects and re-runs partial state).
+            if heap_write_odometer_before
+                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
+            {
+                cancel_committed_frame_escape_pc();
+                restore_escape_flush_undo();
+            }
+            // On a kept commit the undo stays armed: the abort epilogue
+            // consumes it — discard on adoption, restore when the flush is
+            // not adopted (`PYRE_FBW_ABORT_FLUSH=0`).
+            // On the cancel arm the restore above ran FIRST, so this refresh
+            // reloads PRE-walk values — the shadow then matches the frame the
+            // legacy replay will use, not walk-end state.  A future ladder
+            // leg must not assume walk-end shadow state after a cancelled
+            // commit.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }
+    // A flush that ran without a forced abort (an unarmed token or a missing
+    // vable root) must not leak the moved frame into the continuing walk.
+    restore_escape_flush_undo();
     // #57 Option C (Finding #1, R1): a residual that is not provably
     // side-effect-free has now EXECUTED AFTER the in-flight FOR_ITER consume —
     // whether it returned a value (Ok) or raised (Err).  The store/append

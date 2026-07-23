@@ -1748,6 +1748,17 @@ def main():
             15,
             skip_backends=("wasm",),
         )
+        # The f_locals write-through it drives is a 3.14 FrameLocalsProxy
+        # behaviour PyPy 3.11 lacks (its f_locals is a snapshot), so cpython and
+        # pypy disagree on the mutated value and it cannot be a synthetic bench.
+        # The guard is pyre-internal: a forcing callee's escape flush must resume
+        # past the abort, else the in-flight FOR_ITER iteration drops and the
+        # loop total comes up short. Asserted inside the script.
+        chk.run_selfcheck(
+            "getframe_escape_flush_writethrough",
+            f"{B}/getframe_escape_flush_writethrough_regression.py",
+            15,
+        )
 
     if not args.no_synthetic:
         print()

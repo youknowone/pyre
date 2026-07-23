@@ -4385,6 +4385,7 @@ struct FbwStoreJournalRootArea {
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
+    escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
 }
 
 thread_local! {
@@ -4398,6 +4399,7 @@ thread_local! {
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
+        escape_flush_undo: escape_flush_undo_cell_ptr(),
     };
 }
 
@@ -4637,6 +4639,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         // SAFETY: as above — only the `PyObjectRef` slot is a root; the
         // `usize` body pc and the bool flag are plain scalars.
         visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // The escape-flush undo snapshot stays armed from force time until the
+    // abort epilogue consumes it, and its slots can be the ONLY reference to
+    // pre-walk locals the flush displaced (the live-frame slots now hold
+    // walk-end values) — forward each so a minor collection on the abort
+    // unwind cannot move/free what `restore_escape_flush_undo` writes back.
+    let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
+    if let Some(undo) = escape_undo.as_mut() {
+        for slot in undo.slots.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
     }
     // gh#467: the latched forward-flush operand stack (callable + args) is
     // nursery-resident across the abort unwind — the flush boxes Int/Float
