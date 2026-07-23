@@ -2551,8 +2551,10 @@ mod tests {
 
     #[test]
     fn parse_state_fields_rejects_unknown_scalar_type() {
+        // `float` is a supported scalar type now; use a genuinely unsupported
+        // one (`u32` is a real type but not a valid state-field IR type).
         let tokens: proc_macro2::TokenStream = parse_quote! {
-            { val: float }
+            { val: u32 }
         };
         let err = match syn::parse2::<StateFieldsWrapper>(tokens) {
             Ok(_) => panic!("expected parse error for unknown scalar type"),
@@ -2560,7 +2562,8 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("supported: `int`, `int(<TypePath>)`, `opaque(TypePath)`"),
+            msg.contains("unsupported type `u32`")
+                && msg.contains("supported: `int`, `int(<TypePath>)`, `float`"),
             "msg: {msg}"
         );
     }
