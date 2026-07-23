@@ -2000,7 +2000,7 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::P
 fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__getattribute__")?;
     let name = crate::baseobjspace::text_w(args[1])?;
-    crate::baseobjspace::getattr_str(module, name)
+    crate::baseobjspace::module_getattribute(module, name)
 }
 
 /// module.py:164-173 `Module.descr_module__dir__`.

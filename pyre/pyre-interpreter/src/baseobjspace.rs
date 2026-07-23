@@ -4661,6 +4661,24 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     unsafe {
         if is_module(obj) {
             let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+            // module.py Module.descr_getattribute is the default module slot
+            // inlined below.  A retagged module may replace that slot (for
+            // example importlib.util._LazyModule), in which case space.getattr
+            // must dispatch the replacement before touching the module dict.
+            // The default result is memoized on the live, possibly retagged
+            // type so ordinary modules retain the hot path.
+            if call_getattr {
+                if let Some(slot) = module_getattribute_if_not_from_default(w_type) {
+                    let name_obj = w_str_new(name);
+                    match get_and_call_function(slot, obj, w_type, &[name_obj]) {
+                        Ok(v) => return Ok(v),
+                        Err(e) if e.kind == PyErrorKind::AttributeError => {
+                            return module_getattr_hook_or_err(obj, name, e, call_getattr);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
             let w_descr = if w_type.is_null() {
                 None
             } else {
@@ -4893,29 +4911,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // normal lookup misses with AttributeError, a module-level `__getattr__`
     // stored in the module's own dict gets the final say, called with just the
     // attribute name.  Only `space.getattr` consults it.
-    if call_getattr && err.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
-        let w_dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
-        if !w_dict.is_null() {
-            if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
-                if !mod_getattr.is_null() {
-                    let name_obj = w_str_new(name);
-                    return crate::call::call_function_impl_result(mod_getattr, &[name_obj]);
-                }
-            }
-            // No module `__getattr__`: phrase the miss with the module's
-            // `__name__` (`module '<name>' has no attribute '<attr>'`, the
-            // `'%U'` form), which requires a str `__name__` and falls back
-            // to the bare form otherwise.  (The `__spec__`-based
-            // circular-import diagnostics are not ported.)
-            let msg = match finditem_str(w_dict, "__name__")? {
-                Some(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
-                    let nm = unsafe { pyre_object::w_str_get_wtf8(w) };
-                    format!("module '{nm}' has no attribute '{name}'")
-                }
-                _ => format!("module has no attribute '{name}'"),
-            };
-            return Err(PyError::new(PyErrorKind::AttributeError, msg));
-        }
+    if err.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
+        return unsafe { module_getattr_hook_or_err(obj, name, err, call_getattr) };
     }
     Err(err)
 }
@@ -5143,11 +5140,14 @@ unsafe fn setattr_surrogate(
 ) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
-                return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
-                    .map(|_| w_none());
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(PY_NULL)
+        };
+        if !w_type.is_null() {
+            if let Some(sa) = setattr_if_not_from_object(w_type) {
+                return get_and_call_function(sa, obj, w_type, &[w_name, value]).map(|_| w_none());
             }
         }
     }
@@ -5234,19 +5234,18 @@ pub(crate) unsafe fn object_setattr_surrogate(
 unsafe fn delattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(PY_NULL)
+        };
+        if !w_type.is_null() {
             if let Some(da) = lookup_in_type(w_type, "__delattr__") {
-                return crate::call::call_function_impl_result(da, &[obj, w_name])
-                    .map(|_| w_none());
-            }
-        } else if let Some(w_type) = crate::typedef::r#type(obj) {
-            // descroperation.py:254 dispatches through space.lookup for every
-            // receiver kind. A class is an instance of its metaclass, so its
-            // __delattr__ override precedes direct type-dict removal too.
-            if let Some(da) = lookup_in_type(w_type, "__delattr__") {
-                return crate::call::call_function_impl_result(da, &[obj, w_name])
-                    .map(|_| w_none());
+                let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
+                    .is_some_and(|d| std::ptr::eq(da, d));
+                if !is_default {
+                    return get_and_call_function(da, obj, w_type, &[w_name]).map(|_| w_none());
+                }
             }
         }
     }
@@ -5390,6 +5389,51 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
     // protocol with no `__getattr__` fallback — that belongs to space.getattr,
     // not the bare object.__getattribute__ slot (descroperation.py:88).
     getattr_str_impl(obj, name, false)
+}
+
+/// module.py `Module.descr_getattribute` — run the object-default descriptor
+/// protocol, then the module-dict `__getattr__` hook on AttributeError.
+pub(crate) fn module_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
+    match object_getattribute(obj, name) {
+        Ok(value) => Ok(value),
+        Err(err) if err.kind == PyErrorKind::AttributeError => unsafe {
+            module_getattr_hook_or_err(obj, name, err, true)
+        },
+        Err(err) => Err(err),
+    }
+}
+
+/// module.py `Module.descr_getattribute` tail.  A module-level `__getattr__`
+/// is a namespace value called with the name alone, not a type descriptor.
+unsafe fn module_getattr_hook_or_err(
+    obj: PyObjectRef,
+    name: &str,
+    err: PyError,
+    call_getattr: bool,
+) -> PyResult {
+    if !call_getattr {
+        return Err(err);
+    }
+    let w_dict = pyre_object::w_module_get_w_dict(obj);
+    if w_dict.is_null() {
+        return Err(err);
+    }
+    if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
+        if !mod_getattr.is_null() {
+            return crate::call::call_function_impl_result(mod_getattr, &[w_str_new(name)]);
+        }
+    }
+    // No module `__getattr__`: phrase the miss with the module's `__name__`
+    // when it is a string, falling back to the bare form otherwise.  The
+    // `__spec__`-based circular-import diagnostics are not ported.
+    let msg = match finditem_str(w_dict, "__name__")? {
+        Some(w) if !w.is_null() && pyre_object::is_str(w) => {
+            let nm = pyre_object::w_str_get_wtf8(w);
+            format!("module '{nm}' has no attribute '{name}'")
+        }
+        _ => format!("module has no attribute '{name}'"),
+    };
+    Err(PyError::new(PyErrorKind::AttributeError, msg))
 }
 
 /// `descroperation.py:242-245` `_handle_getattribute` tail: on an
@@ -7730,6 +7774,41 @@ unsafe fn is_object_getattribute_descr(w_descr: PyObjectRef) -> bool {
     }
 }
 
+/// module.py `Module.descr_getattribute` is the default attribute slot for
+/// module objects.  Module subclasses inherit it unless they explicitly
+/// replace `__getattribute__`.
+unsafe fn is_module_getattribute_descr(w_descr: PyObjectRef) -> bool {
+    let w_module_type =
+        crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
+            .unwrap_or(PY_NULL);
+    !w_module_type.is_null()
+        && lookup_in_type_where(w_module_type, "__getattribute__")
+            .is_some_and(|d| std::ptr::eq(w_descr, d))
+}
+
+/// Module-specialized companion of `getattribute_if_not_from_object`.
+///
+/// The module default is `Module.descr_getattribute`, not
+/// `object.__getattribute__`, but it uses the same per-type memoized flag and
+/// mutation invalidation as the object-default path.
+unsafe fn module_getattribute_if_not_from_default(w_type: PyObjectRef) -> Option<PyObjectRef> {
+    if majit_metainterp::jit::we_are_jitted() {
+        return lookup_in_type_where(w_type, "__getattribute__")
+            .filter(|&w_descr| !is_module_getattribute_descr(w_descr));
+    }
+    if pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+        return None;
+    }
+    if let Some(w_descr) = lookup_in_type_where(w_type, "__getattribute__") {
+        if is_module_getattribute_descr(w_descr) {
+            pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+            return None;
+        }
+        return Some(w_descr);
+    }
+    None
+}
+
 /// descroperation.py:17-20 `object_setattr(space)` — the canonical
 /// `object.__setattr__` descriptor anchor (see
 /// [`is_object_getattribute_descr`]).
@@ -8577,10 +8656,16 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 pyre_object::type_name_of(w_newcls),
             )));
         }
-        // objectobject.py:143-145 — w_newcls must be a heap type.
-        if !w_type_is_heaptype(w_newcls) {
+        // objectobject.py:166-171 — assignment targets are heap types or the
+        // exact module type.  The latter lets a ModuleType subclass restore
+        // its receiver to ModuleType after temporarily overriding the slots.
+        let w_module_type =
+            crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
+                .unwrap_or(PY_NULL);
+        if !w_type_is_heaptype(w_newcls) && !std::ptr::eq(w_newcls, w_module_type) {
             return Err(crate::PyError::type_error(
-                "__class__ assignment: only for heap types".to_string(),
+                "__class__ assignment only supported for heap types or ModuleType subclasses"
+                    .to_string(),
             ));
         }
         // objectobject.py:146-147 — get the old class
@@ -8647,14 +8732,9 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
             // (e.g. structseq tuple subclasses) may install a non-default
             // __setattr__; only a real override (≠ object.__setattr__)
             // needs invoking — the default terminal path is object_setattr.
-            if let Some(sa) = lookup_in_type(w_type, "__setattr__") {
-                let is_default = lookup_in_type(crate::typedef::w_object(), "__setattr__")
-                    .is_some_and(|d| std::ptr::eq(sa, d));
-                if !is_default {
-                    let w_name = w_str_new(name);
-                    return crate::call::call_function_impl_result(sa, &[obj, w_name, value])
-                        .map(|_| w_none());
-                }
+            if let Some(sa) = setattr_if_not_from_object(w_type) {
+                let w_name = w_str_new(name);
+                return get_and_call_function(sa, obj, w_type, &[w_name, value]).map(|_| w_none());
             }
         }
     }
@@ -9375,30 +9455,18 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                     return get_and_call_function(da, obj, w_type, &[w_name]).map(|_| w_none());
                 }
             }
-        } else if is_type(obj) {
-            // descroperation.py:254 looks up __delattr__ on the receiver type
-            // regardless of receiver kind.  For a type receiver that is the
-            // metaclass; a metaclass overriding __delattr__ customises
-            // `del C.x`.  Only a real override (≠ object.__delattr__) needs
-            // invoking — the default terminal path is object_delattr.
-            if let Some(w_metatype) = crate::typedef::r#type(obj) {
-                if let Some(da) = lookup_in_type(w_metatype, "__delattr__") {
-                    let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
-                        .is_some_and(|d| std::ptr::eq(da, d));
-                    if !is_default {
-                        let w_name = w_str_new(name);
-                        return get_and_call_function(da, obj, w_metatype, &[w_name])
-                            .map(|_| w_none());
-                    }
-                }
-            }
         } else if let Some(w_type) = crate::typedef::r#type(obj) {
-            // A class object's attribute operations dispatch through its
-            // metaclass in PyPy (`space.lookup(w_obj, '__delattr__')`).
+            // descroperation.py:254 looks up __delattr__ on the receiver type
+            // regardless of receiver kind.  This includes a module retagged
+            // to a subclass as well as a type receiver whose metaclass
+            // customises deletion.
             if let Some(da) = lookup_in_type(w_type, "__delattr__") {
-                let w_name = w_str_new(name);
-                return crate::call::call_function_impl_result(da, &[obj, w_name])
-                    .map(|_| w_none());
+                let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
+                    .is_some_and(|d| std::ptr::eq(da, d));
+                if !is_default {
+                    let w_name = w_str_new(name);
+                    return get_and_call_function(da, obj, w_type, &[w_name]).map(|_| w_none());
+                }
             }
         }
     }
