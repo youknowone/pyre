@@ -417,6 +417,24 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // intobject.py `_make_generic_descr_binop`: the machine-int fast path
+    // exits through `_make_ovf2long` when `ovfcheck(op(x, y))` raises.
+    // This walker specialization represents only the no-overflow arm.  When
+    // the concrete walk is already on the overflow arm, defer before emitting
+    // any IR so the generic residual records the authentic W_Long result.
+    // Emitting INT_*_OVF + GUARD_NO_OVERFLOW here would contradict that
+    // result: the bridge would immediately try to prove the freshly boxed
+    // W_IntObject is a W_LongObject and abort on every retry.
+    let overflowed = match op_code {
+        OpCode::IntAddOvf => la.checked_add(rb).is_none(),
+        OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
+        OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
+        _ => false,
+    };
+    if overflowed {
+        return Ok(None);
+    }
+
     // intobject.py range validation (mirror the former int fast path's
     // needs_concrete_check): bail to the generic leg when the bare-IR-op
     // emission would be unsound (zero / INT_MIN-overflow divisor, oversized

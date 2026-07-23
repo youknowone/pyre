@@ -8247,7 +8247,13 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Option<RawCompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let token = compiled.live_token()?;
+        // warmstate.py:398 `loop_token = cell.get_procedure_token()`:
+        // execution must use the cell's current, invalidation-filtered token.
+        // `compiled_loops` is a metadata index and can still retain a weak
+        // predecessor while a recompile/redirect has installed a newer token
+        // on the JitCell.  Executing that predecessor re-enters invalidated
+        // machine code and repeatedly fails GUARD_NOT_INVALIDATED.
+        let token = self.warm_state.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&token, live_values);
@@ -8368,7 +8374,9 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[i64],
     ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let token = compiled.live_token()?;
+        // warmstate.py:398: the JitCell is the canonical current-token
+        // owner and filters invalidated predecessors.
+        let token = self.warm_state.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let frame = self.backend.execute_token_ints(&token, live_values);
@@ -8538,7 +8546,9 @@ impl<M: Clone> MetaInterp<M> {
         dispatch_key: u32,
     ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let token = compiled.live_token()?;
+        // warmstate.py:398: execute the token returned by the JitCell, not
+        // the compiled-metadata index's possibly retired predecessor.
+        let token = self.warm_state.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let frame = self
@@ -9517,6 +9527,23 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
+        // quasiimmut.py:97-100 `QuasiImmut.invalidate()` marks the owning
+        // JitCellToken invalid before `cpu.invalidate_loop()` patches every
+        // GUARD_NOT_INVALIDATED.  The failed guard remains usable only as
+        // resume data; warmstate.py:191-196 no longer returns that token as a
+        // procedure token, and PyPy never traces a bridge onto it.  Preserve
+        // that object ownership here: a stale machine-code activation may
+        // still report the descr, but it must go straight to blackhole
+        // resume instead of ticking the bridge counter and repeatedly
+        // attaching bridges to the permanently invalidated loop.
+        let owning_jct = majit_backend::descr_owning_jct(descr_fd);
+        let owning_key = owning_jct
+            .as_ref()
+            .map(|jct| jct.green_key())
+            .unwrap_or(fallback_green_key);
+        if owning_jct.as_ref().is_some_and(|jct| jct.is_invalidated()) {
+            return (false, owning_key);
+        }
         // A guard whose bridge was refused by a terminal-declining backend
         // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
         // full-body-walk decline must not re-fire: re-tracing rebuilds the same
@@ -9528,9 +9555,6 @@ impl<M: Clone> MetaInterp<M> {
             .contains(&(trace_id, fail_index))
         {
             crate::mc_diag_bump(1); // declined_bridge_guards short-circuit
-            let owning_key = majit_backend::descr_owning_jct(descr_fd)
-                .map(|jct| jct.green_key())
-                .unwrap_or(fallback_green_key);
             return (false, owning_key);
         }
         // compile.py:725 `_trace_and_compile_from_bridge` walks
@@ -9541,9 +9565,6 @@ impl<M: Clone> MetaInterp<M> {
         // outer entry key.  RPython doesn't have this fallback because
         // its identity is descr-pointer-based, never indirected through
         // a numeric `green_key`.
-        let owning_key = majit_backend::descr_owning_jct(descr_fd)
-            .map(|jct| jct.green_key())
-            .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
             crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
