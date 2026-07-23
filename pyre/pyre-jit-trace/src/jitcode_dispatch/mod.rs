@@ -2359,14 +2359,23 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
     }
 }
 
-/// `PYRE_EXC_EDGE_BRIDGE=1` enables the exception-edge bridge: route an
-/// exception-guard bridge (GUARD_NO_EXCEPTION / GUARD_EXCEPTION) resume to the
-/// in-frame `except` handler instead of declining to the blackhole
-/// (`call_jit.rs` pending-exc decline).  Default-off for A/B while the routing
-/// is validated bit-exact.
+/// Exception-edge bridge: route an exception-guard bridge
+/// (GUARD_NO_EXCEPTION / GUARD_EXCEPTION) resume to the in-frame `except`
+/// handler instead of declining to the blackhole (`call_jit.rs` pending-exc
+/// decline).  Default-on; `PYRE_EXC_EDGE_BRIDGE=0` disables.  The wasm guest
+/// has no env plumbing to switch it back off and its abort-replay exception
+/// class (#727) is still open, so the rollout stays opt-in there.
 pub fn exc_edge_bridge_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_EXC_EDGE_BRIDGE").is_some())
+    *ENABLED.get_or_init(|| {
+        if cfg!(target_arch = "wasm32") {
+            return std::env::var_os("PYRE_EXC_EDGE_BRIDGE").is_some();
+        }
+        match std::env::var_os("PYRE_EXC_EDGE_BRIDGE") {
+            Some(v) => v != "0",
+            None => true,
+        }
+    })
 }
 
 /// `PYRE_CARRIER_EXC_RESUME=1` enables the multi-frame (carrier) exception
