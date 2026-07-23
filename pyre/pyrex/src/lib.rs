@@ -194,6 +194,11 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                 }
             }
             Short('O') => {} // no-op
+            // Unbuffered stdio: pyre's stdout/stderr wrappers already write
+            // through to the fd on every call, so the flag has nothing left
+            // to disable; accepting it keeps `script_helper`-style spawns
+            // (`sys.executable -E -u script`) working.
+            Short('u') => {}
             Short('q') => flags.quiet = true,
             Short('s') => flags.no_user_site = true,
             Short('S') => flags.no_site = true,
