@@ -1317,6 +1317,26 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     })
 }
 
+/// Return the exact JitCode coordinate at which a paused caller continues
+/// after an inlined residual call.
+///
+/// RPython's `MIFrame.pc` remains immediately after the call instruction
+/// while the callee runs.  Preserve that shape here: blackhole return setup
+/// walks backward from this coordinate to recover the call's destination
+/// register.  Advancing to a later semantic-fallthrough marker skips the
+/// intervening `live` / virtualizable synchronization instructions and makes
+/// that backward walk read an unrelated operand byte.
+pub(crate) fn inline_call_return_marker(
+    pjc: &crate::pyjitcode::PyJitCode,
+    call_jit_pc: usize,
+) -> Option<usize> {
+    let marker =
+        crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)?.next_pc;
+    pjc.jitcode
+        .can_decode_live_vars(marker, crate::state::op_live())
+        .then_some(marker)
+}
+
 pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -1383,7 +1403,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         (
             jc.index as u32,
             fallthrough,
-            jc.payload.after_residual_marker_for_jitcode_pc(call_jit_pc),
+            inline_call_return_marker(&jc.payload, call_jit_pc),
             jc.payload.code_ptr,
         )
     };
@@ -1450,8 +1470,8 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
-    // The after-residual marker names the same `-live-` the fallthrough
-    // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
+    // Keep the caller at the immediate post-call `-live-`, matching the
+    // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
     let caller_liveness_word = match resume_marker_jit_pc {
         Some(m) => m as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
@@ -1504,7 +1524,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
+    let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc);
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block at inline depth ≥2: the rejoin-loop lift is
     // scoped to the top-level caller (`compute_inline_caller_frame`) for now, so
@@ -1572,8 +1592,8 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
-    // The after-residual marker names the same `-live-` the fallthrough
-    // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
+    // Keep the caller at the immediate post-call `-live-`, matching the
+    // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
     // Without a marker there is no coordinate to encode against, so the
     // sentinel declines the caller frame.
     let caller_liveness_word = match resume_marker_jit_pc {

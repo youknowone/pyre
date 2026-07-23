@@ -570,7 +570,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
         .map(|op| op.pc);
     let resume_marker_jit_pc =
-        call_jit_pc.and_then(|pc| pjc.after_residual_marker_for_jitcode_pc(pc));
+        call_jit_pc.and_then(|pc| super::resume_snapshot::inline_call_return_marker(&pjc, pc));
 
     // Reconstruct this paused parent frame's vable + ec (the same
     // `emit_new_pyframe_inline_with_params` the deepest-callee setup uses) so
