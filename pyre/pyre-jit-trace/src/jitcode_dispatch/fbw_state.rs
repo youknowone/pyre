@@ -40,7 +40,7 @@ pub(crate) fn fbw_max_multiframe_depth() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
-            .clamp(1, 3)
+            .clamp(1, 7)
     })
 }
 
