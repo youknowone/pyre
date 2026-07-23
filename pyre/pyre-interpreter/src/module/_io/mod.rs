@@ -117,6 +117,8 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
+    // CPython 3.14 `IOBase._checkClosed` no longer exposes PyPy's optional
+    // `message` argument: Argument Clinic rejects every argument after self.
     if args.len() != 1 {
         return Err(crate::PyError::type_error(
             "_IOBase._checkClosed() takes no arguments",

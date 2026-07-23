@@ -787,6 +787,9 @@ fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
         return Err(PyError::type_error("read() didn't return bytes"));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec();
+    // CPython 3.14 calls `frombytes` before reporting a short read.  A
+    // non-item-aligned result therefore raises ValueError without appending;
+    // PyPy's source has the same call order despite its EOF-focused comment.
     array_frombytes(obj, &bytes)?;
     if bytes.len() < size {
         let mut error = PyError::value_error("not enough items in file");
@@ -1190,6 +1193,25 @@ fn reconstructor_descriptor(mformat: i64) -> (usize, bool, bool) {
     (size, signed, big_endian)
 }
 
+/// CPython 3.14 `array__array_reconstructor_impl`: when integer bytes came
+/// from an architecture with a different C integer layout, select the native
+/// integer typecode with the same width and signedness before construction.
+fn reconstructor_integer_typecode(size: usize, signed: bool) -> u8 {
+    match (size, signed) {
+        (1, true) => b'b',
+        (1, false) => b'B',
+        (2, true) => b'h',
+        (2, false) => b'H',
+        (4, true) => b'i',
+        (4, false) => b'I',
+        // CPython scans all descriptors and retains the last match.  On the
+        // supported 64-bit targets that is q/Q rather than long/unsigned long.
+        (8, true) => b'q',
+        (8, false) => b'Q',
+        _ => unreachable!("validated machine-format integer width"),
+    }
+}
+
 /// `reconstructor.py:array_reconstructor`: use native bytes on the matching
 /// machine-format fast path, otherwise decode each source item before the
 /// requested array class repacks it in native representation.
@@ -1238,15 +1260,15 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "fourth argument should be bytes, not other",
         ));
     }
-    let new_args = [w_cls, args[1]];
-    let obj = array_descr_new(&new_args)?;
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();
     if mformat == array_machine_format_code(typecode, itemsize) {
+        let obj = array_descr_new(&[w_cls, args[1]])?;
         array_frombytes(obj, &bytes)?;
         return Ok(obj);
     }
 
     if matches!(mformat, 18..=21) {
+        let obj = array_descr_new(&[w_cls, args[1]])?;
         let encoding = match mformat {
             18 => "utf-16-le",
             19 => "utf-16-be",
@@ -1264,6 +1286,13 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "bytes length not a multiple of item size",
         ));
     }
+    let output_typecode = if mformat <= 13 {
+        reconstructor_integer_typecode(source_size, signed)
+    } else {
+        typecode
+    };
+    let output_typecode_text = (output_typecode as char).to_string();
+    let obj = array_descr_new(&[w_cls, pyre_object::w_str_new(&output_typecode_text)])?;
     for chunk in bytes.chunks_exact(source_size) {
         let w_item = if matches!(mformat, 14 | 15) {
             let raw: [u8; 4] = chunk.try_into().unwrap();

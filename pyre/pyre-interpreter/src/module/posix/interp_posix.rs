@@ -517,16 +517,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let flags = loop {
-                let result = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if result >= 0 {
-                    break result;
-                }
+            // PyPy passes `eintr_retry=False`; CPython 3.14's
+            // `_Py_get_blocking` likewise performs one F_GETFL call.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
-                }
-            };
+                return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
+            }
             return Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0));
         }
         #[cfg(any(not(unix), feature = "sandbox"))]
@@ -547,6 +544,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
         let fd = libc::c_int::try_from(crate::builtins::space_index_w(args[0])?)
             .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
+        // CPython 3.14's Argument Clinic declares this parameter `bool`, so
+        // it truth-tests arbitrary objects.  This intentionally differs from
+        // PyPy's older `@unwrap_spec(blocking=int)` gateway.
         let blocking = crate::baseobjspace::is_true(args[1])?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {

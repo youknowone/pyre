@@ -1,4 +1,5 @@
-from array import array
+from array import _array_reconstructor, array
+from io import BytesIO
 from pickle import dumps, loads
 
 from testutils import assert_raises
@@ -143,3 +144,19 @@ class _ReenteringWriter:
 arr = array("b", range(128))
 arr.tofile(_ReenteringWriter(arr))
 assert len(arr) == 129
+
+# CPython 3.14 reconstructs foreign-width integers into a native typecode
+# with the same width and signedness instead of narrowing through the
+# originally pickled C type.
+rebuilt = _array_reconstructor(
+    array, "L", 6, b"\x01\x00\x00\x00\xff\xff\xff\xff"
+)
+assert rebuilt.typecode == "I"
+assert rebuilt.tolist() == [1, 2**32 - 1]
+
+# A short read that is not item-aligned is rejected by frombytes before the
+# EOF check, and must not append the complete prefix.
+partial = array("i")
+with assert_raises(ValueError):
+    partial.fromfile(BytesIO(b"\x01\x00\x00\x00X"), 2)
+assert partial == array("i")
