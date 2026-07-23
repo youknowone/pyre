@@ -4739,6 +4739,7 @@ struct FbwStoreJournalRootArea {
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
+    bridge_iter: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
@@ -4755,6 +4756,7 @@ thread_local! {
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
+        bridge_iter: FBW_BRIDGE_ITER_JOURNAL.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
@@ -5038,6 +5040,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
         }
+    }
+    // The bridge/retrace iterator cursor journal holds a range iterator across
+    // the rest of an authoritative bridge walk. When the parent compiled trace
+    // materialized that iterator via `NewWithVtable` (`CallMallocNursery`) it is
+    // nursery-resident, so a minor collection during the remaining walk moves it
+    // before the non-commit rollback restores its cursor — forward each iterator
+    // so `w_range_iter_set_cursor` writes through the live pointer, not a stale
+    // moved one. The `(pre_current, pre_remaining)` pair are plain scalars.
+    let bridge_iter = unsafe { &mut *(*area.bridge_iter).as_ptr() };
+    for entry in bridge_iter.iter_mut() {
+        visitor(unsafe { &mut *(&mut entry.0 as *mut pyre_object::PyObjectRef).cast() });
     }
     // gh#467: the latched forward-flush operand stack (callable + args) is
     // nursery-resident across the abort unwind — the flush boxes Int/Float
