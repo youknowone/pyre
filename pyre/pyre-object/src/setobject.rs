@@ -696,6 +696,46 @@ pub unsafe fn w_set_update_from_set(
     Ok(())
 }
 
+/// Build the elements on exactly one of the two sides as a fresh set.
+///
+/// `_symmetric_difference_unwrapped` (`setobject.py:1062-1074`) unerases both
+/// tables once — `d_this` and `d_other` — then walks the other side first and
+/// this side second, probing each stored `(key, hash)` pair against the
+/// *captured* opposite table and placing survivors into a fresh `d_new` under
+/// the digest they already carry.  Because both captures happen up front, an
+/// `eq_w` that clears either set mid-walk orphans that table without steering
+/// the walk or the membership probes onto the replacement storage; the caller
+/// then installs the result wholesale (`w_set.sstorage = storage`, `:1114`).
+///
+/// # Safety
+/// `w_set` and `w_other` must point to valid `W_SetObject`s.
+pub unsafe fn w_set_symmetric_difference_storage(
+    w_set: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, SetUpdateError> {
+    let _roots = crate::gc_roots::push_roots();
+    let d_new = w_set_new();
+    // The fresh set is only reachable from this frame while the probes below
+    // run user code; pin it (set bodies are non-moving, so no reload).
+    crate::gc_roots::pin_root(d_new);
+    let d_this = capture_set_items(w_set);
+    let d_other = capture_set_items(w_other);
+    for (walk, probe) in [(d_other, d_this), (d_this, d_other)] {
+        let mut i = 0;
+        loop {
+            let Some((&key, _)) = (*walk).get_index(i) else {
+                break;
+            };
+            let (found, key) = scan_set_key_reentrant(probe, key).map_err(SetUpdateError::Key)?;
+            if found.is_none() {
+                w_set_insert_key_checked(d_new, key)?;
+            }
+            i += 1;
+        }
+    }
+    Ok(d_new)
+}
+
 /// Failure modes of the PyPy `ObjectSetStrategy.update` table merge.
 pub enum SetUpdateError {
     /// An equality callback raised; its concrete exception is parked in the

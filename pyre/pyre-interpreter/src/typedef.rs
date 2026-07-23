@@ -20685,25 +20685,8 @@ fn set_symmetric_difference_storage(
     w_other: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
-        let w_new = pyre_object::w_set_new();
-        for (walk, probe) in [(w_other, w_set), (w_set, w_other)] {
-            let mut i = 0;
-            while let Some(key) = pyre_object::w_set_key_at(walk, i) {
-                if !pyre_object::w_set_contains_key_checked(probe, key)
-                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
-                {
-                    // The probe's `eq_w` can move the element, so the key is
-                    // re-read from the table the collector rewrites.
-                    let Some(key) = pyre_object::w_set_key_at(walk, i) else {
-                        break;
-                    };
-                    pyre_object::w_set_insert_key_checked(w_new, key)
-                        .map_err(crate::baseobjspace::map_set_update_error)?;
-                }
-                i += 1;
-            }
-        }
-        Ok(w_new)
+        pyre_object::setobject::w_set_symmetric_difference_storage(w_set, w_other)
+            .map_err(crate::baseobjspace::map_set_update_error)
     }
 }
 
