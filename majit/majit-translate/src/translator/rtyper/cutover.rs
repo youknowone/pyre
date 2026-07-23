@@ -1614,6 +1614,20 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         };
         pending.push((key, graph, entry));
     }
+    // Lift `pending` in a deterministic order.  `function_graphs.iter()`
+    // (`GraphStore` over `path_to_key: HashMap<CallPath, _>`) yields entries
+    // in `std::HashMap` order, which varies run-to-run.  Pass 2's lift order
+    // is observable: the fail-closed transitive gate (`flowspace_adapter.rs`
+    // `translate_op`) rejects a caller whose callee has ALREADY recorded a
+    // `record_lift_error`, so whether a caller inherits a callee's recorded
+    // error — and which transitive error surfaces — depends on which of the
+    // two lifted first.  Sorting by the path key makes the lift order (and
+    // thus the recorded-error attribution) reproducible, mirroring the
+    // Phase-A subject sort (`run_two_phase_prepass_inner`).  The lift itself
+    // is per-entry isolated (`Rc::as_ptr` dedup below) and aliases of one
+    // entry share the same graph, so ordering changes neither which entries
+    // fail nor what each computes — only the attribution determinism.
+    pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
     // Pass 2 (callee lift).  `build_flow.rs:215` rejects unsafe bodies so
     // they never enter `function_graphs`; without a stub a safe-fn body
