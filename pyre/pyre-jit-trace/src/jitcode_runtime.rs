@@ -617,46 +617,46 @@ pub struct DecodedOp {
 ///
 /// | opname                              | producer (`assembler.rs`)             | payload bytes |
 /// |-------------------------------------|---------------------------------------|---------------|
-/// | `inline_call_pyre_nested`           | `:nested_inline_call_*_typed_args`    | `4 + num_args*5 + 6`  (`sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src u16, callee_dst u16) + return_i u16 + return_r u16 + return_f u16`) |
-/// | `call_assembler_int_pyre`           | `:3429 call_assembler_int_like`       | `6 + num_args*3`  (`target_idx u16 + dst u16 + num_args u16 + num_args × (kind u8, reg u16)`) |
+/// | `inline_call_pyre_nested`           | `:nested_inline_call_*_typed_args`    | `4 + num_args*3 + 3`  (`sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src u8, callee_dst u8) + return_i u8 + return_r u8 + return_f u8`) |
+/// | `call_assembler_int_pyre`           | `:3429 call_assembler_int_like`       | `5 + num_args*2`  (`target_idx u16 + dst u8 + num_args u16 + num_args × (kind u8, reg u8)`) |
 /// | `call_assembler_ref_pyre`           | `:3451 call_assembler_ref_like`       | same as int |
 /// | `call_assembler_float_pyre`         | `:3489 call_assembler_float_like`     | same as int |
-/// | `call_assembler_void_pyre`          | `:3370 call_assembler_void_like`      | `4 + num_args*3`  (omits `dst u16`) |
-/// | `cond_call_void_pyre`               | `:2642 call_cond_like`                | `5 + arg_count*3`  (`first_reg u16 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u16)`) |
+/// | `call_assembler_void_pyre`          | `:3370 call_assembler_void_like`      | `4 + num_args*2`  (omits `dst u8`) |
+/// | `cond_call_void_pyre`               | `:2642 call_cond_like`                | `4 + arg_count*2`  (`first_reg u8 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u8)`) |
 /// | `record_known_result_int_pyre`      | `:2618 call_cond_like`                | same as cond_call |
 /// | `record_known_result_ref_pyre`      | `:2630 call_cond_like`                | same as cond_call |
-/// | `cond_call_value_int_pyre`          | `:2660 call_cond_value_like`          | `7 + arg_count*3`  (cond_call layout + trailing `dst u16`) |
+/// | `cond_call_value_int_pyre`          | `:2660 call_cond_value_like`          | `5 + arg_count*2`  (cond_call layout + trailing `dst u8`) |
 /// | `cond_call_value_ref_pyre`          | `:2660 call_cond_value_like`          | same as int variant |
 fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize> {
     match opname {
         "inline_call_pyre_nested" => {
             // sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src
-            // u16, callee_dst u16) + return_i u16 + return_r u16 + return_f u16
+            // u8, callee_dst u8) + return_i u8 + return_r u8 + return_f u8
             let num_args =
                 u16::from_le_bytes([*code.get(cursor + 2)?, *code.get(cursor + 3)?]) as usize;
-            Some(4 + num_args * 5 + 6)
+            Some(4 + num_args * 3 + 3)
         }
         "call_assembler_int_pyre" | "call_assembler_ref_pyre" | "call_assembler_float_pyre" => {
-            // target_idx u16 + dst u16 + num_args u16 + num_args × (kind u8, reg u16)
+            // target_idx u16 + dst u8 + num_args u16 + num_args × (kind u8, reg u8)
             let num_args =
-                u16::from_le_bytes([*code.get(cursor + 4)?, *code.get(cursor + 5)?]) as usize;
-            Some(6 + num_args * 3)
+                u16::from_le_bytes([*code.get(cursor + 3)?, *code.get(cursor + 4)?]) as usize;
+            Some(5 + num_args * 2)
         }
         "call_assembler_void_pyre" => {
-            // target_idx u16 + num_args u16 + num_args × (kind u8, reg u16)
+            // target_idx u16 + num_args u16 + num_args × (kind u8, reg u8)
             let num_args =
                 u16::from_le_bytes([*code.get(cursor + 2)?, *code.get(cursor + 3)?]) as usize;
-            Some(4 + num_args * 3)
+            Some(4 + num_args * 2)
         }
         "cond_call_void_pyre" | "record_known_result_int_pyre" | "record_known_result_ref_pyre" => {
-            // first_reg u16 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u16)
-            let arg_count = *code.get(cursor + 4)? as usize;
-            Some(5 + arg_count * 3)
+            // first_reg u8 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u8)
+            let arg_count = *code.get(cursor + 3)? as usize;
+            Some(4 + arg_count * 2)
         }
         "cond_call_value_int_pyre" | "cond_call_value_ref_pyre" => {
-            // cond_call shape + trailing dst u16
-            let arg_count = *code.get(cursor + 4)? as usize;
-            Some(7 + arg_count * 3)
+            // cond_call shape + trailing dst u8
+            let arg_count = *code.get(cursor + 3)? as usize;
+            Some(5 + arg_count * 2)
         }
         _ => None,
     }

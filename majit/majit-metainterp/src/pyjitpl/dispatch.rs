@@ -2139,9 +2139,9 @@ where
     ///
     /// Payload (little-endian, emitted by
     /// `JitCodeBuilder::recursive_call_int` and siblings):
-    ///   jd_index:u16, result_dst:u16 (`u16::MAX` = no result / void),
-    ///   num_green:u16, (green_kind:u8, green_src:u16) × num_green,
-    ///   num_args:u16, (kind:u8, caller_src:u16, callee_dst:u16) × num_args.
+    ///   jd_index:u16, result_dst:u8 (`u8::MAX` = no result / void),
+    ///   num_green:u16, (green_kind:u8, green_src:u8) × num_green,
+    ///   num_args:u16, (kind:u8, caller_src:u8, callee_dst:u8) × num_args.
     ///
     /// `result_kind` is `Some(Int/Ref/Float)` for the typed opcodes and
     /// `None` for the void opcode.  The green register sources carry the
@@ -2175,8 +2175,8 @@ where
         let (jd_index, result_dst, green_srcs, arg_triples) = {
             let frame = self.frames.current_mut();
             let jd_index = frame.next_u16() as usize;
-            let result_dst_raw = frame.next_u16() as usize;
-            let result_dst = if result_dst_raw == u16::MAX as usize {
+            let result_dst_raw = frame.next_u8() as usize;
+            let result_dst = if result_dst_raw == u8::MAX as usize {
                 None
             } else {
                 Some(result_dst_raw)
@@ -2185,15 +2185,15 @@ where
             let mut green_srcs = Vec::with_capacity(num_green);
             for _ in 0..num_green {
                 let kind = JitArgKind::decode(frame.next_u8());
-                let src = frame.next_u16() as usize;
+                let src = frame.next_u8() as usize;
                 green_srcs.push((kind, src));
             }
             let num_args = frame.next_u16() as usize;
             let mut arg_triples = Vec::with_capacity(num_args);
             for _ in 0..num_args {
                 let kind = JitArgKind::decode(frame.next_u8());
-                let caller_src = frame.next_u16() as usize;
-                let callee_dst = frame.next_u16() as usize;
+                let caller_src = frame.next_u8() as usize;
+                let callee_dst = frame.next_u8() as usize;
                 arg_triples.push((kind, caller_src, callee_dst));
             }
             // Caller-side result-slot bookkeeping (BC_INLINE_CALL:3298-3300).
@@ -4858,13 +4858,13 @@ where
                     let mut arg_triples = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let caller_src = frame.next_u16() as usize;
-                        let callee_dst = frame.next_u16() as usize;
+                        let caller_src = frame.next_u8() as usize;
+                        let callee_dst = frame.next_u8() as usize;
                         arg_triples.push((kind, caller_src, callee_dst));
                     }
                     let decode_return_slot = |f: &mut MIFrame| {
-                        let dst = f.next_u16() as usize;
-                        if dst == u16::MAX as usize {
+                        let dst = f.next_u8() as usize;
+                        if dst == u8::MAX as usize {
                             None
                         } else {
                             Some(dst)
@@ -4999,9 +4999,6 @@ where
             //     TraceAction::Finish so the outer `finish_and_compile`
             //     (jitdriver.rs::merge_point) drives the compile path —
             //     same precedent as the exception unwind at :935-942.
-            //
-            // Operand width: typed-return src is u16 (assembler.rs:1341
-            // `push_reg_u16`; blackhole.rs:2243 `next_u16`), not u8.
             //
             // last_exc_value clearing mirrors pyjitpl.py:2481 finishframe
             // (Pyre `clear_exception` is the JitCodeMachine equivalent of
@@ -6284,8 +6281,8 @@ where
                     }
                 }
             }
-            // BC_CALL_ASSEMBLER_VOID retains the legacy `(fn_ptr_idx:u16,
-            // num_args:u16, [(kind:u8, reg:u16)]...)` layout — the
+            // BC_CALL_ASSEMBLER_VOID uses `(fn_ptr_idx:u16,
+            // num_args:u16, [(kind:u8, reg:u8)]...)` — the
             // assembler-token path is not in the canonical *_v family
             // and of pyre-call-family-canonical-migration.md
             // owns its migration.
@@ -6309,8 +6306,11 @@ where
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u16();
-                        arg_regs.push(JitCallArg { kind, reg });
+                        let reg = frame.next_u8();
+                        arg_regs.push(JitCallArg {
+                            kind,
+                            reg: reg as u16,
+                        });
                     }
                     (fn_ptr_idx, arg_regs)
                 };
@@ -6384,21 +6384,24 @@ where
             | jitcode::insns::BC_RECORD_KNOWN_RESULT_REF => {
                 let (first_reg, fn_ptr_idx, arg_regs, dst) = {
                     let frame = self.frames.current_mut();
-                    let first_reg = frame.next_u16();
+                    let first_reg = frame.next_u8() as u16;
                     let fn_ptr_idx = frame.next_u16() as usize;
                     let num_args = frame.next_u8() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u16();
-                        arg_regs.push(JitCallArg { kind, reg });
+                        let reg = frame.next_u8();
+                        arg_regs.push(JitCallArg {
+                            kind,
+                            reg: reg as u16,
+                        });
                     }
                     let dst = if matches!(
                         bytecode,
                         jitcode::insns::BC_COND_CALL_VALUE_INT
                             | jitcode::insns::BC_COND_CALL_VALUE_REF
                     ) {
-                        Some(frame.next_u16())
+                        Some(frame.next_u8() as u16)
                     } else {
                         None
                     };
@@ -6547,13 +6550,16 @@ where
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u16();
-                        arg_regs.push(JitCallArg { kind, reg });
+                        let reg = frame.next_u8();
+                        arg_regs.push(JitCallArg {
+                            kind,
+                            reg: reg as u16,
+                        });
                     }
                     (fn_ptr_idx, dst, arg_regs)
                 };
@@ -6617,13 +6623,16 @@ where
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u16();
-                        arg_regs.push(JitCallArg { kind, reg });
+                        let reg = frame.next_u8();
+                        arg_regs.push(JitCallArg {
+                            kind,
+                            reg: reg as u16,
+                        });
                     }
                     (fn_ptr_idx, dst, arg_regs)
                 };
@@ -6687,13 +6696,16 @@ where
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
                     let num_args = frame.next_u16() as usize;
                     let mut arg_regs = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_u16();
-                        arg_regs.push(JitCallArg { kind, reg });
+                        let reg = frame.next_u8();
+                        arg_regs.push(JitCallArg {
+                            kind,
+                            reg: reg as u16,
+                        });
                     }
                     (fn_ptr_idx, dst, arg_regs)
                 };

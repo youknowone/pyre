@@ -2323,9 +2323,9 @@ impl JitCodeBuilder {
     /// Emit a recursive portal call returning an int (pyjitpl.py:1376
     /// `opimpl_recursive_call`).  The payload is consumed by
     /// `JitCodeMachine::exec_recursive_call`:
-    ///   jd_index:u16, result_dst:u16, num_green:u16,
-    ///   (green_kind:u8, green_src:u16) × num_green, num_args:u16,
-    ///   (kind:u8, caller_src:u16, callee_dst:u16) × num_args.
+    ///   jd_index:u16, result_dst:u8, num_green:u16,
+    ///   (green_kind:u8, green_src:u8) × num_green, num_args:u16,
+    ///   (kind:u8, caller_src:u8, callee_dst:u8) × num_args.
     /// The portal is self-recursive, so the opcode carries the jitdriver
     /// index rather than a compiled target.  `greens` are the caller
     /// registers holding the portal green key, in the jitdriver's green
@@ -2358,17 +2358,17 @@ impl JitCodeBuilder {
         }
         self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_INT);
         self.push_u16(jd_index);
-        self.push_u16(result_dst);
+        self.push_reg_u8(result_dst, "recursive_call_int result");
         self.push_u16(greens.len() as u16);
         for &(kind, src) in greens {
             self.push_u8(kind.encode());
-            self.push_u16(src);
+            self.push_reg_u8(src, "recursive_call_int green");
         }
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
             self.push_u8(kind.encode());
-            self.push_u16(caller_src);
-            self.push_u16(callee_dst);
+            self.push_reg_u8(caller_src, "recursive_call_int caller argument");
+            self.push_reg_u8(callee_dst, "recursive_call_int callee argument");
         }
         self.record_resulttype('i');
     }
@@ -2399,17 +2399,17 @@ impl JitCodeBuilder {
         }
         self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_REF);
         self.push_u16(jd_index);
-        self.push_u16(result_dst);
+        self.push_reg_u8(result_dst, "recursive_call_ref result");
         self.push_u16(greens.len() as u16);
         for &(kind, src) in greens {
             self.push_u8(kind.encode());
-            self.push_u16(src);
+            self.push_reg_u8(src, "recursive_call_ref green");
         }
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
             self.push_u8(kind.encode());
-            self.push_u16(caller_src);
-            self.push_u16(callee_dst);
+            self.push_reg_u8(caller_src, "recursive_call_ref caller argument");
+            self.push_reg_u8(callee_dst, "recursive_call_ref callee argument");
         }
         self.record_resulttype('r');
     }
@@ -2440,24 +2440,24 @@ impl JitCodeBuilder {
         }
         self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_FLOAT);
         self.push_u16(jd_index);
-        self.push_u16(result_dst);
+        self.push_reg_u8(result_dst, "recursive_call_float result");
         self.push_u16(greens.len() as u16);
         for &(kind, src) in greens {
             self.push_u8(kind.encode());
-            self.push_u16(src);
+            self.push_reg_u8(src, "recursive_call_float green");
         }
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
             self.push_u8(kind.encode());
-            self.push_u16(caller_src);
-            self.push_u16(callee_dst);
+            self.push_reg_u8(caller_src, "recursive_call_float caller argument");
+            self.push_reg_u8(callee_dst, "recursive_call_float callee argument");
         }
         self.record_resulttype('f');
     }
 
     /// Void-result sibling of [`Self::recursive_call_int`]
     /// (`opimpl_recursive_call_v`).  Carries no result register — the
-    /// `result_dst` slot is emitted as the `u16::MAX` "no result" sentinel the
+    /// `result_dst` slot is emitted as the `u8::MAX` "no result" sentinel the
     /// dispatcher decodes to `None`.
     pub fn recursive_call_void(
         &mut self,
@@ -2480,17 +2480,17 @@ impl JitCodeBuilder {
         }
         self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_VOID);
         self.push_u16(jd_index);
-        self.push_u16(u16::MAX);
+        self.push_u8(u8::MAX);
         self.push_u16(greens.len() as u16);
         for &(kind, src) in greens {
             self.push_u8(kind.encode());
-            self.push_u16(src);
+            self.push_reg_u8(src, "recursive_call_void green");
         }
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
             self.push_u8(kind.encode());
-            self.push_u16(caller_src);
-            self.push_u16(callee_dst);
+            self.push_reg_u8(caller_src, "recursive_call_void caller argument");
+            self.push_reg_u8(callee_dst, "recursive_call_void callee argument");
         }
     }
 
@@ -2793,8 +2793,8 @@ impl JitCodeBuilder {
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
             self.push_u8(kind.encode());
-            self.push_u16(caller_src);
-            self.push_u16(callee_dst);
+            self.push_reg_u8(caller_src, "inline_call caller argument");
+            self.push_reg_u8(callee_dst, "inline_call callee argument");
         }
         self.push_return_slot(return_i);
         self.push_return_slot(return_r);
@@ -2820,8 +2820,8 @@ impl JitCodeBuilder {
 
     fn push_return_slot(&mut self, ret: Option<u16>) {
         match ret {
-            Some(caller_dst) => self.push_u16(caller_dst),
-            None => self.push_u16(u16::MAX),
+            Some(caller_dst) => self.push_reg_u8(caller_dst, "inline_call return"),
+            None => self.push_u8(u8::MAX),
         }
     }
 
@@ -3934,7 +3934,7 @@ impl JitCodeBuilder {
 
     fn call_cond_like(&mut self, bc: u8, fn_ptr_idx: u16, first_reg: u16, args: &[JitCallArg]) {
         self.start_instr(bc);
-        self.push_u16(first_reg);
+        self.push_reg_u8(first_reg, "conditional_call first register");
         self.push_u16(fn_ptr_idx);
         let arg_count = args.len();
         assert!(
@@ -3946,7 +3946,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind as u8);
         }
         for arg in args {
-            self.push_u16(arg.reg);
+            self.push_reg_u8(arg.reg, "conditional_call argument");
         }
     }
 
@@ -3960,7 +3960,7 @@ impl JitCodeBuilder {
         result_kind: char,
     ) {
         self.start_instr(bc);
-        self.push_u16(value_reg);
+        self.push_reg_u8(value_reg, "conditional_call_value first register");
         self.push_u16(fn_ptr_idx);
         let arg_count = args.len();
         assert!(
@@ -3972,9 +3972,9 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind as u8);
         }
         for arg in args {
-            self.push_u16(arg.reg);
+            self.push_reg_u8(arg.reg, "conditional_call_value argument");
         }
-        self.push_u16(dst);
+        self.push_reg_u8(dst, "conditional_call_value result");
         self.record_resulttype(result_kind);
     }
 
@@ -4761,7 +4761,7 @@ impl JitCodeBuilder {
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
             self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
+            self.push_reg_u8(arg.reg, "call_assembler_void argument");
         }
     }
 
@@ -4930,11 +4930,11 @@ impl JitCodeBuilder {
         }
         self.start_instr(opcode);
         self.push_u16(target_idx);
-        self.push_u16(dst);
+        self.push_reg_u8(dst, "call_assembler_int result");
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
             self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
+            self.push_reg_u8(arg.reg, "call_assembler_int argument");
         }
         self.record_resulttype('i');
     }
@@ -4952,11 +4952,11 @@ impl JitCodeBuilder {
         }
         self.start_instr(opcode);
         self.push_u16(target_idx);
-        self.push_u16(dst);
+        self.push_reg_u8(dst, "call_assembler_ref result");
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
             self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
+            self.push_reg_u8(arg.reg, "call_assembler_ref argument");
         }
         self.record_resulttype('r');
     }
@@ -4990,11 +4990,11 @@ impl JitCodeBuilder {
         }
         self.start_instr(opcode);
         self.push_u16(target_idx);
-        self.push_u16(dst);
+        self.push_reg_u8(dst, "call_assembler_float result");
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
             self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
+            self.push_reg_u8(arg.reg, "call_assembler_float argument");
         }
         self.record_resulttype('f');
     }
