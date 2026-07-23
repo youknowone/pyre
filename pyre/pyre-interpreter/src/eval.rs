@@ -1666,6 +1666,15 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let mut next_instr = frame.next_instr();
 
     loop {
+        // Interpreter-path GC safepoint (PYRE_GC_INTERP), mirroring the JIT
+        // eval loop. Between opcodes the only live refs are in the frame,
+        // reachable through the installed `current_frame` root walker; no
+        // bytecode handler holds a Rust-stack temporary here. A no-op unless
+        // the flag is on and enough interpreter objects have accumulated.
+        // Without it, a JIT-off run reclaims interpreter-routed old-gen
+        // allocations only at explicit `gc.collect`, so RSS grows unbounded.
+        pyre_object::gc_interp::safepoint();
+
         if next_instr >= code.instructions.len() {
             return Ok(w_none());
         }
