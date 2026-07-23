@@ -2379,6 +2379,35 @@ pub fn carrier_exc_resume_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_CARRIER_EXC_RESUME").is_some())
 }
 
+/// Mirror of `blackhole.rs BlackholeInterpreter::handle_exception_in_frame`
+/// for the walker: locate the `catch_exception/L` that owns an exception-guard
+/// resume position, forward case first, then the backward scan.
+///
+/// Forward case (blackhole.py:396): the `catch_exception` sits directly after
+/// the resume `-live-` — explicit `raise` sites, and residual ops whose resume
+/// coordinate is their own post-call `-live-` (a mid-Python-op residual such as
+/// a binary-op helper resumes at its OWN op's `-live-`, with its catch
+/// following it).  Backward case: the after-residual-call layout where the
+/// catch sits BEHIND the resume `-live-` (`find_catch_before_resume_live`).
+/// Returns the handler target (2-byte LE label), or `None` when the raising op
+/// sits outside any in-frame try (propagate).
+pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> Option<usize> {
+    let mut position = resume_live_pos;
+    if let Some(op) = decode_op_at(code, position) {
+        if op.key == "live/" {
+            position = op.next_pc;
+        }
+        if let Some(op) = decode_op_at(code, position) {
+            if op.key == "catch_exception/L" {
+                let lo = code[position + 1] as usize;
+                let hi = code[position + 2] as usize;
+                return Some(lo | (hi << 8));
+            }
+        }
+    }
+    find_catch_before_resume_live(code, resume_live_pos)
+}
+
 /// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`
 /// for the walker.  An after-residual-call exception guard resumes at the
 /// no-exception fallthrough `-live-` (the next opcode after the call); the
@@ -3153,13 +3182,19 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// exception state into bridge tracing. Operand-stack values are never scanned
 /// to infer a standing exception.
 fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut TraceCtx) {
-    if !sym.last_exc_box().is_none() {
-        return;
-    }
     if trace_ctx.is_bridge_trace && !trace_ctx.bridge_source_is_exception_guard() {
         return;
     }
 
+    // `_prepare_exception_resumption` (pyjitpl.py:3125-3126) reads the
+    // exception off THIS failure's deadframe (`cpu.grab_exc_value`), and every
+    // bridge compile runs on a fresh `MetaInterp`, so a previous compile's
+    // `last_exc_value` can never leak into a new bridge trace.  Pyre's sym
+    // persists across walks; the routed publish (`BH_LAST_EXC_VALUE`, set from
+    // the same grab) is the fresh-failure signal and must OVERWRITE any
+    // exception state a previous walk left on the sym.  A preseeded sym is
+    // kept only when no fresh signal exists — the multi-frame carrier walk
+    // re-seeds per frame after the first frame drained the cell.
     let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
     if bh_exc != 0 {
         let exc = bh_exc as pyre_object::PyObjectRef;
@@ -3172,6 +3207,10 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
             sym.set_class_of_last_exc_is_const(true);
             return;
         }
+    }
+
+    if !sym.last_exc_box().is_none() {
+        return;
     }
 
     let current = pyre_interpreter::eval::get_current_exception();

@@ -214,7 +214,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null();
     let exc_edge_catch_target = if exc_edge_precondition {
-        find_catch_before_resume_live(jitcode_code, position)
+        find_catch_for_exc_resume(jitcode_code, position)
             // Only route when the handler rejoins this frame's loop; a handler
             // that returns out of the frame (called function's `try/except:
             // return`, compiled as its own function trace) needs cross-frame

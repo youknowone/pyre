@@ -4542,8 +4542,11 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rbp);
                 }
             }
-            OpCode::SaveException => self.genop_save_exception(op),
-            OpCode::SaveExcClass => self.genop_save_exc_class(op),
+            // assembler.py:1820-1821 genop_save_exception IS
+            // `_store_and_reset_exception(resloc)` — reuse the shared helper.
+            OpCode::SaveException => self.emit_store_and_reset_exception(result_loc),
+            OpCode::SaveExcClass => self.genop_save_exc_class(result_loc),
+            OpCode::RestoreException => self.genop_restore_exception(arglocs),
             // Guards never reach the non-guard regalloc dispatch — they
             // are emitted exclusively from `regalloc_perform_guard` via
             // the `RegAllocOp::PerformWithGuard` arm
@@ -8432,20 +8435,66 @@ impl<'a> Assembler386<'a> {
     // assembler.py:1817 genop_save_exc_class / genop_save_exception
     // ================================================================
 
-    /// assembler.py:1817 genop_save_exc_class — stub: returns 0.
-    fn genop_save_exc_class(&mut self, op: &Op) {
-        dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+    /// assembler.py:1817-1818 genop_save_exc_class:
+    /// `MOV resloc, [pos_exception]`.  The regalloc always assigns the
+    /// result a register (`consider_no_arg_result`).
+    fn genop_save_exc_class(&mut self, result_loc: Option<&Loc>) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD exc_type_addr);
+        match result_loc {
+            Some(Loc::Reg(dst)) => {
+                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(scratch)]);
+            }
+            Some(Loc::Frame(frame)) => {
+                let ofs = frame.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64
+                    ; mov Rq(scratch), [Rq(scratch)]
+                    ; mov [rbp + ofs], Rq(scratch)
+                );
+            }
+            _ => {}
         }
     }
 
-    /// assembler.py:1827 genop_save_exception — stub: returns 0.
-    fn genop_save_exception(&mut self, op: &Op) {
-        dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+    /// assembler.py:1845-1850 `_restore_exception`:
+    /// `MOV [pos_exc_value], excvalloc; MOV [pos_exception], exctploc`.
+    /// arglocs = [class, value]; the regalloc brings both into registers
+    /// (`consider_restore_exception`), so only the Reg arm is hot — the
+    /// non-Reg fallback round-trips through rax with a push/pop save.
+    fn genop_restore_exception(&mut self, arglocs: &[Loc]) {
+        if arglocs.len() < 2 {
+            return;
         }
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let mut store_loc_to = |this: &mut Self, cell_addr: i64, loc: &Loc| {
+            dynasm!(this.mc ; .arch x64 ; mov Rq(scratch), QWORD cell_addr);
+            match loc {
+                Loc::Reg(src) => {
+                    dynasm!(this.mc ; .arch x64 ; mov [Rq(scratch)], Rq(src.value));
+                }
+                Loc::Frame(frame) => {
+                    let ofs = frame.ebp_loc.value;
+                    dynasm!(this.mc ; .arch x64
+                        ; push rax
+                        ; mov rax, [rbp + ofs]
+                        ; mov [Rq(scratch)], rax
+                        ; pop rax
+                    );
+                }
+                Loc::Immed(imm) => {
+                    dynasm!(this.mc ; .arch x64
+                        ; push rax
+                        ; mov rax, QWORD imm.value
+                        ; mov [Rq(scratch)], rax
+                        ; pop rax
+                    );
+                }
+                _ => {}
+            }
+        };
+        store_loc_to(self, crate::jit_exc_value_addr() as i64, &arglocs[1]);
+        store_loc_to(self, crate::jit_exc_type_addr() as i64, &arglocs[0]);
     }
 
     // ================================================================

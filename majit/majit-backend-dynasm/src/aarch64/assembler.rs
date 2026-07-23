@@ -3388,8 +3388,11 @@ impl<'a> AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64 ; mov X(r.value), x29);
                 }
             }
-            OpCode::SaveException => self.genop_save_exception(op),
-            OpCode::SaveExcClass => self.genop_save_exc_class(op),
+            // assembler.py:1820-1821 genop_save_exception IS
+            // `_store_and_reset_exception(resloc)` — reuse the shared helper.
+            OpCode::SaveException => self.emit_store_and_reset_exception(result_loc),
+            OpCode::SaveExcClass => self.genop_save_exc_class(result_loc),
+            OpCode::RestoreException => self.genop_restore_exception(arglocs),
             // Guards never reach the non-guard regalloc dispatch — they
             // are emitted exclusively from `regalloc_perform_guard` via
             // the `RegAllocOp::PerformWithGuard` arm.
@@ -6468,20 +6471,46 @@ impl<'a> AssemblerARM64<'a> {
     // assembler.py:1817 genop_save_exc_class / genop_save_exception
     // ================================================================
 
-    /// assembler.py:1817 genop_save_exc_class — stub: returns 0.
-    fn genop_save_exc_class(&mut self, op: &Op) {
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+    /// assembler.py:1817-1818 genop_save_exc_class:
+    /// `MOV resloc, [pos_exception]`.  The regalloc always assigns the
+    /// result a register (`consider_no_arg_result`).
+    fn genop_save_exc_class(&mut self, result_loc: Option<&Loc>) {
+        self.emit_mov_imm64(16, crate::jit_exc_type_addr() as i64);
+        match result_loc {
+            Some(Loc::Reg(dst)) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [x16]);
+            }
+            Some(Loc::Frame(frame)) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16]);
+                self.emit_str_fp(17, frame.ebp_loc.value);
+            }
+            _ => {}
         }
     }
 
-    /// assembler.py:1827 genop_save_exception — stub: returns 0.
-    fn genop_save_exception(&mut self, op: &Op) {
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+    /// assembler.py:1845-1850 `_restore_exception`:
+    /// `MOV [pos_exc_value], excvalloc; MOV [pos_exception], exctploc`.
+    /// arglocs = [class, value]; the regalloc brings both into registers
+    /// (`consider_restore_exception`).  x16/x17 are the scratch pair.
+    fn genop_restore_exception(&mut self, arglocs: &[Loc]) {
+        if arglocs.len() < 2 {
+            return;
         }
+        let load_to_x17 = |this: &mut Self, loc: &Loc| match loc {
+            Loc::Reg(src) => {
+                let src = src.value;
+                dynasm!(this.mc ; .arch aarch64 ; mov x17, X(src));
+            }
+            Loc::Frame(frame) => this.emit_ldr_fp(17, frame.ebp_loc.value),
+            Loc::Immed(imm) => this.emit_mov_imm64(17, imm.value),
+            _ => {}
+        };
+        load_to_x17(self, &arglocs[1]); // value
+        self.emit_mov_imm64(16, crate::jit_exc_value_addr() as i64);
+        dynasm!(self.mc ; .arch aarch64 ; str x17, [x16]);
+        load_to_x17(self, &arglocs[0]); // class
+        self.emit_mov_imm64(16, crate::jit_exc_type_addr() as i64);
+        dynasm!(self.mc ; .arch aarch64 ; str x17, [x16]);
     }
 
     // ================================================================
