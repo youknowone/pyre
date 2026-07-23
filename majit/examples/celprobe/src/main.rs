@@ -180,27 +180,75 @@ fn clean_interp(program: &Code, num_regs: usize) -> i64 {
 fn batch_program(n: i64) -> Vec<i64> {
     vec![
         /* setup */
-        OP_LOAD, 0, 0, // i = 0
-        OP_LOAD, 0, 1, // acc = 0
-        OP_LOAD, 3, 2, // r2 = 3
-        OP_LOAD, 7, 3, // r3 = 7
-        OP_LOAD, 2, 4, // r4 = 2
-        OP_LOAD, 1, 5, // r5 = 1
-        OP_LOAD, n, 6, // r6 = n
-        OP_LOAD, 12345, 7, // x = seed
-        OP_LOAD, LCG_A, 8, // r8 = A
-        OP_LOAD, LCG_C, 9, // r9 = C
+        OP_LOAD,
+        0,
+        0, // i = 0
+        OP_LOAD,
+        0,
+        1, // acc = 0
+        OP_LOAD,
+        3,
+        2, // r2 = 3
+        OP_LOAD,
+        7,
+        3, // r3 = 7
+        OP_LOAD,
+        2,
+        4, // r4 = 2
+        OP_LOAD,
+        1,
+        5, // r5 = 1
+        OP_LOAD,
+        n,
+        6, // r6 = n
+        OP_LOAD,
+        12345,
+        7, // x = seed
+        OP_LOAD,
+        LCG_A,
+        8, // r8 = A
+        OP_LOAD,
+        LCG_C,
+        9, // r9 = C
         // @body = pc 30
-        OP_MUL, 7, 8, 7, // x = x * A
-        OP_ADD, 7, 9, 7, // x = x + C   (LCG step: next input)
-        OP_MUL, 7, 2, 10, // t0 = x * 3
-        OP_ADD, 10, 3, 10, // t0 = t0 + 7
-        OP_SUB, 7, 4, 11, // t1 = x - 2
-        OP_MUL, 10, 11, 10, // t0 = t0 * t1  = f(x)
-        OP_ADD, 1, 10, 1, // acc = acc + f(x)
-        OP_ADD, 0, 5, 0, // i = i + 1
-        OP_JUMP_IF_ABOVE, 6, 0, 30, // if n > i goto @body
-        OP_RETURN, 1, // return acc
+        OP_MUL,
+        7,
+        8,
+        7, // x = x * A
+        OP_ADD,
+        7,
+        9,
+        7, // x = x + C   (LCG step: next input)
+        OP_MUL,
+        7,
+        2,
+        10, // t0 = x * 3
+        OP_ADD,
+        10,
+        3,
+        10, // t0 = t0 + 7
+        OP_SUB,
+        7,
+        4,
+        11, // t1 = x - 2
+        OP_MUL,
+        10,
+        11,
+        10, // t0 = t0 * t1  = f(x)
+        OP_ADD,
+        1,
+        10,
+        1, // acc = acc + f(x)
+        OP_ADD,
+        0,
+        5,
+        0, // i = i + 1
+        OP_JUMP_IF_ABOVE,
+        6,
+        0,
+        30, // if n > i goto @body
+        OP_RETURN,
+        1, // return acc
     ]
 }
 
@@ -240,7 +288,9 @@ fn main() {
     assert_eq!(clean, on, "clean vs JIT-on divergence -> miscompile");
     assert_eq!(off_compiles, 0, "JIT-off must never compile");
     assert!(on_compiles >= 1, "JIT-on must compile the hot loop");
-    println!("n = {n}, acc = {on} (clean==off==on ok), compiles: off={off_compiles} on={on_compiles}");
+    println!(
+        "n = {n}, acc = {on} (clean==off==on ok), compiles: off={off_compiles} on={on_compiles}"
+    );
 
     // Interleaved A/B/C, several rounds (interleave per round to average drift).
     let rounds = 9;
@@ -260,7 +310,10 @@ fn main() {
     println!();
     println!("HONEST ratio (b)/(a) clean-interp vs trace : {:.2}x", b / a);
     println!("       ratio (c)/(a) majit-interp vs trace : {:.2}x", c / a);
-    println!("  instrumentation (c)/(b) majit-interp cost : {:.2}x", c / b);
+    println!(
+        "  instrumentation (c)/(b) majit-interp cost : {:.2}x",
+        c / b
+    );
     println!(
         "kill bar (b)/(a) >=3x: {}",
         if b / a >= 3.0 { "PASS" } else { "FAIL" }

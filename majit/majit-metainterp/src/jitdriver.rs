@@ -3658,8 +3658,7 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                             if layout.num_virt_arrays == 0 {
-                                let float_base =
-                                    layout.float_scalar_base.min(bh.registers_f.len());
+                                let float_base = layout.float_scalar_base.min(bh.registers_f.len());
                                 state.restore_banked3(
                                     &compiled_meta,
                                     &bh.registers_i[int_base..],
@@ -6835,7 +6834,8 @@ mod tests {
         // Build the canonical liveness exactly the way the macro expansion
         // does (orth-6 helper + orth-2 _encode_liveness + insns
         // registration mirroring `assembler.py:222 self.insns[key] = opnum`).
-        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0, 0, 0);
+        let (live_i, live_r, live_f) =
+            crate::live_slots_for_state_field_jit(2, &[1], 0, 0, 0, 0, 0, 0);
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
         asm._encode_liveness(&live_i, &live_r, &live_f, &mut scratch);

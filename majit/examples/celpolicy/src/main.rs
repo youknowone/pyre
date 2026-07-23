@@ -234,19 +234,56 @@ fn skewed_program(n: i64) -> Vec<i64> {
     let mut p = setup(n);
     p.extend_from_slice(&[
         // @body = pc 30
-        OP_MUL, 5, 6, 5, //  x = x*A
-        OP_ADD, 5, 7, 5, //  x = x+C
-        OP_SUB, 5, 4, 10, // bal = x
-        OP_GE, 10, 8, 13, // t0 = bal >= LO      (~always true, not foldable)
-        OP_MUL, 5, 6, 5, //  x = x*A  (fresh draw)
-        OP_ADD, 5, 7, 5, //  x = x+C
-        OP_GE, 5, 9, 12, //  frozen = (x >= HI)  (~always false)
-        OP_EQ, 12, 4, 14, // t1 = (frozen == 0)  (~always true)
-        OP_MUL, 13, 14, 13, // pass = t0 * t1
-        OP_ADD, 1, 13, 1, // acc += pass
-        OP_ADD, 0, 3, 0, //  i += 1
-        OP_JUMP_IF_ABOVE, 2, 0, BODY_PC as i64,
-        OP_RETURN, 1,
+        OP_MUL,
+        5,
+        6,
+        5, //  x = x*A
+        OP_ADD,
+        5,
+        7,
+        5, //  x = x+C
+        OP_SUB,
+        5,
+        4,
+        10, // bal = x
+        OP_GE,
+        10,
+        8,
+        13, // t0 = bal >= LO      (~always true, not foldable)
+        OP_MUL,
+        5,
+        6,
+        5, //  x = x*A  (fresh draw)
+        OP_ADD,
+        5,
+        7,
+        5, //  x = x+C
+        OP_GE,
+        5,
+        9,
+        12, //  frozen = (x >= HI)  (~always false)
+        OP_EQ,
+        12,
+        4,
+        14, // t1 = (frozen == 0)  (~always true)
+        OP_MUL,
+        13,
+        14,
+        13, // pass = t0 * t1
+        OP_ADD,
+        1,
+        13,
+        1, // acc += pass
+        OP_ADD,
+        0,
+        3,
+        0, //  i += 1
+        OP_JUMP_IF_ABOVE,
+        2,
+        0,
+        BODY_PC as i64,
+        OP_RETURN,
+        1,
     ]);
     p
 }
@@ -256,22 +293,68 @@ fn unbiased_program(n: i64) -> Vec<i64> {
     let mut p = setup(n);
     p.extend_from_slice(&[
         // @body = pc 30
-        OP_MUL, 5, 6, 5, //  x = x*A
-        OP_ADD, 5, 7, 5, //  x = x+C
-        OP_SUB, 5, 4, 10, // bal = x
-        OP_MUL, 5, 6, 5, //  x = x*A
-        OP_ADD, 5, 7, 5, //  x = x+C
-        OP_SUB, 5, 4, 11, // amt = x
-        OP_MUL, 5, 6, 5, //  x = x*A
-        OP_ADD, 5, 7, 5, //  x = x+C
-        OP_GE, 5, 4, 12, //  frozen = (x >= 0)   (~50%)
-        OP_GE, 10, 11, 13, // t0 = bal >= amt     (~50%)
-        OP_EQ, 12, 4, 14, // t1 = (frozen == 0)
-        OP_MUL, 13, 14, 13, // pass = t0 * t1
-        OP_ADD, 1, 13, 1, // acc += pass
-        OP_ADD, 0, 3, 0, //  i += 1
-        OP_JUMP_IF_ABOVE, 2, 0, BODY_PC as i64,
-        OP_RETURN, 1,
+        OP_MUL,
+        5,
+        6,
+        5, //  x = x*A
+        OP_ADD,
+        5,
+        7,
+        5, //  x = x+C
+        OP_SUB,
+        5,
+        4,
+        10, // bal = x
+        OP_MUL,
+        5,
+        6,
+        5, //  x = x*A
+        OP_ADD,
+        5,
+        7,
+        5, //  x = x+C
+        OP_SUB,
+        5,
+        4,
+        11, // amt = x
+        OP_MUL,
+        5,
+        6,
+        5, //  x = x*A
+        OP_ADD,
+        5,
+        7,
+        5, //  x = x+C
+        OP_GE,
+        5,
+        4,
+        12, //  frozen = (x >= 0)   (~50%)
+        OP_GE,
+        10,
+        11,
+        13, // t0 = bal >= amt     (~50%)
+        OP_EQ,
+        12,
+        4,
+        14, // t1 = (frozen == 0)
+        OP_MUL,
+        13,
+        14,
+        13, // pass = t0 * t1
+        OP_ADD,
+        1,
+        13,
+        1, // acc += pass
+        OP_ADD,
+        0,
+        3,
+        0, //  i += 1
+        OP_JUMP_IF_ABOVE,
+        2,
+        0,
+        BODY_PC as i64,
+        OP_RETURN,
+        1,
     ]);
     p
 }
@@ -288,30 +371,82 @@ const THRESH: i64 = 0; // element predicate: `elem >= 0` (~50%)
 ///            r8=listlen, r9=THRESH, r10=j, r11=innercount, r12=t.
 fn comprehension_program(n: i64, listlen: i64) -> Vec<i64> {
     vec![
-        OP_LOAD, 0, 0, // i = 0
-        OP_LOAD, 0, 1, // acc = 0
-        OP_LOAD, n, 2, // n
-        OP_LOAD, 1, 3, // one
-        OP_LOAD, 0, 4, // zero
-        OP_LOAD, SEED, 5, // x = seed
-        OP_LOAD, LCG_A, 6, // A
-        OP_LOAD, LCG_C, 7, // C
-        OP_LOAD, listlen, 8, // list length
-        OP_LOAD, THRESH, 9, // element threshold
+        OP_LOAD,
+        0,
+        0, // i = 0
+        OP_LOAD,
+        0,
+        1, // acc = 0
+        OP_LOAD,
+        n,
+        2, // n
+        OP_LOAD,
+        1,
+        3, // one
+        OP_LOAD,
+        0,
+        4, // zero
+        OP_LOAD,
+        SEED,
+        5, // x = seed
+        OP_LOAD,
+        LCG_A,
+        6, // A
+        OP_LOAD,
+        LCG_C,
+        7, // C
+        OP_LOAD,
+        listlen,
+        8, // list length
+        OP_LOAD,
+        THRESH,
+        9, // element threshold
         // @outer_body = pc 30
-        OP_LOAD, 0, 10, // j = 0
-        OP_LOAD, 0, 11, // innercount = 0
+        OP_LOAD,
+        0,
+        10, // j = 0
+        OP_LOAD,
+        0,
+        11, // innercount = 0
         // @inner_body = pc 36
-        OP_MUL, 5, 6, 5, //  x = x*A
-        OP_ADD, 5, 7, 5, //  x = x+C          (next list element)
-        OP_GE, 5, 9, 12, //  t = (x >= THRESH)
-        OP_ADD, 11, 12, 11, // innercount += t
-        OP_ADD, 10, 3, 10, // j += 1
-        OP_JUMP_IF_ABOVE, 8, 10, 36, // if LISTLEN > j goto @inner_body
-        OP_ADD, 1, 11, 1, // acc += innercount
-        OP_ADD, 0, 3, 0, //  i += 1
-        OP_JUMP_IF_ABOVE, 2, 0, 30, // if n > i goto @outer_body
-        OP_RETURN, 1,
+        OP_MUL,
+        5,
+        6,
+        5, //  x = x*A
+        OP_ADD,
+        5,
+        7,
+        5, //  x = x+C          (next list element)
+        OP_GE,
+        5,
+        9,
+        12, //  t = (x >= THRESH)
+        OP_ADD,
+        11,
+        12,
+        11, // innercount += t
+        OP_ADD,
+        10,
+        3,
+        10, // j += 1
+        OP_JUMP_IF_ABOVE,
+        8,
+        10,
+        36, // if LISTLEN > j goto @inner_body
+        OP_ADD,
+        1,
+        11,
+        1, // acc += innercount
+        OP_ADD,
+        0,
+        3,
+        0, //  i += 1
+        OP_JUMP_IF_ABOVE,
+        2,
+        0,
+        30, // if n > i goto @outer_body
+        OP_RETURN,
+        1,
     ]
 }
 
@@ -345,9 +480,16 @@ fn comprehension_unrolled_program(n: i64, listlen: i64) -> Vec<i64> {
         ]);
     }
     p.extend_from_slice(&[
-        OP_ADD, 0, 3, 0, // i += 1
-        OP_JUMP_IF_ABOVE, 2, 0, body_pc,
-        OP_RETURN, 1,
+        OP_ADD,
+        0,
+        3,
+        0, // i += 1
+        OP_JUMP_IF_ABOVE,
+        2,
+        0,
+        body_pc,
+        OP_RETURN,
+        1,
     ]);
     p
 }
@@ -375,7 +517,10 @@ fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize) {
     let on = mainloop(prog, NUM_REGS, JIT_ON);
     let on_c = COMPILES.load(Ordering::Relaxed);
     assert_eq!(clean, off, "{name}: clean vs JIT-off divergence");
-    assert_eq!(clean, on, "{name}: clean vs JIT-on divergence -> miscompile");
+    assert_eq!(
+        clean, on,
+        "{name}: clean vs JIT-on divergence -> miscompile"
+    );
     assert_eq!(off_c, 0, "{name}: JIT-off must not compile");
 
     let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());

@@ -2572,7 +2572,8 @@ mod tests {
             (0, vec![], 0),
         ] {
             let layout = StateFieldLayout::new(s, a.clone(), v, 0);
-            let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0, 0, 0);
+            let (live_i, live_r, live_f) =
+                crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0, 0, 0);
             assert_eq!(layout.total_slots(), live_i.len());
             assert!(live_r.is_empty() && live_f.is_empty());
         }

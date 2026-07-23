@@ -4377,6 +4377,18 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// Widen an int-bank value to the float bank — RPython `cast_int_to_float`
+    /// (`blackhole.py:811-813 bhimpl_cast_int_to_float`). The `i>f` operand
+    /// crosses banks: an int source, a float result. `[src][dst]` byte layout
+    /// per the `bhhandler_i_f!` decoder.
+    pub fn record_cast_int_to_float(&mut self, dst: u16, src: u16) {
+        self.touch_float_reg(dst);
+        self.touch_reg(src);
+        self.write_insn("cast_int_to_float/i>f");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
     /// Append a sub-JitCode descriptor and return its runtime
     /// `descrs` index. Mirrors the RPython build-time flow where
     /// `Assembler._encode_descr(jitcode)` adds the callee `JitCode` to
@@ -6023,7 +6035,8 @@ mod tests {
     #[test]
     fn state_field_canonical_slots_empty_state() {
         // No scalars, no arrays, no virt arrays — empty triple.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(0, &[], 0, 0, 0, 0, 0, 0);
+        let (live_i, live_r, live_f) =
+            super::live_slots_for_state_field_jit(0, &[], 0, 0, 0, 0, 0, 0);
         assert!(live_i.is_empty());
         assert!(live_r.is_empty());
         assert!(live_f.is_empty());
@@ -6070,7 +6083,8 @@ mod tests {
         // virt array (`stack`, ptr+len) plus a synthetic 3-element
         // flattened array.  total_slots = 1 + 3 + 2 = 6, so
         // live_i = [0, 1, 2, 3, 4, 5] and ref/float banks are empty.
-        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0, 0, 0);
+        let (live_i, live_r, live_f) =
+            super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0, 0, 0);
         assert_eq!(live_i, vec![0u8, 1, 2, 3, 4, 5]);
         assert!(live_r.is_empty());
         assert!(live_f.is_empty());

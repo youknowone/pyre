@@ -17,9 +17,7 @@ fn all_jitcode_bodies(dispatch_jc: &majit_metainterp::JitCode) -> Vec<Vec<u8>> {
 
 mod scalar {
     use super::{Bytecode, all_jitcode_bodies};
-    use majit_metainterp::jitcode::insns::{
-        BC_LOAD_STATE_FIELD_FLOAT, BC_STORE_STATE_FIELD_FLOAT,
-    };
+    use majit_metainterp::jitcode::insns::{BC_LOAD_STATE_FIELD_FLOAT, BC_STORE_STATE_FIELD_FLOAT};
     use majit_metainterp::{Assembler, JitDriver};
 
     struct FloatScalarState {

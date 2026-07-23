@@ -206,6 +206,13 @@ impl<'c> Lowerer<'c> {
                     struct_type: None,
                 })
             }
+            Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_float_type(ty) => {
+                let binding = self.lower_value_expr(expr)?;
+                if !matches!(binding.kind, BindingKind::Int) {
+                    return None;
+                }
+                self.lower_int_to_float_cast(binding)
+            }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
                 let binding = self.lower_value_expr(expr)?;
                 if !matches!(binding.kind, BindingKind::Int) {
@@ -1896,6 +1903,30 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Lower an `<int> as f64` cast to RPython's `cast_int_to_float`
+    /// (`bhimpl_cast_int_to_float`). The operand is read from the int bank and
+    /// widened to the float bank; the result is a float binding. `UnaryI` is the
+    /// op-kind label (a single int read) — the float bank of the result is
+    /// carried by the write `Register`, which is what liveness/regalloc read.
+    fn lower_int_to_float_cast(&mut self, binding: Binding) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                Register::ints(&[src_reg]),
+                vec![Register::float(reg)],
+            ),
+            quote! { __builder.record_cast_int_to_float(#reg, #src_reg); },
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Float,
+            depends_on_stack: binding.depends_on_stack,
             struct_type: None,
         })
     }

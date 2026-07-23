@@ -39,11 +39,11 @@ mod reexports {
         block_has_loop_control, expr_has_loop_control, extract_block_tail_int,
         extract_bool_branch_values, extract_branch_int, extract_pat_literals,
         extract_pat_switch_case_tokens, extract_pat_value_tokens, extract_stmts,
-        inline_builder_path, inline_call_tokens, inline_call_tokens_void,
-        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, opcode_for_binop_f,
-        opcode_for_compare_f, stmt_has_loop_control, typed_call_arg_tokens,
+        inline_builder_path, inline_call_tokens, inline_call_tokens_void, inline_float_arg_tokens,
+        inline_int_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, int_arg_regs,
+        is_supported_float_type, is_supported_int_cast, is_supported_ref_type,
+        opcode_for_assign_binop, opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f,
+        stmt_has_loop_control, typed_call_arg_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -250,7 +250,12 @@ impl LowererConfig {
         self.greens
             .iter()
             .zip(self.green_type_tags.iter())
-            .filter(|(_, tag)| matches!(tag, Some(crate::jit_interp::green_type_tag::GreenTypeTag::Float)))
+            .filter(|(_, tag)| {
+                matches!(
+                    tag,
+                    Some(crate::jit_interp::green_type_tag::GreenTypeTag::Float)
+                )
+            })
             .count() as u16
     }
 
@@ -975,64 +980,63 @@ impl LowererConfig {
             state_virt_arrays,
             state_ref_scalars,
             state_float_scalars,
-        ) =
-            if let Some(sf) = state_fields_cfg {
-                use crate::jit_interp::StateFieldKind;
-                let mut scalars = HashMap::new();
-                let mut arrays = HashMap::new();
-                let mut virt_arrays = HashMap::new();
-                let mut ref_scalars = HashMap::new();
-                let mut float_scalars = HashMap::new();
-                let mut scalar_idx = 0usize;
-                let mut array_idx = 0usize;
-                let mut virt_array_idx = 0usize;
-                let mut ref_scalar_idx = 0usize;
-                let mut float_scalar_idx = 0usize;
-                for f in &sf.fields {
-                    match &f.kind {
-                        StateFieldKind::Scalar { ir_type, .. } => {
-                            if ir_type == "float" {
-                                float_scalars.insert(f.name.to_string(), float_scalar_idx);
-                                float_scalar_idx += 1;
-                            } else {
-                                scalars.insert(f.name.to_string(), scalar_idx);
-                                scalar_idx += 1;
-                            }
-                        }
-                        StateFieldKind::Array(_) => {
-                            arrays.insert(f.name.to_string(), array_idx);
-                            array_idx += 1;
-                        }
-                        StateFieldKind::VirtArray(item_type) => {
-                            virt_arrays.insert(
-                                f.name.to_string(),
-                                (virt_array_idx, ValueKind::from_ident(item_type)),
-                            );
-                            virt_array_idx += 1;
-                        }
-                        // Opaque fields are not registered in any index map —
-                        // the lowering layer must not see them as state slots.
-                        StateFieldKind::Opaque(_) => {}
-                        // ref(T) scalars get a separate 0-based index space;
-                        // they lower to the ref register bank. Retain the
-                        // struct Path `T` so a field access through the ref
-                        // can resolve `offset_of!(T, member)` + struct type_id.
-                        StateFieldKind::Ref(p) => {
-                            ref_scalars.insert(f.name.to_string(), (ref_scalar_idx, p.clone()));
-                            ref_scalar_idx += 1;
+        ) = if let Some(sf) = state_fields_cfg {
+            use crate::jit_interp::StateFieldKind;
+            let mut scalars = HashMap::new();
+            let mut arrays = HashMap::new();
+            let mut virt_arrays = HashMap::new();
+            let mut ref_scalars = HashMap::new();
+            let mut float_scalars = HashMap::new();
+            let mut scalar_idx = 0usize;
+            let mut array_idx = 0usize;
+            let mut virt_array_idx = 0usize;
+            let mut ref_scalar_idx = 0usize;
+            let mut float_scalar_idx = 0usize;
+            for f in &sf.fields {
+                match &f.kind {
+                    StateFieldKind::Scalar { ir_type, .. } => {
+                        if ir_type == "float" {
+                            float_scalars.insert(f.name.to_string(), float_scalar_idx);
+                            float_scalar_idx += 1;
+                        } else {
+                            scalars.insert(f.name.to_string(), scalar_idx);
+                            scalar_idx += 1;
                         }
                     }
+                    StateFieldKind::Array(_) => {
+                        arrays.insert(f.name.to_string(), array_idx);
+                        array_idx += 1;
+                    }
+                    StateFieldKind::VirtArray(item_type) => {
+                        virt_arrays.insert(
+                            f.name.to_string(),
+                            (virt_array_idx, ValueKind::from_ident(item_type)),
+                        );
+                        virt_array_idx += 1;
+                    }
+                    // Opaque fields are not registered in any index map —
+                    // the lowering layer must not see them as state slots.
+                    StateFieldKind::Opaque(_) => {}
+                    // ref(T) scalars get a separate 0-based index space;
+                    // they lower to the ref register bank. Retain the
+                    // struct Path `T` so a field access through the ref
+                    // can resolve `offset_of!(T, member)` + struct type_id.
+                    StateFieldKind::Ref(p) => {
+                        ref_scalars.insert(f.name.to_string(), (ref_scalar_idx, p.clone()));
+                        ref_scalar_idx += 1;
+                    }
                 }
-                (scalars, arrays, virt_arrays, ref_scalars, float_scalars)
-            } else {
-                (
-                    HashMap::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                )
-            };
+            }
+            (scalars, arrays, virt_arrays, ref_scalars, float_scalars)
+        } else {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
         // State-field `[int; virt]` arrays converge onto the standard
         // virtualizable path: the state binding is the vable identity var and
         // each virt array becomes a `vable_arrays` entry under its virt index.

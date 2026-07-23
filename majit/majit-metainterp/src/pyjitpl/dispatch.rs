@@ -6852,6 +6852,7 @@ where
             jitcode::insns::BC_FLOAT_NE => self.trace_compare_f(ctx, OpCode::FloatNe),
             jitcode::insns::BC_FLOAT_GT => self.trace_compare_f(ctx, OpCode::FloatGt),
             jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
+            jitcode::insns::BC_CAST_INT_TO_FLOAT => self.trace_cast_int_to_float(ctx),
             // pyjitpl.py opimpl_int_guard_value → implement_guard_value
             // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
             jitcode::insns::BC_INT_GUARD_VALUE => {
@@ -7469,6 +7470,23 @@ where
         let opref = ctx.record_op(opcode, &[src]);
         ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
         self.set_float_reg(dst, Some(opref), Some(value));
+    }
+
+    /// `cast_int_to_float/i>f`: read an int operand, widen it to `f64`, and
+    /// write the float bank. `[src][dst]` argcode order (`bhhandler_i_f!`). The
+    /// float value travels as its `i64` bits, matching `trace_binop_f`.
+    fn trace_cast_int_to_float(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, src_value) = self.read_int_reg(src_idx);
+        let fvalue = src_value as f64;
+        let opref = ctx.record_op(OpCode::CastIntToFloat, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Float(fvalue));
+        self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
     }
 }
 

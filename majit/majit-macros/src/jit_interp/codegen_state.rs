@@ -76,9 +76,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .fields
         .iter()
         .enumerate()
-        .filter(|(_, f)| {
-            matches!(&f.kind, StateFieldKind::Scalar { ir_type, .. } if ir_type == "int")
-        })
+        .filter(
+            |(_, f)| matches!(&f.kind, StateFieldKind::Scalar { ir_type, .. } if ir_type == "int"),
+        )
         .collect();
     // Helper: per-scalar Rust storage type token (`i64` by default, or
     // the explicit `int(<TypePath>)` override). Used to emit `as <type>`
@@ -1575,34 +1575,34 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .collect();
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
-        quote! {
-            fn live_value_types(&self, _meta: &__JitMeta) -> Vec<majit_ir::Type> {
-                // Value-routing types in `extract_live` order: int scalars,
-                // int array elements, then per virt-array the identity ptr
-                // (Ref) + length (Int), then appended ref scalars (Ref), then
-                // appended float scalars (Float).
-                // The ptr slot MUST be Ref so the live `&state` identity is a
-                // Ref failarg (TAGBOX), which the resume reader decodes through
-                // `decode_ref` in both the vable section and the frame
-                // ref-liveness.
-                let mut types: Vec<majit_ir::Type> = Vec::new();
-                for _ in 0..#num_scalars {
-                    types.push(majit_ir::Type::Int);
+            quote! {
+                fn live_value_types(&self, _meta: &__JitMeta) -> Vec<majit_ir::Type> {
+                    // Value-routing types in `extract_live` order: int scalars,
+                    // int array elements, then per virt-array the identity ptr
+                    // (Ref) + length (Int), then appended ref scalars (Ref), then
+                    // appended float scalars (Float).
+                    // The ptr slot MUST be Ref so the live `&state` identity is a
+                    // Ref failarg (TAGBOX), which the resume reader decodes through
+                    // `decode_ref` in both the vable section and the frame
+                    // ref-liveness.
+                    let mut types: Vec<majit_ir::Type> = Vec::new();
+                    for _ in 0..#num_scalars {
+                        types.push(majit_ir::Type::Int);
+                    }
+                    #(#array_type_parts)*
+                    #(#virt_array_type_parts)*
+                    for _ in 0..#num_ref_scalars {
+                        types.push(majit_ir::Type::Ref);
+                    }
+                    for _ in 0..#num_float_scalars {
+                        types.push(majit_ir::Type::Float);
+                    }
+                    types
                 }
-                #(#array_type_parts)*
-                #(#virt_array_type_parts)*
-                for _ in 0..#num_ref_scalars {
-                    types.push(majit_ir::Type::Ref);
-                }
-                for _ in 0..#num_float_scalars {
-                    types.push(majit_ir::Type::Float);
-                }
-                types
             }
-        }
-    } else {
-        quote! {}
-    };
+        } else {
+            quote! {}
+        };
     let restore_banked_override: TokenStream = if num_ref_scalars > 0 || num_float_scalars > 0 {
         quote! {
             fn restore_banked3(
