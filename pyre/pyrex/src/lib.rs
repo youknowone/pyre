@@ -632,6 +632,23 @@ fn run_interact(
 /// `check.py` asserts it stays 0. Must be called before any `process::exit`
 /// since exits skip destructors.
 fn maybe_print_jit_stats() {
+    // warmspot.py finish helper: `if profiler.initialized:
+    // profiler.finish()` — emits the PYPYLOG `jit-summary` section on
+    // stderr, visible under `MAJIT_LOG` (the `[jit-stats]` line below
+    // stays the `MAJIT_STATS` machine-readable summary).
+    if majit_metainterp::majit_log_enabled() {
+        let profiler = &pyre_jit::eval::driver_pair()
+            .0
+            .meta_interp()
+            .staticdata
+            .profiler;
+        if profiler
+            .initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            profiler.finish();
+        }
+    }
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }

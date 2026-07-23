@@ -130,6 +130,12 @@ impl EmptyProfiler {
 /// [`owner_thread`]: TimingState::owner_thread
 #[derive(Default, Debug)]
 struct TimingState {
+    /// `self.starttime` (`jitprof.py:64`) — fixed profile start mark;
+    /// `_print_stats`'s TOTAL line is `tk - starttime`.
+    starttime: Option<Instant>,
+    /// `self.tk` (`jitprof.py:71`) — set by `finish()` just before
+    /// `print_stats()`.
+    tk: Option<Instant>,
     /// `self.t1` (`jitprof.py:56`) — timer baseline for the next
     /// `_start`/`_end` to charge time against.
     t1: Option<Instant>,
@@ -303,10 +309,111 @@ impl JitProfiler {
         //   self.t1 = self.starttime
         //   ...
         //   self.current = []
+        let now = Instant::now();
         let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
-        state.t1 = Some(Instant::now());
+        state.starttime = Some(now);
+        state.tk = None;
+        state.t1 = Some(now);
         state.current.clear();
         state.owner_thread = None;
+    }
+
+    /// jitprof.py:71-73 `Profiler.finish`.
+    ///
+    /// ```text
+    ///  def finish(self):
+    ///      self.tk = self.timer()
+    ///      self.print_stats()
+    /// ```
+    pub fn finish(&self) {
+        {
+            let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+            state.tk = Some(Instant::now());
+        }
+        self.print_stats();
+    }
+
+    /// jitprof.py:124-128 `Profiler.print_stats` — emit the
+    /// `jit-summary` section (visible under `MAJIT_LOG`).
+    pub fn print_stats(&self) {
+        crate::debug::debug_start("jit-summary");
+        if crate::debug::have_debug_prints() {
+            self._print_stats();
+        }
+        crate::debug::debug_stop("jit-summary");
+    }
+
+    /// jitprof.py:130-174 `Profiler._print_stats` — line set, order,
+    /// and layout are upstream's.
+    fn _print_stats(&self) {
+        let snap = self.snapshot();
+        let (starttime, tk) = {
+            let state = self.timing.lock().expect("JitProfiler timing poisoned");
+            (state.starttime, state.tk)
+        };
+        let ns_to_secs = |ns: u64| ns as f64 / 1e9;
+        crate::debug::debug_print(&fmt_line_time(
+            "Tracing",
+            snap.tracing,
+            ns_to_secs(self.tracing_time_ns.load(Ordering::Relaxed)),
+        ));
+        crate::debug::debug_print(&fmt_line_time(
+            "Backend",
+            snap.backend,
+            ns_to_secs(self.backend_time_ns.load(Ordering::Relaxed)),
+        ));
+        let total = match (starttime, tk) {
+            (Some(start), Some(end)) => end.saturating_duration_since(start).as_secs_f64(),
+            _ => 0.0,
+        };
+        crate::debug::debug_print(&format!("TOTAL:      \t\t{total:.6}"));
+        let mut intline = |label: &str, value: usize| {
+            crate::debug::debug_print(&fmt_intline(label, value));
+        };
+        intline("ops", snap.ops);
+        intline("heapcached ops", snap.heapcached_ops);
+        intline("recorded ops", snap.recorded_ops);
+        intline("  calls", snap.calls);
+        intline("guards", snap.guards);
+        intline("opt ops", snap.opt_ops);
+        intline("opt guards", snap.opt_guards);
+        intline("opt guards shared", snap.opt_guards_shared);
+        intline("forcings", snap.opt_forcings);
+        intline("abort: trace too long", snap.abort_too_long);
+        intline("abort: compiling", snap.abort_bridge);
+        intline("abort: vable escape", snap.abort_escape);
+        intline("abort: bad loop", snap.abort_bad_loop);
+        intline("abort: force quasi-immut", snap.abort_force_quasiimmut);
+        intline("abort: segmenting trace", snap.abort_segmented_trace);
+        intline("virtualizables forced", snap.force_virtualizables);
+        intline("nvirtuals", snap.nvirtuals);
+        intline("nvholes", snap.nvholes);
+        intline("nvreused", snap.nvreused);
+        intline("vecopt tried", snap.opt_vectorize_try);
+        intline("vecopt success", snap.opt_vectorized);
+        // jitprof.py:166-174 `if cpu is not None:` — pyre's tracker Arc
+        // is always bound (a fresh one before `set_cpu_tracker`).
+        let tracker = self
+            .cpu_tracker
+            .lock()
+            .expect("JitProfiler cpu_tracker poisoned")
+            .clone();
+        intline(
+            "Total # of loops",
+            tracker.total_compiled_loops.load(Ordering::Relaxed),
+        );
+        intline(
+            "Total # of bridges",
+            tracker.total_compiled_bridges.load(Ordering::Relaxed),
+        );
+        intline(
+            "Freed # of loops",
+            tracker.total_freed_loops.load(Ordering::Relaxed),
+        );
+        intline(
+            "Freed # of bridges",
+            tracker.total_freed_bridges.load(Ordering::Relaxed),
+        );
     }
 
     /// jitprof.py:95 `Profiler.start_tracing`.
@@ -844,6 +951,20 @@ fn debug_channel_for_event(event: i32) -> Option<&'static str> {
     }
 }
 
+/// jitprof.py:176-178 `Profiler._print_line_time` layout:
+/// `"%s:%s\t%d\t%f" % (string, " " * max(0, 13-len(string)), i, tim)`.
+fn fmt_line_time(string: &str, i: usize, tim: f64) -> String {
+    let pad = " ".repeat(13usize.saturating_sub(string.len()));
+    format!("{string}:{pad}\t{i}\t{tim:.6}")
+}
+
+/// jitprof.py:180-182 `Profiler._print_intline` layout:
+/// `"%s:%s\t%d" % (string, " " * max(0, 13-len(string)), i)`.
+fn fmt_intline(string: &str, i: usize) -> String {
+    let pad = " ".repeat(13usize.saturating_sub(string.len()));
+    format!("{string}:{pad}\t{i}")
+}
+
 /// Plain-old-data snapshot of [`JitProfiler`].
 ///
 /// Used by debug printers, tests, and the `JitStats` view. Field order
@@ -1188,6 +1309,36 @@ mod tests {
         // observes the bump (no shadowing into a separate counter).
         sd.profiler.count_ops(OpCode::IntAdd, counters::OPS);
         assert_eq!(sd.profiler.ops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn print_line_layouts_match_print_stats() {
+        // `"%s:%s\t%d\t%f"` with `" " * max(0, 13-len(string))`.
+        assert_eq!(
+            fmt_line_time("Tracing", 2, 0.5),
+            "Tracing:      \t2\t0.500000"
+        );
+        assert_eq!(fmt_intline("ops", 42), "ops:          \t42");
+        // A label longer than 13 chars gets no padding (max(0, ..)).
+        assert_eq!(
+            fmt_intline("abort: trace too long", 1),
+            "abort: trace too long:\t1"
+        );
+        // The calls line keeps its two-space indent inside the label.
+        assert_eq!(fmt_intline("  calls", 7), "  calls:      \t7");
+    }
+
+    #[test]
+    fn finish_marks_tk_and_prints_without_panicking() {
+        let prof = JitProfiler::default();
+        prof.start();
+        prof.count_ops(OpCode::IntAdd, counters::OPS);
+        // `finish()` = `self.tk = timer(); print_stats()`; with MAJIT_LOG
+        // unset the print side is a no-op, the tk mark still lands.
+        prof.finish();
+        let state = prof.timing.lock().unwrap();
+        assert!(state.starttime.is_some());
+        assert!(state.tk.is_some());
     }
 
     #[test]
