@@ -5,6 +5,7 @@ Cross-platform Python translation of pyre/check.sh.
 """
 
 import argparse
+import difflib
 import math
 import os
 import shutil
@@ -334,6 +335,30 @@ def _dump_failed_run(output, stderr, limit=40):
             print(dim(f"... {len(lines) - len(clipped)} earlier line(s) omitted"))
         for line in clipped:
             print(line)
+    print("────────────────────")
+
+
+def _dump_output_mismatch(actual, expected, limit=80):
+    """Print a bounded unified diff for a backend stdout mismatch."""
+    diff = list(
+        difflib.unified_diff(
+            expected.splitlines(),
+            actual.splitlines(),
+            fromfile="expected (pypy)",
+            tofile="actual",
+            lineterm="",
+        )
+    )
+    if not diff:
+        # Preserve otherwise-invisible trailing-newline/line-ending details.
+        print(f"    expected repr: {expected!r}")
+        print(f"    actual repr:   {actual!r}")
+        return
+    print("─── output diff ───")
+    for line in diff[:limit]:
+        print(line)
+    if len(diff) > limit:
+        print(dim(f"... {len(diff) - limit} later diff line(s) omitted"))
     print("────────────────────")
 
 
@@ -1152,10 +1177,9 @@ class Check:
         else:
             matched = output == pypy_output
         if not matched:
-            exp = pypy_output[:60]
-            act = output[:60]
             self._record(backend, False, name, "wrong output")
-            print(f"{red('WRONG')}  got: {act} expected(pypy): {exp}")
+            print(f"{red('WRONG')}")
+            _dump_output_mismatch(output, pypy_output)
             self._append_comparison(backend, name, t_cpython, t_pypy, "WRONG")
             return
 
