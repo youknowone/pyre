@@ -11,6 +11,7 @@
 use crate::baseobjspace::{float_w, int_w, uint_w};
 use crate::objspace::descroperation::{CompareOp, compare};
 use crate::{PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store};
+use malachite_bigint::BigInt;
 use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -84,7 +85,18 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
         }
         b'L' | b'Q' => {
             // Unsigned 64-bit — `uint_w` handles bignums and rejects negatives.
-            let v = uint_w(w)?;
+            let v = if unsafe { pyre_object::is_int(w) || pyre_object::pyobject::is_long(w) } {
+                uint_w(w)
+            } else {
+                uint_w(crate::baseobjspace::space_index(w)?)
+            }
+            .map_err(|error| {
+                if error.kind == PyErrorKind::ValueError {
+                    PyError::overflow_error("unsigned 8-byte integer is less than minimum")
+                } else {
+                    error
+                }
+            })?;
             out[..8].copy_from_slice(&v.to_ne_bytes());
             8
         }
@@ -98,7 +110,7 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
             out[..8].copy_from_slice(&v.to_ne_bytes());
             8
         }
-        b'u' => {
+        b'u' | b'w' => {
             let cp = unicode_char_w(w)?;
             out[..4].copy_from_slice(&cp.to_ne_bytes());
             4
@@ -152,21 +164,28 @@ fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
 }
 
 /// Extend from any iterable, packing each element (`descr_extend`).
-fn array_extend_iterable(obj: PyObjectRef, w_iterable: PyObjectRef) -> Result<(), PyError> {
+fn array_extend_iterable(
+    obj: PyObjectRef,
+    w_iterable: PyObjectRef,
+    reject_different_array: bool,
+) -> Result<(), PyError> {
     array_check_resize(obj)?;
     // A fast path for same-typecode arrays: raw byte concat.
     if unsafe { arr::is_array(w_iterable) } {
         let dst_tc = unsafe { arr::w_array_typecode(obj) };
         let src_tc = unsafe { arr::w_array_typecode(w_iterable) };
         if dst_tc != src_tc {
-            return Err(PyError::type_error(
-                "can only extend with array of same kind",
-            ));
+            if reject_different_array {
+                return Err(PyError::type_error(
+                    "can only extend with array of same kind",
+                ));
+            }
+        } else {
+            let src_bytes = unsafe { arr::w_array_bytes(w_iterable) }.to_vec();
+            let vec = unsafe { arr::w_array_vec_mut(obj) };
+            vec.extend_from_slice(&src_bytes);
+            return Ok(());
         }
-        let src_bytes = unsafe { arr::w_array_bytes(w_iterable) }.to_vec();
-        let vec = unsafe { arr::w_array_vec_mut(obj) };
-        vec.extend_from_slice(&src_bytes);
-        return Ok(());
     }
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
     loop {
@@ -204,6 +223,12 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             "array() takes at least 1 argument (0 given)",
         ));
     }
+    if args.len() > 3 {
+        return Err(PyError::type_error(format!(
+            "array() takes at most 2 arguments ({} given)",
+            args.len() - 1
+        )));
+    }
     let cls = args[0];
     let w_typecode = args[1];
     // typecode must be a 1-character str.
@@ -221,8 +246,13 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     }
     let typecode = tc_bytes[0];
     let itemsize = arr::typecode_itemsize(typecode).ok_or_else(|| {
-        PyError::value_error("bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)")
+        PyError::value_error("bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)")
     })?;
+    if typecode == b'u' {
+        crate::warn::warn_deprecation(
+            "The 'u' type code is deprecated and will be removed in Python 3.16",
+        )?;
+    }
     let obj = arr::w_array_new(typecode, itemsize);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
@@ -239,7 +269,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     if args.len() >= 3 {
         let w_init = args[2];
         if unsafe { pyre_object::is_str(w_init) } {
-            if typecode == b'u' {
+            if matches!(typecode, b'u' | b'w') {
                 array_fromunicode(obj, w_init)?;
             } else {
                 return Err(PyError::type_error(format!(
@@ -251,7 +281,16 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_init) }.to_vec();
             array_frombytes(obj, &bytes)?;
         } else {
-            array_extend_iterable(obj, w_init)?;
+            if unsafe { arr::is_array(w_init) }
+                && matches!(unsafe { arr::w_array_typecode(w_init) }, b'u' | b'w')
+                && !matches!(typecode, b'u' | b'w')
+            {
+                return Err(PyError::type_error(format!(
+                    "cannot use a unicode array to initialize an array with typecode '{}'",
+                    typecode as char
+                )));
+            }
+            array_extend_iterable(obj, w_init, false)?;
         }
     }
     Ok(obj)
@@ -260,7 +299,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
 /// `fromunicode` — append code points of a str to a `'u'` array.
 fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError> {
     array_check_resize(obj)?;
-    if unsafe { arr::w_array_typecode(obj) } != b'u' {
+    if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
         return Err(PyError::value_error(
             "fromunicode() may only be called on unicode type arrays",
         ));
@@ -365,6 +404,9 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
         let src_len = src.len() / isz;
         if step == 1 {
             // Contiguous: may resize.
+            if src_len as i64 != n {
+                array_check_resize(obj)?;
+            }
             let vec = unsafe { arr::w_array_vec_mut(obj) };
             let lo = start as usize * isz;
             let hi = stop.max(start) as usize * isz;
@@ -418,6 +460,9 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
             len as i64,
         )?;
         let n = slice_length(start, stop, step);
+        if n != 0 {
+            array_check_resize(obj)?;
+        }
         // Collect element indices to drop, then rebuild the buffer.
         let mut drop_set: Vec<usize> = Vec::with_capacity(n as usize);
         let mut i = start;
@@ -441,6 +486,7 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
         return Ok(pyre_object::w_none());
     }
     let i = index_in_range(key, len, "array")?;
+    array_check_resize(obj)?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.drain(i * isz..i * isz + isz);
     Ok(pyre_object::w_none())
@@ -451,25 +497,43 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 fn array_len(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.__len__")?;
     Ok(pyre_object::w_int_new(
         unsafe { arr::w_array_len(args[0]) } as i64
     ))
 }
 
 fn array_iter(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.__iter__")?;
     let len = unsafe { arr::w_array_len(args[0]) };
     Ok(pyre_object::w_seq_iter_new(args[0], len))
 }
 
-/// Ensure a method received at least `min_total` positional slots
-/// (`self` included); otherwise raise the "takes exactly N argument(s)"
-/// TypeError rather than panicking on an out-of-range `args` index.
-fn check_arity(args: &[PyObjectRef], min_total: usize, name: &str) -> Result<(), PyError> {
-    if args.len() < min_total {
-        let want = min_total - 1;
+/// Preserve the exact positional signature that PyPy's interp2app gateway
+/// enforces for these methods (`self` included in `expected_total`).
+fn check_arity(args: &[PyObjectRef], expected_total: usize, name: &str) -> Result<(), PyError> {
+    if args.len() != expected_total {
+        let want = expected_total - 1;
         let noun = if want == 1 { "argument" } else { "arguments" };
         return Err(PyError::type_error(format!(
             "{name}() takes exactly {want} {noun} ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(())
+}
+
+fn check_arity_range(
+    args: &[PyObjectRef],
+    min_total: usize,
+    max_total: usize,
+    name: &str,
+) -> Result<(), PyError> {
+    if args.len() < min_total || args.len() > max_total {
+        return Err(PyError::type_error(format!(
+            "{name}() takes from {} to {} arguments ({} given)",
+            min_total - 1,
+            max_total - 1,
             args.len().saturating_sub(1)
         )));
     }
@@ -484,7 +548,7 @@ fn array_append_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.extend")?;
-    array_extend_iterable(args[0], args[1])?;
+    array_extend_iterable(args[0], args[1], true)?;
     Ok(pyre_object::w_none())
 }
 
@@ -515,6 +579,7 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity_range(args, 1, 2, "array.pop")?;
     let obj = args[0];
     array_check_resize(obj)?;
     let len = unsafe { arr::w_array_len(obj) };
@@ -574,7 +639,7 @@ fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, P
 }
 
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.index")?;
+    check_arity_range(args, 2, 4, "array.index")?;
     let obj = args[0];
     let w_value = args[1];
     let len = unsafe { arr::w_array_len(obj) } as i64;
@@ -616,6 +681,7 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.clear")?;
     // descr_clear — empty the buffer, preserving typecode/itemsize.
     array_check_resize(args[0])?;
     unsafe { arr::w_array_vec_mut(args[0]) }.clear();
@@ -642,6 +708,7 @@ fn array_count_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_reverse_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.reverse")?;
     let obj = args[0];
     let isz = unsafe { arr::w_array_itemsize(obj) };
     let len = unsafe { arr::w_array_len(obj) };
@@ -663,6 +730,7 @@ fn array_reverse_method(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.tolist")?;
     let obj = args[0];
     let len = unsafe { arr::w_array_len(obj) };
     let mut items = Vec::with_capacity(len);
@@ -674,11 +742,12 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.fromlist")?;
-    array_extend_iterable(args[0], args[1])?;
+    array_extend_iterable(args[0], args[1], true)?;
     Ok(pyre_object::w_none())
 }
 
 fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.tobytes")?;
     let bytes = unsafe { arr::w_array_bytes(args[0]) };
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(bytes))
 }
@@ -693,9 +762,56 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
+fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
+    let result = crate::baseobjspace::call_method(obj, name, args);
+    if result.is_null() {
+        Err(crate::call::take_call_error()
+            .unwrap_or_else(|| PyError::runtime_error("method call failed")))
+    } else {
+        Ok(result)
+    }
+}
+
+fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 3, "array.fromfile")?;
     let obj = args[0];
-    if unsafe { arr::w_array_typecode(obj) } != b'u' {
+    let count = crate::builtins::getindex_w(args[2])?;
+    if count < 0 {
+        return Err(PyError::value_error("negative count"));
+    }
+    let size = unsafe { arr::w_array_itemsize(obj) }
+        .checked_mul(count as usize)
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let w_bytes = call_method(args[1], "read", &[pyre_object::w_int_new(size as i64)])?;
+    if !unsafe { pyre_object::is_bytes(w_bytes) } {
+        return Err(PyError::type_error("read() didn't return bytes"));
+    }
+    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec();
+    array_frombytes(obj, &bytes)?;
+    if bytes.len() < size {
+        let mut error = PyError::value_error("not enough items in file");
+        if let Some(cls) = crate::builtins::lookup_exc_class("EOFError") {
+            let exc_args = [cls, pyre_object::w_str_new("not enough items in file")];
+            if let Ok(exc) = crate::builtins::exc_exception_new(&exc_args) {
+                error.exc_object = exc;
+            }
+        }
+        return Err(error);
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.tofile")?;
+    let w_bytes = array_tobytes_method(&args[..1])?;
+    call_method(args[1], "write", &[w_bytes])?;
+    Ok(pyre_object::w_none())
+}
+
+fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.tounicode")?;
+    let obj = args[0];
+    if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
         return Err(PyError::value_error(
             "tounicode() may only be called on unicode type arrays",
         ));
@@ -705,9 +821,9 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
     let mut wb = Wtf8Buf::new();
     for i in 0..len {
         let cp = u32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        if let Some(point) = CodePoint::from_u32(cp) {
-            wb.push(point);
-        }
+        let point = CodePoint::from_u32(cp)
+            .ok_or_else(|| PyError::value_error("character out of range"))?;
+        wb.push(point);
     }
     Ok(pyre_object::unicodeobject::w_str_from_wtf8(wb))
 }
@@ -730,6 +846,7 @@ fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.buffer_info")?;
     let obj = args[0];
     let addr = unsafe { arr::w_array_bytes(obj) }.as_ptr() as i64;
     let len = unsafe { arr::w_array_len(obj) } as i64;
@@ -740,6 +857,7 @@ fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_byteswap_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.byteswap")?;
     let obj = args[0];
     let isz = unsafe { arr::w_array_itemsize(obj) };
     if !matches!(isz, 1 | 2 | 4 | 8) {
@@ -756,6 +874,7 @@ fn array_byteswap_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_copy_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity_range(args, 1, 2, "array.__copy__")?;
     let obj = args[0];
     let tc = unsafe { arr::w_array_typecode(obj) };
     let isz = unsafe { arr::w_array_itemsize(obj) } as u8;
@@ -772,10 +891,10 @@ pub fn array_repr_string(obj: PyObjectRef) -> Result<String, PyError> {
     if len == 0 {
         return Ok(format!("array('{tc}')"));
     }
-    if tc == 'u' {
+    if matches!(tc, 'u' | 'w') {
         let s = array_tounicode_method(&[obj])?;
         let inner_s = unsafe { crate::display::py_repr(s)? };
-        return Ok(format!("array('u', {inner_s})"));
+        return Ok(format!("array('{tc}', {inner_s})"));
     }
     let mut parts = Vec::with_capacity(len);
     for i in 0..len {
@@ -786,6 +905,7 @@ pub fn array_repr_string(obj: PyObjectRef) -> Result<String, PyError> {
 }
 
 fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 1, "array.__repr__")?;
     Ok(pyre_object::w_str_new(&array_repr_string(args[0])?))
 }
 
@@ -975,29 +1095,106 @@ fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
 // Pickle: __reduce_ex__ + _array_reconstructor.
 // ──────────────────────────────────────────────────────────────────────
 
-/// `array.__reduce_ex__(protocol)` — list-based reduce
-/// `(type(self), (typecode, tolist()), __dict__)` (`interp_array.py
-/// descr_reduce_ex`; the list form is accepted for every protocol).
+const UNKNOWN_FORMAT: i64 = -1;
+
+fn array_machine_format_code(typecode: u8, itemsize: usize) -> i64 {
+    let big_endian = cfg!(target_endian = "big") as i64;
+    match typecode {
+        b'B' => 0,
+        b'b' => 1,
+        b'H' | b'I' | b'L' | b'Q' => match itemsize {
+            2 => 2 + big_endian,
+            4 => 6 + big_endian,
+            8 => 10 + big_endian,
+            _ => UNKNOWN_FORMAT,
+        },
+        b'h' | b'i' | b'l' | b'q' => match itemsize {
+            2 => 4 + big_endian,
+            4 => 8 + big_endian,
+            8 => 12 + big_endian,
+            _ => UNKNOWN_FORMAT,
+        },
+        b'f' => 14 + big_endian,
+        b'd' => 16 + big_endian,
+        b'u' | b'w' => match itemsize {
+            2 => 18 + big_endian,
+            4 => 20 + big_endian,
+            _ => UNKNOWN_FORMAT,
+        },
+        _ => UNKNOWN_FORMAT,
+    }
+}
+
+/// `interp_array.py:descr_reduce_ex`: protocols below 3 use the portable
+/// list form; newer protocols use the module's canonical reconstructor and
+/// native machine-format bytes.
 fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
+    check_arity(args, 2, "array.__reduce_ex__")?;
     let obj = args[0];
+    let protocol = crate::baseobjspace::int_w(args[1])?;
     let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
-    let tc = unsafe { arr::w_array_typecode(obj) } as char;
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+    let tc = typecode as char;
     let w_typecode = pyre_object::w_str_new(&tc.to_string());
-    let w_items = array_tolist_method(&[obj])?;
-    let ctor_args = pyre_object::w_tuple_new(vec![w_typecode, w_items]);
-    Ok(pyre_object::w_tuple_new(vec![
+    let w_dict =
+        crate::baseobjspace::findattr_result(obj, "__dict__")?.unwrap_or_else(pyre_object::w_none);
+    let mformat = array_machine_format_code(typecode, unsafe { arr::w_array_itemsize(obj) });
+    if protocol < 3 || mformat == UNKNOWN_FORMAT {
+        let w_items = array_tolist_method(&[obj])?;
+        let ctor_args = pyre_object::w_tuple_new(vec![w_typecode, w_items]);
+        return Ok(pyre_object::w_tuple_new(vec![w_type, ctor_args, w_dict]));
+    }
+
+    let module = crate::importing::get_sys_module("array")
+        .ok_or_else(|| PyError::runtime_error("array module not initialized"))?;
+    let reconstructor = crate::baseobjspace::getattr_str(module, "_array_reconstructor")?;
+    let w_bytes = array_tobytes_method(&[obj])?;
+    let ctor_args = pyre_object::w_tuple_new(vec![
         w_type,
+        w_typecode,
+        pyre_object::w_int_new(mformat),
+        w_bytes,
+    ]);
+    Ok(pyre_object::w_tuple_new(vec![
+        reconstructor,
         ctor_args,
-        pyre_object::w_none(),
+        w_dict,
     ]))
 }
 
-/// `_array_reconstructor(cls, typecode, mformat_code, items)` — pyre stores
-/// native machine-format bytes, so this rebuilds via `frombytes`
-/// (`reconstructor.py array_reconstructor`).  The slow per-format decode is
-/// not needed because pyre never produces the bytes-based reduce form.
+fn decode_uint(bytes: &[u8], big_endian: bool) -> u64 {
+    if big_endian {
+        bytes
+            .iter()
+            .fold(0u64, |value, byte| (value << 8) | *byte as u64)
+    } else {
+        bytes
+            .iter()
+            .rev()
+            .fold(0u64, |value, byte| (value << 8) | *byte as u64)
+    }
+}
+
+fn reconstructor_descriptor(mformat: i64) -> (usize, bool, bool) {
+    let big_endian = matches!(mformat, 3 | 5 | 7 | 9 | 11 | 13 | 15 | 17 | 19 | 21);
+    let signed = matches!(mformat, 1 | 4 | 5 | 8 | 9 | 12 | 13);
+    let size = match mformat {
+        0 | 1 => 1,
+        2..=5 => 2,
+        6..=9 | 14 | 15 => 4,
+        10..=13 | 16 | 17 => 8,
+        18 | 19 => 2,
+        20 | 21 => 4,
+        _ => 0,
+    };
+    (size, signed, big_endian)
+}
+
+/// `reconstructor.py:array_reconstructor`: use native bytes on the matching
+/// machine-format fast path, otherwise decode each source item before the
+/// requested array class repacks it in native representation.
 fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 4 {
+    if args.len() != 4 {
         return Err(PyError::type_error(
             "_array_reconstructor() takes exactly 4 arguments",
         ));
@@ -1008,6 +1205,22 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "_array_reconstructor() argument 1 must be type, not other",
         ));
     }
+    let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+    if !crate::baseobjspace::issubclass(w_cls, array_type)? {
+        return Err(PyError::type_error(
+            "_array_reconstructor() argument 1 must be a subclass of array.array",
+        ));
+    }
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(PyError::type_error("typecode must be a unicode character"));
+    }
+    let typecode_text = unsafe { pyre_object::unicodeobject::w_str_get_value(args[1]) };
+    let typecode_bytes = typecode_text.as_bytes();
+    if typecode_bytes.len() != 1 || arr::typecode_itemsize(typecode_bytes[0]).is_none() {
+        return Err(PyError::value_error("invalid type code"));
+    }
+    let typecode = typecode_bytes[0];
+    let itemsize = arr::typecode_itemsize(typecode).unwrap() as usize;
     // mformat_code: int in [MACHINE_FORMAT_CODE_MIN, MACHINE_FORMAT_CODE_MAX].
     if !unsafe { pyre_object::is_int(args[2]) } {
         return Err(PyError::type_error(
@@ -1025,13 +1238,62 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "fourth argument should be bytes, not other",
         ));
     }
-    // pyre stores native machine-format bytes, so the native fast-path
-    // (mformat == native) is a direct frombytes; array_descr_new validates
-    // the typecode (ValueError) and retags any array subclass.
     let new_args = [w_cls, args[1]];
     let obj = array_descr_new(&new_args)?;
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();
-    array_frombytes(obj, &bytes)?;
+    if mformat == array_machine_format_code(typecode, itemsize) {
+        array_frombytes(obj, &bytes)?;
+        return Ok(obj);
+    }
+
+    if matches!(mformat, 18..=21) {
+        let encoding = match mformat {
+            18 => "utf-16-le",
+            19 => "utf-16-be",
+            20 => "utf-32-le",
+            _ => "utf-32-be",
+        };
+        let decoded = call_method(args[3], "decode", &[pyre_object::w_str_new(encoding)])?;
+        array_fromunicode(obj, decoded)?;
+        return Ok(obj);
+    }
+
+    let (source_size, signed, big_endian) = reconstructor_descriptor(mformat);
+    if bytes.len() % source_size != 0 {
+        return Err(PyError::value_error(
+            "bytes length not a multiple of item size",
+        ));
+    }
+    for chunk in bytes.chunks_exact(source_size) {
+        let w_item = if matches!(mformat, 14 | 15) {
+            let raw: [u8; 4] = chunk.try_into().unwrap();
+            let value = if big_endian {
+                f32::from_be_bytes(raw)
+            } else {
+                f32::from_le_bytes(raw)
+            };
+            pyre_object::w_float_new(value as f64)
+        } else if matches!(mformat, 16 | 17) {
+            let raw: [u8; 8] = chunk.try_into().unwrap();
+            let value = if big_endian {
+                f64::from_be_bytes(raw)
+            } else {
+                f64::from_le_bytes(raw)
+            };
+            pyre_object::w_float_new(value)
+        } else {
+            let raw = decode_uint(chunk, big_endian);
+            if signed {
+                let shift = 64 - source_size * 8;
+                pyre_object::w_int_new(((raw << shift) as i64) >> shift)
+            } else if raw <= i64::MAX as u64 {
+                pyre_object::w_int_new(raw as i64)
+            } else {
+                pyre_object::longobject::w_long_new(BigInt::from(raw))
+            }
+        };
+        array_append(obj, w_item)?;
+    }
     Ok(obj)
 }
 
@@ -1097,6 +1359,8 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "fromlist", array_fromlist_method, 2);
     m(ns, "tobytes", array_tobytes_method, 1);
     m(ns, "frombytes", array_frombytes_method, 2);
+    m(ns, "tofile", array_tofile_method, 2);
+    m(ns, "fromfile", array_fromfile_method, 3);
     m(ns, "tounicode", array_tounicode_method, 1);
     m(ns, "fromunicode", array_fromunicode_method, 2);
     m(ns, "buffer_info", array_buffer_info_method, 1);

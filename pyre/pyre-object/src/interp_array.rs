@@ -29,17 +29,17 @@ pub struct W_Array {
     pub exports: i64,
 }
 
-/// The supported typecodes, in `array.typecodes` order
-/// (`interp_array.py:904`).  No `w` code — this mirrors the PyPy set.
-pub const TYPECODES: &str = "bBuhHiIlLqQfd";
+/// The supported typecodes, in Python 3.14's `array.typecodes` order.
+/// PyPy 3.11 lacks `w`; Python 3.14 defines it as a 4-byte Py_UCS4 item.
+pub const TYPECODES: &str = "bBuwhHiIlLqQfd";
 
 /// `itemsize` (bytes per element) for a typecode, or `None` if the code is
-/// not one of the supported `bBuhHiIlLqQfd` (`interp_array.py:885-899`,
+/// not one of the supported `bBuwhHiIlLqQfd` (`interp_array.py:885-899`,
 /// 64-bit `l`/`L` = 8).
 pub fn typecode_itemsize(tc: u8) -> Option<u8> {
     Some(match tc {
         b'b' | b'B' => 1,
-        b'u' => 4,
+        b'u' | b'w' => 4,
         b'h' | b'H' => 2,
         b'i' | b'I' => 4,
         b'l' | b'L' => 8,
@@ -195,7 +195,7 @@ pub fn unpack_value(typecode: u8, buf: &[u8]) -> PyObjectRef {
         }
         b'f' => crate::floatobject::w_float_new(f32::from_ne_bytes(buf.try_into().unwrap()) as f64),
         b'd' => crate::floatobject::w_float_new(f64::from_ne_bytes(buf.try_into().unwrap())),
-        b'u' => {
+        b'u' | b'w' => {
             let cp = u32::from_ne_bytes(buf.try_into().unwrap());
             match char::from_u32(cp) {
                 Some(c) => crate::unicodeobject::w_str_new(&c.to_string()),
@@ -235,6 +235,7 @@ mod tests {
             (b'b', 1),
             (b'B', 1),
             (b'u', 4),
+            (b'w', 4),
             (b'h', 2),
             (b'H', 2),
             (b'i', 4),

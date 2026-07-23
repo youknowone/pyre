@@ -5532,14 +5532,16 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     w_copy,
                 );
             } else {
-                // `create_iterator_classes.rev_update1_dict_dict` walks the
-                // source through `getiteritems_with_hash`
-                // (`dictmultiobject.py:991`), the low-level dict iterator that
-                // carries no changed-size guard: a source mutated by a
-                // destination key's `__eq__` is simply read as it stands at
-                // each step — an in-place `clear()` ends the walk, and a
-                // refilled table keeps it going over the new entries.  The
-                // application-level items iterator would instead raise.
+                // PyPy `create_iterator_classes.rev_update1_dict_dict`
+                // (`dictmultiobject.py:991`) supplies the live
+                // `getiteritems_with_hash` walk.  Python 3.14 adds
+                // `dict_dict_merge`'s `orig_size` check after every
+                // destination insertion (`Objects/dictobject.c:3947-3985`):
+                // destination key equality can re-enter Python and mutate
+                // the source, which must raise instead of silently ending
+                // the next `nth_item` lookup.
+                let source = resolve_dict_backing(data());
+                let orig_size = pyre_object::dictmultiobject::w_dict_len(source);
                 let mut i = 0;
                 loop {
                     let Some((k, v)) = pyre_object::dictmultiobject::w_dict_nth_item(
@@ -5555,6 +5557,11 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
                     let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     dict_store_checked(dict(), k, v)?;
+                    if orig_size
+                        != pyre_object::dictmultiobject::w_dict_len(resolve_dict_backing(data()))
+                    {
+                        return Err(crate::PyError::runtime_error("dict mutated during update"));
+                    }
                     i += 1;
                 }
             }
