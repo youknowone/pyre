@@ -13,6 +13,8 @@ mod buffered_writer;
 pub use buffered_writer::W_BufferedWriter;
 mod buffered_rwpair;
 pub use buffered_rwpair::W_BufferedRWPair;
+mod buffered_random;
+pub use buffered_random::W_BufferedRandom;
 
 // CPython 3.14 raised the public and constructor default from 8 KiB to
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
@@ -960,14 +962,7 @@ crate::py_module! {
             ("BufferedReader", buffered_reader),
             ("BufferedWriter", buffered_writer),
             ("BufferedRWPair", buffered_rwpair),
-            (
-                "BufferedRandom",
-                crate::typedef::make_builtin_type_with_base(
-                    "BufferedRandom",
-                    |_| {},
-                    buffered_base,
-                ),
-            ),
+            ("BufferedRandom", buffered_random::type_object()),
         ] {
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);

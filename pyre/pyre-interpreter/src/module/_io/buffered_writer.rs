@@ -7,7 +7,7 @@ const STATE_ZERO: i64 = 0;
 const STATE_OK: i64 = 1;
 const STATE_DETACHED: i64 = 2;
 
-fn is_blocking_error(error: &crate::PyError) -> bool {
+pub(super) fn is_blocking_error(error: &crate::PyError) -> bool {
     let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
         return false;
     };
@@ -15,7 +15,7 @@ fn is_blocking_error(error: &crate::PyError) -> bool {
         && unsafe { crate::baseobjspace::isinstance_w(error.exc_object, blocking) }
 }
 
-fn make_write_blocking_error(written: usize) -> crate::PyError {
+pub(super) fn make_write_blocking_error(written: usize) -> crate::PyError {
     let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
         return crate::PyError::os_error("write could not complete without blocking");
     };
@@ -32,7 +32,7 @@ fn make_write_blocking_error(written: usize) -> crate::PyError {
     }
 }
 
-fn input_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+pub(super) fn input_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
         return Ok(unsafe { pyre_object::bytesobject::bytes_like_data(obj) }.to_vec());
     }
