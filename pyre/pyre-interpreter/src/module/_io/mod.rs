@@ -496,7 +496,11 @@ fn init_iobase_type(ns: PyObjectRef) {
         ns,
         "__exit__",
         crate::make_builtin_function("__exit__", |args| {
-            iobase_close(&args[..1])?;
+            // Dispatch `close` dynamically (`W_IOBase._exit` calls
+            // `space.call_method(self, "close")`) so a Python subclass
+            // override runs; a static `iobase_close` would mark the object
+            // closed without ever running the override.
+            call_method_result(args[0], "close", &[])?;
             Ok(w_none())
         }),
     );
@@ -842,7 +846,8 @@ fn init_buffered_reader_type(ns: PyObjectRef) {
         ns,
         "__exit__",
         crate::make_builtin_function("__exit__", |args| {
-            buffered_reader_close(&args[..1])?;
+            // Dynamic dispatch, as on the IOBase `__exit__` above.
+            call_method_result(args[0], "close", &[])?;
             Ok(w_none())
         }),
     );
