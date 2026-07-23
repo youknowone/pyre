@@ -255,6 +255,12 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_raw_load_call(call) {
                     return Some(binding);
                 }
+                // Float<->int bitcast intrinsics `majit_f64_to_bits(f)` /
+                // `majit_bits_to_f64(i)` → convert_{float_bytes_to_longlong,
+                // longlong_bytes_to_float} (rpython convert ops).
+                if let Some(binding) = self.lower_float_bitcast_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => {
@@ -264,6 +270,68 @@ impl<'c> Lowerer<'c> {
                 self.lower_method_call_value(call)
             }
             Expr::Struct(s) => self.lower_struct_value(s),
+            _ => None,
+        }
+    }
+
+    /// Lower the float<->int bitcast intrinsics: `majit_f64_to_bits(f)` (float
+    /// argument → its i64 bit pattern, `convert_float_bytes_to_longlong`) and
+    /// `majit_bits_to_f64(i)` (int bits → float, `convert_longlong_bytes_to_float`).
+    /// Both reinterpret the 64-bit pattern (no value change); a branchless float
+    /// bit-select uses them to stay bit-exact where an arithmetic blend cannot.
+    fn lower_float_bitcast_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let segments = canonical_expr_segments(&call.func)?;
+        match segments.last()?.as_str() {
+            "majit_f64_to_bits" => {
+                if call.args.len() != 1 {
+                    return None;
+                }
+                let src = self.lower_value_expr(&call.args[0])?;
+                if !matches!(src.kind, BindingKind::Float) {
+                    return None;
+                }
+                let src_reg = src.reg;
+                let dst = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::float(src_reg)],
+                        vec![Register::int(dst)],
+                    ),
+                    quote! { __builder.record_convert_float_bytes_to_longlong(#dst, #src_reg); },
+                );
+                Some(Binding {
+                    reg: dst,
+                    kind: BindingKind::Int,
+                    depends_on_stack: src.depends_on_stack,
+                    struct_type: None,
+                })
+            }
+            "majit_bits_to_f64" => {
+                if call.args.len() != 1 {
+                    return None;
+                }
+                let src = self.lower_value_expr(&call.args[0])?;
+                if !matches!(src.kind, BindingKind::Int) {
+                    return None;
+                }
+                let src_reg = src.reg;
+                let dst = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::int(src_reg)],
+                        vec![Register::float(dst)],
+                    ),
+                    quote! { __builder.record_convert_longlong_bytes_to_float(#dst, #src_reg); },
+                );
+                Some(Binding {
+                    reg: dst,
+                    kind: BindingKind::Float,
+                    depends_on_stack: src.depends_on_stack,
+                    struct_type: None,
+                })
+            }
             _ => None,
         }
     }

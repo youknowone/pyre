@@ -4389,6 +4389,28 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// Reinterpret a float's 64-bit pattern as an int — RPython
+    /// `convert_float_bytes_to_longlong` (`blackhole.py:828-830`). A bitcast
+    /// (`f>i`), NOT a value cast: float source, int result, `[src][dst]` layout.
+    pub fn record_convert_float_bytes_to_longlong(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_float_reg(src);
+        self.write_insn("convert_float_bytes_to_longlong/f>i");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
+    /// Reinterpret an int's 64-bit pattern as a float — RPython
+    /// `convert_longlong_bytes_to_float` (`blackhole.py:832-834`). The inverse
+    /// bitcast (`i>f`): int source, float result, `[src][dst]` layout.
+    pub fn record_convert_longlong_bytes_to_float(&mut self, dst: u16, src: u16) {
+        self.touch_float_reg(dst);
+        self.touch_reg(src);
+        self.write_insn("convert_longlong_bytes_to_float/i>f");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
     /// Append a sub-JitCode descriptor and return its runtime
     /// `descrs` index. Mirrors the RPython build-time flow where
     /// `Assembler._encode_descr(jitcode)` adds the callee `JitCode` to

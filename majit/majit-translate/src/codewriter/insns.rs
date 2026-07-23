@@ -385,6 +385,12 @@ pub const BC_CAST_INT_TO_FLOAT: u8 = 183;
 pub const BC_CAST_INT_TO_PTR: u8 = 184;
 pub const BC_CAST_PTR_TO_INT: u8 = 185;
 
+// Float<->longlong bit reinterpret — `bhimpl_convert_float_bytes_to_longlong`
+// / `bhimpl_convert_longlong_bytes_to_float` (`blackhole.py:828-834`): a bitcast
+// of the 64-bit pattern, NOT a value cast (unlike `cast_float_to_int`).
+pub const BC_CONVERT_FLOAT_BYTES_TO_LONGLONG: u8 = 229;
+pub const BC_CONVERT_LONGLONG_BYTES_TO_FLOAT: u8 = 230;
+
 // `switch/id` — RPython `blackhole.py:954-960` `bhimpl_switch` —
 // table-of-cases dispatch keyed by an int register + a descr selecting
 // the case table.
@@ -1020,6 +1026,14 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("cast_int_to_ptr/i>r", BC_CAST_INT_TO_PTR);
     m.insert("cast_ptr_to_int/r>i", BC_CAST_PTR_TO_INT);
     m.insert("cast_float_to_int/f>i", BC_CAST_FLOAT_TO_INT);
+    m.insert(
+        "convert_float_bytes_to_longlong/f>i",
+        BC_CONVERT_FLOAT_BYTES_TO_LONGLONG,
+    );
+    m.insert(
+        "convert_longlong_bytes_to_float/i>f",
+        BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
+    );
 
     // Switch dispatch — `blackhole.py:954-960` `bhimpl_switch`.
     // Argcodes `id`: int discriminator + descr selecting the case table.

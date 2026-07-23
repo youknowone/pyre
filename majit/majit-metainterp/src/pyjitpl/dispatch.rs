@@ -6853,6 +6853,12 @@ where
             jitcode::insns::BC_FLOAT_GT => self.trace_compare_f(ctx, OpCode::FloatGt),
             jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
             jitcode::insns::BC_CAST_INT_TO_FLOAT => self.trace_cast_int_to_float(ctx),
+            jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG => {
+                self.trace_convert_float_bytes_to_longlong(ctx)
+            }
+            jitcode::insns::BC_CONVERT_LONGLONG_BYTES_TO_FLOAT => {
+                self.trace_convert_longlong_bytes_to_float(ctx)
+            }
             // pyjitpl.py opimpl_int_guard_value → implement_guard_value
             // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
             jitcode::insns::BC_INT_GUARD_VALUE => {
@@ -7487,6 +7493,37 @@ where
         let opref = ctx.record_op(OpCode::CastIntToFloat, &[src]);
         ctx.set_opref_concrete(opref, majit_ir::Value::Float(fvalue));
         self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
+    }
+
+    /// `convert_float_bytes_to_longlong/f>i`: reinterpret a float's 64-bit
+    /// pattern as an int. `[src][dst]`. The i64 bits are exactly what
+    /// `float_values` already carries, so the concrete value is identity.
+    fn trace_convert_float_bytes_to_longlong(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_float_reg(src_idx);
+        let opref = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(bits));
+        self.set_int_reg(dst, Some(opref), Some(bits));
+    }
+
+    /// `convert_longlong_bytes_to_float/i>f`: reinterpret an int's 64-bit
+    /// pattern as a float — the inverse bitcast. `[src][dst]`.
+    fn trace_convert_longlong_bytes_to_float(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_int_reg(src_idx);
+        let opref = ctx.record_op(OpCode::ConvertLonglongBytesToFloat, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(bits as u64)));
+        self.set_float_reg(dst, Some(opref), Some(bits));
     }
 }
 
