@@ -836,6 +836,41 @@ pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
     }
 }
 
+/// `PYRE_M73_BACKXLAT_TWIN_AUDIT` asserts the codewriter-built forward py_pc
+/// twin equals the [`backxlat_py_pc`] inversion at every non-negative resume
+/// word before [`forward_py_pc_or_backxlat`] trusts the twin. Off in
+/// production; the gated assert is the only added work.
+fn m73_backxlat_twin_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BACKXLAT_TWIN_AUDIT").is_some())
+}
+
+/// Forward Python instruction coordinate for a carried resume JitCode word.
+///
+/// Reads the codewriter-built `forward_py_pc` twin — a by-construction mirror
+/// of [`backxlat_py_pc`]'s block-head/floor resolution plus its
+/// `skip_python_trivia_forward` normalization — keeping the inversion only for
+/// the empty-twin class (skeleton / fixture jitcodes) and for negative words.
+///
+/// Negative words (`NO_JITCODE_PC` `-1`, tagged branch-orgpc words `<= -2`)
+/// cast to a huge `usize` twin key and would floor-resolve to a bogus
+/// predecessor entry, so they are delegated straight to `backxlat_py_pc`, which
+/// resolves them identically to the pre-cutover call.
+pub fn forward_py_pc_or_backxlat(jitcode_index: i32, pc_word: i32) -> i32 {
+    let live = backxlat_py_pc(jitcode_index, pc_word);
+    if pc_word >= 0 && m73_backxlat_twin_audit_enabled() {
+        if let Some(twin) = pyjitcode_for_jitcode_index(jitcode_index)
+            .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(pc_word as usize))
+        {
+            assert_eq!(
+                twin as i32, live,
+                "PYRE_M73_BACKXLAT_TWIN_AUDIT: forward py_pc twin diverged at jitcode {jitcode_index} pc {pc_word}"
+            );
+        }
+    }
+    live
+}
+
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
 /// constants embedded in every live jitcode's `constants_r` pool.
 ///
@@ -6009,7 +6044,7 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         return None;
     }
-    let py_pc = backxlat_py_pc(frame.jitcode_index, frame.pc) as usize;
+    let py_pc = forward_py_pc_or_backxlat(frame.jitcode_index, frame.pc) as usize;
     let w_code = code_for_jitcode_index(frame.jitcode_index)?;
     if w_code.is_null() {
         return None;
@@ -12329,10 +12364,10 @@ pub(crate) fn assemble_bridge_inline_pending(
         concrete_frame.push(recipe_slot_to_pyobj(recipe.concrete_r[k]));
     }
     // last_instr is one before the recipe's Python pc so next_instr() resumes there.
-    concrete_frame
-        .set_last_instr_from_next_instr(
-            backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize
-        );
+    concrete_frame.set_last_instr_from_next_instr(forward_py_pc_or_backxlat(
+        recipe.jitcode_index,
+        recipe.jitcode_pc,
+    ) as usize);
 
     // Symbolic side: mirror the FAST branch field-for-field.
     let mut sym = PyreSym::new_uninit(OpRef::NONE);

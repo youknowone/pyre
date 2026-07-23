@@ -593,7 +593,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
         start_pc
     };
     let lasti_pc = if let Some(ref c) = carrier {
-        crate::state::backxlat_py_pc(c.root_jitcode_index, c.root_pc as i32) as usize
+        crate::state::forward_py_pc_or_backxlat(c.root_jitcode_index, c.root_pc as i32) as usize
     } else {
         start_pc
     };
@@ -1047,7 +1047,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let pcs: Vec<usize> = carrier
             .recipes
             .iter()
-            .map(|r| crate::state::backxlat_py_pc(r.jitcode_index, r.jitcode_pc) as usize)
+            .map(|r| {
+                crate::state::forward_py_pc_or_backxlat(r.jitcode_index, r.jitcode_pc) as usize
+            })
             .collect();
         eprintln!(
             "[p2-shape] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
@@ -1173,9 +1175,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         if want_compile && middles_ok {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-                let root_py_pc =
-                    crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
-                        as usize;
+                let root_py_pc = crate::state::forward_py_pc_or_backxlat(
+                    carrier.root_jitcode_index,
+                    root_pc as i32,
+                ) as usize;
                 // The sub-walks above already applied each frame's eager stores
                 // and journaled them; hand those journals to the root walk so its
                 // epilogue settles them exactly once.
@@ -1198,7 +1201,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             if p2_diag {
                 eprintln!(
                     "[p2-drain] callee sub-walk OK recipe_py_pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
-                    crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
+                    crate::state::forward_py_pc_or_backxlat(
+                        recipe.jitcode_index,
+                        recipe.jitcode_pc
+                    )
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkOk");
@@ -1207,7 +1213,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             if p2_diag {
                 eprintln!(
                     "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
-                    crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
+                    crate::state::forward_py_pc_or_backxlat(
+                        recipe.jitcode_index,
+                        recipe.jitcode_pc
+                    )
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkStop");
