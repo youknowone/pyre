@@ -300,6 +300,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "pyre_object.lltype.malloc_typed",
         malloc_typed_alloc,
     );
+    analyzer_for(
+        &mut reg,
+        "pyre_object.lltype.malloc_typed_managed",
+        malloc_typed_alloc,
+    );
     // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
     // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Recognising it
     // as a builtin keeps its `Box::new` / `Box::into_raw` body out of the

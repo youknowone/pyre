@@ -59,7 +59,8 @@ impl crate::lltype::GcType for Module {
 ///   the anonymous-name sentinel for `pick_builtin`'s default Module
 ///   case (`moduledef.py:106-108`, PyPy `Module(space, None, ...)`)
 ///   in which `Module.__init__` skips the `__name__` setitem.
-pub fn w_module_new(name: &str) -> PyObjectRef {
+///
+fn module_value(name: &str) -> Module {
     // `pypy/interpreter/module.py:18 Module.__init__` opens
     // `w_dict = space.newdict(module=True)` per `dictmultiobject.py:440-451
     // _newdict(module=True)`, which lands on `W_ModuleDictObject`
@@ -74,14 +75,30 @@ pub fn w_module_new(name: &str) -> PyObjectRef {
             crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
         }
     }
-    crate::lltype::malloc_typed(Module {
+    Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
         },
         name: name_box,
         w_dict,
-    }) as PyObjectRef
+    }
+}
+
+/// Bootstrap/import allocation. Native owners of these modules still keep
+/// stable raw pointers, so retain the legacy immortal allocation until those
+/// owners are migrated to ordinary GC roots.
+pub fn w_module_new(name: &str) -> PyObjectRef {
+    crate::lltype::malloc_typed(module_value(name)) as PyObjectRef
+}
+
+/// Python-visible module allocation (`types.ModuleType.__new__`).
+///
+/// This is the ordinary RPython GC shape: the holder belongs to the collector,
+/// carries `W_MODULE_GC_TYPE_ID`, and is traced through
+/// `W_MODULE_GC_PTR_OFFSETS`, so a moving collection forwards `w_dict`.
+pub fn w_module_new_managed(name: &str) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(module_value(name)) as PyObjectRef
 }
 
 /// Allocate a `Module` aliasing a user-supplied `W_DictObject`.
@@ -145,8 +162,7 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
 
 /// Replace the module name (`module.py:24` re-seeding).  Used by
 /// `module.__init__(name, doc)` after `module.__new__` allocates an
-/// anonymous module.  A Module holder is immortal (`malloc_typed`, never
-/// swept), so its `name` stays a `malloc_raw` box that no collector reclaims;
+/// anonymous module. `name` stays a `malloc_raw` box outside the collector;
 /// free the previous box before installing the new one to avoid leaking it.
 ///
 /// # Safety

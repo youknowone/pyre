@@ -223,11 +223,12 @@ pub fn malloc<T>(value: T) -> *mut T {
     majit_gc::header::alloc_with_gc_header(value, 0)
 }
 
-/// Typed variant of [`malloc`]: `T: GcType` lets the allocator stamp the
-/// header with `T::type_id()` and assert `T::SIZE` without a runtime registry
-/// lookup. Same body as [`malloc`] (the `alloc_with_gc_header` prepend),
-/// passing the real GC type id — `init_gc_object(result, typeid, flags=0)`
-/// (`framework.py:807-811`).
+/// Legacy typed allocation outside the managed heap.
+///
+/// This retains the bootstrap/immortal behavior required by existing leaf
+/// boxes and explicit raw-root walkers. New ordinary GC objects must use
+/// [`malloc_typed_managed`], whose allocation belongs to the collector and
+/// therefore receives its registered trace shape.
 ///
 /// `T::type_id()` is `TypeIdCell::UNASSIGNED` (`u32::MAX`) until the JIT
 /// driver registers an auto-id type. That sentinel is not a real id and is
@@ -248,6 +249,40 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
         id => id,
     };
     majit_gc::header::alloc_with_gc_header(value, type_id)
+}
+
+/// Managed typed allocation.
+///
+/// `gct_fv_gc_malloc` / `init_gc_object(result, typeid, flags=0)`
+/// (`framework.py:807-856`): route through the installed GC allocator so the
+/// type id's registered fixed offsets or custom trace hook are applied. Falls
+/// back to [`malloc_typed`] only before the runtime hook is installed (unit
+/// tests and bootstrap tools).
+#[inline]
+pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        T::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    if let Some(raw) = crate::gc_hook::try_gc_alloc(type_id, T::SIZE) {
+        if !raw.is_null() {
+            unsafe {
+                std::ptr::write(raw as *mut T, value);
+                // The no-collect allocator may fall back to old-gen when the
+                // nursery is full.  In that case the freshly-written payload
+                // can already contain nursery references and must enter the
+                // remembered set.  Nursery allocations ignore this barrier.
+                crate::gc_hook::try_gc_write_barrier(raw);
+            }
+            return raw as *mut T;
+        }
+    }
+    malloc_typed(value)
 }
 
 /// Stable-address variant of [`malloc_typed`]: routes through the

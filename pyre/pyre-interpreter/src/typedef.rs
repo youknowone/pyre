@@ -1821,7 +1821,7 @@ fn make_maketrans_descr(
 /// `__new__` ignores its arguments.  A subclass instance is retagged
 /// with the actual class.
 fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let w_module = pyre_object::w_module_new("");
+    let w_module = pyre_object::w_module_new_managed("");
     if let Some(cls) = args.first().copied() {
         if !cls.is_null() {
             unsafe { (*w_module).w_class = cls };

@@ -2209,6 +2209,10 @@ impl HostEnv {
             "malloc_typed",
             HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed"),
         );
+        pyre_object_lltype.module_set(
+            "malloc_typed_managed",
+            HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed_managed"),
+        );
         // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
         // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Exposed as a
         // host builtin so its `Box::new` body is never looked-inside; the

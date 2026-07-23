@@ -1565,7 +1565,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // `is_known_unported`) so the graph census-Skips to the legacy walker
         // instead of silently matching a wrong residual call. Tracked by the
         // boxing-lowering epic (#134/#142).
-        if canonical_strip == ["lltype", "malloc_typed"] {
+        if canonical_strip == ["lltype", "malloc_typed"]
+            || canonical_strip == ["lltype", "malloc_typed_managed"]
+        {
             continue;
         }
         // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation

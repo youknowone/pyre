@@ -2677,7 +2677,10 @@ pub fn fuse_boxing_alloc(
     let is_malloc_typed = |target: &CallTarget| -> bool {
         matches!(target, CallTarget::FunctionPath { segments }
             if segments.len() >= 2
-                && segments[segments.len() - 1] == "malloc_typed"
+                && matches!(
+                    segments[segments.len() - 1].as_str(),
+                    "malloc_typed" | "malloc_typed_managed"
+                )
                 && segments[segments.len() - 2] == "lltype")
     };
 

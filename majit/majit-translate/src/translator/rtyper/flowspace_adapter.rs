@@ -1695,10 +1695,13 @@ pub fn translate_op(
                     // `malloc_typed` registration skip).
                     if segments.len() >= 2
                         && segments[segments.len() - 2] == "lltype"
-                        && segments[segments.len() - 1] == "malloc_typed"
+                        && matches!(
+                            segments[segments.len() - 1].as_str(),
+                            "malloc_typed" | "malloc_typed_managed"
+                        )
                     {
                         return Err(TyperError::message(
-                            "`lltype::malloc_typed` survived fuse_boxing_alloc unfused; \
+                            "`lltype::malloc_typed[_managed]` survived fuse_boxing_alloc unfused; \
                              only the numeric boxing structs fuse_boxing_alloc rewrites \
                              (W_Float/W_Int/W_Complex/W_Long) have a NewWithVtable \
                              lowering; no general malloc->new lowering ported"
