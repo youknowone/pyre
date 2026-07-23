@@ -2500,6 +2500,13 @@ pub fn import_name(
 fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
+    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
+    // would fall back to the interpreter cache, resurrecting a builtin the
+    // sentinel is meant to block.  Give up so the slow path raises
+    // `import of {name} halted; None in sys.modules`.
+    if sys_modules_blocks(name) {
+        return Ok(None);
+    }
     let Some(w_module) = check_sys_modules(name) else {
         return Ok(None);
     };
