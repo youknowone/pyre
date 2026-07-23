@@ -376,6 +376,256 @@ pub(super) fn perf_probe_count(col_a: &[f64], col_b: &[f64]) {
 }
 } // mod count
 
+// ── Two-bank general register machine (the cel VM shape for S3) ───────────
+// The linchpin de-risk for a general float S3: a single state carrying BOTH
+// an int virt-array bank (addressing, bool results, count) AND a float
+// virt-array bank (column values), with a float compare crossing banks
+// (float operands -> int bool). If this compiles and traces bit-exact, cel's
+// VM can gain a float bank the general lowering can target.
+mod twobank {
+    use super::*;
+
+    const OP_LOAD: i64 = 0; // [imm, dst]                regs[dst] = imm
+    const OP_MUL: i64 = 1; // [a, b, dst]               regs[dst] = regs[a]*regs[b]
+    const OP_ADD: i64 = 2; // [a, b, dst]               regs[dst] = regs[a]+regs[b]
+    const OP_COL_LOAD_F: i64 = 3; // [base, ea, fdst]   fregs[fdst] = load_f(regs[base], regs[ea])
+    const OP_FGE: i64 = 4; // [fa, fb, dst]             regs[dst] = (fregs[fa] >= fregs[fb]) as i64
+    const OP_JIA: i64 = 5; // [a, b, tgt]               if regs[a] > regs[b] { pc = tgt }
+    const OP_RETURN: i64 = 6; // [reg]                  return regs[reg]
+
+    const R_I: usize = 0;
+    const R_ACC: usize = 1;
+    const R_N: usize = 2;
+    const R_ONE: usize = 3;
+    const R_STRIDE: usize = 4;
+    const R_EA: usize = 5;
+    const R_BASE_A: usize = 6;
+    const R_BASE_B: usize = 7;
+    const R_BOOL: usize = 8;
+    const NUM_INT: usize = 9;
+
+    const F_A: usize = 0;
+    const F_B: usize = 1;
+    const NUM_FLOAT: usize = 2;
+
+    const BODY_PC: usize = 21; // 7 LOADs * 3
+
+    struct TwoBankState {
+        regs: Vec<i64>,
+        fregs: Vec<f64>,
+    }
+
+    #[majit_macros::jit_interp(
+        state = TwoBankState,
+        env = Code,
+        greens = [pc, program],
+        state_fields = {
+            regs: [int; virt],
+            fregs: [float; virt],
+        },
+    )]
+    fn mainloop_twobank(program: &Code, threshold: u32) -> i64 {
+        let mut driver: majit_metainterp::JitDriver<TwoBankState> =
+            majit_metainterp::JitDriver::new(threshold);
+        driver.set_on_compile_loop(|_g, _a, _b| {
+            COMPILES.fetch_add(1, Ordering::Relaxed);
+        });
+        driver.set_on_trace_abort(|_g, _p| {
+            ABORTS.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let mut pc: usize = 0;
+        let mut state = TwoBankState {
+            regs: vec![0; NUM_INT],
+            fregs: vec![0.0; NUM_FLOAT],
+        };
+
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+
+        loop {
+            jit_merge_point!();
+            let opcode = program[pc];
+            match opcode {
+                OP_LOAD => {
+                    state.regs[program[pc + 2] as usize] = program[pc + 1];
+                    pc += 3;
+                }
+                OP_MUL => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = state.regs[a] * state.regs[b];
+                    pc += 4;
+                }
+                OP_ADD => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = state.regs[a] + state.regs[b];
+                    pc += 4;
+                }
+                OP_COL_LOAD_F => {
+                    let base = program[pc + 1] as usize;
+                    let ea = program[pc + 2] as usize;
+                    let fd = program[pc + 3] as usize;
+                    state.fregs[fd] = majit_raw_load_f(state.regs[base], state.regs[ea]);
+                    pc += 4;
+                }
+                OP_FGE => {
+                    let fa = program[pc + 1] as usize;
+                    let fb = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = (state.fregs[fa] >= state.fregs[fb]) as i64;
+                    pc += 4;
+                }
+                OP_JIA => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let tgt = program[pc + 3] as usize;
+                    if state.regs[a] > state.regs[b] {
+                        if tgt < pc {
+                            can_enter_jit!(driver, tgt, &mut state, program, || {});
+                        }
+                        pc = tgt;
+                        continue;
+                    }
+                    pc += 4;
+                }
+                OP_RETURN => return state.regs[program[pc + 1] as usize],
+                _ => panic!("bad opcode {opcode}"),
+            }
+        }
+    }
+
+    fn clean_twobank(program: &Code) -> i64 {
+        let mut regs = vec![0i64; NUM_INT];
+        let mut fregs = vec![0.0f64; NUM_FLOAT];
+        let mut pc = 0usize;
+        loop {
+            match program[pc] {
+                OP_LOAD => {
+                    regs[program[pc + 2] as usize] = program[pc + 1];
+                    pc += 3;
+                }
+                OP_MUL => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
+                    pc += 4;
+                }
+                OP_ADD => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] + regs[program[pc + 2] as usize];
+                    pc += 4;
+                }
+                OP_COL_LOAD_F => {
+                    fregs[program[pc + 3] as usize] = majit_raw_load_f(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                    );
+                    pc += 4;
+                }
+                OP_FGE => {
+                    regs[program[pc + 3] as usize] =
+                        (fregs[program[pc + 1] as usize] >= fregs[program[pc + 2] as usize]) as i64;
+                    pc += 4;
+                }
+                OP_JIA => {
+                    let tgt = program[pc + 3] as usize;
+                    if regs[program[pc + 1] as usize] > regs[program[pc + 2] as usize] {
+                        pc = tgt;
+                    } else {
+                        pc += 4;
+                    }
+                }
+                OP_RETURN => return regs[program[pc + 1] as usize],
+                op => panic!("bad opcode {op}"),
+            }
+        }
+    }
+
+    // count rows where a[i] >= b[i]
+    fn program(n: i64, base_a: i64, base_b: i64) -> Vec<i64> {
+        let mut p = vec![
+            OP_LOAD, 0, R_I as i64,
+            OP_LOAD, 0, R_ACC as i64,
+            OP_LOAD, n, R_N as i64,
+            OP_LOAD, 1, R_ONE as i64,
+            OP_LOAD, 8, R_STRIDE as i64,
+            OP_LOAD, base_a, R_BASE_A as i64,
+            OP_LOAD, base_b, R_BASE_B as i64,
+        ];
+        assert_eq!(p.len(), BODY_PC);
+        p.extend_from_slice(&[
+            OP_MUL, R_I as i64, R_STRIDE as i64, R_EA as i64,
+            OP_COL_LOAD_F, R_BASE_A as i64, R_EA as i64, F_A as i64,
+            OP_COL_LOAD_F, R_BASE_B as i64, R_EA as i64, F_B as i64,
+            OP_FGE, F_A as i64, F_B as i64, R_BOOL as i64,
+            OP_ADD, R_ACC as i64, R_BOOL as i64, R_ACC as i64,
+            OP_ADD, R_I as i64, R_ONE as i64, R_I as i64,
+            OP_JIA, R_N as i64, R_I as i64, BODY_PC as i64,
+            OP_RETURN, R_ACC as i64,
+        ]);
+        p
+    }
+
+    pub(super) fn run_gate(label: &str, n: i64, col_a: &[f64], col_b: &[f64]) -> i64 {
+        let base_a = col_a.as_ptr() as i64;
+        let base_b = col_b.as_ptr() as i64;
+        let prog = program(n, base_a, base_b);
+
+        COMPILES.store(0, Ordering::Relaxed);
+        ABORTS.store(0, Ordering::Relaxed);
+        let clean = clean_twobank(&prog);
+
+        let off = mainloop_twobank(&prog, JIT_OFF);
+        let off_c = COMPILES.load(Ordering::Relaxed);
+
+        COMPILES.store(0, Ordering::Relaxed);
+        ABORTS.store(0, Ordering::Relaxed);
+        let on = mainloop_twobank(&prog, JIT_ON);
+        let on_c = COMPILES.load(Ordering::Relaxed);
+        let on_a = ABORTS.load(Ordering::Relaxed);
+
+        assert_eq!(clean, off, "{label}: clean vs JIT-off");
+        assert_eq!(clean, on, "{label}: clean vs JIT-on");
+        assert_eq!(off_c, 0, "{label}: JIT-off must not compile");
+        assert!(on_c >= 1, "{label}: JIT-on must compile at least one trace");
+        println!("[twobank {label} n={n}] count={on} compiles off={off_c} on={on_c} aborts on={on_a}");
+        on
+    }
+
+    pub(super) fn perf_probe(col_a: &[f64], col_b: &[f64]) {
+        let n = std::env::var("CELFLOAT_PERF_N")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(1_000_000);
+        let base_a = col_a.as_ptr() as i64;
+        let base_b = col_b.as_ptr() as i64;
+        let prog = program(n, base_a, base_b);
+        let mut clean = Vec::new();
+        let mut jit = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            black_box(clean_twobank(&prog));
+            clean.push(t.elapsed().as_nanos() as f64 / n as f64);
+            let t = Instant::now();
+            black_box(mainloop_twobank(&prog, JIT_ON));
+            jit.push(t.elapsed().as_nanos() as f64 / n as f64);
+        }
+        let clean = median(clean);
+        let jit = median(jit);
+        println!(
+            "[perf twobank n={n}] jit={jit:.3} clean={clean:.3} ns/row  => JIT is {:.2}x of naive",
+            clean / jit
+        );
+    }
+} // mod twobank
+
 fn acc_program() -> Vec<i64> {
     vec![
         OP_LOAD_A, R0 as i64, // r0 = a[i]
@@ -530,6 +780,13 @@ fn main() {
     perf_probe("dot", &dot_program(), &col_a, &col_b);
     perf_probe("compute", &compute_program(), &col_a, &col_b);
     count::perf_probe_count(&col_a, &col_b);
+
+    // Two-bank de-risk: int virt-array + float virt-array in one state.
+    let tb_primary = twobank::run_gate("count-ge", 200_000, &col_a, &col_b);
+    let tb_resume = twobank::run_gate("count-ge-resume", 200_017, &col_a, &col_b);
+    assert_ne!(tb_primary, tb_resume, "twobank: distinct lengths");
+    twobank::perf_probe(&col_a, &col_b);
+
     black_box(col_a);
     black_box(col_b);
 }
