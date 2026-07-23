@@ -34,8 +34,12 @@ use indexmap::IndexMap;
 // 1:1 invariant that `pyjitpl.py:2230 setup_insns` enforces.
 pub const BC_CAST_FLOAT_TO_INT: u8 = 0;
 pub const BC_ARRAYLEN_GC: u8 = 1;
-// (slot 2 free — `BC_ARRAYLEN_VABLE` already pinned at byte 74
-//  in the vable group.)
+/// RPython `blackhole.py:531-533` `bhimpl_int_is_true(a) -> !!a` — the
+/// boolean-coercion of an int, produced by a `Bool` exitswitch source
+/// that is read before the branch rather than fused into
+/// `goto_if_not_int_is_true`. Takes slot 2 (was free; `BC_ARRAYLEN_VABLE`
+/// is pinned at byte 74 in the vable group).
+pub const BC_INT_IS_TRUE: u8 = 2;
 pub const BC_GETINTERIORFIELD_GC_I: u8 = 3;
 pub const BC_GETINTERIORFIELD_GC_R: u8 = 4;
 pub const BC_GETINTERIORFIELD_GC_F: u8 = 5;
@@ -833,6 +837,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_ge/ii>i", BC_INT_GE);
     m.insert("int_neg/i>i", BC_INT_NEG);
     m.insert("int_invert/i>i", BC_INT_INVERT);
+    m.insert("int_is_true/i>i", BC_INT_IS_TRUE);
     m.insert("uint_rshift/ii>i", BC_UINT_RSHIFT);
     m.insert("uint_mul_high/ii>i", BC_UINT_MUL_HIGH);
     m.insert("uint_lt/ii>i", BC_UINT_LT);

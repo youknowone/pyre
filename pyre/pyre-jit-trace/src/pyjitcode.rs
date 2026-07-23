@@ -964,54 +964,80 @@ impl PyJitCode {
     pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject) -> Self {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
-            PyJitCodeMetadata {
-                forward_py_pc_marker_by_jit_pc: Vec::new(),
-                forward_py_pc_pred_by_jit_pc: Vec::new(),
-                after_residual_call_resume_marker_by_jit_pc: Vec::new(),
-                after_residual_call_resume_pred_by_jit_pc: Vec::new(),
-                n_py_instrs: 0,
-                block_head_py_by_jit_pc: Vec::new(),
-                py_floor_by_jit_pc: Vec::new(),
-                merge_entry_by_green: Vec::new(),
-                pcdep_by_jit_pc: Vec::new(),
-                depth_pred_by_jit_pc: Vec::new(),
-                depth_trivia_marker_by_jit_pc: Vec::new(),
-                depth_trivia_pred_by_jit_pc: Vec::new(),
-                depth_containing_by_jit_pc: Vec::new(),
-                depth_block_head_by_jit_pc: Vec::new(),
-                pcdep_trivia_marker_by_jit_pc: Vec::new(),
-                pcdep_trivia_pred_by_jit_pc: Vec::new(),
-                const_ref_trivia_marker_by_jit_pc: Vec::new(),
-                const_ref_trivia_pred_by_jit_pc: Vec::new(),
-                result_color_trivia_marker_by_jit_pc: Vec::new(),
-                result_color_trivia_pred_by_jit_pc: Vec::new(),
-                resume_marker_marker_by_jit_pc: Vec::new(),
-                resume_marker_pred_by_jit_pc: Vec::new(),
-                after_residual_marker_marker_by_jit_pc: Vec::new(),
-                after_residual_marker_pred_by_jit_pc: Vec::new(),
-                result_color_after_residual_marker_by_jit_pc: Vec::new(),
-                result_color_after_residual_pred_by_jit_pc: Vec::new(),
-                depth_after_residual_marker_by_jit_pc: Vec::new(),
-                depth_after_residual_pred_by_jit_pc: Vec::new(),
-                after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
-                after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
-                // Encoder/decoder readers in
-                // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
-                // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both
-                // values together. A real `0` here would alias every locals-
-                // bank color 0 read and silently substitute `sym.frame` for
-                // unrelated locals/stack slots.
-                portal_frame_reg: u16::MAX,
-                portal_ec_reg: u16::MAX,
-                built_as_portal: false,
-                stack_base: 0,
-                max_stackdepth: 0,
-                has_color_map: false,
-                const_ref_slots_by_jit_pc: Vec::new(),
-                is_drained: false,
-            },
+            PyJitCodeMetadata::degenerate(),
             code_ptr,
             false,
         )
+    }
+
+    /// Wrap an already-populated runtime `JitCode` core with a degenerate
+    /// (identity/empty) `PyJitCodeMetadata`.  For a build-time-extracted
+    /// interpreter portal (e.g. jd1's `_unpackiterable_unknown_length`) whose
+    /// CPython-pc↔jitcode-pc translation tables are degenerate and, on the
+    /// jd1 `compile_loop`/resume path, read by no consumer — only
+    /// `frame_value_count_at` runs, off the byte stream + `liveness_info`.
+    /// Unlike [`skeleton`], the core carries real code so its `-live-`
+    /// coordinates decode.
+    pub fn from_core_degenerate(
+        jitcode: std::sync::Arc<RuntimeJitCode>,
+        code_ptr: *const pyre_interpreter::CodeObject,
+        has_abort: bool,
+    ) -> Self {
+        Self::from_parts(jitcode, PyJitCodeMetadata::degenerate(), code_ptr, has_abort)
+    }
+}
+
+impl PyJitCodeMetadata {
+    /// The identity/empty metadata: all `*_by_jit_pc` translation tables empty,
+    /// `portal_frame_reg`/`portal_ec_reg` at the `u16::MAX` sentinel (a real `0`
+    /// would alias locals-bank color 0), every scalar zero/false.  Shared by
+    /// [`PyJitCode::skeleton`] and [`PyJitCode::from_core_degenerate`].
+    pub fn degenerate() -> Self {
+        PyJitCodeMetadata {
+            forward_py_pc_marker_by_jit_pc: Vec::new(),
+            forward_py_pc_pred_by_jit_pc: Vec::new(),
+            after_residual_call_resume_marker_by_jit_pc: Vec::new(),
+            after_residual_call_resume_pred_by_jit_pc: Vec::new(),
+            n_py_instrs: 0,
+            block_head_py_by_jit_pc: Vec::new(),
+            py_floor_by_jit_pc: Vec::new(),
+            merge_entry_by_green: Vec::new(),
+            pcdep_by_jit_pc: Vec::new(),
+            depth_pred_by_jit_pc: Vec::new(),
+            depth_trivia_marker_by_jit_pc: Vec::new(),
+            depth_trivia_pred_by_jit_pc: Vec::new(),
+            depth_containing_by_jit_pc: Vec::new(),
+            depth_block_head_by_jit_pc: Vec::new(),
+            pcdep_trivia_marker_by_jit_pc: Vec::new(),
+            pcdep_trivia_pred_by_jit_pc: Vec::new(),
+            const_ref_trivia_marker_by_jit_pc: Vec::new(),
+            const_ref_trivia_pred_by_jit_pc: Vec::new(),
+            result_color_trivia_marker_by_jit_pc: Vec::new(),
+            result_color_trivia_pred_by_jit_pc: Vec::new(),
+            resume_marker_marker_by_jit_pc: Vec::new(),
+            resume_marker_pred_by_jit_pc: Vec::new(),
+            after_residual_marker_marker_by_jit_pc: Vec::new(),
+            after_residual_marker_pred_by_jit_pc: Vec::new(),
+            result_color_after_residual_marker_by_jit_pc: Vec::new(),
+            result_color_after_residual_pred_by_jit_pc: Vec::new(),
+            depth_after_residual_marker_by_jit_pc: Vec::new(),
+            depth_after_residual_pred_by_jit_pc: Vec::new(),
+            after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
+            after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
+            // Encoder/decoder readers in `get_list_of_active_boxes`,
+            // `regalloc::external/input_indices`, and
+            // `setup_bridge_sym::portal_red_regs_at` sentinel-skip both values
+            // together. A real `0` here would alias every locals-bank color 0
+            // read and silently substitute `sym.frame` for unrelated
+            // locals/stack slots.
+            portal_frame_reg: u16::MAX,
+            portal_ec_reg: u16::MAX,
+            built_as_portal: false,
+            stack_base: 0,
+            max_stackdepth: 0,
+            has_color_map: false,
+            const_ref_slots_by_jit_pc: Vec::new(),
+            is_drained: false,
+        }
     }
 }

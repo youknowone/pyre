@@ -5724,6 +5724,44 @@ pub fn make_field_descr(
     Arc::new(SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_flag(flag))
 }
 
+/// Create a field descriptor whose `parent_descr` back-references an existing
+/// SizeDescr, for a field whose bare name is absent from that struct's
+/// flattened `all_fielddescrs`.  This is the inline-enum-discriminant case: the
+/// getfield names the enclosing Rust field (e.g. `strategy`) and bakes the
+/// absolute byte offset, whereas the flattened layout only carries the embedded
+/// variant's `__discriminant` at its sub-struct-relative offset, so the
+/// by-name group lookup misses.  The getfield's own offset/index_in_parent are
+/// authoritative; wiring them to the containing struct's SizeDescr restores the
+/// `descr.py:238 FieldDescr.parent_descr` invariant that
+/// `OptContext::ensure_ptr_info_arg0` (`optimizer.py:478`) requires.
+///
+/// `parent` must be a cache-owned `DescrRef` (kept alive process-wide) so the
+/// stored `Weak` upgrades; a transient group-local Arc would dangle after the
+/// caller drops it.
+pub fn make_field_descr_with_parent(
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    flag: ArrayFlag,
+    index_in_parent: usize,
+    name: String,
+    parent: &DescrRef,
+) -> DescrRef {
+    let parent_weak: Weak<dyn Descr> = Arc::downgrade(parent);
+    let mut fd = SimpleFieldDescr::new_with_name(
+        index_in_parent as u32,
+        offset,
+        field_size,
+        field_type,
+        false,
+        flag,
+        name,
+    );
+    fd.index_in_parent = index_in_parent;
+    fd.parent_descr = Some(parent_weak);
+    Arc::new(fd)
+}
+
 /// Create a field descriptor with explicit index and immutability.
 pub fn make_field_descr_full(
     index: u32,

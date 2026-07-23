@@ -4522,6 +4522,39 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // A zero-field unit-struct `const` (the `unpackiterable_driver`
+                // JitDriver, baseobjspace.py:29) is inlined and has no
+                // registered address, so `static_addr_op` returned `None` and
+                // the addressed-singleton arm above declined.  The driver
+                // receiver of a `jit_merge_point` marker is erased to a `Void`
+                // constant at rtyping and to a `Signed` jitdriver index before
+                // the trace runs (`jtransform.py:1704`); `OpKind::Call` operands
+                // are Variables, so the receiver still materialises as a
+                // Variable the marker rewrite strips (autoreds redvar
+                // subtraction + `args.split_first()`).  Emit a single non-null
+                // sentinel `ConstRefAddr` — the same one-ref-result shape a
+                // 0-arg accessor call would have, but without the residual call
+                // whose funcptr constant degrades to a `symbolic_fnaddr_for_path`
+                // hash that SIGBUSes at trace time.  Deliberately NOT the
+                // `__pyre_cast_instance` narrowing the addressed siblings use:
+                // its extra cast Variable shifts the loop's ref-register
+                // allocation so a merge-point red lands past `num_regs_r`
+                // (seed-time out-of-bounds in `trace_jitcode_from_merge_point`).
+                // The receiver is stripped, so its `SomePtr` typing is never
+                // unioned downstream; the sentinel is non-null so it never
+                // trips the offset-0 null-Ref wasm silent-miscompile class.
+                if self.refs_static_zerofield_struct_root(&place_ty).is_some() {
+                    const ZEROFIELD_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ConstRefAddr(ZEROFIELD_NAMEDCONST_SENTINEL_ADDR),
+                    });
+                    return Ok(res);
+                }
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.static_int_value_op(&segments))

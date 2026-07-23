@@ -176,7 +176,36 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         let fd: majit_ir::DescrRef = fd;
                         return (*offset, fd);
                     }
-                    let _ = index_in_parent;
+                    // Name-miss: the getfield names a Rust field (e.g.
+                    // `strategy`) that the flattened layout represents under a
+                    // different name — an inline enum's `__discriminant` at its
+                    // sub-struct-relative offset — so the by-name lookup finds
+                    // nothing.  The getfield's own baked offset is the
+                    // authoritative absolute offset; wire it to the containing
+                    // struct's cache-owned SizeDescr so the FieldDescr satisfies
+                    // `descr.py:238 get_parent_descr()` for
+                    // `ensure_ptr_info_arg0` (`optimizer.py:478`) instead of
+                    // falling to the parentless placeholder.
+                    let parent_size = majit_ir::descr::gc_cache()
+                        .lock()
+                        .unwrap()
+                        ._cache_size
+                        .get(&struct_key)
+                        .cloned();
+                    if let Some(parent_size) = parent_size {
+                        return (
+                            *offset,
+                            majit_ir::descr::make_field_descr_with_parent(
+                                *offset,
+                                *field_size,
+                                *field_type,
+                                *field_flag,
+                                *index_in_parent,
+                                name.clone(),
+                                &parent_size,
+                            ),
+                        );
+                    }
                 }
             }
             (
@@ -2968,18 +2997,48 @@ where
                     let frame = self.frames.current_mut();
                     frame.read_getfield_gc()
                 };
-                let (offset, fielddescr) = {
+                let (offset, field_size, is_field_signed, fielddescr) = {
                     let frame = self.frames.current_mut();
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                         panic!("BC_GETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
                     });
-                    field_descr_ref_from_bh(bh)
+                    let (field_size, is_field_signed) = match bh {
+                        crate::blackhole::BhDescr::Field {
+                            field_size,
+                            is_field_signed,
+                            ..
+                        } => (*field_size, *is_field_signed),
+                        _ => (8, false),
+                    };
+                    let (offset, fielddescr) = field_descr_ref_from_bh(bh);
+                    (offset, field_size, is_field_signed, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
-                let loaded = if struct_ptr != 0 {
+                // blackhole.py:1432-1443 reads the field through the fielddescr,
+                // which carries the field's byte width; a sub-word integer field
+                // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
+                // width, not as a full word — otherwise adjacent bytes leak into
+                // the value. Ref fields are always word-sized pointers.
+                let loaded = if struct_ptr == 0 {
+                    0
+                } else if is_ref {
                     unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
                 } else {
-                    0
+                    let addr = (struct_ptr as usize).wrapping_add(offset);
+                    unsafe {
+                        match (field_size, is_field_signed) {
+                            (1, true) => core::ptr::read_unaligned(addr as *const i8) as i64,
+                            (1, false) => core::ptr::read_unaligned(addr as *const u8) as i64,
+                            (2, true) => core::ptr::read_unaligned(addr as *const i16) as i64,
+                            (2, false) => core::ptr::read_unaligned(addr as *const u16) as i64,
+                            (4, true) => core::ptr::read_unaligned(addr as *const i32) as i64,
+                            (4, false) => core::ptr::read_unaligned(addr as *const u32) as i64,
+                            // A non-{1,2,4,8}-byte integer field has no
+                            // fixed-width primitive read; fall back to the
+                            // word-sized read (the pre-sized-read behavior).
+                            _ => core::ptr::read_unaligned(addr as *const i64),
+                        }
+                    }
                 };
                 if !is_ref && ctx.is_bridge_trace && crate::heapdbg_enabled() {
                     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3397,6 +3456,60 @@ where
                 };
                 self.set_ref_reg(dst, Some(opref), Some(concrete));
             }
+            // blackhole.py:1350-1358 bhimpl_setarrayitem_gc_{i,r,f}: record
+            // SetarrayitemGc (a single op-kind whose descr carries the item
+            // type) and write the element through the live array data ptr —
+            // the store side effect is the actual write for this iteration
+            // (mirrors BC_SETFIELD_GC / BC_RAW_STORE_I). Encoding
+            // `riid`/`rird`/`rifd`: [array:u8][index:u8][value:u8][descr:u16].
+            jitcode::insns::BC_SETARRAYITEM_GC_I
+            | jitcode::insns::BC_SETARRAYITEM_GC_R
+            | jitcode::insns::BC_SETARRAYITEM_GC_F => {
+                let (array_reg, index_reg, value_reg, descr_idx) = {
+                    let frame = self.frames.current_mut();
+                    let array_reg = frame.next_u8() as usize;
+                    let index_reg = frame.next_u8() as usize;
+                    let value_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    (array_reg, index_reg, value_reg, descr_idx)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((base_size, itemsize, _is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
+                let (index_opref, index_value) = self.read_int_reg(index_reg);
+                let (value_opref, value_concrete) = match bytecode {
+                    jitcode::insns::BC_SETARRAYITEM_GC_R => self.read_ref_reg(value_reg),
+                    jitcode::insns::BC_SETARRAYITEM_GC_F => self.read_float_reg(value_reg),
+                    _ => self.read_int_reg(value_reg),
+                };
+                ctx.record_op_with_descr(
+                    OpCode::SetarrayitemGc,
+                    &[array_opref, index_opref, value_opref],
+                    descr,
+                );
+                if array_addr != 0 {
+                    let item_addr = (array_addr as usize)
+                        .wrapping_add(base_size)
+                        .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+                    unsafe {
+                        match itemsize {
+                            1 => *(item_addr as *mut u8) = value_concrete as u8,
+                            2 => *(item_addr as *mut u16) = value_concrete as u16,
+                            4 => *(item_addr as *mut u32) = value_concrete as u32,
+                            8 => *(item_addr as *mut i64) = value_concrete,
+                            other => {
+                                panic!("BC_SETARRAYITEM_GC: unsupported itemsize {other}")
+                            }
+                        }
+                    }
+                }
+            }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
                     let frame = self.frames.current_mut();
@@ -3620,6 +3733,7 @@ where
             jitcode::insns::BC_UINT_GE => self.trace_binop_i(ctx, OpCode::UintGe),
             jitcode::insns::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
             jitcode::insns::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
+            jitcode::insns::BC_INT_IS_TRUE => self.trace_unary_i(ctx, OpCode::IntIsTrue),
             jitcode::insns::BC_PTR_EQ => self.trace_binop_r_to_i(ctx, OpCode::PtrEq),
             jitcode::insns::BC_PTR_NE => self.trace_binop_r_to_i(ctx, OpCode::PtrNe),
             jitcode::insns::BC_INSTANCE_PTR_EQ => {
@@ -4244,7 +4358,24 @@ where
                 // A seen>=0 (or `no_loop_header` auto-stamped) depth>0 merge
                 // point falls through into the close protocol at the else-branch
                 // cut below (pyjitpl.py:1579-1602).
-                let no_loop_header = ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header;
+                // pyjitpl.py:1547 `jitdriver_sd =
+                // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
+                // owning driver's `no_loop_header`.  Upstream this is the same
+                // object as the elected `self.metainterp.jitdriver_sd` because
+                // the op's `jdindex` indexes `jitdrivers_sd` directly.  Pyre's
+                // production setup pushes an empty `ensure_default_driver_sd`
+                // placeholder at `jitdrivers_sd[0]`, shifting the real drivers to
+                // 1+, so a merge-point op whose build-time `jdindex` predates the
+                // placeholder can land on a neighbouring slot (the second portal
+                // driver's op carries `jdindex` = its build index, one slot below
+                // its runtime position).  Prefer the elected trace-owner
+                // descriptor (`ctx.driver_descriptor()` = `metainterp.jitdriver_sd`)
+                // so `no_loop_header` reflects the driver actually being traced;
+                // fall back to the op-indexed slot when no descriptor was elected.
+                let no_loop_header = ctx
+                    .driver_descriptor()
+                    .map(|d| d.no_loop_header)
+                    .unwrap_or_else(|| ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header);
                 if ctx.inline_depth() > 0
                     && self.seen_loop_header_for_jdindex < 0
                     && !no_loop_header

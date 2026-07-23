@@ -4789,6 +4789,23 @@ fn drive_unpack_iterable_trace(
     // pool installed above (`descr_at`).
     let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
 
+    // Register the drain (a build-time portal jitcode carrying its baked
+    // absolute `JitCode::index`) into the thread-local
+    // `MetaInterpStaticData.jitcodes` at exactly that index, so `compile_loop`'s
+    // resume reconstruction resolves each recorded frame's `jitcode_index` to
+    // the drain body rather than a stale runtime slot.  The jd1 resume path
+    // reads no `PyJitCodeMetadata` field (only the byte stream + build-time
+    // `liveness_info`), so a degenerate metadata suffices.
+    {
+        let drain_index = jitcode.try_index().unwrap_or(0);
+        let payload = std::sync::Arc::new(pyre_jit_trace::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(jitcode.clone()),
+            std::ptr::null(),
+            /* has_abort */ false,
+        ));
+        pyre_jit_trace::state::install_build_time_jitcode_at(drain_index, payload);
+    }
+
     // Diagnostic: dump the extracted jd1 body's op layout (pc / opname /
     // argcodes / raw operand bytes) so the merge-point register operands are
     // visible for wiring the merge-point trace entry. Returns before any

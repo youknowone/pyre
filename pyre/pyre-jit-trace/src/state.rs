@@ -632,6 +632,53 @@ pub fn install_jitcode_for(
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, Some(payload)) as *const ())
 }
 
+/// Install a build-time (code_ptr-less) portal jitcode into the thread-local
+/// `MetaInterpStaticData.jitcodes` at a FIXED absolute `index`, growing the
+/// store with skeleton placeholders as needed and overwriting any occupant of
+/// `index`.
+///
+/// Unlike [`install_jitcode_for`] (which appends at `len()` and stamps a fresh
+/// slot), this honours the jitcode's baked absolute `JitCode::index` — a
+/// build-time interpreter portal (jd1's `_unpackiterable_unknown_length`,
+/// index 0) carries that index in its serialized `OnceLock`, and a resume frame
+/// records it verbatim (`dispatch.rs` `frame.jitcode.try_index()`).  For the
+/// resume decoders to resolve `sd.jitcodes[index]` to the portal, it must sit
+/// at exactly that slot.
+///
+/// The build-time absolute index space and the runtime-grown user-PyCode slot
+/// space collide here (both start at 0): overwriting `index` clobbers whatever
+/// user jitcode last took that slot.  This is sound only while the jd1
+/// experiment's overwritten slot holds a jitcode with no live resume data (the
+/// import-time `_get_exports_list` at slot 0 is dead by the time user code
+/// drives jd1).  Reconciling the two index spaces into one absolute table is
+/// the standing follow-up.
+pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate::PyJitCode>) {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let mut sd = r.borrow_mut();
+        while sd.jitcodes.len() < index {
+            let i = sd.jitcodes.len() as i32;
+            let skeleton = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
+            skeleton.jitcode.set_index(i as usize);
+            sd.jitcodes.push(Box::new(JitCode {
+                index: i,
+                payload: skeleton,
+            }));
+        }
+        // Idempotent same-value stamp: the portal core already carries `index`.
+        payload.jitcode.set_index(index);
+        let slot = Box::new(JitCode {
+            index: index as i32,
+            payload,
+        });
+        if index < sd.jitcodes.len() {
+            sd.jitcodes[index] = slot;
+        } else {
+            sd.jitcodes.push(slot);
+        }
+    });
+}
+
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
