@@ -721,7 +721,6 @@ impl ExecutionContext {
     }
 
     pub fn sys_exc_info(&self, _for_hidden: bool) -> PyObjectRef {
-        let _ = self.gettopframe();
         let _ = _for_hidden;
         if !self.sys_exc_value.is_null() {
             return self.sys_exc_value;
