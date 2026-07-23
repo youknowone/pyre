@@ -1,4 +1,4 @@
-# gh#495 guard: ForIterNext exemption double-advance is masked by fbw_abort_nested_unjournaled_residual; +1 reproduces under PYRE_FBW_NESTED_RESID_ABORT=0
+# gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).
 # Post-inner declining residual forces abort while inner item in-flight.

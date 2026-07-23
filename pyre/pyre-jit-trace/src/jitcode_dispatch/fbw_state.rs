@@ -95,148 +95,7 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
 
-/// `PYRE_FBW_INLINE_MULTIFRAME` (#68): inline branch-bearing callees with a
-/// multi-frame guard snapshot instead of declining them to interpretation
-/// (`LoopBearingCalleeInlineUnsupported`).  Default-on; `PYRE_FBW_INLINE_MULTIFRAME=0`
-/// (or `false`) is the rollback escape hatch.  The multi-frame snapshot
-/// encode↔decode contract for walker-emitted callee-frame guards is validated
-/// byte-exact (function_calls + corpus) on both backends.
-pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_MULTIFRAME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_NSVABLE_MULTIFRAME` (#73): publish the `_nonstandard_virtualizable`
-/// promote guard through the full multi-frame resume chain (each paused caller
-/// plus the callee's own coordinate) instead of the single-frame sentinel
-/// collapse in [`walker_capture_inline_nonstandard_vable_guard`], which cannot
-/// resolve a JitCode resume word and unconditionally aborts every inline
-/// sub-walk emit of this guard.  Default-on; `PYRE_FBW_NSVABLE_MULTIFRAME=0`
-/// (or `false`) restores the sentinel decline as the rollback escape hatch.
-pub(crate) fn fbw_nsvable_multiframe_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_NSVABLE_MULTIFRAME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_REC_MULTIFRAME` (default ON; `=0`/`false` opts out): route
-/// primary-trace self-recursive Python calls through the multiframe inline path
-/// while below `PYRE_FBW_MULTIFRAME_DEPTH`, instead of folding immediately to
-/// the recursive portal `CALL_ASSEMBLER`.
-///
-/// RPython parity: `opimpl_recursive_call` / `do_recursive_call`
-/// (`pyjitpl.py`) inline within `max_unroll_recursion`; only once the
-/// cap is reached does recursion fall back to the assembler-call path.  The
-/// prior fold-only default (every self-recursive call cut straight to
-/// `CALL_ASSEMBLER`) was the pyre deviation; inlining below the depth bound is
-/// the parity behavior, so this is default-on.  The depth bound
-/// (`fbw_max_multiframe_depth`, default 1) still caps how deep the inline
-/// unrolls before falling back to `CALL_ASSEMBLER`.
-pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MULTIFRAME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_BRIDGE_REC_INLINE` (default ON) — on a plain root bridge walk,
-/// lift the bridge-trace decline that keeps an exact-integer arithmetic callee a
-/// single residual call, letting the bridge inline one self-recursive level
-/// exactly as a primary trace does: the call falls through to the self-recursive
-/// unroll gate and the multiframe seed instead of returning a residual.  The
-/// miscompile hazard it admits — a bridge-inlined int-binop callee's second
-/// virtual frame operand stack has no red bridge input, so an overflow/exception
-/// resume path can leave a NULL vable stack slot — is contained by the
-/// seed-success precondition plus the `n_parents == n_callees` snapshot valve
-/// fallbacks.  A/B across the bench corpus is byte-parity clean and adds no
-/// `loops_aborted` or `internal_compile_panics`; fib_recursive gains one inlined
-/// bridge (guard_failures 407 -> 406, bridges_compiled 2 -> 3) for a ~10% win.
-/// `=0`/`false` opts back out.
-pub(crate) fn fbw_bridge_rec_inline_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BRIDGE_REC_INLINE") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// Full-portal recursive-call cutover (`PYRE_FBW_REC_MUTUAL_CUTOVER`): at the
-/// inline-unroll cap, route a recursive callee (self OR mutual) through
-/// `get_assembler_token` → `compile_tmp_callback` (warmstate.py,
-/// compile.py) so a not-yet-compiled callee still enters via a real
-/// CALL_ASSEMBLER tmp-callback token instead of poisoning the trace with
-/// `LoopBearingCalleeInlineUnsupported`.  Mirrors the `build_jit_driver_pair`
-/// gate of the same name (eval.rs); default ON, `=0` opts out.
-pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_LOOP_CALLEE_CA` (general loop-bearing-callee →
-/// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
-/// callee's own `jit_merge_point` and a compiled loop token already exists
-/// for that green key, emit a `CALL_ASSEMBLER` into it (mirror of
-/// `opimpl_recursive_call_assembler`) instead of declining the enclosing
-/// trace (`JitMergePointGreenKeyUnresolved`). Default-ON;
-/// `=0`/`false` opts out.
-///
-/// The default-ON flip rides the same CALL_ASSEMBLER / residual-executor /
-/// virtualizable machinery already shipping default-ON through the
-/// self-recursive arm ([`try_walker_call_assembler_self_recursive`],
-/// `PYRE_FBW_REC_CA` default-ON). The only extension here is the callee
-/// frame shape: a multi-frame inline frame built by
-/// `emit_new_pyframe_inline_with_params` that can hold Ref locals, vs the
-/// self-recursive arm's int-only `emit_new_pyframe_inline_self_recursive`
-/// frame. A four-lens GC-rooting audit established the two frame builders are
-/// content-agnostically rooted identically — same `pyframe_size_descr()`,
-/// same `pyobject_gcarray_descr()` locals array, same malloc-then-store
-/// ordering, the materialized virtualizable frame is JUMP-loop-carried so its
-/// slot is in every inner residual-call gcmap (`get_gcmap`), and the runtime
-/// `PyFrame`/array GC type registration traces frame->array->elements with no
-/// int-vs-ref branch anywhere. A historical GC-stress SEGV (a freed,
-/// not-forwarded receiver under nursery pressure) reproduced only on
-/// layout-shifting diagnostic-probe builds; on clean binaries it does not
-/// reproduce across the GC-stress matrix (r1/r5/r6/r2/r4 × nursery
-/// {default,1M,256K,64K,16K,4K} × dynasm+x86, all clean) — consistent with a
-/// diagnostic-build layout artifact, and content-agnostic rooting rules out a
-/// ref-specific defect in this chain.
-pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOOP_CALLEE_CA") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of
-/// [`fbw_loop_callee_ca_enabled`]. When on, the loop-callee
+/// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of the loop-callee
 /// CALL_ASSEMBLER passes the callee's loop-carried locals as scalar
 /// CALL_ASSEMBLER args plus a `VableExpansion` (`arg_overrides` mapping each
 /// scalar to a callee jitframe slot), so the optimizer can elide the per-call
@@ -257,131 +116,6 @@ pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_RAISE` (default ON) — the FBW walker owns the Python raise/except
-/// loop.  The twin NULL-ref guards exempt the trailing `cause` sentinel of a
-/// [`PyreHelperKind::RaiseVarargs`] residual so the walker records the raise.
-/// Now that the trait tracer is retired, declining instead
-/// re-interprets without JIT (a hot raise/except loop would time out), so the
-/// walker must own the raise path; `PYRE_FBW_RAISE=0` opts back to declining.
-pub(crate) fn fbw_raise_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_RAISE") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_BUILTIN_FOLD` (default ON) — gates the LOAD_GLOBAL cell fold's
-/// reachability inside handler-bearing bodies and its builtins-fallback arm.
-/// When ON, `dispatch_residual_call_iRd_kind` attempts
-/// [`try_walker_load_global_cell_fold`] even when the body contains a
-/// `catch_exception` (the fold emits an `ElidableCannotRaise` lookup so the
-/// dropped `GUARD_NO_EXCEPTION` is moot for a SUCCESSFUL fold — a declined
-/// fold keeps the residual+guard), and the fold resolves names absent from
-/// the module dict through `frame.get_builtin()` (e.g. `raise ValueError` /
-/// `except ValueError`).  `PYRE_FBW_BUILTIN_FOLD=0` restores the legacy
-/// handler-free-only behavior.
-pub(crate) fn fbw_builtin_fold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BUILTIN_FOLD") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_LOADATTR_FOLD` — gate the full-body-walker LOAD_ATTR fast path
-/// ([`try_walker_specialize_load_attr`]).  When on, a monomorphic plain
-/// instance-attribute read folds to guards + inline storage read instead of the
-/// opaque `getattr_fn` residual.  Default ON (`0`/`false` opts out as the kill
-/// switch); verified byte-exact on synth dynasm + cranelift and GC-soak clean
-/// under `PYPY_GC_NURSERY=131072` on instance-heavy benches.
-pub(crate) fn fbw_loadattr_fold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOADATTR_FOLD") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_STOREATTR_FOLD` — gate the full-body-walker STORE_ATTR fast path
-/// ([`try_walker_specialize_store_attr`]).  When on, a plain same-type unboxed
-/// integer store folds to guards + a non-forcing raw longlong-list write
-/// instead of the forcing `setattr_fn` residual (dropping the force token,
-/// vable spill, and the value re-box).  Default ON (`0`/`false` opts out as the
-/// kill switch, independent of the read fold since the write executes a
-/// concrete heap mutation).
-pub(crate) fn fbw_storeattr_fold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STOREATTR_FOLD") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_LOADMETHOD_FOLD` — gate the full-body-walker method-cache fold.
-/// When on, a monomorphic `obj.method(...)` dispatch folds the LOAD_ATTR
-/// method lookup to a constant descriptor plus guards, and folds the paired
-/// `load_method_self` residual to its constant binding decision.  Default ON;
-/// `0`/`false` opts out as the kill switch.
-pub(crate) fn fbw_loadmethod_fold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOADMETHOD_FOLD") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_DELETE_FAST` — gate the full-body-walker DELETE_FAST lowering.
-/// Default ON; `0`/`false` opts back into the existing `abort_permanent`
-/// marker fallback for unsupported shapes.
-pub(crate) fn fbw_delete_fast_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_DELETE_FAST") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_INLINE_NSFOLD` (default ON) — gates resolving an inlined callee's
-/// `getfield_vable_r` namespace(idx5)/pycode(idx1) read from the callee's
-/// compile-time [`InlineCalleeConsts`] on the MULTIFRAME path (seeded virtual
-/// frame), not just the strict path (unseeded frame).  Without it, the seeded
-/// virtual frame's vable read misses the heapcache forward — the codewriter's
-/// per-fn vable descr identity differs from the seeding descr
-/// (`pyframe_w_globals_obj_descr`) — and records a non-const `GetfieldGcR`,
-/// leaving the LOAD_GLOBAL fold's namespace operand non-concrete so a
-/// loop-bearing inlined callee's `load_global` (e.g. nbody `advance()`'s
-/// `len(bodies)`) stays a residual that the nested-unjournaled-residual abort
-/// declines.  `=0` restores the strict-path-only behavior.
-pub(crate) fn fbw_inline_nsfold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_NSFOLD") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 /// `PYRE_FBW_CALLEE_VSTACK` (default OFF) — maintain a callee-local
 /// operand-stack mirror while walking an inline sub-call.  The callee enters
 /// with an empty operand stack; subsequent boundaries must use the active
@@ -397,31 +131,13 @@ pub(crate) fn fbw_callee_vstack_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_STACK_LIVEREG` (default ON) — for branch-guard operand-stack
-/// snapshot slots, prefer the live Ref register (`pyjitpl.py`
-/// `get_list_of_active_boxes` reads `self.registers_r[index]`) when the
-/// guard PC's per-PC color map proves that color owns the same stack slot.
-/// `=0` restores the shadow-first pyre-local order everywhere.
-pub(crate) fn fbw_stack_livereg_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STACK_LIVEREG") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 thread_local! {
-    /// Finish payload stashed by a top-level `*_return` arm under the
-    /// `PYRE_FBW_CALL_ASSEMBLER` gate, read back by
+    /// Finish payload stashed by a top-level `*_return` arm, read back by
     /// [`crate::trace::full_body_walk_trace`] to build a
     /// `TraceAction::Finish` for a loop-free (Finish-terminated) portal.
     ///
     /// `(finish_value, finish_arg_type)` — the re-boxed return value and
-    /// its `Type::Ref` portal-exit type.  `None` outside the gated path,
-    /// so the default-off walk maps `Terminate -> Abort` exactly as before.
+    /// its `Type::Ref` portal-exit type.
     /// Reset at the start of every walk (`fbw_finish_payload_reset`) so a
     /// stale payload from a prior aborted walk cannot leak into this one.
     static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
@@ -490,26 +206,6 @@ thread_local! {
     /// and the interpreter would replay the executed mutation.
     static FBW_EXECUTED_BODY_RESIDUAL: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-}
-
-/// Whether the Finish-portal compile route is enabled.  Cached so
-/// the per-`*_return` read and the `full_body_walk_trace` read see a
-/// single consistent value.  Default ON; `PYRE_FBW_CALL_ASSEMBLER=0` opts
-/// back into the pre-Finish-portal path (bare
-/// `Terminate` -> `Abort`) as a transition escape hatch.
-pub(crate) fn fbw_call_assembler_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_CALL_ASSEMBLER").as_deref() != Ok("0"))
-}
-
-/// Whether the no-replay portal exit is enabled (a loop-free function
-/// trace that reached `done_with_this_frame` returns its captured concrete
-/// result directly instead of re-running the freshly compiled trace for
-/// the SAME invocation).  Default ON; `PYRE_FBW_NO_REPLAY_EXIT=0` opts
-/// back into the legacy `ContinueRunningNormally` replay for bisection.
-pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_NO_REPLAY_EXIT").as_deref() != Ok("0"))
 }
 
 /// Arm/disarm the bridge `Terminate` no-replay shortcut for the next walk
@@ -674,11 +370,11 @@ pub(crate) fn fbw_store_journal_reset() {
     // clears the per-entry body-effect signal so a prior walk's committed
     // mutation cannot block this walk's delivery.
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
-    // B3 (`PYRE_FBW_RAISE`): drop any inline-built-exception OpRef keys a
+    // B3: drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
     FBW_BUILT_EXC.with(|s| s.borrow_mut().clear());
-    // B3 (`PYRE_FBW_RAISE`): drop any unbalanced PUSH_EXC_INFO prev saves a
+    // B3: drop any unbalanced PUSH_EXC_INFO prev saves a
     // prior aborted walk left (an exception that propagated out without its
     // POP_EXCEPT restore), so a stale saved-prev cannot be popped by an
     // unrelated POP_EXCEPT in this walk.
@@ -1330,13 +1026,6 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Result<(), DispatchError> {
-    // `PYRE_FBW_NESTED_RESID_ABORT=0` opts back into the prior
-    // (miscompiling) mark-and-replay behavior for A/B.
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var_os("PYRE_FBW_NESTED_RESID_ABORT").as_deref()
-            != Some(std::ffi::OsStr::new("0"))
-    });
     // RPython `do_residual_call` runs the residual executor at any framestack
     // depth (`pyjitpl.py`). Exempt only the self-recursive
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
@@ -1354,10 +1043,9 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // `wasm_ca_trampoline_decline` witness).  Both are properties of the
     // framestack knowable at the residual decline point, so the whole trace
     // aborts before the hazardous body is committed.  Every other nested
-    // residual inlines.  The hazard scan is last so the cheap flag checks
+    // residual inlines.  The hazard scan is last so the cheap checks
     // short-circuit it.
-    if enabled
-        && !in_selfrec_fold
+    if !in_selfrec_fold
         && !in_exception_string_inline
         && !ctx.session.borrow().framestack.is_empty()
         && fbw_inline_callee_hazardous(ctx)

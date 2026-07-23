@@ -54,15 +54,6 @@ fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
 
-/// `PYRE_FBW_DELETE_FAST` gates the walker-native DELETE_FAST lowering.
-/// Default ON; `0`/`false` restores the permanent-abort marker.
-#[inline]
-fn fbw_delete_fast_enabled() -> bool {
-    std::env::var("PYRE_FBW_DELETE_FAST")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-}
-
 /// Re-export of `pyre_jit_trace::pyjitcode::portal_red_pre_regalloc_slots`
 /// so the codewriter pipeline shares the same formula with the
 /// portal-bridge install path in `canonical_bridge.rs`.  See the
@@ -11984,110 +11975,26 @@ impl CodeWriter {
                         }
 
                         Instruction::DeleteFast { var_num } => {
-                            if fbw_delete_fast_enabled() {
-                                let idx = var_num.get(op_arg).as_usize();
-                                let local_slot = local_to_vable_slot(idx) as i64;
-                                let v_idx: super::flow::FlowValue =
-                                    super::flow::Constant::signed(local_slot).into();
-                                let code_const: super::flow::FlowValue =
-                                    super::flow::Constant::new(
-                                        super::flow::ConstantValue::Signed(w_code as i64),
-                                        Some(Kind::Ref),
-                                    )
-                                    .into();
-                                let name_idx_const: super::flow::FlowValue =
-                                    super::flow::Constant::signed(idx as i64).into();
-                                // pyopcode.py:998 DELETE_FAST checks for an
-                                // unbound local before clearing its slot. A
-                                // statically unbound slot therefore raises
-                                // unconditionally and performs no write.
-                                if matches!(
-                                    current_state.local_value_at(idx),
-                                    Some(super::flow::FlowValue::Constant(c))
-                                        if c.value == super::flow::ConstantValue::None
-                                ) {
-                                    let v_li: super::flow::FlowValue =
-                                        super::flow::Constant::signed(py_pc as i64 - 1).into();
-                                    record_graph_op(
-                                        &current_block.block(),
-                                        "setfield_vable_i",
-                                        vable_setfield_int_graph_args(
-                                            frame_var.into(),
-                                            v_li.into(),
-                                            VABLE_LAST_INSTR_FIELD_IDX,
-                                        ),
-                                        None,
-                                        py_pc as i64,
-                                    );
-                                    let exc_value = emit_graph_op_with_result(
-                                        &mut graph,
-                                        &current_block.block(),
-                                        "unbound_local_error",
-                                        vec![code_const.into(), name_idx_const.into()],
-                                        Kind::Ref,
-                                        py_pc as i64,
-                                    );
-                                    let exc_flow: super::flow::FlowValue = exc_value.into();
-                                    emit_raise!(0u16, exc_flow, py_pc as i64, true);
-                                    continue;
-                                }
-                                // The dynamic bound check below splits the
-                                // exception arm explicitly. Its successful
-                                // continuation cannot raise and must not
-                                // receive the generic per-op catch edge.
-                                exception_edge_handled = true;
-                                let idx_u16 = idx as u16;
-                                emit_load_fast_ref!(current_depth, idx_u16, py_pc);
-                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                let is_null = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "ptr_iszero",
-                                    vec![value_value.into()],
-                                    Kind::Int,
-                                    py_pc as i64,
-                                );
-                                current_block.block().borrow_mut().exitswitch =
-                                    Some(super::flow::ExitSwitch::Value(is_null.into()));
-                                let unbound_state = current_state.clone();
-                                let unbound_block = SpamBlockRef::new(
-                                    graph.new_block(Vec::new()),
-                                    Some(unbound_state.clone()),
-                                );
-                                unbound_block.block().borrow_mut().inputargs =
-                                    unbound_state.getvariables();
-                                all_walker_blocks.push(unbound_block.clone());
-                                append_exit(
-                                    &current_block.block(),
-                                    output_link(
-                                        &current_state,
-                                        &unbound_state,
-                                        unbound_block.block(),
-                                    ),
-                                );
-                                set_last_bool_exitcase(&current_block.block(), true);
-                                let bound_state = current_state.clone();
-                                let bound_block = SpamBlockRef::new(
-                                    graph.new_block(Vec::new()),
-                                    Some(bound_state.clone()),
-                                );
-                                bound_block.block().borrow_mut().inputargs =
-                                    bound_state.getvariables();
-                                all_walker_blocks.push(bound_block.clone());
-                                append_exit(
-                                    &current_block.block(),
-                                    output_link(&current_state, &bound_state, bound_block.block()),
-                                );
-                                set_last_bool_exitcase(&current_block.block(), false);
-
-                                // The unbound arm raises before any clear,
-                                // matching pyopcode.py:998 DELETE_FAST. Keep
-                                // last_instr at the deleting instruction so
-                                // exception unwind and deopt share its frame
-                                // coordinate.
-                                current_block = unbound_block;
-                                current_state = unbound_state;
+                            let idx = var_num.get(op_arg).as_usize();
+                            let local_slot = local_to_vable_slot(idx) as i64;
+                            let v_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(local_slot).into();
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(idx as i64).into();
+                            // pyopcode.py:998 DELETE_FAST checks for an
+                            // unbound local before clearing its slot. A
+                            // statically unbound slot therefore raises
+                            // unconditionally and performs no write.
+                            if matches!(
+                                current_state.local_value_at(idx),
+                                Some(super::flow::FlowValue::Constant(c))
+                                    if c.value == super::flow::ConstantValue::None
+                            ) {
                                 let v_li: super::flow::FlowValue =
                                     super::flow::Constant::signed(py_pc as i64 - 1).into();
                                 record_graph_op(
@@ -12110,79 +12017,151 @@ impl CodeWriter {
                                     py_pc as i64,
                                 );
                                 let exc_flow: super::flow::FlowValue = exc_value.into();
-                                emit_raise!(0u16, exc_flow.clone(), py_pc as i64, true);
-                                if let Some(catch_label) =
-                                    catch_for_pc.get(py_pc).copied().flatten()
-                                {
-                                    let site = catch_sites
-                                        .iter()
-                                        .find(|site| site.landing_label == catch_label)
-                                        .expect("catch site for DELETE_FAST raise");
-                                    let link = current_block
-                                        .block()
-                                        .borrow()
-                                        .exits
-                                        .last()
-                                        .cloned()
-                                        .expect("DELETE_FAST raise catch edge");
-                                    carry_explicit_raise_value_on_catch_stack(
-                                        &link,
-                                        &site.landing,
-                                        exc_flow,
-                                    );
-                                }
-
-                                // The bound arm is the continuing block. The
-                                // clear is one PY_NULL write, matching
-                                // pyopcode.py:998 DELETE_FAST's single slot
-                                // assignment after the check succeeds.
-                                current_block = bound_block;
-                                current_state = bound_state;
-                                needs_fallthrough = true;
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "setarrayitem_vable_r",
-                                    vable_setarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        v_idx.into(),
-                                        super::flow::Constant::none().into(),
-                                    ),
-                                    None,
-                                    py_pc as i64,
-                                );
-                                // `framestate.py:105-114 union`: an undefined
-                                // local is `None`, not a Constant(None).  The
-                                // graph-side vable write above still carries
-                                // the runtime PY_NULL sentinel.
-                                current_state.clear_local_value(idx);
-                                // The successful branch egg has now executed
-                                // the clear.  Close it into the next bytecode
-                                // through the ordinary joinpoint machinery,
-                                // exactly as `flowcontext.py:424-475
-                                // mergeblock` closes every branch arrival.
-                                // Directly inserting this block into the
-                                // candidate list strands an older candidate
-                                // at the same PC when conditional control flow
-                                // already reaches the continuation.
-                                let next_py_pc = py_pc + 1;
-                                let mut continuation_state = current_state.clone();
-                                continuation_state.next_offset = next_py_pc;
-                                continuation_state.blocklist =
-                                    frame_blocks_for_offset(code, next_py_pc);
-                                let _ = mergeblock(
-                                    code,
-                                    &mut graph,
-                                    &mut joinpoints,
-                                    &current_block,
-                                    &continuation_state,
-                                    next_py_pc,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                );
-                                needs_fallthrough = false;
-                            } else {
-                                emit_abort_permanent!(py_pc);
+                                emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                                continue;
                             }
+                            // The dynamic bound check below splits the
+                            // exception arm explicitly. Its successful
+                            // continuation cannot raise and must not
+                            // receive the generic per-op catch edge.
+                            exception_edge_handled = true;
+                            let idx_u16 = idx as u16;
+                            emit_load_fast_ref!(current_depth, idx_u16, py_pc);
+                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let is_null = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "ptr_iszero",
+                                vec![value_value.into()],
+                                Kind::Int,
+                                py_pc as i64,
+                            );
+                            current_block.block().borrow_mut().exitswitch =
+                                Some(super::flow::ExitSwitch::Value(is_null.into()));
+                            let unbound_state = current_state.clone();
+                            let unbound_block = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(unbound_state.clone()),
+                            );
+                            unbound_block.block().borrow_mut().inputargs =
+                                unbound_state.getvariables();
+                            all_walker_blocks.push(unbound_block.clone());
+                            append_exit(
+                                &current_block.block(),
+                                output_link(&current_state, &unbound_state, unbound_block.block()),
+                            );
+                            set_last_bool_exitcase(&current_block.block(), true);
+                            let bound_state = current_state.clone();
+                            let bound_block = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(bound_state.clone()),
+                            );
+                            bound_block.block().borrow_mut().inputargs = bound_state.getvariables();
+                            all_walker_blocks.push(bound_block.clone());
+                            append_exit(
+                                &current_block.block(),
+                                output_link(&current_state, &bound_state, bound_block.block()),
+                            );
+                            set_last_bool_exitcase(&current_block.block(), false);
+
+                            // The unbound arm raises before any clear,
+                            // matching pyopcode.py:998 DELETE_FAST. Keep
+                            // last_instr at the deleting instruction so
+                            // exception unwind and deopt share its frame
+                            // coordinate.
+                            current_block = unbound_block;
+                            current_state = unbound_state;
+                            let v_li: super::flow::FlowValue =
+                                super::flow::Constant::signed(py_pc as i64 - 1).into();
+                            record_graph_op(
+                                &current_block.block(),
+                                "setfield_vable_i",
+                                vable_setfield_int_graph_args(
+                                    frame_var.into(),
+                                    v_li.into(),
+                                    VABLE_LAST_INSTR_FIELD_IDX,
+                                ),
+                                None,
+                                py_pc as i64,
+                            );
+                            let exc_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "unbound_local_error",
+                                vec![code_const.into(), name_idx_const.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            let exc_flow: super::flow::FlowValue = exc_value.into();
+                            emit_raise!(0u16, exc_flow.clone(), py_pc as i64, true);
+                            if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten() {
+                                let site = catch_sites
+                                    .iter()
+                                    .find(|site| site.landing_label == catch_label)
+                                    .expect("catch site for DELETE_FAST raise");
+                                let link = current_block
+                                    .block()
+                                    .borrow()
+                                    .exits
+                                    .last()
+                                    .cloned()
+                                    .expect("DELETE_FAST raise catch edge");
+                                carry_explicit_raise_value_on_catch_stack(
+                                    &link,
+                                    &site.landing,
+                                    exc_flow,
+                                );
+                            }
+
+                            // The bound arm is the continuing block. The
+                            // clear is one PY_NULL write, matching
+                            // pyopcode.py:998 DELETE_FAST's single slot
+                            // assignment after the check succeeds.
+                            current_block = bound_block;
+                            current_state = bound_state;
+                            needs_fallthrough = true;
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_idx.into(),
+                                    super::flow::Constant::none().into(),
+                                ),
+                                None,
+                                py_pc as i64,
+                            );
+                            // `framestate.py:105-114 union`: an undefined
+                            // local is `None`, not a Constant(None).  The
+                            // graph-side vable write above still carries
+                            // the runtime PY_NULL sentinel.
+                            current_state.clear_local_value(idx);
+                            // The successful branch egg has now executed
+                            // the clear.  Close it into the next bytecode
+                            // through the ordinary joinpoint machinery,
+                            // exactly as `flowcontext.py:424-475
+                            // mergeblock` closes every branch arrival.
+                            // Directly inserting this block into the
+                            // candidate list strands an older candidate
+                            // at the same PC when conditional control flow
+                            // already reaches the continuation.
+                            let next_py_pc = py_pc + 1;
+                            let mut continuation_state = current_state.clone();
+                            continuation_state.next_offset = next_py_pc;
+                            continuation_state.blocklist =
+                                frame_blocks_for_offset(code, next_py_pc);
+                            let _ = mergeblock(
+                                code,
+                                &mut graph,
+                                &mut joinpoints,
+                                &current_block,
+                                &continuation_state,
+                                next_py_pc,
+                                &mut pendingblocks,
+                                &mut all_walker_blocks,
+                            );
+                            needs_fallthrough = false;
                         }
 
                         // DELETE_DEREF clears the cell contents after checking

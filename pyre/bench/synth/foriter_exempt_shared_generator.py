@@ -1,4 +1,4 @@
-# gh#495 guard: ForIterNext exemption double-advance is masked by fbw_abort_nested_unjournaled_residual; +1 reproduces under PYRE_FBW_NESTED_RESID_ABORT=0
+# gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # SHARED long generator consumed incrementally. step consumes ONE item (for..break),
 # FOR_ITER advance mutates shared counter (exempt). Then a declining nested-residual CALL.
 # If the inline sub-walk aborts AFTER the exempt advance and the trait leg re-runs step,

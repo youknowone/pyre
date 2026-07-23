@@ -52,10 +52,8 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // descr-identity-independent (`const_ref`) and only intercepts the two
     // static Ref fields (`try_resolve_inline_callee_static_field` returns `None`
     // for everything else), so it is safe to consult on the seeded path too.
-    if fbw_inline_nsfold_enabled() {
-        if let Some(resolved) = try_resolve_inline_callee_static_field(code, op, ctx, dst_bank)? {
-            return Ok(resolved);
-        }
+    if let Some(resolved) = try_resolve_inline_callee_static_field(code, op, ctx, dst_bank)? {
+        return Ok(resolved);
     }
     // RPython's `box` is always a live virtualizable-frame box. An
     // unseeded walker Ref register holds `OpRef::None` (`raw() ==

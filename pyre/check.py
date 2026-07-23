@@ -67,12 +67,6 @@ def _detect_pyre_stdlib():
 
 PYRE_STDLIB = _detect_pyre_stdlib()
 
-# Opt-out (`--no-fbw-inline-multiframe`): export PYRE_FBW_INLINE_MULTIFRAME=0 into
-# pyre child runs to exercise the #68 multi-frame inline rollback escape hatch.
-# The path is on by default, so the default run already parity-checks it; this
-# opt-out validates the flag-off fallback.
-FBW_INLINE_MULTIFRAME_OFF = False
-
 # Which wasm runtime the `pyre-wasm-runner` uses (`--wasm-engine`). wasmtime
 # (cranelift) is fast in steady state but recompiles the ~14MB module on every
 # process start; wasmi is a pure-Rust interpreter with near-zero startup cost
@@ -304,8 +298,6 @@ def pyre_env():
     # in the environment wins.
     if PYRE_STDLIB and "PYRE_STDLIB" not in env:
         env["PYRE_STDLIB"] = PYRE_STDLIB
-    if FBW_INLINE_MULTIFRAME_OFF:
-        env["PYRE_FBW_INLINE_MULTIFRAME"] = "0"
     # Point the wasm runner at the built module by absolute path so it resolves
     # regardless of the child's working directory (ignored by other backends).
     if "PYRE_WASM_MODULE" not in env and Path(WASM_MODULE_PATH).exists():
@@ -1663,13 +1655,6 @@ def parse_args():
         default=20.0,
         help="per-script timeout in seconds for synthetic benchmarks",
     )
-    parser.add_argument(
-        "--no-fbw-inline-multiframe",
-        action="store_true",
-        help="run pyre with PYRE_FBW_INLINE_MULTIFRAME=0 (#68 forward-branch "
-        "multi-frame inline is on by default; this exercises the rollback "
-        "escape hatch)",
-    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
     try:
@@ -1697,9 +1682,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.no_fbw_inline_multiframe:
-        global FBW_INLINE_MULTIFRAME_OFF
-        FBW_INLINE_MULTIFRAME_OFF = True
     global WASM_ENGINE
     WASM_ENGINE = args.wasm_engine
     chk = Check(args)

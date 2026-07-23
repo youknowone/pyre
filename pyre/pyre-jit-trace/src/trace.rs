@@ -2372,44 +2372,37 @@ fn run_perfn_walk<Sym: WalkSym>(
         // state instead of replaying.  The store-journal epilogue below
         // settles the walk's eager list stores either way (commit keeps
         // them, non-commit rolls them back for the replay).
-        // `PYRE_FBW_END_FLUSH=0` opts out for bisection.
-        if std::env::var_os("PYRE_FBW_END_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
-            if let Ok((outcome, _end_pc)) = &walk_result {
-                let header_pc = match outcome {
-                    crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. } => {
-                        close_loop_restart_pc
-                    }
-                    crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
-                        loop_header_pc,
-                    } => Some(*loop_header_pc),
-                    _ => None,
-                };
-                if let Some(header_pc) = header_pc {
-                    if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-end-flush] declined at header_pc={header_pc} \
-                                 (unjournaled effect) — legacy replay kept"
-                            );
-                        }
-                    } else if crate::state::flush_walk_loop_end_state_to_frame(
-                        ctx, cf_addr, header_pc,
-                    ) {
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
-                                 journal_len={} outcome={outcome:?}",
-                                ctx.is_bridge_trace,
-                                crate::jitcode_dispatch::fbw_store_journal_len(),
-                            );
-                        }
-                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        if let Ok((outcome, _end_pc)) = &walk_result {
+            let header_pc = match outcome {
+                crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. } => close_loop_restart_pc,
+                crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
+                    loop_header_pc,
+                } => Some(*loop_header_pc),
+                _ => None,
+            };
+            if let Some(header_pc) = header_pc {
+                if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
-                            "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
-                             without concrete / depth / lastblock) — legacy replay kept"
+                            "[fbw-end-flush] declined at header_pc={header_pc} \
+                             (unjournaled effect) — legacy replay kept"
                         );
                     }
+                } else if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr, header_pc) {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
+                             journal_len={} outcome={outcome:?}",
+                            ctx.is_bridge_trace,
+                            crate::jitcode_dispatch::fbw_store_journal_len(),
+                        );
+                    }
+                    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
+                         without concrete / depth / lastblock) — legacy replay kept"
+                    );
                 }
             }
         }
@@ -2429,287 +2422,260 @@ fn run_perfn_walk<Sym: WalkSym>(
         // The marker-only fallback uses the same no-unjournaled-effect
         // predicate as the CloseLoop end-flush above.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
-        // inside its discarded attempt.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
+        // inside its discarded attempt.
         let force_blackhole_adopted = matches!(
             &walk_result,
             Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
         ) && try_adopt_force_blackhole(ctx, cf_addr);
-        if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() == Some(std::ffi::OsStr::new("0")) {
-            // Opt-out: never adopt the escape flush — drop the commit and put
-            // the pre-flush frame back so the legacy replay sees pristine
-            // state.
-            if !force_blackhole_adopted
-                && matches!(
-                    &walk_result,
-                    Err(
-                        crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
-                    )
-                )
-            {
-                let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
-                crate::jitcode_dispatch::restore_escape_flush_undo();
-            }
-        } else {
-            if !force_blackhole_adopted
-                && matches!(
-                    &walk_result,
-                    Err(
-                        crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
-                    )
-                )
-                && let Some(resume_py_pc) =
-                    crate::jitcode_dispatch::take_committed_frame_escape_pc()
-            {
-                crate::jitcode_dispatch::discard_escape_flush_undo();
-                // The force-time escape flush wrote the resume state into the
-                // LIVE frame (the frame the callee inspected).  The portal
-                // epilogue propagates `executed_frame` → live on a committed
-                // flush, so mirror the live frame's resume state into the walk
-                // snapshot to make that copy the identity.
-                let live = sym.live_vable_frame_addr();
-                if live != 0 && cf_addr != 0 && live != cf_addr {
-                    unsafe {
-                        (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
-                            &*(live as *const pyre_interpreter::PyFrame),
-                        );
-                    }
+        if !force_blackhole_adopted
+            && matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            )
+            && let Some(resume_py_pc) = crate::jitcode_dispatch::take_committed_frame_escape_pc()
+        {
+            crate::jitcode_dispatch::discard_escape_flush_undo();
+            // The force-time escape flush wrote the resume state into the
+            // LIVE frame (the frame the callee inspected).  The portal
+            // epilogue propagates `executed_frame` → live on a committed
+            // flush, so mirror the live frame's resume state into the walk
+            // snapshot to make that copy the identity.
+            let live = sym.live_vable_frame_addr();
+            if live != 0 && cf_addr != 0 && live != cf_addr {
+                unsafe {
+                    (*(cf_addr as *mut pyre_interpreter::PyFrame))
+                        .restore_resume_state_from(&*(live as *const pyre_interpreter::PyFrame));
                 }
-                // The committed flush owns the iteration count (the resume pc
-                // is PAST the FOR_ITER consume); drop any in-flight item so
-                // the legacy deliver cannot re-apply one.
-                crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-                WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
-                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
             }
-            let call_forward_abort = match &walk_result {
-                Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
-                    Some((*pc, true))
-                }
-                Err(
-                    crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
-                        pc,
-                    },
-                ) => Some((*pc, false)),
-                _ => None,
-            };
-            let mut committed_entry_carrier_call_py_pc = None;
-            if let Some((abort_jit_pc, is_marker_abort)) = call_forward_abort {
-                // gh#467: a supported abort fired inside a TOP-level inline
-                // sub-walk whose callee executed no concrete effect
-                // (`try_walker_inline_user_call` latched the carrier only under
-                // that gate).  The nested-unjournaled-decline class means the
-                // residual did not execute; its callee attempt can be discarded
-                // with any inside-only unjournaled mark.  Flush the OUTER frame
-                // at the CALL that entered the callee and resume the interpreter
-                // forward — re-executing the whole call from scratch — instead
-                // of the legacy replay from loop entry, which double-applies the
-                // non-journaled pre-CALL store.  The abort's `abort_jit_pc` is a
-                // CALLEE coordinate with no meaning in the outer py_pc tables,
-                // so the outer CALL py_pc and operand stack come from the latch.
-                // Convergence of `run_blackhole_interp_to_cancel_tracing`
-                // (`pyjitpl.py:2949`), minus the inner-frame rebuild (#126/#215).
-                let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
-                match carrier.as_ref() {
-                    Some(crate::jitcode_dispatch::InlineAbortCarrier::Entry {
-                        outer_jitcode_index,
-                        call_jitcode_pc,
-                        call_stack,
-                    }) => {
-                        if let Some(call_py_pc) =
-                            resolve_entry_carrier_call_py_pc(*outer_jitcode_index, *call_jitcode_pc)
-                        {
-                            if crate::state::flush_walk_end_state_at_outer_call(
-                                ctx, cf_addr, call_py_pc, call_stack,
-                            ) {
-                                committed_entry_carrier_call_py_pc = Some(call_py_pc);
-                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                    eprintln!(
-                                        "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
+            // The committed flush owns the iteration count (the resume pc
+            // is PAST the FOR_ITER consume); drop any in-flight item so
+            // the legacy deliver cannot re-apply one.
+            crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+            WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
+            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+        }
+        let call_forward_abort = match &walk_result {
+            Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
+                Some((*pc, true))
+            }
+            Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                pc,
+            }) => Some((*pc, false)),
+            _ => None,
+        };
+        let mut committed_entry_carrier_call_py_pc = None;
+        if let Some((abort_jit_pc, is_marker_abort)) = call_forward_abort {
+            // gh#467: a supported abort fired inside a TOP-level inline
+            // sub-walk whose callee executed no concrete effect
+            // (`try_walker_inline_user_call` latched the carrier only under
+            // that gate).  The nested-unjournaled-decline class means the
+            // residual did not execute; its callee attempt can be discarded
+            // with any inside-only unjournaled mark.  Flush the OUTER frame
+            // at the CALL that entered the callee and resume the interpreter
+            // forward — re-executing the whole call from scratch — instead
+            // of the legacy replay from loop entry, which double-applies the
+            // non-journaled pre-CALL store.  The abort's `abort_jit_pc` is a
+            // CALLEE coordinate with no meaning in the outer py_pc tables,
+            // so the outer CALL py_pc and operand stack come from the latch.
+            // Convergence of `run_blackhole_interp_to_cancel_tracing`
+            // (`pyjitpl.py:2949`), minus the inner-frame rebuild (#126/#215).
+            let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
+            match carrier.as_ref() {
+                Some(crate::jitcode_dispatch::InlineAbortCarrier::Entry {
+                    outer_jitcode_index,
+                    call_jitcode_pc,
+                    call_stack,
+                }) => {
+                    if let Some(call_py_pc) =
+                        resolve_entry_carrier_call_py_pc(*outer_jitcode_index, *call_jitcode_pc)
+                    {
+                        if crate::state::flush_walk_end_state_at_outer_call(
+                            ctx, cf_addr, call_py_pc, call_stack,
+                        ) {
+                            committed_entry_carrier_call_py_pc = Some(call_py_pc);
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
                                          abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
                                          stack_depth={}",
-                                        call_stack.len()
-                                    );
-                                }
-                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                                     call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
-                                     lastblock) — legacy replay kept"
+                                    call_stack.len()
                                 );
                             }
+                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                                 abort_jit_pc={abort_jit_pc} (unresolved outer jitcode_index={} \
-                                 or null code ptr) — legacy replay kept",
-                                outer_jitcode_index,
+                                     call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
+                                     lastblock) — legacy replay kept"
                             );
                         }
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                                 abort_jit_pc={abort_jit_pc} (unresolved outer jitcode_index={} \
+                                 or null code ptr) — legacy replay kept",
+                            outer_jitcode_index,
+                        );
                     }
-                    Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
-                        if (is_marker_abort
+                }
+                Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
+                    if (is_marker_abort
+                        && payload.abort_kind
+                            == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
+                        || (!is_marker_abort
                             && payload.abort_kind
-                                == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
-                            || (!is_marker_abort
-                                && payload.abort_kind
-                                    == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
-                    {
-                        if let Some(words) = resolve_midbody_flush_words(payload) {
-                            if try_commit_midbody_abort(ctx, cf_addr, payload, words) {
-                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                    eprintln!(
-                                        "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
+                                == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
+                {
+                    if let Some(words) = resolve_midbody_flush_words(payload) {
+                        if try_commit_midbody_abort(ctx, cf_addr, payload, words) {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
                                          abort_jit_pc={abort_jit_pc} callee_py_pc={} \
                                          call_py_pc={} post_call_py_pc={}",
-                                        words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
-                                    );
-                                }
-                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] gh#467 callee-rebuild declined at \
-                                     callee_py_pc={} — legacy replay kept",
-                                    words.callee_py_pc,
+                                    words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
                                 );
                             }
+                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 callee-rebuild declined at \
-                                 abort_jit_pc={abort_jit_pc} (unresolved carried jitcode identity \
-                                 or null code ptr) — legacy replay kept",
+                                     callee_py_pc={} — legacy replay kept",
+                                words.callee_py_pc,
                             );
                         }
-                    }
-                    None if is_marker_abort => {
-                        if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                            || session.borrow().abort_in_subwalk
-                        {
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                                     (unjournaled effect or inline sub-walk) — legacy replay kept"
-                                );
-                            }
-                        } else if let Some(resume_py_pc) =
-                            crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
-                        {
-                            if crate::state::flush_walk_end_state_to_frame(
-                                ctx,
-                                cf_addr,
-                                resume_py_pc,
-                            ) {
-                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                    eprintln!(
-                                        "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                         resume_py_pc={resume_py_pc}"
-                                    );
-                                }
-                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
-                                );
-                            }
-                        }
-                    }
-                    _ if crate::jitcode_dispatch::fbw_debug_abort_enabled() => {
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
-                            "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                             abort_jit_pc={abort_jit_pc} (no carrier) — legacy replay kept"
+                            "[fbw-abort-flush] gh#467 callee-rebuild declined at \
+                                 abort_jit_pc={abort_jit_pc} (unresolved carried jitcode identity \
+                                 or null code ptr) — legacy replay kept",
                         );
                     }
-                    _ => {}
                 }
-                if carrier.is_some() {
-                    crate::jitcode_dispatch::fbw_abort_carrier_clear();
-                }
-            }
-            if let Err(
-                crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { pc },
-            ) = &walk_result
-            {
-                let abort_jit_pc = *pc;
-                if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (no executed non-pure residual) — legacy replay kept"
-                        );
-                    }
-                } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (unjournaled effect) — legacy replay kept"
-                        );
-                    }
-                } else if let Some((jitcode_index, call_jitcode_pc)) =
-                    crate::jitcode_dispatch::fbw_abort_outer_resume_take()
-                {
-                    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32);
-                    if let Some(pjc) = pjc {
-                        let resume_py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
-                            &pjc.metadata,
-                            call_jitcode_pc,
-                        ) as usize;
-                        if committed_entry_carrier_call_py_pc == Some(resume_py_pc) {
-                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
-                                     (entry carrier already handled same resume)"
-                                );
-                            }
-                        } else {
-                            // Flush while the overrides stay rooted in
-                            // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
-                            // locals — an allocation that can move the nursery-resident
-                            // override refs; the area walker forwards them in place),
-                            // then clear the cell.
-                            let committed =
-                                crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
-                                    |stack_overrides| {
-                                        crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
-                                            ctx,
-                                            cf_addr,
-                                            resume_py_pc,
-                                            stack_overrides,
-                                        )
-                                    },
-                                );
-                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                            if committed {
-                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                    eprintln!(
-                                        "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                         resume_py_pc={resume_py_pc} (nested inline decline)"
-                                    );
-                                }
-                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
-                                );
-                            }
-                        }
-                    } else {
-                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                None if is_marker_abort => {
+                    if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                        || session.borrow().abort_in_subwalk
+                    {
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                                 (unresolved outer jitcode_index={jitcode_index}) — legacy replay kept"
+                                     (unjournaled effect or inline sub-walk) — legacy replay kept"
+                            );
+                        }
+                    } else if let Some(resume_py_pc) =
+                        crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
+                    {
+                        if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc) {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                         resume_py_pc={resume_py_pc}"
+                                );
+                            }
+                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
                             );
                         }
                     }
-                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                }
+                _ if crate::jitcode_dispatch::fbw_debug_abort_enabled() => {
                     eprintln!(
-                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                         (no outer caller resume pc) — legacy replay kept"
+                        "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                             abort_jit_pc={abort_jit_pc} (no carrier) — legacy replay kept"
                     );
                 }
+                _ => {}
+            }
+            if carrier.is_some() {
+                crate::jitcode_dispatch::fbw_abort_carrier_clear();
+            }
+        }
+        if let Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+            pc,
+        }) = &walk_result
+        {
+            let abort_jit_pc = *pc;
+            if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (no executed non-pure residual) — legacy replay kept"
+                    );
+                }
+            } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (unjournaled effect) — legacy replay kept"
+                    );
+                }
+            } else if let Some((jitcode_index, call_jitcode_pc)) =
+                crate::jitcode_dispatch::fbw_abort_outer_resume_take()
+            {
+                let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32);
+                if let Some(pjc) = pjc {
+                    let resume_py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                        &pjc.metadata,
+                        call_jitcode_pc,
+                    ) as usize;
+                    if committed_entry_carrier_call_py_pc == Some(resume_py_pc) {
+                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
+                                     (entry carrier already handled same resume)"
+                            );
+                        }
+                    } else {
+                        // Flush while the overrides stay rooted in
+                        // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
+                        // locals — an allocation that can move the nursery-resident
+                        // override refs; the area walker forwards them in place),
+                        // then clear the cell.
+                        let committed =
+                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
+                                |stack_overrides| {
+                                    crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
+                                        ctx,
+                                        cf_addr,
+                                        resume_py_pc,
+                                        stack_overrides,
+                                    )
+                                },
+                            );
+                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                        if committed {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                         resume_py_pc={resume_py_pc} (nested inline decline)"
+                                );
+                            }
+                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                            );
+                        }
+                    }
+                } else {
+                    crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                                 (unresolved outer jitcode_index={jitcode_index}) — legacy replay kept"
+                        );
+                    }
+                }
+            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                         (no outer caller resume pc) — legacy replay kept"
+                );
             }
         }
 
@@ -2727,76 +2693,49 @@ fn run_perfn_walk<Sym: WalkSym>(
         // no-unjournaled-effect / no-sub-walk predicate and same all-or-nothing
         // `flush_walk_end_state_to_frame` gate as the CloseLoop / marker legs;
         // when the flush declines (a slot the shadow cannot resolve) the legacy
-        // drop stands (the residual S3 case).  `PYRE_FBW_BRANCH_FLUSH=0` opts
-        // out.
-        if std::env::var_os("PYRE_FBW_BRANCH_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
-            let kept_stack_abort_pc = match &walk_result {
-                Err(
-                    crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
-                        pc,
-                    },
-                ) => Some((*pc, false)),
-                Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported {
+        // drop stands (the residual S3 case).
+        let kept_stack_abort_pc = match &walk_result {
+            Err(
+                crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
                     pc,
-                }) => Some((*pc, true)),
-                _ => None,
-            };
-            if let Some((pc, is_unsupported)) = kept_stack_abort_pc {
-                let abort_jit_pc = pc;
-                if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                    || session.borrow().abort_in_subwalk
-                {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-branch-flush] declined at abort_jit_pc={abort_jit_pc} \
+                },
+            ) => Some((*pc, false)),
+            Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported { pc }) => {
+                Some((*pc, true))
+            }
+            _ => None,
+        };
+        if let Some((pc, is_unsupported)) = kept_stack_abort_pc {
+            let abort_jit_pc = pc;
+            if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                || session.borrow().abort_in_subwalk
+            {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-branch-flush] declined at abort_jit_pc={abort_jit_pc} \
                              (unjournaled effect or inline sub-walk) — legacy drop kept"
-                        );
-                    }
-                } else if let Some(resume_py_pc) =
-                    crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
-                {
-                    // Two kept-stack branch aborts reach this leg (`is_unsupported`
-                    // came from the `kept_stack_abort_pc` match).  Both resume at a
-                    // FOR_ITER header whose walk already advanced the iterator; they
-                    // differ in whether the consumed item's body ran.
-                    let committed = if is_unsupported {
-                        if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
-                            cf_addr,
-                            resume_py_pc,
-                        ) {
-                            // The consumed item's body already ran, so resume at
-                            // the FOR_ITER header without re-delivering it.
-                            crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
-                        } else {
-                            // A nested inner FOR_ITER can carry the enclosing
-                            // iterator as its kept stack before the consumed
-                            // item's body runs.  Mirror Shape A and deliver that
-                            // in-flight item exactly once.
-                            let push =
-                                crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
-                                    cf_addr,
-                                    resume_py_pc,
-                                );
-                            push.is_some()
-                                && crate::state::flush_walk_end_state_to_frame_with_item(
-                                    ctx,
-                                    cf_addr,
-                                    resume_py_pc,
-                                    push,
-                                )
-                        }
+                    );
+                }
+            } else if let Some(resume_py_pc) =
+                crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
+            {
+                // Two kept-stack branch aborts reach this leg (`is_unsupported`
+                // came from the `kept_stack_abort_pc` match).  Both resume at a
+                // FOR_ITER header whose walk already advanced the iterator; they
+                // differ in whether the consumed item's body ran.
+                let committed = if is_unsupported {
+                    if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
+                        cf_addr,
+                        resume_py_pc,
+                    ) {
+                        // The consumed item's body already ran, so resume at
+                        // the FOR_ITER header without re-delivering it.
+                        crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
                     } else {
-                        // Shape A — a `BranchGuardUnrestorableKeptStackPermanent`
-                        // abort resumes AT a FOR_ITER header whose consumed item is
-                        // in flight (`body_pc == resume_py_pc + 1`, the opcode
-                        // there really is a FOR_ITER): the walk advanced the
-                        // iterator but the item is not yet on the flushed (header)
-                        // stack, so deliver it (push + reposition to the body) so
-                        // the body runs once.  Commit ONLY when an item is
-                        // delivered — a Permanent abort not at such a header keeps
-                        // the legacy drop byte-identically (the residual S3 case),
-                        // so every other abort shape (and the whole flag-OFF path)
-                        // is untouched.
+                        // A nested inner FOR_ITER can carry the enclosing
+                        // iterator as its kept stack before the consumed
+                        // item's body runs.  Mirror Shape A and deliver that
+                        // in-flight item exactly once.
                         let push = crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
                             cf_addr,
                             resume_py_pc,
@@ -2808,25 +2747,48 @@ fn run_perfn_walk<Sym: WalkSym>(
                                 resume_py_pc,
                                 push,
                             )
-                    };
-                    if committed {
-                        // The flush owns the iteration count; drop any remaining
-                        // in-flight items so the legacy deliver cannot re-apply
-                        // one (exactly-once).
-                        crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-branch-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                 resume_py_pc={resume_py_pc} (delivered in-flight FOR_ITER item)"
-                            );
-                        }
-                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    }
+                } else {
+                    // Shape A — a `BranchGuardUnrestorableKeptStackPermanent`
+                    // abort resumes AT a FOR_ITER header whose consumed item is
+                    // in flight (`body_pc == resume_py_pc + 1`, the opcode
+                    // there really is a FOR_ITER): the walk advanced the
+                    // iterator but the item is not yet on the flushed (header)
+                    // stack, so deliver it (push + reposition to the body) so
+                    // the body runs once.  Commit ONLY when an item is
+                    // delivered — a Permanent abort not at such a header keeps
+                    // the legacy drop byte-identically (the residual S3 case),
+                    // so every other abort shape (and the whole flag-OFF path)
+                    // is untouched.
+                    let push = crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
+                        cf_addr,
+                        resume_py_pc,
+                    );
+                    push.is_some()
+                        && crate::state::flush_walk_end_state_to_frame_with_item(
+                            ctx,
+                            cf_addr,
+                            resume_py_pc,
+                            push,
+                        )
+                };
+                if committed {
+                    // The flush owns the iteration count; drop any remaining
+                    // in-flight items so the legacy deliver cannot re-apply
+                    // one (exactly-once).
+                    crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+                    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
-                            "[fbw-branch-flush] declined at resume_py_pc={resume_py_pc} \
-                             (shadow slot without concrete / depth / lastblock) — legacy drop kept"
+                            "[fbw-branch-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                 resume_py_pc={resume_py_pc} (delivered in-flight FOR_ITER item)"
                         );
                     }
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-branch-flush] declined at resume_py_pc={resume_py_pc} \
+                             (shadow slot without concrete / depth / lastblock) — legacy drop kept"
+                    );
                 }
             }
         }
@@ -2858,8 +2820,8 @@ fn run_perfn_walk<Sym: WalkSym>(
     // predicate, the journal commit below, and the caller's
     // consume-vs-rewind) stay in agreement.  A multiframe resume is never
     // armed, so it stays on the legacy rewind-and-replay path.
-    let terminate_no_replay = crate::jitcode_dispatch::fbw_no_replay_exit_enabled()
-        && (!is_bridge_trace || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
+    let terminate_no_replay = (!is_bridge_trace
+        || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(
             &walk_result,
             Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _))
@@ -3551,7 +3513,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // Clear the walk-local bool-box-truth map left by a prior aborted walk so
     // it cannot leak into this one.
     crate::jitcode_dispatch::bool_box_truth_reset();
-    // Slice b (PYRE_FBW_CALL_ASSEMBLER): clear any Finish payload a prior
+    // Slice b: clear any Finish payload a prior
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
@@ -3632,15 +3594,13 @@ fn full_body_walk_trace<Sym: WalkSym>(
             }
             crate::jitcode_dispatch::DispatchOutcome::Terminate => {
                 // A loop-free portal exit: the top-level `*_return` reached
-                // `done_with_this_frame` with no back-edge.  Under the
-                // PYRE_FBW_CALL_ASSEMBLER gate the return arm routed through
-                // `fbw_terminate_with_finish`, which re-boxed the result to
-                // Type::Ref, recorded the vable store-back + GUARD_NOT_FORCED_2,
-                // and stashed the finish payload.  Build the portal-exit FINISH
-                // from it so the compile pipeline records FINISH from
-                // `finish_args` (matching `StepResult::Return` in
-                // trace_opcode.rs). Ungated → no payload → `Abort`
-                // exactly as before the slice.
+                // `done_with_this_frame` with no back-edge.  The return arm
+                // routed through `fbw_terminate_with_finish`, which re-boxed the
+                // result to Type::Ref, recorded the vable store-back +
+                // GUARD_NOT_FORCED_2, and stashed the finish payload.  Build the
+                // portal-exit FINISH from it so the compile pipeline records
+                // FINISH from `finish_args` (matching `StepResult::Return` in
+                // trace_opcode.rs).  No payload → `Abort`.
                 let finish_is_exception = crate::jitcode_dispatch::fbw_finish_is_exception();
                 match crate::jitcode_dispatch::fbw_finish_payload_take() {
                     // A top-level `void_return/` stashes a `Type::Void`-marked
@@ -3728,7 +3688,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
                 | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
-                // #68 multiframe (`PYRE_FBW_INLINE_MULTIFRAME`): a data-dependent
+                // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same
                 // jitcode walked from the same start_pc reaches the same
@@ -3738,12 +3698,8 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // such a branch, which would otherwise re-trace unbounded (each
                 // re-walk executes the body's residual calls before failing) —
                 // an unbounded slowdown. Decline it so the location interprets
-                // instead. Gated on the flag so the default path's plain
-                // `Abort` (a capability landing mid-run can still pick it up) is
-                // byte-identical.
-                DE::GotoIfNotValueNotConcrete { .. }
-                    if crate::jitcode_dispatch::fbw_inline_multiframe_enabled() =>
-                {
+                // instead.
+                DE::GotoIfNotValueNotConcrete { .. } => {
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
                     TraceAction::Abort
                 }

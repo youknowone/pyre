@@ -5,7 +5,7 @@
 # write-through. Reading the redirected caller frame forces it mid-expression:
 # the escape flush must commit with the operand-stack mirror (the vable shadow's
 # stack region is NULL there) and resume forward AT the escaping opcode. The
-# legacy replay-from-loop-entry fallback (PYRE_FBW_ABORT_FLUSH=0) drops the
+# legacy replay-from-loop-entry fallback drops the
 # in-flight FOR_ITER iteration instead, so `total` comes up short -- the JIT-only
 # regression this guards.
 #

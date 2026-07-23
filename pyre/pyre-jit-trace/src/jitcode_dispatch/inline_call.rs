@@ -238,7 +238,7 @@ pub(crate) fn inline_resolvable_static_vable_read<Sym: WalkSym>(
 }
 
 /// Relaxed variant of [`callee_fast_path_inlinable`] for the multi-frame
-/// inline path (#68, `PYRE_FBW_INLINE_MULTIFRAME`): a FORWARD `goto_if_not`
+/// inline path (#68): a FORWARD `goto_if_not`
 /// (branch target ahead of the branch op) is now inlinable because its
 /// in-callee guard resumes through a multi-frame snapshot
 /// ([`walker_capture_snapshot_for_last_guard_impl`]'s parent-frame branch).
@@ -553,7 +553,7 @@ pub(crate) fn collect_callee_active_boxes(
 }
 
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
-/// at the inline recursion-bound boundary (dev-gated `PYRE_FBW_REC_CA`).
+/// at the inline recursion-bound boundary.
 ///
 /// When the FBW inline depth for a callee reaches `FBW_MAX_INLINE_RECURSION`
 /// the call would otherwise degrade to a generic may-force residual, which
@@ -597,13 +597,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // ---- non-emitting eligibility checks (free to bail with Ok(None)) ----
-    // Default ON since the Phase 5 flip; `PYRE_FBW_REC_CA=0` opts out.
     // Authoritative walks only: the CALL_ASSEMBLER record + walk-commit
     // bookkeeping is FBW machinery; a non-authoritative context (the
     // diagnostic probe, tests) records the plain residual instead.
-    if !ctx.is_authoritative_executor
-        || std::env::var_os("PYRE_FBW_REC_CA").as_deref() == Some(std::ffi::OsStr::new("0"))
-    {
+    if !ctx.is_authoritative_executor {
         return Ok(None);
     }
     // Only a genuine `call_fn` residual is a candidate — every
@@ -720,8 +717,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ()) as *const ()
     };
     // Self-fold requires callee code == portal code.  The full-portal cutover
-    // (`PYRE_FBW_REC_MUTUAL_CUTOVER`) additionally admits a *mutual*-recursive
-    // callee — one whose code is already on the inline framestack, i.e. a
+    // additionally admits a *mutual*-recursive callee — one whose code is
+    // already on the inline framestack, i.e. a
     // genuine recursion cycle (`is_even` → `is_odd` → `is_even` at the unroll
     // cap).  It must NOT admit an arbitrary foreign call: folding a
     // non-recursive callee (e.g. a CALL_KW-bearing leaf) to CALL_ASSEMBLER
@@ -729,13 +726,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // and faults.  The emit below keys on `w_code` (callee-agnostic); the token
     // is resolved / synthesised per `callee_key` via `get_assembler_token`.
     if w_code as usize != caller_code as usize {
-        let admit_mutual = fbw_rec_mutual_cutover_enabled()
-            && ctx
-                .session
-                .borrow()
-                .framestack
-                .iter()
-                .any(|f| f.w_code == w_code as usize);
+        let admit_mutual = ctx
+            .session
+            .borrow()
+            .framestack
+            .iter()
+            .any(|f| f.w_code == w_code as usize);
         if !admit_mutual {
             return Ok(None);
         }
@@ -777,14 +773,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
     let callee_key = crate::driver::make_green_key(w_code, 0);
-    let has_existing = driver.get_loop_token_arc(callee_key).is_some()
-        || driver.get_pending_token_arc(callee_key).is_some();
-    if !has_existing && !fbw_rec_mutual_cutover_enabled() {
-        if std::env::var_os("PYRE_P2_DIAG").is_some() {
-            eprintln!("[p2-ca] decline pc={} reason=no-token", op.pc);
-        }
-        return Ok(None);
-    }
     // warmstate.py / compile.py: resolve an installed
     // procedure token, or synthesize a tmp callback token while the real loop
     // is still tracing.
@@ -1054,7 +1042,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
 /// at entry. The op sequence (vable/vref-before, CALL_ASSEMBLER + KEEPALIVE,
 /// residual executor to run the call concretely and stamp `ca_result`, dst
 /// writeback, GUARD_NOT_FORCED + GUARD_NO_EXCEPTION) mirrors
-/// [`try_walker_call_assembler_self_recursive`]. `PYRE_FBW_LOOP_CALLEE_CA`.
+/// [`try_walker_call_assembler_self_recursive`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -1135,8 +1123,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // binaries it does not reproduce across the GC-stress matrix
     // (r1/r5/r6/r2/r4 × nursery {default,1M,256K,64K,16K,4K} × dynasm+x86, all
     // clean) — a diagnostic-build layout artifact, with content-agnostic
-    // rooting ruling out a ref-specific defect here. See
-    // `fbw_loop_callee_ca_enabled` for the full default-ON rationale.
+    // rooting ruling out a ref-specific defect here.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
     let exec = try_execute_residual_call_via_executor(
@@ -1204,12 +1191,11 @@ pub(crate) fn emit_loop_callee_ca_vable_scalar<Sym: WalkSym>(
 }
 
 /// #62 slice (3c): full-body-walk inline of a recognized user-function
-/// `call_fn`.  Dev-gated by `PYRE_FBW_INLINE` (default OFF — the production
-/// flag-on path is unchanged until this is validated and the gate retired).
+/// `call_fn`.
 ///
 /// Returns:
 /// * `Ok(Some((outcome, next_pc)))` — the call was inlined; caller returns it.
-/// * `Ok(None)` — not eligible (gate off, not a pure-Python function, has a
+/// * `Ok(None)` — not eligible (not a pure-Python function, has a
 ///   closure, or not an exact-positional call).  This branch emits NO IR, so
 ///   the caller's residual-call fallback is clean.
 /// * `Err(..)` — a sub-walk step hit an unsupported op AFTER emitting IR;
@@ -1270,10 +1256,9 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // Default ON since the Phase 5 flip; `PYRE_FBW_INLINE=0` opts out.
     // Authoritative walks only: inline sub-walks lean on FBW multi-frame
     // snapshot plumbing a non-authoritative context does not carry.
-    if !ctx.is_authoritative_executor || std::env::var("PYRE_FBW_INLINE").as_deref() == Ok("0") {
+    if !ctx.is_authoritative_executor {
         return Ok(None);
     }
     // Only a genuine Python call helper (`call_fn` / `call_fn_N`, tagged
@@ -1432,14 +1417,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // The primary loop still inlines the callee, and non-integer/user-
     // overridable calls continue through the ordinary inline/abort policy.
     //
-    // Exception (`PYRE_FBW_BRIDGE_REC_INLINE`, default on): a plain ROOT bridge
-    // walk — no carrier resume, not an inline sub-walk, an empty framestack, and
+    // A plain ROOT bridge walk — no carrier resume, not an inline sub-walk,
+    // an empty framestack, and
     // a live root portal — is uniform with a primary trace, so its second
     // virtual frame is seeded and snapshot-covered exactly as the loop's is.
     // There the decline is lifted: the call falls through to the self-recursive
     // unroll gate and multiframe seed as if walked from a primary trace.
-    // True once this attempt takes the `PYRE_FBW_BRIDGE_REC_INLINE` root-bridge
-    // admission for a self-recursive callee.  The admitted top-level inline's
+    // True once this attempt takes the root-bridge admission for a
+    // self-recursive callee.  The admitted top-level inline's
     // body sub-walk reaches its own recursive CALL as a nested residual, which
     // `fbw_abort_nested_unjournaled_residual` declines on the self-recursive
     // hazard arm — an abort storm that folds the whole guard bridge back to
@@ -1472,7 +1457,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // continuation inlines instead of residualizing.
         let subwalk_admit = ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
         let safe_root_bridge = root_bridge || subwalk_admit;
-        if !(fbw_bridge_rec_inline_enabled() && safe_root_bridge) {
+        if !safe_root_bridge {
             return Ok(None);
         }
         bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32"))
@@ -1486,17 +1471,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
     // a live-heap mutation would double it; the nested-residual decline catches
     // that only after an abort storm.  A side-effect-free callee replays
-    // benignly, so admit it.  `PYRE_FBW_FORITER_INLINE=0` restores the former
-    // blanket decline as a rollback escape hatch.
+    // benignly, so admit it.
     if fbw_foriter_inflight_active()
-        && (std::env::var("PYRE_FBW_FORITER_INLINE").as_deref() == Ok("0")
-            || !fbw_callee_body_side_effect_free(
-                body.code,
-                args_all_numeric,
-                body.num_regs_i,
-                body.constants_i,
-                callee_descr_refs,
-            ))
+        && !fbw_callee_body_side_effect_free(
+            body.code,
+            args_all_numeric,
+            body.num_regs_i,
+            body.constants_i,
+            callee_descr_refs,
+        )
     {
         return Ok(None);
     }
@@ -1567,11 +1550,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // callee is `try_multiframe`-eligible, but unbounded self-recursion bottoms
     // out the multiframe inline at the depth cap.  A strict-inlinable callee is
     // a straight-line leaf (no self-recursion), so this never preempts the
-    // strict path.  Gated on `PYRE_FBW_REC_CA`, matching the fold.
-    if !strict_inlinable
-        && std::env::var_os("PYRE_FBW_REC_CA").as_deref() != Some(std::ffi::OsStr::new("0"))
-        && nparams >= 1
-    {
+    // strict path.
+    if !strict_inlinable && nparams >= 1 {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         let self_recursive = !sym_ptr.is_null()
             && unsafe {
@@ -1582,15 +1562,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if self_recursive {
             // RPython `opimpl_recursive_call` / `do_recursive_call`
             // (`pyjitpl.py`) unroll within `max_unroll_recursion`,
-            // then fall back to the assembler-call path.  Default-on
-            // (`fbw_rec_multiframe_enabled`): a primary trace spends the
+            // then fall back to the assembler-call path. A primary trace spends the
             // recursion-unroll budget unrolling below `max_unroll_recursion`
             // (`fbw_max_rec_unroll_depth`, a bound distinct from the
             // straight-line chain-inline depth `fbw_max_multiframe_depth`)
             // before folding the deepest call to the recursive portal
             // `CALL_ASSEMBLER`.
-            let unroll = fbw_rec_multiframe_enabled()
-                && !ctx.fbw_mode.carrier_resume
+            let unroll = !ctx.fbw_mode.carrier_resume
                 && ctx.session.borrow().framestack.len() < fbw_max_rec_unroll_depth();
             if !unroll {
                 return Ok(None);
@@ -1598,8 +1576,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // fall through to the multiframe gate (unroll one level)
         }
     }
-    // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
-    // is inlinable with a multi-frame guard snapshot (its in-callee branch
+    // #68: a forward-branch-bearing callee is inlinable with a multi-frame
+    // guard snapshot (its in-callee branch
     // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
     // than collapsing to the caller boundary).  The relaxed predicate also
     // accepts a callee whose only non-strict ops are reads off its OWN seeded
@@ -1610,7 +1588,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
     // a depth cap on the inline stack (the `n_parents == n_callees` valve in
     // the snapshot path is the real desync safety net).
-    let multiframe_eligible = !strict_inlinable && fbw_inline_multiframe_enabled();
+    let multiframe_eligible = !strict_inlinable;
     let callee_frame_reg = if multiframe_eligible {
         crate::state::ensure_jitcode_index(callee_code_key as *const ())
             .map(|jc| crate::state::portal_red_regs_at(jc).0)
@@ -1653,10 +1631,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // the CALL_ASSEMBLER fold (`try_walker_call_assembler_self_recursive`,
         // reached next in the residual-call dispatch) so a recursive callee at
         // the inline cap enters via its own (possibly tmp-callback) loop token.
-        if fbw_rec_mutual_cutover_enabled() {
-            return Ok(None);
-        }
-        return Err(DispatchError::callee_inline_unsupported(op.pc));
+        return Ok(None);
     }
 
     // Path-1 (#68): the inlined callee's compile-time-constant frame fields,
@@ -1817,7 +1792,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // an un-seedable strict shape never loses its inline.  Every bail below
     // precedes any IR recording, so a strict fall-through records no dead op.
     //
-    // `PYRE_FBW_LOOP_CALLEE_CA`: the seeded virtual callee frame /
+    // The seeded virtual callee frame /
     // shared ec / local count are hoisted so the sub-walk return site can
     // emit a `CALL_ASSEMBLER` into the callee loop token when the sub-walk
     // surfaces `SubLoopCalleeCallAssembler` (the callee reached its own loop

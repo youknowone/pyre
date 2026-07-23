@@ -2889,7 +2889,7 @@ pub fn trace_and_compile_from_bridge(
         driver.last_bridge_is_exception_guard
     };
     if last_bridge_is_exception_guard {
-        // With `PYRE_EXC_EDGE_BRIDGE` the walker emits the whole exception
+        // The walker emits the whole exception
         // resumption sequence (SAVE_EXC_CLASS/SAVE_EXCEPTION/RESTORE_EXCEPTION +
         // a snapshotted GUARD_EXCEPTION) at the bridge-entry frame state, where
         // the guard can capture resume data.  The legacy call-site prologue
@@ -3013,7 +3013,7 @@ pub fn trace_and_compile_from_bridge(
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
         }
     };
-    // Exception-edge bridge (`PYRE_EXC_EDGE_BRIDGE`): route the caught-in-frame
+    // Exception-edge bridge: route the caught-in-frame
     // single-frame resume to the in-frame `except` handler (walker
     // `find_catch_before_resume_live`) instead of declining.  The escaping case
     // (uncaught) and the multi-frame resume still decline here — those are

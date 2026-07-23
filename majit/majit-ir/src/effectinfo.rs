@@ -603,13 +603,13 @@ pub enum PyreHelperKind {
     /// without `from` (checked, never dereferenced when null), so a concrete
     /// NULL there is the normal shape — not the broken baked-NULL shape the
     /// walker's may-force NULL-ref gate rejects.  The full-body walker
-    /// recognises this tag (gated `PYRE_FBW_RAISE`) to exempt the trailing
+    /// recognises this tag to exempt the trailing
     /// NULL `cause` in both twin NULL-ref guards so the FBW path can own the
     /// raise instead of declining to the trait.
     RaiseVarargs,
     /// `get_current_exception()` — the PUSH_EXC_INFO `prev = ec.sys_exc_value`
     /// save residual (`() → Ref`, TLS read via `cpu.get_current_exception_fn`).
-    /// The full-body walker recognises this tag (gated `PYRE_FBW_RAISE`) to
+    /// The full-body walker recognises this tag to
     /// lower it to `GETFIELD_GC_R(ec, sys_exc_value)` so the exc-info save
     /// participates in the balanced save/restore the heap optimizer
     /// dead-store-eliminates, letting a non-escaping exception stay virtual.
@@ -617,7 +617,7 @@ pub enum PyreHelperKind {
     /// `set_current_exception(exc)` — the PUSH_EXC_INFO store and the
     /// POP_EXCEPT restore residual (`(exc: Ref) → Void`, TLS write via
     /// `cpu.set_current_exception_fn`).  The full-body walker recognises this
-    /// tag (gated `PYRE_FBW_RAISE`) to lower it to `SETFIELD_GC(ec, exc,
+    /// tag to lower it to `SETFIELD_GC(ec, exc,
     /// sys_exc_value)`; paired with the [`GetCurrentException`] save on the
     /// same descr-identity field, a balanced never-read save/restore is
     /// dead-store-eliminated so the virtual exception de-escapes and DCEs.

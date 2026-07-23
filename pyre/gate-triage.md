@@ -143,11 +143,6 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FBW_INLINE, _INLINE_MULTIFRAME, _INLINE_NSFOLD, _LOOP_CALLEE_CA | walker inlining (#62/#68/gap-10) | same epic cluster |
-| PYRE_FBW_CALL_ASSEMBLER, _NO_REPLAY_EXIT, _RAISE, _REC_CA | walker return/raise/recursion | same |
-| PYRE_FBW_ABORT_FLUSH, _BRANCH_FLUSH, _END_FLUSH, _BRIDGE_LOCAL_SEED | shadow-stack flush/seed on resume | same (couples to F1 resume convergence) |
-| PYRE_FBW_BUILTIN_FOLD, _LOADGLOBAL_FOLD, _LOADNAME_FOLD, _STORENAME_FOLD | const-folds in walker bodies | same (fold correctness interlocks with the walker) |
-| PYRE_FBW_NESTED_RESID_ABORT | nested-residual abort vs replay | same |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |

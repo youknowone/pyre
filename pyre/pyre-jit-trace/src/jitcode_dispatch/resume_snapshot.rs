@@ -131,33 +131,31 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     // the promote.  A chain that is not full, or a callee/caller frame the
     // publisher cannot build, falls through to (or aborts the same as) the
     // sentinel below — never a wrong resume.
-    if fbw_nsvable_multiframe_enabled() {
-        let (n_parents, n_callees, parent_frames) = {
-            let session = ctx.session.borrow();
-            (
-                session
-                    .framestack
-                    .iter()
-                    .filter(|frame| frame.parent.is_some())
-                    .count(),
-                session.framestack.len(),
-                session
-                    .framestack
-                    .iter()
-                    .filter_map(|frame| frame.parent.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        if n_parents > 0 && n_parents == n_callees {
-            return walker_capture_multi_frame_inline_snapshot(
-                ctx,
-                op_pc,
-                false,
-                parent_frames,
-                GuardCaptureScope::default(),
-                true,
-            );
-        }
+    let (n_parents, n_callees, parent_frames) = {
+        let session = ctx.session.borrow();
+        (
+            session
+                .framestack
+                .iter()
+                .filter(|frame| frame.parent.is_some())
+                .count(),
+            session.framestack.len(),
+            session
+                .framestack
+                .iter()
+                .filter_map(|frame| frame.parent.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if n_parents > 0 && n_parents == n_callees {
+        return walker_capture_multi_frame_inline_snapshot(
+            ctx,
+            op_pc,
+            false,
+            parent_frames,
+            GuardCaptureScope::default(),
+            true,
+        );
     }
     // The guard is not the last recorded op: `emit_force_virtualizable`
     // records GETFIELD_GC / PTR_NE / COND_CALL after the promote, so stamp
@@ -277,7 +275,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // sub-walk with paused caller frames on the walk framestack resumes
     // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
     // point), instead of collapsing to the caller boundary (re-execute).  Only
-    // the gated forward-branch inline path (`PYRE_FBW_INLINE_MULTIFRAME`)
+    // the forward-branch inline path
     // populates the chain; straight-line callees keep the empty chain + the
     // single-frame collapse below.
     if inline_subwalk {

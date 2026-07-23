@@ -1,5 +1,5 @@
 # Parity fixture for the depth-1 bridge self-recursive inline lift
-# (PYRE_FBW_BRIDGE_REC_INLINE, default on, #704). `f` is a tail-recursive
+# (#704). `f` is a tail-recursive
 # exact-integer callee whose `acc * 2 + 1` crosses the machine-int boundary
 # partway down the recursion, so an overflow guard fires inside the frame the
 # lift inlines on a guard-failure bridge. #704's A/B ran on `fib`, which never

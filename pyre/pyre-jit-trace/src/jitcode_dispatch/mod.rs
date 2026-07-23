@@ -1280,8 +1280,7 @@ pub enum DispatchOutcome {
     /// via `setarrayitem_vable` during the prologue walk; the caller sets
     /// `last_instr = target_pc - 1` on it and passes it as the
     /// CALL_ASSEMBLER `[frame, ec]` red arg (forcing the virtual
-    /// materializes the locals). Gated `PYRE_FBW_LOOP_CALLEE_CA`
-    /// (default-OFF); surfaced only from an inlined sub-walk.
+    /// materializes the locals); surfaced only from an inlined sub-walk.
     SubLoopCalleeCallAssembler {
         token: std::sync::Arc<majit_backend::JitCellToken>,
         target_pc: usize,
@@ -1775,7 +1774,7 @@ pub enum DispatchError {
     /// rewind it and a deliver re-run would double it, so the walk declines BEFORE
     /// the commit and the location interprets permanently (`AbortPermanent`).
     InplaceContainerMutationUnsupported { pc: usize },
-    /// Exception-edge bridge (`PYRE_EXC_EDGE_BRIDGE`): the failing exception
+    /// Exception-edge bridge: the failing exception
     /// guard is caught in-frame, but the `except` handler RETURNS out of the
     /// frame (a called function's `try/except: return`, compiled as its own
     /// function trace) rather than rejoining this frame's loop.  Routing the
@@ -2362,20 +2361,11 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
 /// Exception-edge bridge: route an exception-guard bridge
 /// (GUARD_NO_EXCEPTION / GUARD_EXCEPTION) resume to the in-frame `except`
 /// handler instead of declining to the blackhole (`call_jit.rs` pending-exc
-/// decline).  Default-on; `PYRE_EXC_EDGE_BRIDGE=0` disables.  The wasm guest
-/// has no env plumbing to switch it back off and its abort-replay exception
-/// class (#727) is still open, so the rollout stays opt-in there.
+/// decline). Native backends run the exception-edge bridge unconditionally.
+/// The wasm guest's abort-replay exception class (#727) is still open, so it
+/// stays off there.
 pub fn exc_edge_bridge_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cfg!(target_arch = "wasm32") {
-            return std::env::var_os("PYRE_EXC_EDGE_BRIDGE").is_some();
-        }
-        match std::env::var_os("PYRE_EXC_EDGE_BRIDGE") {
-            Some(v) => v != "0",
-            None => true,
-        }
-    })
+    cfg!(not(target_arch = "wasm32"))
 }
 
 /// `PYRE_CARRIER_EXC_RESUME=1` enables the multi-frame (carrier) exception
@@ -3950,36 +3940,31 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
-    let stack_livereg_gate = fbw_stack_livereg_enabled();
-    let (guard_pcdep_entries, guard_stack_only) = if stack_livereg_gate {
-        if guard_present {
-            if sym.jitcode().is_null() {
-                (Vec::new(), 0usize)
-            } else {
-                unsafe {
-                    let jc = &*sym.jitcode();
-                    let cjc = carried_jitcode_pc;
-                    let entries = if cjc >= 0 {
-                        jc.payload
-                            .pcdep_for_jitcode_pc(cjc as usize)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    let depth = if jc.payload.code_ptr.is_null() {
-                        0usize
-                    } else if cjc >= 0 {
-                        jc.payload
-                            .depth_for_jitcode_pc_pred(cjc as usize)
-                            .unwrap_or(0) as usize
-                    } else {
-                        0
-                    };
-                    (entries, depth)
-                }
-            }
-        } else {
+    let (guard_pcdep_entries, guard_stack_only) = if guard_present {
+        if sym.jitcode().is_null() {
             (Vec::new(), 0usize)
+        } else {
+            unsafe {
+                let jc = &*sym.jitcode();
+                let cjc = carried_jitcode_pc;
+                let entries = if cjc >= 0 {
+                    jc.payload
+                        .pcdep_for_jitcode_pc(cjc as usize)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let depth = if jc.payload.code_ptr.is_null() {
+                    0usize
+                } else if cjc >= 0 {
+                    jc.payload
+                        .depth_for_jitcode_pc_pred(cjc as usize)
+                        .unwrap_or(0) as usize
+                } else {
+                    0
+                };
+                (entries, depth)
+            }
         }
     } else {
         (Vec::new(), 0usize)
@@ -4180,14 +4165,11 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         // stack slot at the guard capture point — there the
                         // register read means exactly `registers_r[index]`;
                         // where ownership is unprovable the virtualizable
-                        // shadow remains authoritative
-                        // (`PYRE_FBW_STACK_LIVEREG=0` restores shadow-first
-                        // everywhere).
+                        // shadow remains authoritative.
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
-                        let guard_pc_proves_slot = stack_livereg_gate
-                            && guard_present
+                        let guard_pc_proves_slot = guard_present
                             && crate::state::semantic_ref_slot_for_reg_color(
                                 nlocals,
                                 guard_stack_only,
@@ -4734,7 +4716,7 @@ thread_local! {
     static FBW_ABORT_CALL_RESUME: std::cell::RefCell<Option<InlineAbortCarrier>> =
         const { std::cell::RefCell::new(None) };
 
-    /// B3 (`PYRE_FBW_RAISE`): the set of OpRefs the walker built inline via
+    /// B3: the set of OpRefs the walker built inline via
     /// [`try_walker_trace_exception_new`] (the virtualizable `NewWithVtable`
     /// exception). The immediately-following `RaiseVarargs` residual consults
     /// it to take the instance fast path — skipping the
@@ -4745,7 +4727,7 @@ thread_local! {
     static FBW_BUILT_EXC: std::cell::RefCell<std::collections::HashSet<OpRef>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 
-    /// B3 (`PYRE_FBW_RAISE`): LIFO stack of the previous-exception slot value
+    /// B3: LIFO stack of the previous-exception slot value
     /// saved by each lowered `PUSH_EXC_INFO` (`get_current_exception` arm),
     /// paired with its live concrete.  `POP_EXCEPT`'s restore consumes the top
     /// entry, so the slot is set back to the TRUE saved prev (None for an outer
@@ -7385,8 +7367,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         // slot to recover.  Treat it as depth 0.
         //
         // Scope this to the collapse case ONLY: the #68 multiframe
-        // inline path (`PYRE_FBW_INLINE_MULTIFRAME`,
-        // `n_parents == n_callees`, both > 0) resumes the callee at its
+        // inline path (`n_parents == n_callees`, both > 0) resumes the callee at its
         // OWN pc through `GuardCaptureScope::branch_guard_jitcode_pc`
         // (`walker_capture_multi_frame_inline_snapshot`), so its
         // kept-stack branches still need the real depth/recovery.
@@ -8899,28 +8880,23 @@ fn handle<Sym: WalkSym>(
                 }
             }
             if ctx.is_top_level {
-                if fbw_call_assembler_enabled() {
-                    // Slice b: route the loop-free portal exit through
-                    // `TraceAction::Finish` so the compile pipeline records
-                    // the FINISH from `finish_args`.  Re-box to Type::Ref +
-                    // store_token_in_vable, then stash the payload; do NOT
-                    // call `ctx.trace_ctx.finish()` here (would double-record).
-                    //
-                    // No-replay portal exit: also stash the CONCRETE return
-                    // so `eval.rs` returns the walk's result directly instead
-                    // of re-running the compiled trace against the already
-                    // side-effected heap (the walk consumed it).  A null /
-                    // unknown concrete leaves the cell `None` → degrade.
-                    if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
-                        if !ptr.is_null() {
-                            fbw_finish_concrete_set(ConcreteValue::Ref(ptr));
-                        }
+                // Slice b: route the loop-free portal exit through
+                // `TraceAction::Finish` so the compile pipeline records
+                // the FINISH from `finish_args`.  Re-box to Type::Ref +
+                // store_token_in_vable, then stash the payload; do NOT
+                // call `ctx.trace_ctx.finish()` here (would double-record).
+                //
+                // No-replay portal exit: also stash the CONCRETE return
+                // so `eval.rs` returns the walk's result directly instead
+                // of re-running the compiled trace against the already
+                // side-effected heap (the walk consumed it).  A null /
+                // unknown concrete leaves the cell `None` → degrade.
+                if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                    if !ptr.is_null() {
+                        fbw_finish_concrete_set(ConcreteValue::Ref(ptr));
                     }
-                    fbw_terminate_with_finish(ctx, result, op.pc)?;
-                } else {
-                    ctx.trace_ctx
-                        .finish(&[result], ctx.done_with_this_frame_descr_ref.clone());
                 }
+                fbw_terminate_with_finish(ctx, result, op.pc)?;
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -8949,22 +8925,17 @@ fn handle<Sym: WalkSym>(
                 }
             }
             if ctx.is_top_level {
-                if fbw_call_assembler_enabled() {
-                    // Slice b: portal-exit FINISH carries Type::Ref even for
-                    // an int return (the eval_loop_jit result_type is REF),
-                    // so `fbw_ensure_boxed_for_ca` re-boxes via wrapint.
-                    //
-                    // No-replay portal exit: stash the concrete int so
-                    // `eval.rs` returns the walk's result directly (re-boxed
-                    // via `ConcreteValue::to_pyobj`).
-                    if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
-                        fbw_finish_concrete_set(ConcreteValue::Int(v));
-                    }
-                    fbw_terminate_with_finish(ctx, result, op.pc)?;
-                } else {
-                    ctx.trace_ctx
-                        .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
+                // Slice b: portal-exit FINISH carries Type::Ref even for
+                // an int return (the eval_loop_jit result_type is REF),
+                // so `fbw_ensure_boxed_for_ca` re-boxes via wrapint.
+                //
+                // No-replay portal exit: stash the concrete int so
+                // `eval.rs` returns the walk's result directly (re-boxed
+                // via `ConcreteValue::to_pyobj`).
+                if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
+                    fbw_finish_concrete_set(ConcreteValue::Int(v));
                 }
+                fbw_terminate_with_finish(ctx, result, op.pc)?;
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -8985,13 +8956,8 @@ fn handle<Sym: WalkSym>(
             let value = code[op.pc + 1] as i8 as i64;
             let result = OpRef::ConstInt(value);
             if ctx.is_top_level {
-                if fbw_call_assembler_enabled() {
-                    fbw_finish_concrete_set(ConcreteValue::Int(value));
-                    fbw_terminate_with_finish(ctx, result, op.pc)?;
-                } else {
-                    ctx.trace_ctx
-                        .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
-                }
+                fbw_finish_concrete_set(ConcreteValue::Int(value));
+                fbw_terminate_with_finish(ctx, result, op.pc)?;
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -9013,18 +8979,13 @@ fn handle<Sym: WalkSym>(
             // Operand layout `f`: 1B float register at op.pc+1.
             let result = read_float_reg(code, op, 0, ctx)?;
             if ctx.is_top_level {
-                if fbw_call_assembler_enabled() {
-                    // Slice b: portal-exit FINISH carries Type::Ref;
-                    // `fbw_ensure_boxed_for_ca` re-boxes the float via
-                    // wrapfloat.
-                    if let Some(majit_ir::Value::Float(v)) = ctx.trace_ctx.box_value(result) {
-                        fbw_finish_concrete_set(ConcreteValue::Float(v));
-                    }
-                    fbw_terminate_with_finish(ctx, result, op.pc)?;
-                } else {
-                    ctx.trace_ctx
-                        .finish(&[result], ctx.done_with_this_frame_descr_float.clone());
+                // Slice b: portal-exit FINISH carries Type::Ref;
+                // `fbw_ensure_boxed_for_ca` re-boxes the float via
+                // wrapfloat.
+                if let Some(majit_ir::Value::Float(v)) = ctx.trace_ctx.box_value(result) {
+                    fbw_finish_concrete_set(ConcreteValue::Float(v));
                 }
+                fbw_terminate_with_finish(ctx, result, op.pc)?;
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -9052,25 +9013,20 @@ fn handle<Sym: WalkSym>(
             // marker for void calls).
             // No operand bytes (the `/` argcodes is empty).
             if ctx.is_top_level {
-                if fbw_call_assembler_enabled() {
-                    // Slice b: route the void portal exit through
-                    // `TraceAction::Finish` (empty args) so the compile
-                    // pipeline records the FINISH(void) from `finish_args`,
-                    // mirroring the three value-returning arms.  Store the
-                    // assembler token in the vable + GUARD_NOT_FORCED_2 like
-                    // those arms, then stash a void-marked payload; do NOT
-                    // call `ctx.trace_ctx.finish()` here (would double-record).
-                    //
-                    // No-replay portal exit: stash `Null` (= void → None at
-                    // the consume site) so a side-effecting void function
-                    // returns directly instead of re-running its already
-                    // applied effects.
-                    fbw_finish_concrete_set(ConcreteValue::Null);
-                    fbw_terminate_void_with_finish(ctx, op.pc)?;
-                } else {
-                    ctx.trace_ctx
-                        .finish(&[], ctx.done_with_this_frame_descr_void.clone());
-                }
+                // Slice b: route the void portal exit through
+                // `TraceAction::Finish` (empty args) so the compile
+                // pipeline records the FINISH(void) from `finish_args`,
+                // mirroring the three value-returning arms.  Store the
+                // assembler token in the vable + GUARD_NOT_FORCED_2 like
+                // those arms, then stash a void-marked payload; do NOT
+                // call `ctx.trace_ctx.finish()` here (would double-record).
+                //
+                // No-replay portal exit: stash `Null` (= void → None at
+                // the consume site) so a side-effecting void function
+                // returns directly instead of re-running its already
+                // applied effects.
+                fbw_finish_concrete_set(ConcreteValue::Null);
+                fbw_terminate_void_with_finish(ctx, op.pc)?;
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))
@@ -9177,30 +9133,19 @@ fn handle<Sym: WalkSym>(
                     }
                 }
             }
-            // Gated `PYRE_FBW_RAISE`: route the top-level raise through
-            // `SubRaise` so walk()'s SubRaise arm runs the in-frame
+            // Route the top-level raise through `SubRaise` so walk()'s
+            // SubRaise arm runs the in-frame
             // `catch_exception/L` lookahead (`finishframe_lookahead_at`) and
             // jumps into the handler instead of recording the top-level
             // exit-frame finish (which escapes a try/except as a no-payload
             // Terminate abort).
-            if ctx.is_top_level && !fbw_raise_enabled() {
-                ctx.trace_ctx
-                    .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
-                if let ConcreteValue::Ref(p) = concrete_exc {
-                    if !p.is_null() {
-                        fbw_finish_raise_set(concrete_exc);
-                    }
-                }
-                Ok((DispatchOutcome::Terminate, op.next_pc))
-            } else {
-                Ok((
-                    DispatchOutcome::SubRaise {
-                        exc,
-                        exc_concrete: concrete_exc,
-                    },
-                    op.next_pc,
-                ))
-            }
+            Ok((
+                DispatchOutcome::SubRaise {
+                    exc,
+                    exc_concrete: concrete_exc,
+                },
+                op.next_pc,
+            ))
         }
         "last_exc_value/>r" => {
             // RPython parity: `pyjitpl.py opimpl_last_exc_value`:
@@ -9321,25 +9266,14 @@ fn handle<Sym: WalkSym>(
             let exc = ctx
                 .last_exc_value
                 .ok_or(DispatchError::ReraiseWithoutLastExcValue { pc: op.pc })?;
-            // Gated `PYRE_FBW_RAISE`: symmetric with `raise/r`.
-            if ctx.is_top_level && !fbw_raise_enabled() {
-                ctx.trace_ctx
-                    .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
-                if let ConcreteValue::Ref(p) = ctx.last_exc_value_concrete {
-                    if !p.is_null() {
-                        fbw_finish_raise_set(ctx.last_exc_value_concrete);
-                    }
-                }
-                Ok((DispatchOutcome::Terminate, op.next_pc))
-            } else {
-                Ok((
-                    DispatchOutcome::SubRaise {
-                        exc,
-                        exc_concrete: ctx.last_exc_value_concrete,
-                    },
-                    op.next_pc,
-                ))
-            }
+            // Symmetric with `raise/r`.
+            Ok((
+                DispatchOutcome::SubRaise {
+                    exc,
+                    exc_concrete: ctx.last_exc_value_concrete,
+                },
+                op.next_pc,
+            ))
         }
         // The `i` spelling is what the assembler emits once the jitdriver
         // index outstrips a signed byte. Its leading byte names an Int-bank
@@ -9394,7 +9328,7 @@ fn handle<Sym: WalkSym>(
                 Some(Value::Int(v)) => v as usize,
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
-            // `PYRE_FBW_LOOP_CALLEE_CA`: an inlined callee's own loop
+            // An inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop
             // token EVEN WHEN its pycode green resolves.  nbody's `advance` has a
             // const-Ref code_green (resolves) plus an existing loop token, so the
@@ -9438,46 +9372,43 @@ fn handle<Sym: WalkSym>(
                     }
                 }
             };
-            if fbw_loop_callee_ca_enabled() {
-                let callee_code = ctx
-                    .session
-                    .borrow()
-                    .framestack
-                    .last()
-                    .map(|frame| frame.w_code)
-                    .filter(|&cc| {
-                        fbw_root_code.is_none_or(|root| root as *const () != cc as *const ())
-                    });
-                if let Some(callee_code) = callee_code {
-                    let callee_key =
-                        crate::driver::make_green_key(callee_code as *const (), next_instr);
-                    let (driver, _) = crate::driver::driver_pair();
-                    let greenboxes = [
-                        Value::Int(next_instr as i64),
-                        Value::Int(0),
-                        Value::Ref(majit_ir::GcRef(callee_code)),
-                    ];
-                    let red_types = [Type::Ref, Type::Ref];
-                    if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                        callee_key,
-                        &greenboxes,
-                        &red_types,
-                    ) {
-                        return Ok((
-                            DispatchOutcome::SubLoopCalleeCallAssembler {
-                                token,
-                                target_pc: next_instr,
-                            },
-                            op.next_pc,
-                        ));
-                    }
+            let callee_code = ctx
+                .session
+                .borrow()
+                .framestack
+                .last()
+                .map(|frame| frame.w_code)
+                .filter(|&cc| {
+                    fbw_root_code.is_none_or(|root| root as *const () != cc as *const ())
+                });
+            if let Some(callee_code) = callee_code {
+                let callee_key =
+                    crate::driver::make_green_key(callee_code as *const (), next_instr);
+                let (driver, _) = crate::driver::driver_pair();
+                let greenboxes = [
+                    Value::Int(next_instr as i64),
+                    Value::Int(0),
+                    Value::Ref(majit_ir::GcRef(callee_code)),
+                ];
+                let red_types = [Type::Ref, Type::Ref];
+                if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
+                    callee_key,
+                    &greenboxes,
+                    &red_types,
+                ) {
+                    return Ok((
+                        DispatchOutcome::SubLoopCalleeCallAssembler {
+                            token,
+                            target_pc: next_instr,
+                        },
+                        op.next_pc,
+                    ));
                 }
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
                 _ => {
-                    // `PYRE_FBW_LOOP_CALLEE_CA` (default-ON): inside a
-                    // multi-frame inline sub-walk the callee's own
+                    // Inside a multi-frame inline sub-walk the callee's own
                     // `jit_merge_point` (its loop header) carries a pycode green
                     // with no live Ref shadow, so this resolution fails and the
                     // enclosing trace would decline. Recover
@@ -9486,36 +9417,34 @@ fn handle<Sym: WalkSym>(
                     // surface a recursive CALL_ASSEMBLER request to the caller's
                     // inline return site (mirror `opimpl_recursive_call_
                     // assembler`, metainterp.rs).
-                    if fbw_loop_callee_ca_enabled() {
-                        let callee_code = ctx
-                            .session
-                            .borrow()
-                            .framestack
-                            .last()
-                            .map(|frame| frame.w_code);
-                        if let Some(callee_code) = callee_code {
-                            let callee_key =
-                                crate::driver::make_green_key(callee_code as *const (), next_instr);
-                            let (driver, _) = crate::driver::driver_pair();
-                            let greenboxes = [
-                                Value::Int(next_instr as i64),
-                                Value::Int(0),
-                                Value::Ref(majit_ir::GcRef(callee_code)),
-                            ];
-                            let red_types = [Type::Ref, Type::Ref];
-                            if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                                callee_key,
-                                &greenboxes,
-                                &red_types,
-                            ) {
-                                return Ok((
-                                    DispatchOutcome::SubLoopCalleeCallAssembler {
-                                        token,
-                                        target_pc: next_instr,
-                                    },
-                                    op.next_pc,
-                                ));
-                            }
+                    let callee_code = ctx
+                        .session
+                        .borrow()
+                        .framestack
+                        .last()
+                        .map(|frame| frame.w_code);
+                    if let Some(callee_code) = callee_code {
+                        let callee_key =
+                            crate::driver::make_green_key(callee_code as *const (), next_instr);
+                        let (driver, _) = crate::driver::driver_pair();
+                        let greenboxes = [
+                            Value::Int(next_instr as i64),
+                            Value::Int(0),
+                            Value::Ref(majit_ir::GcRef(callee_code)),
+                        ];
+                        let red_types = [Type::Ref, Type::Ref];
+                        if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
+                            callee_key,
+                            &greenboxes,
+                            &red_types,
+                        ) {
+                            return Ok((
+                                DispatchOutcome::SubLoopCalleeCallAssembler {
+                                    token,
+                                    target_pc: next_instr,
+                                },
+                                op.next_pc,
+                            ));
                         }
                     }
                     top_level_live_code(ctx)

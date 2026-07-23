@@ -3153,7 +3153,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
     // `pyjitpl.py compile_done_with_this_frame`, the
     // `result_type == VOID` branch — `exits = []`,
     // `token = sd.done_with_this_frame_descr_void`).  Under the
-    // `PYRE_FBW_CALL_ASSEMBLER` gate (default on) it mirrors the three
+    // finish-portal route it mirrors the three
     // value-returning arms: it does NOT record the FINISH op itself
     // (the compile consumer records `FINISH([])` from the empty
     // finish_args) and stashes a `Type::Void`-marked payload so
@@ -3655,7 +3655,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
     // `finishframe_exception` (outermost-frame branch) →
     // `compile_exit_frame_with_exception` records
     // `FINISH(exc, descr=exit_frame_with_exception_descr_ref)`.
-    // With `PYRE_FBW_RAISE` on (default), `raise/r` surfaces
+    // `raise/r` surfaces
     // `SubRaise` and `walk()`'s top-level SubRaise arm records the
     // outermost FINISH + converts to Terminate, so drive `walk()`.
     let raise_byte = *insns_opname_to_byte()
@@ -3916,7 +3916,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    // With `PYRE_FBW_RAISE` on (default), `reraise/` surfaces
+    // `reraise/` surfaces
     // `SubRaise` and `walk()`'s top-level SubRaise arm records the
     // outermost FINISH + converts to Terminate.
     fbw_finish_payload_reset();

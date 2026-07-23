@@ -195,7 +195,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         ConcreteValue::Ref(sym.last_exc_value())
     };
 
-    // Exception-edge bridge routing (`PYRE_EXC_EDGE_BRIDGE`): an exception-guard
+    // Exception-edge bridge routing: an exception-guard
     // bridge with a standing exception resumes at the no-exception fallthrough
     // `-live-`, NOT the `except` handler.  Mirror the blackhole
     // `handle_exception_in_frame` backward case: route the walk entry to the

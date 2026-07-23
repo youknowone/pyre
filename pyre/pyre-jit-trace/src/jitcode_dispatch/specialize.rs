@@ -2167,7 +2167,7 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3 (`PYRE_FBW_RAISE`): walker-native fold of the CHECK_EXC_MATCH
+/// B3: walker-native fold of the CHECK_EXC_MATCH
 /// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
 /// `call_jit.rs`). Computes the match concretely from
 /// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
@@ -3843,7 +3843,7 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3 (`PYRE_FBW_RAISE`): walker-native exception-construction fold.  A
+/// B3: walker-native exception-construction fold.  A
 /// `Type(args)` `CallFn` residual for a canonical builtin exception class or
 /// a heap subclass with the same `__new__` / `__init__` descriptors becomes a
 /// traced `NewWithVtable` + `SetfieldGc` (kind / w_class / args_w) the
@@ -4284,7 +4284,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3 (`PYRE_FBW_RAISE`): walker-native RAISE_VARARGS E1 fast path. The `RaiseVarargs`
+/// B3: walker-native RAISE_VARARGS E1 fast path. The `RaiseVarargs`
 /// residual is `normalize_raise_varargs_jit(frame, exc, cause)` —
 /// `r_args = [frame, exc, cause]`.  When `exc` was built inline by
 /// [`try_walker_trace_exception_new`] (∈ [`FBW_BUILT_EXC`]) and there is
@@ -4418,7 +4418,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3 piece 3 (`PYRE_FBW_RAISE`): lower the PUSH_EXC_INFO / POP_EXCEPT
+/// B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
 /// `sys_exc_value` slot (`ec_sys_exc_value_descr`).
 /// Recognised by the codewriter-stamped `pyre_helper` tag, NOT a funcptr
@@ -5517,13 +5517,12 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
 /// `Ok(false)` when the receiver is not a foldable cell (the caller then
 /// falls through to the generic residual, which stays correct).
 ///
-/// DEV-GATED + INCOMPLETE: callers gate this on `PYRE_FBW_LOADGLOBAL_FOLD`
-/// (default off).  When the loaded global is a function that is then CALLed,
-/// folding it to a loop-invariant constant callee routes the call through the
-/// in-progress FBW call-inlining path (#68), which mis-resolves the callee and
-/// produces wrong output.  Keep default-off until #68 lands.
+/// Callers fall back to the residual call when this fold declines. When the
+/// loaded global is a function that is then CALLed, folding it to a
+/// loop-invariant constant callee routes the call through the FBW call-inlining
+/// path (#68).
 ///
-/// Builtins fallback (`PYRE_FBW_BUILTIN_FOLD`): when `name` is ABSENT from the
+/// Builtins fallback: when `name` is ABSENT from the
 /// module dict but resolves through `frame.get_builtin()` (e.g.
 /// `raise ValueError` / `except ValueError`), the same cell fold is emitted
 /// against the BUILTINS dict, guarded additionally by a `QUASIIMMUT_FIELD` on
@@ -5565,13 +5564,10 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
 
-    // Builtins fallback (`PYRE_FBW_BUILTIN_FOLD`): the name is absent from the
+    // Builtins fallback: the name is absent from the
     // `ns_ptr` module dict.  Mirror `bh_load_global_fn`'s second leg —
     // `frame.get_builtin().getdictvalue(name)` — and fold the builtins cell
     // when the name resolves there.  Requires the live frame operand.
-    if !fbw_builtin_fold_enabled() {
-        return Ok(false);
-    }
     // The builtins fallback needs the module `pick_builtin(w_globals)` picks
     // (`frame.get_builtin()`).  A live frame supplies it directly and also lets
     // us double-check the name is absent from the frame's AUTHORITATIVE globals

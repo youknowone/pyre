@@ -375,7 +375,7 @@ fn capture_escape_flush_undo(frame: usize) {
 
 /// Put the pre-flush frame state back.  Called on every path that does not
 /// adopt the committed escape pc (commit withdrawal, an unforced or
-/// rootless continuation, the `PYRE_FBW_ABORT_FLUSH=0` opt-out) so the
+/// rootless continuation) so the
 /// legacy replay re-enters a pristine frame.
 pub(crate) fn restore_escape_flush_undo() {
     ESCAPE_FLUSH_UNDO.with(|slot| {
@@ -837,10 +837,10 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
     // `RaiseVarargs` (`normalize_raise_varargs`) carries a trailing `cause`
     // Ref that is a checked `PY_NULL` sentinel for `raise X` without `from`
-    // (never dereferenced when null); exempt it (gated `PYRE_FBW_RAISE`) so the
+    // (never dereferenced when null); exempt it so the
     // FBW path can own the raise instead of declining to the trait.
-    let is_raise_varargs = fbw_raise_enabled()
-        && call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
+    let is_raise_varargs =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
     // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
     // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked
     // `PY_NULL` sentinels (never dereferenced when null), so a concrete-NULL
@@ -1242,9 +1242,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let is_call_function_ex =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
     // Same `RaiseVarargs` trailing-`cause` sentinel exemption as
-    // `walker_abort_if_mayforce_null_ref_arg` (gated `PYRE_FBW_RAISE`).
-    let is_raise_varargs = fbw_raise_enabled()
-        && call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
+    // `walker_abort_if_mayforce_null_ref_arg`.
+    let is_raise_varargs =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
     for (i, &arg) in args.iter().enumerate() {
         if is_call_fn && i == 1 {
             continue;
@@ -1696,7 +1696,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             }
             // On a kept commit the undo stays armed: the abort epilogue
             // consumes it — discard on adoption, restore when the flush is
-            // not adopted (`PYRE_FBW_ABORT_FLUSH=0`).
+            // not adopted.
             // On the cancel arm the restore above ran FIRST, so this refresh
             // reloads PRE-walk values — the shadow then matches the frame the
             // legacy replay will use, not walk-end state.  A future ladder
@@ -2286,7 +2286,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     clear_walk_exception(ctx);
 
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
-    // (dev-gated PYRE_FBW_INLINE).  Eligible exact-positional closure-free
+    // unconditionally. Eligible exact-positional closure-free
     // calls sub-walk the callee body in place of the residual; ineligible
     // calls (including every non-`call_fn` helper, gated on `pyre_helper`)
     // fall through with no IR emitted.
@@ -2318,7 +2318,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // #62: a self-recursive call the inline path declined (e.g. the
     // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
-    // (dev-gated PYRE_FBW_REC_CA) instead of the heavyweight func-entry
+    // instead of the heavyweight func-entry
     // residency residual. Independent of inline eligibility.
     if let Some(ca) = try_walker_call_assembler_self_recursive(
         ctx,
@@ -2427,8 +2427,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // handler-free gate as the LoadName fold (the fold elides a can-raise
     // residual a `catch_exception/L` could resume into).
     //
-    // Default ON (`PYRE_FBW_STORENAME_FOLD=0` opts out).  Two staleness bugs
-    // fixed before the flip: (1) the fold now eagerly applies the concrete
+    // Two staleness bugs were fixed before enabling this unconditionally:
+    // (1) the fold now eagerly applies the concrete
     // `cell.intvalue` write (journaled in [`FBW_CELL_STORE_JOURNAL`]) —
     // without it the walk's remaining concrete execution read the pre-store
     // global and the next LOAD fold's cache-hit sanity check tripped;
@@ -2447,7 +2447,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
         )
         && !jitcode_has_exception_handler(code)
-        && std::env::var("PYRE_FBW_STORENAME_FOLD").as_deref() != Ok("0")
     {
         if let (Some(&frame_opref), Some(&name_opref), Some(&value_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2))
@@ -2693,7 +2692,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // B3 (`PYRE_FBW_RAISE`, default OFF): a `raise Type(args)` of a canonical
+    // B3: a `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
     // constructs the exception, and a `RaiseVarargs`
     // (`normalize_raise_varargs_jit`) that publishes it.  The construct fold
@@ -2707,7 +2706,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // the exception virtualizes and DCEs.  Any non-matching shape falls
     // through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
-        && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_trace_exception_new(ctx, code, op, &r_args, dst)?.is_some()
@@ -2715,7 +2713,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     if ctx.is_authoritative_executor
-        && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
         && r_args.is_empty()
@@ -2738,14 +2735,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && fbw_raise_enabled()
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
         && try_walker_trace_raise_builtin(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // B3 piece 3 (`PYRE_FBW_RAISE`): lower the PUSH_EXC_INFO / POP_EXCEPT
+    // B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
     // `sys_exc_value` slot. Recognised by the
     // codewriter-stamped `pyre_helper` tag (not a funcptr address — the
@@ -2756,7 +2752,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // virtual and DCEs — eliding the per-iteration `set_current_exception`
     // CALL that otherwise forces the exception to materialize.
     if ctx.is_authoritative_executor
-        && fbw_raise_enabled()
         && matches!(
             ei.pyre_helper,
             majit_ir::PyreHelperKind::GetCurrentException
@@ -3082,7 +3077,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // values retain the original CallMayForceN unchanged.
     if ctx.is_authoritative_executor
         && original_call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreAttr
-        && fbw_storeattr_fold_enabled()
     {
         if let (Some(&obj_opref), Some(&value_opref), Some(&code_opref), Some(&namei_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2), i_args.first())
@@ -3219,16 +3213,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // for this load is sound — the handler can never be entered from it.  We
     // therefore attempt the fold even in handler-bearing bodies and keep the
     // residual (with its guard) only when the fold DECLINES.  The `B3`/builtin
-    // raise+catch path (`PYRE_FBW_BUILTIN_FOLD`) needs this so the
+    // raise+catch path needs this so the
     // `raise ValueError`/`except ValueError` class loads fold to const.
     //
-    // Default ON since the Phase 5 flip (`PYRE_FBW_LOADGLOBAL_FOLD=0` opts
-    // out): the fold is correct (`try_walker_load_global_cell_fold`
-    // resolves the `co_names` index the same way `bh_load_global_fn` does)
-    // and reaches production parity for global-function-call loops when
-    // combined with the user-call inlining path.  The handler-bearing
-    // reachability is additionally gated `PYRE_FBW_BUILTIN_FOLD` (default ON)
-    // so the legacy handler-free behavior is recoverable.
+    // The fold resolves the `co_names` index the same way
+    // `bh_load_global_fn` does and reaches production parity for
+    // global-function-call loops when combined with the user-call inlining
+    // path. Handler-bearing reachability also includes the builtins fallback.
     if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
@@ -3258,11 +3249,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             ctx.trace_ctx.reads_module_global = true;
         }
     }
-    if ctx.is_authoritative_executor
-        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
-        && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").as_deref() != Ok("0")
-        && (!jitcode_has_exception_handler(code) || fbw_builtin_fold_enabled())
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
         {
@@ -3328,7 +3315,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
         && !jitcode_has_exception_handler(code)
-        && std::env::var("PYRE_FBW_LOADNAME_FOLD").as_deref() != Ok("0")
     {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (
@@ -3355,10 +3341,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // guard proves the attribute is present on this shape), so it is attempted
     // even in handler-bearing bodies; every unfoldable shape falls through to
     // the residual (which keeps its exception guard).
-    if ctx.is_authoritative_executor
-        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadAttr
-        && fbw_loadattr_fold_enabled()
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadAttr {
         if let (Some(&obj_opref), Some(&code_opref), Some(&namei_opref)) =
             (r_args.first(), r_args.get(1), i_args.first())
         {
@@ -3387,7 +3370,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadAttr
-        && fbw_loadmethod_fold_enabled()
         && next_op_is_load_method_self_for_attr(code, op, ctx, dst)
     {
         if let (Some(&obj_opref), Some(&code_opref), Some(&namei_opref)) =
@@ -3416,10 +3398,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             }
         }
     }
-    if ctx.is_authoritative_executor
-        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
-        && fbw_loadmethod_fold_enabled()
-    {
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf {
         if let (Some(&namei_opref), Some(&obj_opref), Some(&attr_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1), r_args.get(2))
         {
@@ -3544,8 +3523,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             },
                         }
                     }
-                } else if op_tag == 10 && fbw_raise_enabled() && ctx.is_authoritative_executor {
-                    // B3 (`PYRE_FBW_RAISE`): `op_tag == 10` is CHECK_EXC_MATCH
+                } else if op_tag == 10 && ctx.is_authoritative_executor {
+                    // B3: `op_tag == 10` is CHECK_EXC_MATCH
                     // (`bh_compare_fn(exc, match_type, 10)`,
                     // `call_jit.rs`).  Fold the match concretely to a
                     // const bool (the immortal TRUE/FALSE singleton) so the
