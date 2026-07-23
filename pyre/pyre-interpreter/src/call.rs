@@ -255,6 +255,29 @@ pub fn set_jit_param(name: &str, value: i64) {
     }
 }
 
+// `rlib/jit.py:842 set_user_param` — the positional-string form
+// (`"name=value,…"`, `"off"`, `"default"`) that `pypyjit.set_param(str)`
+// routes through. The JIT owns the authoritative parser, so this forwards the
+// whole string and returns `Err(())` on a malformed string (rlib/jit.py:853).
+type SetJitParamStringFn = fn(text: &str) -> Result<(), ()>;
+static SET_JIT_PARAM_STRING_HOOK: OnceLock<SetJitParamStringFn> = OnceLock::new();
+
+/// Register the hook that applies a JIT-parameter string via the JIT
+/// runtime's `set_user_param`. Called by pyre-jit at startup.
+pub fn register_set_jit_param_string_hook(f: SetJitParamStringFn) {
+    let _ = SET_JIT_PARAM_STRING_HOOK.set(f);
+}
+
+/// Apply a JIT-parameter string. `Ok(())` when the hook is absent (JIT-disabled
+/// build) so a `pypyjit.set_param("…")` call is inert rather than an error
+/// there; `Err(())` only on a malformed string once the JIT is present.
+pub fn set_jit_param_string(text: &str) -> Result<(), ()> {
+    match SET_JIT_PARAM_STRING_HOOK.get() {
+        Some(hook) => hook(text),
+        None => Ok(()),
+    }
+}
+
 /// jd1 (`unpackiterable_driver`) merge-point hook. pyre-interpreter cannot
 /// import pyre-jit (its upper crate), so the JIT registers this at boot and the
 /// `unpackiterable_driver.jit_merge_point` marker calls through it. Mirrors the

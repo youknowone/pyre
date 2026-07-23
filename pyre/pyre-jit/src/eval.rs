@@ -4699,6 +4699,16 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
         .set_param(name, value);
 }
 
+/// `pypyjit.set_param(str)` seam: apply a whole parameter string
+/// (`"name=value,…"`, `"off"`, `"default"`) to the warmstate through the
+/// authoritative parser, so the positional-string form shares one code path
+/// with the `PYRE_JIT` env lever regardless of backend.
+fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
+    let (driver, _) = driver_pair();
+    let ws = driver.meta_interp_mut().warm_state_mut();
+    apply_jit_param_string(ws, text)
+}
+
 /// WIP gate for jd1 (`unpackiterable_driver`) live-path residual execution.
 /// OFF by default: the merge-point hook stays inert so the second driver does
 /// not perturb jd0 until the full activation slice (blackhole entry +
@@ -5054,6 +5064,7 @@ pub fn init_jit_hooks() {
     init_gc_subsystem();
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+    pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
@@ -5732,6 +5743,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+    pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     // The backend-agnostic registrations here — notably the JIT exception
     // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
     // residual-call raises through — are required on every backend; the

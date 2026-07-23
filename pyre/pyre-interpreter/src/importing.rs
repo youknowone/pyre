@@ -541,6 +541,9 @@ pub fn install_builtin_modules() {
     pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
 
+    // pypyjit — runtime JIT-parameter control (`set_param`).
+    pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
+
     pyre_install_module!(atexit);
     // faulthandler installs host signal handlers and writes tracebacks to a raw
     // fd, neither of which is mediated; like the other host-access modules below

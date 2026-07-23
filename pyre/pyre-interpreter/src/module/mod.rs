@@ -85,6 +85,7 @@ pub mod posix;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod pwd;
 pub mod pyexpat;
+pub mod pypyjit;
 #[cfg(not(feature = "sandbox"))]
 pub mod resource;
 #[cfg(not(feature = "sandbox"))]
