@@ -1134,6 +1134,28 @@ class Check:
 
         return False, elapsed, baseline_time, ""
 
+    def _gate_fail_detail(self, backend, baseline, measured, baseline_time, limit):
+        """One-line FAIL detail using the exact numbers the gate compared.
+
+        The gate decides on startup-subtracted exec times
+        (``_exec_time(backend, measured) <= _exec_time(baseline, baseline_time)
+        * limit``), so those exec times — not the raw run times — are printed,
+        alongside their true measured ratio and the gate threshold. On a FAIL
+        the ratio necessarily exceeds the threshold, so every number on the
+        line is arithmetically self-consistent: exec_measured / exec_baseline
+        equals the shown ratio, which is above the shown gate.
+        """
+        exec_m = self._exec_time(backend, measured)
+        exec_b = self._exec_time(baseline, baseline_time)
+        if exec_b in (None, "-") or float(exec_b) <= 0:
+            ratio = "-"
+        else:
+            ratio = f"{float(exec_m) / float(exec_b):.1f}x"
+        return (
+            f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
+            f"ratio {ratio} > gate {float(limit):g}x"
+        )
+
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
@@ -1199,12 +1221,12 @@ class Check:
                 [PYTHON3, script], pypy_output, "cpython",
             )
             if not passed:
-                self._record(
-                    backend, False, name,
-                    f"{checked_elapsed:.2f}s > cpython {checked_baseline:.2f}s x{vs_cpython}",
+                detail = self._gate_fail_detail(
+                    backend, "cpython", checked_elapsed, checked_baseline, vs_cpython,
                 )
+                self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
-                print(f"{red('SLOWER')}  pyre {checked_elapsed:.2f}s > cpython {checked_baseline:.2f}s x{vs_cpython}{suffix}")
+                print(f"{red('SLOWER')}  pyre {detail}{suffix}")
                 self._append_comparison(
                     backend, name, t_cpython, t_pypy,
                     fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
@@ -1220,12 +1242,12 @@ class Check:
                 [PYPY3, script], pypy_output, "pypy",
             )
             if not passed:
-                self._record(
-                    backend, False, name,
-                    f"{checked_elapsed:.2f}s > pypy {checked_baseline:.2f}s x{vs_pypy}",
+                detail = self._gate_fail_detail(
+                    backend, "pypy", checked_elapsed, checked_baseline, vs_pypy,
                 )
+                self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
-                print(f"{red('SLOWER')}  pyre {checked_elapsed:.2f}s > pypy {checked_baseline:.2f}s x{vs_pypy}{suffix}")
+                print(f"{red('SLOWER')}  pyre {detail}{suffix}")
                 self._append_comparison(
                     backend, name, t_cpython, t_pypy,
                     fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
