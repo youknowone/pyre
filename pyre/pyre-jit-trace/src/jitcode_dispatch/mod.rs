@@ -8220,12 +8220,12 @@ fn handle<Sym: WalkSym>(
         "getfield_gc_i/rd>i" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i'),
         "getfield_gc_r/rd>r" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r'),
         "getfield_gc_f/rd>f" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcF, 'f'),
-        // RPython `blackhole.py` aliases
-        // `bhimpl_getfield_gc_{i,r,f}_pure = bhimpl_getfield_gc_{i,r,f}` —
-        // pure-getter shape on quasi-immutable descrs.  Walker emits
-        // the non-pure opcode; the optimizer rewrites to the Pure form
-        // post-trace based on `descr.is_always_pure()`
-        // (`resoperation.py OpHelpers.getfield_pure_for_descr`).
+        // RPython aliases the `_pure` jitcode spelling to the plain
+        // handler (`pyjitpl.py:884 opimpl_getfield_gc_i_pure =
+        // opimpl_getfield_gc_i`), so the recorded opcode stays plain
+        // and purity is re-derived from `descr.is_always_pure()` by
+        // the optimizer (`heap.py:641` const fold + invalidation-exempt
+        // field cache).
         "getfield_gc_i_pure/rd>i" => {
             getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i')
         }

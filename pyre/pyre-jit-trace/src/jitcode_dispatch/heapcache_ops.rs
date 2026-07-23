@@ -437,13 +437,13 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 ///
 /// Walker behaviour mirrors `_opimpl_getfield_gc_any_pureornot`
 /// uniformly: heapcache hit returns the cached box (no IR op);
-/// heapcache miss records `GetfieldGc<I|R>` (non-pure variant) +
-/// writes through. The optimizer's always-pure pass later folds the
-/// non-pure read into `GetfieldGcPure*` based on `descr.is_always_pure()`,
-/// which is `OpHelpers.getfield_pure_for_descr` (resoperation.py)
-/// parity. Walker emitting Pure variants directly would be
-/// a TODO since RPython's opimpl_* never emits the Pure
-/// opcodes; they're an optimizer-rewrite artifact.
+/// heapcache miss records the opcode the dispatch selected +
+/// writes through. RPython aliases the `_pure` jitcode spelling to
+/// the plain opimpl (`pyjitpl.py:884`), so both spellings record the
+/// plain opnum here; the optimizer re-derives purity from
+/// `descr.is_always_pure()` (`heap.py:641` const fold +
+/// invalidation-exempt field cache). There is no post-trace rewrite
+/// to the Pure opcodes.
 ///
 /// `dst_bank` selects the result bank: `'i'` writes `registers_i[dst]`,
 /// `'r'` writes `registers_r[dst]`.
