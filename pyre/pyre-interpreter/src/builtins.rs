@@ -3988,14 +3988,6 @@ fn type_descr_new_with_metaclass(
                 )));
             }
         }
-        // typeobject.py:ensure_common_attributes always installs __doc__;
-        // user heap types use None when no class-body docstring was supplied.
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__doc__") }.is_none() {
-            unsafe {
-                pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__doc__", pyre_object::w_none())
-            };
-        }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_doc(class_ns)?;
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);

@@ -343,7 +343,25 @@ fn sys_get_coroutine_origin_tracking_depth(_args: &[PyObjectRef]) -> crate::PyRe
 }
 
 fn sys_set_coroutine_origin_tracking_depth(args: &[PyObjectRef]) -> crate::PyResult {
-    let w_depth = *args.first().ok_or_else(|| {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["depth"],
+        "set_coroutine_origin_tracking_depth",
+    )?;
+    if positional.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "set_coroutine_origin_tracking_depth() takes exactly one argument ({} given)",
+            positional.len(),
+        )));
+    }
+    let kw_depth = crate::builtins::kwarg_get(kwargs, "depth");
+    if !positional.is_empty() && kw_depth.is_some() {
+        return Err(crate::PyError::type_error(
+            "set_coroutine_origin_tracking_depth() got multiple values for argument 'depth'",
+        ));
+    }
+    let w_depth = positional.first().copied().or(kw_depth).ok_or_else(|| {
         crate::PyError::type_error(
             "set_coroutine_origin_tracking_depth() missing required argument 'depth'",
         )

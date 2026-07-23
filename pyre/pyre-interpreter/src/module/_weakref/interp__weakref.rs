@@ -878,12 +878,24 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
     let Some(stored) = crate::baseobjspace::finditem(backing, key)? else {
         return Ok(pyre_object::w_none());
     };
-    if !is_w_weakref(stored) {
-        return Err(PyError::type_error("not a weakref"));
-    }
-    if !dereference(stored).is_null() {
+    // app_weakref.py calls the retrieved value directly (`wr()`) rather than
+    // requiring a weakref instance.  Keep backing/key/stored rooted across
+    // that arbitrary call, then use the native identity-checked deletion
+    // primitive exactly as `delitem_if_value_is(d, key, wr)` does upstream.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let backing_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(backing);
+    let key_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(key);
+    let stored_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(stored);
+    let result = crate::call::call_function_impl_result(stored, &[])?;
+    if !unsafe { pyre_object::is_none(result) } {
         return Ok(pyre_object::w_none());
     }
+    let backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
+    let key = pyre_object::gc_roots::shadow_stack_get(key_root);
+    let stored = pyre_object::gc_roots::shadow_stack_get(stored_root);
     crate::baseobjspace::dict_delitem_if_value_is(backing, key, stored)?;
     Ok(pyre_object::w_none())
 }

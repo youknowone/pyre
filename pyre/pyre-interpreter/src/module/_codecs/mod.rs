@@ -1746,7 +1746,6 @@ fn escape_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
             b'\n' => out.extend_from_slice(b"\\n"),
             b'\r' => out.extend_from_slice(b"\\r"),
             b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\'' => out.extend_from_slice(b"\\'"),
             0x20..=0x7e => out.push(*byte),
             value => out.extend_from_slice(format!("\\x{value:02x}").as_bytes()),
         }

@@ -23,6 +23,7 @@ for encoded, expected in cases.items():
 
 raw = b"a\n\\b\x00c\td\xe5"
 assert _codecs.escape_encode(raw) == (b"a\\n\\\\b\\x00c\\td\\xe5", len(raw))
+assert _codecs.escape_encode(b"'") == (b"'", 1)
 
 assert codecs.escape_decode(b"a\\x00\\n") == (b"a\x00\n", 7)
 assert _codecs.escape_decode(b"[\\x]\\x", "ignore") == (b"[]", 6)

@@ -34,6 +34,13 @@ except TypeError:
 else:
     raise AssertionError("_remove_dead_weakref accepted a mappingproxy")
 
+# PyPy's app-level helper calls the current value and deletes it only when
+# that call returns None; it deliberately accepts arbitrary callables.
+callable_entries = {"dead": lambda: None, "live": lambda: 1}
+weakref._remove_dead_weakref(callable_entries, "dead")
+weakref._remove_dead_weakref(callable_entries, "live")
+assert callable_entries == {"live": callable_entries["live"]}
+
 # Test __callback__ property
 assert b.__callback__ is None, (
     "weakref without callback should have __callback__ == None"
@@ -66,6 +73,10 @@ gc.collect()
 assert seen == [(2, None), (1, None)]
 assert w1.__callback__ is None
 assert w2.__callback__ is None
+
+dead_entries = {"x": w1}
+weakref._remove_dead_weakref(dead_entries, "x")
+assert dead_entries == {}
 
 
 class G:

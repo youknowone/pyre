@@ -2,6 +2,7 @@ import _opcode
 import dis
 import inspect
 import opcode
+import sys
 import typing
 
 
@@ -83,6 +84,11 @@ for predicate in (
         raise AssertionError("opcode predicate accepted a missing opcode")
 
 assert _opcode.stack_effect(dis.opmap["NOP"], None) == 0
+
+old_origin_depth = sys.get_coroutine_origin_tracking_depth()
+sys.set_coroutine_origin_tracking_depth(depth=1)
+assert sys.get_coroutine_origin_tracking_depth() == 1
+sys.set_coroutine_origin_tracking_depth(old_origin_depth)
 try:
     _opcode.stack_effect(dis.opmap["NOP"], 0, True)
 except TypeError:
