@@ -494,6 +494,43 @@ pub(crate) unsafe fn exc_user_dunder_obj(
     }
 }
 
+/// Dispatch a user-defined `__repr__` / `__str__` override on a
+/// `types.ModuleType` subclass. A module instance keeps `ob_type` at the
+/// canonical module type and carries its Python class in `w_class`, so the
+/// `ob_type`-keyed formatting in `py_repr` / `py_str` would otherwise bypass a
+/// subclass override. Returns `None` when the method resolves to the base
+/// `module` registration or `object` (no override); a raising override
+/// propagates and a non-string result raises `TypeError`.
+unsafe fn module_user_dunder_obj(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
+        let w_class = (*obj).w_class;
+        if w_class.is_null() || !pyre_object::is_type(w_class) {
+            return Ok(None);
+        }
+        let module_class = crate::typedef::gettypeobject(&MODULE_TYPE);
+        if std::ptr::eq(w_class, module_class) {
+            return Ok(None);
+        }
+        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
+            return Ok(None);
+        };
+        if method.is_null()
+            || std::ptr::eq(src, module_class)
+            || std::ptr::eq(src, crate::typedef::w_object())
+        {
+            return Ok(None);
+        }
+        let r = crate::builtins::call_and_check(method, &[obj])?;
+        if pyre_object::is_str(r) {
+            return Ok(Some(r));
+        }
+        Err(dunder_returned_non_string(name, r))
+    }
+}
+
 pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
     // A tagged immediate must be formatted before `ob_type` touches it as a
     // pointer; `repr` of a plain `int` is its
@@ -759,7 +796,14 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // GenericAlias.__repr__ (`_pypy_generic_alias.py:57`).
             return crate::_pypy_generic_alias::repr(obj);
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
-            crate::typedef::module_repr_string(obj)?
+            // A `types.ModuleType` subclass carries its class in `w_class`; a
+            // subclass `__repr__` override wins over the native module
+            // formatting.
+            if let Some(r) = module_user_dunder_obj(obj, "__repr__")? {
+                pyre_object::w_str_get_value(r).to_string()
+            } else {
+                crate::typedef::module_repr_string(obj)?
+            }
         } else if std::ptr::eq(
             tp,
             &pyre_object::pyobject::MAPPING_PROXY_TYPE as *const PyType,
@@ -1066,6 +1110,13 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
         // above, so this fallthrough never reaches a bare-`str` subclass.
         if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__")? {
             return Ok(s);
+        }
+        // A `types.ModuleType` subclass `__str__` override wins; without one,
+        // `str` falls back to `__repr__` through `py_repr`.
+        if pyre_object::is_module(obj) {
+            if let Some(r) = module_user_dunder_obj(obj, "__str__")? {
+                return Ok(pyre_object::w_str_get_value(r).to_string());
+            }
         }
         py_repr(obj)
     }
