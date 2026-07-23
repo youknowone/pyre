@@ -2921,8 +2921,10 @@ pub(crate) fn try_int_long_pow_with_modulo(
             return Ok(Some(pow_mod_result(result, all_int_like)));
         }
         if bigint_eq(exp.clone(), BigInt::from(0)) {
+            // `x ** 0 % m` is `1 % m` under floor semantics, so a negative
+            // modulus yields a negative residue (`pow(2, 0, -13) == -12`).
             return Ok(Some(pow_mod_result(
-                bigint_mod(BigInt::from(1), modulus),
+                BigInt::from(1).mod_floor(&modulus),
                 all_int_like,
             )));
         }
