@@ -151,6 +151,33 @@ def crate_layout_flags(
     return [expand_features(arg, cargo_features) for arg in spec.layout_cargo_args]
 
 
+def features_in_cargo_flags(crate: str, flags: list[str]) -> list[str]:
+    """Feature names a cargo arg list enables, workspace-qualified.
+
+    A bare name is crate-relative (the extraction passes run cargo inside the
+    crate directory) and must be spelled `crate/feature` for the
+    workspace-level `cargo metadata`. `--no-default-features` is ignored:
+    dropping it can only widen the graph, and the fingerprint may
+    over-approximate but must never miss an input.
+    """
+    features: list[str] = []
+    index = 0
+    while index < len(flags):
+        arg = flags[index]
+        if arg in ("--features", "-F") and index + 1 < len(flags):
+            value = flags[index + 1]
+            index += 2
+        elif arg.startswith(("--features=", "-F=")):
+            value = arg.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+            continue
+        for feature in value.replace(",", " ").split():
+            features.append(feature if "/" in feature else f"{crate}/{feature}")
+    return features
+
+
 def run_capture(args: list[str], *, cwd: Path) -> str:
     return subprocess.run(
         args,
@@ -172,17 +199,33 @@ def host_triple(root: Path) -> str:
     raise SystemExit("extract-llbc.py: could not determine rustc host triple")
 
 
-_metadata_cache: dict[tuple[str, str], dict] = {}
+_metadata_cache: dict[tuple, dict] = {}
 
 
-def metadata(eng: Engine, cargo_features: str, platform: str) -> dict:
-    """`cargo metadata` filtered to `platform`, memoised per (features, platform).
+def metadata(
+    eng: Engine,
+    cargo_features: str,
+    platform: str,
+    extra_features: tuple[str, ...] = (),
+) -> dict:
+    """`cargo metadata` filtered to `platform`, memoised per full query.
 
     The platform matters: `--filter-platform` drops dependencies gated on other
     targets, so the host's graph does not see a `[target.'cfg(...)']` path dep
     that only the cross-target layout sidecar pass compiles.
+    `extra_features` carries workspace-qualified features a layout sidecar
+    pass enables beyond the host pass (`layout_cargo_args`), so the graph
+    sees the dependencies they pull in. The memo key spans every input that
+    shapes the result — including the engine's workspace root and feature
+    crates, which differ between engines sharing this module.
     """
-    key = (cargo_features, platform)
+    key = (
+        str(eng.root),
+        eng.metadata_feature_crates,
+        cargo_features,
+        platform,
+        extra_features,
+    )
     if key in _metadata_cache:
         return _metadata_cache[key]
 
@@ -193,6 +236,7 @@ def metadata(eng: Engine, cargo_features: str, platform: str) -> dict:
             metadata_features.extend(
                 f"{crate}/{feature}" for crate in eng.metadata_feature_crates
             )
+    metadata_features.extend(extra_features)
 
     args = [
         "cargo",
@@ -229,11 +273,25 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
         for name in target_names:
             platforms.update(crate_layout_targets(eng, eng.spec(name)))
 
+        # A layout sidecar pass may enable features the host pass does not
+        # (`layout_cargo_args`); fold them into every metadata query so the
+        # union closure sees the dependencies those features pull in.
+        layout_features: set[str] = set()
+        for name in target_names:
+            spec = eng.spec(name)
+            if spec.layout_cargo_args is not None:
+                layout_features.update(
+                    features_in_cargo_flags(
+                        name, crate_layout_flags(spec, cargo_features, [])
+                    )
+                )
+        extra_features = tuple(sorted(layout_features))
+
         # Never drop a requested target crate, only its excluded dependencies.
         exclude = excluded_packages(eng, crates) - set(target_names)
 
         for platform in sorted(platforms):
-            meta = metadata(eng, cargo_features, platform)
+            meta = metadata(eng, cargo_features, platform, extra_features)
             packages = meta["packages"]
             by_name = {package["name"]: package for package in packages}
             by_id = {package["id"]: package for package in packages}
