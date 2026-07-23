@@ -47,12 +47,17 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
 
 fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
     if unsafe { bytesobject::is_bytes_like(obj) } {
-        Ok(unsafe { bytesobject::bytes_like_data(obj) }.to_vec())
-    } else {
-        Err(PyError::type_error(format!(
-            "{function}() argument must be a bytes-like object"
-        )))
+        return Ok(unsafe { bytesobject::bytes_like_data(obj) }.to_vec());
     }
+    // Any readable buffer is accepted (`interp_marshal` unwraps via
+    // `space.readbuf_w`): `SourcelessFileLoader.get_code` hands `loads` a
+    // sliced memoryview of the pyc payload.
+    if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+        return Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec());
+    }
+    Err(PyError::type_error(format!(
+        "{function}() argument must be a bytes-like object"
+    )))
 }
 
 /// Transient equivalent of PyPy's `Marshaller.all_refs` dict.  A VecMap is
