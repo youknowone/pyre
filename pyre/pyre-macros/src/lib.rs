@@ -181,7 +181,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     for arg in user_sig.inputs.iter() {
         let FnArg::Typed(pt) = arg else { continue };
         let name_lit = match &*pt.pat {
-            Pat::Ident(pi) => pi.ident.to_string(),
+            Pat::Ident(pi) => python_keyword_name(&pi.ident.to_string()),
             _ => continue,
         };
         if pt.attrs.iter().any(|a| a.path().is_ident("kwargs")) {
@@ -653,12 +653,24 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
     ))
 }
 
+/// Derive the Python keyword name from a Rust parameter identifier.  A single
+/// trailing underscore is the convention for dodging a Rust keyword clash
+/// (`final_`, `type_`), and the Python name drops it.  Dunder names end in
+/// `__` and are left intact.
+fn python_keyword_name(ident: &str) -> String {
+    if ident.ends_with('_') && !ident.ends_with("__") {
+        ident[..ident.len() - 1].to_string()
+    } else {
+        ident.to_string()
+    }
+}
+
 /// The keyword name a parameter binds under — its identifier, or a
 /// synthetic positional-only placeholder for a non-ident pattern (which
 /// no real keyword can match).
 fn param_name(idx: usize, pt: &PatType) -> String {
     match &*pt.pat {
-        Pat::Ident(pi) => pi.ident.to_string(),
+        Pat::Ident(pi) => python_keyword_name(&pi.ident.to_string()),
         _ => format!("__pyre_positional_{idx}"),
     }
 }
