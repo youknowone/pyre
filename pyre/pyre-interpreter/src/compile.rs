@@ -17,7 +17,17 @@ pub use rustpython_compiler_core::bytecode::{
 /// The `CompileError` is returned unflattened so the SyntaxError builders
 /// can read its `python_location` / `python_end_location` / `source_path`.
 pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileError> {
-    rp_compile(source, mode, "<string>".into(), Default::default())
+    rp_compile(source, mode, "<string>".into(), default_compile_opts())
+}
+
+/// The `CompileOpts` for an implicit compile (script / `-c` / import): the
+/// `optimize` level tracks `-O` / `-OO` / PYTHONOPTIMIZE via the runtime flag,
+/// the rest default (pycompiler.py `compile_ast` resolving `optimize == -1`).
+fn default_compile_opts() -> CompileOpts {
+    CompileOpts {
+        optimize: crate::importing::optimize_flag(),
+        ..Default::default()
+    }
 }
 
 /// Compile Python source code with a custom filename.
@@ -28,7 +38,7 @@ pub fn compile_source_with_filename(
     mode: Mode,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
-    compile_source_with_opts(source, mode, filename, Default::default())
+    compile_source_with_opts(source, mode, filename, default_compile_opts())
 }
 
 /// Compile Python source with an explicit `CompileOpts`, carrying the

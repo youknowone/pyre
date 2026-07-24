@@ -7730,8 +7730,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ));
     }
     if optimize == -1 {
-        // sys.flags.optimize default.
-        optimize = 0;
+        // pycompiler.py `compile_ast`: -1 resolves to sys.flags.optimize.
+        optimize = i64::from(crate::importing::optimize_flag());
     }
 
     let source_str = unsafe {

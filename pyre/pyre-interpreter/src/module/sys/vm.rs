@@ -746,14 +746,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     fns,
                     "optimize",
-                    w_int_new(0),
+                    w_int_new(i64::from(crate::importing::optimize_flag())),
                 )
             };
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     fns,
                     "dont_write_bytecode",
-                    w_int_new(0),
+                    w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
                 )
             };
             unsafe {
@@ -1478,10 +1478,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "path_importer_cache", w_dict_new());
     // sys.meta_path — empty
     module_ns_store(ns, "meta_path", w_list_new(vec![]));
-    // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode` (0
-    // unless `-B` / PYTHONDONTWRITEBYTECODE); no bytecode cache is written
-    // regardless, but the reported default stays False for compatibility.
-    module_ns_store(ns, "dont_write_bytecode", w_bool_from(false));
+    // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode`
+    // (`-B` / PYTHONDONTWRITEBYTECODE); no bytecode cache is written regardless,
+    // but the reported value tracks the flag for compatibility.
+    module_ns_store(
+        ns,
+        "dont_write_bytecode",
+        w_bool_from(crate::importing::dont_write_bytecode_flag()),
+    );
     // sys.pycache_prefix — None unless -X pycache_prefix / PYTHONPYCACHEPREFIX.
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
     // bytecode path before `dont_write_bytecode` is consulted.

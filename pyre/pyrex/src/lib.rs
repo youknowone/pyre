@@ -47,6 +47,9 @@ struct LaunchFlags {
     dev_mode: bool,
     utf8_mode: Option<i64>,
     safe_path: bool,
+    // `-O` count on the command line; PYTHONOPTIMIZE folds in during finalize.
+    optimize: u8,
+    dont_write_bytecode: bool,
 }
 
 impl Default for LaunchFlags {
@@ -61,6 +64,8 @@ impl Default for LaunchFlags {
             dev_mode: false,
             utf8_mode: None,
             safe_path: false,
+            optimize: 0,
+            dont_write_bytecode: false,
         }
     }
 }
@@ -76,7 +81,9 @@ Options:
 -i     : inspect interactively after running script
 -E     : ignore PYTHON* environment variables
 -I     : isolate Python from the user's environment
--O     : optimize (no-op, reserved for compatibility)
+-B     : don't write .pyc files on import (also PYTHONDONTWRITEBYTECODE=x)
+-O     : remove assert and __debug__-dependent statements (also PYTHONOPTIMIZE=x)
+-OO    : do -O changes and also discard docstrings
 -q     : don't print version on interactive startup
 -s     : don't add user site directory to sys.path
 -S     : don't imply 'import site' on initialization
@@ -146,8 +153,50 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> i64 {
     if locale_implies_utf8_mode() { 1 } else { 0 }
 }
 
+/// `_Py_get_env_flag`: an integer environment flag. An unset or empty value is
+/// absent; a clean non-negative integer is used as-is; anything else (trailing
+/// junk, negative, overflow) counts as 1.
+fn env_int_flag(name: &str) -> Option<u32> {
+    let raw = std::env::var(name).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let value = match raw.parse::<i64>() {
+        Ok(v) if (0..=i64::from(u32::MAX)).contains(&v) => v as u32,
+        _ => 1,
+    };
+    Some(value)
+}
+
+/// `-O` count folded with PYTHONOPTIMIZE (`config_init_optimization_level`):
+/// the effective level is the larger of the two.
+fn resolve_optimize(flags: &LaunchFlags) -> u8 {
+    let mut level = u32::from(flags.optimize);
+    if !flags.ignore_environment {
+        if let Some(v) = env_int_flag("PYTHONOPTIMIZE") {
+            level = level.max(v);
+        }
+    }
+    level.min(u32::from(u8::MAX)) as u8
+}
+
+/// `-B` folded with PYTHONDONTWRITEBYTECODE: either disables bytecode caches.
+fn resolve_dont_write_bytecode(flags: &LaunchFlags) -> bool {
+    if flags.dont_write_bytecode {
+        return true;
+    }
+    if !flags.ignore_environment {
+        if let Some(v) = env_int_flag("PYTHONDONTWRITEBYTECODE") {
+            return v != 0;
+        }
+    }
+    false
+}
+
 fn finalize_flags(mut flags: LaunchFlags) -> LaunchFlags {
     flags.utf8_mode = Some(resolve_utf8_mode(&flags));
+    flags.optimize = resolve_optimize(&flags);
+    flags.dont_write_bytecode = resolve_dont_write_bytecode(&flags);
     flags
 }
 
@@ -193,7 +242,11 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                     _ => {}
                 }
             }
-            Short('O') => {} // no-op
+            // `-O` / `-OO` raise the optimization level; each occurrence counts
+            // (app_main.py `optimize`). PYTHONOPTIMIZE folds in during finalize.
+            Short('O') => flags.optimize = flags.optimize.saturating_add(1),
+            // `-B` disables writing bytecode caches (PYTHONDONTWRITEBYTECODE).
+            Short('B') => flags.dont_write_bytecode = true,
             // Unbuffered stdio: pyre's stdout/stderr wrappers already write
             // through to the fd on every call, so the flag has nothing left
             // to disable; accepting it keeps `script_helper`-style spawns
@@ -415,6 +468,8 @@ fn real_main(binary_name: &str) {
         dev_mode,
         utf8_mode,
         safe_path,
+        optimize,
+        dont_write_bytecode,
     } = flags;
 
     // The `interact` controller does not run the embedded interpreter; it only
@@ -456,6 +511,8 @@ fn real_main(binary_name: &str) {
         dev_mode,
         utf8_mode.unwrap_or(0),
         safe_path,
+        optimize,
+        dont_write_bytecode,
     );
 
     // OS-level hardening (default-on in any Linux `sandbox` build): lock the

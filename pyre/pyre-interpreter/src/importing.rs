@@ -1529,6 +1529,8 @@ thread_local! {
     static SYS_DEV_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SYS_UTF8_MODE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static SYS_SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYS_OPTIMIZE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static SYS_DONT_WRITE_BYTECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
@@ -1546,6 +1548,7 @@ pub fn no_site_flag() -> bool {
 /// Record the command-line flags consumed by `app_main.py` before `sys` is
 /// initialized.  The codec paths also read `dev_mode` directly, matching
 /// `space.sys.get_flag('dev_mode')` in `unicodeobject.py`.
+#[allow(clippy::too_many_arguments)]
 pub fn set_runtime_flags(
     no_user_site: bool,
     ignore_environment: bool,
@@ -1553,6 +1556,8 @@ pub fn set_runtime_flags(
     dev_mode: bool,
     utf8_mode: i64,
     safe_path: bool,
+    optimize: u8,
+    dont_write_bytecode: bool,
 ) {
     SYS_NO_USER_SITE.with(|p| p.set(no_user_site));
     SYS_IGNORE_ENVIRONMENT.with(|p| p.set(ignore_environment));
@@ -1560,6 +1565,8 @@ pub fn set_runtime_flags(
     SYS_DEV_MODE.with(|p| p.set(dev_mode));
     SYS_UTF8_MODE.with(|p| p.set(utf8_mode));
     SYS_SAFE_PATH.with(|p| p.set(safe_path));
+    SYS_OPTIMIZE.with(|p| p.set(optimize));
+    SYS_DONT_WRITE_BYTECODE.with(|p| p.set(dont_write_bytecode));
 }
 
 pub fn no_user_site_flag() -> bool {
@@ -1584,6 +1591,19 @@ pub fn utf8_mode_flag() -> i64 {
 
 pub fn safe_path_flag() -> bool {
     SYS_SAFE_PATH.with(|p| p.get())
+}
+
+/// `-O` / `-OO` / PYTHONOPTIMIZE level, driving `sys.flags.optimize` and the
+/// default compile `optimize` (stripped asserts, `__debug__` = False, and at
+/// level 2 discarded docstrings).
+pub fn optimize_flag() -> u8 {
+    SYS_OPTIMIZE.with(|p| p.get())
+}
+
+/// `-B` / PYTHONDONTWRITEBYTECODE, driving `sys.flags.dont_write_bytecode` and
+/// `sys.dont_write_bytecode`.
+pub fn dont_write_bytecode_flag() -> bool {
+    SYS_DONT_WRITE_BYTECODE.with(|p| p.get())
 }
 
 /// Called from sys module init to pick up any pending argv.
