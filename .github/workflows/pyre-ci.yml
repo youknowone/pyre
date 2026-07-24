@@ -260,45 +260,36 @@ jobs:
           /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/share/boost
         sudo docker image prune --all --force || true
         df -h /
-    - name: Run cargo tests
-      # Pin bash: on windows-latest the default shell is PowerShell, where
-      # POSIX loop/status handling would otherwise need a separate spelling.
+    - name: Run cargo tests (dynasm)
       shell: bash
-      # Two passes, but only ONE full-workspace run. The dynasm pass runs the
-      # whole workspace (--all): that is the single run of every
+      # Only ONE full-workspace run. The dynasm pass runs the whole workspace
+      # (--all): that is the single run of every
       # backend-independent crate's tests (majit-translate/-ir/-gc/-macros/
       # -trace, pyre-object/-native/-module, the backend crates' own tests, …).
       # None of those are gated by the dynasm/cranelift feature, so re-running
       # them under cranelift only reproduced byte-identical results while
       # relinking ~15 extra test binaries (the majit-translate harness alone
-      # links >2900 tests). The cranelift pass therefore re-runs ONLY the crates
-      # whose test outcome depends on the active JIT backend — the metainterp /
+      # links >2900 tests).
+      run: cargo test --all --no-default-features --features dynasm
+
+    - name: Run cargo tests (cranelift)
+      shell: bash
+      # This is a separate step so GitHub reports and reruns the backend passes
+      # independently. Steps remain in one job, in order, so this pass starts
+      # only after dynasm finishes and reuses that pass's Cargo target cache.
+      # Re-run ONLY the crates whose test outcome depends on the active JIT
+      # backend — the metainterp /
       # pyre-jit / pyre-jit-trace / pyrex stack, the interpreter, the cranelift
       # backend crate, and the majit example interpreters (each selects the
       # backend through `majit-metainterp/{dynasm,cranelift}`). Test EXECUTION is
       # cheap (~7s for the whole workspace); the cost this avoids is the second
       # backend's compile+link of those otherwise-identical harnesses.
       run: |
-        status=0
-        run_pass() {
-          local label="$1"; shift
-          echo "::group::cargo test ($label)"
-          if cargo test "$@"; then
-            echo "::notice title=cargo test::$label passed"
-          else
-            code=$?
-            echo "::error title=cargo test::$label failed with exit $code"
-            status=1
-          fi
-          echo "::endgroup::"
-        }
-        run_pass dynasm --all --no-default-features --features dynasm
-        run_pass cranelift --no-default-features --features cranelift \
+        cargo test --no-default-features --features cranelift \
           -p majit-metainterp -p majit-backend-cranelift \
           -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
           -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
           -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
-        exit "$status"
 
   cargo-test-macos:
     name: cargo test (macos-latest)
