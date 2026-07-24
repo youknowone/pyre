@@ -775,7 +775,15 @@ pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObjec
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
-        sd.jitcodes.get(idx).map(|jc| unsafe { jc.raw_code() })
+        // A novable drain portal (the jd1 unpackiterable driver) is a native
+        // function with no Python `CodeObject`; its degenerate PyJitCode carries
+        // a null `code_ptr`. Report that as "no raw code" so the instruction-
+        // decoding consumers (bare-reraise probe, traceback lineno) skip it
+        // instead of dereferencing null.
+        sd.jitcodes.get(idx).and_then(|jc| {
+            let raw = unsafe { jc.raw_code() };
+            (!raw.is_null()).then_some(raw)
+        })
     })
 }
 
