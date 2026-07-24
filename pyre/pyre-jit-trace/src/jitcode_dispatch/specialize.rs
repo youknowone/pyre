@@ -4622,11 +4622,12 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
     // to virtualize alongside message-bearing Object lists.  The Empty strategy
     // (zero-argument `raise ValueError()` / `raise StopIteration()`, the most
-    // common raise shape) reproduces `w_list_new(vec![])`'s empty list.  The
-    // Float strategy retains the safe residual fallback.
+    // common raise shape) reproduces `w_list_new(vec![])`'s empty list, and the
+    // Float strategy reproduces its Float layout.
     enum ArgsEmit {
         Object,
         Int(Vec<i64>),
+        Float(Vec<f64>),
         Empty,
     }
 
@@ -4805,8 +4806,17 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
             ArgsEmit::Int(values)
         }
+        pyre_object::listobject::ListStrategy::Float => {
+            // `all_floats` is strict `type(w) is W_FloatObject`, so every
+            // element is an exact `W_FloatObject` and `walker_unbox_float`'s
+            // `&FLOAT_TYPE` guard holds.
+            let mut values = Vec::with_capacity(final_concrete_args.len());
+            for &arg in final_concrete_args {
+                values.push(unsafe { pyre_object::w_float_get_value(arg) });
+            }
+            ArgsEmit::Float(values)
+        }
         pyre_object::listobject::ListStrategy::Empty => ArgsEmit::Empty,
-        pyre_object::listobject::ListStrategy::Float => return Ok(None),
     };
 
     // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
@@ -4902,6 +4912,24 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     let args_list = match args_emit {
         ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
         ArgsEmit::Empty => crate::helpers::emit_empty_list_inline(ctx.trace_ctx),
+        ArgsEmit::Float(values) => {
+            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let mut raws = Vec::with_capacity(final_args.len());
+            for (&arg, value) in final_args.iter().zip(values) {
+                let raw = walker_unbox_float(ctx, op.pc, arg, float_type_addr)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(value));
+                raws.push(raw);
+            }
+            crate::helpers::emit_typed_list_inline(
+                ctx.trace_ctx,
+                &raws,
+                crate::state::float_gcarray_descr(),
+                crate::descr::list_float_items_len_descr(),
+                crate::descr::list_float_items_block_descr(),
+                pyre_object::listobject::ListStrategy::Float,
+            )
+        }
         ArgsEmit::Int(values) => {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             let mut raws = Vec::with_capacity(final_args.len());
