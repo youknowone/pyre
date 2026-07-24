@@ -386,6 +386,19 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "vec.Vec.with_capacity", foreign_container_ctor);
     analyzer_for(&mut reg, "indexmap.IndexMap.new", foreign_container_ctor);
     analyzer_for(&mut reg, "Box.new", foreign_container_ctor);
+    // `<[T]>::into_vec` producer — returns a fresh `Vec<T>`, the same
+    // opaque container shell as `Vec::new`.
+    analyzer_for(
+        &mut reg,
+        "alloc.boxed.box_assume_init_into_vec_unsafe",
+        foreign_container_ctor,
+    );
+    // The WTF-8 buffer builder — a mutable `SomeString` like `String::*`.
+    // (Crate-qualified `string.String.*` needs no row here: its `HostEnv`
+    // carrier reuses the bare `String.new` / `with_capacity` callables, whose
+    // `String.*` qualnames already resolve to the analyzers above.)
+    analyzer_for(&mut reg, "Wtf8Buf.new", string_constructor);
+    analyzer_for(&mut reg, "Wtf8Buf.with_capacity", string_constructor);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to

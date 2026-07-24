@@ -2169,6 +2169,38 @@ impl HostEnv {
             "new_uninit",
             HostObject::new_builtin_callable("boxed.Box.new_uninit"),
         );
+        // `<[T]>::into_vec` lowers through `alloc::boxed::
+        // box_assume_init_into_vec_unsafe(Box<[T]>) -> Vec<T>`; a Vec
+        // producer like the other container ctors above.
+        let alloc_boxed = HostObject::new_module("alloc.boxed");
+        alloc_boxed.module_set(
+            "box_assume_init_into_vec_unsafe",
+            HostObject::new_builtin_callable("alloc.boxed.box_assume_init_into_vec_unsafe"),
+        );
+        // Crate-qualified `string::String::new` / `with_capacity` — some
+        // caller chains keep the `string` module segment (Branch 3b joins
+        // `segments[..-1]` so `"string.String"` must exist alongside the bare
+        // `"String"`, the same bare/crate dual as `vec.Vec`).  Reuse the bare
+        // callables so a single qualname/analyzer covers each leaf.
+        let string_crate = HostObject::new_module("string.String");
+        string_crate.module_set(
+            "new",
+            string_ty.module_get("new").expect("String.new bound above"),
+        );
+        string_crate.module_set(
+            "with_capacity",
+            string_ty
+                .module_get("with_capacity")
+                .expect("String.with_capacity bound above"),
+        );
+        // `Wtf8Buf::new` / `with_capacity` — the owned WTF-8 buffer builder;
+        // a mutable str value like `String::*`.
+        let wtf8buf_ty = HostObject::new_module("Wtf8Buf");
+        wtf8buf_ty.module_set("new", HostObject::new_builtin_callable("Wtf8Buf.new"));
+        wtf8buf_ty.module_set(
+            "with_capacity",
+            HostObject::new_builtin_callable("Wtf8Buf.with_capacity"),
+        );
         let map_indexmap = HostObject::new_module("map.IndexMap");
         map_indexmap.module_set(
             "new",
@@ -2240,6 +2272,9 @@ impl HostEnv {
         mods.insert("vec.Vec".into(), vec_crate);
         mods.insert("bigint.BigInt".into(), bigint_crate);
         mods.insert("boxed.Box".into(), boxed_crate);
+        mods.insert("alloc.boxed".into(), alloc_boxed);
+        mods.insert("string.String".into(), string_crate);
+        mods.insert("Wtf8Buf".into(), wtf8buf_ty);
         mods.insert("map.IndexMap".into(), map_indexmap);
         mods.insert("std.ptr".into(), std_ptr);
         mods.insert("std.mem".into(), std_mem);
