@@ -1608,6 +1608,104 @@ fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool 
     adopted
 }
 
+fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
+    let Some(mut latched) = crate::jitcode_dispatch::take_multi_frame_blackhole() else {
+        return false;
+    };
+    let depth = latched.framestack.len();
+    let virtualizable_info = ctx
+        .virtualizable_info()
+        .map(std::sync::Arc::as_ptr)
+        .unwrap_or(std::ptr::null());
+    if virtualizable_info.is_null() {
+        return false;
+    }
+    let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
+        return false;
+    };
+    // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
+    // full-coverage dispatch table, not the inline-call-only builder.
+    let (mut mf_builder, _unwired) =
+        crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
+    mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
+    let outcome = majit_metainterp::drive_multi_frame_blackhole(
+        &mut mf_builder,
+        &mut latched.framestack,
+        majit_metainterp::blackhole::StateFieldLayout::default(),
+        virtualizable_info,
+        cf_addr as i64,
+        stack_base,
+        ctx.metainterp_sd().as_ref(),
+        latched.last_exc_value,
+        latched.raising_exception,
+    );
+
+    let adopted = match outcome {
+        majit_metainterp::jitexc::JitException::ContinueRunningNormally {
+            ref green_int, ..
+        } => {
+            let Some(&resume_py_pc) = green_int.first() else {
+                return false;
+            };
+            let resume_py_pc = resume_py_pc as usize;
+            if cf_addr == 0 || resume_py_pc == 0 {
+                return false;
+            }
+            // Every frame in the chain uses the live portal virtualizable.
+            // Its setfield_vable operations have already committed the outer
+            // frame state; only the interpreter restart coordinate remains.
+            unsafe {
+                (*(cf_addr as *mut pyre_interpreter::PyFrame)).last_instr =
+                    resume_py_pc as isize - 1;
+            }
+            WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(value) => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Int(
+                value,
+            ));
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(value) => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Ref(
+                value.as_usize() as pyre_object::PyObjectRef,
+            ));
+            true
+        }
+        majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(value) => {
+            crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Float(
+                value,
+            ));
+            true
+        }
+        majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
+            crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
+                value.as_usize() as pyre_object::PyObjectRef,
+            ));
+            true
+        }
+    };
+    if adopted {
+        let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
+        crate::jitcode_dispatch::discard_escape_flush_undo();
+        crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+        WALK_END_FLUSH_COMMITTED.with(|slot| slot.set(true));
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
+        }
+    }
+    adopted
+}
+
+fn try_adopt_force_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
+    try_adopt_multi_frame_blackhole(ctx, cf_addr) || try_adopt_single_frame_blackhole(ctx, cf_addr)
+}
+
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -2307,15 +2405,15 @@ fn run_perfn_walk<Sym: WalkSym>(
         // predicate as the CloseLoop end-flush above.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
-        let single_frame_blackhole_adopted = matches!(
+        let force_blackhole_adopted = matches!(
             &walk_result,
             Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-        ) && try_adopt_single_frame_blackhole(ctx, cf_addr);
+        ) && try_adopt_force_blackhole(ctx, cf_addr);
         if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() == Some(std::ffi::OsStr::new("0")) {
             // Opt-out: never adopt the escape flush — drop the commit and put
             // the pre-flush frame back so the legacy replay sees pristine
             // state.
-            if !single_frame_blackhole_adopted
+            if !force_blackhole_adopted
                 && matches!(
                     &walk_result,
                     Err(
@@ -2327,7 +2425,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::restore_escape_flush_undo();
             }
         } else {
-            if !single_frame_blackhole_adopted
+            if !force_blackhole_adopted
                 && matches!(
                     &walk_result,
                     Err(

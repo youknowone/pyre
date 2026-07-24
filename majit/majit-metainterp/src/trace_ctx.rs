@@ -2309,6 +2309,39 @@ impl TraceCtx {
     ///      `None` as "never matches a real heap pointer", so PTR_EQ
     ///      comparisons with the standard vable resolve to "different" at
     ///      trace time.
+    /// Reconstruct a ref value whose recorder box carries no stamped concrete,
+    /// by re-executing its recorded producer against now-resolvable operands.
+    /// history.py:948 `resbox = execute_with_descr(...)` deferred to
+    /// resume-image build time: an inlined sub-walk that reads a loop-invariant
+    /// OUTER input arg records a `getfield_gc_r` while the obj is still symbolic
+    /// (its concrete lives only in the outer frame's register shadow), so
+    /// `concrete_of_opref` stays `None` until the seeded input arg lets the load
+    /// re-run here.  Follows a chain of `getfield_gc_r` ops down to a resolvable
+    /// root; `depth` bounds the walk.  Returns `None` when the chain roots at an
+    /// op that is neither stamped nor a ref getfield, or the obj is null.
+    pub fn recover_ref_value(&self, opref: OpRef, depth: u32) -> Option<Value> {
+        if let Some(v) = self.concrete_of_opref(opref) {
+            return Some(v);
+        }
+        if depth == 0 {
+            return None;
+        }
+        let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
+        if !matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
+            return None;
+        }
+        let descr = op.descr.borrow().clone()?;
+        let obj = op.args.borrow().first()?.to_opref();
+        let Value::Ref(obj_ref) = self.recover_ref_value(obj, depth - 1)? else {
+            return None;
+        };
+        let obj_ptr = obj_ref.0 as i64;
+        if obj_ptr == 0 || obj_ptr == usize::MAX as i64 {
+            return None;
+        }
+        self.field_sanity_load(obj_ptr, &descr, Type::Ref)
+    }
+
     pub fn concrete_of_opref(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             // history.py:220/261/307 box.type parity: the OpRef variant

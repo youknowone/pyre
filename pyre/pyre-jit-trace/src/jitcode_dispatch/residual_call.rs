@@ -48,6 +48,11 @@ thread_local! {
     /// carried to the walk-end VableEscaped leg.
     static FBW_SINGLE_FRAME_BLACKHOLE: std::cell::RefCell<Option<LatchedSingleFrameBlackhole>> =
         const { std::cell::RefCell::new(None) };
+    /// Force-time image of the paused caller chain plus the live innermost
+    /// tracing frame.  Like the single-frame latch, this outlives the walk
+    /// contexts whose concrete banks supplied it.
+    static FBW_MULTI_FRAME_BLACKHOLE: std::cell::RefCell<Option<LatchedMultiFrameBlackhole>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) struct EscapeFlushUndo {
@@ -63,6 +68,12 @@ pub(crate) struct LatchedSingleFrameBlackhole {
     pub(crate) raising_exception: bool,
 }
 
+pub(crate) struct LatchedMultiFrameBlackhole {
+    pub(crate) framestack: majit_metainterp::MIFrameStack,
+    pub(crate) last_exc_value: i64,
+    pub(crate) raising_exception: bool,
+}
+
 pub(crate) fn single_frame_blackhole_cell_ptr()
 -> *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>> {
     FBW_SINGLE_FRAME_BLACKHOLE.with(|cell| cell as *const _)
@@ -72,14 +83,41 @@ pub(crate) fn take_single_frame_blackhole() -> Option<LatchedSingleFrameBlackhol
     FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| slot.borrow_mut().take())
 }
 
+pub(crate) fn multi_frame_blackhole_cell_ptr()
+-> *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>> {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|cell| cell as *const _)
+}
+
+pub(crate) fn take_multi_frame_blackhole() -> Option<LatchedMultiFrameBlackhole> {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| slot.borrow_mut().take())
+}
+
 pub(crate) fn reset_single_frame_blackhole() {
     FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
         *slot.borrow_mut() = None;
     });
 }
 
 fn single_frame_blackhole_resume_enabled() -> bool {
     std::env::var_os("PYRE_FBW_BLACKHOLE_RESUME").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Opt-in for adopting the MULTI-frame (inlined sub-walk) blackhole image.
+/// The build side (`build_multi_frame_miframe`, the input-arg `_resref` seed,
+/// and the getfield-chain `recover_ref_value`) reconstructs the frame stack
+/// correctly, but the resume side (`drive_multi_frame_blackhole` →
+/// `convert_and_run_from_pyjitpl`) does not yet materialize an OUTER frame's
+/// locals into its live frame before the innermost frame re-reads them (an
+/// inner `sys._getframe(1).f_locals[...]` runs first in the blackhole chain and
+/// sees the not-yet-restored caller frame).  Until that materialization lands,
+/// keep the multi-frame image from being latched so an inline-sub-walk force
+/// declines to the legacy escape/replay path (correct output) instead of
+/// resuming into an incomplete caller frame.
+fn multi_frame_blackhole_resume_enabled() -> bool {
+    std::env::var_os("PYRE_FBW_MULTIFRAME").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 fn build_single_frame_miframe<Sym: WalkSym>(
@@ -124,13 +162,23 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.ref_values.get(color).copied().flatten().is_some() {
             continue;
         }
-        let ConcreteValue::Ref(value) = ctx.concrete_registers_r.get(color).copied()? else {
+        let value = match ctx.concrete_registers_r.get(color).copied()? {
+            ConcreteValue::Ref(value) => value as i64,
             // ConcreteValue::Null is the walker's "unknown" sentinel, not a
-            // proven Python null.  S1 declines the whole image rather than
-            // manufacturing a hole in a live Ref color.
-            return None;
+            // proven Python null.  The register shadow never held this color's
+            // concrete — recover it from the recorded box's producer (a getfield
+            // chain rooted at a seeded input arg an inlined sub-walk read but
+            // never concretized in this frame's shadow); decline only when even
+            // that cannot resolve it.
+            _ => {
+                let opref = ctx.registers_r.get(color).copied()?;
+                match ctx.trace_ctx.recover_ref_value(opref, 8) {
+                    Some(majit_ir::Value::Ref(gc)) => gc.0 as i64,
+                    _ => return None,
+                }
+            }
         };
-        *miframe.ref_values.get_mut(color)? = Some(value as i64);
+        *miframe.ref_values.get_mut(color)? = Some(value);
     }
     for &color in &live.float {
         let color = color as usize;
@@ -145,6 +193,87 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     }
 
     Some(miframe)
+}
+
+fn build_multi_frame_miframe<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    resume_pc: usize,
+    lastop_result: Option<(char, usize, i64)>,
+) -> Option<majit_metainterp::MIFrameStack> {
+    let session = ctx.session.borrow();
+    if session.framestack.is_empty() {
+        return None;
+    }
+    macro_rules! s2dbg {
+        ($($a:tt)*) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[s2-build-decline] {}", format!($($a)*));
+            }
+        };
+    }
+    let mut frames = majit_metainterp::MIFrameStack::empty();
+
+    for (index, inline) in session.framestack.iter().enumerate() {
+        let Some(parent) = inline.parent.as_ref() else {
+            s2dbg!("frame {index}: no parent");
+            return None;
+        };
+        let Some(concrete) = parent.blackhole.as_ref() else {
+            s2dbg!("frame {index}: parent.blackhole None (capture missing)");
+            return None;
+        };
+        let pjc = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)?;
+        let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
+        for &(color, value) in &concrete.int_values {
+            *miframe.int_values.get_mut(color)? = Some(value);
+        }
+        for &(color, _semantic_slot, value) in &concrete.ref_values {
+            *miframe.ref_values.get_mut(color)? = Some(value as i64);
+        }
+        for &(color, opref) in &concrete.float_values {
+            let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+                return None;
+            };
+            *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
+        }
+        if index != 0 {
+            miframe.last_caught_exception_value =
+                session.framestack[index - 1].last_caught_exception_value;
+        }
+        frames.push(miframe);
+    }
+
+    let current = session.framestack.last()?;
+    // The innermost frame is the callee `ctx` is actively sub-walking. In a
+    // sub-walk its identity lives in `inline_callee_consts` — the copied
+    // `snapshot_sym` still points at the outer portal, so resolving off it
+    // pins the OUTER jitcode while `resume_pc` and the concrete banks are the
+    // callee's, landing the resume mid-op in the wrong code. Resolve the
+    // callee's own jitcode so all three share its coordinate space; fall back
+    // to `snapshot_sym` for a top-level (non-sub-walk) abort.
+    let innermost_jitcode = if let Some(consts) = ctx.inline_callee_consts {
+        let jc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+        jc.jitcode.clone()
+    } else {
+        unsafe {
+            let sym = &*ctx.fbw_mode.snapshot_sym;
+            if sym.jitcode().is_null() {
+                s2dbg!("innermost snapshot_sym jitcode null");
+                return None;
+            }
+            (&(*sym.jitcode()).payload).jitcode.clone()
+        }
+    };
+    let Some(mut innermost) =
+        build_single_frame_miframe(ctx, innermost_jitcode, resume_pc, lastop_result)
+    else {
+        s2dbg!("innermost build_single_frame_miframe declined");
+        return None;
+    };
+    innermost.last_caught_exception_value = current.last_caught_exception_value;
+    frames.push(innermost);
+    s2dbg!("BUILT multi-frame depth={}", frames.frames.len());
+    Some(frames)
 }
 
 /// TLS cell pointer for the store-journal root area: the undo stays armed
@@ -1508,32 +1637,47 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // failure leaves the pre-existing escape/replay path untouched.
             let odometer_unchanged = heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() == before);
+            if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
+                eprintln!(
+                    "[s2-gate] inline_subwalk fs={} flag={} writes_live={} odo_unchanged={} \
+                     committed_none={} not_bridge={} bh_result_some={} sym_nonnull={}",
+                    ctx.session.borrow().framestack.len(),
+                    single_frame_blackhole_resume_enabled(),
+                    writes_live_heap,
+                    odometer_unchanged,
+                    committed_frame_escape_pc().is_none(),
+                    !ctx.trace_ctx.is_bridge_trace,
+                    blackhole_result.is_some(),
+                    !ctx.fbw_mode.snapshot_sym.is_null(),
+                );
+            }
             if single_frame_blackhole_resume_enabled()
                 && writes_live_heap
                 && odometer_unchanged
-                && committed_frame_escape_pc().is_none()
-                && !ctx.fbw_mode.inline_subwalk
                 && !ctx.trace_ctx.is_bridge_trace
-                && ctx.session.borrow().framestack.is_empty()
                 && let Some((resume_pc, result_bank, result_color)) = blackhole_result
                 && !ctx.fbw_mode.snapshot_sym.is_null()
             {
-                let jitcode = unsafe {
-                    let sym = &*ctx.fbw_mode.snapshot_sym;
-                    (!sym.jitcode().is_null()).then(|| (&(*sym.jitcode()).payload).jitcode.clone())
+                let (lastop_result, last_exc_value, raising_exception) = match exec_result {
+                    Ok(value) => (
+                        (result_bank != 'v').then_some((result_bank, result_color, value)),
+                        0,
+                        false,
+                    ),
+                    Err(exc) => (None, exc, true),
                 };
-                if let Some(jitcode) = jitcode {
-                    let (lastop_result, last_exc_value, raising_exception) = match exec_result {
-                        Ok(value) => (
-                            (result_bank != 'v').then_some((result_bank, result_color, value)),
-                            0,
-                            false,
-                        ),
-                        Err(exc) => (None, exc, true),
+                if ctx.session.borrow().framestack.is_empty()
+                    && !ctx.fbw_mode.inline_subwalk
+                    && committed_frame_escape_pc().is_none()
+                {
+                    let jitcode = unsafe {
+                        let sym = &*ctx.fbw_mode.snapshot_sym;
+                        (!sym.jitcode().is_null())
+                            .then(|| (&(*sym.jitcode()).payload).jitcode.clone())
                     };
-                    if let Some(miframe) =
+                    if let Some(miframe) = jitcode.and_then(|jitcode| {
                         build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
-                    {
+                    }) {
                         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
                             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                                 miframe,
@@ -1542,6 +1686,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             });
                         });
                     }
+                } else if ctx.fbw_mode.inline_subwalk
+                    && multi_frame_blackhole_resume_enabled()
+                    && let Some(framestack) =
+                        build_multi_frame_miframe(ctx, resume_pc, lastop_result)
+                {
+                    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+                        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+                            framestack,
+                            last_exc_value,
+                            raising_exception,
+                        });
+                    });
                 }
             }
             // On a kept commit the undo stays armed: the abort epilogue

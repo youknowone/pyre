@@ -511,6 +511,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         jitcode_index,
         call_jitcode_pc: None,
         call_stack_overrides: Vec::new(),
+        blackhole: None,
         resume_coord: ParentResumeCoord::Backxlat(root_pc),
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
@@ -661,6 +662,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: call_jit_pc,
         call_stack_overrides: Vec::new(),
+        blackhole: None,
         // The recipe's resolved word was `backxlat_py_pc(jitcode_index,
         // jitcode_pc)` by construction, exactly the bridge-root flavor.
         resume_coord: ParentResumeCoord::Backxlat(recipe.jitcode_pc as usize),

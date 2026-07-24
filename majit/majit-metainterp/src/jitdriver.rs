@@ -199,6 +199,73 @@ pub fn drive_single_frame_blackhole(
     result
 }
 
+/// Run a tracing MIFrame chain through the structured multi-frame blackhole
+/// conversion.  Every frame shares the portal-level virtualizable layout, but
+/// retains its own jitcode, register banks, and blackhole interpreter.
+pub fn drive_multi_frame_blackhole(
+    builder: &mut crate::blackhole::BlackholeInterpBuilder,
+    framestack: &mut crate::pyjitpl::MIFrameStack,
+    state_field_layout: crate::blackhole::StateFieldLayout,
+    virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
+    virtualizable_ptr: i64,
+    virtualizable_stack_base: usize,
+    metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
+    mut last_exc_value: i64,
+    raising_exception: bool,
+) -> crate::jitexc::JitException {
+    let mut ref_locations = Vec::new();
+    let mut packed_ref_roots = Vec::new();
+    for (frame_index, frame) in framestack.frames.iter().enumerate() {
+        for (color, value) in frame.ref_values.iter().enumerate() {
+            if let Some(value) = value {
+                ref_locations.push((frame_index, color));
+                packed_ref_roots.push(*value);
+            }
+        }
+    }
+    let exception_root = (last_exc_value != 0).then(|| {
+        let index = packed_ref_roots.len();
+        packed_ref_roots.push(last_exc_value);
+        index
+    });
+    let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
+    }
+
+    builder.setup_cached_control_opcodes(
+        metainterp_sd.op_live as i32,
+        metainterp_sd.op_catch_exception as i32,
+        metainterp_sd.op_rvmprof_code as i32,
+    );
+    for ((frame_index, color), forwarded) in ref_locations
+        .into_iter()
+        .zip(packed_ref_roots.iter().copied())
+    {
+        framestack.frames[frame_index].ref_values[color] = Some(forwarded);
+    }
+    if let Some(index) = exception_root {
+        last_exc_value = packed_ref_roots[index];
+    }
+
+    let jitdrivers_sd = bh_jitdrivers_sd(metainterp_sd);
+    let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
+        builder,
+        framestack,
+        last_exc_value,
+        raising_exception,
+        Some(crate::blackhole::PyjitplBlackholeFrameConfig {
+            state_field_layout,
+            virtualizable_info,
+            virtualizable_ptr,
+            virtualizable_stack_base,
+            jitdrivers_sd: &jitdrivers_sd,
+        }),
+    );
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+    outcome
+}
+
 fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     state: &mut S,
     layout: &crate::blackhole::StateFieldLayout,

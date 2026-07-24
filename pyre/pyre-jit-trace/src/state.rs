@@ -5206,6 +5206,32 @@ impl PyreSym {
                 &input_values,
                 concrete_frame as *const u8,
             );
+            // history.py:806-807 `*FrontendOp._resref` parity: give every ref
+            // input arg its runtime value on the recorder value channel (shared
+            // across the outer walk and every inlined sub-walk), not only in the
+            // per-frame register shadow / vable cache.  An inlined callee that
+            // reads a loop-invariant OUTER inputarg — e.g. `getfield_gc_r` off a
+            // portal-frame input reached through `sys._getframe` — records the
+            // load with `box_value(inputarg)` resolvable, so the load result is
+            // stamped and a blackhole-resume image can recover it.  Ref-only:
+            // int/float locals reconstruct through their own concrete shadows,
+            // and input args are never `is_constant()`, so folding gates are
+            // untouched.
+            for (i, opref) in scalar_oprefs.iter().enumerate() {
+                if let Some(majit_ir::Value::Ref(_)) = input_values.get(i).copied() {
+                    ctx.try_set_opref_concrete(*opref, input_values[i]);
+                }
+            }
+            for (j, opref) in array_items.iter().enumerate() {
+                if let Some(v @ majit_ir::Value::Ref(_)) =
+                    input_values.get(num_vable_scalars + j).copied()
+                {
+                    ctx.try_set_opref_concrete(*opref, v);
+                }
+            }
+            if let majit_ir::Value::Ref(_) = vable_ref_value {
+                ctx.try_set_opref_concrete(vable_ref, vable_ref_value);
+            }
         }
     }
 

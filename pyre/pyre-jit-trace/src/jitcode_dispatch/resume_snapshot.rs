@@ -1235,6 +1235,88 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     overrides
 }
 
+fn capture_inline_parent_blackhole<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jitcode_index: u32,
+    call_jit_pc: usize,
+) -> Option<InlineParentBlackhole> {
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+    let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
+    let result_bank = call.argcodes.chars().last()?;
+    let result_color = (result_bank != 'v')
+        .then(|| pjc.jitcode.code.get(call.next_pc.checked_sub(1)?).copied())
+        .flatten()
+        .map(usize::from);
+    let live = crate::state::frame_liveness_reg_indices_by_bank_at(
+        jitcode_index as i32,
+        i32::try_from(call.next_pc).ok()?,
+    );
+    let depth = pjc
+        .depth_trivia_for_jitcode_pc(call.next_pc)
+        .or_else(|| pjc.depth_for_jitcode_pc_pred(call.next_pc))
+        .unwrap_or(0) as usize;
+    let nlocals = (!pjc.code_ptr.is_null())
+        .then(|| unsafe { &*pjc.code_ptr }.varnames.len())
+        .unwrap_or(0);
+    let pcdep = pjc
+        .pcdep_trivia_for_jitcode_pc(call.next_pc)
+        .map(ToOwned::to_owned)
+        .or_else(|| pjc.pcdep_for_jitcode_pc(call.next_pc))
+        .unwrap_or_default();
+
+    let mut int_values = Vec::with_capacity(live.int.len());
+    for &color in &live.int {
+        let color = color as usize;
+        if result_bank == 'i' && result_color == Some(color) {
+            continue;
+        }
+        let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
+            return None;
+        };
+        int_values.push((color, value));
+    }
+
+    let mut ref_values = Vec::with_capacity(live.ref_.len());
+    for &color in &live.ref_ {
+        let color = color as usize;
+        if result_bank == 'r' && result_color == Some(color) {
+            continue;
+        }
+        let semantic_slot =
+            crate::state::semantic_ref_slot_for_reg_color(nlocals, depth, &pcdep, color)
+                .unwrap_or(color);
+        let ConcreteValue::Ref(value) = ctx
+            .concrete_registers_r
+            .get(semantic_slot)
+            .copied()
+            .or_else(|| ctx.concrete_registers_r.get(color).copied())?
+        else {
+            return None;
+        };
+        ref_values.push((color, semantic_slot, value));
+    }
+
+    let mut float_values = Vec::with_capacity(live.float.len());
+    for &color in &live.float {
+        let color = color as usize;
+        if result_bank == 'f' && result_color == Some(color) {
+            continue;
+        }
+        let opref = ctx.registers_f.get(color).copied()?;
+        if opref == OpRef::NONE {
+            return None;
+        }
+        float_values.push((color, opref));
+    }
+
+    Some(InlineParentBlackhole {
+        resume_pc: call.next_pc,
+        int_values,
+        ref_values,
+        float_values,
+    })
+}
+
 pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -1396,6 +1478,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
         call_stack_overrides,
+        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
@@ -1607,6 +1690,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
         call_stack_overrides: Vec::new(),
+        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,

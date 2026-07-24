@@ -4240,6 +4240,11 @@ struct InlineParentFrame {
     /// Concrete operand-stack slots at the caller CALL, keyed by absolute
     /// `locals_cells_stack_w` index. Used only by the abort-point flush.
     call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
+    /// Complete concrete image needed to turn this paused caller into an
+    /// `MIFrame` if a force aborts in a descendant residual call.  Captured
+    /// while the caller's register banks are still live; `None` is a
+    /// best-effort decline that leaves the existing guard snapshot usable.
+    blackhole: Option<InlineParentBlackhole>,
     /// Authoritative derivation of the caller's Python resume pc.  The
     /// Python-native consumers resolve this at their boundary; a CALL inside
     /// a try-block (catch marker) still declines multi-frame.
@@ -4252,6 +4257,21 @@ struct InlineParentFrame {
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs).
     boxes: Vec<OpRef>,
+}
+
+#[derive(Clone)]
+struct InlineParentBlackhole {
+    /// Position immediately after the CALL.  The callee blackhole writes its
+    /// return value through `call_result_reg()` before this caller runs.
+    resume_pc: usize,
+    int_values: Vec<(usize, i64)>,
+    /// `(register color, semantic slot, value)`.  Keeping both indices makes
+    /// the semantic Ref shadow's source explicit while the MIFrame consumer
+    /// restores the color-indexed bank.
+    ref_values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
+    /// Float values have no concrete shadow bank; retain their OpRefs and
+    /// resolve them at force time while the trace context is still live.
+    float_values: Vec<(usize, OpRef)>,
 }
 
 /// The derivation flavor of a paused caller frame's Python resume pc.
@@ -4651,6 +4671,7 @@ struct FbwStoreJournalRootArea {
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
+    multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
 }
 
 thread_local! {
@@ -4666,6 +4687,7 @@ thread_local! {
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
+        multi_frame_blackhole: multi_frame_blackhole_cell_ptr(),
     };
 }
 
@@ -4875,6 +4897,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 for (_slot, value) in parent.call_stack_overrides.iter_mut() {
                     visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                 }
+                if let Some(blackhole) = parent.blackhole.as_mut() {
+                    for (_color, _semantic_slot, value) in blackhole.ref_values.iter_mut() {
+                        visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
+                    }
+                }
             }
         }
     }
@@ -4924,6 +4951,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     if let Some(latched) = single_frame_blackhole.as_mut() {
         for value in latched.miframe.ref_values.iter_mut().flatten() {
             visitor(unsafe { &mut *(value as *mut i64).cast() });
+        }
+        if latched.last_exc_value != 0 {
+            visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
+        }
+    }
+    let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
+    if let Some(latched) = multi_frame_blackhole.as_mut() {
+        for frame in latched.framestack.frames.iter_mut() {
+            for value in frame.ref_values.iter_mut().flatten() {
+                visitor(unsafe { &mut *(value as *mut i64).cast() });
+            }
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });

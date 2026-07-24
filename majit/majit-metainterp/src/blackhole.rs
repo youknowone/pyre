@@ -2411,23 +2411,48 @@ pub fn run_forever_with_portal(
 ///
 /// Get a chain of blackhole interpreters and fill them by copying
 /// 'metainterp.framestack'.
+pub struct PyjitplBlackholeFrameConfig<'a> {
+    pub state_field_layout: StateFieldLayout,
+    pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
+    pub virtualizable_ptr: i64,
+    pub virtualizable_stack_base: usize,
+    pub jitdrivers_sd: &'a [BhJitDriverSd],
+}
+
 pub fn convert_and_run_from_pyjitpl(
     builder: &mut BlackholeInterpBuilder,
     framestack: &MIFrameStack,
     last_exc_value: i64,
     raising_exception: bool,
+    config: Option<PyjitplBlackholeFrameConfig<'_>>,
 ) -> JitException {
     // blackhole.py:1803-1810
     let mut next_bh: Option<Box<BlackholeInterpreter>> = None;
+    let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
 
     for frame in &framestack.frames {
         let mut cur_bh = builder.acquire_interp();
         cur_bh.copy_data_from_miframe(frame);
+        if let Some(config) = config.as_ref() {
+            cur_bh.state_field_layout = config.state_field_layout.clone();
+            cur_bh.virtualizable_info = config.virtualizable_info;
+            cur_bh.virtualizable_ptr = config.virtualizable_ptr;
+            cur_bh.virtualizable_stack_base = config.virtualizable_stack_base;
+            cur_bh.jitdrivers_sd = config.jitdrivers_sd.to_vec();
+        }
+        // Keep every completed interpreter bank rooted while later frames are
+        // acquired and throughout `run_forever`.  The chain is consumed and
+        // released there, so these banks cannot be recovered by moving them
+        // out after the run.
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(cur_bh.registers_r.as_mut_slice());
+        }
         cur_bh.nextblackholeinterp = next_bh;
         next_bh = Some(Box::new(cur_bh));
     }
 
     let Some(first_bh_box) = next_bh else {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
         return JitException::DoneWithThisFrameVoid;
     };
     let mut first_bh = *first_bh_box;
@@ -2440,7 +2465,9 @@ pub fn convert_and_run_from_pyjitpl(
         0
     };
 
-    run_forever(builder, first_bh, current_exc)
+    let outcome = run_forever(builder, first_bh, current_exc);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
+    outcome
 }
 
 /// blackhole.py:1782 resume_in_blackhole
