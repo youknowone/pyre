@@ -1398,13 +1398,15 @@ impl W_TextIOWrapper {
         } else {
             Some(crate::builtins::space_index_w(write_through)? != 0)
         };
-        // A newline change forces a codec rebuild only when the new mode is
-        // universal-newline (`set_newline`: `readuniversal = not newline`), so
-        // a fixed-to-fixed newline change keeps the incremental codec state.
-        let newline_forces_reset = matches!(
-            &new_newline,
-            Some(value) if value.as_deref().is_none_or(str::is_empty)
-        );
+        // The incremental newline decoder captures its translation at build
+        // time, so a newline change must rebuild the codec whenever it flips
+        // `readuniversal` or `readtranslate`; otherwise a universal-to-fixed
+        // reconfigure would keep translating `\r\n` with the stale decoder.
+        let newline_forces_reset = new_newline.as_ref().is_some_and(|value| {
+            let new_readuniversal = value.as_deref().is_none_or(str::is_empty);
+            let new_readtranslate = value.is_none();
+            self.readuniversal != new_readuniversal || self.readtranslate != new_readtranslate
+        });
         let reset_codec = new_encoding.is_some() || new_errors.is_some() || newline_forces_reset;
         // PyPy/CPython prepare the replacement codec before mutating the
         // wrapper.  In particular, a failing codec lookup must leave
