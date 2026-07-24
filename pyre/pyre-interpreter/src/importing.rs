@@ -1627,9 +1627,7 @@ pub fn safe_path_flag() -> bool {
 /// docstrings), clamped into the compiler's byte-wide field.  Levels above 2
 /// behave as 2.
 pub fn optimize_flag() -> u8 {
-    SYS_OPTIMIZE
-        .with(|p| p.get())
-        .clamp(0, i64::from(u8::MAX)) as u8
+    SYS_OPTIMIZE.with(|p| p.get()).clamp(0, i64::from(u8::MAX)) as u8
 }
 
 /// The raw optimization level for `sys.flags.optimize`, mirroring a large
@@ -3111,9 +3109,7 @@ pub(crate) fn is_spec_uninitialized_submodule(
 /// when `has_location` is truthy and `origin` is a string, otherwise None.  A
 /// missing `has_location` / `origin`, or a falsey `has_location`, yields None;
 /// other lookup errors and the truth test propagate.
-pub(crate) fn spec_file_origin(
-    w_spec: PyObjectRef,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     if unsafe { pyre_object::is_none(w_spec) } {
         return Ok(None);
     }
@@ -3273,6 +3269,21 @@ pub fn import_from(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // import_from Issue #17636 — a submodule already bound in sys.modules under
+    // `<__name__>.<name>` is returned even when the parent object rejected the
+    // attribute (e.g. a non-module stand-in with restrictive slots that
+    // `_handle_fromlist` could not setattr onto). Read `__name__` off the object
+    // rather than requiring it to be a module.
+    if let Ok(w_name) = crate::baseobjspace::getattr_str(module, "__name__") {
+        if unsafe { pyre_object::is_str(w_name) } {
+            let modname = unsafe { pyre_object::w_str_get_value(w_name) };
+            let fullname = format!("{modname}.{name}");
+            if let Some(submod) = check_sys_modules(&fullname) {
+                return Ok(submod);
             }
         }
     }
