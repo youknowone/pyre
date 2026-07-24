@@ -3100,7 +3100,11 @@ impl OpcodeStepExecutor for PyFrame {
             2 => {
                 // pyopcode.py:704-722 — pop+normalize cause first, then exc.
                 let raw_cause = self.pop();
-                let cause = Some(normalize_raise_cause(raw_cause)?);
+                // `normalize_raise_cause` returns `Ok(null)` for a null/absent
+                // cause; report absence as `None` so the value is never
+                // `Some(null)` (mirrors the JIT paths call_jit.rs / trace_opcode.rs).
+                let c = normalize_raise_cause(raw_cause)?;
+                let cause = if c.is_null() { None } else { Some(c) };
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {

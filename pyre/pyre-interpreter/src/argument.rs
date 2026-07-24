@@ -837,10 +837,9 @@ impl Arguments {
     /// ```
     #[inline]
     pub fn firstarg(&self) -> Option<PyObjectRef> {
-        if !self.arguments_w.is_empty() {
-            Some(self.arguments_w[0])
-        } else {
-            None
+        match self.arguments_w.first() {
+            Some(&w) if !w.is_null() => Some(w),
+            _ => None,
         }
     }
 

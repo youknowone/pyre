@@ -287,6 +287,7 @@ pub unsafe fn walk_module_value_slot(
 /// `w_cell` must be either `None` or a valid PyObjectRef.  `w_value`
 /// must be a valid non-null PyObjectRef.
 pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> Option<PyObjectRef> {
+    debug_assert!(!w_value.is_null(), "write_cell: null value");
     // The cell payload lives in a Box-immortal structure reached only by the
     // prebuilt-family root walk; record the store so the next minor
     // collection rescans it (gc_roots.rs prebuilt-root write tracking).
@@ -506,7 +507,12 @@ impl GlobalCache {
     /// absent at install time).
     #[inline]
     pub unsafe fn getvalue(&self) -> Option<PyObjectRef> {
-        self.cell.map(|c| unwrap_cell(c))
+        // A cached cell whose unwrapped value is null is a stale/empty binding:
+        // treat it as a cache miss rather than surfacing `Some(null)`.
+        self.cell.and_then(|c| {
+            let v = unwrap_cell(c);
+            if v.is_null() { None } else { Some(v) }
+        })
     }
 }
 
@@ -857,7 +863,11 @@ impl ModuleDictStrategy {
     /// ```
     pub fn getitem_str(&self, storage: &ModuleDictStorage, key: &str) -> Option<PyObjectRef> {
         let raw = self.getdictvalue_no_unwrapping(storage, key)?;
-        Some(unsafe { unwrap_cell(raw) })
+        // `unwrap_cell` is null-tolerant and an `ObjectMutableCell` may hold a
+        // null `w_value`; a null unwrap means the name has no live binding, so
+        // report absence rather than `Some(null)`.
+        let v = unsafe { unwrap_cell(raw) };
+        if v.is_null() { None } else { Some(v) }
     }
 
     /// `celldict.py:106-126 delitem` — minimal str-key path

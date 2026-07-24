@@ -448,7 +448,10 @@ pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef>
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
-    node_read(map, inst, Wtf8::new("weakref"), SPECIAL)
+    // A cleared lifeline (mapdict.py:802 writes `None` = null into the retained
+    // node) reads back as a null slot; report it as absent rather than
+    // `Some(null)`.
+    node_read(map, inst, Wtf8::new("weakref"), SPECIAL).filter(|w| !w.is_null())
 }
 
 /// Write the weakref lifeline into the instance's `"weakref"` SPECIAL slot

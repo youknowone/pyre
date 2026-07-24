@@ -3028,6 +3028,7 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
 /// `Ok(None)`, and a hit as `Ok(Some(value))`.
 pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     match getitem(obj, index) {
+        Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
         Err(err) if err.kind == crate::PyErrorKind::KeyError => Ok(None),
         Err(err) => Err(err),
@@ -3672,6 +3673,7 @@ pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
         return None;
     }
     match getattr_str(obj, name) {
+        Ok(value) if value.is_null() => None,
         Ok(value) => Some(value),
         Err(err) => {
             if err.kind == crate::PyErrorKind::AttributeError
@@ -3693,6 +3695,7 @@ pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRe
         return Ok(None);
     }
     match getattr_str(obj, name) {
+        Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
         Err(err) => {
             if err.kind == crate::PyErrorKind::AttributeError
@@ -8488,8 +8491,10 @@ pub(crate) unsafe fn get(
             return Err(property_no_accessor(descr, obj, "getter")?);
         }
         // W_Property.get → `space.call_function(self.fget, w_obj)`: the
-        // getter's exception propagates rather than being swallowed.
-        return Ok(Some(crate::call::call_function_impl_result(fget, &[obj])?));
+        // getter's exception propagates rather than being swallowed.  A null
+        // result is no binding, reported as absence rather than `Some(null)`.
+        let r = crate::call::call_function_impl_result(fget, &[obj])?;
+        return Ok(if r.is_null() { None } else { Some(r) });
     }
 
     // typedef.py:504-516 Member.descr_member_get:
@@ -8554,7 +8559,7 @@ pub(crate) unsafe fn get(
                 let visible_obj = if obj.is_null() { w_none() } else { obj };
                 let result =
                     crate::call::call_function_impl_result(get_fn, &[descr, visible_obj, w_type])?;
-                return Ok(Some(result));
+                return Ok(if result.is_null() { None } else { Some(result) });
             }
         }
     }
@@ -11016,6 +11021,7 @@ fn object_functionstr_findattr(
         return Ok(None);
     }
     match getattr_str(obj, name) {
+        Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
         Err(e) if e.kind == crate::PyErrorKind::SystemExit => Err(e),
         Err(_) => Ok(None),
@@ -13030,7 +13036,7 @@ fn generator_send_ex(
         // resume to `frame.execute_frame(w_arg_or_err)`.  In particular,
         // `PyFrame.resume_execute_frame` handles `w_yielding_from` only after
         // the outer frame has entered the execution context.
-        let w_inputvalue = if already_started && operr.is_none() {
+        let w_inputvalue = if already_started && operr.is_none() && !w_arg.is_null() {
             Some(w_arg)
         } else {
             None

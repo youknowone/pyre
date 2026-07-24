@@ -813,7 +813,11 @@ pub unsafe fn module_dict_cell_at(obj: PyObjectRef, slot: usize) -> Option<PyObj
     if !md.object_storage.is_null() || md.dstorage.is_null() {
         return None;
     }
-    (*md.dstorage).entries.get_index(slot).map(|(_, v)| *v)
+    (*md.dstorage)
+        .entries
+        .get_index(slot)
+        .map(|(_, v)| *v)
+        .filter(|p| !p.is_null())
 }
 
 /// Direct O(1) entry count of a module dict's `ModuleDictStorage`
@@ -2105,6 +2109,11 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
 /// go through `ModuleDictStrategy::setitem` and regular dicts through
 /// `ObjectDictStrategy::setitem`.
 pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    // A stored value is always a live object reference — null is never a
+    // dict value (deletes `shift_remove` the entry; there is no null
+    // tombstone).  Enforcing it at the store boundary means every lookup
+    // return is provably non-null.
+    debug_assert!(!value.is_null(), "w_dict_store: null value");
     w_dict_get_strategy(obj).setitem(obj, key, value)
 }
 
@@ -2139,6 +2148,7 @@ unsafe fn w_dict_store_checked_inner(
     value: PyObjectRef,
     hash: Option<i64>,
 ) -> Result<(), DictKeyError> {
+    debug_assert!(!value.is_null(), "w_dict_store_checked: null value");
     if is_module_dict(obj) {
         return w_module_dict_store_inner_checked(obj, key, value);
     }
@@ -2436,6 +2446,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     value: PyObjectRef,
     hash: Option<i64>,
 ) -> Result<(), DictKeyError> {
+    debug_assert!(!value.is_null(), "w_dict_store_object_strategy: null value");
     let object_key = match hash {
         Some(hash) => object_key_hashed(key, hash),
         None => object_key_for_checked(key)?,
