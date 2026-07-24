@@ -1406,6 +1406,48 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
+/// `importing.py:379 update_code_filenames`: set `source_path` on `code` and,
+/// recursively, on every nested code constant whose filename still matches the
+/// root's *original* name (leaving unrelated inlined filenames untouched).
+/// `Constants` exposes no in-place mutation, so the table is rebuilt.
+fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str) {
+    code.source_path = newname.to_owned();
+    let new_consts: crate::bytecode::Constants<crate::bytecode::ConstantData> = code
+        .constants
+        .iter()
+        .map(|c| match c {
+            crate::bytecode::ConstantData::Code { code: nested }
+                if nested.source_path == oldname =>
+            {
+                let mut nested = (**nested).clone();
+                fix_code_filenames(&mut nested, oldname, newname);
+                crate::bytecode::ConstantData::Code {
+                    code: Box::new(nested),
+                }
+            }
+            other => other.clone(),
+        })
+        .collect();
+    code.constants = new_consts;
+}
+
+/// `_imp._fix_co_filename(code, path)` (importing.py:158 fix_co_filename):
+/// replace `co_filename` on the code object in place, recursing through its
+/// nested code constants.  Only valid because the code object is owned
+/// (`Box::into_raw`), single-threaded, and not executing when import machinery
+/// calls this right after compilation.
+///
+/// # Safety
+/// `w_code` must point to a valid `PyCode` whose body is not currently running.
+pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &str) {
+    let code_ptr = unsafe { w_code_get_ptr(w_code) } as *mut crate::CodeObject;
+    if code_ptr.is_null() {
+        return;
+    }
+    let oldname = unsafe { (*code_ptr).source_path.clone() };
+    unsafe { fix_code_filenames(&mut *code_ptr, &oldname, newname) };
+}
+
 /// Cached [`crate::pyframe::npure_cellvars`] for the code wrapper `obj`,
 /// or `None` for a null/stub wrapper (sentinel `u32::MAX`) so the caller
 /// falls back to recomputation.

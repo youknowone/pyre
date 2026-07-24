@@ -106,6 +106,12 @@ static FROZEN_MODULES: &[FrozenModule] = &[
 
 static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(0);
 
+/// `importing.py:159 ImportRLock` reentrant depth. With one execution context
+/// the owner collapses to held/not-held and the real lock never blocks, so the
+/// recursion counter is the whole observable state; it is per-interpreter
+/// (shared across threads), so a global — not thread-local — is correct.
+static IMPORT_LOCK_COUNT: AtomicI64 = AtomicI64::new(0);
+
 fn frozen_module(name: &str) -> Option<&'static FrozenModule> {
     FROZEN_MODULES.iter().find(|entry| entry.name == name)
 }
@@ -150,6 +156,14 @@ fn missing_frozen_error(name: &str) -> crate::PyError {
         pyre_object::w_str_new(name),
         pyre_object::w_none(),
     )
+}
+
+/// The receiver's type name, for argument-type error messages.
+fn type_name(obj: pyre_object::PyObjectRef) -> String {
+    match crate::typedef::r#type(obj) {
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+        None => "object".to_string(),
+    }
 }
 
 fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyError> {
@@ -397,30 +411,85 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     crate::module_ns_store(
         ns,
+        "create_dynamic",
+        // interp_imp.py:49 create_dynamic — no C-extension support, the
+        // `has_so_extension() == False` branch. Raising ImportError (rather
+        // than being absent) matches the meta-path `hasattr` probe while still
+        // letting `except ImportError` fall back to a pure-Python module.
+        crate::make_builtin_function_with_arity(
+            "create_dynamic",
+            |_| {
+                Err(crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    "Not implemented".to_string(),
+                ))
+            },
+            1,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
         "acquire_lock",
-        crate::make_builtin_function_with_arity("acquire_lock", |_| Ok(pyre_object::w_none()), 0),
+        // importing.py:174 acquire_lock — reentrant; bump the depth.
+        crate::make_builtin_function_with_arity(
+            "acquire_lock",
+            |_| {
+                IMPORT_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
     );
     crate::module_ns_store(
         ns,
         "release_lock",
-        crate::make_builtin_function_with_arity("release_lock", |_| Ok(pyre_object::w_none()), 0),
+        // importing.py:192 release_lock — releasing an unheld lock is an error.
+        crate::make_builtin_function_with_arity(
+            "release_lock",
+            |_| {
+                if IMPORT_LOCK_COUNT.load(Ordering::Relaxed) <= 0 {
+                    return Err(crate::PyError::runtime_error("not holding the import lock"));
+                }
+                IMPORT_LOCK_COUNT.fetch_sub(1, Ordering::Relaxed);
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
     );
     crate::module_ns_store(
         ns,
         "lock_held",
+        // importing.py:171 lock_held_by_anyone.
         crate::make_builtin_function_with_arity(
             "lock_held",
-            |_| Ok(pyre_object::w_bool_from(false)),
+            |_| Ok(pyre_object::w_bool_from(IMPORT_LOCK_COUNT.load(Ordering::Relaxed) > 0)),
             0,
         ),
     );
     crate::module_ns_store(
         ns,
         "_fix_co_filename",
+        // interp_imp.py:157 fix_co_filename(code, pathname).
         crate::make_builtin_function_with_arity(
             "_fix_co_filename",
-            |_| Ok(pyre_object::w_none()),
-            0,
+            |args| {
+                if !unsafe { crate::is_code(args[0]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "_fix_co_filename() argument 1 must be code, not {}",
+                        type_name(args[0])
+                    )));
+                }
+                if !unsafe { pyre_object::is_str(args[1]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "_fix_co_filename() argument 2 must be str, not {}",
+                        type_name(args[1])
+                    )));
+                }
+                let newname = unsafe { pyre_object::w_str_get_value(args[1]) }.to_owned();
+                unsafe { crate::pycode::fix_co_filename(args[0], &newname) };
+                Ok(pyre_object::w_none())
+            },
+            2,
         ),
     );
     crate::module_ns_store(

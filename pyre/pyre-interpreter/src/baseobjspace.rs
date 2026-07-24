@@ -5454,10 +5454,12 @@ unsafe fn module_getattr_hook_or_err(
         Some(w) if !w.is_null() && pyre_object::is_str(w) => {
             pyre_object::w_str_get_wtf8(w).to_string()
         }
-        _ => return Err(PyError::new(
-            PyErrorKind::AttributeError,
-            format!("module has no attribute '{name}'"),
-        )),
+        _ => {
+            return Err(PyError::new(
+                PyErrorKind::AttributeError,
+                format!("module has no attribute '{name}'"),
+            ));
+        }
     };
     // module.py:148-159 — a module still executing (`__spec__._initializing`)
     // or naming an as-yet-unset submodule reports the circular-import cause.
