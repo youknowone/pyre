@@ -22,11 +22,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     raw_descrs: RawDescrPool,
     is_authoritative_executor: bool,
     sub_jitcode_lookup: &SubJitCodeLookup,
-    done_with_this_frame_descr_ref: DescrRef,
-    done_with_this_frame_descr_int: DescrRef,
-    done_with_this_frame_descr_float: DescrRef,
-    done_with_this_frame_descr_void: DescrRef,
-    exit_frame_with_exception_descr_ref: DescrRef,
     is_top_level: bool,
     // PyPy `pyjitpl.py MIFrame.__init__` analog: the
     // top-level jitcode's per-bank register count.  `dispatch_via_miframe`
@@ -275,11 +270,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             raw_descrs,
             is_authoritative_executor,
             trace_ctx,
-            done_with_this_frame_descr_ref,
-            done_with_this_frame_descr_int,
-            done_with_this_frame_descr_float,
-            done_with_this_frame_descr_void,
-            exit_frame_with_exception_descr_ref,
             is_top_level,
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
@@ -757,20 +747,21 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
-    // Terminal descrs off MetaInterpStaticData (mirror `dispatch_perfn_frame`).
-    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+    // Terminal descrs must be wired on MetaInterpStaticData before the walk can
+    // produce a compilable FINISH (mirror `dispatch_perfn_frame`).  The walk
+    // itself no longer carries them: the compile consumer selects the descr
+    // from `finish_arg_types` (`pyjitpl.rs done_with_this_frame_descr_from_types`).
+    {
         let sd = ctx.metainterp_sd();
-        match (
-            sd.done_with_this_frame_descr_void.clone(),
-            sd.done_with_this_frame_descr_int.clone(),
-            sd.done_with_this_frame_descr_ref.clone(),
-            sd.done_with_this_frame_descr_float.clone(),
-            sd.exit_frame_with_exception_descr_ref.clone(),
-        ) {
-            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
-            _ => return None,
+        if sd.done_with_this_frame_descr_void.is_none()
+            || sd.done_with_this_frame_descr_int.is_none()
+            || sd.done_with_this_frame_descr_ref.is_none()
+            || sd.done_with_this_frame_descr_float.is_none()
+            || sd.exit_frame_with_exception_descr_ref.is_none()
+        {
+            return None;
         }
-    };
+    }
 
     // Per-fn descr pool + sub-jitcode lookup off the callee body's own runtime
     // pool (mirror `dispatch_perfn_frame`).  `callee_pjc` is an `Arc` that
@@ -938,11 +929,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
-            done_with_this_frame_descr_ref: done_ref,
-            done_with_this_frame_descr_int: done_int,
-            done_with_this_frame_descr_float: done_float,
-            done_with_this_frame_descr_void: done_void,
-            exit_frame_with_exception_descr_ref: exit_exc_ref,
             is_top_level: false,
             sub_jitcode_lookup: lookup_ref,
             last_exc_value: None,

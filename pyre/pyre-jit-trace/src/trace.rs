@@ -874,26 +874,24 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
     argboxes_f: &[majit_ir::OpRef],
     authoritative: bool,
 ) -> Option<(usize, PerfnWalkResult)> {
-    // Resolve the five terminal descrs off MetaInterpStaticData so the
-    // walk's Finish / exit-with-exception records carry production descr
-    // identities.  A missing one means setup never ran — log and bail
-    // rather than feed placeholder descrs.
-    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+    // The walk records no descr itself — the compile consumer picks the
+    // terminator descr from `finish_arg_types` (`pyjitpl.rs
+    // done_with_this_frame_descr_from_types`).  Still require the five terminal
+    // descrs to be wired on MetaInterpStaticData: a missing one means setup
+    // never ran, so a Finish this walk produced would have nothing to compile
+    // against.  Log and bail rather than walk into that.
+    {
         let sd = ctx.metainterp_sd();
-        match (
-            sd.done_with_this_frame_descr_void.clone(),
-            sd.done_with_this_frame_descr_int.clone(),
-            sd.done_with_this_frame_descr_ref.clone(),
-            sd.done_with_this_frame_descr_float.clone(),
-            sd.exit_frame_with_exception_descr_ref.clone(),
-        ) {
-            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
-            _ => {
-                eprintln!("[walk-perfn] terminal descrs not wired; skipping walk");
-                return None;
-            }
+        if sd.done_with_this_frame_descr_void.is_none()
+            || sd.done_with_this_frame_descr_int.is_none()
+            || sd.done_with_this_frame_descr_ref.is_none()
+            || sd.done_with_this_frame_descr_float.is_none()
+            || sd.exit_frame_with_exception_descr_ref.is_none()
+        {
+            eprintln!("[walk-perfn] terminal descrs not wired; skipping walk");
+            return None;
         }
-    };
+    }
 
     // Per-fn descr-pool plumbing: the per-CodeObject body resolves `d`/`j`
     // descr operands through its OWN runtime pool (`pjc.jitcode.exec.descrs`,
@@ -962,11 +960,6 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
         // for the production full-body tracer (the walk IS the execution).
         authoritative,
         &sub_jitcode_lookup,
-        done_ref,
-        done_int,
-        done_float,
-        done_void,
-        exit_exc_ref,
         true,
         pjc.jitcode.num_regs_r() as usize,
         pjc.jitcode.num_regs_i() as usize,

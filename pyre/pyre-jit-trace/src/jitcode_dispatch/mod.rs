@@ -310,12 +310,6 @@ pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
 ///   2-byte LE descr index in the jitcode bytes resolves through this
 ///   table.
 /// * `trace_ctx`: live trace recorder.
-/// * `done_with_this_frame_descr_ref`: descr the FINISH terminator
-///   for a Ref-returning trace must carry. Production callers resolve
-///   via `MetaInterpStaticData::done_with_this_frame_descr_for(Type::Ref)`
-///   (`pyjitpl.py`); tests use `make_fail_descr(1)` as the same
-///   fallback `finish_and_compile` (`pyjitpl.py`) uses when the
-///   staticdata singleton was never attached.
 ///
 /// Register banks are *mutable* — `int_copy/i>i` and
 /// `residual_call_r_r/iRd>r` write their dst slot inline (RPython parity:
@@ -951,46 +945,20 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// Live trace recorder. `record_finish` / `record_op` /
     /// `record_op_with_descr` go through this.
     pub trace_ctx: &'frame mut TraceCtx,
-    /// `done_with_this_frame_descr_ref` — the descr `pyjitpl.py
-    /// finish_and_compile` attaches to the trace's terminator FINISH for
-    /// the Ref kind. Caller-provided so the dispatcher does not reach
-    /// into `TraceCtx::metainterp_sd` (which is `pub(crate)`).
-    pub done_with_this_frame_descr_ref: DescrRef,
-    /// Int-kind counterpart used by `int_return/i` (`pyjitpl.py
-    /// compile_done_with_this_frame: token = sd.done_with_this_frame_descr_int`).
-    /// Production wires `MetaInterpStaticData::done_with_this_frame_descr_for(Type::Int)`;
-    /// tests pass `make_fail_descr(N)` placeholders since the descr's
-    /// only role here is identity-tagging the FINISH terminator.
-    pub done_with_this_frame_descr_int: DescrRef,
-    /// Float-kind counterpart used by `float_return/f` (`pyjitpl.py
-    /// compile_done_with_this_frame: token = sd.done_with_this_frame_descr_float`).
-    pub done_with_this_frame_descr_float: DescrRef,
-    /// Void-kind counterpart used by `void_return/` (`pyjitpl.py
-    /// compile_done_with_this_frame: token = sd.done_with_this_frame_descr_void`,
-    /// `exits = []` — the FINISH carries no value).
-    pub done_with_this_frame_descr_void: DescrRef,
-    /// `exit_frame_with_exception_descr_ref` — the descr `pyjitpl.py
-    /// compile_exit_frame_with_exception` attaches to the FINISH that
-    /// terminates a trace whose outermost frame raised an unhandled
-    /// exception. RPython:
-    ///   token = sd.exit_frame_with_exception_descr_ref
-    ///   self.history.record1(rop.FINISH, valuebox, None, descr=token)
-    /// Production callers resolve via `MetaInterpStaticData`
-    /// (cf. `pyjitpl.rs`); tests use `make_fail_descr(1)`.
-    pub exit_frame_with_exception_descr_ref: DescrRef,
     /// Whether this `WalkContext` is the outermost trace frame
     /// (`true`) or a nested sub-jitcode frame entered through
     /// `inline_call_r_r/dR>r` recursion (`false`). The flag
     /// disambiguates dual-behaviour terminators:
     ///
-    /// * `ref_return/r` at top-level records `Finish` + Terminate;
-    ///   inside a sub-walk it returns `SubReturn { result }` so the
-    ///   caller's `inline_call_*` handler can write the dst register.
-    /// * `raise/r` at top-level records the outermost
-    ///   `Finish(exit_frame_with_exception_descr_ref)`; inside a
-    ///   sub-walk it propagates `SubRaise { exc }` — the caller's
-    ///   `inline_call_*` handler may catch via `catch_exception`
-    ///   metadata or bubble up further.
+    /// * `ref_return/r` at top-level stashes the finish payload +
+    ///   Terminate; inside a sub-walk it returns `SubReturn { result }`
+    ///   so the caller's `inline_call_*` handler can write the dst
+    ///   register.
+    /// * `raise/r` propagates `SubRaise { exc }` either way; only at
+    ///   top-level, with no handler anywhere in the framestack, does the
+    ///   post-op scan turn it into an `is_exception` finish payload.  In
+    ///   a sub-walk the caller's `inline_call_*` handler may catch via
+    ///   `catch_exception` metadata or bubble up further.
     ///
     /// RPython parity: pyre flattens the framestack-driven
     /// `metainterp.popframe()` + `finishframe[_exception]` flow
