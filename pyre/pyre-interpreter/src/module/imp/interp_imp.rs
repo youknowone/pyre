@@ -413,12 +413,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "create_dynamic",
         // interp_imp.py:49 create_dynamic — no C-extension support, the
-        // `has_so_extension() == False` branch. Raising ImportError (rather
-        // than being absent) matches the meta-path `hasattr` probe while still
-        // letting `except ImportError` fall back to a pure-Python module.
+        // `has_so_extension() == False` branch. The spec's `name` and `origin`
+        // are read and rejected for an embedded null before reporting the
+        // unsupported load, matching `_imp_create_dynamic_impl`. Raising
+        // ImportError (rather than being absent) matches the meta-path
+        // `hasattr` probe while still letting `except ImportError` fall back to
+        // a pure-Python module.
         crate::make_builtin_function_with_arity(
             "create_dynamic",
-            |_| {
+            |args| {
+                let Some(&spec) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "create_dynamic() missing required argument 'spec'",
+                    ));
+                };
+                crate::baseobjspace::text0_w(crate::baseobjspace::getattr_str(spec, "name")?)?;
+                crate::baseobjspace::text0_w(crate::baseobjspace::getattr_str(spec, "origin")?)?;
                 Err(crate::PyError::new(
                     crate::PyErrorKind::ImportError,
                     "Not implemented".to_string(),
