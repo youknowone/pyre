@@ -2327,7 +2327,7 @@ impl TraceCtx {
             return None;
         }
         let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
-        if !matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
+        if !matches!(op.opcode, OpCode::GetfieldGcR) {
             return None;
         }
         let descr = op.descr.borrow().clone()?;
