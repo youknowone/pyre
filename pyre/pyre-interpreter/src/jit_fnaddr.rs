@@ -394,7 +394,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::drain_list_append",
         drain_list_append as *const (),
     );
-    push_fnaddr(&mut entries, "drain_list_append", drain_list_append as *const ());
+    push_fnaddr(
+        &mut entries,
+        "drain_list_append",
+        drain_list_append as *const (),
+    );
 
     // The drain's prologue (`w_list_new_empty`) and epilogue
     // (`drain_collect_items`) wrap the `Vec`/`Range`/`Option` host plumbing
@@ -410,7 +414,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_list_new_empty",
         w_list_new_empty as *const (),
     );
-    push_fnaddr(&mut entries, "w_list_new_empty", w_list_new_empty as *const ());
+    push_fnaddr(
+        &mut entries,
+        "w_list_new_empty",
+        w_list_new_empty as *const (),
+    );
     let w_list_new_object: fn(Vec<pyre_object::PyObjectRef>) -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_object;
     push_alias_pair(

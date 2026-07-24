@@ -2045,7 +2045,10 @@ pub fn blackhole_resume_via_rd_numb(
                 return None;
             }
             let core = majit_metainterp::JitCode::from_canonical((*canonical).clone());
-            return Some(resume::ResolvedJitCode::new(std::sync::Arc::new(core), pc as usize));
+            return Some(resume::ResolvedJitCode::new(
+                std::sync::Arc::new(core),
+                pc as usize,
+            ));
         }
         let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
         if pyjitcode.has_abort_opcode() {
