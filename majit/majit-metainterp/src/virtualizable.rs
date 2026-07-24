@@ -2988,3 +2988,51 @@ mod opt1_rustvec_abi_roundtrip {
         assert_eq!(info.get_total_size(&lengths), 1 + 4);
     }
 }
+
+#[cfg(test)]
+mod bh_clear_vable_token_inert_token_protocol {
+    use super::*;
+
+    // Two words: `first` sits at offset 0 (a live field on a stack-resident
+    // state struct — e.g. a `Vec`'s data pointer), `token` at a nonzero offset.
+    #[repr(C)]
+    struct TokenProbe {
+        first: usize,
+        token: usize,
+    }
+
+    // A state-field machine builds `VirtualizableInfo::new(0)`: there is no heap
+    // `vable_token`, so `token_offset == 0`. Clearing must be inert — writing to
+    // offset 0 would clobber the live first field. This is the guard that lets
+    // the overflow-deopt blackhole run a `[int; virt]` vable op without corrupting
+    // the state struct.
+    #[test]
+    fn clear_is_inert_when_token_offset_is_zero() {
+        let mut probe = TokenProbe {
+            first: 0xDEAD_BEEF,
+            token: 0x1234,
+        };
+        let info = VirtualizableInfo::new(0);
+        let p = (&mut probe as *mut TokenProbe) as *mut u8;
+        unsafe { bh_clear_vable_token(&info, p) };
+        assert_eq!(probe.first, 0xDEAD_BEEF, "offset-0 field must be untouched");
+        assert_eq!(probe.token, 0x1234, "unrelated word must be untouched");
+    }
+
+    // A real GC virtualizable keeps `token_offset > 0` (offset 0 is its type
+    // pointer). Its live token IS cleared, and the non-inert path is unchanged.
+    #[test]
+    fn clear_zeroes_a_real_heap_token_at_nonzero_offset() {
+        let mut probe = TokenProbe {
+            first: 0xDEAD_BEEF,
+            token: 0x1234,
+        };
+        let token_off = std::mem::offset_of!(TokenProbe, token);
+        assert_ne!(token_off, 0, "a real vable_token never lands at offset 0");
+        let info = VirtualizableInfo::new(token_off);
+        let p = (&mut probe as *mut TokenProbe) as *mut u8;
+        unsafe { bh_clear_vable_token(&info, p) };
+        assert_eq!(probe.token, 0, "a nonzero heap token must be cleared");
+        assert_eq!(probe.first, 0xDEAD_BEEF, "the type-pointer word is untouched");
+    }
+}

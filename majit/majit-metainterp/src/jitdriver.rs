@@ -5915,6 +5915,41 @@ mod tests {
     use crate::resume::ReconstructedFrame;
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 
+    // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
+    // a non-null `bh.virtualizable_info`. A state-field machine (`token_offset == 0`)
+    // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
+    // guard on a `[int; virt]` field — resolves its vinfo during resume instead of
+    // panicking. A real heap virtualizable (`token_offset > 0`, e.g. PyFrame) keeps
+    // the prior null-vinfo resume contract unless the portal-inline experiment is on.
+    #[test]
+    fn seed_deopt_vinfo_ptr_seeds_state_field_and_skips_heap_virtualizable() {
+        use crate::virtualizable::VirtualizableInfo;
+
+        // token_offset == 0 → seed the reconstructed vinfo pointer (always, since
+        // its `bh_clear_vable_token` is inert and cannot corrupt the state struct).
+        let state_field = std::sync::Arc::new(VirtualizableInfo::new(0));
+        assert_eq!(
+            seed_deopt_vinfo_ptr(Some(&state_field)),
+            std::sync::Arc::as_ptr(&state_field),
+            "a token_offset==0 state-field machine must seed a non-null vinfo",
+        );
+
+        // No vinfo available → null.
+        assert!(seed_deopt_vinfo_ptr(None).is_null());
+
+        // token_offset > 0 → null while the portal-inline experiment is off, so a
+        // real heap virtualizable keeps its existing null-vinfo resume contract.
+        // (The experiment flag is a process-wide latch; guard the assertion on it
+        // rather than assuming the env is unset.)
+        if !crate::pyjitpl::dispatch::portal_inline_experiment_enabled() {
+            let heap_vable = std::sync::Arc::new(VirtualizableInfo::new(8));
+            assert!(
+                seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
+                "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
+            );
+        }
+    }
+
     #[derive(Default)]
     struct TypedRestoreState {
         live_values: Vec<i64>,
