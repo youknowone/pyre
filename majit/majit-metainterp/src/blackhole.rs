@@ -7446,6 +7446,23 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "new_array_clear/cd>r".to_string(),
         majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
     );
+    // Overflow-checked arithmetic (`int_{add,sub,mul}_jump_if_ovf`): a guard
+    // failure on `GuardNoOverflow`/`GuardOverflow` resumes forward through the
+    // fused op, so the blackhole must dispatch it. The `bhimpl_*` handlers are
+    // wired in `wire_bhimpl_handlers` below; without the map entry `wire_handler`
+    // silently no-ops and the byte stays unwired.
+    insns.insert(
+        "int_add_jump_if_ovf/Lii>i".to_string(),
+        majit_translate::insns::BC_INT_ADD_JUMP_IF_OVF,
+    );
+    insns.insert(
+        "int_sub_jump_if_ovf/Lii>i".to_string(),
+        majit_translate::insns::BC_INT_SUB_JUMP_IF_OVF,
+    );
+    insns.insert(
+        "int_mul_jump_if_ovf/Lii>i".to_string(),
+        majit_translate::insns::BC_INT_MUL_JUMP_IF_OVF,
+    );
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
     // from the registered canonical subset above.  `rvmprof_code/ii` is

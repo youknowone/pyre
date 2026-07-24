@@ -1753,6 +1753,45 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// `blackhole.py:478-497` `bhimpl_int_{add,sub,mul}_jump_if_ovf(label,
+    /// a, b)`: compute the wrapping result and, on signed overflow, branch to
+    /// `label` instead of writing the result register.  The metatracer records
+    /// these as `IntAddOvf`/`IntSubOvf`/`IntMulOvf` + `GuardNoOverflow`
+    /// (`pyjitpl/dispatch.rs`); on guard failure the blackhole resumes at this
+    /// op and performs the overflow branch itself.  Byte layout follows argcode
+    /// `Lii>i` (`assembler.py:165-174`): `[target:u16][lhs][rhs][dst]`, matching
+    /// the `bhhandler_ovf_jump_ii!` decoder.  A caller-emitted `-live-` must
+    /// precede the op (like every guard/branch) so the guard snapshot decodes.
+    pub fn int_add_jump_if_ovf(&mut self, dst: u16, lhs: u16, rhs: u16, label: u16) {
+        self.record_int_binop_jump_if_ovf("int_add_jump_if_ovf/Lii>i", dst, lhs, rhs, label);
+    }
+
+    pub fn int_sub_jump_if_ovf(&mut self, dst: u16, lhs: u16, rhs: u16, label: u16) {
+        self.record_int_binop_jump_if_ovf("int_sub_jump_if_ovf/Lii>i", dst, lhs, rhs, label);
+    }
+
+    pub fn int_mul_jump_if_ovf(&mut self, dst: u16, lhs: u16, rhs: u16, label: u16) {
+        self.record_int_binop_jump_if_ovf("int_mul_jump_if_ovf/Lii>i", dst, lhs, rhs, label);
+    }
+
+    fn record_int_binop_jump_if_ovf(
+        &mut self,
+        key: &'static str,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        label: u16,
+    ) {
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.touch_reg(dst);
+        self.write_insn(key);
+        self.push_label_ref(label);
+        self.push_u8(lhs as u8);
+        self.push_u8(rhs as u8);
+        self.push_u8(dst as u8);
+    }
+
     /// `jtransform.py:576-577` `rewrite_op_int_floordiv = _do_builtin_call`
     /// / `rewrite_op_int_mod = _do_builtin_call`: `int_floordiv` / `int_mod`
     /// have no `bhimpl_int_*` primitive (`record_binop_i` rejects them), so

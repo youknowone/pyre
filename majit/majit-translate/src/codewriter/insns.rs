@@ -391,6 +391,16 @@ pub const BC_CAST_PTR_TO_INT: u8 = 185;
 pub const BC_CONVERT_FLOAT_BYTES_TO_LONGLONG: u8 = 229;
 pub const BC_CONVERT_LONGLONG_BYTES_TO_FLOAT: u8 = 230;
 
+// Overflow-checked arithmetic fused with its branch — `bhimpl_int_{add,sub,mul}
+// _jump_if_ovf` (`blackhole.py:478-497`).  Argcode `Lii>i`: a 2-byte overflow
+// label + two int reads + one int write (written only on the no-overflow path).
+// The metatracer records these as `IntAddOvf`/`IntSubOvf`/`IntMulOvf` + a
+// box-less `GuardNoOverflow`/`GuardOverflow` (`pyjitpl/dispatch.rs`); a guard
+// failure resumes at the fused op and the blackhole performs the branch itself.
+pub const BC_INT_ADD_JUMP_IF_OVF: u8 = 231;
+pub const BC_INT_SUB_JUMP_IF_OVF: u8 = 232;
+pub const BC_INT_MUL_JUMP_IF_OVF: u8 = 233;
+
 // `switch/id` — RPython `blackhole.py:954-960` `bhimpl_switch` —
 // table-of-cases dispatch keyed by an int register + a descr selecting
 // the case table.
@@ -826,6 +836,11 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_add/ii>i", BC_INT_ADD);
     m.insert("int_sub/ii>i", BC_INT_SUB);
     m.insert("int_mul/ii>i", BC_INT_MUL);
+    // blackhole.py:478-497 overflow-checked arithmetic — `Lii>i`: 2-byte label +
+    // 2 int reads + 1 int write (only on the no-overflow path).
+    m.insert("int_add_jump_if_ovf/Lii>i", BC_INT_ADD_JUMP_IF_OVF);
+    m.insert("int_sub_jump_if_ovf/Lii>i", BC_INT_SUB_JUMP_IF_OVF);
+    m.insert("int_mul_jump_if_ovf/Lii>i", BC_INT_MUL_JUMP_IF_OVF);
     // `int_floordiv/ii>i` / `int_mod/ii>i` intentionally absent —
     // `jtransform.py:576-577` rewrites via `_do_builtin_call`, so the
     // SSA-name → bytecode table never matches these.  See the

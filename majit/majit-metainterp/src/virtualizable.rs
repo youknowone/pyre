@@ -2886,6 +2886,17 @@ pub(crate) unsafe fn vable_write_array_item(
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
 pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
+    // `token_offset == 0` marks a machine with no real `vable_token` field: a
+    // non-GC, stack-resident `state` struct whose identity is recovered straight
+    // from the resume snapshot rather than via a heap token (see the state-field
+    // `VirtualizableInfo::new(0)` in the `#[jit_interp]` codegen). Offset 0 on a
+    // GC virtualizable is always the type pointer, so a real `vable_token` never
+    // lands there (`PYFRAME_VABLE_TOKEN_OFFSET > 0`). Writing to offset 0 here
+    // would clobber the struct's first field (e.g. a `Vec`'s data pointer), so
+    // honor the documented "inert token protocol" and do nothing.
+    if vinfo.token_offset == 0 {
+        return;
+    }
     unsafe {
         let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
         let token = *token_ptr;

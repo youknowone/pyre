@@ -1591,6 +1591,31 @@ impl OpMeta {
         }
     }
 
+    /// Fused overflow-checked binop `int_*_jump_if_ovf(dst, lhs, rhs, label)`
+    /// (`blackhole.py:478-497`).  Reads `lhs`/`rhs`, defines `dst` on the
+    /// no-overflow fall-through, and branches to `label` on overflow.  Modeled
+    /// as a `ConditionalGuard` (fall-through = taken iteration, branch =
+    /// overflow) so the preceding `-live-` snapshot folds the overflow label's
+    /// alive set and keeps `lhs`/`rhs` live; `dst` is a def (killed by the
+    /// walker's `ConditionalGuard` write handling) so the not-yet-written
+    /// result register does not enter the guard snapshot.
+    pub(super) fn int_binop_jump_if_ovf(
+        lhs: Register,
+        rhs: Register,
+        dst: Register,
+        target: Ident,
+    ) -> Self {
+        Self {
+            kind: OpKind::GotoIfNot,
+            reads: vec![lhs, rhs],
+            writes: vec![dst],
+            target_label: Some(target),
+            live_target_labels: Vec::new(),
+            live_condition: None,
+            control: ControlFlowClass::ConditionalGuard,
+        }
+    }
+
     /// Label definition site. Walker uses `target` to associate the
     /// current `alive` set with the label name.
     pub(super) fn label_def(target: Ident) -> Self {

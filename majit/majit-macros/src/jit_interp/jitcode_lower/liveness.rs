@@ -89,6 +89,16 @@ pub(super) fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerL
                     alive = label_alive.get(&name).cloned().unwrap_or_default();
                 }
                 ControlFlowClass::ConditionalGuard => {
+                    // Def-first (`alive.discard`), matching Linear: a fused
+                    // branch-op that also writes a result (e.g.
+                    // `int_*_jump_if_ovf`, whose `dst` is produced on the
+                    // fall-through) must kill that def so the not-yet-written
+                    // register does not survive into the preceding `-live-`
+                    // guard snapshot.  Pure `goto_if_not_*` guards carry no
+                    // writes, so this is a no-op for them.
+                    for w in &op.writes {
+                        alive.remove(w);
+                    }
                     // Fold the branch target's alive set into the
                     // fall-through alive set, then add the cond_reg(s)
                     // as uses. RPython treats `goto_if_not` as a

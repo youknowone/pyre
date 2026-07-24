@@ -222,7 +222,10 @@ impl<'c> Lowerer<'c> {
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
-            Expr::Match(expr_match) => self.lower_match_value(expr_match),
+            Expr::Match(expr_match) => match self.lower_checked_ovf_match(expr_match) {
+                Some(result) => result,
+                None => self.lower_match_value(expr_match),
+            },
             Expr::Unary(ExprUnary { op, expr, .. }) => self.lower_unary(op, expr),
             Expr::Binary(binary) => self.lower_binary(binary),
             Expr::Call(call) => {

@@ -3822,6 +3822,15 @@ where
             jitcode::insns::BC_INT_ADD => self.trace_binop_i(ctx, OpCode::IntAdd),
             jitcode::insns::BC_INT_SUB => self.trace_binop_i(ctx, OpCode::IntSub),
             jitcode::insns::BC_INT_MUL => self.trace_binop_i(ctx, OpCode::IntMul),
+            jitcode::insns::BC_INT_ADD_JUMP_IF_OVF => {
+                self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntAddOvf)
+            }
+            jitcode::insns::BC_INT_SUB_JUMP_IF_OVF => {
+                self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntSubOvf)
+            }
+            jitcode::insns::BC_INT_MUL_JUMP_IF_OVF => {
+                self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntMulOvf)
+            }
             // `int_floordiv` / `int_mod` have no bytecode opcode:
             // `jtransform.py:576-577` rewrites both via
             // `_do_builtin_call` to `direct_call(ll_int_py_div)` /
@@ -7343,6 +7352,62 @@ where
         // see the value (matches PyPy `BoxInt(value)` carrier).
         ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
         self.set_int_reg(dst, Some(opref), Some(value));
+    }
+
+    /// `pyjitpl.py opimpl_int_{add,sub,mul}_ovf` — the overflow-checked
+    /// arithmetic op fused with its branch (`blackhole.py:478-497`
+    /// `int_*_jump_if_ovf`).  Records the `IntAddOvf`/`IntSubOvf`/`IntMulOvf`
+    /// resop, then a `GuardNoOverflow` (traced iteration did not overflow) or
+    /// a `GuardOverflow` + branch to the overflow label (it did).  The guard's
+    /// resume position is this op, so on failure the blackhole re-executes
+    /// `int_*_jump_if_ovf` and performs the overflow branch itself.
+    fn trace_int_binop_jump_if_ovf(&mut self, ctx: &mut TraceCtx, sym: &mut S, opcode: OpCode) {
+        // Canonical `Lii>i` encoding: [target:u16][lhs:u8][rhs:u8][dst:u8].
+        let (opcode_pc, target, lhs_idx, rhs_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let opcode_pc = frame.code_cursor - 1;
+            let target = frame.next_u16() as usize;
+            let lhs_idx = frame.next_u8() as usize;
+            let rhs_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (opcode_pc, target, lhs_idx, rhs_idx, dst)
+        };
+        let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
+        let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+        let (wrapped, overflowed) = match opcode {
+            OpCode::IntAddOvf => lhs_value.overflowing_add(rhs_value),
+            OpCode::IntSubOvf => lhs_value.overflowing_sub(rhs_value),
+            OpCode::IntMulOvf => lhs_value.overflowing_mul(rhs_value),
+            _ => unreachable!("trace_int_binop_jump_if_ovf: {opcode:?}"),
+        };
+        // All-constant operands fold at trace time (pyjitpl `_record_helper_pure`):
+        // no resop, no guard.  A constant pair that overflows unconditionally
+        // takes the overflow branch.
+        if lhs.is_constant() && rhs.is_constant() {
+            if overflowed {
+                self.frames.current_mut().code_cursor = target;
+            } else {
+                self.set_int_reg(dst, Some(ctx.const_int(wrapped)), Some(wrapped));
+            }
+            return;
+        }
+        // `int_*_ovf` produces the wrapping result and sets the overflow flag;
+        // the following box-less guard checks that flag.
+        let opref = ctx.record_op(opcode, &[lhs, rhs]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(wrapped));
+        let guard = if overflowed {
+            OpCode::GuardOverflow
+        } else {
+            OpCode::GuardNoOverflow
+        };
+        self.record_state_guard(ctx, sym, guard, &[], opcode_pc, false);
+        if overflowed {
+            // Overflow branch taken: the result register is not written; follow
+            // the label (matches `bhimpl_int_*_jump_if_ovf` returning `None`).
+            self.frames.current_mut().code_cursor = target;
+        } else {
+            self.set_int_reg(dst, Some(opref), Some(wrapped));
+        }
     }
 
     fn trace_unary_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {

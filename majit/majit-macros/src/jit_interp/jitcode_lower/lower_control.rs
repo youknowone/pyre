@@ -681,4 +681,149 @@ impl<'c> Lowerer<'c> {
             struct_type: None,
         })
     }
+
+    /// Overflow-checked arithmetic value match — the orthodox `ovfcheck`
+    /// idiom (`match a.checked_add(b) { Some(v) => v, None => <handler> }`).
+    /// Returns `None` when `expr_match` is not this idiom (the caller then
+    /// tries the generic value-match path); returns `Some(result)` once
+    /// committed, where `result` is `None` only on a hard lowering failure.
+    pub(super) fn lower_checked_ovf_match(
+        &mut self,
+        expr_match: &syn::ExprMatch,
+    ) -> Option<Option<Binding>> {
+        let (builder_method, recv, arg, none_body) = parse_checked_ovf_match(expr_match)?;
+        Some(self.emit_checked_ovf_match(builder_method, recv, arg, none_body))
+    }
+
+    fn emit_checked_ovf_match(
+        &mut self,
+        builder_method: &str,
+        recv: &Expr,
+        arg: &Expr,
+        none_body: &Expr,
+    ) -> Option<Binding> {
+        let lhs = self.lower_value_expr(recv)?;
+        let rhs = self.lower_value_expr(arg)?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+        // Lower the overflow (None) arm into a deferred sequence up front so its
+        // result register is known for the convergence move.
+        let (none_seq, none_binding) = self.lower_branch_value_expr(none_body)?;
+        if !matches!(none_binding.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let dst = self.alloc_reg();
+        let ovf_label = self.alloc_label();
+        let end_label = self.alloc_label();
+        let builder_ident = format_ident!("{builder_method}");
+        let lhs_reg = lhs.reg;
+        let rhs_reg = rhs.reg;
+        let none_reg = none_binding.reg;
+
+        self.emit_aux(quote! { let #ovf_label = __builder.new_label(); });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
+        // `-live-` precedes the fused guard so blackhole liveness decodes at the
+        // op's resume position (see `lower_if_stmt`).
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        self.emit_op(
+            OpMeta::int_binop_jump_if_ovf(
+                Register::int(lhs_reg),
+                Register::int(rhs_reg),
+                Register::int(dst),
+                ovf_label.clone(),
+            ),
+            quote! { __builder.#builder_ident(#dst, #lhs_reg, #rhs_reg, #ovf_label); },
+        );
+        // No-overflow path: `dst` holds the result; skip the overflow arm.
+        self.emit_jump(&end_label);
+        // Overflow path: run the None arm and converge its result into `dst`.
+        self.emit_label_def(&ovf_label);
+        self.append_lowered_sequence(none_seq);
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(none_reg)],
+                vec![Register::int(dst)],
+            ),
+            quote! { __builder.move_i(#dst, #none_reg); },
+        );
+        self.emit_label_def(&end_label);
+
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Int,
+            depends_on_stack: lhs.depends_on_stack
+                || rhs.depends_on_stack
+                || none_binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+}
+
+/// Overflow (`None`) vs no-overflow (`Some`) variant of an option pattern.
+enum OptionPatVariant {
+    Some,
+    None,
+}
+
+fn option_variant_of_pat(pat: &Pat) -> Option<OptionPatVariant> {
+    let ident = match pat {
+        Pat::TupleStruct(ts) => ts.path.segments.last()?.ident.to_string(),
+        Pat::Path(p) => p.path.segments.last()?.ident.to_string(),
+        Pat::Ident(pi) if pi.subpat.is_none() => pi.ident.to_string(),
+        _ => return None,
+    };
+    match ident.as_str() {
+        "Some" => Some(OptionPatVariant::Some),
+        "None" => Some(OptionPatVariant::None),
+        _ => None,
+    }
+}
+
+/// Recognize the orthodox `ovfcheck` idiom
+/// `match recv.checked_{add,sub,mul}(arg) { Some(_) => _, None => <handler> }`.
+/// Returns the fused builder method name, the two operand expressions, and the
+/// overflow (`None`) arm body; `None` when `expr_match` is not this shape.
+fn parse_checked_ovf_match(
+    expr_match: &syn::ExprMatch,
+) -> Option<(&'static str, &Expr, &Expr, &Expr)> {
+    let call = match &*expr_match.expr {
+        Expr::MethodCall(call) => call,
+        _ => return None,
+    };
+    let builder_method = match call.method.to_string().as_str() {
+        "checked_add" => "int_add_jump_if_ovf",
+        "checked_sub" => "int_sub_jump_if_ovf",
+        "checked_mul" => "int_mul_jump_if_ovf",
+        _ => return None,
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let recv = &*call.receiver;
+    let arg = call.args.first()?;
+    // Exactly two guard-less arms: `Some(_) => _` and `None => <handler>`.
+    if expr_match.arms.len() != 2 {
+        return None;
+    }
+    let mut some_seen = false;
+    let mut none_body: Option<&Expr> = None;
+    for arm in &expr_match.arms {
+        if arm.guard.is_some() {
+            return None;
+        }
+        match option_variant_of_pat(&arm.pat)? {
+            OptionPatVariant::Some => some_seen = true,
+            OptionPatVariant::None => none_body = Some(&*arm.body),
+        }
+    }
+    if !some_seen {
+        return None;
+    }
+    Some((builder_method, recv, arg, none_body?))
 }
