@@ -299,11 +299,9 @@ fn rewire_one_option_try_site(
         // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
         // two `Ref` operands lowers to `ptr_ne` with an `Int` result, feeding
         // the `{1 => Some, 0 => None}` switch exactly as the aggregate read.
-        let nullc = graph.alloc_value_var();
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(nullc.clone()),
-            kind: OpKind::ConstRefNull,
-        });
+        // The null is a repr-adaptive `null_mut()` call, not a fixed-GCREF
+        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
+        let nullc = graph.push_null_mut_ptr(a_id);
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(opt_disc.clone()),
             kind: OpKind::BinOp {

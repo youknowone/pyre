@@ -3997,6 +3997,34 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     return Ok((Some(OpKind::ConstInt(tag)), res));
                 }
+                // A niche `Option<NonNull<T>>` is one pointer word, so
+                // constructing it names either the null pointer (`None`) or
+                // the wrapped non-null pointer (`Some(p)`) directly — not a
+                // two-word aggregate with a `__discriminant` tag.  Fold `None`
+                // (zero-operand variant) to the `null_mut()` builtin call and
+                // `Some(p)` to the identity on its single pointer operand, so a
+                // constructed value is a maybe-null pointer end-to-end and both
+                // variants unify at the function return merge.  The null is a
+                // `null_mut()` call (a classdef-less nullable `SomeInstance`,
+                // the same lattice a `*mut T` value carries) rather than a
+                // `ConstRefNull` (a GCREF `_ptr`): the return merge unions the
+                // `None` value with the pointer-valued `Some` branch, and the
+                // two must share a universe — a bare `ConstRefNull` would
+                // annotate `SomePtr` and fail to union with the `SomeInstance`
+                // pointer.  (RPython has no `Option`; a maybe-null `Ptr` is the
+                // pointer itself, null for the absent case.)
+                if self.tyref_is_niche_option_ptr(dest_ty) {
+                    match operands.into_iter().next() {
+                        None => {
+                            let nullc = self.push_niche_null_ptr(mir_bb);
+                            return Ok((None, nullc));
+                        }
+                        Some(op) => {
+                            let p = self.resolve_operand(mir_bb, op)?;
+                            return Ok((None, p));
+                        }
+                    }
+                }
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
                 // arg list.
@@ -4231,20 +4259,22 @@ impl<'a> Lowering<'a> {
                 // discriminant is the pointer-null test `base != null`
                 // (`None` = 0, `Some` = 1), not a `__discriminant` field off
                 // a two-word aggregate base (there is none).  Emit the null
-                // constant, then compare — a `ne` on two `Ref` operands
+                // pointer, then compare — a `ne` on two `Ref` operands
                 // lowers to `ptr_ne` (`jtransform`), and its `Int` result
                 // feeds the match switch exactly as a `__discriminant` read
-                // would.  Modelling the maybe-null pointer this way is the
-                // orthodox representation (RPython has no `Option`; a
-                // maybe-null `Ptr` tests `ptr_nonzero`).
+                // would.  The null is a `null_mut()` call, not a
+                // `ConstRefNull`: `null_mut()` rtypes to `convert_const(None)`
+                // on the result repr (`rbuiltin::rtype_ptr_null`), so it
+                // adapts to the `base` pointer's own `InstanceRepr` and the
+                // `ptr_ne` sees two same-repr operands.  A `ConstRefNull` is a
+                // fixed GCREF `_ptr`, which cannot rtype against an
+                // `InstanceRepr(PyObject)` base at the `ne`.  Modelling the
+                // maybe-null pointer this way is the orthodox representation
+                // (RPython has no `Option`; a maybe-null `Ptr` tests
+                // `ptr_nonzero`).
                 if self.tyref_is_niche_option_ptr(&place.ty) {
                     let base = self.resolve_place(mir_bb, place)?;
-                    let bb_id = self.block_id[mir_bb];
-                    let nullc = self.graph.alloc_value_var();
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(nullc.clone()),
-                        kind: OpKind::ConstRefNull,
-                    });
+                    let nullc = self.push_niche_null_ptr(mir_bb);
                     return Ok((
                         Some(OpKind::BinOp {
                             op: "ne".to_string(),
@@ -6721,36 +6751,38 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                let alias =
-                    if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
-                        // Identity unwrap: the receiver variable was bound
-                        // directly to the `Ok` payload, so the result is
-                        // that variable — bind and close the block with no
-                        // op emitted.
-                        Some(payload)
-                    } else {
-                        self.reflexive_into_alias(
+                let alias = if let Some(payload) =
+                    self.expect_on_const_ok(&segments, &args, &arg_locals)
+                {
+                    // Identity unwrap: the receiver variable was bound
+                    // directly to the `Ok` payload, so the result is
+                    // that variable — bind and close the block with no
+                    // op emitted.
+                    Some(payload)
+                } else {
+                    self.reflexive_into_alias(
+                        &segments,
+                        &args,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    )
+                    .or_else(|| {
+                        self.reflexive_into_iter_alias(
                             &segments,
                             &args,
                             first_arg_ty.as_ref(),
                             &call.dest.ty,
                         )
-                        .or_else(|| {
-                            self.reflexive_into_iter_alias(
-                                &segments,
-                                &args,
-                                first_arg_ty.as_ref(),
-                                &call.dest.ty,
-                            )
-                        })
-                        .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
-                        .or_else(|| self.wtf8_string_identity_alias(&segments, &args))
-                        .or_else(|| {
-                            self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
-                        })
-                        .or_else(|| self.oparg_value_alias(&segments, &args))
-                        .or_else(|| self.identity_passthrough_alias(&segments, &args))
-                    };
+                    })
+                    .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                    .or_else(|| self.wtf8_string_identity_alias(&segments, &args))
+                    .or_else(|| {
+                        self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
+                    })
+                    .or_else(|| self.oparg_value_alias(&segments, &args))
+                    .or_else(|| self.identity_passthrough_alias(&segments, &args))
+                    .or_else(|| self.nonnull_new_identity_alias(&segments, &args, &call.dest.ty))
+                };
                 if let Some(value) = alias {
                     self.local_var[dest_local] = Some(value);
                     let bb_id = self.block_id[mir_bb];
@@ -8814,6 +8846,40 @@ impl<'a> Lowering<'a> {
         is_identity.then(|| arg.clone())
     }
 
+    /// The `NonNull<T>` niche identities.  A `NonNull<T>` modelling an object
+    /// pointer is represented by its raw `*mut T`, so both constructors and
+    /// the pointer accessor are the identity on their single operand:
+    ///
+    /// - `NonNull::new(p) -> Option<NonNull<T>>` — the niche `Option`
+    ///   represents `None` as null and `Some(p)` as the pointer, so the
+    ///   constructed value *is* `p`.  Gated on the destination being that
+    ///   niche `Option<NonNull>` (`tyref_is_niche_option_ptr`).
+    /// - `NonNull::as_ptr(self) -> *mut T` — reads the pointer back out, which
+    ///   is the receiver itself.
+    ///
+    /// Aliasing drops the graph-less `NonNull` externs (otherwise "not
+    /// registered" in the rtyper census), mirroring the payload/discriminant
+    /// niche folds.
+    fn nonnull_new_identity_alias(
+        &self,
+        segments: &[String],
+        args: &[Variable],
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let [arg] = args else {
+            return None;
+        };
+        if fmt_path_ends_with(segments, &["non_null", "NonNull", "new"])
+            && self.tyref_is_niche_option_ptr(dest_ty)
+        {
+            return Some(arg.clone());
+        }
+        if fmt_path_ends_with(segments, &["non_null", "NonNull", "as_ptr"]) {
+            return Some(arg.clone());
+        }
+        None
+    }
+
     /// The ADT `def_id` behind a signature [`TyRef`], whether inline
     /// or routed through the dedup table.  `None` for non-ADT shapes.
     fn tyref_adt_def_id(&self, ty: &TyRef) -> Option<u64> {
@@ -9379,6 +9445,25 @@ impl<'a> Lowering<'a> {
             .map(|td| td.item_meta.name_path())
             .as_deref()
             == Some("core::ptr::non_null::NonNull")
+    }
+
+    /// Emit a null pointer for a niche `Option<NonNull<T>>` (`None`) as a
+    /// `core::ptr::null_mut()` call, returning its result `Variable`.
+    ///
+    /// `null_mut()` is preferred over a bare `ConstRefNull`: the annotator's
+    /// `ptr_null_constant` types it as a classdef-less nullable `SomeInstance`
+    /// (joinable with any typed pointer receiver), and the rtyper's
+    /// `rtype_ptr_null` recovers the null via `convert_const(None)` on the
+    /// *result repr* — so the null adapts to whatever `InstanceRepr` /
+    /// `PtrRepr` the consuming slot carries.  A `ConstRefNull` is a fixed
+    /// GCREF `_ptr`, which fails to union (annotate) and fails to convert
+    /// (rtype) against an `InstanceRepr(PyObject)` at a `ptr_ne` or a return
+    /// merge.  Used by both the `Discriminant` null-test fold and the niche
+    /// `Aggregate` `None` construction fold so every niche-Option null shares
+    /// one repr-adaptive source.
+    fn push_niche_null_ptr(&mut self, mir_bb: usize) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        self.graph.push_null_mut_ptr(bb_id)
     }
 
     /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
@@ -19498,20 +19583,20 @@ mod tests {
         );
     }
 
-    /// The niche-`Option<NonNull>` fold must stay INERT on the current
-    /// `Option<*mut PyObject>` tree: a raw `*mut` payload has no null
-    /// niche (two-word tagged aggregate), so `tyref_is_niche_option_ptr`
-    /// must reject it and `gettypeobject`
-    /// (`gettypefor(..).unwrap_or(PY_NULL)`, a 14-head census function)
-    /// must still lower its Option match through the aggregate
-    /// `__discriminant` FieldRead path — NOT the niche `ptr_ne` /
-    /// `ConstRefNull` fold.  Guards against the detector matching a
-    /// two-word Option before the `NonNull` source swap lands (a
-    /// miscompile: the pointer bits would be read as the tag).  Ignored by
-    /// default (loads the real LLBC).
+    /// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)
+    /// must fold its `gettypefor` match through the niche
+    /// `Option<NonNull<PyObject>>` path now that `gettypefor` returns a
+    /// one-word niche Option: the discriminant is a `ptr_ne` null-test
+    /// (`base != null_mut()`), NOT an aggregate `__discriminant` FieldRead,
+    /// and the null is a `null_mut()` call (repr-adaptive) rather than a
+    /// fixed-GCREF `ConstRefNull`.  Guards against a regression where the
+    /// niche detector stops recognising the `NonNull` payload (which would
+    /// re-introduce the classdef-less `__discriminant` base) or where the
+    /// null reverts to `ConstRefNull` (which cannot rtype against the
+    /// pointer's `InstanceRepr`).  Ignored by default (loads the real LLBC).
     #[test]
     #[ignore]
-    fn niche_option_fold_inert_on_raw_ptr_option() {
+    fn niche_option_gettypeobject_folds_to_ptr_null_test() {
         use crate::model::OpKind;
 
         let path = concat!(
@@ -19519,20 +19604,55 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph =
-            super::lower_function(&llbc, "gettypeobject").expect("lower gettypeobject");
+        let graph = super::lower_function(&llbc, "gettypeobject").expect("lower gettypeobject");
 
-        // No niche fold artefact: the fold emits a `ConstRefNull` feeding a
-        // `ne` BinOp.  A raw-`*mut` Option must produce neither.
-        let null_consts = graph
+        // The niche null is a `null_mut()` call, never a `ConstRefNull`.
+        let const_ref_nulls = graph
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
             .filter(|op| matches!(&op.kind, OpKind::ConstRefNull))
             .count();
         assert_eq!(
-            null_consts, 0,
-            "gettypeobject: niche fold fired on a raw-*mut Option (ConstRefNull emitted)"
+            const_ref_nulls, 0,
+            "gettypeobject: niche null must be null_mut(), not a fixed-GCREF ConstRefNull"
+        );
+        let null_muts = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. }
+                    if target.to_string() == "core::ptr::null_mut")
+            })
+            .count();
+        assert!(
+            null_muts >= 1,
+            "gettypeobject: expected a null_mut() feeding the niche ptr null-test"
+        );
+        // The niche discriminant is a `ne` pointer null-test, and no
+        // `__discriminant` FieldRead survives on the niche `gettypefor` result.
+        let has_ne = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"));
+        assert!(
+            has_ne,
+            "gettypeobject: expected a `ne` pointer null-test discriminant"
+        );
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant")
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "gettypeobject: niche Option must not read an aggregate __discriminant"
         );
     }
 }

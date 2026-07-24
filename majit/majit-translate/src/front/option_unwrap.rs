@@ -203,12 +203,10 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
     if site.niche {
         // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
         // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
-        // `ptr_ne` with an `Int` result matching the aggregate read.
-        let nullc = graph.alloc_value_var();
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(nullc.clone()),
-            kind: OpKind::ConstRefNull,
-        });
+        // `ptr_ne` with an `Int` result matching the aggregate read.  The null
+        // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
+        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
+        let nullc = graph.push_null_mut_ptr(a_id);
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {

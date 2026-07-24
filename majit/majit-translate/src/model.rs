@@ -4582,6 +4582,27 @@ impl FunctionGraph {
         self.alloc_value_var_with_type(ConcreteType::Unknown)
     }
 
+    /// Emit a `core::ptr::null_mut()` call into `block` and return its result
+    /// `Variable` — the repr-adaptive null pointer used for a niche
+    /// `Option<NonNull<T>>` `None` (the discriminant null-test rhs and the
+    /// `Some`/`None` combinator folds).  `null_mut()` types as a classdef-less
+    /// nullable `SomeInstance` (annotate) and recovers the null via
+    /// `convert_const(None)` on the result repr (rtype), so it unions and
+    /// converts against the pointer receiver's own `InstanceRepr`; a bare
+    /// `ConstRefNull` is a fixed GCREF `_ptr` that does neither.
+    pub fn push_null_mut_ptr(&mut self, block: BlockId) -> crate::flowspace::model::Variable {
+        let res = self.alloc_value_var();
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "null_mut"]),
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        res
+    }
+
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
     /// [`ConcreteType`] stamped at construction — pyre's analogue of
     /// upstream `Variable(concretetype=...)` (RPython

@@ -287,12 +287,11 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         // Niche `Option<NonNull>`: the discriminant is the pointer null-test
         // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
         // two `Ref` operands lowers to `ptr_ne` with an `Int` result, matching
-        // the aggregate `__discriminant` read's value for the branch.
-        let nullc = graph.alloc_value_var();
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(nullc.clone()),
-            kind: OpKind::ConstRefNull,
-        });
+        // the aggregate `__discriminant` read's value for the branch.  The null
+        // is a `null_mut()` call (repr-adaptive) rather than a `ConstRefNull`
+        // (fixed GCREF), so `ptr_ne` sees two operands of the receiver's own
+        // `InstanceRepr`.
+        let nullc = graph.push_null_mut_ptr(a_id);
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
@@ -679,15 +678,20 @@ mod tests {
             field_reads, 0,
             "a niche Option reads no aggregate __discriminant/__pos_0"
         );
-        // Block A discriminant = `opt != null`: a `ConstRefNull` feeding a `ne`.
+        // Block A discriminant = `opt != null`: a `null_mut()` call feeding a
+        // `ne` (the repr-adaptive null, not a fixed-GCREF `ConstRefNull`).
         assert_eq!(
             g.blocks[a.0]
                 .operations
                 .iter()
-                .filter(|op| matches!(&op.kind, OpKind::ConstRefNull))
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if target.to_string() == "core::ptr::null_mut"
+                ))
                 .count(),
             1,
-            "the niche discriminant emits a ConstRefNull"
+            "the niche discriminant emits a null_mut() call"
         );
         let ne = g.blocks[a.0]
             .operations
