@@ -11,6 +11,7 @@ use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::address_dict::AddressMap;
 use crate::flags;
 use crate::header::{GcHeader, header_of};
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
@@ -542,7 +543,7 @@ pub struct MiniMarkGC {
     /// and registered here.  `copy_nursery_object` copies to the
     /// shadow instead of a fresh allocation.  Cleared after each
     /// minor collection.
-    nursery_objects_shadows: std::collections::HashMap<usize, usize>,
+    nursery_objects_shadows: AddressMap<usize>,
     /// Registry of compiled code regions for GC root scanning.
     pub compiled_code_registry: CompiledCodeRegistry,
     /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
@@ -656,7 +657,7 @@ impl MiniMarkGC {
             pressure_since_minor: 0,
             oldgen_external_bytes: 0,
             pinned_objects: IndexSet::new(),
-            nursery_objects_shadows: std::collections::HashMap::new(),
+            nursery_objects_shadows: AddressMap::default(),
             compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: IndexMap::new(),
             _infobits_offset: 0,
@@ -889,6 +890,67 @@ impl MiniMarkGC {
             let ptr = self.nursery.alloc(total_size);
             if ptr.is_null() {
                 // Still no space after collection. Allocate in old gen as fallback.
+                return self.alloc_in_oldgen(type_id, total_size);
+            }
+            Self::init_nursery_object(ptr, type_id);
+            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+            self.register_weakref_if_needed(type_id, obj.0);
+            self.register_destructor_if_needed(type_id, obj.0);
+            return obj;
+        }
+
+        Self::init_nursery_object(ptr, type_id);
+        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+        self.register_weakref_if_needed(type_id, obj.0);
+        self.register_destructor_if_needed(type_id, obj.0);
+        obj
+    }
+
+    /// `malloc_fixedsize` / `collect_and_reserve` with one native-stack root.
+    ///
+    /// RPython's GC transform puts live GC locals in a shadow-stack/stack-map,
+    /// but the allocation fast path is still a plain nursery bump. Rust locals
+    /// are not scanned, so callers pass the exceptional local slot explicitly.
+    /// Register it only when the bump fails and a collection is actually
+    /// required; this preserves the upstream fast path instead of doing a
+    /// root-set add/remove for every allocation.
+    ///
+    /// # Safety
+    /// `root` must point to a valid mutable `GcRef` slot until this call
+    /// returns.
+    pub unsafe fn alloc_with_type_rooted(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        root: *mut GcRef,
+    ) -> GcRef {
+        #[cfg(feature = "gc_stress")]
+        if self.stress_collect {
+            unsafe { self.roots.add(root) };
+            self.do_collect_full();
+            self.roots.remove(root);
+        }
+
+        let total_size = GcHeader::SIZE + payload_size;
+
+        // Large objects never trigger a nursery collection, so the native
+        // slot needs no temporary registration.
+        if total_size > self.config.large_object_threshold {
+            return self.alloc_in_oldgen(type_id, total_size);
+        }
+
+        let ptr = self.nursery.alloc(total_size);
+        if ptr.is_null() {
+            self.pending_reserving_size = total_size;
+            unsafe { self.roots.add(root) };
+            self.do_collect_nursery();
+            self.roots.remove(root);
+            self.pending_reserving_size = 0;
+            if std::mem::take(&mut self.oom_pending) {
+                return GcRef(0);
+            }
+            let ptr = self.nursery.alloc(total_size);
+            if ptr.is_null() {
                 return self.alloc_in_oldgen(type_id, total_size);
             }
             Self::init_nursery_object(ptr, type_id);
@@ -3436,6 +3498,15 @@ impl GcAllocator for MiniMarkGC {
         self.alloc_with_type(type_id, size)
     }
 
+    unsafe fn alloc_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+    ) -> GcRef {
+        unsafe { self.alloc_with_type_rooted(type_id, size, root) }
+    }
+
     /// Charge `bytes` of off-heap pressure and force a minor when the combined
     /// nursery footprint (struct fill + charged external bytes) reaches the
     /// nursery size. Called from the bignum collecting-alloc site BEFORE the
@@ -4112,6 +4183,43 @@ mod tests {
             gc.alloc_with_type(0, 16);
         }
         assert!(gc.minor_collections > 0);
+    }
+
+    #[test]
+    fn rooted_collecting_alloc_keeps_fast_bump_in_nursery() {
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut child = gc.alloc_with_type(tid, 16);
+        let roots_before = gc.roots.len();
+
+        let parent = unsafe { gc.alloc_with_type_rooted(tid, 16, &mut child as *mut GcRef) };
+
+        assert!(gc.is_in_nursery(child.0));
+        assert!(gc.is_in_nursery(parent.0));
+        assert_eq!(gc.minor_collections, 0);
+        assert_eq!(gc.roots.len(), roots_before);
+    }
+
+    #[test]
+    fn rooted_collecting_alloc_forwards_child_only_on_slow_path() {
+        let mut gc = test_gc(256);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut child = gc.alloc_with_type(tid, 16);
+
+        // A 16-byte payload plus the GC header occupies 24 aligned bytes.
+        // Leave less than one object free without collecting.
+        while gc.nursery.remaining() >= GcHeader::SIZE + 16 {
+            let filler = gc.alloc_with_type_no_collect(tid, 16);
+            assert!(gc.is_in_nursery(filler.0));
+        }
+        let roots_before = gc.roots.len();
+
+        let parent = unsafe { gc.alloc_with_type_rooted(tid, 16, &mut child as *mut GcRef) };
+
+        assert_eq!(gc.minor_collections, 1);
+        assert!(!gc.is_in_nursery(child.0));
+        assert!(gc.is_in_nursery(parent.0));
+        assert_eq!(gc.roots.len(), roots_before);
     }
 
     // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---

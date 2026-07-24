@@ -11,6 +11,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 use majit_ir::{Const, ConstMap, GcRef, Op};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
+mod address_dict;
 pub mod collector;
 pub mod gc_sync;
 pub mod gcreftracer;
@@ -171,6 +172,30 @@ pub trait GcAllocator: Send {
     fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         let _ = type_id;
         self.alloc_nursery(size)
+    }
+
+    /// Allocate a fixed-size typed object, collecting the nursery when full,
+    /// while keeping one caller-owned GC slot live across the slow path.
+    ///
+    /// RPython's shadow-stack/stack-map transform exposes such a local only
+    /// when the allocation reaches `collect_and_reserve`.  The default keeps
+    /// the slot registered around the whole allocation for collectors without
+    /// a nursery fast-path override. MiniMark overrides this so a successful
+    /// bump allocation performs no dynamic root registration.
+    ///
+    /// # Safety
+    /// `root` must point to a valid mutable `GcRef` slot for the duration of
+    /// this call.
+    unsafe fn alloc_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+    ) -> GcRef {
+        unsafe { self.add_root(root) };
+        let result = self.alloc_nursery_typed(type_id, size);
+        self.remove_root(root);
+        result
     }
 
     /// Allocate a fixed-size object without triggering collection.
@@ -671,6 +696,16 @@ impl GcAllocator for GcHandle {
     }
     fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery_typed(type_id, size))
+    }
+    unsafe fn alloc_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| unsafe {
+            gc.alloc_nursery_collecting_typed_rooted(type_id, size, root)
+        })
     }
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect(size))
@@ -1287,6 +1322,38 @@ pub fn set_active_alloc_nursery_collecting_typed(hook: Option<AllocNurseryCollec
 pub fn alloc_nursery_collecting_typed(type_id: u32, payload_size: usize) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.get() {
         Some(f) => f(type_id, payload_size),
+        None => GcRef(0),
+    }
+}
+
+/// Process-global rooted companion of
+/// [`AllocNurseryCollectingTypedFn`]. The caller supplies the one GC slot that
+/// is live only on the native Rust stack while the allocation may collect.
+pub type AllocNurseryCollectingTypedRootedFn =
+    unsafe fn(type_id: u32, payload_size: usize, root: *mut GcRef) -> GcRef;
+
+global_hook!(
+    static ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED:
+        AllocNurseryCollectingTypedRootedFn
+);
+
+pub fn set_active_alloc_nursery_collecting_typed_rooted(
+    hook: Option<AllocNurseryCollectingTypedRootedFn>,
+) {
+    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.set(hook);
+}
+
+/// Allocate through the active rooted collecting allocator.
+///
+/// # Safety
+/// `root` must remain a valid mutable `GcRef` slot until this call returns.
+pub unsafe fn alloc_nursery_collecting_typed_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut GcRef,
+) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
+        Some(f) => unsafe { f(type_id, payload_size, root) },
         None => GcRef(0),
     }
 }

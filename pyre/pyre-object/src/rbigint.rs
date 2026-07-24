@@ -484,20 +484,16 @@ pub fn alloc_rbigint_nursery_collecting(mut value: RBigInt) -> *mut RBigInt {
     }
     let tid = rbigint_gc_type_id();
     if tid != 0 {
-        // The freshly computed rbigint is not boxed yet. Root its sole GC edge
-        // while the collecting allocation creates the rbigint payload.
-        let pinned = unsafe {
-            crate::gc_hook::try_gc_add_root(
-                (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>(),
-            )
-        };
-        let raw = crate::gc_hook::try_gc_alloc_collecting(tid, RBIGINT_PAYLOAD_SIZE)
-            .filter(|pointer| !pointer.is_null());
-        if pinned {
-            crate::gc_hook::try_gc_remove_root(
-                (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>(),
-            );
+        // RPython's stack map exposes this freshly-computed rbigint's sole GC
+        // edge only when malloc reaches collect_and_reserve. The rooted
+        // collecting hook preserves that shape: the common nursery bump does
+        // no dynamic root-set mutation, while the nursery-full slow path
+        // temporarily registers and forwards this exact digit slot.
+        let digit_slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
+        let raw = unsafe {
+            crate::gc_hook::try_gc_alloc_collecting_rooted(tid, RBIGINT_PAYLOAD_SIZE, digit_slot)
         }
+        .filter(|pointer| !pointer.is_null());
         if let Some(raw) = raw {
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);

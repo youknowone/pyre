@@ -1,10 +1,9 @@
 //! Old-generation allocation on `minimarkpage.py:ArenaCollection`.
 
 use std::alloc::{self, Layout};
-use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::ptr;
 
+use crate::address_dict::AddressSet;
 use crate::flags;
 use crate::header::{GcHeader, header_of};
 use crate::minimarkpage::ArenaCollection;
@@ -21,38 +20,6 @@ struct RawMallocedObject {
     header_addr: usize,
     layout: Layout,
 }
-
-/// `rpython.memory.support.mangle_hash` / `memory/lldict.py:_hash`.
-///
-/// AddressDict hashes aligned addresses as `i ^ (i >> 4)`.  Rust's default
-/// HashSet uses SipHash, which changes the translated AddressDict's hot-path
-/// cost substantially during every major root walk.
-#[derive(Default)]
-struct AddressHasher {
-    hash: u64,
-}
-
-impl Hasher for AddressHasher {
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        // AddressSet only hashes `usize`, whose Hash implementation calls
-        // write_usize. Keep a deterministic fallback for the Hasher contract.
-        let mut value = 0_u64;
-        for (shift, byte) in bytes.iter().copied().take(8).enumerate() {
-            value |= (byte as u64) << (shift * 8);
-        }
-        self.hash = value ^ (value >> 4);
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.hash = (value ^ (value >> 4)) as u64;
-    }
-}
-
-type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
 
 pub struct OldGen {
     ac: ArenaCollection,

@@ -183,6 +183,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed(Some(
         dynasm_alloc_nursery_collecting_typed,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
+        dynasm_alloc_nursery_collecting_typed_rooted,
+    ));
     majit_gc::set_active_charge_memory_pressure(Some(dynasm_charge_memory_pressure));
     majit_gc::set_active_charge_oldgen_external(Some(dynasm_charge_oldgen_external));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
@@ -392,6 +395,30 @@ fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_typed(type_id, size))
+}
+
+/// Rooted collecting allocation used when a residual helper has manufactured
+/// one GC child on the native Rust stack before allocating its parent. The
+/// MiniMark override keeps the root out of the dynamic root set unless the
+/// nursery bump actually reaches `collect_and_reserve`.
+///
+/// # Safety
+/// `root` must remain a valid mutable GC slot until this call returns.
+unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
+    type_id: u32,
+    size: usize,
+    root: *mut GcRef,
+) -> GcRef {
+    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut()
+            .as_deref_mut()
+            .map(|g| unsafe { g.alloc_nursery_collecting_typed_rooted(type_id, size, root) })
+    }) {
+        return r;
+    }
+    majit_gc::gc_sync::gc_op(|g| unsafe {
+        g.alloc_nursery_collecting_typed_rooted(type_id, size, root)
+    })
 }
 
 /// Host-side old-gen external-byte trampoline — charges off-heap

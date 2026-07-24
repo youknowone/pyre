@@ -165,6 +165,49 @@ pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut
         .map(|f| f(type_id, payload_size))
 }
 
+/// Root-aware collecting allocation callback. `root` is a caller-owned slot
+/// containing the one GC child manufactured before its parent allocation.
+pub type GcAllocCollectingRootedHookFn =
+    unsafe fn(type_id: u32, payload_size: usize, root: *mut *mut u8) -> *mut u8;
+
+majit_gc::global_hook!(
+    static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
+);
+
+pub fn register_gc_alloc_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
+    GC_ALLOC_COLLECTING_ROOTED_HOOK.set(Some(hook));
+}
+
+pub fn clear_gc_alloc_collecting_rooted_hook() {
+    GC_ALLOC_COLLECTING_ROOTED_HOOK.set(None);
+}
+
+/// Attempt a collecting allocation while preserving `root`.
+///
+/// Backends with the rooted fast path register the slot only if the nursery
+/// bump fails. The fallback retains the previous conservative behavior for
+/// backends that expose only the ordinary collecting hook.
+///
+/// # Safety
+/// `root` must remain a valid mutable GC-pointer slot until this call returns.
+#[inline]
+pub unsafe fn try_gc_alloc_collecting_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut *mut u8,
+) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size, root) });
+    }
+    let collecting = GC_ALLOC_COLLECTING_HOOK.get()?;
+    let pinned = unsafe { try_gc_add_root(root) };
+    let result = collecting(type_id, payload_size);
+    if pinned {
+        try_gc_remove_root(root);
+    }
+    Some(result)
+}
+
 /// Signature of the host-side full-collection callback. Used by
 /// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this hook.
@@ -594,6 +637,20 @@ mod tests {
         let ptr = try_gc_alloc(1, 8);
         assert!(ptr.is_some());
         assert!(ptr.unwrap().is_null());
+        clear_gc_alloc_hook();
+    }
+
+    #[test]
+    fn managed_bigint_digits_do_not_fall_back_to_raw_after_hook_failure() {
+        let _hook_lock = hook_test_guard();
+        register_gc_alloc_hook(null_hook);
+        let block = unsafe {
+            crate::object_array::try_alloc_typed_items_block_nursery(
+                4,
+                crate::object_array::GC_INT_ARRAY_GC_TYPE_ID,
+            )
+        };
+        assert!(block.is_none());
         clear_gc_alloc_hook();
     }
 

@@ -379,6 +379,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed(Some(
         alloc_nursery_collecting_typed_via_active_runtime,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
+        alloc_nursery_collecting_typed_rooted_via_active_runtime,
+    ));
     majit_gc::set_active_charge_memory_pressure(Some(charge_memory_pressure_via_active_runtime));
     majit_gc::set_active_charge_oldgen_external(Some(charge_oldgen_external_via_active_runtime));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
@@ -1541,6 +1544,20 @@ fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
 /// the embedded minor cycle reclaims dead bigints instead of spilling to old-gen.
 fn alloc_nursery_collecting_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// Rooted companion used for a GC child held only in one native Rust slot.
+/// MiniMark registers that slot only on the nursery-full slow path.
+///
+/// # Safety
+/// `root` must remain a valid mutable GC slot until this call returns.
+unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
+    type_id: u32,
+    size: usize,
+    root: *mut GcRef,
+) -> GcRef {
+    with_cranelift_gc(|gc| unsafe { gc.alloc_nursery_collecting_typed_rooted(type_id, size, root) })
+        .unwrap_or(GcRef(0))
 }
 
 /// `majit_gc::ChargeMemoryPressureFn` installed by `set_gc_allocator`. Charges a

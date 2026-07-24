@@ -621,7 +621,10 @@ pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBl
 /// may hold several unboxed Rust `RBigInt` handles at once, so the allocator
 /// must not trigger a collection while those raw digit pointers are live.
 /// The completed result's digit edge is explicitly rooted when its RBigInt
-/// payload is boxed by `alloc_rbigint_nursery_collecting`.
+/// payload is boxed by `alloc_rbigint_nursery_collecting`. Once the GC hook is
+/// installed, allocation failure must remain a failure: a raw fallback would
+/// leave `RBigInt._digits` pointing outside the managed heap even though its
+/// descriptor traces that field as `GcArray(Signed)`.
 pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut TypedItemsBlock {
     unsafe {
         try_alloc_typed_items_block_nursery(cap, tid)
@@ -636,20 +639,23 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
 ) -> Option<*mut TypedItemsBlock> {
     let cap = cap.max(1);
     let layout = try_typed_items_block_layout(cap)?;
-    if itemsblock_gc_enabled()
-        && let Some(raw) = crate::gc_hook::try_gc_alloc(tid, layout.size())
-        && !raw.is_null()
-    {
-        let block = raw as *mut TypedItemsBlock;
-        unsafe {
-            (*block).capacity = cap;
-            std::ptr::write_bytes(
-                typed_items_block_items_base(block),
-                0,
-                cap * std::mem::size_of::<u64>(),
-            );
+    if itemsblock_gc_enabled() {
+        match crate::gc_hook::try_gc_alloc(tid, layout.size()) {
+            Some(raw) if raw.is_null() => return None,
+            Some(raw) => {
+                let block = raw as *mut TypedItemsBlock;
+                unsafe {
+                    (*block).capacity = cap;
+                    std::ptr::write_bytes(
+                        typed_items_block_items_base(block),
+                        0,
+                        cap * std::mem::size_of::<u64>(),
+                    );
+                }
+                return Some(block);
+            }
+            None => {}
         }
-        return Some(block);
     }
     unsafe {
         let raw = alloc_zeroed(layout);
