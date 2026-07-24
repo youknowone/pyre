@@ -1411,7 +1411,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
-            quote! { values.push(self.#fname.to_bits() as i64); }
+            // Widen to f64 before taking bits so the encoding is the 64-bit
+            // representation the restore path reads back via
+            // `f64::from_bits(_ as u64) as #rust_ty`. A `float(f32)` field's
+            // own `to_bits()` yields 32-bit bits, which would round-trip
+            // through `f64::from_bits` as a bogus value.
+            // Widen to f64 before taking bits so the encoding is the 64-bit
+            // representation the restore path reads back via
+            // `f64::from_bits(_ as u64) as #rust_ty`. A `float(f32)` field's
+            // own `to_bits()` yields 32-bit bits, which would round-trip
+            // through `f64::from_bits` as a bogus value.
+            quote! { values.push((self.#fname as f64).to_bits() as i64); }
         })
         .collect();
     let restore_float_scalar_parts: Vec<TokenStream> = float_scalars
@@ -1430,7 +1440,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|(_, f)| {
             let fname = &f.name;
             let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { sym.#value_name = self.#fname.to_bits() as i64; }
+            quote! { sym.#value_name = (self.#fname as f64).to_bits() as i64; }
         })
         .collect();
     let collect_float_scalar_parts: Vec<TokenStream> = float_scalars

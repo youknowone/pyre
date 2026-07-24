@@ -229,3 +229,61 @@ mod virt_array {
         );
     }
 }
+
+// Finding E: a `float(f32)` scalar declares an f32 struct field. Extraction
+// took `self.f.to_bits()` (32-bit f32 bits), but the restore path reads it
+// back with `f64::from_bits(_ as u64) as f32`, so the value was corrupted.
+// Extraction/init now widen to f64 first, matching restore.
+mod scalar_f32 {
+    use super::Bytecode;
+    use majit_metainterp::JitDriver;
+
+    struct F32State {
+        a: i64,
+        f: f32,
+    }
+
+    const OP_NOP: u8 = 0;
+
+    #[majit_macros::jit_interp(
+        state = F32State,
+        env = Bytecode,
+        state_fields = { a: int, f: float(f32) },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn f32_scalar_minimal(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<F32State> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = F32State { a: 0, f: 0.0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_NOP => {}
+                _ => break,
+            }
+        }
+        state.a
+    }
+
+    #[test]
+    fn f32_scalar_extracts_f64_widened_bits() {
+        use majit_metainterp::JitState as _;
+        let state = F32State { a: 0, f: 1.5f32 };
+        let meta = state.build_meta(0, &[OP_NOP]);
+        let live = state.extract_live(&meta);
+        // The f32 field is encoded as its f64 widening, so the restore path
+        // `f64::from_bits(_ as u64) as f32` recovers the original value.
+        assert_eq!(live, vec![0, (1.5f32 as f64).to_bits() as i64]);
+        // Guard against the pre-fix encoding, which stored the raw 32-bit
+        // f32 bit pattern and round-tripped to a bogus f64.
+        assert_ne!(live[1], 1.5f32.to_bits() as i64);
+    }
+}
