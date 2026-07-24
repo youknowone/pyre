@@ -682,6 +682,18 @@ pub(crate) fn fbw_foriter_body_effect_since_consume() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolved `body_pc` of the most-recent (top) in-flight FOR_ITER entry — the
+/// FOR_ITER continue-arm fallthrough, i.e. the pc of the loop-variable store
+/// that binds the just-consumed item.  `None` when no item is in flight or its
+/// coordinate is an unresolvable native pc.
+pub(crate) fn fbw_foriter_inflight_top_body_pc() -> Option<usize> {
+    FBW_FORITER_INFLIGHT.with(|c| {
+        c.borrow()
+            .last()
+            .and_then(|e| inflight_foriter_body_pc(e.body))
+    })
+}
+
 /// Whether ANY of the three R1 body-effect signals is currently present:
 /// the body-effect-since-consume flag, either journal non-empty, or the
 /// unjournaled-effect flag.  These are the exact signals

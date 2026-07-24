@@ -1502,8 +1502,29 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         None
     };
+    // The loop-variable binding store is the op at the in-flight FOR_ITER's
+    // `body_pc` (the FOR_ITER continue-arm fallthrough), a STORE_NAME/
+    // STORE_GLOBAL that writes the just-consumed item to the loop target (a
+    // module/global-scope `for i in …`; a function-scope loop var is a
+    // STORE_FAST frame local that never becomes a residual).  Re-delivery
+    // re-runs the body from `body_pc`, re-storing the SAME re-delivered item to
+    // the SAME name — an idempotent write, never an accumulating double.  Like
+    // the `is_idempotent_gc_barrier` write barrier it still EXECUTES concretely
+    // (the module dict must hold the binding for the walk's remaining reads) but
+    // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
+    // accounting so an escaping residual later in the same body does not
+    // refuse-drop the whole iteration.
+    // `vstack_cur_pypc` points one past the executing op (next-instr
+    // convention), while `body_pc` is the store's own py_pc, so the loop-var
+    // store satisfies `vstack_cur_pypc == body_pc + 1`.
+    let is_loop_var_binding_store = matches!(
+        helper,
+        majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
+    ) && fbw_foriter_inflight_top_body_pc()
+        .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize);
     let body_effect_candidate = !provably_side_effect_free
         && !is_idempotent_gc_barrier
+        && !is_loop_var_binding_store
         && writes_live_heap
         && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
