@@ -379,8 +379,32 @@ impl<'c> Lowerer<'c> {
             }
         }
 
+        // Names `let`-bound at the top level of the loop body are scoped to
+        // the body. Dropping the ones that did not exist before the loop is
+        // handled by the `retain` below, but a `let` that SHADOWS an outer
+        // binding must revert to the outer value rather than escaping with the
+        // last iteration's inner binding. Assignments to existing locals are
+        // not `let`s, so they are absent here and correctly persist.
+        let body_let_names: Vec<String> = expr_for
+            .body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Local(local) => match &local.pat {
+                    Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
         self.bindings
             .retain(|name, _| snap_bindings.contains_key(name));
+        for name in &body_let_names {
+            if let Some(outer_binding) = snap_bindings.get(name) {
+                self.bindings.insert(name.clone(), outer_binding.clone());
+            }
+        }
         if let Some(loop_var) = &loop_var {
             let name = loop_var.to_string();
             if let Some(old_binding) = snap_bindings.get(&name) {
@@ -826,4 +850,61 @@ fn parse_checked_ovf_match(
         return None;
     }
     Some((builder_method, recv, arg, none_body?))
+}
+
+#[cfg(test)]
+mod unroll_binding_tests {
+    use super::*;
+
+    fn int_binding(reg: u16) -> Binding {
+        Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+            struct_type: None,
+        }
+    }
+
+    #[test]
+    fn unrolled_body_let_shadow_reverts_to_outer_binding() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert("x".to_string(), int_binding(42));
+        let expr_for: syn::ExprForLoop = syn::parse_quote! {
+            for _ in 0..2 {
+                let x = 7;
+            }
+        };
+        assert!(
+            lowerer.lower_for_loop(&expr_for).is_some(),
+            "literal-range unroll must succeed"
+        );
+        // The body `let x` shadows the outer `x`; its binding is scoped to the
+        // loop body, so after the loop `x` must be the outer binding (reg 42),
+        // not the last iteration's inner `let`.
+        assert_eq!(
+            lowerer.bindings.get("x").map(|b| b.reg),
+            Some(42),
+            "a shadowed outer binding must be restored after unrolling"
+        );
+    }
+
+    #[test]
+    fn unrolled_body_let_without_outer_is_removed() {
+        let mut lowerer = Lowerer::new(None);
+        let expr_for: syn::ExprForLoop = syn::parse_quote! {
+            for _ in 0..2 {
+                let y = 7;
+            }
+        };
+        assert!(
+            lowerer.lower_for_loop(&expr_for).is_some(),
+            "literal-range unroll must succeed"
+        );
+        // `y` did not exist before the loop, so its body-local binding must not
+        // escape.
+        assert!(
+            lowerer.bindings.get("y").is_none(),
+            "a body-local let must not escape the loop"
+        );
+    }
 }
