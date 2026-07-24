@@ -367,6 +367,14 @@ impl<'c> Lowerer<'c> {
                 config.state_scalars.contains_key(&member)
                     || config.state_arrays.contains_key(&member)
                     || config.state_virt_arrays.contains_key(&member)
+                    // Float and ref scalars also lower field writes to
+                    // `store_state_field_{float,ref}` (lower_vable.rs). Omitting
+                    // them here makes an arm whose only state effect is
+                    // `state.x = <float>` / `state.r = <ref>` register as
+                    // runtime-only, so `lower_dispatch_body` drops the store and
+                    // compiled execution leaves the field stale.
+                    || config.state_float_scalars.contains_key(&member)
+                    || config.state_ref_scalars.contains_key(&member)
             }
             Expr::Index(syn::ExprIndex { expr, .. }) => self.expr_is_jit_state_place(expr),
             _ => false,

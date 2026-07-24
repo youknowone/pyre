@@ -92,6 +92,74 @@ mod scalar {
     }
 }
 
+// Finding F reproduction: a float state write positioned as a top-level
+// dispatch-loop statement (not an opcode-match arm body) is filtered by
+// `lower_dispatch_body`'s `stmt_modifies_jit_state` skip gate. Until float
+// scalars were added to `expr_is_jit_state_place`, that predicate returned
+// false for `state.f`, so the write was silently dropped from the dispatch
+// JitCode and compiled execution left the field stale. Its own module
+// because `#[jit_interp]` emits per-module `__JitSym` / `__JitMeta` types.
+mod scalar_toplevel {
+    use super::{Bytecode, all_jitcode_bodies};
+    use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD_FLOAT;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    struct FloatToplevelState {
+        a: i64,
+        f: f64,
+    }
+
+    const OP_NOP: u8 = 0;
+
+    #[majit_macros::jit_interp(
+        state = FloatToplevelState,
+        env = Bytecode,
+        state_fields = { a: int, f: float },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn float_scalar_toplevel_write(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<FloatToplevelState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = FloatToplevelState { a: 0, f: 0.0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            // Top-level float write — reaches the `stmt_modifies_jit_state`
+            // gate in `lower_dispatch_body` rather than the arm-inline path.
+            state.f = state.f + 1.5;
+            match opcode {
+                OP_NOP => {}
+                _ => break,
+            }
+        }
+        state.a
+    }
+
+    #[test]
+    fn toplevel_float_write_is_not_dropped_from_dispatch_body() {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![1], vec![], vec![0]);
+        __prebuild_jitcode_liveness_float_scalar_toplevel_write(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_float_scalar_toplevel_write(&mut asm, 0i64)
+            .expect("dispatch lower must succeed for the top-level float write fixture");
+        let bodies = all_jitcode_bodies(&dispatch_jc);
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.iter().any(|&b| b == BC_STORE_STATE_FIELD_FLOAT)),
+            "a top-level float write must lower to store_state_field_float; bodies: {bodies:?}"
+        );
+    }
+}
+
 mod virt_array {
     use super::{Bytecode, all_jitcode_bodies};
     use majit_metainterp::jitcode::insns::{BC_GETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_F};
