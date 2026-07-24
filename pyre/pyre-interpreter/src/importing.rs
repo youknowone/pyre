@@ -3024,37 +3024,48 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
 // Get an attribute from the module on TOS. Like `space.getattr(w_module, w_name)`.
 
 /// `importing.py:430 get_spec` — `space.getattr(w_module, '__spec__')`,
-/// returning None when the module carries no spec.
-pub(crate) fn get_spec(module: PyObjectRef) -> PyObjectRef {
+/// returning None when the module carries no `__spec__`.  Only a missing
+/// attribute is suppressed; any other lookup error propagates.
+pub(crate) fn get_spec(module: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     match crate::baseobjspace::getattr_str(module, "__spec__") {
-        Ok(v) => v,
-        Err(_) => pyre_object::w_none(),
+        Ok(v) => Ok(v),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(pyre_object::w_none()),
+        Err(e) => Err(e),
     }
 }
 
 /// `importing.py:438 is_spec_initializing` — a spec whose `_initializing`
 /// flag is truthy marks a module still executing, the circular-import signal.
-pub(crate) fn is_spec_initializing(w_spec: PyObjectRef) -> bool {
+/// A missing `_initializing` reads as not initializing; any other lookup error,
+/// and the truth test itself, propagate.
+pub(crate) fn is_spec_initializing(w_spec: PyObjectRef) -> Result<bool, crate::PyError> {
     if unsafe { pyre_object::is_none(w_spec) } {
-        return false;
+        return Ok(false);
     }
-    match crate::baseobjspace::getattr_str(w_spec, "_initializing") {
-        Ok(v) => crate::baseobjspace::is_true(v).unwrap_or(false),
-        Err(_) => false,
-    }
+    let w_initializing = match crate::baseobjspace::getattr_str(w_spec, "_initializing") {
+        Ok(v) => v,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    crate::baseobjspace::is_true(w_initializing)
 }
 
 /// `importing.py:452 is_spec_uninitialized_submodule` — the name appears in the
-/// spec's `_uninitialized_submodules` list.
-pub(crate) fn is_spec_uninitialized_submodule(w_spec: PyObjectRef, name: &str) -> bool {
+/// spec's `_uninitialized_submodules` list.  A missing attribute reads as not a
+/// submodule; any other lookup error, and the containment test, propagate.
+pub(crate) fn is_spec_uninitialized_submodule(
+    w_spec: PyObjectRef,
+    name: &str,
+) -> Result<bool, crate::PyError> {
     if unsafe { pyre_object::is_none(w_spec) } {
-        return false;
+        return Ok(false);
     }
     let w_value = match crate::baseobjspace::getattr_str(w_spec, "_uninitialized_submodules") {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(false),
+        Err(e) => return Err(e),
     };
-    crate::baseobjspace::contains(w_value, pyre_object::w_str_new(name)).unwrap_or(false)
+    crate::baseobjspace::contains(w_value, pyre_object::w_str_new(name))
 }
 
 pub fn import_from(
@@ -3159,9 +3170,9 @@ pub fn import_from(
     // pyopcode.py:1165-1177 — classify the failure through `__spec__` before
     // reading the path buffer: a module still executing reports the
     // circular-import cause, as does one whose submodule slot is unset.
-    let w_spec = get_spec(module);
-    let initializing = is_spec_initializing(w_spec);
-    let uninit_submodule = !initializing && is_spec_uninitialized_submodule(w_spec, &pkgname);
+    let w_spec = get_spec(module)?;
+    let initializing = is_spec_initializing(w_spec)?;
+    let uninit_submodule = !initializing && is_spec_uninitialized_submodule(w_spec, &pkgname)?;
     let pkgpath = crate::baseobjspace::utf8_w(w_pkgpath)?;
     let msg = if initializing {
         format!(

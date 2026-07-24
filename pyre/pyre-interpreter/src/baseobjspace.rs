@@ -5464,18 +5464,22 @@ unsafe fn module_getattr_hook_or_err(
     // module.py:148-159 — a module still executing (`__spec__._initializing`)
     // or naming an as-yet-unset submodule reports the circular-import cause.
     let w_spec = finditem_str(w_dict, "__spec__")?.filter(|w| !w.is_null());
-    let msg = match w_spec {
-        Some(w_spec) if crate::importing::is_spec_initializing(w_spec) => format!(
-            "partially initialized module '{nm}' has no attribute '{name}' \
-             (most likely due to a circular import)"
-        ),
-        Some(w_spec) if crate::importing::is_spec_uninitialized_submodule(w_spec, name) => {
+    let msg = if let Some(w_spec) = w_spec {
+        if crate::importing::is_spec_initializing(w_spec)? {
+            format!(
+                "partially initialized module '{nm}' has no attribute '{name}' \
+                 (most likely due to a circular import)"
+            )
+        } else if crate::importing::is_spec_uninitialized_submodule(w_spec, name)? {
             format!(
                 "cannot access submodule '{name}' of module '{nm}' \
                  (most likely due to a circular import)"
             )
+        } else {
+            format!("module '{nm}' has no attribute '{name}'")
         }
-        _ => format!("module '{nm}' has no attribute '{name}'"),
+    } else {
+        format!("module '{nm}' has no attribute '{name}'")
     };
     Err(PyError::new(PyErrorKind::AttributeError, msg))
 }
