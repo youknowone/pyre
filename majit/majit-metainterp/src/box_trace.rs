@@ -62,6 +62,12 @@ fn getfield_gc_i_pureornot(
     // Record the plain GETFIELD_GC_I opnum regardless of
     // `descr.is_always_pure()`; purity is re-derived from the descr by
     // OptHeap. There is no pure getfield opnum.
+    // pyjitpl.py:948 cache-miss `execute_with_descr` routes through
+    // `execute_and_record`, which counts OPS and RECORDED_OPS.
+    ctx.profiler()
+        .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
+    ctx.profiler()
+        .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
     let result = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], descr.clone());
     // pyjitpl.py:948-949 — pair the recorded opref with the live int
     // payload so subsequent `box_value(result)` mirrors RPython's
@@ -335,6 +341,12 @@ fn getfield_gc_f_pureornot(
     // Record the plain GETFIELD_GC_F opnum regardless of
     // `descr.is_always_pure()`; purity is re-derived from the descr by
     // OptHeap. There is no pure getfield opnum.
+    // pyjitpl.py:948 cache-miss `execute_with_descr` routes through
+    // `execute_and_record`, which counts OPS and RECORDED_OPS.
+    ctx.profiler()
+        .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
+    ctx.profiler()
+        .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
     let result = ctx.record_op_with_descr(OpCode::GetfieldGcF, &[obj], descr.clone());
     // Pair the recorded opref with the live float payload — RPython's
     // executor returns a BoxFloat with both identity and value.

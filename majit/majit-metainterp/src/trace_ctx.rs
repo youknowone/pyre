@@ -2601,9 +2601,14 @@ impl TraceCtx {
             }
         }
 
+        // Final token-null store (`record2`, so it records no profiler
+        // counters). The token slot holds a raw force marker, and this
+        // store resets it to zero. Use an integer-zero null rather than a
+        // Ref `const_null`: introducing a Ref constant here routes the
+        // store through the ref-const path, which miscompiles on backends
+        // that bake ref consts as raw addresses (wasm) or emit a GC write
+        // barrier under a differing calling convention.
         let null = self.const_int(0);
-        // pyjitpl.py:3521 final token-null store uses `record2`, so it
-        // contributes no profiler counters.
         self.record_op_with_descr(
             OpCode::SetfieldGc,
             &[vable_opref, null],
