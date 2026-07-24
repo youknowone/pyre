@@ -2388,7 +2388,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                              (unjournaled effect) — legacy replay kept"
                         );
                     }
-                } else if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr, header_pc) {
+                } else if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr, header_pc)
+                {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
                             "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
