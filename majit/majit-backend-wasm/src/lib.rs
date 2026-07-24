@@ -302,6 +302,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
+        wasm_alloc_nursery_typed_with_placement,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
@@ -505,6 +508,22 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // is not a registered GC root.
     with_wasm_active_gc_mut(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
         .unwrap_or(GcRef(0))
+}
+
+/// Placement-reporting companion of [`wasm_alloc_nursery_typed`].
+///
+/// # Safety
+/// `needs_write_barrier` must remain a valid mutable `bool` slot until this
+/// call returns.
+unsafe fn wasm_alloc_nursery_typed_with_placement(
+    type_id: u32,
+    size: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_wasm_active_gc_mut(|gc| unsafe {
+        gc.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
 }
 
 /// Host-side old-gen allocation trampoline. Stable

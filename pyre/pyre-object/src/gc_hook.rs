@@ -80,6 +80,15 @@ pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> *mut u8;
 majit_gc::global_hook!(static GC_ALLOC_HOOK: GcAllocHookFn);
 majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
 
+/// Placement-reporting companion of [`GcAllocHookFn`] for no-collect
+/// allocations that may spill from the nursery to old-gen.
+pub type GcAllocWithPlacementHookFn =
+    unsafe fn(type_id: u32, payload_size: usize, needs_write_barrier: *mut bool) -> *mut u8;
+
+majit_gc::global_hook!(
+    static GC_ALLOC_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
+);
+
 /// Install the allocation callback. Overwrites any previously-installed hook.
 pub fn register_gc_alloc_hook(hook: GcAllocHookFn) {
     GC_ALLOC_HOOK.set(Some(hook));
@@ -97,6 +106,30 @@ pub fn clear_gc_alloc_hook() {
 #[inline]
 pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
     GC_ALLOC_HOOK.get().map(|f| f(type_id, payload_size))
+}
+
+pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
+    GC_ALLOC_WITH_PLACEMENT_HOOK.set(Some(hook));
+}
+
+pub fn clear_gc_alloc_with_placement_hook() {
+    GC_ALLOC_WITH_PLACEMENT_HOOK.set(None);
+}
+
+/// Attempt a no-collect allocation and report whether a fresh GC-reference
+/// field needs a creation barrier. Backends without placement reporting fall
+/// back to the ordinary allocation hook and conservatively keep the barrier.
+#[inline]
+pub fn try_gc_alloc_with_placement(
+    type_id: u32,
+    payload_size: usize,
+    needs_write_barrier: &mut bool,
+) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_WITH_PLACEMENT_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
+    }
+    *needs_write_barrier = true;
+    try_gc_alloc(type_id, payload_size)
 }
 
 /// Install the stable (old-gen) allocation callback for this thread.
@@ -621,6 +654,15 @@ mod tests {
         mock_hook(type_id, payload_size)
     }
 
+    unsafe fn nursery_placement_hook(
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> *mut u8 {
+        unsafe { *needs_write_barrier = false };
+        mock_hook(type_id, payload_size)
+    }
+
     #[test]
     fn returns_none_when_unregistered() {
         let _hook_lock = hook_test_guard();
@@ -731,6 +773,27 @@ mod tests {
 
         clear_gc_alloc_hook();
         clear_gc_alloc_stable_hook();
+    }
+
+    #[test]
+    fn no_collect_placement_hook_has_conservative_fallback() {
+        let _hook_lock = hook_test_guard();
+        clear_gc_alloc_hook();
+        clear_gc_alloc_with_placement_hook();
+        let mut needs_write_barrier = false;
+
+        register_gc_alloc_hook(mock_hook);
+        let result = try_gc_alloc_with_placement(7, 24, &mut needs_write_barrier);
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(needs_write_barrier);
+
+        register_gc_alloc_with_placement_hook(nursery_placement_hook);
+        let result = try_gc_alloc_with_placement(7, 24, &mut needs_write_barrier);
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(!needs_write_barrier);
+
+        clear_gc_alloc_hook();
+        clear_gc_alloc_with_placement_hook();
     }
 
     #[test]

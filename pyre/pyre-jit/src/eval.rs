@@ -51,6 +51,20 @@ fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
 
+/// Placement-reporting companion of [`pyre_object_gc_alloc_trampoline`].
+///
+/// # Safety
+/// `needs_write_barrier` must remain a valid mutable `bool` slot until this
+/// call returns.
+unsafe fn pyre_object_gc_alloc_with_placement_trampoline(
+    type_id: u32,
+    size: usize,
+    needs_write_barrier: *mut bool,
+) -> *mut u8 {
+    unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size, needs_write_barrier) }.0
+        as *mut u8
+}
+
 /// Trampoline for stable-address host-side allocations.
 /// Routes pyre-object's stable-allocation hook to the backend's
 /// `alloc_oldgen_typed`. MiniMark's old-gen is mark-sweep
@@ -3361,6 +3375,9 @@ fn register_thread_root_areas() {
 /// `Cell` slots and do not touch interpreter state.
 fn install_pyre_object_hooks() {
     pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
+    pyre_object::register_gc_alloc_with_placement_hook(
+        pyre_object_gc_alloc_with_placement_trampoline,
+    );
     pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
         pyre_object_gc_alloc_collecting_trampoline,

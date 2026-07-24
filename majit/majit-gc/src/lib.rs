@@ -246,6 +246,26 @@ pub trait GcAllocator: Send {
         self.alloc_nursery_no_collect_typed(type_id, size)
     }
 
+    /// Fallible no-collect allocation that also reports whether initializing
+    /// the fresh result with a young GC reference needs a creation barrier.
+    ///
+    /// Collectors without placement information conservatively report
+    /// `true`. MiniMark clears the flag for an ordinary nursery bump and keeps
+    /// it set when the allocation spills to old-gen.
+    ///
+    /// # Safety
+    /// `needs_write_barrier` must point to a valid mutable `bool` slot for the
+    /// duration of this call.
+    unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe { *needs_write_barrier = true };
+        self.try_alloc_nursery_no_collect_typed(type_id, size)
+    }
+
     /// Allocate a variable-size object without triggering collection.
     ///
     /// Implementations may fall back to old-gen allocation when the nursery
@@ -271,26 +291,6 @@ pub trait GcAllocator: Send {
     /// override to force placement there.
     fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         self.alloc_nursery_no_collect_typed(type_id, size)
-    }
-
-    /// Charge `bytes` of off-heap memory pressure (e.g. a nursery object's
-    /// external, GC-invisible payload such as a bignum's limb `Vec`). Mirrors
-    /// RPython `rgc.add_memory_pressure`: the GC accounts memory it cannot see so
-    /// collection cadence reflects true footprint. Default is a no-op so backends
-    /// without a generational collector compile unchanged.
-    fn charge_memory_pressure(&mut self, bytes: usize) {
-        let _ = bytes;
-    }
-
-    /// Add `bytes` of `obj_addr`'s off-heap payload to the major-collection
-    /// threshold's external total if the object is already old-gen, WITHOUT
-    /// forcing a minor (unlike
-    /// [`charge_memory_pressure`](GcAllocator::charge_memory_pressure)).
-    /// Callers may pass a nursery object; generational collectors ignore it
-    /// because promotion accounting will charge it later. Default is a no-op so
-    /// backends without a generational collector compile unchanged.
-    fn charge_oldgen_external(&mut self, obj_addr: usize, bytes: usize) {
-        let _ = (obj_addr, bytes);
     }
 
     /// incminimark.py:1569: jit_remember_young_pointer(obj)
@@ -745,6 +745,16 @@ impl GcAllocator for GcHandle {
     fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
     }
+    unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| unsafe {
+            gc.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+        })
+    }
     fn alloc_varsize_no_collect(
         &mut self,
         base_size: usize,
@@ -755,12 +765,6 @@ impl GcAllocator for GcHandle {
     }
     fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
-    }
-    fn charge_memory_pressure(&mut self, bytes: usize) {
-        gc_sync::gc_op(|gc| gc.charge_memory_pressure(bytes))
-    }
-    fn charge_oldgen_external(&mut self, obj_addr: usize, bytes: usize) {
-        gc_sync::gc_op(|gc| gc.charge_oldgen_external(obj_addr, bytes))
     }
     fn write_barrier(&mut self, obj: GcRef) {
         gc_sync::gc_op(|gc| gc.write_barrier(obj))
@@ -1292,6 +1296,40 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
     }
 }
 
+/// Placement-reporting companion of [`AllocNurseryTypedFn`] for fresh-object
+/// initialization. The allocation remains no-collect; the out-parameter is
+/// `false` for a nursery result and `true` for an old-gen spill.
+pub type AllocNurseryTypedWithPlacementFn =
+    unsafe fn(type_id: u32, payload_size: usize, needs_write_barrier: *mut bool) -> GcRef;
+
+global_hook!(
+    static ACTIVE_ALLOC_NURSERY_TYPED_WITH_PLACEMENT:
+        AllocNurseryTypedWithPlacementFn
+);
+
+pub fn set_active_alloc_nursery_typed_with_placement(
+    hook: Option<AllocNurseryTypedWithPlacementFn>,
+) {
+    ACTIVE_ALLOC_NURSERY_TYPED_WITH_PLACEMENT.set(hook);
+}
+
+/// Allocate through the active backend's no-collect nursery allocator while
+/// reporting the result placement.
+///
+/// # Safety
+/// `needs_write_barrier` must remain a valid mutable `bool` slot until this
+/// call returns.
+pub unsafe fn alloc_nursery_typed_with_placement(
+    type_id: u32,
+    payload_size: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_TYPED_WITH_PLACEMENT.get() {
+        Some(f) => unsafe { f(type_id, payload_size, needs_write_barrier) },
+        None => GcRef(0),
+    }
+}
+
 /// Process-global callback that performs a stable-address old-gen
 /// allocation for the currently active backend. Used by host-side
 /// allocators whose callers hold the returned pointer on the Rust
@@ -1381,49 +1419,6 @@ pub unsafe fn alloc_nursery_collecting_typed_rooted(
     match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
         Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
         None => GcRef(0),
-    }
-}
-
-/// Process-global callback that charges off-heap memory pressure on the active
-/// backend's GC (`GcAllocator::charge_memory_pressure`). Used by host-side
-/// allocators of GC objects whose payload includes external, GC-invisible memory
-/// (the bignum limb `Vec`). Returns silently when no backend is installed.
-pub type ChargeMemoryPressureFn = fn(bytes: usize);
-
-global_hook!(static ACTIVE_CHARGE_MEMORY_PRESSURE: ChargeMemoryPressureFn);
-
-/// Install the active backend's memory-pressure callback. Pass `None` to clear.
-pub fn set_active_charge_memory_pressure(hook: Option<ChargeMemoryPressureFn>) {
-    ACTIVE_CHARGE_MEMORY_PRESSURE.set(hook);
-}
-
-/// Charge `bytes` of off-heap memory pressure on the active backend's GC. No-op
-/// when no backend has installed a hook.
-pub fn charge_memory_pressure(bytes: usize) {
-    if let Some(f) = ACTIVE_CHARGE_MEMORY_PRESSURE.get() {
-        f(bytes);
-    }
-}
-
-/// Process-global callback that charges an object's off-heap payload against the
-/// active backend's major threshold (`GcAllocator::charge_oldgen_external`) when
-/// the object is old-gen, without forcing a minor. Used after initializing GC
-/// objects whose payload includes external, GC-invisible memory (the bignum limb
-/// `Vec`). Returns silently when no backend is installed.
-pub type ChargeOldgenExternalFn = fn(obj_addr: usize, bytes: usize);
-
-global_hook!(static ACTIVE_CHARGE_OLDGEN_EXTERNAL: ChargeOldgenExternalFn);
-
-/// Install the active backend's old-gen external-byte callback. Pass `None` to clear.
-pub fn set_active_charge_oldgen_external(hook: Option<ChargeOldgenExternalFn>) {
-    ACTIVE_CHARGE_OLDGEN_EXTERNAL.set(hook);
-}
-
-/// Charge `bytes` of `obj_addr`'s off-heap payload on the active backend's GC
-/// when the object is old-gen. No-op when no backend has installed a hook.
-pub fn charge_oldgen_external(obj_addr: usize, bytes: usize) {
-    if let Some(f) = ACTIVE_CHARGE_OLDGEN_EXTERNAL.get() {
-        f(obj_addr, bytes);
     }
 }
 

@@ -513,27 +513,6 @@ pub struct MiniMarkGC {
     ///
     /// Mirrors incminimark's `threshold_objects_made_old`.
     threshold_bytes_made_old: usize,
-    /// Off-heap memory pressure (external, GC-invisible payload bytes — e.g. a
-    /// bignum's limb `Vec`) charged since the last minor collection. Added to the
-    /// nursery struct-fill when deciding whether to force a minor in
-    /// [`charge_memory_pressure`](MiniMarkGC::charge_memory_pressure), so the
-    /// collection cadence reflects true footprint rather than only the 8+payload
-    /// struct bytes the nursery bump pointer tracks. Reset to 0 at the start of
-    /// each minor (the previous generation's external bytes were freed by the
-    /// dead young objects' destructors), mirroring how `nursery.reset()` zeroes
-    /// struct fill. RPython `rgc.add_memory_pressure` analog, retargeted from the
-    /// major threshold onto the minor trigger because the charged objects (young
-    /// bignums) are reclaimed at minors.
-    pressure_since_minor: usize,
-    /// Sum of the off-heap (GC-invisible) byte footprint of old-gen objects
-    /// whose type carries an `external_size` fn — currently promoted `BigInt`
-    /// payloads whose limb `Vec` lives in the system heap. Folded into
-    /// `get_total_memory_used` so the major-collection threshold reflects the
-    /// true footprint, not just the tracked struct, and majors fire to reclaim
-    /// the limb memory of dead promoted bignums. Incremented when such an object
-    /// is promoted (its value is valid post-copy) and recomputed exactly from
-    /// the surviving destructor list at the end of each major cycle.
-    oldgen_external_bytes: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: IndexSet<usize>,
     /// minimark.py:338 `nursery_objects_shadows = AddressDict()`.
@@ -654,8 +633,6 @@ impl MiniMarkGC {
             next_major_collection_threshold: min_heap_size,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
-            pressure_since_minor: 0,
-            oldgen_external_bytes: 0,
             pinned_objects: IndexSet::new(),
             nursery_objects_shadows: AddressMap::default(),
             compiled_code_registry: CompiledCodeRegistry::new(),
@@ -1003,6 +980,33 @@ impl MiniMarkGC {
     /// fail. Oversized objects and nursery-full spill use rawmalloc and return
     /// NULL on failure, matching RPython's `MemoryError` path.
     pub fn try_alloc_with_type_no_collect(&mut self, type_id: u32, payload_size: usize) -> GcRef {
+        let mut needs_write_barrier = true;
+        unsafe {
+            self.try_alloc_with_type_no_collect_with_placement(
+                type_id,
+                payload_size,
+                &mut needs_write_barrier,
+            )
+        }
+    }
+
+    /// Placement-reporting counterpart of
+    /// [`try_alloc_with_type_no_collect`](Self::try_alloc_with_type_no_collect).
+    ///
+    /// `framework.py:28-61` propagates `no_write_barrier_needed` through a
+    /// fresh nursery allocation. The no-collect path can instead spill to
+    /// old-gen, so report that exceptional placement to the initializer.
+    ///
+    /// # Safety
+    /// `needs_write_barrier` must point to a valid mutable `bool` slot for the
+    /// duration of this call.
+    pub unsafe fn try_alloc_with_type_no_collect_with_placement(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe { *needs_write_barrier = true };
         let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
             return GcRef(0);
         };
@@ -1024,6 +1028,7 @@ impl MiniMarkGC {
         let obj = GcRef((ptr as usize) + GcHeader::SIZE);
         self.register_weakref_if_needed(type_id, obj.0);
         self.register_destructor_if_needed(type_id, obj.0);
+        unsafe { *needs_write_barrier = false };
         obj
     }
 
@@ -1185,12 +1190,6 @@ impl MiniMarkGC {
             );
         }
         self.minor_collections += 1;
-        // The previous generation's external (off-heap) bytes have been freed by
-        // the dead young objects' destructors during this cycle; restart the
-        // since-last-minor pressure budget, mirroring nursery.reset() zeroing
-        // struct fill.
-        self.pressure_since_minor = 0;
-
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
         // copy_nursery_object mutates oldgen/nursery.
@@ -1604,15 +1603,6 @@ impl MiniMarkGC {
                 // Surviving: track the promoted copy for the major cycle.
                 let new_obj = unsafe { GcHeader::forwarding_address(hdr_ptr) };
                 self.old_objects_with_destructors.push(new_obj);
-                // The payload is now in old-gen with a valid value; fold its
-                // off-heap footprint into the major threshold so the dead
-                // promoted bigints' limb memory is reclaimed by a major.
-                let tid = unsafe { (*header_of(new_obj)).type_id() };
-                if let Some(external_size) = self.types.get(tid).external_size {
-                    self.oldgen_external_bytes = self
-                        .oldgen_external_bytes
-                        .saturating_add(unsafe { external_size(new_obj) });
-                }
             }
         }
     }
@@ -1962,7 +1952,7 @@ impl MiniMarkGC {
     /// aggregates promoted objects and large/raw objects allocated straight
     /// into the old generation.
     fn get_total_memory_used(&self) -> usize {
-        self.oldgen.total_bytes() + self.oldgen_external_bytes
+        self.oldgen.total_bytes()
     }
 
     /// incminimark.py:1288-1290 `threshold_reached`. True once the old-gen
@@ -2426,12 +2416,6 @@ impl MiniMarkGC {
         if !self.old_objects_with_destructors.is_empty() {
             self.deal_with_old_objects_with_destructors();
         }
-        // Reset the live off-heap footprint exactly from the survivors (the
-        // dying objects' destructors just ran, freeing their limb Vecs), so the
-        // promotion-time running total cannot drift and the next-major threshold
-        // later taken from get_total_memory_used reflects the post-sweep truth.
-        self.recompute_oldgen_external_bytes();
-
         // incminimark.py:2512-2514. ArenaCollection's prepare moves active
         // pages to old_* lists, and OldGen swaps old_rawmalloced_objects into
         // raw_malloc_might_sweep. Promotions between sweep steps therefore
@@ -2743,22 +2727,6 @@ impl MiniMarkGC {
             }
         }
         self.old_objects_with_destructors = new_objects;
-    }
-
-    /// Recompute `oldgen_external_bytes` exactly from the surviving
-    /// destructor-bearing old-gen objects. Called at the end of a major cycle
-    /// so the running promotion-time increment cannot drift (an object may
-    /// reach old-gen without passing through the promotion increment, e.g. a
-    /// large object allocated straight into old-gen).
-    fn recompute_oldgen_external_bytes(&mut self) {
-        let mut total = 0usize;
-        for &addr in &self.old_objects_with_destructors {
-            let tid = unsafe { (*header_of(addr)).type_id() };
-            if let Some(external_size) = self.types.get(tid).external_size {
-                total = total.saturating_add(unsafe { external_size(addr) });
-            }
-        }
-        self.oldgen_external_bytes = total;
     }
 
     /// Whether an incremental marking cycle is currently in progress.
@@ -3555,41 +3523,6 @@ impl GcAllocator for MiniMarkGC {
         unsafe { self.alloc_with_type_rooted(type_id, size, root, needs_write_barrier) }
     }
 
-    /// Charge `bytes` of off-heap pressure and force a minor when the combined
-    /// nursery footprint (struct fill + charged external bytes) reaches the
-    /// nursery size. Called from the bignum collecting-alloc site BEFORE the
-    /// struct is carved and BEFORE the fresh value is written into the nursery,
-    /// while the operand bignums are already boxed and gcmap-rooted at the
-    /// residual call and the fresh value lives only on the Rust stack — so the
-    /// forced minor holds no unrooted nursery pointer, the same invariant
-    /// `alloc_with_type` relies on for its own nursery-full `do_collect_nursery`.
-    fn charge_memory_pressure(&mut self, bytes: usize) {
-        self.pressure_since_minor = self.pressure_since_minor.saturating_add(bytes);
-        if self.nursery.used() + self.pressure_since_minor >= self.nursery.size() {
-            self.do_collect_nursery();
-        }
-    }
-
-    /// Add an old-gen object's off-heap `bytes` to the running
-    /// `oldgen_external_bytes`, so a bignum allocated straight into old-gen via
-    /// a stable or fallback allocation enters `get_total_memory_used` (and thus
-    /// the major threshold) at allocation time, not only at the next major's
-    /// `recompute_oldgen_external_bytes`. Nursery objects are ignored here
-    /// because their external bytes are charged when they promote. No minor is
-    /// forced — old-gen is non-moving — so this is safe on unrooted
-    /// host/interpreter paths. The end-of-major recompute corrects any drift.
-    fn charge_oldgen_external(&mut self, obj_addr: usize, bytes: usize) {
-        // Nursery objects are the common case on this path and never old-gen;
-        // answer them with the O(1) range check instead of the old-gen
-        // membership probe (arena scan + rawmalloc hash lookup).
-        if self.nursery.contains(obj_addr) {
-            return;
-        }
-        if self.oldgen.contains(obj_addr) {
-            self.oldgen_external_bytes = self.oldgen_external_bytes.saturating_add(bytes);
-        }
-    }
-
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
     }
@@ -3600,6 +3533,17 @@ impl GcAllocator for MiniMarkGC {
 
     fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         self.try_alloc_with_type_no_collect(type_id, size)
+    }
+
+    unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_with_type_no_collect_with_placement(type_id, size, needs_write_barrier)
+        }
     }
 
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {
@@ -4303,6 +4247,39 @@ mod tests {
         assert!(needs_write_barrier);
     }
 
+    #[test]
+    fn no_collect_alloc_reports_nursery_and_oldgen_placement() {
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut needs_write_barrier = true;
+
+        let young = unsafe {
+            gc.try_alloc_with_type_no_collect_with_placement(tid, 16, &mut needs_write_barrier)
+        };
+        assert!(gc.is_in_nursery(young.0));
+        assert!(!needs_write_barrier);
+
+        while gc.nursery.remaining() >= GcHeader::SIZE + 16 {
+            let filler = gc.alloc_with_type_no_collect(tid, 16);
+            assert!(gc.is_in_nursery(filler.0));
+        }
+        let spilled = unsafe {
+            gc.try_alloc_with_type_no_collect_with_placement(tid, 16, &mut needs_write_barrier)
+        };
+        assert!(!gc.is_in_nursery(spilled.0));
+        assert!(needs_write_barrier);
+
+        let oversized = unsafe {
+            gc.try_alloc_with_type_no_collect_with_placement(
+                tid,
+                gc.config.large_object_threshold,
+                &mut needs_write_barrier,
+            )
+        };
+        assert!(!gc.is_in_nursery(oversized.0));
+        assert!(needs_write_barrier);
+    }
+
     // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---
     //
     // The counting destructor below deliberately does NOT `drop_in_place`
@@ -4435,25 +4412,6 @@ mod tests {
         gc.alloc_with_type(tid, 16);
         assert!(gc.young_objects_with_destructors.is_empty());
         assert!(gc.old_objects_with_destructors.is_empty());
-    }
-
-    #[test]
-    fn oldgen_external_charge_ignores_nursery_counts_oldgen() {
-        let mut gc = test_gc(4096);
-        let tid = gc.register_type(TypeInfo::simple(16));
-
-        let young = gc.alloc_with_type(tid, 16);
-        assert!(gc.is_in_nursery(young.0));
-        <MiniMarkGC as crate::GcAllocator>::charge_oldgen_external(&mut gc, young.0, 128);
-        assert_eq!(gc.oldgen_external_bytes, 0);
-
-        let old = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
-        assert!(!gc.is_in_nursery(old.0));
-        <MiniMarkGC as crate::GcAllocator>::charge_oldgen_external(&mut gc, old.0, 128);
-        assert_eq!(gc.oldgen_external_bytes, 128);
-
-        <MiniMarkGC as crate::GcAllocator>::charge_oldgen_external(&mut gc, 0, 64);
-        assert_eq!(gc.oldgen_external_bytes, 128);
     }
 
     #[test]

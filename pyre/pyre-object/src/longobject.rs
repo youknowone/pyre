@@ -63,11 +63,11 @@ pub fn bigint_gc_type_id() -> u32 {
 }
 
 /// Allocate `value` as a GC-managed `rbigint` in the nursery (no-collect host
-/// path). For the JIT `*_raw` arithmetic helpers, whose result flows straight
-/// into the boxing `NewWithVtable` in the same trace — that collecting NEW
-/// gcmap-roots the returned pointer, so a young payload is forwarded/promoted
-/// rather than dangling. Falls back to the leaked `malloc_raw` when no GC hook
-/// is installed (bare unit tests, where the result is never traced).
+/// path). The caller must immediately store the result into a traced owner:
+/// `w_long_new` uses a non-collecting old-gen wrapper allocation plus a
+/// creation barrier, while JIT `*_raw` helpers flow straight into the boxing
+/// `NewWithVtable`. Falls back to leaked `malloc_raw` when no GC hook is
+/// installed (bare unit tests, where the result is never traced).
 #[inline]
 pub fn alloc_bigint_nursery(value: BigInt) -> *mut BigInt {
     crate::rbigint::alloc_rbigint_nursery(value)
@@ -90,9 +90,9 @@ pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
 }
 
 /// Allocate `value` as a GC-managed `rbigint` at a stable (old-gen, non-moving)
-/// address, for host/interpreter callers (`w_long_new`) that hold the pointer
-/// on the Rust stack without rooting it. Mirrors `w_float_new`'s
-/// `try_gc_alloc_stable`. Falls back to the leaked `malloc_raw` pre-init.
+/// address for callers that must retain a raw payload pointer across a
+/// potentially collecting operation. Falls back to the leaked `malloc_raw`
+/// pre-init.
 #[inline]
 pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
     crate::rbigint::alloc_rbigint_stable(value)
@@ -122,18 +122,10 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // wrapper's GC path to the same predicate as the payload, not to
     // `gc_interp::enabled()` alone (unlike int/float, whose payload is inline).
     if crate::gc_interp::enabled() || bigint_gc_type_id() != 0 {
-        // Pin the (possibly young) `value` payload across the wrapper malloc:
-        // a minor collection inside `try_gc_alloc_stable` can move a young
-        // bigint, so re-read its address afterwards. The proxy/dictproxy
-        // `gct_fv_gc_malloc` bracket pattern, but for a raw `*mut BigInt`
-        // rooted as a GcRef slot rather than a PyObjectRef.
-        let mut slot = value as *mut u8;
-        let pinned = unsafe { crate::gc_hook::try_gc_add_root(&mut slot as *mut *mut u8) };
+        // `alloc_oldgen_typed` is a direct, non-collecting old-gen allocation.
+        // The young immutable payload therefore stays at the same address
+        // until the wrapper is initialized and remembered below.
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE);
-        let value = slot as *mut BigInt;
-        if pinned {
-            crate::gc_hook::try_gc_remove_root(&mut slot as *mut *mut u8);
-        }
         if !raw.is_null() {
             // Advance the dispatch-loop safepoint counter, as w_int_new /
             // w_float_new do for their stable allocs — otherwise a long-dominated
@@ -162,19 +154,19 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
 }
 
 /// Allocate a new W_LongObject on the heap from a `BigInt` value. The bigint
-/// payload is GC-managed at a stable address (held on the Rust stack by host
-/// callers without rooting), and the wrapper traces it via the registered
-/// `LONG_VALUE_OFFSET` gc-pointer.
+/// payload is a fresh nursery object, matching RPython's ordinary GC
+/// allocation. The wrapper itself is born in non-moving old-gen and its
+/// creation barrier records the old→young `LONG_VALUE_OFFSET` edge.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
-/// delegates through `alloc_bigint_stable -> *mut BigInt`, so tracing into it
+/// delegates through `alloc_bigint_nursery -> *mut BigInt`, so tracing into it
 /// leaks the raw `BigInt` pointee into the return model and unifies against the
 /// `w_int_new` fast path as `PyObject ∪ BigInt`. Residualising the whole box
 /// tail models it by signature — a plain `PyObjectRef` GCREF with no
 /// discriminant to erase — the `w_str_new`/`box_bigint_constant` twin.
 #[majit_macros::dont_look_inside]
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
-    w_long_from_raw(alloc_bigint_stable(value))
+    w_long_from_raw(alloc_bigint_nursery(value))
 }
 
 /// Create a W_LongObject from an i64 value.

@@ -376,14 +376,15 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
+    majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
+        alloc_nursery_typed_with_placement_via_active_runtime,
+    ));
     majit_gc::set_active_alloc_nursery_collecting_typed(Some(
         alloc_nursery_collecting_typed_via_active_runtime,
     ));
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         alloc_nursery_collecting_typed_rooted_via_active_runtime,
     ));
-    majit_gc::set_active_charge_memory_pressure(Some(charge_memory_pressure_via_active_runtime));
-    majit_gc::set_active_charge_oldgen_external(Some(charge_oldgen_external_via_active_runtime));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
@@ -1537,6 +1538,23 @@ fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
+/// Placement-reporting companion of
+/// [`alloc_nursery_typed_via_active_runtime`].
+///
+/// # Safety
+/// `needs_write_barrier` must remain a valid mutable `bool` slot until this
+/// call returns.
+unsafe fn alloc_nursery_typed_with_placement_via_active_runtime(
+    type_id: u32,
+    size: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_cranelift_gc(|gc| unsafe {
+        gc.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
+}
+
 /// `majit_gc::AllocNurseryCollectingTypedFn` installed by `set_gc_allocator`.
 /// Unlike [`alloc_nursery_typed_via_active_runtime`] (no-collect), this runs a
 /// minor when the nursery is full. Only the elidable bigint payload helpers use
@@ -1562,20 +1580,6 @@ unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
         gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
     })
     .unwrap_or(GcRef(0))
-}
-
-/// `majit_gc::ChargeMemoryPressureFn` installed by `set_gc_allocator`. Charges a
-/// freshly-built bignum's off-heap limb-`Vec` bytes so the active GC's minor
-/// cadence reflects true footprint; may force a minor, safe from the same
-/// gcmap-rooted residual call as [`alloc_nursery_collecting_typed_via_active_runtime`].
-fn charge_memory_pressure_via_active_runtime(bytes: usize) {
-    with_cranelift_gc(|gc| gc.charge_memory_pressure(bytes));
-}
-
-/// Charge an old-gen object's off-heap payload against the major threshold on
-/// the active cranelift runtime's GC, without forcing a minor.
-fn charge_oldgen_external_via_active_runtime(obj_addr: usize, bytes: usize) {
-    with_cranelift_gc(|gc| gc.charge_oldgen_external(obj_addr, bytes));
 }
 
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.

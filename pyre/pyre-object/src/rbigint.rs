@@ -459,19 +459,25 @@ pub fn alloc_rbigint_nursery(value: RBigInt) -> *mut RBigInt {
         return prebuilt;
     }
     let tid = rbigint_gc_type_id();
+    let mut needs_write_barrier = true;
     if tid != 0
-        && let Some(raw) = crate::gc_hook::try_gc_alloc(tid, RBIGINT_PAYLOAD_SIZE)
-            .filter(|pointer| !pointer.is_null())
+        && let Some(raw) = crate::gc_hook::try_gc_alloc_with_placement(
+            tid,
+            RBIGINT_PAYLOAD_SIZE,
+            &mut needs_write_barrier,
+        )
+        .filter(|pointer| !pointer.is_null())
     {
         unsafe {
             std::ptr::write(raw as *mut RBigInt, value);
         }
-        // `alloc_nursery_no_collect_typed` spills to old-gen when the
-        // nursery is full.  In that case this fresh payload contains an
-        // old→young `_digits` edge, so preserve the write barrier that
-        // RPython's translated GcStruct field initialisation emits.  The
-        // backend barrier is a no-op when `raw` is still young.
-        crate::gc_hook::try_gc_write_barrier(raw);
+        // framework.py:28-61 `propagate_no_write_barrier_needed` removes
+        // GC-pointer field barriers while initializing a fresh fixed-size
+        // nursery allocation. The no-collect allocator reports the exceptional
+        // old-gen spill, where `_digits` can still be young.
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier(raw);
+        }
         return raw as *mut RBigInt;
     }
     crate::lltype::malloc_raw(value)
