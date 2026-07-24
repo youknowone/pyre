@@ -1698,7 +1698,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool, block_emit_start: usize) {
+    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
         if exits.len() == 1 {
             // `flatten.py:181 assert link.exitcase in (None, False, True)`
@@ -1832,119 +1832,26 @@ impl<'a> GraphFlattener<'a> {
             // that survived metainterp policy but lack a real
             // raising-op-with-trailing-`-live-` pattern.
             //
-            // Vable ops are baked into the graph here: upstream
-            // blocks end at `[raising_op, -live-]` because flowspace's
-            // `guessexception` (flowcontext.py:130-156) closes the block at
-            // each can-raise op.  Pyre's walker does NOT split there, so the
-            // raising op's vable-mirror stores (setfield_vable_i /
-            // setarrayitem_vable_r for the post-op frame state) follow the
-            // `-live-` in the SAME block — the block's last op is a vable
-            // store, never `-live-`.  The graph-tail `last_op_is_live` scan
-            // therefore reports `index == -1` for EVERY pyre canraise block
-            // (verified raise_catch_loop: 50/50 blocks), dropping all
-            // `catch_exception` emission and stranding the exception edge.
-            // On the canonical (lowering_ctx) path detect the raising op off
-            // the EMITTED stream instead: `serialize_op` lowers HLOps
-            // (mod/eq/add/simple_call) and residual calls to
-            // `residual_call_*` and appends a trailing `-live-` exactly when
-            // `insn_needs_trailing_live` (calldescr_canraise), so the same
-            // predicate over the block's emitted insns recognises a real
-            // raising op regardless of the trailing vable stores.  Spurious
-            // canraise blocks (empty joinpoints, vable-only, non-raising
-            // residual_call_r_r/r_v) carry no such insn and keep the
-            // early-return.  The block has at most one raising op (verified
-            // raise_catch_loop), so one `catch_exception` at block end —
-            // after the raising op's vable stores, matching the production
-            // walker's per-PC `emit_catch_exception!` placement — is
-            // correct.  Graph CFG is untouched, so regalloc / gate-off
-            // bytes are unchanged.
-            let block_can_raise = if self.lowering_ctx.is_some() {
-                self.ssarepr.insns[block_emit_start..]
-                    .iter()
-                    .any(insn_needs_trailing_live)
-            } else {
-                block
-                    .borrow()
-                    .operations
-                    .last()
-                    .map_or(false, |op| op.opname == OPNAME_LIVE)
-            };
+            // The walker closes a caught can-raise op's block at the
+            // op's trailing `-live-` (`flowcontext.py:130-156
+            // guessexception` shape); the post-op vable-mirror stores
+            // land in the normal-flow successor, so the graph tail is
+            // structurally `[raising_op, -live-]` and `catch_exception`
+            // lands directly after the `-live-` — the adjacency
+            // `handle_exception_in_frame` (`blackhole.py:396`) and
+            // `derive_after_call_indices_from_sparse` (the
+            // after-residual-call resume anchor) both require.
+            let block_can_raise = block
+                .borrow()
+                .operations
+                .last()
+                .map_or(false, |op| op.opname == OPNAME_LIVE);
             if !self.include_all_exc_links && !block_can_raise {
                 self.make_link(&normal_link, false);
                 return;
             }
-            // RPython flowspace (`flowcontext.py:130-156 guessexception`)
-            // closes a canraise block at the raising op, so its post-call
-            // `-live-` is the block's last insn and `catch_exception` lands
-            // directly after it — the adjacency `handle_exception_in_frame`
-            // (`blackhole.py:396`) and `derive_after_call_indices_from_sparse`
-            // (the after-residual-call resume anchor) both require.  Pyre
-            // does not split there, so the raising op's post-op vable-mirror
-            // stores (`setfield_vable_i` / `setarrayitem_vable_r` for the
-            // post-op frame state) were serialized into THIS block after the
-            // `-live-`.  Hoist `catch_exception` to directly follow that
-            // `-live-` and move the trailing stores after it; `catch_exception`
-            // is a no-op on the normal fall-through (`bhimpl_catch_exception`),
-            // so the stores still execute there, while the exception path now
-            // finds the catch one op past the resume `-live-`.
-            let hoisted_tail: Vec<Insn> = {
-                let raising_rel = self.ssarepr.insns[block_emit_start..]
-                    .iter()
-                    .rposition(insn_needs_trailing_live);
-                match raising_rel {
-                    Some(rel) => {
-                        let live_idx = block_emit_start + rel + 1;
-                        let has_trailing_stores = live_idx + 1 < self.ssarepr.insns.len();
-                        if self.ssarepr.insns.get(live_idx).is_some_and(Insn::is_live)
-                            && has_trailing_stores
-                        {
-                            // Inserting one `catch_exception` before the moved
-                            // stores shifts their positions by one; keep the
-                            // sparse `pc_first_insn_pos` anchors aligned.
-                            for (_pc, pos) in self.ssarepr.pc_first_insn_pos.iter_mut() {
-                                if *pos > live_idx {
-                                    *pos += 1;
-                                }
-                            }
-                            self.ssarepr.insns.split_off(live_idx + 1)
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                    None => Vec::new(),
-                }
-            };
             let catch_label = self.tlabel_for_link(&normal_link);
             self.emitline(Insn::op("catch_exception", vec![catch_label]));
-            // flatten.py:206-220 statically guarantees `catch_exception`
-            // directly follows the raising op's trailing `-live-` (the block is
-            // closed at the canraise op, then the trailing-`-live-` walk-back
-            // places the catch right after it).  Pyre rebuilds that adjacency
-            // via the hoist above rather than by block-splitting, so the
-            // invariant is not structural — enforce it here.  Both
-            // `handle_exception_in_frame` (blackhole.py:396, skip one `-live-`
-            // then expect the catch) and `derive_after_call_indices_from_sparse`
-            // (resume anchor keyed on `insns[catch-1].is_live()`) silently
-            // mis-resume if a vable-mirror store serialized between the two.
-            // Pyre blocks may hold several can-raise ops (the walker does not
-            // block-split like flowspace); only the caught op — the last raising op,
-            // which the hoist above targets — needs this adjacency, so the invariant
-            // enforced here is adjacency, not a per-block can-raise-op count.
-            assert!(
-                !block_can_raise
-                    || self
-                        .ssarepr
-                        .insns
-                        .iter()
-                        .rev()
-                        .nth(1)
-                        .is_some_and(Insn::is_live),
-                "catch_exception must directly follow the raising op's -live- \
-                 (block_emit_start={block_emit_start})",
-            );
-            for insn in hoisted_tail {
-                self.emitline(insn);
-            }
             self.make_link(&normal_link, false);
             let normal_label = self.label_for_link(&normal_link);
             self.emitline(normal_label);
@@ -2330,12 +2237,6 @@ impl<'a> GraphFlattener<'a> {
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
-        // First emitted-insn index of this block's serialized ops, so
-        // `insert_exits` can detect a real raising op off the lowered
-        // stream (a `residual_call_*` whose calldescr can raise) rather
-        // than the graph tail, which pyre's vable-mirror stores push past
-        // the `-live-`.  See the raising-op detection in `insert_exits`.
-        let block_emit_start = self.ssarepr.insns.len();
         for op in &operations {
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
@@ -2356,7 +2257,7 @@ impl<'a> GraphFlattener<'a> {
             }
             self.serialize_op(op);
         }
-        self.insert_exits(&block, handling_ovf, block_emit_start);
+        self.insert_exits(&block, handling_ovf);
     }
 
     fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
@@ -2628,6 +2529,99 @@ fn insn_needs_trailing_live(insn: &Insn) -> bool {
         return residual_call_can_raise(args);
     }
     false
+}
+
+/// `flowcontext.py:130-156 guessexception` attaches an exception edge
+/// only to an operation that can raise; the walker's per-PC catch-attach
+/// site consults this classifier on the graph `SpaceOperation`s it just
+/// recorded to decide whether the opcode closes its block with an
+/// exception edge (and the structural `[op, -live-]` tail).
+///
+/// * `residual_call_*` — `call.py:353-355 calldescr_canraise`, read off
+///   the recorded `CallDescrStub` descr operand (the graph-side twin of
+///   [`insn_needs_trailing_live`]'s emitted-stream rule).
+/// * `inline_call_*` — always (`jtransform.py:481 handle_regular_call`).
+/// * pre-rtype HLOps — the `calldescr_canraise` of the residual call the
+///   lowering dispatcher produces for the opname; the arms below mirror
+///   the per-family `CallFlavor` each `lower_*_hlop_to_insn` records
+///   (`MayForce`/`Plain` → can raise, `PlainCannotRaise*` → cannot).
+///   `newlist`/`newtuple` classify as their post-
+///   `lower_frontend_collection_ops` `*_from_array` residual.
+/// * everything else (vable mirrors, `ptr_*` tests, copies, markers,
+///   elidable HLOps) — cannot raise.
+pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
+    let opname = op.opname.as_str();
+    if opname.starts_with("residual_call") {
+        return op.args.iter().any(|arg| match arg {
+            super::flow::SpaceOperationArg::Descr(descr) => descr
+                .0
+                .as_any()
+                .and_then(|any| any.downcast_ref::<CallDescrStub>())
+                .is_some_and(|stub| stub.effect_info.check_can_raise(false)),
+            _ => false,
+        });
+    }
+    if opname.starts_with("inline_call") {
+        return true;
+    }
+    // BINARY_OP / COMPARE_OP families (both lower with `MayForce`).
+    if binary_op_tag_for_opname(opname).is_some() || compare_op_tag_for_opname(opname).is_some() {
+        return true;
+    }
+    // `load_method_self`, `store_deref_value`, `unbound_local_error`
+    // lower with `PlainCannotRaise` and are intentionally absent.
+    matches!(
+        opname,
+        "bool"
+            | "setitem"
+            | "store_slice"
+            | "load_name"
+            | "store_name"
+            | "store_global"
+            | "simple_call"
+            | "getattr"
+            | "load_special"
+            | "load_special_self"
+            | "load_fast_check"
+            | "store_attr"
+            | "binary_slice"
+            | "newslice"
+            | "format_simple"
+            | "format_with_spec"
+            | "convert_value"
+            | "load_common_constant"
+            | "load_deref_value"
+            | "make_cell_value"
+            | "make_function_value"
+            | "set_function_attribute"
+            | "neg"
+            | "invert"
+            | "pos"
+            | "list_to_tuple"
+            | "not_"
+            | "import_name"
+            | "import_from"
+            | "load_from_dict_or_globals"
+            | "load_super_attr"
+            | "super_attr_unwrap"
+            | "delete_subscr"
+            | "delete_attr"
+            | "list_extend"
+            | "set_add"
+            | "set_update"
+            | "dict_update"
+            | "map_add"
+            | "dict_merge"
+            | "call_kw"
+            | "call_function_ex"
+            | "newlist"
+            | "newtuple"
+            | "newlist_from_array"
+            | "newtuple_from_array"
+            | "build_map_from_array"
+            | "build_set_from_array"
+            | "build_string_from_array"
+    )
 }
 
 /// `call.py:353-355 calldescr_canraise` — `calldescr.get_extra_info()

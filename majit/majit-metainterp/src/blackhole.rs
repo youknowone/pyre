@@ -1151,11 +1151,16 @@ impl BlackholeInterpreter {
     /// Locate the `catch_exception` op that belongs to the just-executed
     /// opcode whose post-call guard resumed at `resume_live_pos` (the next
     /// opcode's `-live-`).  Scans op boundaries (the jitcode's `startpoints`)
-    /// strictly before `resume_live_pos`, newest first, and stops at the
-    /// first `-live-` — that is the call's own post-call `-live-`, so the only
-    /// `catch_exception` that can match sits inside this opcode's expansion.
-    /// Returns `None` (propagate) when the opcode raised outside any
-    /// try-block (no `catch_exception` was emitted for it).
+    /// strictly before `resume_live_pos`, newest first.  The caught can-raise
+    /// op's expansion is `[op, -live-, catch_exception, -live-(block entry),
+    /// vable stores…]` (the guessexception split closes the block at the op's
+    /// trailing `-live-`, so the successor block opens with its own `-live-`
+    /// before the moved stores).  The scan therefore hops over exactly one
+    /// `-live-` — the successor's block-entry marker — and accepts the
+    /// `catch_exception` only when it sits immediately before it; any other
+    /// op there is the raising op itself (no catch emitted), and a second
+    /// `-live-` means the raising op sits outside any in-frame try.
+    /// Returns `None` (propagate) in those cases.
     fn find_catch_before_resume_live(&self, resume_live_pos: usize) -> Option<usize> {
         let code = &self.jitcode.code;
         let startpoints = self.jitcode.startpoints.as_ref()?;
@@ -1165,14 +1170,23 @@ impl BlackholeInterpreter {
             .filter(|&q| q < resume_live_pos)
             .collect();
         points.sort_unstable_by(|a, b| b.cmp(a));
+        let mut crossed_block_entry_live = false;
         for q in points {
             let op = code[q];
             if op == self.op_catch_exception {
                 return Some(q);
             }
             if op == self.op_live {
-                // The call's own post-call `-live-`: bound the scan here so a
-                // preceding opcode's catch can never be mis-selected.
+                if crossed_block_entry_live {
+                    // Second `-live-`: the raising op has no catch.
+                    return None;
+                }
+                crossed_block_entry_live = true;
+                continue;
+            }
+            if crossed_block_entry_live {
+                // The op immediately before the block-entry `-live-` is not a
+                // `catch_exception` — it is the raising op itself (uncaught).
                 return None;
             }
         }

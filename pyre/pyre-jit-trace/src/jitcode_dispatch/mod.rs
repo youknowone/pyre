@@ -2638,10 +2638,15 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
 /// for the walker.  An after-residual-call exception guard resumes at the
 /// no-exception fallthrough `-live-` (the next opcode after the call); the
 /// `catch_exception/L` that belongs to the just-executed raising op sits BEHIND
-/// that resume `-live-` (between the call's own post-call `-live-` and the next
-/// op), so there is no forward catch to route to.  Scan op boundaries backward
-/// from `resume_live_pos`, newest first, bounded by the first `live/` (the
-/// call's own post-call `-live-`), so only THIS opcode's catch can match.
+/// that resume `-live-`.  The caught can-raise op's expansion is `[op, -live-,
+/// catch_exception, -live-(block entry), vable stores…]` (the guessexception
+/// split closes the block at the op's trailing `-live-`, so the successor block
+/// opens with its own `-live-` before the moved stores).  Scan op boundaries
+/// backward from `resume_live_pos`, newest first, hopping over exactly one
+/// `-live-` (the successor's block-entry marker); accept the `catch_exception`
+/// only when it sits immediately before it — any other op there is the raising
+/// op itself (uncaught), and a second `-live-` means the raising op sits
+/// outside any in-frame try.
 /// Returns the handler target (2-byte LE label after `catch_exception/L`), or
 /// `None` when the raising op sits outside any in-frame try (propagate).
 pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
@@ -2650,6 +2655,7 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
         .filter(|&pc| pc < resume_live_pos)
         .collect();
     pcs.sort_unstable_by(|a, b| b.cmp(a));
+    let mut crossed_block_entry_live = false;
     for pc in pcs {
         let op = decode_op_at(code, pc)?;
         if op.key == "catch_exception/L" {
@@ -2658,8 +2664,16 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
             return Some(lo | (hi << 8));
         }
         if op.key == "live/" {
-            // The call's own post-call `-live-`: bound the scan so a preceding
-            // opcode's catch can never be mis-selected.
+            if crossed_block_entry_live {
+                // Second `-live-`: the raising op has no catch.
+                return None;
+            }
+            crossed_block_entry_live = true;
+            continue;
+        }
+        if crossed_block_entry_live {
+            // The op immediately before the block-entry `-live-` is not a
+            // `catch_exception` — it is the raising op itself (uncaught).
             return None;
         }
     }

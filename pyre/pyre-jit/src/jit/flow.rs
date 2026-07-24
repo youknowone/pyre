@@ -982,9 +982,17 @@ impl Block {
     }
 
     /// `model.py:219-222` `Block.raising_op`.
+    ///
+    /// A caught can-raise operation carries a structural trailing
+    /// `-live-` marker (`jtransform.py:311-313`), so the raising op is
+    /// the last NON-`-live-` operation — the same back-scan
+    /// `flatten.py:206-217` performs.
     pub fn raising_op(&self) -> Option<&SpaceOperation> {
         if self.canraise() {
-            self.operations.last()
+            self.operations
+                .iter()
+                .rev()
+                .find(|op| op.opname != super::flatten::OPNAME_LIVE)
         } else {
             None
         }

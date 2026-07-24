@@ -1907,6 +1907,20 @@ fn record_graph_op(
 ) -> super::flow::SpaceOperation {
     let op = super::flow::SpaceOperation::new(opname, args, result, offset);
     super::flow::push_op(block, op.clone());
+    // `jtransform.py:311-313` / `handle_residual_call`: an operation
+    // whose lowering can raise is immediately followed by a `-live-`
+    // SpaceOperation in the graph, so `flatten.py:206-217` recognises an
+    // actually-raising block by its structural `[raising_op, -live-]`
+    // tail.  Centralized at the recording funnel: every can-raise op
+    // (residual_call with a can-raise calldescr, pre-rtype HLOp whose
+    // lowering flavor can raise) gets the marker, matching the graph
+    // shape jtransform produces after rewriting.
+    if super::flatten::graph_op_can_raise(&op) {
+        super::flow::push_op(
+            block,
+            super::flow::SpaceOperation::new(super::flatten::OPNAME_LIVE, Vec::new(), None, offset),
+        );
+    }
     op
 }
 
@@ -2062,12 +2076,17 @@ fn record_residual_call_graph_op(
     // `jitcode_dispatch.rs`); mirrors the tag the dedicated walker-emit
     // builders (`flatten.rs build_*_insn`) attach to the same helpers.
     effect_info.pyre_helper = pyre_helper;
-    let can_raise = effect_info.check_can_raise(false);
     op_args.push(
         super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
     );
 
-    let result_var = match reskind.to_kind() {
+    // `jtransform.py:311-313` / `handle_residual_call`: a residual_call
+    // whose calldescr can raise is immediately followed by a trailing
+    // `-live-` so the liveness pass records the registers alive at the
+    // implicit GUARD_NO_EXCEPTION.  `record_graph_op` appends the marker
+    // via `graph_op_can_raise` (which reads the calldescr just interned
+    // above).
+    match reskind.to_kind() {
         Some(result_kind) => {
             let result = graph.fresh_variable(result_kind);
             record_graph_op(block, opname, op_args, Some(result.into()), offset);
@@ -2077,16 +2096,7 @@ fn record_residual_call_graph_op(
             record_graph_op(block, opname, op_args, None, offset);
             None
         }
-    };
-    // `jtransform.py:311-313` / `handle_residual_call`: a residual_call
-    // whose calldescr can raise is immediately followed by a trailing
-    // `-live-` so the liveness pass records the registers alive at the
-    // implicit GUARD_NO_EXCEPTION.  `flatten.py:206-217` recognises an
-    // actually-raising block by scanning this trailing `-live-`.
-    if can_raise {
-        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
     }
-    result_var
 }
 
 /// Emit a void-result `SpaceOperation` into `block` and return it.
@@ -12430,19 +12440,134 @@ impl CodeWriter {
                         // stray catch link to a block whose exits the
                         // just-emitted opcode already closed.
                         let block_already_closed = !current_block.block().borrow().exits.is_empty();
-                        if !block_already_closed {
-                            // `flatten.py:206-217` + `jtransform.py:311-313`:
-                            // a `catch_exception` must be immediately
-                            // preceded by a `-live-` so the blackhole's
-                            // after-residual-call resume
-                            // (`pyjitpl.py:2610-2624 capture_resumedata`,
-                            // `resumepc=-1`) lands on a marker it can
-                            // decode (`blackhole.py:396-410
-                            // handle_exception_in_frame` skips one
-                            // `-live-` then reads the catch).  A repeated
-                            // `-live-` here folds in `remove_repeated_live`.
-                            emit_live_placeholder!();
+                        // `guessexception` closes the block AT the caught
+                        // can-raise operation, so the block tail is
+                        // structurally `[raising_op, -live-]` and any
+                        // later operation belongs to the normal-flow
+                        // successor.  Find the last can-raise op this
+                        // opcode recorded (`record_graph_op` appended its
+                        // `-live-`); a covered PC whose opcode recorded no
+                        // can-raise op attaches no exception edge — same
+                        // set of catch edges the flatten early-return used
+                        // to drop post-hoc.
+                        let split_at = if block_already_closed {
+                            None
+                        } else {
+                            current_block
+                                .block()
+                                .borrow()
+                                .operations
+                                .iter()
+                                .rposition(|op| {
+                                    op.offset == py_pc as i64
+                                        && super::flatten::graph_op_can_raise(op)
+                                })
+                                .map(|raising_pos| raising_pos + 2)
+                        };
+                        if let Some(split_at) = split_at {
+                            debug_assert!(
+                                current_block
+                                    .block()
+                                    .borrow()
+                                    .operations
+                                    .get(split_at - 1)
+                                    .is_some_and(|op| op.opname == super::flatten::OPNAME_LIVE),
+                                "can-raise graph op must carry its trailing -live- \
+                                 (record_graph_op invariant) at py_pc {py_pc}",
+                            );
+                            // Move the opcode's post-raise operations (vable
+                            // mirror stores of the pushed result, vsd syncs)
+                            // into the normal-flow successor — the
+                            // `unsimplify.py:44 split_block` shape.  The
+                            // walker keeps emitting into the successor, so
+                            // subsequent PCs land there.
+                            let moved: Vec<super::flow::SpaceOperation> = current_block
+                                .block()
+                                .borrow_mut()
+                                .operations
+                                .split_off(split_at);
                             emit_catch_exception!(catch_label);
+                            // Successor continuation: identity split — same
+                            // Variables, no freshening (the UNPACK_SEQUENCE /
+                            // FOR_ITER split precedent).  The block's own
+                            // framestate stays at `py_pc` (mid-opcode
+                            // continuation, like those precedents) so the
+                            // next PC's boundary machinery — branch-target
+                            // force, joinpoint merge — still observes a
+                            // block that did not start there.  The walker's
+                            // `current_state` keeps its already-advanced
+                            // `next_offset = py_pc + 1`.
+                            let mut next_state = current_state.clone();
+                            next_state.next_offset = py_pc;
+                            next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                            let next_block = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(next_state.clone()),
+                            );
+                            all_walker_blocks.push(next_block.clone());
+                            // `unsimplify.py:59-76 split_block` varmap rules:
+                            //   * a Variable PRODUCED by a moved op
+                            //     (`vars_produced_in_new_block`) is defined
+                            //     inside the successor — it must NOT be
+                            //     passed on the link even when the
+                            //     FrameState already lists it (e.g. a
+                            //     follow-up op's result the dispatch pushed
+                            //     onto the symbolic stack);
+                            //   * a Variable a moved op CONSUMES that the
+                            //     FrameState no longer lists (a receiver
+                            //     popped before the raising op) must be
+                            //     threaded through the link so the
+                            //     successor's inputargs cover every use.
+                            let moved_results: Vec<u32> = moved
+                                .iter()
+                                .filter_map(|op| match &op.result {
+                                    Some(super::flow::FlowValue::Variable(r)) => Some(r.id.0),
+                                    _ => None,
+                                })
+                                .collect();
+                            let mut inputargs: Vec<super::flow::FlowValue> = next_state
+                                .getvariables()
+                                .into_iter()
+                                .filter(|value| {
+                                    value
+                                        .as_variable()
+                                        .is_none_or(|v| !moved_results.contains(&v.id.0))
+                                })
+                                .collect();
+                            // Identity split: the link passes each surviving
+                            // Variable through unchanged, so `link_args`
+                            // mirrors `inputargs`.
+                            let mut link_args = inputargs.clone();
+                            {
+                                let mut known: Vec<u32> = inputargs
+                                    .iter()
+                                    .filter_map(super::flow::FlowValue::as_variable)
+                                    .map(|v| v.id.0)
+                                    .collect();
+                                known.extend(moved_results.iter().copied());
+                                for op in &moved {
+                                    for arg in &op.args {
+                                        for v in arg.variables() {
+                                            if !known.contains(&v.id.0) {
+                                                known.push(v.id.0);
+                                                inputargs.push(v.into());
+                                                link_args.push(v.into());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            next_block.block().borrow_mut().inputargs = inputargs;
+                            append_exit(
+                                &current_block.block(),
+                                super::flow::Link::new(link_args, Some(next_block.block()), None)
+                                    .into_ref(),
+                            );
+                            restore_canraise_exit_order(&current_block.block());
+                            for op in moved {
+                                super::flow::push_op(&next_block.block(), op);
+                            }
+                            current_block = next_block;
                         }
                     }
                 }
@@ -14655,6 +14780,22 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Last recorded non-`-live-` op.  A can-raise HLOp/residual is
+    /// followed by its structural `-live-` marker (`record_graph_op` via
+    /// `graph_op_can_raise`), so shape assertions read past it.
+    fn last_recorded_op(
+        block: &super::super::flow::BlockRef,
+    ) -> super::super::flow::SpaceOperation {
+        block
+            .borrow()
+            .operations
+            .iter()
+            .rev()
+            .find(|op| op.opname != super::super::flatten::OPNAME_LIVE)
+            .cloned()
+            .expect("a non--live- op should be recorded")
+    }
     use super::{
         FrameState, SpamBlockRef, attach_catch_exception_edge, entry_arg_slots, entry_frame_state,
         entry_inputargs, mergeblock, new_shadow_graph,
@@ -14897,8 +15038,7 @@ mod tests {
 
         let result = emit_frontend_neg(&mut graph, &start, operand.into(), 33);
 
-        let block = start.borrow();
-        let op = block.operations.last().expect("neg op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "neg");
         assert_eq!(op.offset, 33);
         assert_eq!(op.args, vec![operand.into()]);
@@ -14922,11 +15062,7 @@ mod tests {
             46,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newslice op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 46);
         assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
@@ -14949,11 +15085,7 @@ mod tests {
             44,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newlist op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newlist");
         assert_eq!(op.offset, 44);
         assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
@@ -14976,11 +15108,7 @@ mod tests {
             45,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("newtuple op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newtuple");
         assert_eq!(op.offset, 45);
         assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
@@ -15001,9 +15129,20 @@ mod tests {
         lower_frontend_collection_ops(&graph);
 
         let block = start.borrow();
-        let ops = &block.operations;
-        // new_array_clear(Const(2)) + 2× setarrayitem_gc_r + newlist_from_array.
+        // new_array_clear(Const(2)) + 2× setarrayitem_gc_r + newlist_from_array;
+        // the can-raise `newlist` HLOp's structural trailing `-live-`
+        // survives the lowering after the `*_from_array` residual.
+        let ops: Vec<_> = block
+            .operations
+            .iter()
+            .filter(|op| op.opname != super::super::flatten::OPNAME_LIVE)
+            .cloned()
+            .collect();
         assert_eq!(ops.len(), 4);
+        assert_eq!(
+            block.operations.last().map(|op| op.opname.as_str()),
+            Some(super::super::flatten::OPNAME_LIVE),
+        );
         assert_eq!(ops[0].opname, "new_array_clear");
         assert_eq!(
             ops[0].args,
@@ -15042,8 +15181,14 @@ mod tests {
         lower_frontend_collection_ops(&graph);
 
         let block = start.borrow();
-        let ops = &block.operations;
-        // new_array_clear(Const(1)) + 1× setarrayitem_gc_r + newtuple_from_array.
+        // new_array_clear(Const(1)) + 1× setarrayitem_gc_r + newtuple_from_array,
+        // followed by the can-raise HLOp's structural trailing `-live-`.
+        let ops: Vec<_> = block
+            .operations
+            .iter()
+            .filter(|op| op.opname != super::super::flatten::OPNAME_LIVE)
+            .cloned()
+            .collect();
         assert_eq!(ops.len(), 3);
         assert_eq!(ops[0].opname, "new_array_clear");
         assert_eq!(ops[1].opname, "setarrayitem_gc_r");
@@ -15069,11 +15214,7 @@ mod tests {
             47,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("BUILD_SLICE argc=2 should record newslice");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 47);
         assert_eq!(op.args[0], w_start.into());
@@ -15109,11 +15250,7 @@ mod tests {
             48,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("BUILD_SLICE argc=3 should record newslice");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "newslice");
         assert_eq!(op.offset, 48);
         assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
@@ -15138,11 +15275,7 @@ mod tests {
             55,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("setitem op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "setitem");
         assert_eq!(op.offset, 55);
         assert_eq!(op.args, vec![obj.into(), key.into(), value.into()]);
@@ -15201,11 +15334,7 @@ mod tests {
             57,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("getattr op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "getattr");
         assert_eq!(op.offset, 57);
         assert_eq!(
@@ -15236,11 +15365,7 @@ mod tests {
             66,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("binary op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "inplace_add");
         assert_eq!(op.offset, 66);
         assert_eq!(op.args, vec![lhs.into(), rhs.into()]);
@@ -15263,11 +15388,7 @@ mod tests {
             77,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("compare op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "le");
         assert_eq!(op.offset, 77);
         assert_eq!(op.args, vec![lhs.into(), rhs.into()]);
@@ -15283,8 +15404,7 @@ mod tests {
         let result = emit_frontend_bool(&mut graph, &start, operand.into(), 78);
 
         assert_eq!(result.kind, Some(Kind::Int));
-        let block = start.borrow();
-        let op = block.operations.last().expect("bool op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "bool");
         assert_eq!(op.offset, 78);
         assert_eq!(op.args, vec![operand.into()]);
@@ -15394,11 +15514,7 @@ mod tests {
             88,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("simple_call op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "simple_call");
         assert_eq!(op.offset, 88);
         assert_eq!(
