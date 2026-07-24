@@ -6064,6 +6064,70 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
     ))
 }
 
+/// Walker-native unbox of a fits-int `W_LongObject` operand into a raw i64 —
+/// the long analogue of [`walker_unbox_int`], mirroring
+/// [`crate::state::trace_unbox_long_with_resume`] but emitting the walker
+/// snapshot guards.  `is_plain_int1` accepts a `W_LongObject` whose BigInt
+/// fits a machine word (`type(w_obj) is W_LongObject and w_obj._fits_int()`,
+/// listobject.py), and `plain_int_w` unwraps it via `_int_w`:
+///
+/// 1. `GUARD_CLASS(obj, LONG_TYPE)` when the class is not already known.
+/// 2. `residual_call(jit_w_long_fits_int, obj)` + `GUARD_TRUE` — a later
+///    execution may see the BigInt grown out of i64 range, so re-probe and
+///    deopt to the residual on a non-fitting arrival.
+/// 3. `residual_call(jit_w_long_toint, obj)` — `rbigint.toint()`, statically
+///    non-raising after the fits guard.
+///
+/// A `W_LongObject` is a distinct 8-aligned heap struct and is never a tagged
+/// immediate, so the `GUARD_CLASS` deref needs no lowbit pre-test.
+fn walker_unbox_long<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    long_type_addr: i64,
+) -> Result<OpRef, DispatchError> {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(long_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, long_type_addr);
+    }
+    let obj_concrete = walker_concrete_ref_object(ctx, obj);
+    let fits_fn = pyre_object::longobject::jit_w_long_fits_int as *const ();
+    let fits = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        fits_fn,
+        &[obj],
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::cannot_raise_effect_info(),
+    );
+    if let Some(o) = obj_concrete {
+        let fits_concrete = pyre_object::longobject::jit_w_long_fits_int(o as usize as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
+    }
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[fits])?;
+    let toint_fn = pyre_object::longobject::jit_w_long_toint as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        toint_fn,
+        &[obj],
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::cannot_raise_effect_info(),
+    );
+    if let Some(o) = obj_concrete {
+        let v = pyre_object::longobject::jit_w_long_toint(o as usize as i64);
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(v));
+    }
+    Ok(raw)
+}
+
 /// Walker-native unbox of a boxed `W_FloatObject` operand: the float
 /// analogue of [`walker_unbox_int`].  `GUARD_CLASS` (with the walker
 /// snapshot) when the operand's class is not yet known, then the ctx-only
