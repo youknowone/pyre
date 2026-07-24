@@ -725,8 +725,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // elidable effect already lowers the callsite to CALL_PURE and never
     // looks inside the body.  Harvest the elidable set from the same
     // vector so `stamp_return_token` can stamp the matching FUNC.RESULT
-    // token. `PYRE_ELIDABLE_RESIDUALIZE=0` is only a diagnostic kill switch
-    // for the upstream-default opaque-elidable policy.
+    // token. `JitPolicy._reject_function()` makes this unconditional.
     let elidable_residual: std::collections::HashSet<String> = harvested
         .iter()
         .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
@@ -861,7 +860,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (`lib.rs`) keeps its `None`→`Void` default when the routing is off
         // — off-path byte-identity holds.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
-            || (elidable_residualize_enabled() && elidable_residual.contains(&fn_path))
+            || elidable_residual.contains(&fn_path)
             || (dyn_indirect_enabled() && trait_root.is_some() && self_ty_root.is_none());
         let return_type = if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc)
@@ -13488,20 +13487,6 @@ pub(crate) fn dyn_indirect_enabled() -> bool {
     matches!(
         std::env::var("PYRE_DYN_INDIRECT").as_deref(),
         Ok("1") | Ok("true")
-    )
-}
-
-/// Residualize a `#[majit_macros::elidable]` graph — stamp its return-kind
-/// FUNC.RESULT token and prefill a signature-only stub instead of lifting
-/// the body — mirroring `JitPolicy._reject_function()` in
-/// `rpython/jit/codewriter/policy.py`: explicitly elidable functions are
-/// always opaque, while the callsite lowers to `CALL_PURE` through the
-/// elidable effect.  This is the upstream default.  The environment variable
-/// is only a diagnostic kill switch for comparing the pre-parity behaviour.
-pub(crate) fn elidable_residualize_enabled() -> bool {
-    !matches!(
-        std::env::var("PYRE_ELIDABLE_RESIDUALIZE").as_deref(),
-        Ok("0") | Ok("false")
     )
 }
 

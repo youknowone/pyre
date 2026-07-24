@@ -11,8 +11,8 @@
 use crate::baseobjspace::{float_w, int_w, uint_w};
 use crate::objspace::descroperation::{CompareOp, compare};
 use crate::{PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store};
-use malachite_bigint::BigInt;
 use pyre_object::interp_array as arr;
+use pyre_object::rbigint::RBigInt as BigInt;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 

@@ -10538,7 +10538,7 @@ pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
         Ok(index) => Ok(index),
         Err(error) if error.kind == PyErrorKind::OverflowError => {
             let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
-            if big.sign() == malachite_bigint::Sign::Minus {
+            if big.sign() == RBigIntSign::Minus {
                 Ok(i64::MIN)
             } else {
                 Err(error)

@@ -997,6 +997,36 @@ impl MiniMarkGC {
         obj
     }
 
+    /// Fallible host-side counterpart of `alloc_with_type_no_collect`.
+    ///
+    /// The ordinary nursery bump remains allocation-free and therefore cannot
+    /// fail. Oversized objects and nursery-full spill use rawmalloc and return
+    /// NULL on failure, matching RPython's `MemoryError` path.
+    pub fn try_alloc_with_type_no_collect(&mut self, type_id: u32, payload_size: usize) -> GcRef {
+        let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+            return GcRef(0);
+        };
+
+        if total_size > self.config.large_object_threshold {
+            return self
+                .try_alloc_in_oldgen(type_id, total_size)
+                .unwrap_or(GcRef(0));
+        }
+
+        let ptr = self.nursery.alloc(total_size);
+        if ptr.is_null() {
+            return self
+                .try_alloc_in_oldgen(type_id, total_size)
+                .unwrap_or(GcRef(0));
+        }
+
+        Self::init_nursery_object(ptr, type_id);
+        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
+        self.register_weakref_if_needed(type_id, obj.0);
+        self.register_destructor_if_needed(type_id, obj.0);
+        obj
+    }
+
     /// incminimark.py:690-692 parity. When a freshly-allocated object
     /// is a WEAKREF (T_IS_WEAKREF in its TYPE_INFO), push it onto the
     /// young-weakref list so the next minor collection can invalidate
@@ -1080,6 +1110,17 @@ impl MiniMarkGC {
     /// Allocate directly in old gen (for large objects or post-collection fallback).
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
+        self.finish_alloc_in_oldgen(type_id, total_size, ptr)
+    }
+
+    /// Fallible old-gen allocation used by host allocation hooks. Upstream
+    /// rawmalloc failure returns NULL so the caller can raise `MemoryError`.
+    fn try_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> Option<GcRef> {
+        let ptr = self.oldgen.try_alloc(total_size)?;
+        Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr))
+    }
+
+    fn finish_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize, ptr: *mut u8) -> GcRef {
         // `do_malloc_fixedsize_clear` and the resume.py direct reader both
         // require a zero-filled payload.  In particular, resume
         // materialization writes only fields present in resumedata; omitted
@@ -3555,6 +3596,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(type_id, size)
+    }
+
+    fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.try_alloc_with_type_no_collect(type_id, size)
     }
 
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {

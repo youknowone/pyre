@@ -64,6 +64,12 @@ impl OldGen {
         self.alloc_with_card_header(total_size, 0)
     }
 
+    /// Fallible rawmalloc allocation for host-side helpers whose RPython
+    /// callers translate a null result into `MemoryError`.
+    pub fn try_alloc(&mut self, total_size: usize) -> Option<*mut u8> {
+        self.try_alloc_with_card_header(total_size, 0)
+    }
+
     /// incminimark.py:1012-1080: card headers occur in the rawmalloc branch,
     /// are prepended to the allocation, and only the card bytes are cleared.
     pub fn alloc_with_card_header(
@@ -71,15 +77,38 @@ impl OldGen {
         total_size: usize,
         card_header_bytes: usize,
     ) -> *mut u8 {
-        let obj_size = round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE));
-        let alloc_size = round_up(card_header_bytes + obj_size);
+        self.try_alloc_with_card_header(total_size, card_header_bytes)
+            .unwrap_or_else(|| {
+                let obj_size = round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE));
+                let alloc_size = round_up(
+                    card_header_bytes
+                        .checked_add(obj_size)
+                        .expect("allocation size overflow"),
+                );
+                let layout =
+                    Layout::from_size_align(alloc_size, WORD).expect("invalid allocation layout");
+                alloc::handle_alloc_error(layout)
+            })
+    }
+
+    /// Fallible counterpart of `alloc_with_card_header`. RPython's
+    /// `raw_malloc` can return NULL and the translated allocation helper then
+    /// raises `MemoryError`; do not turn that recoverable result into a Rust
+    /// process abort.
+    pub fn try_alloc_with_card_header(
+        &mut self,
+        total_size: usize,
+        card_header_bytes: usize,
+    ) -> Option<*mut u8> {
+        let obj_size = try_round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE))?;
+        let alloc_size = try_round_up(card_header_bytes.checked_add(obj_size)?)?;
         let header_ptr = if card_header_bytes == 0 && alloc_size <= SMALL_REQUEST_THRESHOLD {
             self.ac.malloc(alloc_size)
         } else {
-            let layout = Layout::from_size_align(alloc_size, WORD).expect("invalid layout");
+            let layout = Layout::from_size_align(alloc_size, WORD).ok()?;
             let raw = unsafe { alloc::alloc(layout) };
             if raw.is_null() {
-                alloc::handle_alloc_error(layout);
+                return None;
             }
             if card_header_bytes > 0 {
                 unsafe { ptr::write_bytes(raw, 0, card_header_bytes) };
@@ -101,7 +130,7 @@ impl OldGen {
             // both fresh/recycled arena blocks and rawmalloced objects.
             unsafe { ptr::write_bytes(header_ptr, 0xAA, obj_size) };
         }
-        header_ptr
+        Some(header_ptr)
     }
 
     /// Allocate uninitialized space and overwrite the complete object from
@@ -226,9 +255,11 @@ impl OldGen {
 }
 
 fn round_up(size: usize) -> usize {
-    size.checked_add(WORD - 1)
-        .expect("allocation size overflow")
-        & !(WORD - 1)
+    try_round_up(size).expect("allocation size overflow")
+}
+
+fn try_round_up(size: usize) -> Option<usize> {
+    Some(size.checked_add(WORD - 1)? & !(WORD - 1))
 }
 
 impl Default for OldGen {
@@ -259,6 +290,12 @@ mod tests {
         let dst = unsafe { oldgen.alloc_and_copy(src.as_ptr(), src.len()) };
         assert_eq!(unsafe { *dst.add(17) }, 1);
         assert!(oldgen.contains(dst as usize + GcHeader::SIZE));
+    }
+
+    #[test]
+    fn fallible_allocation_reports_size_overflow() {
+        let mut oldgen = OldGen::new();
+        assert!(oldgen.try_alloc(usize::MAX).is_none());
     }
 
     #[test]

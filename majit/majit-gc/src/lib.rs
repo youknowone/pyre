@@ -237,6 +237,15 @@ pub trait GcAllocator: Send {
         self.alloc_nursery_no_collect(size)
     }
 
+    /// Fallible host-side form of `alloc_nursery_no_collect_typed`.
+    ///
+    /// MiniMark overrides this so rawmalloc failure is returned as NULL.
+    /// Collectors without a distinct fallible path retain their existing
+    /// allocation behavior.
+    fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.alloc_nursery_no_collect_typed(type_id, size)
+    }
+
     /// Allocate a variable-size object without triggering collection.
     ///
     /// Implementations may fall back to old-gen allocation when the nursery
@@ -732,6 +741,9 @@ impl GcAllocator for GcHandle {
     }
     fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect_typed(type_id, size))
+    }
+    fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
     }
     fn alloc_varsize_no_collect(
         &mut self,

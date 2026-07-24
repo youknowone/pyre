@@ -1747,8 +1747,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // against the real struct.  An unrecognized token (none currently
         // emitted) falls through to the normal lift.
         let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
-            || (crate::front::mir::elidable_residualize_enabled()
-                && graph.hints.iter().any(|h| h == "elidable"));
+            || graph.hints.iter().any(|h| h == "elidable");
         if residualize {
             let result_shell = match graph.return_type.as_deref() {
                 Some("ref") => Some(

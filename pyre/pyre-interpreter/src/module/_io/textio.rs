@@ -4,7 +4,6 @@
 //! `W_TextIOWrapper`.  In particular, the buffer and the
 //! ZERO/OK/DETACHED state are not instance-dict side data.
 
-use num_traits::ToPrimitive;
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -26,22 +25,26 @@ struct PositionCookie {
 impl PositionCookie {
     const BITS: usize = u64::BITS as usize;
 
-    fn unpack(mut value: malachite_bigint::BigInt) -> Result<Self, crate::PyError> {
-        if value < malachite_bigint::BigInt::from(0) {
+    fn unpack(mut value: RBigInt) -> Result<Self, crate::PyError> {
+        if value.int_lt(0) {
             return Err(crate::PyError::value_error("negative seek position"));
         }
-        let mask =
-            (malachite_bigint::BigInt::from(1) << Self::BITS) - malachite_bigint::BigInt::from(1);
+        let mask = RBigInt::one()
+            .lshift(Self::BITS as i64)
+            .expect("native-word shift")
+            .int_sub(1);
         let mut take = || {
-            let field = (&value & &mask).to_u64().unwrap_or(0);
-            value >>= Self::BITS;
+            let field = value.and_(&mask).to_u64().unwrap_or(0);
+            value = value
+                .rshift(Self::BITS as i64, false)
+                .expect("native-word shift");
             field
         };
         let start_pos = take();
         let dec_flags = take();
         let bytes_to_feed = take();
         let chars_to_skip = take();
-        let need_eof = value != malachite_bigint::BigInt::from(0);
+        let need_eof = value.tobool();
         Ok(Self {
             start_pos,
             dec_flags,
@@ -51,13 +54,29 @@ impl PositionCookie {
         })
     }
 
-    fn pack(&self) -> malachite_bigint::BigInt {
-        let mut result = malachite_bigint::BigInt::from(self.start_pos);
-        result |= malachite_bigint::BigInt::from(self.dec_flags) << Self::BITS;
-        result |= malachite_bigint::BigInt::from(self.bytes_to_feed) << (Self::BITS * 2);
-        result |= malachite_bigint::BigInt::from(self.chars_to_skip) << (Self::BITS * 3);
+    fn pack(&self) -> RBigInt {
+        let mut result = RBigInt::from(self.start_pos);
+        result = result.or_(
+            &RBigInt::from(self.dec_flags)
+                .lshift(Self::BITS as i64)
+                .expect("native-word shift"),
+        );
+        result = result.or_(
+            &RBigInt::from(self.bytes_to_feed)
+                .lshift((Self::BITS * 2) as i64)
+                .expect("native-word shift"),
+        );
+        result = result.or_(
+            &RBigInt::from(self.chars_to_skip)
+                .lshift((Self::BITS * 3) as i64)
+                .expect("native-word shift"),
+        );
         if self.need_eof {
-            result |= malachite_bigint::BigInt::from(1) << (Self::BITS * 4);
+            result = result.or_(
+                &RBigInt::one()
+                    .lshift((Self::BITS * 4) as i64)
+                    .expect("native-word shift"),
+            );
         }
         result
     }
@@ -1249,14 +1268,14 @@ impl W_TextIOWrapper {
         let mut position = unsafe { crate::builtins::obj_to_bigint(w_position) };
 
         if whence == 1 {
-            if position != malachite_bigint::BigInt::from(0) {
+            if position.tobool() {
                 return Err(super::unsupported("can't do nonzero cur-relative seeks"));
             }
             w_position = super::call_method_result(self.self_obj(), "tell", &[])?;
             let indexed = crate::baseobjspace::space_index(w_position)?;
             position = unsafe { crate::builtins::obj_to_bigint(indexed) };
         } else if whence == 2 {
-            if position != malachite_bigint::BigInt::from(0) {
+            if position.tobool() {
                 return Err(super::unsupported("can't do nonzero end-relative seeks"));
             }
             super::call_method_result(self.self_obj(), "flush", &[])?;
@@ -1279,7 +1298,7 @@ impl W_TextIOWrapper {
 
         let position_cookie = PositionCookie::unpack(position)?;
         super::call_method_result(self.self_obj(), "flush", &[])?;
-        let start = crate::objspace::descroperation::bigint_result(malachite_bigint::BigInt::from(
+        let start = crate::objspace::descroperation::bigint_result(RBigInt::from(
             position_cookie.start_pos,
         ));
         self.call_buffer("seek", &[start])?;

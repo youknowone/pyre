@@ -2409,12 +2409,21 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 crate::builtins::obj_to_bigint(val)
             };
             let parsed = FormatSpec::parse(spec);
+            let p = parse_spec(spec);
+            if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
+                // pypy/objspace/std/newformat.py format_int_or_long:
+                // `z` is meaningful only after conversion to a floating
+                // presentation type.
+                return Err(crate::PyError::value_error(
+                    "Negative zero coercion (z) not allowed",
+                ));
+            }
             if spec.ends_with('c') && parsed.is_ok() {
                 return format_char(&big, spec);
             }
             // A float presentation code formats the `f64` conversion (`n` and
             // the integer bases keep full integer precision instead).
-            if matches!(parse_spec(spec).ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
+            if matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
                 let f = big.to_f64().unwrap_or(f64::INFINITY);
                 if f.is_infinite() {
                     return Err(crate::PyError::overflow_error(

@@ -365,18 +365,19 @@ fn dynasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // caller holds a raw `*mut u8` on the Rust stack that is NOT
     // registered as a GC root. Collection here would move the
     // freshly-allocated nursery object, leaving the caller with a
-    // dangling pointer. Routing through `alloc_nursery_no_collect_typed`
+    // dangling pointer. Routing through `try_alloc_nursery_no_collect_typed`
     // falls back to old-gen on nursery full — stable across minor
-    // collections that fire between here and the caller's store into
-    // a tracked slot.
+    // collections that fire between here and the caller's store into a
+    // tracked slot — and returns NULL when rawmalloc fails so the host helper
+    // can raise `MemoryError`.
     if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
         c.borrow_mut()
             .as_deref_mut()
-            .map(|g| g.alloc_nursery_no_collect_typed(type_id, size))
+            .map(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
     }) {
         return r;
     }
-    majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_no_collect_typed(type_id, size))
+    majit_gc::gc_sync::gc_op(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
 }
 
 /// Host-side *collecting* nursery allocation trampoline. Unlike

@@ -1528,13 +1528,13 @@ fn typeid_is_object_via_active_runtime(typeid: u32) -> Option<bool> {
 /// the active cranelift-owned GC. Returns `GcRef(0)` when no active
 /// runtime is set on this thread.
 ///
-/// Uses `alloc_nursery_no_collect_typed`: host callers hold a raw
+/// Uses `try_alloc_nursery_no_collect_typed`: host callers hold a raw
 /// `*mut u8` on the Rust stack that is NOT a registered GC root.
 /// Triggering a minor collection here would move the nursery object
 /// we just returned, leaving the caller dangling. `no_collect` falls
-/// back to old-gen on nursery full instead.
+/// back to old-gen on nursery full and returns NULL on rawmalloc failure.
 fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
-    with_cranelift_gc(|gc| gc.alloc_nursery_no_collect_typed(type_id, size)).unwrap_or(GcRef(0))
+    with_cranelift_gc(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// `majit_gc::AllocNurseryCollectingTypedFn` installed by `set_gc_allocator`.

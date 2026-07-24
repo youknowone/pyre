@@ -503,7 +503,7 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // See cranelift/dynasm counterparts: host-side allocation must not
     // trigger collection because the caller holds a raw pointer that
     // is not a registered GC root.
-    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size))
+    with_wasm_active_gc_mut(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
         .unwrap_or(GcRef(0))
 }
 
