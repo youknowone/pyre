@@ -630,6 +630,33 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     list
 }
 
+/// Emit inline Empty-strategy `W_ListObject` creation — the `args_w` of a
+/// zero-argument exception (`raise ValueError()`) — as a bare `NewWithVtable`
+/// wrapper plus the `strategy` store, mirroring `w_list_new(vec![])` /
+/// `w_list_new_with_strategy(vec![], Empty)`.
+///
+/// `length` (0) and `items` (null) stay zero-filled by `NewWithVtable`, as the
+/// non-Object strategies leave them.  The typed `int_items` / `float_items`
+/// blocks also stay null: the Empty strategy reads neither (its first append
+/// installs fresh typed storage via `switch_to_correct_strategy`), and
+/// `list_object_custom_trace` forwards a typed block only when the GC owns it,
+/// so a null slot is inert.  OptVirtualize folds the whole wrapper when the
+/// list never escapes.
+pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
+    use crate::descr::{list_strategy_descr, w_list_size_descr};
+
+    let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
+    ctx.heap_cache_mut().new_object(list);
+
+    let strategy_const = ctx.const_int(pyre_object::listobject::ListStrategy::Empty as i64);
+    let strategy_descr = list_strategy_descr();
+    let strategy_idx = strategy_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, strategy_const], strategy_descr);
+    ctx.heapcache_setfield_cached(list, strategy_idx, strategy_const);
+
+    list
+}
+
 /// Trace-visible canonical `W_TupleObject` construction from boxed items.
 /// This is the allocation half of `W_BaseException.descr_getargs`: the raw
 /// `args_w` list is copied into a fresh tuple on every public attribute read.

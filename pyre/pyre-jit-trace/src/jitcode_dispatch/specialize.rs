@@ -4620,11 +4620,14 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // final slice is selected below after the concrete constructor exposes the
     // value-dependent branch result.  The shared typed-list emitter reproduces
     // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
-    // to virtualize alongside message-bearing Object lists.  Other strategies
-    // retain the safe residual fallback.
+    // to virtualize alongside message-bearing Object lists.  The Empty strategy
+    // (zero-argument `raise ValueError()` / `raise StopIteration()`, the most
+    // common raise shape) reproduces `w_list_new(vec![])`'s empty list.  The
+    // Float strategy retains the safe residual fallback.
     enum ArgsEmit {
         Object,
         Int(Vec<i64>),
+        Empty,
     }
 
     let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
@@ -4802,8 +4805,8 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
             ArgsEmit::Int(values)
         }
-        pyre_object::listobject::ListStrategy::Empty
-        | pyre_object::listobject::ListStrategy::Float => return Ok(None),
+        pyre_object::listobject::ListStrategy::Empty => ArgsEmit::Empty,
+        pyre_object::listobject::ListStrategy::Float => return Ok(None),
     };
 
     // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
@@ -4898,6 +4901,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // alongside the exception.
     let args_list = match args_emit {
         ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
+        ArgsEmit::Empty => crate::helpers::emit_empty_list_inline(ctx.trace_ctx),
         ArgsEmit::Int(values) => {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             let mut raws = Vec::with_capacity(final_args.len());
