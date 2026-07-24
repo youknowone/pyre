@@ -207,8 +207,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Ok(pyre_object::w_int_new(0));
                     }
                 };
+                // `interp_imp.is_builtin`: 0 = not a builtin, 1 = a builtin
+                // not yet imported, -1 = a builtin already in sys.modules and
+                // thus not re-initializable (sys/builtins and any other
+                // already-imported builtin).
                 let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(name));
-                Ok(pyre_object::w_int_new(if is_builtin { 1 } else { 0 }))
+                let result = if !is_builtin {
+                    0
+                } else if crate::importing::check_sys_modules(name).is_some() {
+                    -1
+                } else {
+                    1
+                };
+                Ok(pyre_object::w_int_new(result))
             },
             1,
         ),
@@ -237,6 +248,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let entry =
                     served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
                 Ok(pyre_object::w_bool_from(entry.is_package))
+            },
+            1,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "init_frozen",
+        crate::make_builtin_function_with_arity(
+            "init_frozen",
+            // interp_imp.py:74 — frozen modules are served through the meta
+            // path, never re-initialized by this legacy entry point.
+            |args| {
+                let _ = frozen_name(args, "init_frozen")?;
+                Ok(pyre_object::w_none())
             },
             1,
         ),
