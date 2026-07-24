@@ -1692,10 +1692,6 @@ pub struct RegAlloc<'a> {
     /// closing JUMP, used by `_compute_hint_locations_from_descr` to pin
     /// reg hints via `longevity.fixed_register(position, reg, box)`.
     final_jump_op_position: i32,
-    /// j2-style deopt-only fail args, indexed by original operation index.
-    /// These values are needed by guard recovery but not by the fast path
-    /// after the guard, so keeping them in registers only increases pressure.
-    j2_deopt_spill_args: Vec<Vec<OpRef>>,
     /// j2-lowered operations, indexed by original operation index. The main
     /// dispatch path consumes these; legacy opcode dispatch is a guard rail
     /// only if a plan entry is missing.
@@ -1736,7 +1732,6 @@ impl<'a> RegAlloc<'a> {
             jump_target_descr: None,
             final_jump_args: None,
             final_jump_op_position: -1,
-            j2_deopt_spill_args: Vec::new(),
             j2_ops: Vec::new(),
             temp_var_counter: 0,
         }
@@ -1829,7 +1824,6 @@ impl<'a> RegAlloc<'a> {
         self.final_jump_args = None;
         self.final_jump_op_position = -1;
         let j2_plan = crate::j2plan::TracePlan::build(self.inputargs, self.operations);
-        self.j2_deopt_spill_args = j2_plan.deopt_spill_args_by_index(self.operations.len());
         self.j2_ops = j2_plan.ops;
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
@@ -2246,7 +2240,6 @@ impl<'a> RegAlloc<'a> {
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
-        self.spill_j2_deopt_args(op_index);
         self.flush_moves(output);
         let faillocs = self.locs_for_fail(op);
         output.push(RegAllocOp::PerformGuard {
@@ -2265,7 +2258,6 @@ impl<'a> RegAlloc<'a> {
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
-        self.spill_j2_deopt_args(op_index);
         self.flush_moves(output);
         let faillocs = self.locs_for_fail_args(fail_args);
         output.push(RegAllocOp::PerformGuard {
@@ -2274,56 +2266,6 @@ impl<'a> RegAlloc<'a> {
             result_loc,
             faillocs,
         });
-    }
-
-    fn spill_j2_deopt_args(&mut self, op_index: usize) {
-        let Some(args) = self.j2_deopt_spill_args.get(op_index).cloned() else {
-            return;
-        };
-        for arg in args {
-            if arg.is_none() || arg.is_constant() {
-                continue;
-            }
-            let tp = self.tp(arg);
-            if tp == Type::Float {
-                Self::spill_deopt_arg_from_manager(
-                    &mut self.xrm,
-                    arg,
-                    tp,
-                    &mut self.longevity,
-                    &mut self.fm,
-                );
-            } else {
-                Self::spill_deopt_arg_from_manager(
-                    &mut self.rm,
-                    arg,
-                    tp,
-                    &mut self.longevity,
-                    &mut self.fm,
-                );
-            }
-        }
-    }
-
-    fn spill_deopt_arg_from_manager(
-        mgr: &mut RegisterManager,
-        arg: OpRef,
-        tp: Type,
-        longevity: &mut LifetimeManager,
-        fm: &mut FrameManager,
-    ) {
-        let Some(reg) = mgr.reg_bindings_get(arg, longevity) else {
-            return;
-        };
-        mgr._sync_var_to_stack(arg, tp, longevity, fm);
-        mgr.reg_bindings_del(arg, longevity);
-        mgr.free_regs.push(reg);
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[dynasm:j2plan] spill deopt-only failarg {:?} from {:?}",
-                arg, reg
-            );
-        }
     }
 
     /// aarch64/regalloc.py:1089 get_gcmap.
@@ -6321,7 +6263,13 @@ mod tests {
     }
 
     #[test]
-    fn test_j2_deopt_only_failarg_spilled_before_guard() {
+    fn test_j2_deopt_only_failarg_kept_in_register_at_guard() {
+        // A deopt-only fail arg (dead on the fast path after the guard) is
+        // captured from its register at the guard, not eagerly spilled to a
+        // frame slot: the failure path saves every register before rebuilding
+        // the frame, so a register faillocs is fully recoverable, and the
+        // fast path pays no spill store.
+        //
         // i0 is the typed inputarg slot 0 (Int) that the regalloc
         // registers from `inputargs.opref()`. i1/i2 are op result
         // positions; their variant tag is unconstrained, so plain
@@ -6368,8 +6316,8 @@ mod tests {
             panic!("guard op was not lowered through RegAllocOp::PerformGuard");
         };
         assert!(
-            matches!(faillocs.as_slice(), [Some(Loc::Frame(_))]),
-            "deopt-only failarg should be captured from a frame slot: {:?}",
+            matches!(faillocs.as_slice(), [Some(Loc::Reg(_))]),
+            "deopt-only failarg should be captured from a register: {:?}",
             faillocs
         );
     }

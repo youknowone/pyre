@@ -165,24 +165,15 @@ pub(crate) struct TracePlan {
     pub inputargs: Vec<OpRef>,
     pub ops: Vec<LirOp>,
     pub live_points: Vec<LivePoint>,
-    pub deopt_spill_points: Vec<DeoptSpillPoint>,
     pub max_live: usize,
     pub lowered_ops: usize,
     pub fallback_ops: usize,
-}
-
-/// Guard fail args that are only needed on the deopt path at this point.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeoptSpillPoint {
-    pub op_index: usize,
-    pub args: Vec<OpRef>,
 }
 
 impl TracePlan {
     pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
         let lowered: Vec<LirOp> = ops.iter().map(|op| lower_op(op)).collect();
         let live_points = compute_live_points(&lowered);
-        let deopt_spill_points = compute_deopt_spill_points(&lowered);
         let max_live = live_points
             .iter()
             .map(|point| point.live_in.len())
@@ -196,23 +187,12 @@ impl TracePlan {
             fallback_ops,
             ops: lowered,
             live_points,
-            deopt_spill_points,
             max_live,
         }
     }
 
     pub(crate) fn summary(&self) -> TracePlanSummary<'_> {
         TracePlanSummary(self)
-    }
-
-    pub(crate) fn deopt_spill_args_by_index(&self, len: usize) -> Vec<Vec<OpRef>> {
-        let mut by_index = vec![Vec::new(); len];
-        for point in &self.deopt_spill_points {
-            if point.op_index < by_index.len() {
-                by_index[point.op_index] = point.args.clone();
-            }
-        }
-        by_index
     }
 }
 
@@ -223,12 +203,11 @@ impl fmt::Display for TracePlanSummary<'_> {
         let plan = self.0;
         write!(
             f,
-            "ops={} lowered={} fallback={} max_live={} deopt_spills={}",
+            "ops={} lowered={} fallback={} max_live={}",
             plan.ops.len(),
             plan.lowered_ops,
             plan.fallback_ops,
             plan.max_live,
-            plan.deopt_spill_points.len()
         )
     }
 }
@@ -394,33 +373,6 @@ fn compute_live_points(ops: &[LirOp]) -> Vec<LivePoint> {
             op_index,
             live_in: live.clone(),
         });
-    }
-
-    points.reverse();
-    points
-}
-
-fn compute_deopt_spill_points(ops: &[LirOp]) -> Vec<DeoptSpillPoint> {
-    let mut fast_live_after = Vec::new();
-    let mut points = Vec::new();
-
-    for (op_index, op) in ops.iter().enumerate().rev() {
-        if let LirOp::Guard { fail_args, .. } = op {
-            let mut args = Vec::new();
-            for &arg in fail_args {
-                if !fast_live_after.contains(&arg) {
-                    add_ref(&mut args, arg);
-                }
-            }
-            if !args.is_empty() {
-                points.push(DeoptSpillPoint { op_index, args });
-            }
-        }
-
-        if let Some(dst) = op.def() {
-            remove_ref(&mut fast_live_after, dst);
-        }
-        op.add_uses(&mut fast_live_after);
     }
 
     points.reverse();
@@ -665,7 +617,6 @@ mod tests {
         );
 
         assert_eq!(plan.fallback_ops, 0);
-        assert!(plan.deopt_spill_points.is_empty());
         assert!(matches!(
             plan.ops[1],
             LirOp::IntBin {
@@ -715,42 +666,9 @@ mod tests {
         assert!(guard_live.contains(&OpRef::int_op(1)));
         assert!(guard_live.contains(&OpRef::int_op(2)));
 
-        assert_eq!(
-            plan.deopt_spill_points,
-            vec![super::DeoptSpillPoint {
-                op_index: 2,
-                args: vec![OpRef::int_op(1)]
-            }]
-        );
-
         let add_live = &plan.live_points[0].live_in;
         assert!(add_live.contains(&i0));
         assert!(!add_live.contains(&c1));
-    }
-
-    #[test]
-    fn deopt_spill_point_keeps_jump_args_on_fast_path() {
-        let i0 = OpRef::int_op(0);
-        let c1 = OpRef::const_int(1);
-
-        let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
-        add.pos.set(OpRef::int_op(1));
-
-        let is_true = Op::new(OpCode::IntIsTrue, &[rb(OpRef::int_op(1))]);
-        is_true.pos.set(OpRef::int_op(2));
-
-        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
-        guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
-        let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
-        jump.pos.set(OpRef::int_op(4));
-
-        let plan = TracePlan::build(
-            &[InputArg::from_type(Type::Int, 0)],
-            &[add, is_true, guard, jump],
-        );
-
-        assert!(plan.deopt_spill_points.is_empty());
     }
 
     #[test]
