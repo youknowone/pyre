@@ -1478,8 +1478,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "path_importer_cache", w_dict_new());
     // sys.meta_path — empty
     module_ns_store(ns, "meta_path", w_list_new(vec![]));
-    // sys.dont_write_bytecode
-    module_ns_store(ns, "dont_write_bytecode", w_bool_from(true));
+    // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode` (0
+    // unless `-B` / PYTHONDONTWRITEBYTECODE); no bytecode cache is written
+    // regardless, but the reported default stays False for compatibility.
+    module_ns_store(ns, "dont_write_bytecode", w_bool_from(false));
     // sys.pycache_prefix — None unless -X pycache_prefix / PYTHONPYCACHEPREFIX.
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
     // bytecode path before `dont_write_bytecode` is consulted.
