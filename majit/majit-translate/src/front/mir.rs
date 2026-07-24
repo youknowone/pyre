@@ -2301,7 +2301,18 @@ impl<'a> Lowering<'a> {
                         let spelling = tyref_to_ast_string(&local.ty, llbc);
                         majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
                     }),
-                _ => None,
+                // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
+                // so it takes the non-`Ref` arm and would otherwise carry no
+                // `class_root`.  Its variant-name metadata is a side table
+                // keyed by the enum type (the RPython "names by int" model),
+                // not a field on the value; carry the crate-stripped enum
+                // path so the `Debug`-fmt collapse can recover the enum
+                // identity from the value's origin (`debug_enum_disc_owner`)
+                // now that no `__discriminant` field read remains to scavenge.
+                // `derive_subject_inputcells` only consumes `class_root` on
+                // the `Ref` arm, so the annotation seed stays a plain
+                // `SomeInteger`.
+                _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
             };
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
@@ -3922,6 +3933,22 @@ impl<'a> Lowering<'a> {
             // construction).  Operands flow as call arguments; the
             // synthetic name is best-effort from the AggregateKind tag.
             Rvalue::Aggregate(kind, operands) => {
+                // A fieldless (C-like) enum variant carries no payload, so
+                // constructing it is just naming its discriminant integer
+                // — the by-value representation of the whole enum (RPython
+                // has no enum type; a fieldless enum is a named `int`).
+                // Fold to `ConstInt(discriminant)` so the constructed value
+                // is an int end-to-end, matching the int-modeled param /
+                // field read / `Discriminant` sites.  Emitting the
+                // transparent ctor (a `Ref` result) here would disagree
+                // with the int coloring `tyref_to_value_type` gives the
+                // destination and re-introduce the classdef-less base.
+                if let Some(tag) = self.aggregate_fieldless_enum_discriminant(&kind) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    return Ok((Some(OpKind::ConstInt(tag)), res));
+                }
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
                 // arg list.
@@ -4114,6 +4141,22 @@ impl<'a> Lowering<'a> {
                         }),
                         res,
                     ));
+                }
+                // A standalone fieldless (C-like) enum is represented
+                // by-value as its discriminant integer, so
+                // `Discriminant(enum)` is the identity on that value — alias
+                // the place value with no field read (mirroring `Rvalue::Use`
+                // / the const-tag fold above).  Modelling the value as the
+                // int is the orthodox representation (RPython has no enum
+                // type; a fieldless enum is a named `int`), and it means the
+                // downstream switch reads the int directly rather than a
+                // `__discriminant` field off an aggregate base that carries
+                // no rtype clsfield.  The INLINE-field case is handled above
+                // (the tag is read from the container at the field offset),
+                // so this only fires for a standalone enum value.
+                if self.tyref_is_fieldless_enum(&place.ty) {
+                    let base = self.resolve_place(mir_bb, place)?;
+                    return Ok((None, base));
                 }
                 let base = self.resolve_place(mir_bb, place)?;
                 Ok((
@@ -4705,6 +4748,31 @@ impl<'a> Lowering<'a> {
             return None;
         }
         Some(arr[1].as_u64()? as usize)
+    }
+
+    /// The discriminant integer of a fieldless-enum `AggregateKind::Adt`
+    /// construction, or `None` for any non-fieldless-enum aggregate
+    /// (struct / tuple / array / payload-enum variant).  Charon encodes
+    /// `AggregateKind::Adt(type_id, variant_idx, ..)` as `{"Adt":
+    /// [type_id, variant_idx, ..]}` (same head shapes `resolve_aggregate_adt`
+    /// decodes); a fieldless enum's variant carries zero fields, so the
+    /// whole value is its `discriminant_i64()`.
+    fn aggregate_fieldless_enum_discriminant(&self, kind: &serde_json::Value) -> Option<i64> {
+        let adt = kind.as_object()?.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
+        let td = self.llbc.type_by_id(type_id)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        if variants.is_empty() || variants.iter().any(|v| !v.fields.is_empty()) {
+            return None;
+        }
+        variants.get(variant_idx)?.discriminant_i64()
     }
 
     fn resolve_aggregate_adt(
@@ -11711,7 +11779,55 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_oparg(ty, llbc) {
         return ValueType::Int;
     }
+    // A fieldless (C-like) enum is represented by-value as its
+    // discriminant integer — RPython has no enum type; a fieldless enum
+    // is a named `int` (`SomeInteger`).  Model it as `Int` so the value
+    // lives in the int register bank at every site (param, field read,
+    // construction, `Discriminant` read): `Rvalue::Discriminant` then
+    // aliases the int directly instead of reading a `__discriminant`
+    // field off an aggregate `Ref` base whose enum has no rtype clsfield.
+    if tyref_is_fieldless_enum_free(ty, llbc) {
+        return ValueType::Int;
+    }
     ValueType::Ref(None)
+}
+
+/// Free-function form of [`Lowering::tyref_is_fieldless_enum`] for the
+/// standalone [`tyref_to_value_type`] helper (which holds no `Lowering`):
+/// `true` when `ty` resolves to an enum with at least one variant and
+/// every variant carrying zero payload fields.
+fn tyref_is_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_fieldless_enum_def(ty, llbc).is_some()
+}
+
+/// The `TypeDecl` behind `ty` when it resolves to a fieldless (C-like)
+/// enum (at least one variant, every variant carrying zero payload
+/// fields); `None` otherwise.  Shared by [`tyref_is_fieldless_enum_free`]
+/// and [`tyref_fieldless_enum_class_root`].
+fn tyref_fieldless_enum_def<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDecl> {
+    let def_id = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
+    }?;
+    let td = llbc.type_by_id(def_id)?;
+    match &td.kind {
+        TypeDeclKind::Enum(variants)
+            if !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty()) =>
+        {
+            Some(td)
+        }
+        _ => None,
+    }
+}
+
+/// The crate-stripped `module::Enum` spelling of a fieldless enum `ty`,
+/// or `None` when `ty` is not a fieldless enum.  Matches the spelling
+/// [`debug_enum_variants_by_discr`] compares against
+/// (`strip_crate_prefix(name_path())`) so the `Debug`-fmt collapse can
+/// recover the enum's variant table from the value's origin `Input` op.
+fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let td = tyref_fieldless_enum_def(ty, llbc)?;
+    Some(strip_crate_prefix(&td.item_meta.name_path()))
 }
 
 /// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
@@ -15515,13 +15631,10 @@ struct DebugEnumFmtCollapse {
     /// through this slot.
     format_result: Variable,
     /// The enum value being `Debug`-rendered (recovered through the
-    /// `format_args!` argument Tuple), live at `format_block` — the
-    /// `__discriminant` read base.
+    /// `format_args!` argument Tuple), live at `format_block`.  A fieldless
+    /// enum is `Int`-valued, so this IS the discriminant the switch reads
+    /// directly (no `__discriminant` field read).
     enum_value: Variable,
-    /// The `__discriminant` field owner the enum's existing tag read uses,
-    /// so the synthesized read resolves at the same layout offset.
-    disc_owner_root: Option<String>,
-    disc_owner_id: Option<majit_ir::descr::StructId>,
     /// The literal template pieces around the single `{:?}` placeholder
     /// (`["intrinsic function ", " not implemented"]`).
     pieces: Vec<String>,
@@ -15542,28 +15655,27 @@ struct DebugEnumFmtCollapse {
     dead_bases: Vec<u64>,
 }
 
-/// Locate the `__discriminant` field read owner for `enum_value` — the
-/// owner_root / owner_id an existing tag read of the same base uses, so a
-/// synthesized read resolves at the identical layout offset.  Traces the
-/// read base through the single-predecessor link-arg forwarding chain so a
-/// framestate-renamed alias of the enum value still matches.
-fn debug_enum_disc_owner(
-    graph: &FunctionGraph,
-    enum_value: &Variable,
-) -> Option<(Option<String>, Option<majit_ir::descr::StructId>)> {
-    let producer = resolve_to_producer_op(graph, enum_value);
-    for block in &graph.blocks {
-        for op in &block.operations {
-            if let OpKind::FieldRead { base, field, .. } = &op.kind
-                && field.name == "__discriminant"
-                && (base.id() == enum_value.id()
-                    || (producer.is_some() && resolve_to_producer_op(graph, base) == producer))
-            {
-                return Some((field.owner_root.clone(), field.owner_id));
-            }
-        }
+/// Recover the fieldless-enum identity (crate-stripped `module::Enum`
+/// spelling) for `enum_value` from its origin `Input` op's `class_root`.
+/// A fieldless enum is `Int`-valued (`tyref_to_value_type`), so its
+/// `Discriminant` read is an identity with no `__discriminant` field read
+/// left to scavenge; the enum's variant-name table is keyed by the enum
+/// type carried on the param (`tyref_fieldless_enum_class_root`,
+/// mir.rs:2278).  Traces the value back through the single-predecessor
+/// link-arg forwarding chain to its defining `Input` op so a
+/// framestate-renamed alias of the param still resolves.  `None` when the
+/// value does not originate at a fieldless-enum-typed input (the collapse
+/// then declines, leaving the chain residual).
+fn debug_enum_disc_owner(graph: &FunctionGraph, enum_value: &Variable) -> Option<String> {
+    let (block, idx) = resolve_to_producer_op(graph, enum_value)?;
+    let op = graph.blocks.iter().find(|b| b.id == block)?.operations.get(idx)?;
+    match &op.kind {
+        OpKind::Input {
+            class_root: Some(root),
+            ..
+        } => Some(root.clone()),
+        _ => None,
     }
-    None
 }
 
 /// Build `(discriminant, variant_ident)` for the fieldless enum named
@@ -15624,16 +15736,15 @@ fn collect_debug_enum_fmt_collapse(
     }
     // The rendered value is the enum being `Debug`-formatted.
     let enum_value = nav.context;
-    // Recover the enum identity from an existing `__discriminant` read of
-    // the same value; without one the value is not a modeled enum here.
-    let (disc_owner_root, disc_owner_id) = debug_enum_disc_owner(graph, &enum_value)?;
-    let owner_root = disc_owner_root.clone()?;
+    // Recover the enum identity from the value's origin `Input` op
+    // `class_root`; without one the value is not a modeled fieldless enum
+    // here (a fieldless enum is `Int`-valued, so no `__discriminant` field
+    // read survives to identify it).
+    let owner_root = debug_enum_disc_owner(graph, &enum_value)?;
     let by_discr = debug_enum_variants_by_discr(llbc, &owner_root)?;
     Some(DebugEnumFmtCollapse {
         format_result: nav.format_result,
         enum_value,
-        disc_owner_root,
-        disc_owner_id,
         pieces: nav.pieces,
         by_discr,
         link_rewrites: nav.link_rewrites,
@@ -15790,23 +15901,12 @@ fn rewrite_debug_enum_fmt_site(graph: &mut FunctionGraph, site: &DebugEnumFmtCol
 
     // --- All structural checks passed; mutate the graph. ---
 
-    // Drop the residual `alloc::fmt::format` op (its block tail), then read
-    // the enum discriminant as the switch value.
+    // Drop the residual `alloc::fmt::format` op (its block tail).  A
+    // fieldless enum is `Int`-valued (`tyref_to_value_type`), so its value
+    // IS the discriminant — switch on it directly, no `__discriminant`
+    // field read (a getfield off an integer base has no blackhole handler).
     graph.blocks[bf_idx].operations.remove(fi);
-    let disc = graph.alloc_value_var();
-    graph.block_mut(bf).operations.push(SpaceOperation {
-        result: Some(disc.clone()),
-        kind: OpKind::FieldRead {
-            base: site.enum_value.clone(),
-            field: FieldDescriptor {
-                name: "__discriminant".to_string(),
-                owner_root: site.disc_owner_root.clone(),
-                owner_id: site.disc_owner_id,
-            },
-            ty: ValueType::Int,
-            pure: true,
-        },
-    });
+    let disc = site.enum_value.clone();
 
     // One arm per variant: emit the constant message and forward it to the
     // continuation through the format-result slot, threading `carried`.
@@ -16866,9 +16966,7 @@ mod tests {
 
         let site = DebugEnumFmtCollapse {
             format_result: formatted.clone(),
-            enum_value: func,
-            disc_owner_root: Some("bytecode::oparg::IntrinsicFunction1".to_string()),
-            disc_owner_id: None,
+            enum_value: func.clone(),
             pieces: vec![
                 "intrinsic function ".to_string(),
                 " not implemented".to_string(),
@@ -16883,8 +16981,9 @@ mod tests {
         };
         assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
 
-        // The residual `alloc::fmt::format` is gone; Bf now switches on a
-        // freshly-read `__discriminant`.
+        // The residual `alloc::fmt::format` is gone; Bf now switches on the
+        // enum value directly (a fieldless enum is `Int`-valued, so its
+        // value IS the discriminant — no `__discriminant` field read).
         let has_format = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(
                 &op.kind,
@@ -16894,11 +16993,14 @@ mod tests {
         });
         assert!(!has_format, "residual alloc::fmt::format removed");
         let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
-        assert!(matches!(bf_block.exitswitch, Some(ExitSwitch::Value(_))));
+        assert!(
+            matches!(&bf_block.exitswitch, Some(ExitSwitch::Value(v)) if v.id() == func.id()),
+            "switch selects the enum value directly"
+        );
         let disc_read = bf_block.operations.iter().any(|op| {
             matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
         });
-        assert!(disc_read, "discriminant read emitted at the switch block");
+        assert!(!disc_read, "no __discriminant field read (enum value is the tag)");
 
         // Two variant arms + a default arm.
         assert_eq!(bf_block.exits.len(), 3, "two variant arms + default");
@@ -16970,8 +17072,6 @@ mod tests {
             // A var never produced by any op — no format block to split.
             format_result: Variable::new(),
             enum_value: func,
-            disc_owner_root: Some("bytecode::oparg::IntrinsicFunction1".to_string()),
-            disc_owner_id: None,
             pieces: vec!["a".to_string(), "b".to_string()],
             by_discr: vec![(0, "Invalid".to_string())],
             link_rewrites: Vec::new(),
