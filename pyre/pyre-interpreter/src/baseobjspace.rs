@@ -4908,17 +4908,35 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
+    // module.py:130-162 `Module.descr_getattribute` — a module receiver runs
+    // the generic lookup with the `__getattr__` fallback suppressed, then
+    // consults its own dict's PEP 562 `__getattr__`, and only then the receiver
+    // type's class-level `__getattr__` (descroperation.py:242-245).  Ordering
+    // the module-dict hook before the class hook — and giving the class hook the
+    // final say — matches `slot_tp_getattr_hook`: a class-level `__getattr__`'s
+    // own AttributeError must reach the caller rather than be overwritten by the
+    // generic module-miss message.
+    if call_getattr && unsafe { is_module(obj) } {
+        let err = match object_getattr_miss(obj, name, false) {
+            Ok(value) => return Ok(value),
+            Err(e) => e,
+        };
+        if err.kind != PyErrorKind::AttributeError {
+            return Err(err);
+        }
+        let err = match unsafe { module_getattr_hook_or_err(obj, name, err, true) } {
+            Ok(value) => return Ok(value),
+            Err(e) if e.kind == PyErrorKind::AttributeError => e,
+            Err(e) => return Err(e),
+        };
+        let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+        return unsafe { instance_getattr_hook_or_err(w_type, obj, name, err) };
+    }
+
     let err = match object_getattr_miss(obj, name, call_getattr) {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
-    // module.py:130-142 `Module.descr_getattribute` — PEP 562: after the
-    // normal lookup misses with AttributeError, a module-level `__getattr__`
-    // stored in the module's own dict gets the final say, called with just the
-    // attribute name.  Only `space.getattr` consults it.
-    if err.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
-        return unsafe { module_getattr_hook_or_err(obj, name, err, call_getattr) };
-    }
     Err(err)
 }
 
@@ -5429,14 +5447,33 @@ unsafe fn module_getattr_hook_or_err(
         }
     }
     // No module `__getattr__`: phrase the miss with the module's `__name__`
-    // when it is a string, falling back to the bare form otherwise.  The
-    // `__spec__`-based circular-import diagnostics are not ported.
-    let msg = match finditem_str(w_dict, "__name__")? {
+    // when it is a string, falling back to the bare form otherwise
+    // (module.py:143-162).  Own the name up front so the `__spec__` lookups
+    // below, which allocate, cannot dangle the dict-borrowed slice.
+    let nm = match finditem_str(w_dict, "__name__")? {
         Some(w) if !w.is_null() && pyre_object::is_str(w) => {
-            let nm = pyre_object::w_str_get_wtf8(w);
-            format!("module '{nm}' has no attribute '{name}'")
+            pyre_object::w_str_get_wtf8(w).to_string()
         }
-        _ => format!("module has no attribute '{name}'"),
+        _ => return Err(PyError::new(
+            PyErrorKind::AttributeError,
+            format!("module has no attribute '{name}'"),
+        )),
+    };
+    // module.py:148-159 — a module still executing (`__spec__._initializing`)
+    // or naming an as-yet-unset submodule reports the circular-import cause.
+    let w_spec = finditem_str(w_dict, "__spec__")?.filter(|w| !w.is_null());
+    let msg = match w_spec {
+        Some(w_spec) if crate::importing::is_spec_initializing(w_spec) => format!(
+            "partially initialized module '{nm}' has no attribute '{name}' \
+             (most likely due to a circular import)"
+        ),
+        Some(w_spec) if crate::importing::is_spec_uninitialized_submodule(w_spec, name) => {
+            format!(
+                "cannot access submodule '{name}' of module '{nm}' \
+                 (most likely due to a circular import)"
+            )
+        }
+        _ => format!("module '{nm}' has no attribute '{name}'"),
     };
     Err(PyError::new(PyErrorKind::AttributeError, msg))
 }
