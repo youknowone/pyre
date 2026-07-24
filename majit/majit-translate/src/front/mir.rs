@@ -1182,27 +1182,34 @@ fn derive_program_metadata(
                 // discriminants, so unsigned is exact. A negative-discriminant
                 // enum would need a signed width here AND a sign-extending field
                 // read; revisit if one is introduced.
-                let disc_ty = if variants.iter().all(|v| v.fields.is_empty()) {
-                    match td.layout_for_target(&target).and_then(|l| l.size) {
-                        Some(1) => "u8",
-                        Some(2) => "u16",
-                        Some(4) => "u32",
-                        _ => "i64",
-                    }
-                } else {
-                    "i64"
-                };
-                let rows: Vec<(String, String)> =
-                    vec![("__discriminant".to_string(), disc_ty.to_string())];
-                struct_fields.fields.insert(name.clone(), rows.clone());
-                struct_fields.fields.insert(leaf.clone(), rows.clone());
-                struct_fields.fields.insert(canon_base.clone(), rows);
-                // Object identity for the enum base (the discriminant
-                // carrier), minted from the crate-stripped `module::Enum`.
+                // A FIELDLESS (C-like) enum is modeled by-value as its
+                // discriminant integer (`tyref_to_value_type` colors it
+                // `Int`; `Rvalue::Discriminant` / `discriminant_value` alias
+                // that int; the constructor folds to `ConstInt`), so it has
+                // no `SomeInstance` base and needs no `__discriminant`-only
+                // base ClassDef.  Skip the base + variant-subclass
+                // registration entirely for it (only the payload-enum sum
+                // type needs the base tag carrier + per-variant subclasses).
+                // The inline-field read (`self.strategy`) sizes off the
+                // enum's OWN Charon layout (`inline_fieldless_enum_field_tag0`
+                // / the container field descr), not this registration, and
+                // `enum_variant_by_discriminant` (kept below) supplies the
+                // switch-arm discr→name mapping — both independent of the
+                // base ClassDef.
+                let fieldless = variants.iter().all(|v| v.fields.is_empty());
                 let base_sid = majit_ir::descr::StructId::from_canonical(&canon_base);
-                record_struct_id(&mut struct_ids, name.clone(), base_sid);
-                record_struct_id(&mut struct_ids, leaf.clone(), base_sid);
-                record_struct_id(&mut struct_ids, canon_base.clone(), base_sid);
+                if !fieldless {
+                    let rows: Vec<(String, String)> =
+                        vec![("__discriminant".to_string(), "i64".to_string())];
+                    struct_fields.fields.insert(name.clone(), rows.clone());
+                    struct_fields.fields.insert(leaf.clone(), rows.clone());
+                    struct_fields.fields.insert(canon_base.clone(), rows);
+                    // Object identity for the enum base (the discriminant
+                    // carrier), minted from the crate-stripped `module::Enum`.
+                    record_struct_id(&mut struct_ids, name.clone(), base_sid);
+                    record_struct_id(&mut struct_ids, leaf.clone(), base_sid);
+                    record_struct_id(&mut struct_ids, canon_base.clone(), base_sid);
+                }
                 // Per-variant field rows + exact offsets under
                 // `{enum}::{variant}` keys — the RPython sum-type subclass
                 // layout where each variant carries its OWN fields, the base
@@ -1223,7 +1230,8 @@ fn derive_program_metadata(
                 // offset 0 (the common case) registers 0, matching the
                 // heuristic exactly; a single-variant type has no `Branch`
                 // tag (`discriminant_offset` → `None`) and also registers 0.
-                if let Some(l) = enum_layout.as_ref() {
+                // Fieldless enums skip this (int-valued, no base ClassDef).
+                if !fieldless && let Some(l) = enum_layout.as_ref() {
                     let mut base_offsets = std::collections::HashMap::new();
                     base_offsets.insert(
                         "__discriminant".to_string(),
@@ -1236,64 +1244,71 @@ fn derive_program_metadata(
                     };
                     exact_layouts.insert(base_sid, base_exact);
                 }
-                for (vidx, v) in variants.iter().enumerate() {
-                    let variant_qual = format!("{name}::{}", v.name);
-                    let variant_leaf = format!("{leaf}::{}", v.name);
-                    let variant_canon = format!("{canon_base}::{}", v.name);
-                    let mut vrows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
-                    let mut vattrs: Vec<(String, ValueType)> = Vec::with_capacity(v.fields.len());
-                    let mut voffsets: std::collections::HashMap<String, u64> =
-                        std::collections::HashMap::new();
-                    for (i, f) in v.fields.iter().enumerate() {
-                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        // A bytecode-arg marker reads as a `u32` at runtime
-                        // and annotates as an integer — keep the row string
-                        // and the FORCE attr type in agreement so the
-                        // projection refines the same shell.
-                        let (row_ty, attr_ty) = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
-                            ("u32".to_string(), ValueType::Int)
-                        } else {
-                            (
-                                tyref_to_ast_string(&f.ty, llbc),
-                                tyref_to_attr_value_type(&f.ty, llbc),
-                            )
-                        };
-                        if let Some(off) =
-                            enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
-                        {
-                            voffsets.insert(fname.clone(), off);
+                // Per-variant subclasses carry each variant's OWN payload
+                // fields; a fieldless enum has none, so it needs no variant
+                // subclass registration.  Only the payload-enum sum type
+                // reaches here.
+                if !fieldless {
+                    for (vidx, v) in variants.iter().enumerate() {
+                        let variant_qual = format!("{name}::{}", v.name);
+                        let variant_leaf = format!("{leaf}::{}", v.name);
+                        let variant_canon = format!("{canon_base}::{}", v.name);
+                        let mut vrows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
+                        let mut vattrs: Vec<(String, ValueType)> =
+                            Vec::with_capacity(v.fields.len());
+                        let mut voffsets: std::collections::HashMap<String, u64> =
+                            std::collections::HashMap::new();
+                        for (i, f) in v.fields.iter().enumerate() {
+                            let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                            // A bytecode-arg marker reads as a `u32` at runtime
+                            // and annotates as an integer — keep the row string
+                            // and the FORCE attr type in agreement so the
+                            // projection refines the same shell.
+                            let (row_ty, attr_ty) = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
+                                ("u32".to_string(), ValueType::Int)
+                            } else {
+                                (
+                                    tyref_to_ast_string(&f.ty, llbc),
+                                    tyref_to_attr_value_type(&f.ty, llbc),
+                                )
+                            };
+                            if let Some(off) =
+                                enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
+                            {
+                                voffsets.insert(fname.clone(), off);
+                            }
+                            vattrs.push((fname.clone(), attr_ty));
+                            vrows.push((fname, row_ty));
                         }
-                        vattrs.push((fname.clone(), attr_ty));
-                        vrows.push((fname, row_ty));
+                        struct_fields
+                            .fields
+                            .insert(variant_qual.clone(), vrows.clone());
+                        struct_fields
+                            .fields
+                            .insert(variant_leaf.clone(), vrows.clone());
+                        struct_fields.fields.insert(variant_canon.clone(), vrows);
+                        // Object identity for the variant subclass, minted from
+                        // the crate-stripped `module::Enum::Variant`.
+                        let vsid = majit_ir::descr::StructId::from_canonical(&variant_canon);
+                        record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
+                        record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
+                        record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
+                        if let Some(l) = enum_layout.as_ref() {
+                            let exact = crate::front::semantic::ExactLayout {
+                                size: l.size,
+                                align: l.align,
+                                field_offsets: voffsets,
+                            };
+                            exact_layouts.insert(vsid, exact);
+                        }
+                        // Variant payload attrs for `FORCE_ATTRIBUTES_INTO_CLASSES`,
+                        // keyed by the canonical `module::Enum::Variant` — the
+                        // key `_init_classdef` derives for the variant classdef
+                        // whether the narrowing or the constructor minted it, so
+                        // the payload attrs are forced onto the one variant
+                        // class.  Mirrors the struct arm above.
+                        struct_field_attrs.insert(variant_canon, vattrs);
                     }
-                    struct_fields
-                        .fields
-                        .insert(variant_qual.clone(), vrows.clone());
-                    struct_fields
-                        .fields
-                        .insert(variant_leaf.clone(), vrows.clone());
-                    struct_fields.fields.insert(variant_canon.clone(), vrows);
-                    // Object identity for the variant subclass, minted from
-                    // the crate-stripped `module::Enum::Variant`.
-                    let vsid = majit_ir::descr::StructId::from_canonical(&variant_canon);
-                    record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
-                    record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
-                    record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
-                    if let Some(l) = enum_layout.as_ref() {
-                        let exact = crate::front::semantic::ExactLayout {
-                            size: l.size,
-                            align: l.align,
-                            field_offsets: voffsets,
-                        };
-                        exact_layouts.insert(vsid, exact);
-                    }
-                    // Variant payload attrs for `FORCE_ATTRIBUTES_INTO_CLASSES`,
-                    // keyed by the canonical `module::Enum::Variant` — the
-                    // key `_init_classdef` derives for the variant classdef
-                    // whether the narrowing or the constructor minted it, so
-                    // the payload attrs are forced onto the one variant
-                    // class.  Mirrors the struct arm above.
-                    struct_field_attrs.insert(variant_canon, vattrs);
                 }
                 // discriminant → variant name, published under both the
                 // qualified path and the bare leaf so the opcode-dispatch
@@ -6495,6 +6510,29 @@ impl<'a> Lowering<'a> {
                         }
                         None => (None, None),
                     };
+                    // A FIELDLESS enum is `Int`-valued (`tyref_to_value_type`),
+                    // and `&enum` aliases the enum value (`Rvalue::Ref` is the
+                    // identity), so `args[0]` already IS the discriminant int —
+                    // alias it directly rather than reading a `__discriminant`
+                    // field off an integer base (no rtype clsfield / blackhole
+                    // handler covers a getfield off an int).  Mirrors the
+                    // standalone `Rvalue::Discriminant` identity collapse.  A
+                    // payload enum keeps the `__discriminant` `FieldRead`.
+                    let pointee_fieldless = first_arg_ty
+                        .as_ref()
+                        .and_then(|t| self.tyref_ref_adt_def_id(t))
+                        .and_then(|id| self.llbc.type_by_id(id))
+                        .is_some_and(|td| {
+                            matches!(&td.kind, TypeDeclKind::Enum(vs)
+                                if !vs.is_empty() && vs.iter().all(|v| v.fields.is_empty()))
+                        });
+                    if pointee_fieldless {
+                        self.local_var[dest_local] = Some(args[0].clone());
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15668,7 +15706,12 @@ struct DebugEnumFmtCollapse {
 /// then declines, leaving the chain residual).
 fn debug_enum_disc_owner(graph: &FunctionGraph, enum_value: &Variable) -> Option<String> {
     let (block, idx) = resolve_to_producer_op(graph, enum_value)?;
-    let op = graph.blocks.iter().find(|b| b.id == block)?.operations.get(idx)?;
+    let op = graph
+        .blocks
+        .iter()
+        .find(|b| b.id == block)?
+        .operations
+        .get(idx)?;
     match &op.kind {
         OpKind::Input {
             class_root: Some(root),
@@ -17000,7 +17043,10 @@ mod tests {
         let disc_read = bf_block.operations.iter().any(|op| {
             matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
         });
-        assert!(!disc_read, "no __discriminant field read (enum value is the tag)");
+        assert!(
+            !disc_read,
+            "no __discriminant field read (enum value is the tag)"
+        );
 
         // Two variant arms + a default arm.
         assert_eq!(bf_block.exits.len(), 3, "two variant arms + default");
