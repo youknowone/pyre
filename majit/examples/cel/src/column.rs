@@ -1,6 +1,6 @@
 //! cell-majit de-risk — COLUMNAR read kill-test (issue #357). ZERO CEL text.
 //!
-//! `celprobe`/`celpolicy` proved majit beats a clean interpreter on batches
+//! The `probe`/`policy` machines proved majit beats a clean interpreter on batches
 //! whose per-row inputs are SYNTHESIZED in-trace by an LCG. The open question
 //! blocking a REAL cel batch evaluator: can a compiled majit trace read an
 //! actual external i64 data column at a RED (data-dependent) row index and
@@ -24,11 +24,10 @@
 //! baseline, also reads raw memory), (c) JIT-off. Meaningful ratio = (b)/(a).
 //! RELEASE ONLY (i64 wrap; 3-way equality gate).
 
+use crate::common::*;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-
-pub type Code = [i64];
 
 const OP_LOAD: i64 = 0; // [LOAD, imm, dst]
 const OP_ADD: i64 = 1; // [ADD, a, b, dst]
@@ -37,19 +36,6 @@ const OP_JUMP_IF_ABOVE: i64 = 3; // [JIA, a, b, target_pc]
 const OP_RETURN: i64 = 4; // [RETURN, reg]
 const OP_COL_LOAD: i64 = 5; // [COL_LOAD, base_reg, ea_reg, dst]  dst = *(regs[base]+regs[ea])
 const OP_GE: i64 = 6; // [GE, a, b, dst]  dst = (regs[a] >= regs[b]) as {0,1}
-
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-pub static ABORTS: AtomicUsize = AtomicUsize::new(0);
-
-const LCG_A: i64 = 6364136223846793005;
-const LCG_C: i64 = 1442695040888963407;
-
-/// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
-/// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
-/// `base`/`ea` are an address and a byte offset. Copied from the wasmi kernel.
-fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
-    unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const i64) }
-}
 
 struct VmState {
     regs: Vec<i64>,
@@ -314,9 +300,6 @@ fn policy_program(n: i64, base_a: i64, base_b: i64) -> Vec<i64> {
     ]
 }
 
-const JIT_ON: u32 = 8;
-const JIT_OFF: u32 = u32::MAX;
-
 fn make_col(n: i64, seed: i64) -> Vec<i64> {
     let mut v = Vec::with_capacity(n as usize);
     let mut x = seed;
@@ -327,11 +310,6 @@ fn make_col(n: i64, seed: i64) -> Vec<i64> {
     v
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
-
 fn time_ns_per_row<F: Fn() -> i64>(n: i64, f: F) -> f64 {
     let t = Instant::now();
     black_box(f());
@@ -340,7 +318,12 @@ fn time_ns_per_row<F: Fn() -> i64>(n: i64, f: F) -> f64 {
 
 /// Run one program: 3-way equality gate (small n) then interleaved A/B/C
 /// timing (large n). `hold` keeps the backing column buffers alive.
-fn run(label: &str, num_regs: usize, prog_at: &dyn Fn(i64) -> Vec<i64>, hold: &[&Vec<i64>]) {
+fn run_program(
+    label: &str,
+    num_regs: usize,
+    prog_at: &dyn Fn(i64) -> Vec<i64>,
+    hold: &[&Vec<i64>],
+) {
     let gn: i64 = std::env::var("CELGATE_N")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -391,7 +374,7 @@ fn run(label: &str, num_regs: usize, prog_at: &dyn Fn(i64) -> Vec<i64>, hold: &[
     black_box(hold);
 }
 
-fn main() {
+pub fn run() {
     let n: i64 = 20_000_000;
     // REAL data columns: LCG-filled, distinct, non-foldable.
     let col_a = make_col(n, 0x2545F4914F6CDD1D);
@@ -400,9 +383,9 @@ fn main() {
     let base_b = col_b.as_ptr() as i64;
 
     println!("columnar red-index reads via raw_load_i (base in register file)\n");
-    run("SUM   ", SUM_REGS, &|k| sum_program(k, base_a), &[&col_a]);
+    run_program("SUM   ", SUM_REGS, &|k| sum_program(k, base_a), &[&col_a]);
     println!();
-    run(
+    run_program(
         "POLICY",
         POL_REGS,
         &|k| policy_program(k, base_a, base_b),

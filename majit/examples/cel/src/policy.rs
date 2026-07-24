@@ -1,6 +1,6 @@
 //! cell-majit de-risk — CEL-subset policy prototype (issue #357). ZERO CEL text.
 //!
-//! The kill-test (`celprobe`) proved majit beats a clean interpreter ~10x on a
+//! The kill-test (`probe`) proved majit beats a clean interpreter ~10x on a
 //! straight-line ARITHMETIC batch. This prototype takes the next step: a
 //! realistic POLICY PREDICATE with comparisons + boolean AND over slot-resolved
 //! context fields, probing whether slot-resolution defeats the "member_access
@@ -30,11 +30,10 @@
 //!   (a) majit JIT-on, (b) clean hand interp (honest baseline), (c) JIT-off.
 //! Meaningful ratio = (b)/(a). RELEASE ONLY (i64 wrap; 3-way equality gate).
 
+use crate::common::*;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-
-pub type Code = [i64];
 
 const OP_LOAD: i64 = 0; // [LOAD, imm, dst]
 const OP_ADD: i64 = 1; // [ADD, a, b, dst]
@@ -45,10 +44,6 @@ const OP_EQ: i64 = 5; // [EQ, a, b, dst]  dst = (a==b) as {0,1}
 const OP_JUMP_IF_ABOVE: i64 = 6; // [JIA, a, b, target_pc]
 const OP_RETURN: i64 = 7; // [RETURN, reg]
 
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-
-const LCG_A: i64 = 6364136223846793005;
-const LCG_C: i64 = 1442695040888963407;
 const SEED: i64 = 0x2545F4914F6CDD1D;
 const LO: i64 = i64::MIN + 1; // `bal >= LO` ~always true, not foldable
 const HI: i64 = i64::MAX; // `draw >= HI` ~always false, not foldable
@@ -494,14 +489,6 @@ fn comprehension_unrolled_program(n: i64, listlen: i64) -> Vec<i64> {
     p
 }
 
-const JIT_ON: u32 = 8;
-const JIT_OFF: u32 = u32::MAX;
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
-
 fn time_ns<F: Fn() -> i64>(n: i64, f: F) -> f64 {
     let t = Instant::now();
     black_box(f());
@@ -542,7 +529,7 @@ fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize) {
     );
 }
 
-fn main() {
+pub fn run() {
     let n: i64 = 5_000_000;
     println!("policy: account.balance >= txn.amount && !account.frozen  (slot-resolved)\n");
     run_regime("SKEWED  ", &skewed_program(n), n, 5);

@@ -1,11 +1,11 @@
 //! Float register machine — the honest fair-win probe for the float macro path.
 //!
-//! celfloat originally fused raw_load+add+i++ into ONE opcode; that made the
+//! This machine originally fused raw_load+add+i++ into ONE opcode; that made the
 //! clean interpreter a single-op memory-bandwidth-bound loop with no dispatch
 //! for the JIT to eliminate, so the JIT could not win (0.62x). That was a
-//! kernel artifact, not a float-JIT defect. This rewrite mirrors celcolumn's
-//! honest structure: a PER-OP bytecode machine whose clean interpreter pays
-//! real dispatch cost, so the win is attributable to compilation.
+//! kernel artifact, not a float-JIT defect. This rewrite mirrors the `column`
+//! probe's honest structure: a PER-OP bytecode machine whose clean interpreter
+//! pays real dispatch cost, so the win is attributable to compilation.
 //!
 //! Addressing (i, n, base_a, base_b) lives in SCALAR int state fields; values
 //! (column reads, accumulator) live in a `[float; virt]` register bank. Three
@@ -14,11 +14,10 @@
 //!   DOT     — sum(a[i]*b[i])         2 loads, 1 mul + 1 add
 //!   COMPUTE — sum(a*b - a*a + b*b)   2 loads, 5 float ops   (compute-bound)
 
+use crate::common::{ABORTS, COMPILES, Code, JIT_OFF, JIT_ON, majit_raw_load_f, median};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-
-pub type Code = [i64];
 
 const OP_LOAD_A: i64 = 0; // [OP, dst]        regs[dst] = a[i]
 const OP_LOAD_B: i64 = 1; // [OP, dst]        regs[dst] = b[i]
@@ -40,18 +39,6 @@ const R6: usize = 7;
 const NUM_REGS: usize = 8;
 
 const BODY_PC: usize = 0;
-
-const JIT_ON: u32 = 8;
-const JIT_OFF: u32 = u32::MAX;
-
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-pub static ABORTS: AtomicUsize = AtomicUsize::new(0);
-
-/// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
-/// macro (lowered to `raw_load_f`); at the interpreter tier this real fn runs.
-fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
-    unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const f64) }
-}
 
 struct VmState {
     i: i64,
@@ -790,11 +777,6 @@ fn time_ns_per_row<F: Fn() -> f64>(n: i64, f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
-fn median(mut xs: Vec<f64>) -> f64 {
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    xs[xs.len() / 2]
-}
-
 fn perf_probe(label: &str, prog: &Code, col_a: &[f64], col_b: &[f64]) {
     let n = std::env::var("CELFLOAT_PERF_N")
         .ok()
@@ -818,7 +800,7 @@ fn perf_probe(label: &str, prog: &Code, col_a: &[f64], col_b: &[f64]) {
     );
 }
 
-fn main() {
+pub fn run() {
     let max_n = 1_100_000usize;
     let col_a = make_col(max_n, 0x2545_F491_4F6C_DD1D);
     let col_b = make_col(max_n, 0x9E37_79B9_7F4A_7C15);

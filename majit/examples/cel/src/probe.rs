@@ -25,12 +25,10 @@
 //! RELEASE ONLY: `acc`/`x` wrap i64 and all three paths must wrap identically
 //! (`+`/`*` in release), so the equality gate needs overflow checks off.
 
+use crate::common::*;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-
-/// The env: an i64-word bytecode stream (8-byte elements).
-pub type Code = [i64];
 
 const OP_LOAD: i64 = 0; // [LOAD, imm, dst]
 const OP_ADD: i64 = 1; // [ADD, a, b, dst]
@@ -38,13 +36,6 @@ const OP_JUMP_IF_ABOVE: i64 = 2; // [JIA, a, b, target_pc]
 const OP_RETURN: i64 = 3; // [RETURN, reg]
 const OP_MUL: i64 = 4; // [MUL, a, b, dst]
 const OP_SUB: i64 = 5; // [SUB, a, b, dst]
-
-/// Hot loops majit compiled — evidence the JIT tier traced + compiled.
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-
-// LCG (Knuth MMIX) constants — a serial recurrence, unfoldable/unvectorizable.
-const LCG_A: i64 = 6364136223846793005;
-const LCG_C: i64 = 1442695040888963407;
 
 struct VmState {
     regs: Vec<i64>,
@@ -254,13 +245,6 @@ fn batch_program(n: i64) -> Vec<i64> {
 
 const NUM_REGS: usize = 12;
 const BODY_PC: usize = 30;
-const JIT_ON: u32 = 8;
-const JIT_OFF: u32 = u32::MAX;
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
 
 fn time_ns_per_eval<F: Fn() -> i64>(n: i64, f: F) -> f64 {
     let t = Instant::now();
@@ -268,7 +252,7 @@ fn time_ns_per_eval<F: Fn() -> i64>(n: i64, f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
-fn main() {
+pub fn run() {
     // Sanity: the body really starts at BODY_PC (the backward JIA target).
     assert_eq!(batch_program(1)[BODY_PC], OP_MUL, "BODY_PC out of sync");
 

@@ -2,16 +2,15 @@
 //! does WRITING that field every iteration (as the wasmi kernel does with
 //! `state.mem_base = __mb`) change the outcome vs a READ-ONLY scalar field?
 //!
-//! `celcolumn` proved base-in-REGISTER compiles (13-16x). This isolates the
+//! The `column` probe proved base-in-REGISTER compiles (13-16x). This isolates the
 //! VirtualStatesCantMatch root cause: base-in-SCALAR-FIELD. Two programs,
 //! identical except one re-writes the scalar field each iteration:
 //!   * RDONLY  — `state.col_base` set once at init, only READ in the loop.
 //!   * WRITTEN — `state.col_base` re-assigned from a register every iteration.
 //! Prints compiles/aborts for each. RELEASE ONLY.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-pub type Code = [i64];
+use crate::common::*;
+use std::sync::atomic::Ordering;
 
 const OP_LOAD: i64 = 0; // [LOAD, imm, dst]
 const OP_ADD: i64 = 1; // [ADD, a, b, dst]
@@ -20,16 +19,6 @@ const OP_JUMP_IF_ABOVE: i64 = 3; // [JIA, a, b, target_pc]
 const OP_RETURN: i64 = 4; // [RETURN, reg]
 const OP_COL_LOAD_SF: i64 = 5; // [COL_LOAD_SF, ea_reg, dst]  dst=*(col_base+regs[ea])
 const OP_SET_BASE: i64 = 6; // [SET_BASE, src_reg]  state.col_base = regs[src]
-
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-pub static ABORTS: AtomicUsize = AtomicUsize::new(0);
-
-const LCG_A: i64 = 6364136223846793005;
-const LCG_C: i64 = 1442695040888963407;
-
-fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
-    unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const i64) }
-}
 
 struct VmState {
     regs: Vec<i64>,
@@ -267,9 +256,6 @@ fn written_program(n: i64, base: i64) -> Vec<i64> {
     ]
 }
 
-const JIT_ON: u32 = 8;
-const JIT_OFF: u32 = u32::MAX;
-
 fn make_col(n: i64) -> Vec<i64> {
     let mut v = Vec::with_capacity(n as usize);
     let mut x = 0x2545F4914F6CDD1Di64;
@@ -280,7 +266,7 @@ fn make_col(n: i64) -> Vec<i64> {
     v
 }
 
-fn run(label: &str, prog: &[i64], col_base: i64) {
+fn run_case(label: &str, prog: &[i64], col_base: i64) {
     COMPILES.store(0, Ordering::Relaxed);
     ABORTS.store(0, Ordering::Relaxed);
     let clean = clean_interp(prog, NUM_REGS, col_base);
@@ -301,7 +287,7 @@ fn run(label: &str, prog: &[i64], col_base: i64) {
     println!("[{label}] compiles: off={off_c} on={on_c}  aborts(on)={on_a}  -> {verdict}");
 }
 
-fn main() {
+pub fn run() {
     let n: i64 = std::env::var("CELN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -309,7 +295,7 @@ fn main() {
     let col = make_col(n);
     let base = col.as_ptr() as i64;
     println!("scalar-int-state-field base for raw_load: read-only vs written\n");
-    run("RDONLY ", &rdonly_program(n), base);
-    run("WRITTEN", &written_program(n, base), base);
+    run_case("RDONLY ", &rdonly_program(n), base);
+    run_case("WRITTEN", &written_program(n, base), base);
     std::hint::black_box(&col);
 }
