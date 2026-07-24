@@ -2106,6 +2106,23 @@ fn load_source_module(
     let module = pyre_object::w_module_new_aliasing_dict(modulename, canonical);
     set_sys_module(modulename, module);
 
+    // `_frozen_importlib`'s install() (moduledef.py:17-49) executes the two
+    // bootstrap sources under their frozen names, so classes defined in them
+    // capture `__module__` = the frozen name; importlib/__init__.py then renames
+    // the modules to `importlib._bootstrap{,_external}` afterward.  Mirror that:
+    // exec under the frozen `__name__`, restore it after (before install, whose
+    // `sys.modules[__name__]` lookups need the real name).
+    let frozen_exec_name = match modulename {
+        "importlib._bootstrap" => Some("_frozen_importlib"),
+        "importlib._bootstrap_external" => Some("_frozen_importlib_external"),
+        _ => None,
+    };
+    if let Some(frozen) = frozen_exec_name {
+        unsafe {
+            pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new(frozen));
+        }
+    }
+
     // PyPy `importing.py:300` passes `pathname`/`cpathname` to
     // `exec_code_module`; pyre has no .pyc cache today so cpathname is
     // always None, matching the PyPy `cpathname is None` arm at line
@@ -2123,6 +2140,18 @@ fn load_source_module(
     ) {
         remove_sys_module(modulename);
         return Err(e);
+    }
+
+    // Restore the public name now that class bodies have captured the frozen
+    // `__module__`; `module.__name__` resolves from this dict entry.
+    if frozen_exec_name.is_some() {
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                w_globals,
+                "__name__",
+                pyre_object::w_str_new(modulename),
+            );
+        }
     }
 
     // Module-level code may have rewritten `sys.modules[name]` (the
