@@ -4226,6 +4226,35 @@ impl<'a> Lowering<'a> {
                     let base = self.resolve_place(mir_bb, place)?;
                     return Ok((None, base));
                 }
+                // A niche `Option<NonNull<T>>` is one pointer word: `None`
+                // = null, `Some(p)` = the non-null pointer.  Its
+                // discriminant is the pointer-null test `base != null`
+                // (`None` = 0, `Some` = 1), not a `__discriminant` field off
+                // a two-word aggregate base (there is none).  Emit the null
+                // constant, then compare — a `ne` on two `Ref` operands
+                // lowers to `ptr_ne` (`jtransform`), and its `Int` result
+                // feeds the match switch exactly as a `__discriminant` read
+                // would.  Modelling the maybe-null pointer this way is the
+                // orthodox representation (RPython has no `Option`; a
+                // maybe-null `Ptr` tests `ptr_nonzero`).
+                if self.tyref_is_niche_option_ptr(&place.ty) {
+                    let base = self.resolve_place(mir_bb, place)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let nullc = self.graph.alloc_value_var();
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(nullc.clone()),
+                        kind: OpKind::ConstRefNull,
+                    });
+                    return Ok((
+                        Some(OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: base,
+                            rhs: nullc,
+                            result_ty: ValueType::Int,
+                        }),
+                        res,
+                    ));
+                }
                 let base = self.resolve_place(mir_bb, place)?;
                 Ok((
                     Some(OpKind::FieldRead {
@@ -4357,6 +4386,16 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
+                    // A niche `Option<NonNull<T>>` is one pointer word, so the
+                    // `Some` payload IS the base pointer — reading `Some.__pos_0`
+                    // is the identity on it, not a field off a two-word
+                    // aggregate (there is none, and its `__pos_0` attr has no
+                    // rtype clsfield).  Alias the base value with no field read,
+                    // mirroring the fieldless-enum discriminant collapse and the
+                    // `Discriminant` niche fold above.
+                    if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
+                        return self.resolve_place(mir_bb, *inner);
+                    }
                     // Narrow a classdef-less raw-pointer-deref base to
                     // `SomeInstance(<pointee root>)` before the field read.
                     // A `(*p).field` where `p: *mut/*const <Struct>` deref's to
@@ -9286,6 +9325,50 @@ impl<'a> Lowering<'a> {
             }
             _ => false,
         }
+    }
+
+    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>` — an
+    /// `Option` whose sole payload is a `core::ptr::non_null::NonNull`
+    /// wrapper.  Rust encodes such an Option in ONE pointer word (`None`
+    /// = null, `Some(p)` = the non-null pointer), so `Discriminant` on it
+    /// is a pointer-null test (`base != null`) and the `Some` payload read
+    /// is the identity on that pointer — no aggregate `__discriminant` /
+    /// `__pos_0` field exists.  This mirrors the fieldless-enum by-value
+    /// model ([`Self::tyref_is_fieldless_enum`]).
+    ///
+    /// Gated strictly to the `NonNull` payload: a raw `*mut T` / `*const T`
+    /// payload (`Option<*mut PyObject>`) has NO null niche — Rust lays it
+    /// out as a two-word tagged aggregate (discriminant word + pointer
+    /// word), so folding it to a one-word pointer would read the tag word
+    /// as the payload.  A `&T` payload is also niche, but the object
+    /// pointers this models are spelled `NonNull`, so only that shape
+    /// matches.
+    fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
+        if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
+            return false;
+        }
+        let Some(node) = tyref_node(ty, self.llbc) else {
+            return false;
+        };
+        let Some(payload) = node
+            .as_object()
+            .and_then(|m| m.get("Adt"))
+            .and_then(|a| a.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+            .and_then(|p| strip_ty_wrappers(p, self.llbc))
+        else {
+            return false;
+        };
+        let Some(def_id) = adt_node_def_id(payload) else {
+            return false;
+        };
+        self.llbc
+            .type_by_id(def_id)
+            .map(|td| td.item_meta.name_path())
+            .as_deref()
+            == Some("core::ptr::non_null::NonNull")
     }
 
     /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
@@ -19402,6 +19485,44 @@ mod tests {
         assert!(
             has_value_switch,
             "call_intrinsic_1: expected an enum-discriminant switch after the collapse"
+        );
+    }
+
+    /// The niche-`Option<NonNull>` fold must stay INERT on the current
+    /// `Option<*mut PyObject>` tree: a raw `*mut` payload has no null
+    /// niche (two-word tagged aggregate), so `tyref_is_niche_option_ptr`
+    /// must reject it and `gettypeobject`
+    /// (`gettypefor(..).unwrap_or(PY_NULL)`, a 14-head census function)
+    /// must still lower its Option match through the aggregate
+    /// `__discriminant` FieldRead path — NOT the niche `ptr_ne` /
+    /// `ConstRefNull` fold.  Guards against the detector matching a
+    /// two-word Option before the `NonNull` source swap lands (a
+    /// miscompile: the pointer bits would be read as the tag).  Ignored by
+    /// default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn niche_option_fold_inert_on_raw_ptr_option() {
+        use crate::model::OpKind;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "gettypeobject").expect("lower gettypeobject");
+
+        // No niche fold artefact: the fold emits a `ConstRefNull` feeding a
+        // `ne` BinOp.  A raw-`*mut` Option must produce neither.
+        let null_consts = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::ConstRefNull))
+            .count();
+        assert_eq!(
+            null_consts, 0,
+            "gettypeobject: niche fold fired on a raw-*mut Option (ConstRefNull emitted)"
         );
     }
 }
