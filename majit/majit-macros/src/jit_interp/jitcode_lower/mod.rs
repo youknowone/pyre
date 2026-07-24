@@ -260,7 +260,6 @@ impl LowererConfig {
     }
 
     /// One past the last float-bank identity slot.
-    #[allow(dead_code)]
     pub(super) fn float_identity_end(&self) -> u16 {
         if self.state_float_scalars.is_empty() {
             0

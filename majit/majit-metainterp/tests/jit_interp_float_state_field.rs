@@ -287,3 +287,93 @@ mod scalar_f32 {
         assert_ne!(live[1], 1.5f32.to_bits() as i64);
     }
 }
+
+// Finding D: with two float scalars {a, b} their canonical identity slots
+// are float f0/f1. `alloc_reg` draws float working registers from the flat
+// `next_reg`, which was floored past only the int/ref identity ends. For a
+// float-only state those ends (int end = 1, ref end = 0) are below the float
+// end (2), so a read of `state.a` allocated a temp at f1 — `b`'s identity
+// slot — and `load_state_field_float`'s register-bank copy on blackhole
+// resume overwrote `b`. Flooring `next_reg` past `float_identity_end()` too
+// keeps float temps above the reserved prefix.
+mod scalar_float_slot_reserve {
+    use super::{Bytecode, all_jitcode_bodies};
+    use majit_metainterp::jitcode::insns::BC_LOAD_STATE_FIELD_FLOAT;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    struct TwoFloatState {
+        a: f64,
+        b: f64,
+    }
+
+    const OP_NOP: u8 = 0;
+    const OP_MIX: u8 = 1;
+
+    #[majit_macros::jit_interp(
+        state = TwoFloatState,
+        env = Bytecode,
+        state_fields = { a: float, b: float },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn two_float_minimal(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<TwoFloatState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = TwoFloatState { a: 0.0, b: 0.0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_NOP => {}
+                // Reads `a` into a float temp, then writes `b`.
+                OP_MIX => state.b = state.a + 1.5,
+                _ => break,
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn float_temp_does_not_alias_a_sibling_identity_slot() {
+        // Two float scalars → identity slots f0 (a) and f1 (b);
+        // `float_identity_end()` == 2. Every `load_state_field_float` dest is
+        // a working register that must sit at or above that end.
+        const FLOAT_IDENTITY_END: u8 = 2;
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![], vec![], vec![0, 1]);
+        __prebuild_jitcode_liveness_two_float_minimal(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_two_float_minimal(&mut asm, 0i64)
+            .expect("dispatch lower must succeed for the two-float fixture");
+        let bodies = all_jitcode_bodies(&dispatch_jc);
+        // `load_state_field_float/df`: [opcode][field_idx:u16 LE][dest:u8].
+        // Match only a plausible field index (high byte 0, index < 2) so an
+        // operand byte that happens to equal the opcode is not misread.
+        let mut seen_load = false;
+        for body in &bodies {
+            let mut i = 0;
+            while i + 3 < body.len() {
+                if body[i] == BC_LOAD_STATE_FIELD_FLOAT && body[i + 2] == 0 && body[i + 1] < 2 {
+                    let dest = body[i + 3];
+                    assert!(
+                        dest >= FLOAT_IDENTITY_END,
+                        "load_state_field_float dest f{dest} aliases a reserved \
+                         float identity slot [0, {FLOAT_IDENTITY_END}); body: {body:?}"
+                    );
+                    seen_load = true;
+                }
+                i += 1;
+            }
+        }
+        assert!(
+            seen_load,
+            "fixture must emit at least one load_state_field_float; bodies: {bodies:?}"
+        );
+    }
+}

@@ -133,6 +133,17 @@ fn split_identity_floor(config: Option<&LowererConfig>) -> u16 {
         .unwrap_or(0)
 }
 
+/// Floor for a sub-JitCode body's flat `next_reg` past the float identity
+/// slots `[float_identity_base, float_identity_end)`. Unlike the int/ref
+/// `split_identity_floor`, this is NOT gated on `split_dispatch`: a non-split
+/// arm sub-JitCode's `load_state_field_float` / const loads address the same
+/// caller-frame float bank, and floats have no caller-local to raise the
+/// pre-bound floor, so a temp would otherwise alias a sibling float scalar's
+/// identity slot (`{ a: float, b: float }`: a read of `a` lands on `b`).
+fn float_identity_floor(config: Option<&LowererConfig>) -> u16 {
+    config.map(|c| c.float_identity_end()).unwrap_or(0)
+}
+
 /// Compile-time guard for `split_dispatch`: no caller-local may be pre-bound
 /// into its bank's reserved identity range `[identity_base, identity_end)`.
 /// Those registers hold the virtualizable identity (array base/len, state
@@ -209,7 +220,8 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     lowerer.next_reg = lowerer
         .next_reg
         .max(max_pre_bound)
-        .max(split_identity_floor(config));
+        .max(split_identity_floor(config))
+        .max(float_identity_floor(config));
 
     for stmt in &stmts {
         lowerer.lower_stmt(stmt)?;
@@ -274,7 +286,8 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     lowerer.next_reg = lowerer
         .next_reg
         .max(max_pre_bound)
-        .max(split_identity_floor(config));
+        .max(split_identity_floor(config))
+        .max(float_identity_floor(config));
 
     for stmt in work {
         lowerer.lower_stmt(stmt)?;

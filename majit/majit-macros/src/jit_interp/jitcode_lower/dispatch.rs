@@ -3319,7 +3319,19 @@ pub(crate) fn lower_dispatch_body(
     let int_identity_end = config.int_identity_base()
         + config.state_scalars.len() as u16
         + 2 * config.state_virt_arrays.len() as u16;
-    lowerer.next_reg = lowerer.next_reg.max(int_identity_end).max(ref_identity_end);
+    // Float scalars seed their own reserved prefix at
+    // `float_regs[float_identity_base()..float_identity_end())`, restored by
+    // the guard-failure resume seeder just like the int/ref banks. `alloc_reg`
+    // also draws float working registers from `next_reg`, so a float-heavy
+    // state (whose float_identity_end exceeds the int/ref ends) would otherwise
+    // hand out a working register aliasing a float identity slot and corrupt a
+    // sibling scalar (`{ a: float, b: float }`: a read of `a` could land on
+    // `b`'s slot).
+    lowerer.next_reg = lowerer
+        .next_reg
+        .max(int_identity_end)
+        .max(ref_identity_end)
+        .max(config.float_identity_end());
 
     // A.3.6.1 (jtransform.py:1693): bind body-local `let` stmts that
     // appear BEFORE `jit_merge_point!()` in the dispatch while-body, so
