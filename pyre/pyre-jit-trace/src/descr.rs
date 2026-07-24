@@ -2624,6 +2624,14 @@ pub fn w_exception_slot_descr(
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename => 13,
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename2 => 14,
         pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => 15,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback => 5,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeObject => 6,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeStart => 7,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEnd => 8,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeReason => 9,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEncoding => 10,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Name => 16,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::AttrObj => 17,
     };
     field_descr_from_group(cache[idx].as_ref().unwrap(), field_index)
 }

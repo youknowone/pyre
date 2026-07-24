@@ -2083,10 +2083,18 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     )
                 }
                 pyre_interpreter::baseobjspace::ExceptionAttrSlot::Context
-                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause => {
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::Name
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::AttrObj
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeObject
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeStart
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEnd
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeReason
+                | pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEncoding => {
                     // `exception_attr_slot_fold` declines these for stores, so
                     // the store fold never reaches here.
-                    unreachable!("__context__/__cause__ slots fold on load only")
+                    unreachable!("load-only exception slots fold on load only")
                 }
                 pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => {
                     pyre_object::interp_exceptions::w_exception_set_code(
@@ -5260,7 +5268,9 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[class_op, expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(class_op, expected);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(class_op, expected);
     }
 
     // Empty `args_w` list (zero-argument construction), stamped with the
