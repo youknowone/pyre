@@ -1529,7 +1529,7 @@ thread_local! {
     static SYS_DEV_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SYS_UTF8_MODE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static SYS_SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_OPTIMIZE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static SYS_OPTIMIZE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static SYS_DONT_WRITE_BYTECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1556,7 +1556,7 @@ pub fn set_runtime_flags(
     dev_mode: bool,
     utf8_mode: i64,
     safe_path: bool,
-    optimize: u8,
+    optimize: i64,
     dont_write_bytecode: bool,
 ) {
     SYS_NO_USER_SITE.with(|p| p.set(no_user_site));
@@ -1593,10 +1593,20 @@ pub fn safe_path_flag() -> bool {
     SYS_SAFE_PATH.with(|p| p.get())
 }
 
-/// `-O` / `-OO` / PYTHONOPTIMIZE level, driving `sys.flags.optimize` and the
-/// default compile `optimize` (stripped asserts, `__debug__` = False, and at
-/// level 2 discarded docstrings).
+/// `-O` / `-OO` / PYTHONOPTIMIZE level for the default compile `optimize`
+/// (stripped asserts, `__debug__` = False, and at level 2 discarded
+/// docstrings), clamped into the compiler's byte-wide field.  Levels above 2
+/// behave as 2.
 pub fn optimize_flag() -> u8 {
+    SYS_OPTIMIZE
+        .with(|p| p.get())
+        .clamp(0, i64::from(u8::MAX)) as u8
+}
+
+/// The raw optimization level for `sys.flags.optimize`, mirroring a large
+/// `PYTHONOPTIMIZE` value verbatim; `optimize_flag` clamps this for the
+/// compiler.
+pub fn optimize_level() -> i64 {
     SYS_OPTIMIZE.with(|p| p.get())
 }
 

@@ -746,7 +746,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     fns,
                     "optimize",
-                    w_int_new(i64::from(crate::importing::optimize_flag())),
+                    w_int_new(crate::importing::optimize_level()),
                 )
             };
             unsafe {

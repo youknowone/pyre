@@ -48,7 +48,7 @@ struct LaunchFlags {
     utf8_mode: Option<i64>,
     safe_path: bool,
     // `-O` count on the command line; PYTHONOPTIMIZE folds in during finalize.
-    optimize: u8,
+    optimize: i64,
     dont_write_bytecode: bool,
 }
 
@@ -169,15 +169,17 @@ fn env_int_flag(name: &str) -> Option<u32> {
 }
 
 /// `-O` count folded with PYTHONOPTIMIZE (`config_init_optimization_level`):
-/// the effective level is the larger of the two.
-fn resolve_optimize(flags: &LaunchFlags) -> u8 {
-    let mut level = u32::from(flags.optimize);
+/// the effective level is the larger of the two.  The level is kept as a wide
+/// integer so `sys.flags.optimize` mirrors a large `PYTHONOPTIMIZE` verbatim;
+/// the compiler clamps it into a byte at read time.
+fn resolve_optimize(flags: &LaunchFlags) -> i64 {
+    let mut level = flags.optimize;
     if !flags.ignore_environment {
         if let Some(v) = env_int_flag("PYTHONOPTIMIZE") {
-            level = level.max(v);
+            level = level.max(i64::from(v));
         }
     }
-    level.min(u32::from(u8::MAX)) as u8
+    level
 }
 
 /// `-B` folded with PYTHONDONTWRITEBYTECODE: either disables bytecode caches.
