@@ -442,6 +442,15 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                     return Ok(w);
                 }
             }
+            // A `types.ModuleType` subclass `__repr__` override may likewise
+            // return a lone surrogate; read it as WTF-8 rather than folding to
+            // `&str`. Without an override, the native module repr is plain and
+            // delegates to `py_repr` below.
+            if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
+                if let Some(r) = module_user_dunder_obj(obj, "__repr__")? {
+                    return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+                }
+            }
         }
         Ok(Wtf8Buf::from_string(py_repr(obj)?))
     }
@@ -1171,6 +1180,16 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
                 if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
                     return Ok(w);
                 }
+            }
+            // A `types.ModuleType` subclass `__str__` override may likewise
+            // return a lone surrogate; read it as WTF-8. Without one, `str`
+            // falls back to `__repr__`, kept on the WTF-8 path so a
+            // surrogate-bearing module `__repr__` is preserved too.
+            if pyre_object::is_module(obj) {
+                if let Some(r) = module_user_dunder_obj(obj, "__str__")? {
+                    return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+                }
+                return py_repr_wtf8(obj);
             }
         }
         Ok(Wtf8Buf::from_string(py_str(obj)?))
