@@ -142,6 +142,28 @@ thread_local! {
     static TL_JIT_PENDING_EXCEPTION: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Serialize tests that mutate the process-global stack-probe state with
+    /// tests that execute compiled traces reading that state.
+    ///
+    /// The Rust test harness runs both groups in parallel. Keeping separate
+    /// locks lets a stack-check test plant a synthetic `stack_end` or
+    /// `stack_length` while a Cranelift prologue is probing the real thread
+    /// stack, producing a spurious overflow. This lock also remains the
+    /// single-threaded ownership boundary for the process-global JIT compiler
+    /// state.
+    static STACK_AND_JIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the shared test lock, tolerating poisoning so one failed test
+    /// does not cascade into the rest of the test binary.
+    pub(crate) fn stack_and_jit_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STACK_AND_JIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 // The visible recursion limit lives in `crate::module::sys::state`
 // (`space.sys.recursionlimit` parity, `pypy/module/sys/vm.py:96`);
 // `stack_check` forwards reads/writes through
@@ -540,18 +562,11 @@ pub extern "C" fn stack_almost_full() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialize access to the global `PYRE_STACKTOOBIG` so parallel
-    /// test threads can't stomp on each other. Previously the state
-    /// was per-thread (`thread_local!`) and tests didn't need this
-    /// lock; moving to a process-wide global (for JIT addressability)
-    /// introduces contention.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Reset every shared or thread-local stack-check slot back to its
-    /// default — call from each test under `TEST_LOCK` so the order
-    /// tests run in cannot poison shared state.
+    /// default — call from each test under `STACK_AND_JIT_TEST_LOCK`
+    /// so neither another stack-state test nor a compiled trace can
+    /// observe the synthetic values.
     fn reset_all() {
         reset_stack_base();
         PYRE_STACKTOOBIG
@@ -586,7 +601,7 @@ mod tests {
     /// Acquire the test mutex, tolerating poisoning so a single
     /// previous-test panic doesn't cascade into every follow-up test.
     fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        test_support::stack_and_jit_test_guard()
     }
 
     #[test]

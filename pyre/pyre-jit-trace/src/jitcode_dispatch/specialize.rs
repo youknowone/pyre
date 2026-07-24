@@ -678,7 +678,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     }
     use pyre_interpreter::bytecode::BinaryOperator;
     use pyre_interpreter::objspace::descroperation as desc;
-    type PayloadFn = extern "C" fn(i64, i64) -> *mut pyre_object::rbigint::RBigInt;
+    type PayloadFn = extern "C" fn(i64, i64) -> pyre_object::longobject::JitBigIntResult;
     let (helper, commutative): (PayloadFn, bool) =
         match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
             Some(BinaryOperator::Add | BinaryOperator::InplaceAdd) => {

@@ -153,7 +153,7 @@ fn bigint_pow_nomod(a: &BigInt, b: &BigInt) -> Result<BigInt, PyError> {
 ///
 /// `long_lshift` has already validated the count exactly like
 /// longobject.py:372-381.  The MIR front retargets this Result carrier to the
-/// pointer-returning `jit_bigint_lshift_count` residual, just as it does for
+/// GCREF-returning `jit_bigint_lshift_count` residual, just as it does for
 /// `bigint_pow_nomod`.
 #[majit_macros::dont_look_inside]
 fn bigint_lshift_count(a: &BigInt, shift: i64) -> Result<BigInt, PyError> {
@@ -207,16 +207,18 @@ pub extern "C" fn jit_bigint_bit_count(value: i64) -> i64 {
 /// RPython `_divrem`'s truncated quotient over two bare RBigInt payloads.
 /// Allocates the result via the COLLECTING nursery (a gcmap-rooted residual,
 /// its operand pointers rooted across the alloc), matching the arithmetic
-/// residuals. Returns a freshly heap-allocated `*mut BigInt` — a `ref`-token
-/// return so the CodeWriter models the result as a traced GcRef.
+/// residuals. Returns a freshly heap-allocated `*mut BigInt` encoded as the
+/// JIT's uniform i64 word; the MIR retarget keeps the result modeled as GcRef.
 #[majit_macros::elidable]
-pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        pyre_object::longobject::alloc_bigint_nursery_collecting(
-            pyre_object::rbigint::_divrem(&*a, &*b)
-                .expect("division by zero")
-                .0,
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                pyre_object::rbigint::_divrem(&*a, &*b)
+                    .expect("division by zero")
+                    .0,
+            ),
         )
     }
 }
@@ -224,13 +226,15 @@ pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> *mut BigInt {
 /// `_divrem`'s truncated remainder.
 /// See [`jit_bigint_div`]; both project the same upstream helper.
 #[majit_macros::elidable]
-pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        pyre_object::longobject::alloc_bigint_nursery_collecting(
-            pyre_object::rbigint::_divrem(&*a, &*b)
-                .expect("division by zero")
-                .1,
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                pyre_object::rbigint::_divrem(&*a, &*b)
+                    .expect("division by zero")
+                    .1,
+            ),
         )
     }
 }
@@ -238,25 +242,29 @@ pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> *mut BigInt {
 /// `rbigint.divmod`'s floored quotient projection. Allocates via the collecting nursery
 /// (a gcmap-rooted residual, its operand pointers rooted across the alloc),
 /// matching the arithmetic residuals. Returns a freshly heap-allocated
-/// `*mut BigInt` — a `ref`-token return so the CodeWriter models the result as
-/// a traced GcRef.
+/// `*mut BigInt` encoded as the JIT's uniform i64 word; the MIR retarget keeps
+/// the result modeled as a traced GcRef.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_div_floor(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_div_floor(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        pyre_object::longobject::alloc_bigint_nursery_collecting(
-            (&*a).divmod(&*b).expect("division by zero").0,
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                (&*a).divmod(&*b).expect("division by zero").0,
+            ),
         )
     }
 }
 
 /// `rbigint.divmod`'s floored modulus projection.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_mod_floor(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_mod_floor(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        pyre_object::longobject::alloc_bigint_nursery_collecting(
-            (&*a).divmod(&*b).expect("division by zero").1,
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                (&*a).divmod(&*b).expect("division by zero").1,
+            ),
         )
     }
 }
@@ -269,52 +277,76 @@ pub extern "C" fn jit_bigint_mod_floor(a: i64, b: i64) -> *mut BigInt {
 // opaque `BigInt` ADT — to the matching residual below. Both operands and
 // the result are the classdef-less `*mut BigInt` GcRef the front models a
 // `BigInt` as: the operands arrive as i64-encoded pointers (a faithful ABI
-// pass) and the result is returned as `*mut BigInt` so the return token is
-// `ref` (a traced GcRef), matching the front's `Ref(None)` result type. Each
+// pass) and the result pointer is returned in the same uniform i64 word ABI;
+// the retarget preserves the front's `Ref(None)` result type. Each
 // allocates the fresh result in the collecting nursery, its operand pointers
 // rooted across the alloc. These wrappers retain RPython's elidable effect:
 // allocation-only operations use `EF_ELIDABLE_OR_MEMORYERROR`.
 
 /// `rbigint.and_` payload — `&BigInt & &BigInt`. See the module note above.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a & &*b) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a & &*b),
+        )
+    }
 }
 
 /// `rbigint.or_` payload — `&BigInt | &BigInt`. See [`jit_bigint_and`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a | &*b) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a | &*b),
+        )
+    }
 }
 
 /// `rbigint.xor_` payload — `&BigInt ^ &BigInt`. See [`jit_bigint_and`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a ^ &*b) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a ^ &*b),
+        )
+    }
 }
 
 /// `rbigint.sub` payload — `&BigInt - &BigInt`. See [`jit_bigint_and`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a - &*b) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a - &*b),
+        )
+    }
 }
 
 /// `rbigint.mul` payload — `&BigInt * &BigInt`. See [`jit_bigint_and`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a * &*b) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a * &*b),
+        )
+    }
 }
 
 /// `rbigint.add` payload — `&BigInt + &BigInt`. See [`jit_bigint_and`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a + &*b) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a + &*b),
+        )
+    }
 }
 
 // ── BigInt/machine-int arithmetic residuals ─────────────────────────
@@ -330,9 +362,13 @@ macro_rules! bigint_int_residual {
     ($name:ident, $method:ident) => {
         #[doc = "Bare-RBigInt/machine-int residual using the translated GC-reference ABI."]
         #[majit_macros::elidable_or_memerror]
-        pub extern "C" fn $name(a: i64, b: i64) -> *mut BigInt {
+        pub extern "C" fn $name(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
             let a = a as *const BigInt;
-            unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).$method(b)) }
+            unsafe {
+                pyre_object::longobject::encode_jit_bigint_result(
+                    pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).$method(b)),
+                )
+            }
         }
     };
 }
@@ -371,15 +407,17 @@ bigint_int_comparison_residual!(jit_bigint_int_ge, int_ge);
 /// it as the implicit exception edge of an `EF_ELIDABLE_OR_MEMORYERROR` call;
 /// publish the same backend exception and return an ignored null payload.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_pow_nomod(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_pow_nomod(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     match unsafe { (&*a).pow(&*b, None) } {
-        Ok(value) => pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+        Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+        ),
         Err(_) => {
             crate::runtime_ops::jit_publish_exception(
                 pyre_object::interp_exceptions::memory_error_singleton(),
             );
-            std::ptr::null_mut()
+            pyre_object::longobject::encode_jit_bigint_result(std::ptr::null_mut())
         }
     }
 }
@@ -387,15 +425,20 @@ pub extern "C" fn jit_bigint_pow_nomod(a: i64, b: i64) -> *mut BigInt {
 /// `rbigint.lshift(a, machine_count)` after the Python-level sign/range
 /// checks. RPython exposes only its implicit MemoryError edge.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_lshift_count(a: i64, shift: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_lshift_count(
+    a: i64,
+    shift: i64,
+) -> pyre_object::longobject::JitBigIntResult {
     let a = a as *const BigInt;
     match unsafe { (&*a).lshift(shift) } {
-        Ok(value) => pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+        Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+        ),
         Err(_) => {
             crate::runtime_ops::jit_publish_exception(
                 pyre_object::interp_exceptions::memory_error_singleton(),
             );
-            std::ptr::null_mut()
+            pyre_object::longobject::encode_jit_bigint_result(std::ptr::null_mut())
         }
     }
 }
@@ -403,9 +446,13 @@ pub extern "C" fn jit_bigint_lshift_count(a: i64, shift: i64) -> *mut BigInt {
 /// `rbigint.neg` payload — `-&BigInt`. A unary operator, so a single operand
 /// pointer; the result is a fresh negated `BigInt`. See [`jit_bigint_and`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_neg(a: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_neg(a: i64) -> pyre_object::longobject::JitBigIntResult {
     let a = a as *const BigInt;
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(-&*a) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(-&*a),
+        )
+    }
 }
 
 // ── BigInt shift-by-`usize` residuals ────────────────────────────────
@@ -417,16 +464,24 @@ pub extern "C" fn jit_bigint_neg(a: i64) -> *mut BigInt {
 
 /// `rbigint.lshift` by a machine `usize` — `&BigInt << (b as usize)`.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_shl(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_shl(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let a = a as *const BigInt;
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a << (b as usize)) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a << (b as usize)),
+        )
+    }
 }
 
 /// `rbigint.rshift` by a machine `usize` — `&BigInt >> (b as usize)`.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_shr(a: i64, b: i64) -> *mut BigInt {
+pub extern "C" fn jit_bigint_shr(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let a = a as *const BigInt;
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a >> (b as usize)) }
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a >> (b as usize)),
+        )
+    }
 }
 
 #[majit_macros::elidable]

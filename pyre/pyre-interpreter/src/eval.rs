@@ -4537,15 +4537,11 @@ mod tests {
     /// executable-code buffers — is a process-global singleton driven on a
     /// single thread by design. The `cargo test` harness runs tests on a thread
     /// pool, so two loops crossing the compile threshold at once race on that
-    /// shared state and one of them reads a half-installed trace. Tests that
-    /// drive JIT compilation serialise on this lock so only one compiles at a
-    /// time. Poison is recovered: a panicking test must not wedge the others.
-    static JIT_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// shared state and one of them reads a half-installed trace. Use the same
+    /// exclusion domain as tests that mutate the process-global stack-probe
+    /// state: compiled Cranelift prologues read those values directly.
     fn jit_compile_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        JIT_COMPILE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::stack_check::test_support::stack_and_jit_test_guard()
     }
 
     fn run_eval(source: &str) -> PyResult {
@@ -5601,7 +5597,9 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = frame.execute_frame(None, None);
+        frame
+            .execute_frame(None, None)
+            .expect("hot user-function loop failed");
         unsafe {
             let i = w_dict_getitem_str(frame.w_globals, "i").unwrap();
             let acc = w_dict_getitem_str(frame.w_globals, "acc").unwrap();

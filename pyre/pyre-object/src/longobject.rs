@@ -44,6 +44,28 @@ impl crate::lltype::GcType for W_LongObject {
 /// Payload size of a raw `rbigint` GC object.
 pub const BIGINT_PAYLOAD_SIZE: usize = crate::rbigint::RBIGINT_PAYLOAD_SIZE;
 
+/// Translated rbigint GC-reference result ABI.
+///
+/// Native LLBC extraction must retain the pointer result so the codewriter
+/// models it as a GcRef. wasm32 direct residual calls use the JIT's uniform
+/// i64 word family, so encode the same pointer in an i64 on that target.
+#[cfg(not(target_arch = "wasm32"))]
+pub type JitBigIntResult = *mut BigInt;
+#[cfg(target_arch = "wasm32")]
+pub type JitBigIntResult = i64;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn encode_jit_bigint_result(value: *mut BigInt) -> JitBigIntResult {
+    value
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn encode_jit_bigint_result(value: *mut BigInt) -> JitBigIntResult {
+    value as usize as i64
+}
+
 /// GC type id for the raw `rbigint` payload, published at JitDriver init by
 /// `set_bigint_gc_type_id`. `0` until then, in which case the alloc helpers
 /// fall back to leaked raw allocations in bare tests / pre-init bootstrap.
@@ -184,16 +206,19 @@ pub fn box_bigint_constant(value: &BigInt) -> PyObjectRef {
 ///
 /// Rust returns `RBigInt` by value, but RPython returns a GC reference.  The
 /// MIR front retargets machine-word constructor calls here so generated JIT
-/// code receives a rooted `*mut RBigInt` rather than a native Rust aggregate.
+/// code receives a rooted `*mut RBigInt`, encoded in the JIT's uniform i64
+/// word ABI on wasm32 rather than returned as a native wasm pointer.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_from_i64(value: i64) -> *mut BigInt {
-    alloc_bigint_nursery_collecting(BigInt::fromint(value))
+pub extern "C" fn jit_bigint_from_i64(value: i64) -> JitBigIntResult {
+    encode_jit_bigint_result(alloc_bigint_nursery_collecting(BigInt::fromint(value)))
 }
 
 /// Unsigned machine-word companion of [`jit_bigint_from_i64`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_from_u64(value: u64) -> *mut BigInt {
-    alloc_bigint_nursery_collecting(BigInt::from_u128(value as u128))
+pub extern "C" fn jit_bigint_from_u64(value: u64) -> JitBigIntResult {
+    encode_jit_bigint_result(alloc_bigint_nursery_collecting(BigInt::from_u128(
+        value as u128,
+    )))
 }
 
 macro_rules! bigint_comparison_residual {
