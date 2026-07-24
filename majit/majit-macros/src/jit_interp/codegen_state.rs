@@ -2437,12 +2437,37 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 sym: &mut __JitSym,
                 ctx: &mut majit_metainterp::TraceCtx,
                 resume_data: &majit_metainterp::ResumeDataResult,
-                _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
                 fail_values: &[i64],
                 fail_types: &[majit_ir::Type],
             ) {
                 use majit_ir::resumedata::RebuiltValue;
                 use majit_metainterp::JitCodeSym as _;
+                if std::env::var_os("AHEUI_BRIDGE_DIAG").is_some() {
+                    eprintln!(
+                        "[setup_bridge_sym] CALLED frames={} rd_virtuals={}",
+                        resume_data.frames.len(),
+                        rd_virtuals.map_or(0, |v| v.len()),
+                    );
+                }
+                // resume.py:993-1007 — materialize the guard's virtuals + replay
+                // its deferred heap writes as bridge-entry NEW/SETFIELD_GC ops so
+                // the compiled bridge observes the heap state the blackhole deopt
+                // would rebuild. A push/dup whose node is virtualized-and-elided
+                // defers its head-store to rd_pendingfields while the size store
+                // commits inline; without this replay the bridge reads size>chain
+                // and dereferences a NULL node head. Runs independent of the
+                // frame-register seeding below (which may decline).
+                let mut __bridge_cache = majit_metainterp::BridgeVirtualCache::new(
+                    rd_virtuals.map_or(0, |v| v.len()),
+                    majit_metainterp::default_bridge_array_descr,
+                );
+                majit_metainterp::replay_pending_fields(
+                    ctx,
+                    resume_data,
+                    rd_virtuals,
+                    &mut __bridge_cache,
+                );
                 let frame = match resume_data.frames.first() {
                     Some(f) => f,
                     None => return,
@@ -2488,7 +2513,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     let __pos = reg_indices.int.iter().position(|&r| r as usize == __target);
                     let __pos = match __pos {
                         Some(p) => p,
-                        None => continue,
+                        None => {
+                            if __dbg {
+                                eprintln!("  int scalar {} <- reg {} UNSEEDED (color not in reg_indices.int)", __k, __target);
+                            }
+                            continue;
+                        }
                     };
                     match &frame.values[__pos] {
                         RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Int) => {
@@ -2510,7 +2540,24 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                                 eprintln!("  int scalar {} <- reg {} Const {}", __k, __target, __bits);
                             }
                         }
-                        _ => {}
+                        RebuiltValue::Virtual(__vidx) => {
+                            // resume.py:945-956 getvirtual — materialize the
+                            // virtual as bridge NEW/SETFIELD_GC ops and bind the
+                            // state field to its OpRef. Symbolic only; the concrete
+                            // int shadow needs backend/callinfocollection.
+                            let __op = majit_metainterp::materialize_bridge_virtual(
+                                ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,
+                            );
+                            sym.set_state_field_ref(__k, __op);
+                            if __dbg {
+                                eprintln!("  int scalar {} <- reg {} Virtual {}", __k, __target, __vidx);
+                            }
+                        }
+                        __other => {
+                            if __dbg {
+                                eprintln!("  int scalar {} <- reg {} UNSEEDED variant={:?}", __k, __target, std::mem::discriminant(__other));
+                            }
+                        }
                     }
                 }
                 // ref scalars: identity register = ref_identity_base + j.
@@ -2519,7 +2566,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     let __pos = reg_indices.ref_.iter().position(|&r| r as usize == __target);
                     let __pos = match __pos {
                         Some(p) => p,
-                        None => continue,
+                        None => {
+                            if __dbg {
+                                eprintln!("  ref scalar {} <- reg {} UNSEEDED (color not in reg_indices.ref)", __j, __target);
+                            }
+                            continue;
+                        }
                     };
                     match &frame.values[__ref_off + __pos] {
                         RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Ref) => {
@@ -2541,7 +2593,22 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                                 eprintln!("  ref scalar {} <- reg {} Const {:#x}", __j, __target, __bits);
                             }
                         }
-                        _ => {}
+                        RebuiltValue::Virtual(__vidx) => {
+                            // resume.py:945-956 getvirtual — materialize the
+                            // virtual and bind the ref state field to its OpRef.
+                            let __op = majit_metainterp::materialize_bridge_virtual(
+                                ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,
+                            );
+                            sym.set_state_ref_field_ref(__j, __op);
+                            if __dbg {
+                                eprintln!("  ref scalar {} <- reg {} Virtual {}", __j, __target, __vidx);
+                            }
+                        }
+                        __other => {
+                            if __dbg {
+                                eprintln!("  ref scalar {} <- reg {} UNSEEDED variant={:?}", __j, __target, std::mem::discriminant(__other));
+                            }
+                        }
                     }
                 }
                 // float scalars: identity register = float_identity_base + k.

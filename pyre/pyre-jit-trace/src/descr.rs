@@ -361,24 +361,7 @@ pub fn make_field_descr(
 /// The `index_in_parent` is computed by scanning the parent SizeDescr's
 /// `all_fielddescrs` for a matching offset.
 pub fn make_field_descr_with_parent(parent: DescrRef, offset: usize) -> DescrRef {
-    // resume.py:597-603 self.setfields → decoder.setfield(struct, fieldnum,
-    // fielddescr) uses the parent's canonical FieldDescr. Return the *live*
-    // field descr the parent SizeDescr already owns (full immutable /
-    // quasi-immutable / name / ei_index) instead of minting a partial copy
-    // that drops those properties; the parent SizeDescr is the same live
-    // descr the original trace recorded against, so its `all_fielddescrs()`
-    // are the canonical field descriptors keyed by index_in_parent.
-    let sd = parent
-        .as_size_descr()
-        .expect("make_field_descr_with_parent: parent is not a SizeDescr");
-    let fd = sd
-        .all_fielddescrs()
-        .iter()
-        .find(|fd| fd.offset() == offset)
-        .unwrap_or_else(|| {
-            panic!("FieldDescr offset {offset} is not present in parent SizeDescr all_fielddescrs")
-        });
-    fd.clone() as DescrRef
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
 }
 
 pub fn make_field_descr_full(

@@ -5762,6 +5762,31 @@ pub fn make_field_descr_with_parent(
     Arc::new(fd)
 }
 
+/// Resolve the canonical `FieldDescr` a parent `SizeDescr` already owns for a
+/// given byte `offset`, rather than minting a partial copy.
+///
+/// resume.py:597-603 `self.setfields` → `decoder.setfield(struct, fieldnum,
+/// fielddescr)` uses the parent's live `FieldDescr` (full immutable /
+/// quasi-immutable / name / ei_index). The parent `SizeDescr` is the same live
+/// descr the original trace recorded against, so its `all_fielddescrs()` are
+/// the canonical field descriptors keyed by `index_in_parent`; return the one
+/// whose `offset()` matches instead of reconstructing a lossy partial. Keying
+/// by `descr_index()` = `index_in_parent` (a small sequential index) avoids the
+/// `stable_field_index` hash fallback that OOMs `ensure_field_descr_slot`.
+pub fn field_descr_from_parent_by_offset(parent: &DescrRef, offset: usize) -> DescrRef {
+    let sd = parent
+        .as_size_descr()
+        .expect("field_descr_from_parent_by_offset: parent is not a SizeDescr");
+    let fd = sd
+        .all_fielddescrs()
+        .iter()
+        .find(|fd| fd.offset() == offset)
+        .unwrap_or_else(|| {
+            panic!("FieldDescr offset {offset} is not present in parent SizeDescr all_fielddescrs")
+        });
+    fd.clone() as DescrRef
+}
+
 /// Create a field descriptor with explicit index and immutability.
 pub fn make_field_descr_full(
     index: u32,
