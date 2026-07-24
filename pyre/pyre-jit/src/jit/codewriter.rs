@@ -4579,13 +4579,31 @@ fn filter_liveness_in_place(
                 break;
             }
             let super::flatten::Insn::Op {
-                opname: _,
+                opname,
                 args,
                 result,
             } = next
             else {
                 continue;
             };
+            // A `raise/r <reg>` op reads its exception operand — the residual
+            // `normalize_raise_varargs` result the tracer populated via
+            // `make_result_of_lastop`. It is a live operand read by the raise,
+            // not disposable scratch, so `get_list_of_active_boxes` keeps it in
+            // the resume `-live-`; the frame-slot retain above drops it (an
+            // operand-stack temp with no Python-local slot). Re-add its Ref
+            // register so the after-residual `GUARD_NO_EXCEPTION` /
+            // `GUARD_NOT_FORCED` and the raise's `GUARD_CLASS` all resume with
+            // the exception seeded (blackhole `bhimpl_raise` asserts non-null).
+            if opname == "raise" {
+                for arg in args {
+                    if let SsaOperand::Register(reg) = arg
+                        && reg.kind == SsaKind::Ref
+                    {
+                        union_r.insert(reg.index);
+                    }
+                }
+            }
             // A sparse opcode-start marker can also precede the residual op
             // that consumes the prior opcode's result (for example
             // LOAD_NAME(r) followed by LOAD_ATTR). Those Ref arguments are
