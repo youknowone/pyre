@@ -387,6 +387,13 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // stack (exc on TOS), then enter at the handler.
             wc.last_exc_value = Some(seed.exc);
             wc.last_exc_value_concrete = seed.exc_concrete;
+            // The raise is a const-class exception (the callee's inline RAISE
+            // recorded a NewWithVtable of a known class), so its class is
+            // constant — same as the `exc_edge_catch_target` branch and the
+            // walk-level SubRaise routing (`opimpl_raise`).  Without this, the
+            // writeback below stamps the stale pre-bridge value onto the sym and
+            // a reraise in the handler mis-reads the standing exception.
+            wc.fbw_mode.class_of_last_exc_is_const = true;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
             seed.catch_target

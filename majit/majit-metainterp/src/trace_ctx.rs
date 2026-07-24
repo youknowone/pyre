@@ -529,6 +529,13 @@ pub struct TraceCtx {
     /// sym's standing exception (pyjitpl.py:3125 `_prepare_exception_resumption`
     /// grabs BEFORE frame reconstruction). Raw `PyObjectRef as i64`; 0 when the
     /// guard carried no exception. Class is re-derived from the value's typeptr.
+    ///
+    /// NOT a traced GC root: it is stored unconditionally but only dereferenced
+    /// under the default-off `PYRE_CARRIER_EXC_RESUME` gate, so today no live
+    /// deref can outlive a moving collection. Before that gate is flipped on
+    /// this must become a real root (or be re-grabbed at read time), since a
+    /// collection between `set_bridge_guard_exc` and the seed read would leave
+    /// the raw integer stale — tracked as a pre-flip-on parity gap.
     pub(crate) bridge_guard_exc: i64,
 }
 
