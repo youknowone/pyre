@@ -4839,6 +4839,34 @@ impl<S: JitState> JitDriver<S> {
         self.meta.has_compiled_loop(green_key)
     }
 
+    /// Whether the warm-entry runner can actually execute the code at this
+    /// green key. Stronger than `has_compiled_loop`: it also requires a
+    /// frontend `compiled_loops` meta (`get_compiled_meta`).
+    ///
+    /// `has_compiled_loop` is true whenever the cell's procedure token has a
+    /// compiled backend body (`warmstate.py:482-511` gates entry on code
+    /// presence). That includes a `compile_tmp_callback` token
+    /// (`compile.py:1101-1150`): a CALL_ASSEMBLER fallback stub with a real
+    /// body but NO frontend meta, since MetaInterp never inserts it into
+    /// `compiled_loops`. RPython's `execute_assembler` can enter such a token
+    /// directly — the stub bounces control back to the interpreter
+    /// (ContinueRunningNormally). Pyre's warm-entry runner instead needs the
+    /// `compiled_loops` meta to interpret guard-failure exit layouts, so
+    /// entering a bare tmp callback here has no meta and aborts.
+    ///
+    /// Gating warm-entry dispatch on this predicate lets a tmp-only cell fall
+    /// through to the counter tick / trace-start, which is the pyre-orthodox
+    /// realization of the tmp-callback → resume-interp semantics: the back-edge
+    /// counter keeps ticking until the real loop compiles (a `compiled_loops`
+    /// entry appears) and `redirect_call_assembler` takes over. Entry bridges
+    /// (`ResumeFromInterpDescr`, `compile.py:1079-1083`) DO get a
+    /// `compiled_loops` entry despite carrying 0 target tokens, so they remain
+    /// dispatchable — this predicate only excludes bare tmp callbacks.
+    #[inline]
+    pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
+        self.has_compiled_loop(green_key) && self.meta.get_compiled_meta(green_key).is_some()
+    }
+
     /// Actual key the last compile_loop stored under.
     pub fn last_compiled_key(&self) -> Option<u64> {
         self.meta.last_compiled_key()

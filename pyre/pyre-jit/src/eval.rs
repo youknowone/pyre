@@ -6613,8 +6613,13 @@ fn maybe_compile_and_run(
     }
     // warmstate.py:503-511: procedure_token exists → EnterJitAssembler.
     // RPython enters assembler unconditionally when a compiled loop is
-    // available for this green_key.
-    if driver.has_compiled_loop(green_key) {
+    // available for this green_key. Pyre gates on `has_runnable_compiled_loop`
+    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token — which
+    // has a compiled body but no `compiled_loops` meta — falls through to the
+    // counter tick below instead of entering `execute_assembler` with no meta
+    // to interpret its exit (which aborts). The tmp cell then re-ticks until
+    // the real loop compiles.
+    if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
     // Pyre-local deviation: this short-circuit treats `DONT_TRACE_HERE` as a
@@ -7511,7 +7516,7 @@ fn bound_reached(
     {
         return None;
     }
-    if !driver.has_compiled_loop(green_key) && !driver.is_tracing() {
+    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -7523,7 +7528,7 @@ fn bound_reached(
         );
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
-    let outcome = if driver.has_compiled_loop(green_key) {
+    let outcome = if driver.has_runnable_compiled_loop(green_key) {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -7653,8 +7658,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let (driver, info) = driver_pair();
 
     // RPython warmstate.py maybe_compile_and_run fast path:
-    // if no compiled loop and not tracing, just tick the counter.
-    if !driver.has_compiled_loop(green_key) && !driver.is_tracing() {
+    // if no runnable compiled loop and not tracing, just tick the counter.
+    // A bare `compile_tmp_callback` token (has_compiled_loop true, no
+    // `compiled_loops` meta) is treated as not-yet-runnable so the counter
+    // keeps ticking toward compiling the real loop.
+    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
         let should_trace = driver
             .meta_interp_mut()
             .warm_state_mut()
@@ -7671,9 +7679,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     )) {
         return None;
     }
-    if driver.has_compiled_loop(green_key) {
+    if driver.has_runnable_compiled_loop(green_key) {
         // Same gate as maybe_compile_and_run: only enter compiled code
-        // when a compiled loop exists for this green_key.
+        // when a runnable compiled loop (frontend meta present, not a bare
+        // tmp callback) exists for this green_key.
         // warmstate.py:503-511: procedure_token → enter unconditionally.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
