@@ -3928,6 +3928,33 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn inline_builder_wires_float_cmp_and_raw_load_f() {
+            // A dispatch arm materializing a float comparison as an int
+            // (`(a >= b) as i64`) emits `float_ge/ff>i` and siblings, and
+            // `majit_raw_load_f` emits `raw_load_f/iid>f`.  Both must be in
+            // the inline builder's insns map so `wire_handler` installs a
+            // real handler; a forward blackhole resume through an unwired
+            // byte panics at `dispatch_step`.
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as *const () as usize;
+            for byte in [
+                majit_translate::insns::BC_FLOAT_LT,
+                majit_translate::insns::BC_FLOAT_LE,
+                majit_translate::insns::BC_FLOAT_EQ,
+                majit_translate::insns::BC_FLOAT_NE,
+                majit_translate::insns::BC_FLOAT_GT,
+                majit_translate::insns::BC_FLOAT_GE,
+                majit_translate::insns::BC_RAW_LOAD_F,
+            ] {
+                assert_ne!(
+                    builder.dispatch_table[byte as usize] as *const () as usize,
+                    placeholder,
+                    "opcode byte {byte} must be wired in the inline blackhole builder",
+                );
+            }
+        }
     }
 
     // ── `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod`
@@ -6970,6 +6997,17 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         ),
         ("float_neg/f>f", majit_translate::insns::BC_FLOAT_NEG),
         ("float_abs/f>f", majit_translate::insns::BC_FLOAT_ABS),
+        // Float value-comparisons materialized as an int result (e.g. a
+        // dispatch arm writing `(a >= b) as i64`).  Their `bhimpl_*`
+        // handlers are wired in `wire_bhimpl_handlers`; without the map
+        // entry `wire_handler` no-ops and a forward resume through the
+        // opcode hits the unwired-byte panic.
+        ("float_lt/ff>i", majit_translate::insns::BC_FLOAT_LT),
+        ("float_le/ff>i", majit_translate::insns::BC_FLOAT_LE),
+        ("float_eq/ff>i", majit_translate::insns::BC_FLOAT_EQ),
+        ("float_ne/ff>i", majit_translate::insns::BC_FLOAT_NE),
+        ("float_gt/ff>i", majit_translate::insns::BC_FLOAT_GT),
+        ("float_ge/ff>i", majit_translate::insns::BC_FLOAT_GE),
         ("ptr_eq/rr>i", majit_translate::insns::BC_PTR_EQ),
         ("ptr_ne/rr>i", majit_translate::insns::BC_PTR_NE),
         (
@@ -7410,6 +7448,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "raw_load_i/iid>i".to_string(),
         majit_translate::insns::BC_RAW_LOAD_I,
+    );
+    // `raw_load_f/iid>f` — the float read-side companion (`majit_raw_load_f`,
+    // used by the celfloat example).  `handler_raw_load_f` is wired below;
+    // register the opname so a forward resume through the opcode blackholes
+    // instead of hitting the unwired-byte panic.
+    insns.insert(
+        "raw_load_f/iid>f".to_string(),
+        majit_translate::insns::BC_RAW_LOAD_F,
     );
     insns.insert(
         "setarrayitem_gc_i/riid".to_string(),
