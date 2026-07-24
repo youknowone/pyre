@@ -917,13 +917,17 @@ impl MiniMarkGC {
     ///
     /// # Safety
     /// `root` must point to a valid mutable `GcRef` slot until this call
-    /// returns.
+    /// returns. `needs_write_barrier` must point to a valid mutable `bool`
+    /// slot.
     pub unsafe fn alloc_with_type_rooted(
         &mut self,
         type_id: u32,
         payload_size: usize,
         root: *mut GcRef,
+        needs_write_barrier: *mut bool,
     ) -> GcRef {
+        unsafe { *needs_write_barrier = false };
+
         #[cfg(feature = "gc_stress")]
         if self.stress_collect {
             unsafe { self.roots.add(root) };
@@ -936,6 +940,7 @@ impl MiniMarkGC {
         // Large objects never trigger a nursery collection, so the native
         // slot needs no temporary registration.
         if total_size > self.config.large_object_threshold {
+            unsafe { *needs_write_barrier = true };
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
@@ -951,6 +956,7 @@ impl MiniMarkGC {
             }
             let ptr = self.nursery.alloc(total_size);
             if ptr.is_null() {
+                unsafe { *needs_write_barrier = true };
                 return self.alloc_in_oldgen(type_id, total_size);
             }
             Self::init_nursery_object(ptr, type_id);
@@ -3503,8 +3509,9 @@ impl GcAllocator for MiniMarkGC {
         type_id: u32,
         size: usize,
         root: *mut GcRef,
+        needs_write_barrier: *mut bool,
     ) -> GcRef {
-        unsafe { self.alloc_with_type_rooted(type_id, size, root) }
+        unsafe { self.alloc_with_type_rooted(type_id, size, root, needs_write_barrier) }
     }
 
     /// Charge `bytes` of off-heap pressure and force a minor when the combined
@@ -4191,11 +4198,15 @@ mod tests {
         let tid = gc.register_type(TypeInfo::simple(16));
         let mut child = gc.alloc_with_type(tid, 16);
         let roots_before = gc.roots.len();
+        let mut needs_write_barrier = true;
 
-        let parent = unsafe { gc.alloc_with_type_rooted(tid, 16, &mut child as *mut GcRef) };
+        let parent = unsafe {
+            gc.alloc_with_type_rooted(tid, 16, &mut child as *mut GcRef, &mut needs_write_barrier)
+        };
 
         assert!(gc.is_in_nursery(child.0));
         assert!(gc.is_in_nursery(parent.0));
+        assert!(!needs_write_barrier);
         assert_eq!(gc.minor_collections, 0);
         assert_eq!(gc.roots.len(), roots_before);
     }
@@ -4213,13 +4224,38 @@ mod tests {
             assert!(gc.is_in_nursery(filler.0));
         }
         let roots_before = gc.roots.len();
+        let mut needs_write_barrier = true;
 
-        let parent = unsafe { gc.alloc_with_type_rooted(tid, 16, &mut child as *mut GcRef) };
+        let parent = unsafe {
+            gc.alloc_with_type_rooted(tid, 16, &mut child as *mut GcRef, &mut needs_write_barrier)
+        };
 
         assert_eq!(gc.minor_collections, 1);
         assert!(!gc.is_in_nursery(child.0));
         assert!(gc.is_in_nursery(parent.0));
+        assert!(!needs_write_barrier);
         assert_eq!(gc.roots.len(), roots_before);
+    }
+
+    #[test]
+    fn rooted_collecting_alloc_reports_oldgen_creation_barrier() {
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut child = gc.alloc_with_type(tid, 16);
+        let mut needs_write_barrier = false;
+        let payload_size = gc.config.large_object_threshold;
+
+        let parent = unsafe {
+            gc.alloc_with_type_rooted(
+                tid,
+                payload_size,
+                &mut child as *mut GcRef,
+                &mut needs_write_barrier,
+            )
+        };
+
+        assert!(!gc.is_in_nursery(parent.0));
+        assert!(needs_write_barrier);
     }
 
     // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---

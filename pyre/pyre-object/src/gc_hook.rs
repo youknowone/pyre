@@ -167,8 +167,12 @@ pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut
 
 /// Root-aware collecting allocation callback. `root` is a caller-owned slot
 /// containing the one GC child manufactured before its parent allocation.
-pub type GcAllocCollectingRootedHookFn =
-    unsafe fn(type_id: u32, payload_size: usize, root: *mut *mut u8) -> *mut u8;
+pub type GcAllocCollectingRootedHookFn = unsafe fn(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
+) -> *mut u8;
 
 majit_gc::global_hook!(
     static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
@@ -190,16 +194,21 @@ pub fn clear_gc_alloc_collecting_rooted_hook() {
 ///
 /// # Safety
 /// `root` must remain a valid mutable GC-pointer slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 #[inline]
 pub unsafe fn try_gc_alloc_collecting_rooted(
     type_id: u32,
     payload_size: usize,
     root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
 ) -> Option<*mut u8> {
     if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
-        return Some(unsafe { f(type_id, payload_size, root) });
+        return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
     }
     let collecting = GC_ALLOC_COLLECTING_HOOK.get()?;
+    // Backends without placement reporting retain the conservative creation
+    // barrier. MiniMark's rooted hook clears this for a nursery result.
+    unsafe { *needs_write_barrier = true };
     let pinned = unsafe { try_gc_add_root(root) };
     let result = collecting(type_id, payload_size);
     if pinned {
@@ -602,6 +611,16 @@ mod tests {
         std::ptr::null_mut()
     }
 
+    unsafe fn nursery_rooted_hook(
+        type_id: u32,
+        payload_size: usize,
+        _root: *mut *mut u8,
+        needs_write_barrier: *mut bool,
+    ) -> *mut u8 {
+        unsafe { *needs_write_barrier = false };
+        mock_hook(type_id, payload_size)
+    }
+
     #[test]
     fn returns_none_when_unregistered() {
         let _hook_lock = hook_test_guard();
@@ -712,6 +731,32 @@ mod tests {
 
         clear_gc_alloc_hook();
         clear_gc_alloc_stable_hook();
+    }
+
+    #[test]
+    fn rooted_collecting_hook_reports_placement_conservatively() {
+        let _hook_lock = hook_test_guard();
+        clear_gc_alloc_collecting_hook();
+        clear_gc_alloc_collecting_rooted_hook();
+        clear_gc_root_hooks();
+        let mut root = std::ptr::null_mut();
+        let mut needs_write_barrier = false;
+
+        register_gc_alloc_collecting_hook(mock_hook);
+        let result =
+            unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(needs_write_barrier);
+
+        register_gc_alloc_collecting_rooted_hook(nursery_rooted_hook);
+        needs_write_barrier = true;
+        let result =
+            unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
+        assert_eq!(result, Some(24usize as *mut u8));
+        assert!(!needs_write_barrier);
+
+        clear_gc_alloc_collecting_hook();
+        clear_gc_alloc_collecting_rooted_hook();
     }
 
     #[test]

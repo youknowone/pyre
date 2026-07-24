@@ -185,13 +185,20 @@ pub trait GcAllocator: Send {
     ///
     /// # Safety
     /// `root` must point to a valid mutable `GcRef` slot for the duration of
-    /// this call.
+    /// this call. `needs_write_barrier` must point to a valid mutable `bool`
+    /// slot; the allocator writes whether initializing the result with `root`
+    /// requires an old-to-young creation barrier.
     unsafe fn alloc_nursery_collecting_typed_rooted(
         &mut self,
         type_id: u32,
         size: usize,
         root: *mut GcRef,
+        needs_write_barrier: *mut bool,
     ) -> GcRef {
+        // Collectors without placement information keep the conservative
+        // creation barrier. MiniMark overrides this and clears the flag for
+        // the ordinary nursery result.
+        unsafe { *needs_write_barrier = true };
         unsafe { self.add_root(root) };
         let result = self.alloc_nursery_typed(type_id, size);
         self.remove_root(root);
@@ -702,9 +709,10 @@ impl GcAllocator for GcHandle {
         type_id: u32,
         size: usize,
         root: *mut GcRef,
+        needs_write_barrier: *mut bool,
     ) -> GcRef {
         gc_sync::gc_op(|gc| unsafe {
-            gc.alloc_nursery_collecting_typed_rooted(type_id, size, root)
+            gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
         })
     }
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
@@ -1329,8 +1337,12 @@ pub fn alloc_nursery_collecting_typed(type_id: u32, payload_size: usize) -> GcRe
 /// Process-global rooted companion of
 /// [`AllocNurseryCollectingTypedFn`]. The caller supplies the one GC slot that
 /// is live only on the native Rust stack while the allocation may collect.
-pub type AllocNurseryCollectingTypedRootedFn =
-    unsafe fn(type_id: u32, payload_size: usize, root: *mut GcRef) -> GcRef;
+pub type AllocNurseryCollectingTypedRootedFn = unsafe fn(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut GcRef,
+    needs_write_barrier: *mut bool,
+) -> GcRef;
 
 global_hook!(
     static ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED:
@@ -1347,13 +1359,15 @@ pub fn set_active_alloc_nursery_collecting_typed_rooted(
 ///
 /// # Safety
 /// `root` must remain a valid mutable `GcRef` slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 pub unsafe fn alloc_nursery_collecting_typed_rooted(
     type_id: u32,
     payload_size: usize,
     root: *mut GcRef,
+    needs_write_barrier: *mut bool,
 ) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
-        Some(f) => unsafe { f(type_id, payload_size, root) },
+        Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
         None => GcRef(0),
     }
 }

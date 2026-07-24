@@ -75,14 +75,21 @@ fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> *mut
 ///
 /// # Safety
 /// `root` must remain a valid mutable GC-pointer slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
     type_id: u32,
     size: usize,
     root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
 ) -> *mut u8 {
     unsafe {
-        majit_gc::alloc_nursery_collecting_typed_rooted(type_id, size, root as *mut majit_ir::GcRef)
-            .0 as *mut u8
+        majit_gc::alloc_nursery_collecting_typed_rooted(
+            type_id,
+            size,
+            root as *mut majit_ir::GcRef,
+            needs_write_barrier,
+        )
+        .0 as *mut u8
     }
 }
 

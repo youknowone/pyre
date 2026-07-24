@@ -490,18 +490,27 @@ pub fn alloc_rbigint_nursery_collecting(mut value: RBigInt) -> *mut RBigInt {
         // no dynamic root-set mutation, while the nursery-full slow path
         // temporarily registers and forwards this exact digit slot.
         let digit_slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
+        let mut needs_write_barrier = true;
         let raw = unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(tid, RBIGINT_PAYLOAD_SIZE, digit_slot)
+            crate::gc_hook::try_gc_alloc_collecting_rooted(
+                tid,
+                RBIGINT_PAYLOAD_SIZE,
+                digit_slot,
+                &mut needs_write_barrier,
+            )
         }
         .filter(|pointer| !pointer.is_null());
         if let Some(raw) = raw {
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);
             }
-            // Normally both objects are young.  Keep the creation barrier
-            // explicit for collectors that satisfy the collecting request in
-            // old-gen (for example an oversized/allocation-pressure spill).
-            crate::gc_hook::try_gc_write_barrier(raw);
+            // framework.py:28-61 `propagate_no_write_barrier_needed` removes
+            // GC-pointer field barriers while initializing a fresh fixed-size
+            // nursery allocation. Retain it only for collectors that satisfy
+            // the request in old-gen.
+            if needs_write_barrier {
+                crate::gc_hook::try_gc_write_barrier(raw);
+            }
             return raw as *mut RBigInt;
         }
     }

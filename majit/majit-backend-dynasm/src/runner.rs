@@ -404,20 +404,22 @@ fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
 ///
 /// # Safety
 /// `root` must remain a valid mutable GC slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
     type_id: u32,
     size: usize,
     root: *mut GcRef,
+    needs_write_barrier: *mut bool,
 ) -> GcRef {
     if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut()
-            .as_deref_mut()
-            .map(|g| unsafe { g.alloc_nursery_collecting_typed_rooted(type_id, size, root) })
+        c.borrow_mut().as_deref_mut().map(|g| unsafe {
+            g.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+        })
     }) {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| unsafe {
-        g.alloc_nursery_collecting_typed_rooted(type_id, size, root)
+        g.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
     })
 }
 

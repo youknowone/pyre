@@ -1551,13 +1551,17 @@ fn alloc_nursery_collecting_typed_via_active_runtime(type_id: u32, size: usize) 
 ///
 /// # Safety
 /// `root` must remain a valid mutable GC slot until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
     type_id: u32,
     size: usize,
     root: *mut GcRef,
+    needs_write_barrier: *mut bool,
 ) -> GcRef {
-    with_cranelift_gc(|gc| unsafe { gc.alloc_nursery_collecting_typed_rooted(type_id, size, root) })
-        .unwrap_or(GcRef(0))
+    with_cranelift_gc(|gc| unsafe {
+        gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
 }
 
 /// `majit_gc::ChargeMemoryPressureFn` installed by `set_gc_allocator`. Charges a
