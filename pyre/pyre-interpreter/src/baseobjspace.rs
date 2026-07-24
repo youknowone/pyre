@@ -9606,6 +9606,10 @@ pub unsafe fn exception_attr_slot_fold(
             ExceptionAttrSlot::Filename2
         }
         // `__traceback__` is a `W_BaseException` slot on every exception kind.
+        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`, which
+        // `w_exception_get_traceback` omits while the `ExecutionContext::leave`
+        // vref force it feeds is unported; the fold tracks that getter, so both
+        // sides gain the mark together.
         "__traceback__" => ExceptionAttrSlot::Traceback,
         // `name` shares the `w_exc_name` slot across the four kinds whose getattr
         // arm reads it; other kinds keep the regular attribute fall-through.
