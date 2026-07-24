@@ -432,6 +432,10 @@ impl<'c> Lowerer<'c> {
             "majit_raw_load_i32" => (4usize, true),
             "majit_raw_load_u32" => (4usize, false),
             "majit_raw_load_i64" => (8usize, true),
+            // At 8 bytes signed/unsigned load into an i64 register is
+            // identical (no sign-extension gap), but the intrinsic is
+            // documented as supported, so accept it for parity.
+            "majit_raw_load_u64" => (8usize, false),
             _ => return None,
         };
         if call.args.len() != 2 {

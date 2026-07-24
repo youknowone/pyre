@@ -174,7 +174,17 @@ impl<'c> Lowerer<'c> {
         if self.config.is_none() {
             return None;
         }
-        let inert = !self.stmt_modifies_jit_state(stmt) && !self.stmt_touches_storage(stmt);
+        // Drop only genuinely inert statements: no jit-state write, no
+        // storage/user-local reference, AND no call.  A residual call
+        // (e.g. `record_event();` or an unrolled `for _ in 0..4 {
+        // side_effect(); }` body) that no lowering arm consumed cannot be
+        // proven pure, so silently dropping it would delete a side effect
+        // the interpreter performs.  Returning `None` aborts lowering so
+        // the arm runs interpreted instead — jtransform.py rejects ops it
+        // cannot transform rather than deleting them.
+        let inert = !self.stmt_modifies_jit_state(stmt)
+            && !self.stmt_touches_storage(stmt)
+            && !self.stmt_contains_call(stmt);
         if inert {
             if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
                 eprintln!(

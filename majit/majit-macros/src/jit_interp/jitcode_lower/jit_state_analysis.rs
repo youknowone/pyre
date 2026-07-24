@@ -105,30 +105,75 @@ impl<'c> Lowerer<'c> {
                 ..
             }) => {
                 self.expr_references_unknown_local(cond)
-                    || then_branch.stmts.iter().any(|s| {
-                        if let Stmt::Expr(e, _) = s {
-                            self.expr_references_unknown_local(e)
-                        } else {
-                            false
-                        }
-                    })
+                    || then_branch
+                        .stmts
+                        .iter()
+                        .any(|s| self.stmt_references_unknown_local(s))
                     || else_branch
                         .as_ref()
                         .is_some_and(|(_, e)| self.expr_references_unknown_local(e))
             }
+            Expr::Block(b) => b
+                .block
+                .stmts
+                .iter()
+                .any(|s| self.stmt_references_unknown_local(s)),
             Expr::ForLoop(f) => {
                 self.expr_references_unknown_local(&f.expr)
-                    || f.body.stmts.iter().any(|s| {
-                        if let Stmt::Expr(e, _) = s {
-                            self.expr_references_unknown_local(e)
-                        } else {
-                            false
-                        }
-                    })
+                    || f.body
+                        .stmts
+                        .iter()
+                        .any(|s| self.stmt_references_unknown_local(s))
             }
             // Literals, returns without expression, etc. are safe.
             _ => false,
         }
+    }
+
+    /// Statement form of [`Self::expr_references_unknown_local`]: probes
+    /// both the expression of a `Stmt::Expr` and the initializer of a
+    /// `Stmt::Local`.  A `let x = <unknown local>;` inside an `if` / `for`
+    /// / block body references a name the trace function does not carry,
+    /// so it must not be treated as reference-free.
+    fn stmt_references_unknown_local(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Expr(expr, _) => self.expr_references_unknown_local(expr),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_references_unknown_local(&init.expr)),
+            _ => false,
+        }
+    }
+
+    /// True when `stmt` contains any call, method call, or macro
+    /// invocation.  A statement that reached `lower_stmt_fallback` was
+    /// accepted by no lowering arm; if it still holds a call whose purity
+    /// the macro cannot prove, dropping it as "inert" would delete a side
+    /// effect the interpreter performs.  jtransform.py rejects operations
+    /// it cannot transform (raising) rather than deleting them, so such a
+    /// statement must abort lowering instead of being silently skipped.
+    pub(super) fn stmt_contains_call(&self, stmt: &Stmt) -> bool {
+        use syn::visit::Visit;
+        struct CallProbe {
+            hit: bool,
+        }
+        impl<'ast> Visit<'ast> for CallProbe {
+            fn visit_expr_call(&mut self, c: &'ast ExprCall) {
+                self.hit = true;
+                syn::visit::visit_expr_call(self, c);
+            }
+            fn visit_expr_method_call(&mut self, c: &'ast ExprMethodCall) {
+                self.hit = true;
+                syn::visit::visit_expr_method_call(self, c);
+            }
+            fn visit_macro(&mut self, _m: &'ast syn::Macro) {
+                self.hit = true;
+            }
+        }
+        let mut probe = CallProbe { hit: false };
+        probe.visit_stmt(stmt);
+        probe.hit
     }
 
     fn expr_modifies_jit_state(&self, expr: &Expr) -> bool {

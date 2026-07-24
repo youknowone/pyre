@@ -12,8 +12,36 @@ fn literal_nonnegative_i64(expr: &Expr) -> Option<i64> {
 }
 
 impl<'c> Lowerer<'c> {
+    /// True when any op recorded since index `since` is a float
+    /// comparison — an `OpKind::BinopF` whose result register is int
+    /// banked.  Float arithmetic writes a float result; only the value-
+    /// form `float_lt/le/eq/ne/gt/ge` (`ff>i`) writes an int.  A float
+    /// comparison feeding a conditional guard grows a bridge that hangs
+    /// the compiled trace (a4e191f71b5), so the branch lowerers roll back
+    /// and bail to interpreter fallback when the condition lowered through
+    /// one.
+    fn ops_since_contain_float_compare(&self, since: usize) -> bool {
+        self.op_metadata[since..].iter().any(|op| {
+            matches!(op.kind, OpKind::BinopF)
+                && op.writes.iter().any(|w| matches!(w.kind, BindingKind::Int))
+        })
+    }
+
     pub(super) fn lower_if_stmt(&mut self, expr_if: &ExprIf) -> Option<()> {
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_bindings = self.bindings.clone();
         let cond = self.lower_value_expr(&expr_if.cond)?;
+        if self.ops_since_contain_float_compare(snap_meta) {
+            // Guard over a float comparison hangs the compiled trace; roll
+            // back the condition ops and bail so the arm runs interpreted.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.bindings = snap_bindings;
+            return None;
+        }
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let cond_reg = cond.reg;
@@ -206,6 +234,12 @@ impl<'c> Lowerer<'c> {
     /// loop_end:
     /// ```
     pub(super) fn lower_while_loop(&mut self, expr_while: &syn::ExprWhile) -> Option<()> {
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_label = self.next_label;
+        let snap_bindings = self.bindings.clone();
+
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
@@ -215,6 +249,17 @@ impl<'c> Lowerer<'c> {
 
         // Evaluate the condition
         let cond = self.lower_value_expr(&expr_while.cond)?;
+        if self.ops_since_contain_float_compare(snap_meta) {
+            // Guard over a float comparison hangs the compiled trace; roll
+            // back everything emitted for this loop and bail so the arm
+            // runs interpreted instead.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.next_label = snap_label;
+            self.bindings = snap_bindings;
+            return None;
+        }
         let cond_reg = cond.reg;
         self.emit_op(
             OpMeta::live_marker(),
@@ -272,28 +317,38 @@ impl<'c> Lowerer<'c> {
         };
         let start = literal_nonnegative_i64(range.start.as_deref()?)?;
         let end = literal_nonnegative_i64(range.end.as_deref()?)?;
-        let values = match range.limits {
-            syn::RangeLimits::HalfOpen(_) => {
-                if start >= end {
-                    Vec::new()
-                } else {
-                    (start..end).collect::<Vec<_>>()
-                }
-            }
+        // Compute the iteration count with checked arithmetic BEFORE
+        // materializing the range.  `(start..end).collect()` on a huge
+        // literal range (`for _ in 0..i64::MAX`) would exhaust memory
+        // during macro expansion; bail as soon as the count is known to
+        // exceed the unroll cap (or overflows i64 for a closed range).
+        let count: Option<i64> = match range.limits {
+            // `end > start >= 0` and both `<= i64::MAX`, so the difference
+            // never overflows.
+            syn::RangeLimits::HalfOpen(_) => Some((start < end).then(|| end - start).unwrap_or(0)),
+            // Closed range spans `end - start + 1` values; the `+ 1` can
+            // overflow when `end == i64::MAX`, so guard it.
             syn::RangeLimits::Closed(_) => {
                 if start > end {
-                    Vec::new()
+                    Some(0)
                 } else {
-                    (start..=end).collect::<Vec<_>>()
+                    (end - start).checked_add(1)
                 }
             }
         };
-        if values.len() > 64 || block_has_loop_control(&expr_for.body) {
+        let Some(count) = count else {
+            return None;
+        };
+        if count > 64 || block_has_loop_control(&expr_for.body) {
             return None;
         }
-        if values.is_empty() {
+        if count == 0 {
             return Some(());
         }
+        let values: Vec<i64> = match range.limits {
+            syn::RangeLimits::HalfOpen(_) => (start..end).collect(),
+            syn::RangeLimits::Closed(_) => (start..=end).collect(),
+        };
 
         let snap_stmts = self.statements.len();
         let snap_meta = self.op_metadata.len();
@@ -420,7 +475,22 @@ impl<'c> Lowerer<'c> {
             return None; // no break/continue, fall back to normal lowering
         }
 
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_label = self.next_label;
+        let snap_bindings = self.bindings.clone();
         let cond = self.lower_value_expr(&expr_if.cond)?;
+        if self.ops_since_contain_float_compare(snap_meta) {
+            // Guard over a float comparison hangs the compiled trace; roll
+            // back and bail so the arm runs interpreted instead.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.next_label = snap_label;
+            self.bindings = snap_bindings;
+            return None;
+        }
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let cond_reg = cond.reg;

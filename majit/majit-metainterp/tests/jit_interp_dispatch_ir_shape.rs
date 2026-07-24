@@ -2518,3 +2518,241 @@ mod oparg_with_full_4_green_parity {
         );
     }
 }
+
+/// A qualified (multi-segment) call that no lowering arm consumed must
+/// abort lowering, not be silently dropped as "inert".  Regression for the
+/// side-effect-drop hole in `lower_stmt_fallback` / for-loop unrolling.
+mod residual_call_not_dropped {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    // `sidefx::noop` is a two-segment path, so `expr_references_unknown_local`
+    // treats it as a safe module-scope reference; before the fix its unrolled
+    // loop body was dropped rather than aborting the arm.
+    mod sidefx {
+        #[allow(dead_code)]
+        pub fn noop() {}
+    }
+
+    const OP_PURE: u8 = 4;
+    const OP_LOOP_CALL: u8 = 5;
+
+    struct CallState {
+        acc: i64,
+    }
+
+    #[majit_macros::jit_interp(
+        state = CallState,
+        env = Bytecode,
+        state_fields = { acc: int },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_residual_call(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<CallState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = CallState { acc: 0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_PURE => state.acc += 1,
+                OP_LOOP_CALL => {
+                    for _ in 0..2 {
+                        sidefx::noop();
+                        state.acc += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        state.acc
+    }
+
+    #[test]
+    fn qualified_call_in_unrolled_loop_aborts_instead_of_dropping() {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
+        __prebuild_jitcode_liveness_dispatch_residual_call(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_dispatch_residual_call(&mut asm, 0i64)
+            .expect("dispatch lower must succeed");
+        let store_count: usize = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .map(|sub| sub.code.iter().filter(|&&b| b == BC_STORE_STATE_FIELD).count())
+            .sum();
+        // Only `OP_PURE` contributes one state-field store.  `OP_LOOP_CALL`
+        // holds an unregistered qualified call, so its whole body must abort
+        // lowering (interpreter fallback) instead of unrolling with the call
+        // dropped — which would have added two more stores (total 3).
+        assert_eq!(
+            store_count, 1,
+            "residual-call loop arm must abort, not drop the call and unroll; stores={store_count}"
+        );
+    }
+}
+
+/// A float comparison lowers in value form (materialized to an int) but a
+/// float comparison feeding a conditional guard must abort lowering — the
+/// guard bridge hangs the compiled trace (a4e191f71b5).
+mod float_compare_branch_gate {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::BC_FLOAT_GE;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    const OP_VALUE: u8 = 6;
+    const OP_BRANCH: u8 = 7;
+
+    struct FloatCmpState {
+        fa: f64,
+        fb: f64,
+        acc: i64,
+    }
+
+    #[majit_macros::jit_interp(
+        state = FloatCmpState,
+        env = Bytecode,
+        state_fields = { fa: float, fb: float, acc: int },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_float_cmp(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<FloatCmpState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = FloatCmpState {
+            fa: 0.0,
+            fb: 0.0,
+            acc: 0,
+        };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                // Value form: float compare materialized to an int — lowers.
+                OP_VALUE => state.acc += (state.fa >= state.fb) as i64,
+                // Branch form: float compare feeding a guard — must abort.
+                OP_BRANCH => {
+                    if state.fa >= state.fb {
+                        state.acc += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        state.acc
+    }
+
+    #[test]
+    fn float_compare_lowers_as_value_but_not_as_branch_guard() {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![2], vec![], vec![0, 1]);
+        __prebuild_jitcode_liveness_dispatch_float_cmp(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_dispatch_float_cmp(&mut asm, 0i64)
+            .expect("dispatch lower must succeed");
+        let ge_count: usize = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .map(|sub| sub.code.iter().filter(|&&b| b == BC_FLOAT_GE).count())
+            .sum();
+        // The value-form arm emits exactly one float_ge; the branch-form arm
+        // must abort lowering (no float_ge feeding a guard), so the total is
+        // 1 rather than 2.
+        assert_eq!(
+            ge_count, 1,
+            "float compare must lower as value but not as branch guard; float_ge={ge_count}"
+        );
+    }
+}
+
+/// A literal-range `for` loop larger than the unroll cap must bail to
+/// interpreter fallback WITHOUT first materializing the whole range — a
+/// huge range (`0..i64::MAX`) would otherwise exhaust memory during macro
+/// expansion.  The mere fact that this fixture compiles proves the range is
+/// never collected; the assertion confirms the oversized arm falls back.
+mod huge_range_for_loop_falls_back {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    const OP_PURE: u8 = 8;
+    const OP_HUGE: u8 = 9;
+
+    struct HugeState {
+        acc: i64,
+    }
+
+    #[majit_macros::jit_interp(
+        state = HugeState,
+        env = Bytecode,
+        state_fields = { acc: int },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_huge_range(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<HugeState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = HugeState { acc: 0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_PURE => state.acc += 1,
+                OP_HUGE => {
+                    for _ in 0i64..9223372036854775807 {
+                        state.acc += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        state.acc
+    }
+
+    #[test]
+    fn oversized_range_arm_bails_without_unrolling() {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
+        __prebuild_jitcode_liveness_dispatch_huge_range(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_dispatch_huge_range(&mut asm, 0i64)
+            .expect("dispatch lower must succeed");
+        let store_count: usize = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .map(|sub| sub.code.iter().filter(|&&b| b == BC_STORE_STATE_FIELD).count())
+            .sum();
+        // Only the `OP_PURE` arm inlines its single store; the oversized
+        // `OP_HUGE` loop exceeds the unroll cap and aborts the arm.
+        assert_eq!(
+            store_count, 1,
+            "oversized-range arm must bail; stores={store_count}"
+        );
+    }
+}
