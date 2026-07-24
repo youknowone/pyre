@@ -1247,35 +1247,66 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "builtin_module_names",
         w_tuple_new(builtin_names.into_iter().map(w_str_new).collect()),
     );
-    // sys.stdlib_module_names — frozenset of stdlib module names, read by
-    // `traceback.TracebackException` (`wrong_name in sys.stdlib_module_names`)
-    // to offer "did you forget to import" hints.  Seeded from the
-    // compiled-in builtin module names; the full pure-Python stdlib set is
-    // not enumerated yet, so a name absent here simply yields no hint
-    // rather than a crash.
+    // sys.stdlib_module_names — frozenset of every top-level standard-library
+    // module name (`Python/stdlib_module_names.h`).  Read by
+    // `traceback.TracebackException` for "did you forget to import" hints and
+    // by the module shadowing check for the stronger stdlib rename hint.  The
+    // list is the full set regardless of platform, as upstream ships it.
+    const STDLIB_MODULE_NAMES: &[&str] = &[
+        "__future__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast",
+        "_ast_unparse", "_asyncio", "_bisect", "_blake2", "_bz2", "_codecs", "_codecs_cn",
+        "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
+        "_collections", "_collections_abc", "_colorize", "_compat_pickle", "_contextvars",
+        "_csv", "_ctypes", "_curses", "_curses_panel", "_datetime", "_dbm", "_decimal",
+        "_elementtree", "_frozen_importlib", "_frozen_importlib_external", "_functools",
+        "_gdbm", "_hashlib", "_heapq", "_hmac", "_imp", "_interpchannels", "_interpqueues",
+        "_interpreters", "_io", "_ios_support", "_json", "_locale", "_lsprof", "_lzma",
+        "_markupbase", "_md5", "_multibytecodec", "_multiprocessing", "_opcode",
+        "_opcode_metadata", "_operator", "_osx_support", "_overlapped", "_pickle",
+        "_posixshmem", "_posixsubprocess", "_py_abc", "_py_warnings", "_pydatetime",
+        "_pydecimal", "_pyio", "_pylong", "_pyrepl", "_queue", "_random",
+        "_remote_debugging", "_scproxy", "_sha1", "_sha2", "_sha3", "_signal",
+        "_sitebuiltins", "_socket", "_sqlite3", "_sre", "_ssl", "_stat", "_statistics",
+        "_string", "_strptime", "_struct", "_suggestions", "_symtable", "_sysconfig",
+        "_thread", "_threading_local", "_tkinter", "_tokenize", "_tracemalloc", "_types",
+        "_typing", "_uuid", "_warnings", "_weakref", "_weakrefset", "_winapi", "_wmi",
+        "_zoneinfo", "_zstd", "abc", "annotationlib", "antigravity", "argparse", "array",
+        "ast", "asyncio", "atexit", "base64", "bdb", "binascii", "bisect", "builtins",
+        "bz2", "cProfile", "calendar", "cmath", "cmd", "code", "codecs", "codeop",
+        "collections", "colorsys", "compileall", "compression", "concurrent",
+        "configparser", "contextlib", "contextvars", "copy", "copyreg", "csv", "ctypes",
+        "curses", "dataclasses", "datetime", "dbm", "decimal", "difflib", "dis", "doctest",
+        "email", "encodings", "ensurepip", "enum", "errno", "faulthandler", "fcntl",
+        "filecmp", "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc",
+        "genericpath", "getopt", "getpass", "gettext", "glob", "graphlib", "grp", "gzip",
+        "hashlib", "heapq", "hmac", "html", "http", "idlelib", "imaplib", "importlib",
+        "inspect", "io", "ipaddress", "itertools", "json", "keyword", "linecache", "locale",
+        "logging", "lzma", "mailbox", "marshal", "math", "mimetypes", "mmap",
+        "modulefinder", "msvcrt", "multiprocessing", "netrc", "nt", "ntpath", "nturl2path",
+        "numbers", "opcode", "operator", "optparse", "os", "pathlib", "pdb", "pickle",
+        "pickletools", "pkgutil", "platform", "plistlib", "poplib", "posix", "posixpath",
+        "pprint", "profile", "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc",
+        "pydoc_data", "pyexpat", "queue", "quopri", "random", "re", "readline", "reprlib",
+        "resource", "rlcompleter", "runpy", "sched", "secrets", "select", "selectors",
+        "shelve", "shlex", "shutil", "signal", "site", "smtplib", "socket", "socketserver",
+        "sqlite3", "sre_compile", "sre_constants", "sre_parse", "ssl", "stat", "statistics",
+        "string", "stringprep", "struct", "subprocess", "symtable", "sys", "sysconfig",
+        "syslog", "tabnanny", "tarfile", "tempfile", "termios", "textwrap", "this",
+        "threading", "time", "timeit", "tkinter", "token", "tokenize", "tomllib", "trace",
+        "traceback", "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
+        "unicodedata", "unittest", "urllib", "uuid", "venv", "warnings", "wave", "weakref",
+        "webbrowser", "winreg", "winsound", "wsgiref", "xml", "xmlrpc", "zipapp", "zipfile",
+        "zipimport", "zlib", "zoneinfo",
+    ];
     module_ns_store(
         ns,
         "stdlib_module_names",
-        pyre_object::setobject::w_frozenset_from_items(&[
-            w_str_new("sys"),
-            w_str_new("builtins"),
-            w_str_new("_thread"),
-            w_str_new("time"),
-            w_str_new("errno"),
-            w_str_new("_io"),
-            w_str_new("marshal"),
-            w_str_new("_imp"),
-            w_str_new("gc"),
-            w_str_new("_warnings"),
-            w_str_new("_string"),
-            w_str_new("_codecs"),
-            w_str_new("_weakref"),
-            w_str_new("_operator"),
-            w_str_new("_collections"),
-            w_str_new("_functools"),
-            w_str_new("itertools"),
-            w_str_new("atexit"),
-        ]),
+        pyre_object::setobject::w_frozenset_from_items(
+            &STDLIB_MODULE_NAMES
+                .iter()
+                .map(|&n| w_str_new(n))
+                .collect::<Vec<_>>(),
+        ),
     );
     // sys.exception() — the value half of `sys.exc_info()`: the exception
     // instance currently being handled, or None outside an `except` block.

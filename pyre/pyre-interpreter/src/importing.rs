@@ -1135,9 +1135,33 @@ fn startup_builtin_module(
 /// PyPy equivalent: sys.path is populated at startup with the script
 /// directory, then PYTHONPATH entries, then the stdlib.
 #[cfg(feature = "host_env")]
+/// The canonical absolute form of a startup `sys.path[0]` directory, for the
+/// shadowing check to compare against absolute module origins.  Under the
+/// sandbox the path is left as given (a virtual path the controller mediates);
+/// `canonicalize` would issue raw host syscalls past the seccomp lockdown.
+fn canonical_startup_dir(dir: &Path) -> String {
+    #[cfg(not(feature = "sandbox"))]
+    if let Ok(abs) = std::path::absolute(dir) {
+        return abs
+            .canonicalize()
+            .unwrap_or(abs)
+            .to_string_lossy()
+            .into_owned();
+    }
+    dir.to_string_lossy().into_owned()
+}
+
 pub fn init_sys_path(script_dir: &Path) {
     // Register builtin modules (PyPy: make_builtins / setup_builtin_modules)
     install_builtin_modules();
+
+    // Record the startup `sys.path[0]` for the shadowing check before any user
+    // code can mutate `sys.path`.  Module origins are absolute canonical paths,
+    // so store the canonical absolute form here for the directory comparison to
+    // hold for a relative script argument or a symlinked working directory.
+    SYS_PATH_0.with(|p| {
+        *p.borrow_mut() = Some(canonical_startup_dir(script_dir));
+    });
 
     SYS_PATH.with(|p| {
         let mut path = p.borrow_mut();
@@ -1531,6 +1555,11 @@ thread_local! {
     static SYS_SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SYS_OPTIMIZE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static SYS_DONT_WRITE_BYTECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The directory prepended to `sys.path` at startup (`config->sys_path_0`):
+    /// the script's directory, or the cwd for `-c` / `-m`.  Captured once by
+    /// `init_sys_path`; read by the shadowing check, which must not see later
+    /// `sys.path` mutations.
+    static SYS_PATH_0: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
@@ -3078,6 +3107,108 @@ pub(crate) fn is_spec_uninitialized_submodule(
     crate::baseobjspace::contains(w_value, pyre_object::w_str_new(name))
 }
 
+/// `_PyModuleSpec_GetFileOrigin` — the spec's file origin: its `origin` string
+/// when `has_location` is truthy and `origin` is a string, otherwise None.  A
+/// missing `has_location` / `origin`, or a falsey `has_location`, yields None;
+/// other lookup errors and the truth test propagate.
+pub(crate) fn spec_file_origin(
+    w_spec: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    if unsafe { pyre_object::is_none(w_spec) } {
+        return Ok(None);
+    }
+    // `has_location` is a property whose getter runs Python and allocates, so
+    // pin the spec and read it back before the `origin` lookup.
+    let _scope = pyre_object::gc_roots::push_roots();
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_spec);
+    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "has_location") {
+        Ok(v) => v,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !crate::baseobjspace::is_true(w_has_location)? {
+        return Ok(None);
+    }
+    let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+    let w_origin = match crate::baseobjspace::getattr_str(w_spec, "origin") {
+        Ok(v) => v,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !unsafe { pyre_object::is_str(w_origin) } {
+        return Ok(None);
+    }
+    Ok(Some(w_origin))
+}
+
+/// `_PyModule_IsPossiblyShadowing` — whether a module loaded from `origin` could
+/// be shadowing a same-named module later on the search path.  True when `-P`
+/// is off and the file's directory equals the startup `sys.path[0]`; a package
+/// `__init__.py` compares its parent directory instead.
+pub(crate) fn is_possibly_shadowing(origin: &str) -> bool {
+    if safe_path_flag() {
+        return false;
+    }
+    let Some(sys_path_0) = SYS_PATH_0.with(|p| p.borrow().clone()) else {
+        return false;
+    };
+    let sep = std::path::MAIN_SEPARATOR;
+    // root = os.path.dirname(origin.removesuffix(os.sep + "__init__.py"))
+    let mut root = origin.to_string();
+    let Some(idx) = root.rfind(sep) else {
+        return false;
+    };
+    if root[idx + 1..] == *"__init__.py" {
+        root.truncate(idx);
+        let Some(idx2) = root.rfind(sep) else {
+            return false;
+        };
+        root.truncate(idx2);
+    } else {
+        root.truncate(idx);
+    }
+    root == sys_path_0
+}
+
+/// The shadowing classification for a module: its spec file origin (a path
+/// string, when it has one), whether it is possibly shadowing a same-named
+/// search-path module, and whether that shadowed module is a standard-library
+/// one.  `w_name` is the module's `__name__` object, tested against
+/// `sys.stdlib_module_names`.
+pub(crate) fn module_shadow_info(
+    w_spec: PyObjectRef,
+    w_name: PyObjectRef,
+) -> Result<(Option<String>, bool, bool), crate::PyError> {
+    let origin = match spec_file_origin(w_spec)? {
+        Some(o) => unsafe { pyre_object::w_str_get_value(o) }.to_string(),
+        None => return Ok((None, false, false)),
+    };
+    if !is_possibly_shadowing(&origin) {
+        return Ok((Some(origin), false, false));
+    }
+    // Shadowing a same-named search-path module; a standard-library name gets
+    // the stronger hint.  `sys.stdlib_module_names` may be replaced or deleted
+    // by user code — only a real set participates, and its membership test
+    // (which hashes `__name__`) propagates.
+    let mut shadowing_stdlib = false;
+    if let Some(sys_mod) = get_sys_module("sys") {
+        let _scope = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_name);
+        let w_names = match crate::baseobjspace::getattr_str(sys_mod, "stdlib_module_names") {
+            Ok(v) => v,
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => pyre_object::w_none(),
+            Err(e) => return Err(e),
+        };
+        if unsafe { pyre_object::is_set_or_frozenset(w_names) } {
+            let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+            shadowing_stdlib = crate::baseobjspace::contains(w_names, w_name)?;
+        }
+    }
+    Ok((Some(origin), true, shadowing_stdlib))
+}
+
 pub fn import_from(
     module: PyObjectRef,
     name: &str,
@@ -3165,30 +3296,57 @@ pub fn import_from(
     // collect; the name string is young and movable, so pin it and read it
     // back from the slot afterwards.
     pyre_object::gc_roots::pin_root(w_pkgname);
-    // pypy/module/imp/importing.py:460 get_path
+    // pypy/module/imp/importing.py:460 get_path — a non-str `__file__`
+    // (including None) reports the location as unknown.
     let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
-        Ok(v) if unsafe { pyre_object::is_none(v) } => pyre_object::w_str_new("unknown location"),
-        Ok(v) => v,
+        Ok(v) if unsafe { pyre_object::is_str(v) } => v,
+        Ok(_) => pyre_object::w_str_new("unknown location"),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             pyre_object::w_str_new("unknown location")
         }
         Err(e) => return Err(e),
     };
+    // Pin the path string across the spec lookups below (which allocate) too.
+    let pkgpath_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_pkgpath);
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     // Own the name so the spec lookups below (which allocate) cannot dangle it.
     let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) }.to_string();
-    // pyopcode.py:1165-1177 — classify the failure through `__spec__` before
-    // reading the path buffer: a module still executing reports the
-    // circular-import cause, as does one whose submodule slot is unset.
+    // Classify the failure through `__spec__`: a same-named file shadowing a
+    // search-path module is flagged first, then a module still executing
+    // reports the circular-import cause, then an unset submodule slot.
     let w_spec = get_spec(module)?;
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_spec);
+    let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
+    let (origin, is_shadowing, is_shadowing_stdlib) = module_shadow_info(w_spec, w_pkgname)?;
+    let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
     let initializing = is_spec_initializing(w_spec)?;
+    let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
     let uninit_submodule = !initializing && is_spec_uninitialized_submodule(w_spec, &pkgname)?;
-    let pkgpath = crate::baseobjspace::utf8_w(w_pkgpath)?;
-    let msg = if initializing {
+    let pkgpath =
+        crate::baseobjspace::utf8_w(pyre_object::gc_roots::shadow_stack_get(pkgpath_slot))?;
+    let origin = origin.as_deref().unwrap_or("");
+    let msg = if is_shadowing_stdlib {
         format!(
-            "cannot import name '{name}' from partially initialized module \
-             '{pkgname}' (most likely due to a circular import) ({pkgpath})"
+            "cannot import name '{name}' from '{pkgname}' (consider renaming \
+             '{origin}' since it has the same name as the standard library \
+             module named '{pkgname}' and prevents importing that standard \
+             library module)"
         )
+    } else if initializing {
+        if is_shadowing {
+            format!(
+                "cannot import name '{name}' from '{pkgname}' (consider renaming \
+                 '{origin}' if it has the same name as a library you intended \
+                 to import)"
+            )
+        } else {
+            format!(
+                "cannot import name '{name}' from partially initialized module \
+                 '{pkgname}' (most likely due to a circular import) ({pkgpath})"
+            )
+        }
     } else if uninit_submodule {
         format!(
             "cannot access submodule '{pkgname}' of module '{name}' \
@@ -3197,6 +3355,8 @@ pub fn import_from(
     } else {
         format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})")
     };
+    let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
+    let w_pkgpath = pyre_object::gc_roots::shadow_stack_get(pkgpath_slot);
     Err(crate::PyError::import_error_name_path(
         msg, w_pkgname, w_pkgpath,
     ))

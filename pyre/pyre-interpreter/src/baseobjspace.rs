@@ -5450,10 +5450,8 @@ unsafe fn module_getattr_hook_or_err(
     // when it is a string, falling back to the bare form otherwise
     // (module.py:143-162).  Own the name up front so the `__spec__` lookups
     // below, which allocate, cannot dangle the dict-borrowed slice.
-    let nm = match finditem_str(w_dict, "__name__")? {
-        Some(w) if !w.is_null() && pyre_object::is_str(w) => {
-            pyre_object::w_str_get_wtf8(w).to_string()
-        }
+    let w_name = match finditem_str(w_dict, "__name__")? {
+        Some(w) if !w.is_null() && pyre_object::is_str(w) => w,
         _ => {
             return Err(PyError::new(
                 PyErrorKind::AttributeError,
@@ -5461,22 +5459,61 @@ unsafe fn module_getattr_hook_or_err(
             ));
         }
     };
-    // module.py:148-159 — a module still executing (`__spec__._initializing`)
-    // or naming an as-yet-unset submodule reports the circular-import cause.
+    // Pin the name across the `__spec__` / shadowing lookups below, which
+    // allocate, then read the display form back from its slot.
+    let _scope = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_name);
+    let nm = pyre_object::w_str_get_wtf8(w_name).to_string();
+    // Classify the miss through `__spec__`: a same-named file shadowing a
+    // search-path module is flagged first (the stdlib hint takes priority over
+    // the circular-import cause), then a module still executing, then an unset
+    // submodule slot.
     let w_spec = finditem_str(w_dict, "__spec__")?.filter(|w| !w.is_null());
     let msg = if let Some(w_spec) = w_spec {
-        if crate::importing::is_spec_initializing(w_spec)? {
+        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_spec);
+        let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        let (origin, is_shadowing, is_shadowing_stdlib) =
+            crate::importing::module_shadow_info(w_spec, w_name)?;
+        let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+        if is_shadowing_stdlib {
+            let origin = origin.as_deref().unwrap_or("");
             format!(
-                "partially initialized module '{nm}' has no attribute '{name}' \
-                 (most likely due to a circular import)"
+                "module '{nm}' has no attribute '{name}' (consider renaming \
+                 '{origin}' since it has the same name as the standard library \
+                 module named '{nm}' and prevents importing that standard \
+                 library module)"
             )
-        } else if crate::importing::is_spec_uninitialized_submodule(w_spec, name)? {
-            format!(
-                "cannot access submodule '{name}' of module '{nm}' \
-                 (most likely due to a circular import)"
-            )
+        } else if crate::importing::is_spec_initializing(w_spec)? {
+            if is_shadowing {
+                let origin = origin.as_deref().unwrap_or("");
+                format!(
+                    "module '{nm}' has no attribute '{name}' (consider renaming \
+                     '{origin}' if it has the same name as a library you \
+                     intended to import)"
+                )
+            } else if let Some(origin) = origin.as_deref() {
+                format!(
+                    "partially initialized module '{nm}' from '{origin}' has no \
+                     attribute '{name}' (most likely due to a circular import)"
+                )
+            } else {
+                format!(
+                    "partially initialized module '{nm}' has no attribute \
+                     '{name}' (most likely due to a circular import)"
+                )
+            }
         } else {
-            format!("module '{nm}' has no attribute '{name}'")
+            let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+            if crate::importing::is_spec_uninitialized_submodule(w_spec, name)? {
+                format!(
+                    "cannot access submodule '{name}' of module '{nm}' \
+                     (most likely due to a circular import)"
+                )
+            } else {
+                format!("module '{nm}' has no attribute '{name}'")
+            }
         }
     } else {
         format!("module '{nm}' has no attribute '{name}'")
