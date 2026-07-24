@@ -236,14 +236,9 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
             };
             *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
         }
-        if index != 0 {
-            miframe.last_caught_exception_value =
-                session.framestack[index - 1].last_caught_exception_value;
-        }
         frames.push(miframe);
     }
 
-    let current = session.framestack.last()?;
     // The innermost frame is the callee `ctx` is actively sub-walking. In a
     // sub-walk its identity lives in `inline_callee_consts` — the copied
     // `snapshot_sym` still points at the outer portal, so resolving off it
@@ -264,13 +259,12 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
             (&(*sym.jitcode()).payload).jitcode.clone()
         }
     };
-    let Some(mut innermost) =
+    let Some(innermost) =
         build_single_frame_miframe(ctx, innermost_jitcode, resume_pc, lastop_result)
     else {
         s2dbg!("innermost build_single_frame_miframe declined");
         return None;
     };
-    innermost.last_caught_exception_value = current.last_caught_exception_value;
     frames.push(innermost);
     s2dbg!("BUILT multi-frame depth={}", frames.frames.len());
     Some(frames)
