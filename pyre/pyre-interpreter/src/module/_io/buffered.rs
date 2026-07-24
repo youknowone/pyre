@@ -313,7 +313,15 @@ impl W_BufferedReader {
         while remaining >= self.buffer_size as usize {
             let block = self.buffer_size as usize * (remaining / self.buffer_size as usize);
             let temp = pyre_object::bytearrayobject::w_bytearray_new(block);
-            let result = super::call_method_result(self.w_raw, "readinto", &[temp])?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(self.self_obj());
+            pyre_object::gc_roots::pin_root(temp);
+            let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
+            let result = super::call_method_result(
+                self.w_raw,
+                "readinto",
+                &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
+            )?;
             if unsafe { pyre_object::is_none(result) } {
                 return if output.is_empty() {
                     Ok(None)
@@ -325,6 +333,7 @@ impl W_BufferedReader {
             if size == 0 {
                 return Ok(Some(output));
             }
+            let temp = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(temp) };
             output.extend_from_slice(&data[..size]);
             remaining -= size;
