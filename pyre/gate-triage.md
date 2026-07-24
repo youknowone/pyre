@@ -69,11 +69,20 @@ would only manufacture conflicts):
 
 - **PYRE_P2_DRAIN** — RETIRED. The drain became the only bridge-carrier
   consumer once it compiled N-deep carriers (recipes 1..=7); the buggy
-  framestack-walk escape hatch it gated was deleted. The remaining branchy
-  inlined-callee continuation gap stays with epic #343.
+  framestack-walk escape hatch it gated was deleted. The branchy inlined-callee
+  continuation gap's plain-branch subcase is closed unconditionally (the
+  carrier-resume sub-walk int-binop inline landed without a gate in #748); its
+  exception-unwind subcase is handled by the try-block callee inline +
+  carrier-boundary raise delivery, now unconditional with the
+  `PYRE_FBW_TRYBLOCK_INLINE` / `PYRE_FBW_CARRIER_RAISE` gates retired.
 
 **Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam
-of the vable-owner rework toward `direct_assembler_call` scalar args).
+of the vable-owner rework toward `direct_assembler_call` scalar args);
+`PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
+into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
+inert until validated; the seed's `bridge_guard_exc` GC-rooting and the
+unconditional `execute_ll_raised` exception assign are parity gaps to close
+before it is enabled by default).
 
 ## §1c — Retired since the 2026-07-05 audit (10): reader already deleted by a closed epic
 
