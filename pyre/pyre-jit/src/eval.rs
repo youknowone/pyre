@@ -1095,7 +1095,8 @@ use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
-const JIT_THRESHOLD: u32 = 200;
+// rlib/jit.py PARAMETERS default: loop hot-count threshold.
+const JIT_THRESHOLD: u32 = 1039;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
     std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
