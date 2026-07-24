@@ -3949,8 +3949,7 @@ mod tests {
                 majit_translate::insns::BC_RAW_LOAD_F,
             ] {
                 assert_ne!(
-                    builder.dispatch_table[byte as usize] as *const () as usize,
-                    placeholder,
+                    builder.dispatch_table[byte as usize] as *const () as usize, placeholder,
                     "opcode byte {byte} must be wired in the inline blackhole builder",
                 );
             }

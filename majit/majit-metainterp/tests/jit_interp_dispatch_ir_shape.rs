@@ -2589,7 +2589,12 @@ mod residual_call_not_dropped {
             .descrs
             .iter()
             .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| sub.code.iter().filter(|&&b| b == BC_STORE_STATE_FIELD).count())
+            .map(|sub| {
+                sub.code
+                    .iter()
+                    .filter(|&&b| b == BC_STORE_STATE_FIELD)
+                    .count()
+            })
             .sum();
         // Only `OP_PURE` contributes one state-field store.  `OP_LOOP_CALL`
         // holds an unregistered qualified call, so its whole body must abort
@@ -2746,7 +2751,12 @@ mod huge_range_for_loop_falls_back {
             .descrs
             .iter()
             .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| sub.code.iter().filter(|&&b| b == BC_STORE_STATE_FIELD).count())
+            .map(|sub| {
+                sub.code
+                    .iter()
+                    .filter(|&&b| b == BC_STORE_STATE_FIELD)
+                    .count()
+            })
             .sum();
         // Only the `OP_PURE` arm inlines its single store; the oversized
         // `OP_HUGE` loop exceeds the unroll cap and aborts the arm.

@@ -3033,6 +3033,9 @@ mod bh_clear_vable_token_inert_token_protocol {
         let p = (&mut probe as *mut TokenProbe) as *mut u8;
         unsafe { bh_clear_vable_token(&info, p) };
         assert_eq!(probe.token, 0, "a nonzero heap token must be cleared");
-        assert_eq!(probe.first, 0xDEAD_BEEF, "the type-pointer word is untouched");
+        assert_eq!(
+            probe.first, 0xDEAD_BEEF,
+            "the type-pointer word is untouched"
+        );
     }
 }
