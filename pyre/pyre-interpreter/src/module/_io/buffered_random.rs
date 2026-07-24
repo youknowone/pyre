@@ -209,7 +209,7 @@ impl W_BufferedRandom {
         if unsafe { pyre_object::is_none(result) } {
             return Err(super::buffered_writer::make_write_blocking_error(0));
         }
-        let written = crate::baseobjspace::int_w(result)?;
+        let written = crate::builtins::space_index_w(result)?;
         if written < 0 || written as usize > data.len() {
             return Err(crate::PyError::os_error(
                 "raw write() returned invalid length",
@@ -389,8 +389,11 @@ impl W_BufferedRandom {
                 }
                 break;
             }
-            if !unsafe { pyre_object::bytesobject::is_bytes_like(data) } {
-                return Err(crate::PyError::type_error("read() should return bytes"));
+            if !unsafe { crate::baseobjspace::isinstance_bytes_w(data) } {
+                return Err(crate::PyError::type_error(format!(
+                    "expected bytes, got {} object",
+                    crate::type_methods::arg_type_name(data)
+                )));
             }
             let chunk = unsafe { pyre_object::bytesobject::bytes_like_data(data) };
             if chunk.is_empty() {

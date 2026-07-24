@@ -11367,71 +11367,90 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     pyre_object::gc_roots::pin_root(raw);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    let isatty = crate::baseobjspace::call_method(
-        pyre_object::gc_roots::shadow_stack_get(raw_slot),
-        "isatty",
-        &[],
-    );
-    if isatty.is_null() {
-        return Err(crate::call::take_call_error()
-            .unwrap_or_else(|| crate::PyError::runtime_error("isatty failed")));
-    }
-    let line_buffering = buffering == 1 || (buffering < 0 && crate::baseobjspace::is_true(isatty)?);
-    if line_buffering {
-        buffering = -1;
-    }
-    if buffering < 0 {
-        buffering = crate::baseobjspace::getattr_str(
+    // `_open` closes the outermost constructed layer when a later layer's
+    // constructor raises, so a failed `open()` never leaks the descriptor.
+    let mut close_target = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    let outcome = (|| -> Result<PyObjectRef, crate::PyError> {
+        let isatty = crate::baseobjspace::call_method(
             pyre_object::gc_roots::shadow_stack_get(raw_slot),
-            "_blksize",
-        )
-        .ok()
-        .and_then(|value| crate::baseobjspace::int_w(value).ok())
-        .filter(|size| *size > 1)
-        .unwrap_or(crate::module::_io::DEFAULT_BUFFER_SIZE);
-    }
-    if buffering == 0 {
-        if !binary {
-            return Err(crate::PyError::value_error(
-                "can't have unbuffered text I/O",
-            ));
+            "isatty",
+            &[],
+        );
+        if isatty.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("isatty failed")));
         }
-        return Ok(pyre_object::gc_roots::shadow_stack_get(raw_slot));
-    }
+        let line_buffering =
+            buffering == 1 || (buffering < 0 && crate::baseobjspace::is_true(isatty)?);
+        if line_buffering {
+            buffering = -1;
+        }
+        if buffering < 0 {
+            buffering = crate::baseobjspace::getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(raw_slot),
+                "_blksize",
+            )
+            .ok()
+            .and_then(|value| crate::baseobjspace::int_w(value).ok())
+            .filter(|size| *size > 1)
+            .unwrap_or(crate::module::_io::DEFAULT_BUFFER_SIZE);
+        }
+        if buffering == 0 {
+            if !binary {
+                return Err(crate::PyError::value_error(
+                    "can't have unbuffered text I/O",
+                ));
+            }
+            return Ok(pyre_object::gc_roots::shadow_stack_get(raw_slot));
+        }
 
-    let buffer_type = if updating {
-        crate::module::_io::buffered_random_type()
-    } else if writing || appending || exclusive {
-        crate::module::_io::buffered_writer_type()
-    } else {
-        crate::module::_io::buffered_reader_type()
+        let buffer_type = if updating {
+            crate::module::_io::buffered_random_type()
+        } else if writing || appending || exclusive {
+            crate::module::_io::buffered_writer_type()
+        } else {
+            crate::module::_io::buffered_reader_type()
+        };
+        let buffer = crate::call::call_function_impl_result(
+            buffer_type,
+            &[
+                pyre_object::gc_roots::shadow_stack_get(raw_slot),
+                w_int_new(buffering),
+            ],
+        )?;
+        pyre_object::gc_roots::pin_root(buffer);
+        let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        close_target = pyre_object::gc_roots::shadow_stack_get(buffer_slot);
+        if binary {
+            return Ok(pyre_object::gc_roots::shadow_stack_get(buffer_slot));
+        }
+
+        let wrapper = crate::call::call_function_impl_result(
+            text_io_wrapper_type(),
+            &[
+                pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+                w_encoding,
+                w_errors,
+                w_newline,
+                w_bool_from(line_buffering),
+            ],
+        )?;
+        crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode))?;
+        Ok(wrapper)
+    })();
+    let result = match outcome {
+        Ok(object) => Ok(object),
+        Err(error) => {
+            // The original error takes precedence; a `close` failure here is
+            // discarded (its call-error slot is cleared so it cannot leak).
+            if crate::baseobjspace::call_method(close_target, "close", &[]).is_null() {
+                let _ = crate::call::take_call_error();
+            }
+            Err(error)
+        }
     };
-    let buffer = crate::call::call_function_impl_result(
-        buffer_type,
-        &[
-            pyre_object::gc_roots::shadow_stack_get(raw_slot),
-            w_int_new(buffering),
-        ],
-    )?;
-    pyre_object::gc_roots::pin_root(buffer);
-    let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    if binary {
-        return Ok(pyre_object::gc_roots::shadow_stack_get(buffer_slot));
-    }
-
-    let wrapper = crate::call::call_function_impl_result(
-        text_io_wrapper_type(),
-        &[
-            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
-            w_encoding,
-            w_errors,
-            w_newline,
-            w_bool_from(line_buffering),
-        ],
-    )?;
-    crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode))?;
     drop(roots);
-    Ok(wrapper)
+    result
 }
 
 /// Low-level storage opener used by `W_FileIO.descr_init`.

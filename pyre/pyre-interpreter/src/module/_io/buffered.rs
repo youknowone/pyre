@@ -278,7 +278,7 @@ impl W_BufferedReader {
                 }
                 break;
             }
-            if !unsafe { pyre_object::bytesobject::is_bytes(data) } {
+            if !unsafe { crate::baseobjspace::isinstance_bytes_w(data) } {
                 return Err(crate::PyError::type_error(format!(
                     "expected bytes, got {} object",
                     crate::type_methods::arg_type_name(data)
