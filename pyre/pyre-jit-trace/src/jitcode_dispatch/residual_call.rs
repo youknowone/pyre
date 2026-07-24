@@ -2843,6 +2843,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // A bare-class `raise Type` has no construct residual to fold; synthesize
+    // the zero-argument instance at the raise itself when the operand is a
+    // canonical builtin exception class.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
+        && try_walker_trace_raise_bare_class(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     // B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
     // `sys_exc_value` slot. Recognised by the
