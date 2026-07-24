@@ -4815,9 +4815,10 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             ArgsEmit::Int(values)
         }
         pyre_object::listobject::ListStrategy::Float => {
-            // `all_floats` is strict `type(w) is W_FloatObject`, so every
-            // element is an exact `W_FloatObject` and `walker_unbox_float`'s
-            // `&FLOAT_TYPE` guard holds.
+            // `all_floats` is strict `type(w) is W_FloatObject`, which reads
+            // `w_class`, so every element is an exact `W_FloatObject` here.
+            // The emit side pins that `w_class` as well: `walker_unbox_float`
+            // guards only the payload `ob_type`, which a subclass shares.
             let mut values = Vec::with_capacity(final_concrete_args.len());
             for &arg in final_concrete_args {
                 values.push(unsafe { pyre_object::w_float_get_value(arg) });
@@ -4922,8 +4923,21 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         ArgsEmit::Empty => crate::helpers::emit_empty_list_inline(ctx.trace_ctx),
         ArgsEmit::Float(values) => {
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let float_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
             let mut raws = Vec::with_capacity(final_args.len());
             for (&arg, value) in final_args.iter().zip(values) {
+                // A float subclass instance carries the same payload
+                // `ob_type` and only retags `w_class`, so `walker_unbox_float`
+                // alone would let a later subclass argument stay on this trace
+                // and be unboxed into Float-strategy storage — `e.args[0]`
+                // would come back a plain float.  `FloatListStrategy.
+                // is_correct_type` rejects it, so pin the exact `w_class` and
+                // let such an argument side-exit to the residual.  A constant
+                // operand is the same object on every iteration, so its
+                // trace-time `w_class` already holds.
+                if !arg.is_constant() {
+                    walker_guard_exact_w_class(ctx, op.pc, arg, float_typeobj)?;
+                }
                 let raw = walker_unbox_float(ctx, op.pc, arg, float_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(value));
@@ -4940,8 +4954,15 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         }
         ArgsEmit::Int(values) => {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let int_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
             let mut raws = Vec::with_capacity(final_args.len());
             for (&arg, value) in final_args.iter().zip(values) {
+                // Same subclass hole as the Float arm: `is_plain_int1` rejects
+                // an int subclass on `w_class`, but `walker_unbox_int` guards
+                // the shared payload `ob_type`.
+                if !arg.is_constant() {
+                    walker_guard_exact_w_class(ctx, op.pc, arg, int_typeobj)?;
+                }
                 let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(value));
@@ -5260,6 +5281,17 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // Resolve the EC while declining is still free.  `walker_ensure_execution_
+    // context` returns `None` on a null snapshot sym or a frameless walk, and
+    // its recovery records a `GETFIELD_GC_R` that must not land after a guard
+    // referencing it — `ensure_execution_context` recovers eagerly at walk
+    // entry for that reason.  A decline past the commit below would also leave
+    // the construction ops orphaned and the heap-cache shadows describing an
+    // object the caller's generic-residual fall-through never built.
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+
     // --- commit: pin the class identity, emit the construction + raise ---
     // Guard the class operand so the trace-time kind / vtable stay valid
     // across iterations (`implement_guard_value`).
@@ -5298,12 +5330,9 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
 
     // `__context__` chaining on the still-virtual exception, mirroring the
     // `try_walker_trace_raise_builtin` tail: `active = GETFIELD_GC_R(ec,
-    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  The EC is
-    // routed through `walker_ensure_execution_context` so the read shares the
-    // one seeded EC OpRef the PUSH_EXC_INFO / POP_EXCEPT lowering consumes.
-    let Some(ec) = walker_ensure_execution_context(ctx) else {
-        return Ok(None);
-    };
+    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  `ec` came
+    // from `walker_ensure_execution_context` above, so the read shares the one
+    // seeded EC OpRef the PUSH_EXC_INFO / POP_EXCEPT lowering consumes.
     let active = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[ec],
