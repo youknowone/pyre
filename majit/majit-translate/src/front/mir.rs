@@ -9097,12 +9097,14 @@ impl<'a> Lowering<'a> {
         // The payload `T` is the first type arg for both `Option<T>` and
         // `Result<T, E>`.
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_unwrap_or::UnwrapOrSite {
             result_var: result_var.clone(),
             enum_owner,
             payload_owner,
             payload_ty,
             payload_on_disc_true,
+            niche,
         })
     }
 
@@ -9155,11 +9157,13 @@ impl<'a> Lowering<'a> {
         let option_owner = td.item_meta.name_path();
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_unwrap::UnwrapSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,
+            niche,
         })
     }
 
@@ -9180,11 +9184,13 @@ impl<'a> Lowering<'a> {
         let option_owner = td.item_meta.name_path();
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_try::OptionTrySite {
             branch_result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,
+            niche,
         })
     }
 
@@ -9230,6 +9236,7 @@ impl<'a> Lowering<'a> {
         // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
         // the read side derives at `resolve_place`.
         let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
+        let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_map_or::MapOrSite {
             result_var: result_var.clone(),
             option_owner,
@@ -9238,6 +9245,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             result_ty,
             args_tuple_suffix,
+            niche,
         })
     }
 
@@ -9293,6 +9301,7 @@ impl<'a> Lowering<'a> {
             | ClosureCombinator::OrElse
             | ClosureCombinator::UnwrapOrElse => tyref_to_value_type(dest_ty, self.llbc),
         };
+        let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_closure_select::ClosureSelectSite {
             kind,
             result_var: result_var.clone(),
@@ -9302,6 +9311,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             call_result_ty,
             args_tuple_suffix,
+            niche,
         })
     }
 

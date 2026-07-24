@@ -87,6 +87,12 @@ pub(crate) struct ClosureSelectSite {
     /// and the `resolve_place` read key under one classdef.  "" (bare `Tuple`)
     /// for a unit payload.
     pub args_tuple_suffix: String,
+    /// True when the receiver is a niche `Option<NonNull<_>>` — a one-word
+    /// pointer with no aggregate `__discriminant` / `__pos_0`.  The `Some`-arm
+    /// discriminant is then `opt != null` and the payload is the base pointer
+    /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
+    /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
+    pub niche: bool,
 }
 
 /// Rewrite every recorded closure-select call site into the discriminant
@@ -305,19 +311,39 @@ fn rewire_one_closure_select_site(
         graph.blocks[a].operations.remove(ci);
     }
     let disc = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(disc.clone()),
-        kind: OpKind::FieldRead {
-            base: opt.clone(),
-            field: FieldDescriptor {
-                name: "__discriminant".to_string(),
-                owner_root: Some(site.option_owner.clone()),
-                owner_id: None,
+    if site.niche {
+        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
+        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
+        // `ptr_ne` with an `Int` result matching the aggregate read.
+        let nullc = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(nullc.clone()),
+            kind: OpKind::ConstRefNull,
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone(),
+                rhs: nullc,
+                result_ty: ValueType::Int,
             },
-            ty: ValueType::Int,
-            pure: true,
-        },
-    });
+        });
+    } else {
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::FieldRead {
+                base: opt.clone(),
+                field: FieldDescriptor {
+                    name: "__discriminant".to_string(),
+                    owner_root: Some(site.option_owner.clone()),
+                    owner_id: None,
+                },
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+    }
     graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
     Ok(())
 }
@@ -332,6 +358,11 @@ fn read_some_payload(
     opt: Variable,
     site: &ClosureSelectSite,
 ) -> Variable {
+    // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
+    // base pointer, so the read is the identity on it.
+    if site.niche {
+        return opt;
+    }
     let payload = graph.alloc_value_var();
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(payload.clone()),
@@ -421,6 +452,7 @@ mod tests {
             payload_ty: ValueType::Int,
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
+            niche: false,
         }
     }
 

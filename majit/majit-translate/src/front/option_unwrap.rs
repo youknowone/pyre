@@ -60,6 +60,11 @@ pub(crate) struct UnwrapSite {
     /// The `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind and the extracted result kind.
     pub payload_ty: ValueType,
+    /// True when the receiver is a niche `Option<NonNull<_>>` — a one-word
+    /// pointer with no aggregate `__discriminant` / `__pos_0`.  The `Some`-arm
+    /// discriminant is then `opt != null` and the payload is the base pointer
+    /// itself (identity), not a `__pos_0` field read.
+    pub niche: bool,
 }
 
 /// Rewrite every recorded `Option::unwrap` call site into the discriminant
@@ -151,23 +156,29 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, _else_inputs) = graph.create_block_with_arg_vars(0);
 
-    // `then_bb`: payload = opt.__pos_0.
+    // `then_bb`: payload = opt.__pos_0.  A niche `Option<NonNull>` has no
+    // aggregate `__pos_0`; the payload IS the base pointer (identity).
     let opt_in_then = map_source(&then_sources, &then_inputs, &opt)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    let payload = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(payload.clone()),
-        kind: OpKind::FieldRead {
-            base: opt_in_then,
-            field: FieldDescriptor {
-                name: "__pos_0".to_string(),
-                owner_root: Some(site.some_owner.clone()),
-                owner_id: None,
+    let payload = if site.niche {
+        opt_in_then
+    } else {
+        let payload = graph.alloc_value_var();
+        graph.block_mut(then_bb).operations.push(SpaceOperation {
+            result: Some(payload.clone()),
+            kind: OpKind::FieldRead {
+                base: opt_in_then,
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(site.some_owner.clone()),
+                    owner_id: None,
+                },
+                ty: site.payload_ty.clone(),
+                pure: true,
             },
-            ty: site.payload_ty.clone(),
-            pure: true,
-        },
-    });
+        });
+        payload
+    };
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &site.result_var,
@@ -189,19 +200,39 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
     let a_id = graph.blocks[a].id;
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(disc.clone()),
-        kind: OpKind::FieldRead {
-            base: opt.clone(),
-            field: FieldDescriptor {
-                name: "__discriminant".to_string(),
-                owner_root: Some(site.option_owner.clone()),
-                owner_id: None,
+    if site.niche {
+        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
+        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
+        // `ptr_ne` with an `Int` result matching the aggregate read.
+        let nullc = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(nullc.clone()),
+            kind: OpKind::ConstRefNull,
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone(),
+                rhs: nullc,
+                result_ty: ValueType::Int,
             },
-            ty: ValueType::Int,
-            pure: true,
-        },
-    });
+        });
+    } else {
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::FieldRead {
+                base: opt.clone(),
+                field: FieldDescriptor {
+                    name: "__discriminant".to_string(),
+                    owner_root: Some(site.option_owner.clone()),
+                    owner_id: None,
+                },
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+    }
     graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, Vec::new());
     Ok(())
 }
@@ -246,6 +277,7 @@ mod tests {
                 option_owner: "core::option::Option".to_string(),
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
+                niche: false,
             }],
         );
         assert_eq!(rewritten, 1, "the unwrap site must be rewritten");
@@ -314,6 +346,7 @@ mod tests {
                 option_owner: "core::option::Option".to_string(),
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
+                niche: false,
             }],
         );
         assert_eq!(rewritten, 0, "a non-unary producer declines");

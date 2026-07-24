@@ -61,6 +61,11 @@ pub(crate) struct OptionTrySite {
     pub some_owner: String,
     /// The `Option` payload `T` — the `Some::__pos_0` field kind.
     pub payload_ty: ValueType,
+    /// True when the branched `Option` is a niche `Option<NonNull<_>>` — a
+    /// one-word pointer with no aggregate `__discriminant` / `__pos_0`.  The
+    /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
+    /// payload is the base pointer itself (identity).
+    pub niche: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -236,20 +241,27 @@ fn rewire_one_option_try_site(
 
     let opt_in_some = map_source(&some_sources, &some_inputs, &opt_a)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    let payload = graph.alloc_value_var();
-    graph.block_mut(some_bb).operations.push(SpaceOperation {
-        result: Some(payload.clone()),
-        kind: OpKind::FieldRead {
-            base: opt_in_some,
-            field: FieldDescriptor {
-                name: "__pos_0".to_string(),
-                owner_root: Some(site.some_owner.clone()),
-                owner_id: None,
+    // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
+    // base pointer (identity).
+    let payload = if site.niche {
+        opt_in_some
+    } else {
+        let payload = graph.alloc_value_var();
+        graph.block_mut(some_bb).operations.push(SpaceOperation {
+            result: Some(payload.clone()),
+            kind: OpKind::FieldRead {
+                base: opt_in_some,
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(site.some_owner.clone()),
+                    owner_id: None,
+                },
+                ty: site.payload_ty.clone(),
+                pure: true,
             },
-            ty: site.payload_ty.clone(),
-            pure: true,
-        },
-    });
+        });
+        payload
+    };
     let some_link_args = continue_specs
         .iter()
         .map(|spec| match spec {
@@ -281,10 +293,28 @@ fn rewire_one_option_try_site(
     );
 
     let opt_disc = graph.alloc_value_var();
-    graph
-        .block_mut(graph.blocks[a].id)
-        .operations
-        .push(SpaceOperation {
+    let a_id = graph.blocks[a].id;
+    if site.niche {
+        // Niche `Option<NonNull>`: the switch value is the pointer null-test
+        // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
+        // two `Ref` operands lowers to `ptr_ne` with an `Int` result, feeding
+        // the `{1 => Some, 0 => None}` switch exactly as the aggregate read.
+        let nullc = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(nullc.clone()),
+            kind: OpKind::ConstRefNull,
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(opt_disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt_a.clone(),
+                rhs: nullc,
+                result_ty: ValueType::Int,
+            },
+        });
+    } else {
+        graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(opt_disc.clone()),
             kind: OpKind::FieldRead {
                 base: opt_a.clone(),
@@ -297,6 +327,7 @@ fn rewire_one_option_try_site(
                 pure: true,
             },
         });
+    }
     graph.set_control_flow_metadata(
         graph.blocks[a].id,
         Some(ExitSwitch::Value(opt_disc)),

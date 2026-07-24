@@ -91,6 +91,11 @@ pub(crate) struct MapOrSite {
     /// and the `resolve_place` read key under one classdef.  "" (bare `Tuple`)
     /// for a unit payload.
     pub args_tuple_suffix: String,
+    /// True when the receiver is a niche `Option<NonNull<_>>` — a one-word
+    /// pointer with no aggregate `__discriminant` / `__pos_0`.  The `Some`-arm
+    /// discriminant is then `opt != null` and the payload is the base pointer
+    /// itself (identity), not a `__pos_0` field read.
+    pub niche: bool,
 }
 
 /// Rewrite every recorded `Option::map_or` call site into the discriminant
@@ -237,20 +242,27 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
     let env_in_then = map_source(&then_sources, &then_inputs, &env)
         .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?;
-    let payload = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(payload.clone()),
-        kind: OpKind::FieldRead {
-            base: opt_in_then,
-            field: FieldDescriptor {
-                name: "__pos_0".to_string(),
-                owner_root: Some(site.some_owner.clone()),
-                owner_id: None,
+    // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
+    // base pointer, so the closure input is the identity on it.
+    let payload = if site.niche {
+        opt_in_then
+    } else {
+        let payload = graph.alloc_value_var();
+        graph.block_mut(then_bb).operations.push(SpaceOperation {
+            result: Some(payload.clone()),
+            kind: OpKind::FieldRead {
+                base: opt_in_then,
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(site.some_owner.clone()),
+                    owner_id: None,
+                },
+                ty: site.payload_ty.clone(),
+                pure: true,
             },
-            ty: site.payload_ty.clone(),
-            pure: true,
-        },
-    });
+        });
+        payload
+    };
     // The closure's `Args` tuple `(payload,)` — the transparent-ctor + a
     // single `__pos_0` FieldWrite, the same shape `Rvalue::Aggregate` emits for
     // a tuple (write ty `Ref(None)`).  The owner carries the per-shape `<X>`
@@ -330,19 +342,39 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         graph.blocks[a].operations.remove(ci);
     }
     let disc = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(disc.clone()),
-        kind: OpKind::FieldRead {
-            base: opt.clone(),
-            field: FieldDescriptor {
-                name: "__discriminant".to_string(),
-                owner_root: Some(site.option_owner.clone()),
-                owner_id: None,
+    if site.niche {
+        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
+        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
+        // `ptr_ne` with an `Int` result matching the aggregate read.
+        let nullc = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(nullc.clone()),
+            kind: OpKind::ConstRefNull,
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone(),
+                rhs: nullc,
+                result_ty: ValueType::Int,
             },
-            ty: ValueType::Int,
-            pure: true,
-        },
-    });
+        });
+    } else {
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::FieldRead {
+                base: opt.clone(),
+                field: FieldDescriptor {
+                    name: "__discriminant".to_string(),
+                    owner_root: Some(site.option_owner.clone()),
+                    owner_id: None,
+                },
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+    }
     graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
     Ok(())
 }
@@ -387,6 +419,7 @@ mod tests {
             payload_ty: ValueType::Int,
             result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
+            niche: false,
         }
     }
 
