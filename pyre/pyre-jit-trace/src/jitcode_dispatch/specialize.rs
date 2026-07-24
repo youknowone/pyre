@@ -746,7 +746,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcPureR,
+        OpCode::GetfieldGcR,
         &[long],
         crate::descr::long_value_descr(),
     );
@@ -896,7 +896,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let lhs_payload = unsafe { *((lhs_obj as *const u8).add(off) as *const i64) };
     let lhs_pl = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcPureR,
+        OpCode::GetfieldGcR,
         &[lhs],
         crate::descr::long_value_descr(),
     );
@@ -2793,7 +2793,7 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcPureR,
+        OpCode::GetfieldGcR,
         &[long],
         crate::descr::long_value_descr(),
     );

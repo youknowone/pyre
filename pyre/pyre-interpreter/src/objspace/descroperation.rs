@@ -728,9 +728,7 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(
-            w_long_get_value(a).int_add(w_int_get_value(b)),
-        ));
+        return Ok(w_long_new(w_long_get_value(a).int_add(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
@@ -738,9 +736,7 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(
-            w_long_get_value(b).int_add(w_int_get_value(a)),
-        ));
+        return Ok(w_long_new(w_long_get_value(b).int_add(w_int_get_value(a))));
     }
     Ok(w_long_new(bigint_add(as_bigint(a), as_bigint(b))))
 }
@@ -754,9 +750,7 @@ unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(
-            w_long_get_value(a).int_sub(w_int_get_value(b)),
-        ));
+        return Ok(w_long_new(w_long_get_value(a).int_sub(w_int_get_value(b))));
     }
     Ok(w_long_new(bigint_sub(as_bigint(a), as_bigint(b))))
 }
@@ -769,9 +763,7 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(
-            w_long_get_value(a).int_mul(w_int_get_value(b)),
-        ));
+        return Ok(w_long_new(w_long_get_value(a).int_mul(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
@@ -779,9 +771,7 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(
-            w_long_get_value(b).int_mul(w_int_get_value(a)),
-        ));
+        return Ok(w_long_new(w_long_get_value(b).int_mul(w_int_get_value(a))));
     }
     Ok(w_long_new(bigint_mul(as_bigint(a), as_bigint(b))))
 }
@@ -1456,9 +1446,7 @@ unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(
-            w_long_get_value(a).int_and_(w_int_get_value(b)),
-        ));
+        return Ok(w_long_new(w_long_get_value(a).int_and_(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
@@ -1466,9 +1454,7 @@ unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(
-            w_long_get_value(b).int_and_(w_int_get_value(a)),
-        ));
+        return Ok(w_long_new(w_long_get_value(b).int_and_(w_int_get_value(a))));
     }
     Ok(w_long_new(bigint_and(as_bigint(a), as_bigint(b))))
 }
@@ -1480,9 +1466,7 @@ unsafe fn long_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(
-            w_long_get_value(a).int_or_(w_int_get_value(b)),
-        ));
+        return Ok(w_long_new(w_long_get_value(a).int_or_(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
@@ -1490,9 +1474,7 @@ unsafe fn long_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(
-            w_long_get_value(b).int_or_(w_int_get_value(a)),
-        ));
+        return Ok(w_long_new(w_long_get_value(b).int_or_(w_int_get_value(a))));
     }
     Ok(w_long_new(bigint_or(as_bigint(a), as_bigint(b))))
 }
@@ -1504,9 +1486,7 @@ unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_long(a) && is_int(b) {
-        return Ok(w_long_new(
-            w_long_get_value(a).int_xor(w_int_get_value(b)),
-        ));
+        return Ok(w_long_new(w_long_get_value(a).int_xor(w_int_get_value(b))));
     }
     if is_bool(a) && is_long(b) {
         return Ok(w_long_new(
@@ -1514,9 +1494,7 @@ unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         ));
     }
     if is_int(a) && is_long(b) {
-        return Ok(w_long_new(
-            w_long_get_value(b).int_xor(w_int_get_value(a)),
-        ));
+        return Ok(w_long_new(w_long_get_value(b).int_xor(w_int_get_value(a))));
     }
     Ok(w_long_new(bigint_xor(as_bigint(a), as_bigint(b))))
 }
@@ -3378,7 +3356,7 @@ pub(crate) fn try_int_long_pow_with_modulo(
             // `x ** 0 % m` is `1 % m` under floor semantics, so a negative
             // modulus yields a negative residue (`pow(2, 0, -13) == -12`).
             return Ok(Some(pow_mod_result(
-                BigInt::from(1).mod_floor(&modulus),
+                bigint_modulo_nonzero(BigInt::from(1), modulus),
                 all_int_like,
             )));
         }

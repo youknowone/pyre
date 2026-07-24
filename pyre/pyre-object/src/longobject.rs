@@ -505,7 +505,7 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_add_int_int(a: i64, b: i64) -> i64 {
     // Exact in i128 for any i64 pair; skips the general bigint add machinery.
-    unsafe { alloc_bigint_nursery_collecting(BigInt::from(a as i128 + b as i128)) as i64 }
+    alloc_bigint_nursery_collecting(BigInt::from(a as i128 + b as i128)) as i64
 }
 
 /// `rbigint.sub` on bare payloads (collecting). See [`jit_bigint_add`].
@@ -529,7 +529,7 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_sub_int_int(a: i64, b: i64) -> i64 {
     // Exact in i128 for any i64 pair; skips the general bigint sub machinery.
-    unsafe { alloc_bigint_nursery_collecting(BigInt::from(a as i128 - b as i128)) as i64 }
+    alloc_bigint_nursery_collecting(BigInt::from(a as i128 - b as i128)) as i64
 }
 
 /// `rbigint.mul` on bare payloads (collecting). See [`jit_bigint_add`].
@@ -545,7 +545,7 @@ pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mul_int_int(a: i64, b: i64) -> i64 {
     // A 64x64 product is exact in i128; skips the general bigint mul machinery.
-    unsafe { alloc_bigint_nursery_collecting(BigInt::from(a as i128 * b as i128)) as i64 }
+    alloc_bigint_nursery_collecting(BigInt::from(a as i128 * b as i128)) as i64
 }
 
 /// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
