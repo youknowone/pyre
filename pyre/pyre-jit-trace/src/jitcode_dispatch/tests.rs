@@ -73,13 +73,13 @@ fn done_descr_ref_for_tests() -> DescrRef {
 fn inline_caller_frame_distinguishes_try_block_catch_marker_decline() {
     // No after-residual catch resume → not a try-block CALL → accept.
     assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(None, &[], 0),
+        decline_inline_caller_frame_for_catch_marker(None, &[]),
         Ok(()),
     );
-    // A try-block CALL with no resolvable loop header / catch (empty jitcode)
-    // cannot prove its handler rejoins the CALL's loop → decline.
+    // A try-block CALL with no resolvable catch (empty jitcode) cannot prove its
+    // handler rejoins a loop → decline.
     assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(42), &[], 0),
+        decline_inline_caller_frame_for_catch_marker(Some(42), &[]),
         Err(InlineCallerFrameDecline::TryBlockCatchMarker),
     );
 }

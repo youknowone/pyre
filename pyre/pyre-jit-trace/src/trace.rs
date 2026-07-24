@@ -1271,7 +1271,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         _ => None,
     };
     if let Some((exc, exc_concrete)) = subwalk_raise {
-        if carrier.recipes.len() == 1 && crate::jitcode_dispatch::fbw_carrier_raise_enabled() {
+        if carrier.recipes.len() == 1 {
             if let Some(catch_target) = carrier_root_catch_target(sym, root_pc) {
                 crate::jitcode_dispatch::set_carrier_raise_seed(
                     crate::jitcode_dispatch::CarrierRaiseSeed {

@@ -112,51 +112,6 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_TRYBLOCK_INLINE`: multi-frame-inline a branch-bearing callee
-/// CALLed inside a try-block when its `except` handler REJOINS the CALL's own
-/// loop (`exc_handler_rejoins_specific_loop`).  The paused caller frame resumes
-/// at the CALL fallthrough on the no-raise path, and on a raise the caller's
-/// `lastblock` (a static box in its virtualizable image) unwinds to the handler
-/// in the blackhole — bit-exact.  A handler that BREAKS / RETURNS out of that
-/// loop is not routed (a hot raise there cannot be bridged and would
-/// deopt-storm), so it keeps declining to the residual path.  Default-on;
-/// `PYRE_FBW_TRYBLOCK_INLINE=0` (or `false`) restores the blanket try-block
-/// decline as the rollback escape hatch.
-pub(crate) fn fbw_tryblock_inline_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_TRYBLOCK_INLINE") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_FBW_CARRIER_RAISE`: deliver a depth-2 inlined-callee raise to the ROOT
-/// frame's `except` handler at the bridge-carrier boundary
-/// (`finishframe_exception`), so the raise compiles a bridge into the enclosing
-/// loop instead of aborting the carrier and deopt-storming.  Without it, a
-/// carrier sub-walk that ends in `SubRaise` is dropped (the consumer only
-/// continues a value-`SubReturn`), and every raise iteration re-interprets.
-///
-/// This also gates the try-block inline gate WIDENING: when on, a handler that
-/// breaks/returns to an ENCLOSING loop is inline-eligible (its hot raise bridges
-/// via this delivery); when off, only a handler rejoining the CALL's own loop
-/// inlines (`exc_handler_rejoins_specific_loop`), so the widened shape declines
-/// to the residual path instead of deopt-storming.  Default-on;
-/// `PYRE_FBW_CARRIER_RAISE=0` (or `false`) is the rollback escape hatch.
-pub(crate) fn fbw_carrier_raise_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CARRIER_RAISE") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 /// `PYRE_FBW_NSVABLE_MULTIFRAME` (#73): publish the `_nonstandard_virtualizable`
 /// promote guard through the full multi-frame resume chain (each paused caller
 /// plus the callee's own coordinate) instead of the single-frame sentinel
