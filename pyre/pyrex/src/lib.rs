@@ -824,15 +824,42 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
     importing::set_sys_module("__main__", main_module);
 
+    // Seed the module-identity attributes every `__main__` namespace carries
+    // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a
+    // bare `__spec__` / `__package__` / `__doc__` reference falls through to
+    // the `builtins` module and returns its values, so `if __spec__ is None`
+    // main-detection (multiprocessing spawn, runpy, pytest) inverts.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            canonical,
+            "__spec__",
+            pyre_object::w_none(),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            canonical,
+            "__package__",
+            pyre_object::w_none(),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            canonical,
+            "__doc__",
+            pyre_object::w_none(),
+        );
+    }
+
     // A script run by path gets `__file__` / `__cached__` in `__main__`
     // (pythonrun.c `_PyRun_SimpleFileObject`); the `-c "<string>"` command
-    // path does not. `__file__` is the literal command-line path, not a
-    // canonicalized one.
+    // path does not. `__file__` is absolutized (os.path.abspath, 3.9+) while
+    // `sys.argv[0]` keeps the literal command-line path.
     if filename != "<string>" {
+        let abs_file = match std::path::absolute(filename) {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => filename.to_string(),
+        };
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
             "__file__",
-            pyre_object::w_str_new(filename),
+            pyre_object::w_str_new(&abs_file),
         );
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
