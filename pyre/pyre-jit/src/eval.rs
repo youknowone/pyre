@@ -16,8 +16,11 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
     PyError, PyResult, StepResult, decode_instruction_forward, execute_opcode_step,
 };
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::rc::Rc;
+
+use vecset::VecSet;
 
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
@@ -6156,6 +6159,34 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
     // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
+thread_local! {
+    /// Memoizes `find_loop_header_pcs` per code object.  The loop-header set
+    /// depends only on `code.instructions` (immutable) and the `CodeObject`
+    /// behind `code_ptr` is `Box`-immortal — a stable, never-freed address —
+    /// so the raw pointer is a sound stable key.  Recomputing it on every
+    /// `eval_loop_jit` entry re-scans the whole bytecode and rebuilds the
+    /// successor map for each called function / module-body frame; the loop
+    /// headers are code-invariant (fixed once the codewriter has seen the
+    /// code), so that per-frame O(code) work is pure waste on cold, run-once
+    /// startup code where no frame is entered twice through this loop.
+    static LOOP_HEADER_MEMO: RefCell<HashMap<usize, Rc<VecSet<usize>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Cached form of [`crate::jit::codewriter::find_loop_header_pcs`], keyed by
+/// the immortal `CodeObject` address.
+fn cached_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> Rc<VecSet<usize>> {
+    let key = code as *const pyre_interpreter::CodeObject as usize;
+    LOOP_HEADER_MEMO.with(|memo| {
+        if let Some(hit) = memo.borrow().get(&key) {
+            return hit.clone();
+        }
+        let computed = Rc::new(crate::jit::codewriter::find_loop_header_pcs(code));
+        memo.borrow_mut().insert(key, computed.clone());
+        computed
+    })
+}
+
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
@@ -6176,7 +6207,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    let semantic_loop_headers = crate::jit::codewriter::find_loop_header_pcs(code);
+    // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
+    // back-edge event).  Loopless frames — the overwhelming majority during
+    // cold startup, where every called helper / class body / module top level
+    // runs once and never takes a back-edge — never reach it, so computing it
+    // eagerly here scanned the whole bytecode and built a successor map for
+    // every frame entry to produce a set no one read.  Compute it lazily at
+    // the first back-edge instead (memoized per code object).
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
@@ -6343,7 +6380,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 driver.blackhole_if_trace_too_long();
             }
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
-                if !semantic_loop_headers.contains(&loop_header_pc) {
+                if !cached_loop_header_pcs(code).contains(&loop_header_pc) {
                     driver.blackhole_if_trace_too_long();
                     continue;
                 }
