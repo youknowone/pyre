@@ -909,7 +909,17 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     // path does not. `__file__` is absolutized (os.path.abspath, 3.9+) while
     // `sys.argv[0]` keeps the literal command-line path.
     if filename != "<string>" {
-        let abs_file = match std::path::absolute(filename) {
+        // Resolve a relative path against `sys_path_cwd()` — the seam-provided
+        // virtual cwd under sandbox — before normalizing, so `std::path::absolute`
+        // never consults (and leaks) the trusted process cwd. Off sandbox this is
+        // identical to `absolute(filename)`.
+        let path = Path::new(filename);
+        let to_absolutize = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            sys_path_cwd().join(path)
+        };
+        let abs_file = match std::path::absolute(&to_absolutize) {
             Ok(p) => p.to_string_lossy().into_owned(),
             Err(_) => filename.to_string(),
         };
