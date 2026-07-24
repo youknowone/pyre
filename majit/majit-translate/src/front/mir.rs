@@ -1637,6 +1637,19 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
         // it actually rewrote.  Only an actual rewrite detaches blocks (the
         // discriminant switch), so the unreachable-block sweep is gated on
         // that count, leaving a declined graph byte-identical.
+        // Divert exclusive int-`Range` for-loops (`for _ in a..b`) to the
+        // orthodox `range()` builtin + list-iter BEFORE the `next`-diamond
+        // runs, so its `originates_from_iter_op` gate sees the
+        // `["core","slice","iter"]` op and folds the loop.  Runs on the same
+        // simplified graph; fail-safe — an unpaired / multi-consumer range
+        // aggregate stays the ordinary ADT ctor (census Skip).
+        if !lo.range_iter_new_sites.is_empty() && !lo.next_call_results.is_empty() {
+            crate::front::range_iter::rewire_range_iter_sites(
+                &mut lo.graph,
+                &lo.range_iter_new_sites,
+                &lo.next_call_results,
+            );
+        }
         let next_rewritten = if lo.next_call_results.is_empty() {
             0
         } else {
@@ -2189,6 +2202,11 @@ struct Lowering<'a> {
     /// `front::range_contains` post-pass synthesizes (see
     /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
     range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
+    /// Exclusive int-`Range { start, end }` aggregates (`for _ in a..b`)
+    /// recorded for the `range()` + list-iter divert the
+    /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
+    /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
+    range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
     /// `RangeInclusive::contains(&self, &x)` call sites paired with the
     /// `new` sites above by the `front::range_contains` post-pass (see
     /// [`crate::front::range_contains::RangeContainsSite`]).
@@ -2377,6 +2395,7 @@ impl<'a> Lowering<'a> {
             bigint_div_rem_sites: Vec::new(),
             bigint_div_mod_floor_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
+            range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
@@ -3992,6 +4011,26 @@ impl<'a> Lowering<'a> {
                         result_ty: ValueType::Ref(Some(result_ty_owner.clone())),
                     },
                 });
+                // Capture an exclusive int-`Range { start, end }` aggregate
+                // (`for _ in a..b`) so `front::range_iter` can divert it to
+                // the orthodox `range()` builtin + list-iter — the
+                // `next`-diamond then folds the loop, instead of the
+                // union-failing shared `core.ops.range.Range` classdef.  Only
+                // int/uint element ranges are recorded; the divert itself is
+                // consumer-gated in the post-pass, so a range read by a
+                // slice-index / field read keeps this ctor + FieldWrite path.
+                if owner_path.as_slice() == ["core", "ops", "range"]
+                    && ctor_name == "Range"
+                    && arg_vars.len() == 2
+                    && self.aggregate_head_is_int_range(&kind)
+                {
+                    self.range_iter_new_sites
+                        .push(crate::front::range_iter::RangeNewSite {
+                            result_var: res.clone(),
+                            start: arg_vars[0].clone(),
+                            end: arg_vars[1].clone(),
+                        });
+                }
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -4761,6 +4800,54 @@ impl<'a> Lowering<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `true` when the `AggregateKind::Adt` head constructs a
+    /// `core::ops::range::Range` whose element type is a word-sized integer
+    /// (`i64` / `isize` / `u64` / `usize`) — the `for _ in a..b` int-range
+    /// shape `front::range_iter` diverts to the orthodox `range()` builtin.
+    /// The element is read from the head's `generics.types[0]` (present even
+    /// when the bounds are literal consts); a non-int element, a non-object
+    /// head (bare `type_id`, no generics), or a non-`Range` owner declines,
+    /// leaving the ordinary ADT ctor path.
+    fn aggregate_head_is_int_range(&self, kind: &serde_json::Value) -> bool {
+        let Some(head) = kind
+            .as_object()
+            .and_then(|m| m.get("Adt"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+        else {
+            return false;
+        };
+        let is_range = head
+            .get("id")
+            .and_then(|i| i.get("Adt"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::Range");
+        if !is_range {
+            return false;
+        }
+        let Some(lit) = head
+            .get("generics")
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+            .and_then(|n| strip_ty_wrappers(n, self.llbc))
+            .and_then(|e| e.as_object())
+            .and_then(|m| m.get("Literal"))
+            .and_then(|l| l.as_object())
+        else {
+            return false;
+        };
+        matches!(
+            lit.get("Int").and_then(serde_json::Value::as_str),
+            Some("I64" | "Isize")
+        ) || matches!(
+            lit.get("UInt").and_then(serde_json::Value::as_str),
+            Some("U64" | "Usize")
+        )
     }
 
     /// For a struct the owner_root is the LLBC TypeDecl's leaf name

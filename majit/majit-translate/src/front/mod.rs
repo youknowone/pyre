@@ -79,6 +79,7 @@ pub(crate) mod option_try;
 pub(crate) mod option_unwrap;
 pub(crate) mod option_unwrap_or;
 pub(crate) mod range_contains;
+pub(crate) mod range_iter;
 pub(crate) mod result_exc;
 pub mod semantic;
 pub mod typestr;

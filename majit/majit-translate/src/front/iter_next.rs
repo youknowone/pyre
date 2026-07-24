@@ -611,7 +611,17 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     // invariant).
     let stop_etype = graph.alloc_value_var();
     let stop_evalue = graph.alloc_value_var();
-    let mut stopiter_link = Link::new_mixed(none_args, none_target, Some(stopiteration_exitcase()));
+    // Derive the low-level exit case for the typed `StopIteration` link in
+    // the front, exactly as `SwitchInt` (`mir.rs`) and `set_branch`
+    // (`model.rs`) do for their model-`Link`s: `flatten.rs:1155
+    // GotoIfExceptionMismatch` reads `link.llexitcase`, and the legacy
+    // walker (unlike the rtyper's `_convert_link`) never populates it, so a
+    // folded `next` diamond in a graph that falls to the legacy tier would
+    // otherwise reach the codewriter with an unset case.  The
+    // `Constant(HostObject(class))` the exitcase carries is the shape
+    // `assembler::emit_llexitcase` encodes via `identity_id()`.
+    let mut stopiter_link = Link::new_mixed(none_args, none_target, Some(stopiteration_exitcase()))
+        .with_llexitcase_from_exitcase();
     stopiter_link.last_exception = Some(LinkArg::Value(stop_etype));
     stopiter_link.last_exc_value = Some(LinkArg::Value(stop_evalue));
 
