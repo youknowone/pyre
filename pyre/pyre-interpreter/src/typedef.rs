@@ -11,6 +11,7 @@
 //! unifies attribute lookup for all object types.
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use pyre_object::pyobject::*;
@@ -175,12 +176,17 @@ pub static TYPEOBJECT_CACHE: OnceLock<HashMap<usize, usize>> = OnceLock::new();
 /// `set_instantiate` loop — the same source that backs
 /// `TYPEOBJECT_CACHE`. The slot read is a single field load the JIT can
 /// model, where the `usize`-keyed `HashMap` lookup is not.
-pub fn gettypefor(tp: *const PyType) -> Option<PyObjectRef> {
+pub fn gettypefor(tp: *const PyType) -> Option<NonNull<PyObject>> {
     if tp.is_null() {
         return None;
     }
     let w = unsafe { pyre_object::get_instantiate(&*tp) };
-    if w.is_null() { None } else { Some(w) }
+    // The `instantiate` slot is a maybe-null object pointer: null while the
+    // type is still bootstrapping, otherwise the type object.  Modelled as a
+    // one-word niche `Option<NonNull<PyObject>>` (None = null, Some(p) = the
+    // type object) so a payload read is a pointer identity and the match is a
+    // pointer null-test.
+    NonNull::new(w)
 }
 
 /// Get the W_TypeObject for any PyObjectRef.
@@ -200,7 +206,7 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     // derefs below (which would fault on the immediate). Gated on
     // `CAN_BE_TAGGED` (default false), so the derefs stay the only live path.
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-        return gettypefor(&pyre_object::INT_TYPE);
+        return gettypefor(&pyre_object::INT_TYPE).map(|p| p.as_ptr());
     }
     unsafe {
         // Exception instances share a single W_BaseException layout
@@ -234,7 +240,7 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
         // so writing to (*obj).w_class would SIGBUS — just look it up via
         // gettypefor(), which reads an AtomicPtr on the PyType.
         let tp = (*obj).ob_type;
-        gettypefor(tp)
+        gettypefor(tp).map(|p| p.as_ptr())
     }
 }
 
@@ -1259,7 +1265,8 @@ fn patch_object_class_descriptor() {
 /// namespace (it is created by the same call that runs the initializer), so
 /// the two descriptors are stored here, once the type is registered.
 fn patch_complex_realimag_descriptors() {
-    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).unwrap_or(pyre_object::PY_NULL);
+    let complex_type =
+        gettypefor(&pyre_object::COMPLEX_TYPE).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
@@ -1378,7 +1385,7 @@ pub fn w_type() -> PyObjectRef {
 }
 
 pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
-    gettypefor(tp as *const PyType).unwrap_or(PY_NULL)
+    gettypefor(tp as *const PyType).map_or(PY_NULL, |p| p.as_ptr())
 }
 
 /// Get the wrapped `object` typeobject.
@@ -1685,7 +1692,7 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // intobject.py _new_int → check_user_subclass
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
         if let Some(w_int) = gettypefor(&pyre_object::INT_TYPE) {
-            check_user_subclass(w_int, cls)?;
+            check_user_subclass(w_int.as_ptr(), cls)?;
         }
     }
     let value = crate::builtins::builtin_int(&args[1..])?;
@@ -1694,7 +1701,7 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(value);
     }
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
-    if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+    if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     // cls is a subclass of int. Create a unique instance (bypassing the
@@ -1769,7 +1776,7 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         return Ok(value);
     }
     let complex_typeobj = gettypefor(&pyre_object::COMPLEX_TYPE);
-    if complex_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+    if complex_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     // Subclass path — retag a fresh W_ComplexObject with the subclass.
@@ -2015,7 +2022,7 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         || (!unsafe { pyre_object::is_dict(w_dict) }
             && !unsafe { pyre_object::dictmultiobject::is_module_dict(w_dict) }
             && !gettypefor(&pyre_object::DICT_TYPE).is_some_and(|dict_type| unsafe {
-                crate::baseobjspace::isinstance_w(w_dict, dict_type)
+                crate::baseobjspace::isinstance_w(w_dict, dict_type.as_ptr())
             }))
     {
         return Err(crate::PyError::type_error(format!(
@@ -2266,7 +2273,7 @@ fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
     let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_ellipsis) = gettypefor(&pyre_object::ELLIPSIS_TYPE) {
-        check_user_subclass(w_ellipsis, cls)?;
+        check_user_subclass(w_ellipsis.as_ptr(), cls)?;
     }
     Ok(pyre_object::special::w_ellipsis())
 }
@@ -2326,7 +2333,7 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
     let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_notimplemented) = gettypefor(&pyre_object::pyobject::NOTIMPLEMENTED_TYPE) {
-        check_user_subclass(w_notimplemented, cls)?;
+        check_user_subclass(w_notimplemented.as_ptr(), cls)?;
     }
     Ok(pyre_object::special::w_not_implemented())
 }
@@ -2421,7 +2428,7 @@ fn none_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_none_type) = gettypefor(&pyre_object::NONE_TYPE) {
-        check_user_subclass(w_none_type, cls)?;
+        check_user_subclass(w_none_type.as_ptr(), cls)?;
     }
     Ok(pyre_object::w_none())
 }
@@ -2555,7 +2562,7 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(value);
     }
     let str_typeobj = gettypefor(&pyre_object::STR_TYPE);
-    if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+    if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     if !unsafe { pyre_object::is_type(cls) } {
@@ -2564,7 +2571,7 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     if let Some(w_str) = str_typeobj {
-        if !unsafe { crate::baseobjspace::issubtype_w(cls, w_str) } {
+        if !unsafe { crate::baseobjspace::issubtype_w(cls, w_str.as_ptr()) } {
             let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
             return Err(crate::PyError::type_error(format!(
                 "str.__new__({cls_name}): {cls_name} is not a subtype of str"
@@ -2620,7 +2627,7 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = w_booltype (cls)
     let w_booltype = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_bool) = gettypefor(&pyre_object::BOOL_TYPE) {
-        check_user_subclass(w_bool, w_booltype)?;
+        check_user_subclass(w_bool.as_ptr(), w_booltype)?;
     }
     // boolobject.py: descr_new(space, w_booltype, w_obj)
     // Takes exactly (cls) or (cls, obj). No extra args, no kwargs.
@@ -2709,7 +2716,7 @@ fn subclass_to_tag(
         return Ok(None);
     }
     let base_obj = match gettypefor(base) {
-        Some(t) => t,
+        Some(t) => t.as_ptr(),
         None => return Ok(Some(cls)),
     };
     // `cls` is the builtin base itself → keep the canonical layout, no retag.
@@ -2894,8 +2901,8 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         pyre_object::gc_roots::shadow_stack_len() - 1
     });
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
-    let filter_type =
-        gettypefor(&pyre_object::functional::FILTER_TYPE).unwrap_or(pyre_object::PY_NULL);
+    let filter_type = gettypefor(&pyre_object::functional::FILTER_TYPE)
+        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     let init_matches = std::ptr::eq(cls, filter_type)
         || unsafe {
             match (
@@ -7850,7 +7857,8 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// sliceobject.py `W_SliceObject.descr__new__` — `slice([start,] stop[, step])`.
 fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let slice_type = gettypefor(&pyre_object::sliceobject::SLICE_TYPE).unwrap_or(PY_NULL);
+    let slice_type =
+        gettypefor(&pyre_object::sliceobject::SLICE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     check_user_subclass(slice_type, cls)?;
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args.get(1..).unwrap_or(&[]));
     if crate::builtins::has_real_kwargs(kwargs) {
@@ -10618,8 +10626,8 @@ fn init_builtin_function_type(ns: PyObjectRef) {
 /// inherited descriptors; CPython's `PyGetSetDef` / `PyMemberDef` entries all
 /// carry `PyCFunction_Type` as their owner.
 fn patch_builtin_function_descriptors() {
-    let bf_type =
-        gettypefor(&crate::BUILTIN_FUNCTION_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
+    let bf_type = gettypefor(&crate::BUILTIN_FUNCTION_TYPE as *const PyType)
+        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if bf_type.is_null() {
         return;
     }
@@ -10650,8 +10658,8 @@ fn patch_builtin_function_descriptors() {
 /// the Function W_TypeObject is available. This is the Member counterpart of
 /// the GetSetProperty reqcls patch immediately above.
 fn patch_function_member_descriptors() {
-    let function_type =
-        gettypefor(&crate::FUNCTION_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
+    let function_type = gettypefor(&crate::FUNCTION_TYPE as *const PyType)
+        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if function_type.is_null() || !crate::type_dict_has_storage(function_type) {
         return;
     }
@@ -10674,8 +10682,8 @@ fn patch_function_member_descriptors() {
 /// stamp that inferred `cls=Module` after the W_TypeObject is registered so
 /// foreign receivers fail in GetSetProperty.typecheck before field access.
 fn patch_module_descriptors() {
-    let module_type =
-        gettypefor(&pyre_object::MODULE_TYPE as *const PyType).unwrap_or(pyre_object::PY_NULL);
+    let module_type = gettypefor(&pyre_object::MODULE_TYPE as *const PyType)
+        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if module_type.is_null() || !crate::type_dict_has_storage(module_type) {
         return;
     }
@@ -10693,8 +10701,8 @@ fn patch_module_descriptors() {
 /// field in the same post-registration pass used for BuiltinFunction and
 /// frame descriptors.
 fn patch_cell_descriptor() {
-    let cell_type =
-        gettypefor(&pyre_object::nestedscope::CELL_TYPE).unwrap_or(pyre_object::PY_NULL);
+    let cell_type = gettypefor(&pyre_object::nestedscope::CELL_TYPE)
+        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if cell_type.is_null() || !crate::type_dict_has_storage(cell_type) {
         return;
     }
@@ -10722,7 +10730,7 @@ fn patch_frame_traceback_descriptors() {
         &crate::pyframe::FRAME_TYPE as *const PyType,
         &crate::pytraceback::PYTRACEBACK_TYPE as *const PyType,
     ] {
-        let w_type = gettypefor(layout).unwrap_or(pyre_object::PY_NULL);
+        let w_type = gettypefor(layout).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
         if w_type.is_null() {
             continue;
         }
@@ -11601,7 +11609,8 @@ fn cell_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let cls = positional.first().copied().unwrap_or(PY_NULL);
-    let cell_type = gettypefor(&pyre_object::nestedscope::CELL_TYPE).unwrap_or(PY_NULL);
+    let cell_type =
+        gettypefor(&pyre_object::nestedscope::CELL_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     check_user_subclass(cell_type, cls)?;
     let contents = match positional.get(1..) {
         Some([]) | None => PY_NULL,
@@ -22273,7 +22282,7 @@ fn count_check_number(obj: PyObjectRef) -> Result<(), crate::PyError> {
     // wording (`a number is required`) in place of PyPy 3.11's older text.
     let has_int = unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some();
     let has_float = unsafe { crate::baseobjspace::lookup(obj, "__float__") }.is_some();
-    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).unwrap_or(PY_NULL);
+    let complex_type = gettypefor(&pyre_object::COMPLEX_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     if !has_int
         && !has_float
         && (complex_type.is_null()
@@ -22297,14 +22306,15 @@ fn count_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let w_step = scope[1];
     count_check_number(w_start)?;
     count_check_number(w_step)?;
-    let exact = gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let obj = pyre_object::interp_itertools::w_count_new(w_start, w_step);
     itertools_alloc_for_class(cls, exact, obj)
 }
 
 fn count_single_argument(w_step: PyObjectRef) -> Result<bool, crate::PyError> {
     // W_Count.single_argument: isinstance(step, int) and step == 1.
-    let int_type = gettypefor(&pyre_object::INT_TYPE).unwrap_or(PY_NULL);
+    let int_type = gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     Ok(!int_type.is_null()
         && unsafe { crate::baseobjspace::isinstance_w(w_step, int_type) }
         && crate::baseobjspace::eq_w(w_step, w_int_new(1))?)
@@ -22369,7 +22379,8 @@ fn repeat_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     } else {
         Some(crate::builtins::space_index_w(w_times)?)
     };
-    let exact = gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let obj = pyre_object::interp_itertools::w_repeat_new(w_obj, times);
     itertools_alloc_for_class(cls, exact, obj)
 }
@@ -22473,7 +22484,8 @@ fn itertools_twoarg_new(
 }
 
 fn takewhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exact = gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "takewhile")?;
     let iterator = crate::baseobjspace::iter(iterable)?;
     let obj = pyre_object::interp_itertools::w_takewhile_new(predicate, iterator);
@@ -22481,7 +22493,8 @@ fn takewhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn dropwhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exact = gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "dropwhile")?;
     let iterator = crate::baseobjspace::iter(iterable)?;
     let obj = pyre_object::interp_itertools::w_dropwhile_new(predicate, iterator);
@@ -22489,7 +22502,8 @@ fn dropwhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn filterfalse_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exact = gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE).unwrap_or(PY_NULL);
+    let exact = gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
     let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "filterfalse")?;
     let predicate = if unsafe { pyre_object::is_none(predicate) } {
         PY_NULL
@@ -22505,7 +22519,8 @@ fn compress_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     // PyPy W_Compress__new__ allocates the subtype and applies space.iter to
     // both inputs.  Python 3.14's Argument Clinic surface additionally
     // accepts the `data` and `selectors` keyword names.
-    let exact = gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (cls, scope_w) =
         itertools_constructor_scope(args, "compress", vec!["data", "selectors"], &[])?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -22555,7 +22570,8 @@ fn compress_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn starmap_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // interp_itertools.py W_StarMap___new__, kept in source order.
-    let exact = gettypefor(&pyre_object::interp_itertools::STARMAP_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::STARMAP_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (cls, w_fun, w_iterable) = itertools_twoarg_new(args, exact, "starmap")?;
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(cls);
@@ -22600,7 +22616,8 @@ fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
 fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // W_Accumulate__new__(space, w_subtype, w_iterable, w_func=None,
     //                     __kwonly__=None, w_initial=None).
-    let exact = gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE).unwrap_or(PY_NULL);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let w_none = pyre_object::w_none();
     let (cls, scope_w) = itertools_constructor_scope(
         args,
@@ -22639,7 +22656,8 @@ fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 fn zip_longest_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // W_ZipLongest___new__: keep all positional sources as live iterators and
     // accept only the fillvalue keyword.
-    let exact = gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE).unwrap_or(PY_NULL);
+    let exact = gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
     let sources = positional.get(1..).unwrap_or(&[]);
@@ -23202,7 +23220,8 @@ mod tests {
     fn check_cell_typedef_python314_surface() {
         crate::typedef::init_typeobjects();
         let w_type = crate::typedef::gettypefor(&pyre_object::nestedscope::CELL_TYPE)
-            .expect("cell should resolve to a W_TypeObject");
+            .expect("cell should resolve to a W_TypeObject")
+            .as_ptr();
         let expected = [
             "__doc__",
             "__eq__",

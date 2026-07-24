@@ -1413,8 +1413,8 @@ impl Converter<'_> {
     fn number(&self, value: &ast::Number) -> crate::PyResult {
         Ok(match value {
             ast::Number::Int(value) => {
-                let int_type =
-                    crate::typedef::gettypefor(&pyre_object::INT_TYPE).unwrap_or(PY_NULL);
+                let int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE)
+                    .map_or(PY_NULL, |p| p.as_ptr());
                 crate::call::call_function_impl_result(
                     int_type,
                     &[self.string(&value.to_string())],
@@ -1434,8 +1434,8 @@ impl Converter<'_> {
             ast::ConstantValue::Str(value) => self.string(value),
             ast::ConstantValue::Bytes(value) => self.pin(pyre_object::w_bytes_from_bytes(value)),
             ast::ConstantValue::Integer(value) => {
-                let int_type =
-                    crate::typedef::gettypefor(&pyre_object::INT_TYPE).unwrap_or(PY_NULL);
+                let int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE)
+                    .map_or(PY_NULL, |p| p.as_ptr());
                 crate::call::call_function_impl_result(int_type, &[self.string(value)])?
             }
             ast::ConstantValue::Float(value) => self.pin(pyre_object::w_float_new(*value)),

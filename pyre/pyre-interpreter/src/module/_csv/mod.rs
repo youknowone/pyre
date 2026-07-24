@@ -612,7 +612,7 @@ fn save_field(
 fn to_float(w_str: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let float_type = crate::typedef::gettypefor(&pyre_object::FLOAT_TYPE)
         .ok_or_else(|| PyError::runtime_error("float type unavailable"))?;
-    crate::call::call_function_impl_result(float_type, &[w_str])
+    crate::call::call_function_impl_result(float_type.as_ptr(), &[w_str])
 }
 
 /// `W_Reader.next_w` — parse the next CSV record from the underlying line

@@ -524,7 +524,7 @@ pub unsafe fn isinstance_str_w(obj: PyObjectRef) -> bool {
         return true;
     }
     if let Some(str_type) = crate::typedef::gettypefor(&pyre_object::STR_TYPE) {
-        return isinstance_w(obj, str_type);
+        return isinstance_w(obj, str_type.as_ptr());
     }
     false
 }
@@ -541,7 +541,7 @@ pub unsafe fn isinstance_int_w(obj: PyObjectRef) -> bool {
         return true;
     }
     if let Some(int_type) = crate::typedef::gettypefor(&pyre_object::INT_TYPE) {
-        return isinstance_w(obj, int_type);
+        return isinstance_w(obj, int_type.as_ptr());
     }
     false
 }
@@ -556,7 +556,7 @@ pub unsafe fn isinstance_bytes_w(obj: PyObjectRef) -> bool {
         return true;
     }
     if let Some(bytes_type) = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE) {
-        return isinstance_w(obj, bytes_type);
+        return isinstance_w(obj, bytes_type.as_ptr());
     }
     false
 }
@@ -574,12 +574,12 @@ pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
         return true;
     }
     if let Some(bytes_type) = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE) {
-        if isinstance_w(obj, bytes_type) {
+        if isinstance_w(obj, bytes_type.as_ptr()) {
             return true;
         }
     }
     if let Some(bytearray_type) = crate::typedef::gettypefor(&pyre_object::BYTEARRAY_TYPE) {
-        return isinstance_w(obj, bytearray_type);
+        return isinstance_w(obj, bytearray_type.as_ptr());
     }
     false
 }
@@ -595,7 +595,7 @@ pub unsafe fn isinstance_list_w(obj: PyObjectRef) -> bool {
         return true;
     }
     if let Some(list_type) = crate::typedef::gettypefor(&pyre_object::LIST_TYPE) {
-        return isinstance_w(obj, list_type);
+        return isinstance_w(obj, list_type.as_ptr());
     }
     false
 }
@@ -5705,8 +5705,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     None
                 }
             };
-            let w_metaclasses: [Option<PyObjectRef>; 2] =
-                [w_metaclass, crate::typedef::gettypefor((*obj).ob_type)];
+            let w_metaclasses: [Option<PyObjectRef>; 2] = [
+                w_metaclass,
+                crate::typedef::gettypefor((*obj).ob_type).map(|p| p.as_ptr()),
+            ];
             // typeobject.py:811-819 — `space.lookup(self, name)` searches the
             // complete metaclass MRO, and any data descriptor found there is
             // consulted before the class's own MRO.  This includes getsets
@@ -6812,8 +6814,8 @@ pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     // baseobjspace.py:324 `w_result = space.get_and_call_function(w_impl, self)`
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
     // baseobjspace.py:326-327 — an exact int returns directly.
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE);
-    if crate::typedef::r#type(w_result) == w_int {
+    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    if crate::typedef::r#type(w_result).unwrap_or(PY_NULL) == w_int {
         return Ok(w_result);
     }
     // baseobjspace.py:328-336 — a strict int subclass is accepted for now,
@@ -7868,7 +7870,7 @@ unsafe fn is_object_getattribute_descr(w_descr: PyObjectRef) -> bool {
 unsafe fn is_module_getattribute_descr(w_descr: PyObjectRef) -> bool {
     let w_module_type =
         crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
-            .unwrap_or(PY_NULL);
+            .map_or(PY_NULL, |p| p.as_ptr());
     !w_module_type.is_null()
         && lookup_in_type_where(w_module_type, "__getattribute__")
             .is_some_and(|d| std::ptr::eq(w_descr, d))
@@ -8751,7 +8753,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // its receiver to ModuleType after temporarily overriding the slots.
         let w_module_type =
             crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
-                .unwrap_or(PY_NULL);
+                .map_or(PY_NULL, |p| p.as_ptr());
         if !w_type_is_heaptype(w_newcls) && !std::ptr::eq(w_newcls, w_module_type) {
             return Err(crate::PyError::type_error(
                 "__class__ assignment only supported for heap types or ModuleType subclasses"
@@ -10424,8 +10426,8 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         )));
     };
     let w_result = crate::builtins::call_and_check(method, &[obj])?;
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE);
-    if crate::typedef::r#type(w_result) == w_int {
+    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    if crate::typedef::r#type(w_result).unwrap_or(PY_NULL) == w_int {
         return Ok(w_result);
     }
     if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
@@ -11557,7 +11559,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // Fallback: check type type's MRO
             if let Some(w_type_type) = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
             {
-                if let Some(method) = lookup_in_type_where(w_type_type, "__iter__") {
+                if let Some(method) = lookup_in_type_where(w_type_type.as_ptr(), "__iter__") {
                     let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
                     return iter_check_is_iterator(w_iter);
                 }

@@ -2299,7 +2299,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "slice", || {
         // The slice type object, for isinstance(x, slice) checks.
         crate::typedef::gettypefor(&pyre_object::sliceobject::SLICE_TYPE)
-            .unwrap_or(pyre_object::PY_NULL)
+            .map_or(pyre_object::PY_NULL, |p| p.as_ptr())
     });
     crate::module_ns_get_or_insert_with(ns, "frozenset", || {
         crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE)
@@ -5196,8 +5196,8 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             w_object_in
         } else {
             let bytes_type = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE);
-            let inherits_bytes =
-                bytes_type.is_some_and(|bt| crate::baseobjspace::isinstance_w(w_object_in, bt));
+            let inherits_bytes = bytes_type
+                .is_some_and(|bt| crate::baseobjspace::isinstance_w(w_object_in, bt.as_ptr()));
             let data = if inherits_bytes {
                 pyre_object::bytesobject::w_bytes_data(w_object_in)
             } else {
@@ -6478,7 +6478,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if w_base.is_none() {
         // intobject.py:991: space.is_w(space.type(w_value), space.w_int)
         let w_type = crate::typedef::r#type(obj);
-        let w_int = crate::typedef::gettypefor(&INT_TYPE);
+        let w_int = crate::typedef::gettypefor(&INT_TYPE).map(|p| p.as_ptr());
         if w_type.is_some() && w_type == w_int {
             return Ok(obj);
         }
@@ -8662,8 +8662,8 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                     } else {
                         crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
                     };
-                    let base_hash =
-                        base.and_then(|b| crate::baseobjspace::lookup_in_type(b, "__hash__"));
+                    let base_hash = base
+                        .and_then(|b| crate::baseobjspace::lookup_in_type(b.as_ptr(), "__hash__"));
                     if Some(method) != base_hash {
                         return hash_call_normalize(method, obj, w_type);
                     }

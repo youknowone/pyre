@@ -1834,7 +1834,7 @@ fn expand_pyre_methods(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
                         );
                         let __pyre_same_tp = match __pyre_static_tp {
-                            ::std::option::Option::Some(t) => __pyre_cls == t,
+                            ::std::option::Option::Some(t) => __pyre_cls == t.as_ptr(),
                             ::std::option::Option::None => false,
                         };
                         if !__pyre_same_tp {

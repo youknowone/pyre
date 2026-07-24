@@ -105,8 +105,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "starmap",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::STARMAP_TYPE)
-            .expect("itertools.starmap TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::STARMAP_TYPE).expect("itertools.starmap TypeDef initialized").as_ptr(),
     );
     // PyPy exposes W_Count.typedef / W_Repeat.typedef themselves from the
     // module, not function-shaped constructor shims.  Their `__new__` slots
@@ -114,14 +113,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "count",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::COUNT_TYPE)
-            .expect("itertools.count TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).expect("itertools.count TypeDef initialized").as_ptr(),
     );
     crate::module_ns_store(
         ns,
         "repeat",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE)
-            .expect("itertools.repeat TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).expect("itertools.repeat TypeDef initialized").as_ptr(),
     );
     // islice(iterable, stop) | islice(iterable, start, stop[, step]) —
     // PyPy: W_ISlice.__init__.  Pulled lazily from the source iterator so
@@ -447,8 +444,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "zip_longest",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE)
-            .expect("itertools.zip_longest TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE).expect("itertools.zip_longest TypeDef initialized").as_ptr(),
     );
     // PyPy exports the live W_Accumulate iterator TypeDef.  Its running total,
     // optional function, and initial value stay on the object and next_w
@@ -456,36 +452,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "accumulate",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE)
-            .expect("itertools.accumulate TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE).expect("itertools.accumulate TypeDef initialized").as_ptr(),
     );
     // W_Compress.typedef is exported directly, matching PyPy's dedicated
     // live iterator rather than materializing both inputs into a list.
     crate::module_ns_store(
         ns,
         "compress",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE)
-            .expect("itertools.compress TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE).expect("itertools.compress TypeDef initialized").as_ptr(),
     );
     // PyPy exposes these W_Root subclasses through their TypeDefs.  Their
     // `__new__` slots retain the two-argument/subclass-init gateway behavior.
     crate::module_ns_store(
         ns,
         "takewhile",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE)
-            .expect("itertools.takewhile TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE).expect("itertools.takewhile TypeDef initialized").as_ptr(),
     );
     crate::module_ns_store(
         ns,
         "dropwhile",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE)
-            .expect("itertools.dropwhile TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE).expect("itertools.dropwhile TypeDef initialized").as_ptr(),
     );
     crate::module_ns_store(
         ns,
         "filterfalse",
-        crate::typedef::gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE)
-            .expect("itertools.filterfalse TypeDef initialized"),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE).expect("itertools.filterfalse TypeDef initialized").as_ptr(),
     );
     // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
     // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).

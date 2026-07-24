@@ -2373,6 +2373,7 @@ unsafe fn needs_seq_binop_dispatch(
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
+    let t = t.as_ptr();
     dunder_overridden(a, fwd, t)
         || dunder_overridden(a, rev, t)
         || dunder_overridden(b, fwd, t)
@@ -2402,6 +2403,7 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
+    let t = t.as_ptr();
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
@@ -2436,7 +2438,9 @@ unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyTy
 /// UTF-8-keyed cache probe per dunder) are the dominant per-iteration cost
 /// of the interpreter numeric fast path.  This mirrors the exact-builtin
 /// gate already opening `subclass_special_override` / `is_true`.
-unsafe fn numeric_base_type_of_overriding_subclass(obj: PyObjectRef) -> Option<PyObjectRef> {
+unsafe fn numeric_base_type_of_overriding_subclass(
+    obj: PyObjectRef,
+) -> Option<std::ptr::NonNull<pyre_object::PyObject>> {
     if pyre_object::is_exact_builtin_instance(obj) {
         return None;
     }
@@ -2455,6 +2459,7 @@ unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &st
     let Some(t) = numeric_base_type_of_overriding_subclass(obj) else {
         return false;
     };
+    let t = t.as_ptr();
     dunder_overridden(obj, dunder, t) || dunder_overridden(obj, rdunder, t)
 }
 
@@ -2497,7 +2502,7 @@ unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
     let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
         return false;
     };
-    dunder_overridden(a, dunder, t)
+    dunder_overridden(a, dunder, t.as_ptr())
 }
 
 /// Call the overriding unary special on a numeric subclass operand before
