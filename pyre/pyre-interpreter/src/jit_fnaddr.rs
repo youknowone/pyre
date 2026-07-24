@@ -366,13 +366,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     // `unpackiterable_driver` (jd1) portal callees.  Its extracted body
     // (`_unpackiterable_unknown_length`) residual-calls `next(w_iterator)` and
-    // `w_list_append(items, w_item)` directly in source, so the codewriter
+    // `drain_list_append(items, w_item)` directly in source, so the codewriter
     // records the bare source paths; without a runtime binding the funcptr
     // constants fall back to a `symbolic_fnaddr_for_path` hash the residual
     // handler cannot resolve.  `next` returns `Result<PyObjectRef, PyError>`
     // and rides the Ref-returning `bh_next` bridge (publishes StopIteration,
-    // unlike the FOR_ITER `jit_next`); `w_list_append` is a `-> ()` residual
-    // and binds its Rust `fn` directly.
+    // unlike the FOR_ITER `jit_next`); `drain_list_append` is a `-> ()`
+    // `dont_look_inside` seam over `w_list_append` that collapses append's
+    // strategy/grow helper subtree to one registered residual (the global
+    // `list.append` stays traced), and binds its Rust `fn` directly.
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::baseobjspace::next",
@@ -384,15 +386,47 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "next",
         crate::runtime_ops::bh_next as *const (),
     );
-    let w_list_append: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
-        pyre_object::listobject::w_list_append;
+    let drain_list_append: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
+        pyre_object::listobject::drain_list_append;
     push_alias_pair(
         &mut entries,
-        "pyre_object::listobject::w_list_append",
-        "pyre_object::w_list_append",
-        w_list_append as *const (),
+        "pyre_object::listobject::drain_list_append",
+        "pyre_object::drain_list_append",
+        drain_list_append as *const (),
     );
-    push_fnaddr(&mut entries, "w_list_append", w_list_append as *const ());
+    push_fnaddr(&mut entries, "drain_list_append", drain_list_append as *const ());
+
+    // The drain's prologue (`w_list_new_empty`) and epilogue
+    // (`drain_collect_items`) wrap the `Vec`/`Range`/`Option` host plumbing
+    // that RPython does not have; both are `#[dont_look_inside]` residuals and
+    // bind their `fn` directly (`-> PyObjectRef` / `-> Vec<PyObjectRef>`).
+    // `w_list_new_object` is residualized (`#[dont_look_inside]`) but was
+    // unregistered; bind it too so any direct residual site resolves.
+    let w_list_new_empty: fn() -> pyre_object::PyObjectRef =
+        pyre_object::listobject::w_list_new_empty;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_new_empty",
+        "pyre_object::w_list_new_empty",
+        w_list_new_empty as *const (),
+    );
+    push_fnaddr(&mut entries, "w_list_new_empty", w_list_new_empty as *const ());
+    let w_list_new_object: fn(Vec<pyre_object::PyObjectRef>) -> pyre_object::PyObjectRef =
+        pyre_object::listobject::w_list_new_object;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_new_object",
+        "pyre_object::w_list_new_object",
+        w_list_new_object as *const (),
+    );
+    let drain_collect_items: fn(pyre_object::PyObjectRef) -> Vec<pyre_object::PyObjectRef> =
+        crate::baseobjspace::drain_collect_items;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::drain_collect_items",
+        "pyre_interpreter::drain_collect_items",
+        drain_collect_items as *const (),
+    );
 
     push_alias_pair(
         &mut entries,

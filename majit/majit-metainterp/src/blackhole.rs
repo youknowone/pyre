@@ -7029,6 +7029,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     for (key, byte) in [
         ("int_neg/i>i", majit_translate::insns::BC_INT_NEG),
         ("int_invert/i>i", majit_translate::insns::BC_INT_INVERT),
+        // `int_is_true/i>i` — `@arguments("i", returns="i")` unary
+        // (`blackhole.py:559 bhimpl_int_is_true`). Emitted as the
+        // loop-condition test of any int-typed `while`, including the
+        // `_unpackiterable_unknown_length` drain's back-edge guard; its
+        // handler is wired in `wire_bhimpl_handlers` but the byte was
+        // absent from this curated set, so a blackhole-executed drain hit
+        // the unwired-opcode panic at the first back-edge test.
+        ("int_is_true/i>i", majit_translate::insns::BC_INT_IS_TRUE),
         ("float_add/ff>f", majit_translate::insns::BC_FLOAT_ADD),
         ("float_sub/ff>f", majit_translate::insns::BC_FLOAT_SUB),
         ("float_mul/ff>f", majit_translate::insns::BC_FLOAT_MUL),

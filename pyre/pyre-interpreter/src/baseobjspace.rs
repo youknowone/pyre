@@ -10201,7 +10201,11 @@ pub fn unpackiterable(
             generator_unpack_into(w_iterator, &mut lst_w)?;
             return Ok(lst_w);
         }
-        _unpackiterable_unknown_length(w_iterator, w_iterable)
+        // The drain returns the grown `W_List` ref (`Type::Ref`, RPython's
+        // `return items`); read it back into the `Vec<PyObjectRef>` the Rust
+        // signature promises here, outside the traced/blackholed drain body.
+        let w_list = _unpackiterable_unknown_length(w_iterator, w_iterable)?;
+        Ok(drain_collect_items(w_list))
     } else {
         // baseobjspace.py:996-998 — known-length path with shape validation.
         _unpackiterable_known_length_jitlook(w_iterator, expected_length as usize)
@@ -10383,11 +10387,11 @@ fn generator_unpack_into(
 fn _unpackiterable_unknown_length(
     w_iterator: PyObjectRef,
     w_iterable: PyObjectRef,
-) -> Result<Vec<PyObjectRef>, crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     // baseobjspace.py:1005-1008 — `try: items = newlist_hint(length_hint(...))
     // except MemoryError: items = []`.
     let _ = length_hint(w_iterable, 0)?;
-    let items = pyre_object::listobject::w_list_new_object(Vec::new());
+    let items = pyre_object::listobject::w_list_new_empty();
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(items);
     // baseobjspace.py:1010 `greenkey = self.iterator_greenkey(w_iterator)`.
@@ -10397,7 +10401,7 @@ fn _unpackiterable_unknown_length(
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
         unpackiterable_driver.jit_merge_point(greenkey, w_iterator, items);
         match next(w_iterator) {
-            Ok(w_item) => unsafe { pyre_object::listobject::w_list_append(items, w_item) },
+            Ok(w_item) => unsafe { pyre_object::listobject::drain_list_append(items, w_item) },
             // `except OperationError as e: if not e.match(space,
             // w_StopIteration): raise; break` — the StopIteration test rides
             // inside the handler (`e` is bound once, consumed only on the
@@ -10410,12 +10414,38 @@ fn _unpackiterable_unknown_length(
             }
         }
     }
+    // `return items` — hand the grown `W_List` back as a single ref, matching
+    // the driver's `Type::Ref` result and RPython's `return items`. The
+    // `W_List` → `Vec` readback is caller-side host glue
+    // (`drain_collect_items`), kept out of the traced/blackholed drain body so
+    // the blackhole epilogue is a plain `ref_return` rather than a
+    // multi-word (`Vec`, sret-ABI) residual the single-register residual-call
+    // handlers cannot invoke.
+    Ok(items)
+}
+
+/// Copy the drained `W_List` back into a `Vec<PyObjectRef>` for the Rust
+/// return type — the caller-side host glue for `unpackiterable`'s `Vec`
+/// contract (RPython returns the list object directly; the `Vec` growth,
+/// `Range`-indexed readback and `Option::unwrap` are pyre-only). Called
+/// AFTER the drain returns the `W_List` ref, outside the traced/blackholed
+/// drain body, so it never surfaces as a residual funcptr in the drain
+/// jitcode. `#[dont_look_inside]` keeps the host plumbing opaque should a
+/// caller ever be traced.
+///
+/// Pins `items` across the readback: an Integer/Float-strategy `getitem`
+/// boxes each element through the moving collector (`w_int_new` /
+/// `w_float_new`), which can relocate `items`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(items);
     let n = unsafe { pyre_object::listobject::w_list_len(items) };
     let mut out: Vec<PyObjectRef> = Vec::with_capacity(n);
     for i in 0..n as i64 {
         out.push(unsafe { pyre_object::listobject::w_list_getitem(items, i).unwrap() });
     }
-    Ok(out)
+    out
 }
 
 /// pypy/interpreter/baseobjspace.py:1080-1108 `length_hint`.

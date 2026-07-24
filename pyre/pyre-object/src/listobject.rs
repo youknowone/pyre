@@ -515,6 +515,14 @@ pub fn w_list_new_object(items: Vec<PyObjectRef>) -> PyObjectRef {
     w_list_new_with_strategy(items, ListStrategy::Object)
 }
 
+/// Construct an empty list. Residualized so the `Vec::new()` backing-store
+/// construction stays inside the opaque call rather than surfacing as a
+/// separate residual funcptr at the caller's trace/blackhole level.
+#[majit_macros::dont_look_inside]
+pub fn w_list_new_empty() -> PyObjectRef {
+    w_list_new_object(Vec::new())
+}
+
 fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
@@ -919,6 +927,26 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
             }
         }
     }
+}
+
+/// Drain-only `dont_look_inside` seam over [`w_list_append`].
+///
+/// The jd1 `_unpackiterable_unknown_length` driver compiles its drain loop and
+/// blackhole-executes it on a guard failure. An *inlined* append would surface
+/// each of its strategy/grow helpers (`object_push`,
+/// `switch_to_correct_strategy`, typed-array grow, …) as a separate residual
+/// funcptr the blackhole must resolve; wrapping the drain's append in one
+/// `dont_look_inside` residual collapses that whole subtree to a single
+/// registered address (`jit_fnaddr.rs`) — the same seam the drain already draws
+/// around its `w_list_new_empty` prologue and `drain_collect_items` epilogue.
+/// The global `list.append` path keeps calling [`w_list_append`] directly and
+/// stays traced, so the append fold and the escape-flush replay are unaffected.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn drain_list_append(obj: PyObjectRef, value: PyObjectRef) {
+    w_list_append(obj, value)
 }
 
 /// Set the live length of an Integer-strategy list without reallocating
