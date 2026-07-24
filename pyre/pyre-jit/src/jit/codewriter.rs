@@ -3235,29 +3235,6 @@ fn attach_catch_exception_edge(
     link
 }
 
-fn carry_explicit_raise_value_on_catch_stack(
-    link: &super::flow::LinkRef,
-    target: &SpamBlockRef,
-    raised_value: super::flow::FlowValue,
-) {
-    let target_state = target
-        .framestate()
-        .expect("explicit raise catch landing must carry a FrameState");
-    let stack_value = target_state
-        .stack
-        .last()
-        .and_then(super::flow::FlowValue::as_variable)
-        .expect("catch landing must end its stack with the raised value");
-    let input_index = target
-        .block()
-        .borrow()
-        .inputargs
-        .iter()
-        .position(|value| value.as_variable().is_some_and(|v| v.id == stack_value.id))
-        .expect("catch stack value must appear in landing inputargs");
-    link.borrow_mut().args[input_index] = Some(raised_value);
-}
-
 fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
     let mut block_mut = block.borrow_mut();
     if block_mut.exits.len() < 2 {
@@ -6743,30 +6720,24 @@ impl CodeWriter {
                     None
                 };
                 if let Some(catch_label) = catch_label_opt {
-                    // Raise inside a try/except range: RPython
-                    // canraise-arm shape. The block's exception edge
-                    // goes to the catch landing, not `graph.exceptblock`.
-                    // `emit_catch_exception!` both pushes the
-                    // `catch_exception/L<catch_landing_{label}>` insn
-                    // AND calls `attach_catch_exception_edge` (the
-                    // exception Link onto `current_block.exits`).
+                    // Raise inside a try/except range: the `raise` op
+                    // closes the block as its last operation and the sole
+                    // exit is the exception edge to the catch landing.
+                    // The standard flattener serializes `raise <value>`
+                    // from the block body and emits the byte-adjacent
+                    // `catch_exception` dispatch from the graph shape
+                    // alone (single-exit canraise arm); the raised value
+                    // reaches the handler through the runtime exception
+                    // state (`route_to_catch` → `last_exc_value`), the
+                    // same delivery every canraise catch uses.
+                    record_graph_op(
+                        &current_block.block(),
+                        "raise",
+                        vec![evalue_fv.into()],
+                        None,
+                        offset,
+                    );
                     emit_catch_exception!(catch_label);
-                    // Carry the normalized raised value on the
-                    // just-attached exception edge.  Unlike the
-                    // `graph.exceptblock` arm below (whose
-                    // `explicit_raise_state` puts the raised value in
-                    // `link.args[1]`), `attach_catch_exception_edge`
-                    // links directly to the catch landing and seeds
-                    // `extravars` with a FRESH (type, value) read-back
-                    // pair — so the canonical flatten cannot recover the
-                    // `raise` operand from the link.  Record it here so
-                    // `insert_exits`' single-exit explicit-raise arm
-                    // emits `raise <getcolor(value)>`.
-                    if let Some(raised) = evalue_fv.as_variable() {
-                        if let Some(exc_link) = current_block.block().borrow().exits.last() {
-                            exc_link.borrow_mut().explicit_raise_value = Some(raised);
-                        }
-                    }
                 } else {
                     // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
                     //   link = Link([w_exc.w_type, w_exc.w_value],
@@ -6970,13 +6941,14 @@ impl CodeWriter {
                 // merge PC, so `mergeblock` appends a spurious normal exit onto
                 // the raise-terminated block (making it multi-exit); then
                 // `insert_exits` lowers the raise edge as a plain catch and
-                // drops the `raise` op, so the handler never runs.
+                // drops the `raise` op, so the handler never runs.  A
+                // raise-terminated block is recognized structurally: its
+                // raising op (last non-`-live-` operation) is the `raise`.
                 let has_explicit_raise = current_block
                     .block()
                     .borrow()
-                    .exits
-                    .iter()
-                    .any(|e| e.borrow().explicit_raise_value.is_some());
+                    .raising_op()
+                    .is_some_and(|op| op.opname == "raise");
                 let canraise_pending = !has_explicit_raise
                     && matches!(
                         current_block.block().borrow().exitswitch,
@@ -7821,10 +7793,8 @@ impl CodeWriter {
                     let block_closed_by_terminator = {
                         let block_rc = current_block.block();
                         let block = block_rc.borrow();
-                        let has_explicit_raise = block
-                            .exits
-                            .iter()
-                            .any(|e| e.borrow().explicit_raise_value.is_some());
+                        let has_explicit_raise =
+                            block.raising_op().is_some_and(|op| op.opname == "raise");
                         !block.exits.is_empty()
                             && (has_explicit_raise
                                 || !matches!(
@@ -12113,25 +12083,7 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             let exc_flow: super::flow::FlowValue = exc_value.into();
-                            emit_raise!(0u16, exc_flow.clone(), py_pc as i64, true);
-                            if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten() {
-                                let site = catch_sites
-                                    .iter()
-                                    .find(|site| site.landing_label == catch_label)
-                                    .expect("catch site for DELETE_FAST raise");
-                                let link = current_block
-                                    .block()
-                                    .borrow()
-                                    .exits
-                                    .last()
-                                    .cloned()
-                                    .expect("DELETE_FAST raise catch edge");
-                                carry_explicit_raise_value_on_catch_stack(
-                                    &link,
-                                    &site.landing,
-                                    exc_flow,
-                                );
-                            }
+                            emit_raise!(0u16, exc_flow, py_pc as i64, true);
 
                             // The bound arm is the continuing block. The
                             // clear is one PY_NULL write, matching
@@ -16754,47 +16706,6 @@ def f(i):
             .framestate()
             .expect("catch landing should acquire a FrameState");
         assert!(catch_state.last_exception.is_some());
-    }
-
-    #[test]
-    fn explicit_raise_stack_value_preserves_exception_link_kinds() {
-        let code = first_nested_function_code("def f(a):\n    return a\n");
-        let mut graph = new_shadow_graph(&code);
-        let catch_block = graph.new_block(Vec::new());
-        let catch_ref = SpamBlockRef::new(catch_block, None);
-        let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
-        let startblock_ref = graph.startblock.clone();
-        let site = synthetic_catch_site(&catch_ref);
-        let link = attach_catch_exception_edge(
-            &code,
-            &mut graph,
-            &startblock_ref,
-            &catch_ref,
-            &source_state,
-            &site,
-        );
-        let (last_exception, last_exc_value) = {
-            let link = link.borrow();
-            (link.last_exception, link.last_exc_value)
-        };
-
-        carry_explicit_raise_value_on_catch_stack(
-            &link,
-            &catch_ref,
-            Variable::new(VariableId(100), Kind::Ref).into(),
-        );
-
-        let link = link.borrow();
-        assert_eq!(link.last_exception, last_exception);
-        assert_eq!(link.last_exc_value, last_exc_value);
-        assert_eq!(
-            link.last_exception.and_then(|variable| variable.kind),
-            Some(Kind::Int)
-        );
-        assert_eq!(
-            link.last_exc_value.and_then(|variable| variable.kind),
-            Some(Kind::Ref)
-        );
     }
 
     #[test]

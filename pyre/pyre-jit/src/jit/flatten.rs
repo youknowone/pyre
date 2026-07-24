@@ -1724,29 +1724,27 @@ impl<'a> GraphFlattener<'a> {
                      must be None / False / True, got {other:?}"
                 ),
             }
-            // Explicit `raise X` inside a try block.  pyre's walker
-            // (`emit_raise!` → `emit_catch_exception!`) wires the raise's
-            // exception edge directly to its catch landing — a single
-            // exit (exitcase=None, `block.canraise()`) — instead of to
-            // `graph.exceptblock` (where `make_link`→`make_exception_link`
-            // would emit `raise link.args[1]`).  The `raise` op itself is
-            // walker-inline-only (no graph SpaceOp), so without this arm
-            // the canonical flatten lowers the block as a plain
-            // `make_link` goto into the landing: the spliced block then
-            // falls into the landing's `last_exception` with no pending
-            // exception, and blackhole `handler_last_exception` reads a
-            // null `exception_last_value`.  Reproduce the inline shape —
-            // `raise <value>` then a byte-adjacent `catch_exception <L>`
-            // dispatch — using the raised value recorded on the link
-            // (`explicit_raise_value`).  `L` is the handler entry placed
+            // Explicit `raise X` inside a try block.  The walker records
+            // the `raise` op as the block's LAST operation (serialized by
+            // the body loop above) and closes the block with a single
+            // exception exit to the catch landing (`exitswitch ==
+            // c_last_exception`, extravars seeded, the raised value
+            // threaded through the link args at the landing's exception
+            // stack slot).  Emit the byte-adjacent `catch_exception <L>`
+            // dispatch and lower the handler entry through
+            // `make_exception_link` — `L` is the handler entry placed
             // right before `make_exception_link`'s `last_exception` /
             // `last_exc_value` emission, mirroring the canraise arm's
             // `catch_exception TLabel(normal) … Label(normal) …
             // make_exception_link` layout (flatten.py:139-180).
-            let explicit_raise_value = link.borrow().explicit_raise_value;
-            if let Some(raised) = explicit_raise_value {
-                let raise_operand = self.getcolor(&raised.into());
-                self.emitline(Insn::op("raise", vec![raise_operand]));
+            if block.borrow().canraise() {
+                debug_assert!(
+                    block
+                        .borrow()
+                        .raising_op()
+                        .is_some_and(|op| op.opname == "raise"),
+                    "single-exit canraise block must be raise-terminated"
+                );
                 let catch_label = self.tlabel_for_link(link);
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
                 let handler_label = self.label_for_link(link);
