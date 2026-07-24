@@ -143,6 +143,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retire once the multi-frame twin (`_MULTIFRAME`) lands and the escape/replay fallback is no longer the only other leg |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
@@ -167,10 +168,16 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (1 remaining)** — triaged in §1b/§1c (4 retired
-  in the 2026-07-05 pass, 8 retired since then, 1 kept as a WIP parity port;
-  `PYRE_P2_DRAIN` retired with the framestack-walk deletion):
-  `PYRE_FBW_VABLE_SCALAR_CA` (keep).
+- **Default-OFF experiments (4 remaining)** — triaged in §1b/§1c (4 retired
+  in the 2026-07-05 pass, 8 retired since then; `PYRE_P2_DRAIN` retired with
+  the framestack-walk deletion).  All four are WIP parity ports, kept: the three
+  unadopted `PYRE_FBW_*` seams — `_MULTIFRAME` (multi-frame blackhole image),
+  `_CALLEE_VSTACK` (callee-local operand-stack mirror), `_VABLE_SCALAR_CA` (S0
+  seam toward `direct_assembler_call` scalar args) — plus
+  `PYRE_CARRIER_EXC_RESUME`.  These are adoption targets, not retirement
+  targets: the *ON* path is the unattested one.
+  `_BLACKHOLE_RESUME` graduated out of this bucket on 2026-07-25 (flipped
+  default-ON, now in §4).
 - **Config / value / master switches (~18)** — tuning, paths, modes; keep:
   `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
@@ -185,9 +192,9 @@ Kept as-is; listed for completeness.
 |---|---|
 | retired (§1 default-ON pass + §1b default-OFF pass + §1c re-audit book-keeping) | 5 + 4 + 10 |
 | not gates (identifiers) | 11 |
-| dead (no read site) | 9 |
-| live default-ON, kept until epic closes | ~26 |
+| dead (no read site) | 10 |
+| live default-ON, kept until epic closes | 9 (+ `PYRE_GC_INTERP`, wasm32-only) |
 | diagnostics (OFF) | ~34 |
-| default-OFF experiments (1 keep + 1 deferred) | 2 |
+| default-OFF experiments (all keep — adoption targets) | 4 |
 | config / value / master | ~18 |
 | test harness | 1 |

@@ -101,8 +101,25 @@ pub(crate) fn reset_single_frame_blackhole() {
     });
 }
 
+/// `PYRE_FBW_BLACKHOLE_RESUME` (default ON) — a top-level one-frame walk whose
+/// residual forced the vable and writes live heap resumes PAST the escaping
+/// opcode through the blackhole instead of falling back to escape/replay.  Both
+/// the latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
+/// framestack, no committed escape pc, resolvable snapshot sym) and the adopt
+/// (`try_adopt_single_frame_blackhole` → `apply_single_frame_blackhole_crn`,
+/// which validates every mapped color and every live operand-stack slot before
+/// writing anything) decline to the pre-existing path on any unmet condition,
+/// so the flip only ever replaces a replay that would have produced the same
+/// state.  `=0`/`false` opts back out.
 fn single_frame_blackhole_resume_enabled() -> bool {
-    std::env::var_os("PYRE_FBW_BLACKHOLE_RESUME").as_deref() == Some(std::ffi::OsStr::new("1"))
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BLACKHOLE_RESUME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 /// Opt-in for adopting the MULTI-frame (inlined sub-walk) blackhole image.
