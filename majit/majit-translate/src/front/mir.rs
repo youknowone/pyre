@@ -1822,6 +1822,15 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
         // the `Arguments::new` block, so multi-arg Display chains lower to
         // native `str` + `ll_strconcat` like the single-arg case.
         fmt_collapsed += collapse_fmt_chains_multi(&mut lo.graph);
+        // Fieldless-enum `Debug` (`{:?}`) `format!` chains the `Display`
+        // collapsers above decline: a `Debug` render of a fieldless enum has
+        // no native rstr counterpart, but each variant's derived `Debug` is
+        // the bare variant identifier — a compile-time constant — so the whole
+        // rendered message is a per-variant constant.  Lower the chain to a
+        // switch on the enum discriminant emitting the constant message per
+        // arm (the `discriminant → name-table` shape the enum's `Debug` is),
+        // retiring the graph-less `fmt::rt::Argument::new_debug` extern.
+        fmt_collapsed += collapse_debug_enum_fmt_chains(&mut lo.graph, lo.llbc);
         // Re-threading a rendered value onto a forwarding link and deleting
         // the chain's intermediate ops can leave a block with no remaining
         // predecessor (the pre-collapse branch arm) whose `Link.args` still
@@ -14631,16 +14640,47 @@ struct FmtCollapse {
     dead_bases: Vec<u64>,
 }
 
-/// Recognize the single-argument `format!` chain terminating at the
-/// `alloc::fmt::format` op `(bf, fi)` and collect the rewrite plan, or
-/// `None` for any shape outside the recognized subset (multi-argument,
-/// non-threaded, or phi-merged) so the collapse leaves the graph
-/// untouched. The recognized shape is the one charon lowers for
-/// `f(format!("…{x}"))`: block B0 builds `Argument::new_display(&x)` off
-/// the argument Tuple and forwards it; block Bp builds the args + pieces
-/// arrays and `Arguments::new`, forwarding the `Arguments`; block Bf
-/// calls `alloc::fmt::format`.
-fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
+/// The arg-kind-agnostic navigation of a single-argument `format!` chain
+/// terminating at the `alloc::fmt::format` op `(bf, fi)`.  Both the
+/// `Display` collapse ([`collect_fmt_collapse`]) and the fieldless-enum
+/// `Debug` collapse ([`collect_debug_enum_fmt_collapse`]) walk the identical
+/// three-block topology and delete the identical residual chain — they
+/// differ only in the render gate (`Display` vs `Debug`) and how the format
+/// op is replaced (native `str`+concat vs discriminant switch).
+struct SingleArgFmtChainNav {
+    /// The render kind of the single argument (`Display` / `Debug`).
+    kind: FmtArgKind,
+    /// The literal template pieces around the single placeholder.
+    pieces: Vec<String>,
+    /// The `alloc::fmt::format` result var.
+    format_result: Variable,
+    /// The single rendered value (the tuple field source).
+    context: Variable,
+    /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
+    /// chain value the link forwarded onto a still-live value so no link
+    /// references a deleted result var after the chain ops are removed.
+    link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
+    /// Op result var ids to delete (chain ctors / pieces bytes /
+    /// `Arguments::new`).
+    dead_results: Vec<u64>,
+    /// Aggregate base var ids whose `FieldWrite`s are deleted.
+    dead_bases: Vec<u64>,
+}
+
+/// Back-navigate the single-argument `format!` chain the charon lowering
+/// builds for `f(format!("…{x}"))` — block B0 builds `Argument::new_*(&x)`
+/// off the argument Tuple and forwards it; block Bp builds the args + pieces
+/// arrays and `Arguments::new`, forwarding the `Arguments`; block Bf calls
+/// `alloc::fmt::format` — collecting the render kind, template pieces, the
+/// rendered value, and the residual-chain delete / re-thread plan shared by
+/// both collapses.  `None` for any shape outside the recognized subset
+/// (multi-argument, non-threaded, or phi-merged), so a caller leaves the
+/// graph untouched.
+fn navigate_single_arg_fmt_chain(
+    graph: &FunctionGraph,
+    bf: BlockId,
+    fi: usize,
+) -> Option<SingleArgFmtChainNav> {
     use crate::model::{CallTarget, OpKind};
     let block_f = graph.blocks.iter().find(|b| b.id == bf)?;
     let format_op = block_f.operations.get(fi)?;
@@ -14650,7 +14690,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
             args,
             ..
         } if fmt_path_ends_with(segments, &["fmt", "format"]) => {
-            (args.first()?.clone(), format_op.result.as_ref()?.id())
+            (args.first()?.clone(), format_op.result.as_ref()?.clone())
         }
         _ => return None,
     };
@@ -14663,11 +14703,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
         // expansion below.
         return None;
     }
-    if chain.args[0].kind != FmtArgKind::Display {
-        // `str(value)` renders Display; `{:?}` Debug has no native rstr
-        // counterpart, so leave a Debug chain residual.
-        return None;
-    }
+    let kind = chain.args[0].kind.clone();
     let pieces = chain.pieces.clone();
 
     // `fmt_args` reaches Bf as an inputarg threaded from Bp's
@@ -14698,9 +14734,9 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
     let arg_elem = arg_elems.into_iter().next()?;
 
     // `arg_elem` reaches Bp as an inputarg threaded from B0's
-    // `new_display` result.
+    // `new_*` result.
     let pe = inputarg_pos(graph, bp, &arg_elem)?;
-    let (b0, ei_bp, new_display_var) = single_incoming_link(graph, bp, pe)?;
+    let (b0, ei_bp, new_arg_var) = single_incoming_link(graph, bp, pe)?;
     if b0 == bp {
         return None;
     }
@@ -14710,7 +14746,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if op.result.as_ref().map(|r| r.id()) == Some(new_display_var.id())
+        } if op.result.as_ref().map(|r| r.id()) == Some(new_arg_var.id())
             && fmt_argument_ctor_kind(segments).is_some() =>
         {
             let arg_ref = args.first()?.clone();
@@ -14727,16 +14763,15 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
     let context = unwrap_fmt_arg_tuple_ref(graph, &arg_ref)?;
 
     // Thread `context` straight through the slots the chain values used:
-    // B0→Bp forwards `context` where it forwarded `new_display`, Bp→Bf
-    // forwards Bp's now-`context`-bound inputarg where it forwarded
-    // `Arguments`.  The format op then reads `context` in place of the
-    // `Arguments` value.
+    // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
+    // Bp's now-`context`-bound inputarg where it forwarded `Arguments`, so
+    // no link references a deleted result var once the chain ops are gone.
     let link_rewrites = vec![
         (b0, ei_bp, pe, context.clone()),
         (bp, ei_bf, pf, arg_elem.clone()),
     ];
     let mut dead_results = vec![
-        new_display_var.id(),
+        new_arg_var.id(),
         arg_ref.id(),
         tuple_var.id(),
         arguments_var.id(),
@@ -14746,13 +14781,35 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
     dead_results.extend(piece_byte_vars.iter().map(|v| v.id()));
     let dead_bases = vec![tuple_var.id(), pieces_var.id(), args_var.id()];
 
-    Some(FmtCollapse {
-        format_block: bf,
-        format_result,
+    Some(SingleArgFmtChainNav {
+        kind,
         pieces,
+        format_result,
+        context,
         link_rewrites,
         dead_results,
         dead_bases,
+    })
+}
+
+/// Recognize the single-argument `Display` `format!` chain terminating at
+/// the `alloc::fmt::format` op `(bf, fi)` and collect the rewrite plan, or
+/// `None` for any shape outside the recognized subset so the collapse
+/// leaves the graph untouched.
+fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
+    let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
+    if nav.kind != FmtArgKind::Display {
+        // `str(value)` renders Display; `{:?}` Debug has no native rstr
+        // counterpart, so leave a Debug chain to `collapse_debug_enum_fmt_chains`.
+        return None;
+    }
+    Some(FmtCollapse {
+        format_block: bf,
+        format_result: nav.format_result.id(),
+        pieces: nav.pieces,
+        link_rewrites: nav.link_rewrites,
+        dead_results: nav.dead_results,
+        dead_bases: nav.dead_bases,
     })
 }
 
@@ -15439,6 +15496,419 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
         });
     }
     sites.len()
+}
+
+/// A recognized single-argument fieldless-enum `Debug` (`{:?}`) `format!`
+/// chain ready to lower to a discriminant switch of per-variant constant
+/// messages.  Where [`collapse_fmt_chains`] renders a `Display` argument
+/// with `str(value)` (`ll_str`), a `Debug` render of a fieldless enum has
+/// no native rstr counterpart — but every variant's `#[derive(Debug)]`
+/// output is the bare variant identifier, a compile-time constant, and the
+/// literal template pieces are constants too, so the whole rendered
+/// message is a per-variant constant selected by the enum discriminant.
+/// This reproduces the `discriminant → constant string` table shape a
+/// fieldless (C-like) enum's `Debug` is (an int-indexed name table), which
+/// the `Display`-only fmt collapser declines.
+struct DebugEnumFmtCollapse {
+    /// The `alloc::fmt::format` result var — the rendered `String` the
+    /// continuation consumes; each switch arm forwards its constant message
+    /// through this slot.
+    format_result: Variable,
+    /// The enum value being `Debug`-rendered (recovered through the
+    /// `format_args!` argument Tuple), live at `format_block` — the
+    /// `__discriminant` read base.
+    enum_value: Variable,
+    /// The `__discriminant` field owner the enum's existing tag read uses,
+    /// so the synthesized read resolves at the same layout offset.
+    disc_owner_root: Option<String>,
+    disc_owner_id: Option<majit_ir::descr::StructId>,
+    /// The literal template pieces around the single `{:?}` placeholder
+    /// (`["intrinsic function ", " not implemented"]`).
+    pieces: Vec<String>,
+    /// `(discriminant, variant_ident)` for every variant — the switch arms
+    /// and their per-variant constant messages.
+    by_discr: Vec<(i64, String)>,
+    /// `(block, exit_index, arg_pos, replacement)` — re-thread the residual
+    /// chain values the predecessor links forwarded onto still-live values,
+    /// so no link references a deleted result var once the chain is removed.
+    link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
+    /// Op result var ids of the residual `new_debug` / `Arguments::new` /
+    /// on-stack arrays / packed pieces bytes to delete.  Without this the
+    /// switch would build but the graph-less `fmt::rt::Argument::new_debug`
+    /// extern would survive in a predecessor block and keep walling the
+    /// rtyper (`prune_dead_phis` never reclaims a dead `Call{FunctionPath}`).
+    dead_results: Vec<u64>,
+    /// Aggregate base var ids whose `FieldWrite`s are deleted.
+    dead_bases: Vec<u64>,
+}
+
+/// Locate the `__discriminant` field read owner for `enum_value` — the
+/// owner_root / owner_id an existing tag read of the same base uses, so a
+/// synthesized read resolves at the identical layout offset.  Traces the
+/// read base through the single-predecessor link-arg forwarding chain so a
+/// framestate-renamed alias of the enum value still matches.
+fn debug_enum_disc_owner(
+    graph: &FunctionGraph,
+    enum_value: &Variable,
+) -> Option<(Option<String>, Option<majit_ir::descr::StructId>)> {
+    let producer = resolve_to_producer_op(graph, enum_value);
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::FieldRead { base, field, .. } = &op.kind
+                && field.name == "__discriminant"
+                && (base.id() == enum_value.id()
+                    || (producer.is_some() && resolve_to_producer_op(graph, base) == producer))
+            {
+                return Some((field.owner_root.clone(), field.owner_id));
+            }
+        }
+    }
+    None
+}
+
+/// Build `(discriminant, variant_ident)` for the fieldless enum named
+/// `owner_root`, matching the `v.name` / `discriminant_i64()` pairing the
+/// program's `enum_variant_by_discriminant` table records (mir.rs:1303).
+/// `None` unless the resolved type is a fieldless enum carrying at least
+/// one integer-discriminant variant.
+fn debug_enum_variants_by_discr(llbc: &Llbc, owner_root: &str) -> Option<Vec<(i64, String)>> {
+    // The `__discriminant` read's `owner_root` is crate-stripped
+    // (`strip_crate_prefix`, mir.rs Discriminant lowering) while
+    // `item_meta.name_path()` carries the full crate-qualified path, so
+    // compare on the crate-stripped spelling.
+    let td = llbc
+        .iter_type_decls()
+        .find(|td| strip_crate_prefix(&td.item_meta.name_path()) == owner_root)?;
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    if variants.is_empty() || variants.iter().any(|v| !v.fields.is_empty()) {
+        return None; // not fieldless
+    }
+    let by_discr: Vec<(i64, String)> = variants
+        .iter()
+        .filter_map(|v| v.discriminant_i64().map(|d| (d, v.name.clone())))
+        .collect();
+    (by_discr.len() == variants.len()).then_some(by_discr)
+}
+
+/// Recognize a single-argument fieldless-enum `Debug` `format!` chain
+/// terminating at the `alloc::fmt::format` op `(bf, fi)`, or `None` for any
+/// shape outside the subset (multi-argument, `Display`, non-fieldless-enum
+/// argument, or a format op not closing its block with a single goto) so
+/// the collapse leaves the graph untouched.
+fn collect_debug_enum_fmt_collapse(
+    graph: &FunctionGraph,
+    llbc: &Llbc,
+    bf: BlockId,
+    fi: usize,
+) -> Option<DebugEnumFmtCollapse> {
+    let block_f = graph.blocks.iter().find(|b| b.id == bf)?;
+    // The format op must be the block's last op (so the switch replaces the
+    // block tail) closed by a single plain goto to the continuation.
+    if fi + 1 != block_f.operations.len() {
+        return None;
+    }
+    let [exit] = block_f.exits.as_slice() else {
+        return None;
+    };
+    if exit.exitcase.is_some() || exit.last_exception.is_some() || exit.last_exc_value.is_some() {
+        return None;
+    }
+    // Navigate the chain (shared with the `Display` collapse); the `Debug`
+    // gate below selects only the `{:?}` renders, and the navigation also
+    // supplies the residual-chain delete / re-thread plan the switch needs.
+    let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
+    if nav.kind != FmtArgKind::Debug {
+        return None; // Display is handled by `collapse_fmt_chains`
+    }
+    // The rendered value is the enum being `Debug`-formatted.
+    let enum_value = nav.context;
+    // Recover the enum identity from an existing `__discriminant` read of
+    // the same value; without one the value is not a modeled enum here.
+    let (disc_owner_root, disc_owner_id) = debug_enum_disc_owner(graph, &enum_value)?;
+    let owner_root = disc_owner_root.clone()?;
+    let by_discr = debug_enum_variants_by_discr(llbc, &owner_root)?;
+    Some(DebugEnumFmtCollapse {
+        format_result: nav.format_result,
+        enum_value,
+        disc_owner_root,
+        disc_owner_id,
+        pieces: nav.pieces,
+        by_discr,
+        link_rewrites: nav.link_rewrites,
+        dead_results: nav.dead_results,
+        dead_bases: nav.dead_bases,
+    })
+}
+
+/// Lower every recognized fieldless-enum `Debug` (`{:?}`) `format!` chain to
+/// a discriminant switch of per-variant constant messages.  The
+/// `alloc::fmt::format` block is split: its tail becomes an N-way switch on
+/// the enum's `__discriminant`, one arm per variant emitting the constant
+/// `"{pre}{variant}{post}"` message (`emit_str_const`, natively `SomeString`)
+/// and forwarding it to the continuation through the format result slot; the
+/// default arm raises the implicit `AssertionError` (a closed enum's
+/// out-of-range tag can't occur, the shape `remove_assertion_errors`
+/// prunes).  The residual `new_debug` / `Arguments::new` / on-stack arrays
+/// in the predecessor blocks are deleted explicitly here (their cross-block
+/// forwards re-threaded onto live values first) — no sweep reclaims a dead
+/// `Call{FunctionPath}`, so leaving them in place would let the graph-less
+/// `fmt::rt::Argument::new_debug` extern keep walling the rtyper even after
+/// the switch is built.  Every emitted op the rtyper / codewriter / runtime
+/// already handle.  Returns the number of chains lowered.
+///
+/// Fail-safe: any structural mismatch leaves the chain residual (census
+/// Skip), never a regression.
+fn collapse_debug_enum_fmt_chains(graph: &mut FunctionGraph, llbc: &Llbc) -> usize {
+    let targets: Vec<(BlockId, usize)> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .enumerate()
+                .filter_map(move |(fi, op)| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
+                    _ => None,
+                })
+        })
+        .collect();
+    let sites: Vec<DebugEnumFmtCollapse> = targets
+        .into_iter()
+        .filter_map(|(bid, fi)| collect_debug_enum_fmt_collapse(graph, llbc, bid, fi))
+        .collect();
+    if sites.is_empty() {
+        return 0;
+    }
+    // 1. Re-thread the residual chain's cross-block forwards onto live
+    //    values so no link references a chain result var about to be deleted
+    //    (B0→Bp forwarded `new_debug`, Bp→Bf forwarded `Arguments`).
+    for site in &sites {
+        for (bid, ei, pos, repl) in &site.link_rewrites {
+            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei)
+                && let Some(arg) = link.args.get_mut(*pos)
+            {
+                *arg = LinkArg::Value(repl.clone());
+            }
+        }
+    }
+    // 2. Delete the now-dead chain ops across all blocks.  Essential: the
+    //    switch replaces only the `alloc::fmt::format` op, so without this
+    //    the graph-less `fmt::rt::Argument::new_debug` extern survives in a
+    //    predecessor block and keeps walling the rtyper (no sweep reclaims a
+    //    dead `Call{FunctionPath}` — `prune_dead_phis` leaves it).
+    let dead_results: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|s| s.dead_results.iter().copied())
+        .collect();
+    let dead_bases: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|s| s.dead_bases.iter().copied())
+        .collect();
+    for block in &mut graph.blocks {
+        block.operations.retain(|op| {
+            if let Some(r) = &op.result
+                && dead_results.contains(&r.id())
+            {
+                return false;
+            }
+            if let OpKind::FieldWrite { base, .. } = &op.kind
+                && dead_bases.contains(&base.id())
+            {
+                return false;
+            }
+            true
+        });
+    }
+    // 3. Replace each `alloc::fmt::format` op with the discriminant switch of
+    //    per-variant constant messages.
+    let mut lowered = 0;
+    for site in &sites {
+        if rewrite_debug_enum_fmt_site(graph, site) {
+            lowered += 1;
+        }
+    }
+    lowered
+}
+
+/// Split the format block into the discriminant switch for one recognized
+/// site.  Returns `false` (leaving the graph untouched) on any threading /
+/// arity mismatch.
+fn rewrite_debug_enum_fmt_site(graph: &mut FunctionGraph, site: &DebugEnumFmtCollapse) -> bool {
+    use crate::flowspace::model::ConstValue;
+    use crate::front::bool_then::close_goto_mixed;
+    use crate::model::{ExitCase, ExitSwitch, Link};
+    // Re-locate the format op (block/op indices are stable within this
+    // pass, but resolve by result var to stay robust to prior rewrites).
+    let Some((bf_idx, fi)) = graph.blocks.iter().enumerate().find_map(|(bi, b)| {
+        b.operations
+            .iter()
+            .position(|op| op.result.as_ref() == Some(&site.format_result))
+            .map(|oi| (bi, oi))
+    }) else {
+        return false;
+    };
+    let bf = graph.blocks[bf_idx].id;
+    // The saved single goto exit → continuation; each arm reproduces it
+    // with the format-result slot sourced from the arm's constant message.
+    let Some([saved_exit]) = graph.blocks[bf_idx].exits.first().map(std::slice::from_ref) else {
+        return false;
+    };
+    let saved_exit = saved_exit.clone();
+    let b_cont = saved_exit.target;
+
+    // The enum value must be live at `bf` to read its discriminant.  It is
+    // already an inputarg on the real graphs (the switch dispatch in the
+    // entry block forwards `func` down every arm), so this is a no-op there;
+    // decline rather than panic if a shape cannot thread it.
+    if !graph.variable_defined_in_block(bf, &site.enum_value)
+        && !can_thread_var_to_block(graph, bf, &site.enum_value)
+    {
+        return false;
+    }
+    if !graph.ensure_variable_at_block(bf, &site.enum_value) {
+        return false;
+    }
+
+    // `carried` = the distinct live Values the saved exit forwards other
+    // than the format result; each threads through every arm to reach the
+    // continuation.  The default (raise) arm carries nothing.
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != site.format_result
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+
+    // --- All structural checks passed; mutate the graph. ---
+
+    // Drop the residual `alloc::fmt::format` op (its block tail), then read
+    // the enum discriminant as the switch value.
+    graph.blocks[bf_idx].operations.remove(fi);
+    let disc = graph.alloc_value_var();
+    graph.block_mut(bf).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::FieldRead {
+            base: site.enum_value.clone(),
+            field: FieldDescriptor {
+                name: "__discriminant".to_string(),
+                owner_root: site.disc_owner_root.clone(),
+                owner_id: site.disc_owner_id,
+            },
+            ty: ValueType::Int,
+            pure: true,
+        },
+    });
+
+    // One arm per variant: emit the constant message and forward it to the
+    // continuation through the format-result slot, threading `carried`.
+    let mut links: Vec<Link> = Vec::with_capacity(site.by_discr.len() + 1);
+    for (discr, ident) in &site.by_discr {
+        let (arm, arm_inputs) = graph.create_block_with_arg_vars(carried.len());
+        let msg = format!("{}{}{}", site.pieces[0], ident, site.pieces[1]);
+        let msg_var = emit_str_const(graph, arm, &msg);
+        let arm_args = match debug_enum_reproduce_exit_args(
+            &saved_exit,
+            &site.format_result,
+            &msg_var,
+            &carried,
+            &arm_inputs,
+        ) {
+            Some(args) => args,
+            None => return false,
+        };
+        close_goto_mixed(graph, arm, b_cont, arm_args);
+        links.push(
+            Link::from_variables(
+                graph,
+                carried.clone(),
+                arm,
+                Some(ExitCase::Const(ConstValue::Int(*discr))),
+            )
+            .with_prevblock(bf)
+            .with_llexitcase_from_exitcase(),
+        );
+    }
+    // Default arm: a closed enum's tag is always one of the above, so this
+    // path "shouldn't occur" — raise the implicit `AssertionError`
+    // `remove_assertion_errors` prunes (matching `option_unwrap`'s None arm).
+    let (default_arm, _) = graph.create_block_with_arg_vars(0);
+    graph.set_raise_implicit(
+        default_arm,
+        "fieldless-enum Debug over unknown discriminant",
+    );
+    links.push(
+        Link::from_variables(
+            graph,
+            Vec::new(),
+            default_arm,
+            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+        )
+        .with_prevblock(bf),
+    );
+
+    graph.block_mut(bf).exitswitch = Some(ExitSwitch::Value(disc));
+    graph.recloseblock(bf, links);
+    true
+}
+
+/// Reproduce the format block's saved exit args for a switch arm: the
+/// format-result slot is sourced from the arm's constant message, every
+/// other live Value from the arm's threaded inputarg, constants pass
+/// through.  `None` if a forwarded Value was not threaded into the arm.
+fn debug_enum_reproduce_exit_args(
+    saved: &crate::model::Link,
+    format_result: &Variable,
+    msg_var: &Variable,
+    carried: &[Variable],
+    inputs: &[Variable],
+) -> Option<Vec<LinkArg>> {
+    let mut out = Vec::with_capacity(saved.args.len());
+    for arg in &saved.args {
+        match arg {
+            LinkArg::Const(c) => out.push(LinkArg::Const(c.clone())),
+            LinkArg::Value(v) if v == format_result => out.push(LinkArg::Value(msg_var.clone())),
+            LinkArg::Value(v) => {
+                let pos = carried.iter().position(|c| c == v)?;
+                out.push(LinkArg::Value(inputs[pos].clone()));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `var` can thread to `block` iff it is already defined there or reachable
+/// through a single-predecessor chain — the precondition under which
+/// [`FunctionGraph::ensure_variable_at_block`] succeeds without panicking.
+fn can_thread_var_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable) -> bool {
+    if graph.variable_defined_in_block(block, var) {
+        return true;
+    }
+    let mut cur = block;
+    let mut hops = 0usize;
+    loop {
+        hops += 1;
+        if hops > graph.blocks.len() {
+            return false;
+        }
+        let preds = graph.predecessors(cur);
+        if preds.len() != 1 {
+            return false;
+        }
+        let p = preds[0];
+        if graph.variable_defined_in_block(p, var) {
+            return true;
+        }
+        cur = p;
+    }
 }
 
 /// A block is collapsible into a bare implicit-`AssertionError` raise when
@@ -16331,6 +16801,189 @@ mod tests {
         assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
         let bp_exit = &bp_block.exits[0];
         assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
+    }
+
+    /// Build the `alloc::fmt::format` block shape a fieldless-enum `{:?}`
+    /// chain reaches after the `Display` collapsers decline — the format op
+    /// as the block's last op, closed by a single goto to a continuation
+    /// that consumes the rendered String — and assert the rewrite splits it
+    /// into a discriminant switch: one arm per variant emitting the constant
+    /// `"pre{ident}post"` message forwarded through the format-result slot,
+    /// plus a default arm raising to the exceptblock.
+    #[test]
+    fn rewrite_debug_enum_fmt_site_splits_into_discriminant_switch() {
+        use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
+        use crate::model::{
+            CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+        };
+
+        let mut graph = FunctionGraph::new("debug_enum_fmt");
+        let bf = graph.startblock;
+
+        // Bf: the enum value is live (an op result here), and the terminal
+        // `alloc::fmt::format` produces the rendered String.
+        let func = graph.push_op_var(bf, OpKind::ConstInt(0), true).unwrap();
+        let fmt_args = graph
+            .push_op_var(
+                bf,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor {
+                        name: "Arguments".to_string(),
+                        owner_path: vec![],
+                    },
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let formatted = graph
+            .push_op_var(
+                bf,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["alloc", "fmt", "format"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    },
+                    args: vec![fmt_args],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        // Continuation consumes the String plus an unrelated live carried
+        // value, so the rewrite must thread `carried` through each arm.
+        let carried = graph.push_op_var(bf, OpKind::ConstInt(7), true).unwrap();
+        let (bcont, cont_args) = graph.create_block_with_arg_vars(2);
+        graph.set_return(bcont, Some(cont_args[0].clone()));
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone(), carried], bcont, None)
+                .with_prevblock(bf),
+        ];
+
+        let site = DebugEnumFmtCollapse {
+            format_result: formatted.clone(),
+            enum_value: func,
+            disc_owner_root: Some("bytecode::oparg::IntrinsicFunction1".to_string()),
+            disc_owner_id: None,
+            pieces: vec![
+                "intrinsic function ".to_string(),
+                " not implemented".to_string(),
+            ],
+            by_discr: vec![(0, "Invalid".to_string()), (1, "Print".to_string())],
+            // This test drives `rewrite_debug_enum_fmt_site` (the switch
+            // build) directly on a graph with no residual chain, so the
+            // delete / re-thread plan is empty.
+            link_rewrites: Vec::new(),
+            dead_results: Vec::new(),
+            dead_bases: Vec::new(),
+        };
+        assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
+
+        // The residual `alloc::fmt::format` is gone; Bf now switches on a
+        // freshly-read `__discriminant`.
+        let has_format = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if super::fmt_path_ends_with(segments, &["fmt", "format"])
+            )
+        });
+        assert!(!has_format, "residual alloc::fmt::format removed");
+        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+        assert!(matches!(bf_block.exitswitch, Some(ExitSwitch::Value(_))));
+        let disc_read = bf_block.operations.iter().any(|op| {
+            matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+        });
+        assert!(disc_read, "discriminant read emitted at the switch block");
+
+        // Two variant arms + a default arm.
+        assert_eq!(bf_block.exits.len(), 3, "two variant arms + default");
+
+        // Each variant arm emits its `__str_const` message and forwards it
+        // as the format-result slot into the continuation.
+        let str_consts: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__str_const") => {
+                    segments.get(1).cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(str_consts.contains(&"intrinsic function Invalid not implemented".to_string()));
+        assert!(str_consts.contains(&"intrinsic function Print not implemented".to_string()));
+
+        // Exactly one arm raises (the default `AssertionError`).
+        let raises = graph
+            .blocks
+            .iter()
+            .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
+            .count();
+        assert_eq!(raises, 1, "the default arm raises to exceptblock");
+
+        // The continuation still receives a String in its first slot from
+        // every variant arm (the message var), and the carried value in the
+        // second slot.
+        let arm_exits: Vec<&Link> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.exits)
+            .filter(|l| l.target == bcont)
+            .collect();
+        assert_eq!(
+            arm_exits.len(),
+            2,
+            "both variant arms reach the continuation"
+        );
+        for l in arm_exits {
+            assert_eq!(l.args.len(), 2, "continuation arity preserved");
+            assert!(matches!(l.args[0], LinkArg::Value(_)));
+        }
+    }
+
+    /// The rewrite is fail-safe: a site whose recorded format-result var has
+    /// no producer op (a stale / mismatched site) leaves the graph untouched.
+    #[test]
+    fn rewrite_debug_enum_fmt_site_declines_when_result_has_no_producer() {
+        use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
+        use crate::flowspace::model::Variable;
+        use crate::model::FunctionGraph;
+
+        let mut graph = FunctionGraph::new("debug_enum_fmt_decline");
+        let bf = graph.startblock;
+        let func = graph
+            .push_op_var(bf, crate::model::OpKind::ConstInt(0), true)
+            .unwrap();
+        graph.set_return(bf, None);
+        let ops_before = graph.blocks[bf.0].operations.len();
+
+        let site = DebugEnumFmtCollapse {
+            // A var never produced by any op — no format block to split.
+            format_result: Variable::new(),
+            enum_value: func,
+            disc_owner_root: Some("bytecode::oparg::IntrinsicFunction1".to_string()),
+            disc_owner_id: None,
+            pieces: vec!["a".to_string(), "b".to_string()],
+            by_discr: vec![(0, "Invalid".to_string())],
+            link_rewrites: Vec::new(),
+            dead_results: Vec::new(),
+            dead_bases: Vec::new(),
+        };
+        assert!(!rewrite_debug_enum_fmt_site(&mut graph, &site));
+        assert_eq!(
+            graph.blocks[bf.0].operations.len(),
+            ops_before,
+            "graph left untouched on decline"
+        );
     }
 
     #[test]
@@ -17977,6 +18630,52 @@ mod tests {
         assert!(
             array_writes >= 1,
             "fill_user_function_args: expected at least one native ArrayWrite (setarrayitem)"
+        );
+    }
+
+    /// Real-LLBC anchor for the fieldless-enum `Debug` `format!` collapse:
+    /// `call_intrinsic_1`'s unknown-intrinsic arm renders `func`
+    /// (`IntrinsicFunction1`, a fieldless enum) with `{:?}`, which lowers to
+    /// the `alloc::fmt::format` / `fmt::rt::Argument::new_debug` chain.  After
+    /// `collapse_debug_enum_fmt_chains` there must be no residual `new_debug`
+    /// (the graph-less extern that walls the rtyper) and the enum-discriminant
+    /// switch must be present.  `#[ignore]`d (loads the ~440MB real LLBC); run
+    /// with `cargo test -p majit-translate --lib call_intrinsic_1_debug_enum_fmt_real
+    /// -- --ignored`.
+    #[test]
+    #[ignore]
+    fn call_intrinsic_1_debug_enum_fmt_real() {
+        use crate::model::{CallTarget, ExitSwitch, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "call_intrinsic_1").expect("lower call_intrinsic_1");
+        let new_debug_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["Argument", "new_debug"])
+                )
+            })
+            .count();
+        assert_eq!(
+            new_debug_residual, 0,
+            "call_intrinsic_1: residual fmt::rt::Argument::new_debug after the Debug-enum collapse"
+        );
+        let has_value_switch = graph
+            .blocks
+            .iter()
+            .any(|b| matches!(b.exitswitch, Some(ExitSwitch::Value(_))));
+        assert!(
+            has_value_switch,
+            "call_intrinsic_1: expected an enum-discriminant switch after the collapse"
         );
     }
 }
