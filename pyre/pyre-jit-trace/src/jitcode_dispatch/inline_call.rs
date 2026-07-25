@@ -2237,11 +2237,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // committed side effect on deopt.
         //
         // Best effort: `compute_inline_caller_frame` returns `Unavailable` for a caller
-        // shape it cannot build yet (a CALL inside a try-block, or no result on
-        // the operand stack at the return point).  Fall back to the single-frame
-        // collapse there (do NOT decline the inline — that shape is served
-        // correctly today), so this never removes a working inline.
-        compute_inline_caller_frame(ctx, op.pc).ok()
+        // shape it cannot build yet (no result on the operand stack at the
+        // return point, missing liveness / resume tables).  Fall back to the
+        // single-frame collapse there (do NOT decline the inline — that shape is
+        // served correctly today), so this never removes a working inline.
+        //
+        // A `TryBlockCatchMarker` decline is different: the CALL is covered by
+        // the caller's exception table.  The collapse resumes at the CALL's
+        // pre-call `-live-`, which precedes the CALL's own `catch_exception`,
+        // so an in-callee `GUARD_NO_EXCEPTION` failing there hands the
+        // blackhole a pending exception at a coordinate from which neither the
+        // forward check nor the bounded backward startpoint scan
+        // (`handle_exception_in_frame`) can reach that catch — the raise exits
+        // the caller frame past its matching handler.  Decline the inline so
+        // the call stays residual, where the post-call catch resume
+        // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
+        match compute_inline_caller_frame(ctx, op.pc) {
+            Ok(pf) => Some(pf),
+            Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            Err(InlineCallerFrameDecline::Unavailable) => None,
+        }
     } else {
         // Single-frame collapse (resume at the CALL boundary, re-execute the
         // whole call on deopt): a nested strict callee
