@@ -458,6 +458,72 @@ fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyErro
     }
 }
 
+/// The module name as the extension-module loader spells it.
+///
+/// `_Py_ext_module_loader_info_init` encodes the name to ASCII because it has
+/// to build the `PyInit_<name>` symbol from it, so a name outside ASCII is
+/// rejected by the codec before the builtin registry is ever consulted.
+fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
+    if let Ok(name) = unsafe { pyre_object::w_str_get_wtf8(w_name) }.as_str() {
+        if name.is_ascii() {
+            return Ok(name.to_owned());
+        }
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_name);
+    // The strict ascii codec raises here, so the `UnicodeEncodeError` carries
+    // the encoding, object, position and reason `name.encode("ascii")` reports.
+    // Should it ever encode, the bytes are ASCII and the lossy decode below
+    // cannot substitute anything.
+    let encode_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+        "encode",
+    )?);
+    let encoded = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(encode_slot),
+        &[pyre_object::w_str_new("ascii")],
+    )?;
+    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(encoded) };
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The code object a frozen table entry stands for.  A real frozen module ships
+/// pre-marshalled bytes; pyre keeps the source and compiles it on demand, so
+/// both `get_frozen_object` and the `withdata` arm of `find_frozen` come
+/// through here and observe the same object.
+fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let (source, code_name) = frozen_source(entry)?;
+    let filename = format!("<frozen {code_name}>");
+    let code = crate::compile::compile_source_with_filename(
+        &source,
+        crate::compile::Mode::Exec,
+        &filename,
+    )
+    .map_err(|error| crate::builtins::compile_err_to_syntax_error(error, &source))?;
+    Ok(crate::w_code_new(
+        Box::into_raw(Box::new(code)) as *const ()
+    ))
+}
+
+/// The `data` element of a `withdata=True` `find_frozen` result: a read-only
+/// `memoryview` over the frozen bytes, so `marshal.loads(bytes(data))`
+/// reconstructs the same code object `get_frozen_object` returns.
+fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let code = frozen_code(entry)?;
+    let bytes = crate::module::marshal::dumps_bytes(code)?;
+    let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&bytes);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_bytes);
+    let mv_type = crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE);
+    crate::module::_pickle::call_fn(
+        mv_type,
+        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+    )
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -557,25 +623,46 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "find_frozen",
-        crate::make_builtin_function_with_arity(
-            "find_frozen",
-            |args| {
-                let name = frozen_name(args, "find_frozen")?;
-                let Some(entry) = served_frozen_module(&name) else {
-                    return Ok(pyre_object::w_none());
-                };
-                let origname = entry
+        // `withdata` is keyword-only, so no call shape fills every parameter
+        // positionally and there is no fixed natural arity to fast-path on.
+        crate::make_builtin_function("find_frozen", |args| {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(kwargs, &["withdata"], "find_frozen")?;
+            if positional.len() != 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "find_frozen() takes exactly 1 positional argument ({} given)",
+                    positional.len()
+                )));
+            }
+            // `withdata: bool(accept={int})` — any object, read for truth.
+            let withdata = match crate::builtins::kwarg_get(kwargs, "withdata") {
+                Some(value) => crate::baseobjspace::is_true(value)?,
+                None => false,
+            };
+            let name = frozen_name(positional, "find_frozen")?;
+            let Some(entry) = served_frozen_module(&name) else {
+                return Ok(pyre_object::w_none());
+            };
+            let _roots = pyre_object::gc_roots::push_roots();
+            let data_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(if withdata {
+                frozen_data(entry)?
+            } else {
+                pyre_object::w_none()
+            });
+            let origname_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(
+                entry
                     .origname
                     .map(pyre_object::w_str_new)
-                    .unwrap_or_else(pyre_object::w_none);
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_none(),
-                    pyre_object::w_bool_from(entry.is_package),
-                    origname,
-                ]))
-            },
-            1,
-        ),
+                    .unwrap_or_else(pyre_object::w_none),
+            );
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(data_slot),
+                pyre_object::w_bool_from(entry.is_package),
+                pyre_object::gc_roots::shadow_stack_get(origname_slot),
+            ]))
+        }),
     );
     crate::module_ns_store(
         ns,
@@ -642,17 +729,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let entry =
                     served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
-                let (source, code_name) = frozen_source(entry)?;
-                let filename = format!("<frozen {code_name}>");
-                let code = crate::compile::compile_source_with_filename(
-                    &source,
-                    crate::compile::Mode::Exec,
-                    &filename,
-                )
-                .map_err(|error| crate::builtins::compile_err_to_syntax_error(error, &source))?;
-                Ok(crate::w_code_new(
-                    Box::into_raw(Box::new(code)) as *const ()
-                ))
+                frozen_code(entry)
             }),
     );
     crate::module_ns_store(
@@ -665,43 +742,44 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // module back; `_load` then binds it in sys.modules. A name
                 // already imported keeps its module, so the machinery and a plain
                 // `import X` agree on one object.
-                let Some(&spec) = args.first() else {
+                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                if crate::builtins::has_real_kwargs(kwargs) {
                     return Err(crate::PyError::type_error(
-                        "create_builtin() missing required argument 'spec'",
+                        "_imp.create_builtin() takes no keyword arguments",
                     ));
-                };
+                }
+                if positional.len() != 1 {
+                    return Err(crate::PyError::type_error(format!(
+                        "_imp.create_builtin() takes exactly one argument ({} given)",
+                        positional.len()
+                    )));
+                }
+                let spec = positional[0];
                 let w_name = crate::baseobjspace::getattr_str(spec, "name")?;
                 if !unsafe { pyre_object::is_str(w_name) } {
-                    return Err(crate::PyError::type_error("spec.name must be a string"));
+                    return Err(crate::PyError::type_error(format!(
+                        "name must be string, not {}",
+                        type_name(w_name)
+                    )));
                 }
-                // The builtin registry is `&'static str`-keyed, so a name
-                // carrying a lone surrogate names no builtin and takes the
-                // not-found report; those code points have no `&str` spelling,
-                // so it is rendered the way `%R` does.
-                let w_name_wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-                let Ok(name) = w_name_wtf8.as_str() else {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::ImportError,
-                        format!(
-                            "no built-in module named {}",
-                            crate::display::format_wtf8_repr(w_name_wtf8)
-                        ),
-                    ));
-                };
-                let name = name.to_string();
+                let name = ascii_module_name(w_name)?;
+                if name.as_bytes().contains(&0) {
+                    return Err(crate::PyError::value_error("embedded null character"));
+                }
                 if let Some(module) = crate::importing::get_sys_module(&name) {
                     return Ok(module);
                 }
-                crate::importing::create_builtin_module(
-                    &name,
-                    crate::call::getexecutioncontext(),
-                )?
-                .ok_or_else(|| {
-                    crate::PyError::new(
-                        crate::PyErrorKind::ImportError,
-                        format!("no built-in module named {name}"),
-                    )
-                })
+                // A name that is spelled correctly but names no builtin is
+                // reported by returning None, leaving the diagnostic to
+                // `BuiltinImporter.create_module`, which has already screened
+                // the name against `sys.builtin_module_names`.
+                Ok(
+                    crate::importing::create_builtin_module(
+                        &name,
+                        crate::call::getexecutioncontext(),
+                    )?
+                    .unwrap_or_else(pyre_object::w_none),
+                )
             },
             1,
         ),
