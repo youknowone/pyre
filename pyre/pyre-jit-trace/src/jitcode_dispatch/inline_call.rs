@@ -1766,13 +1766,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // reads from the unseeded frame box; inlining it would abort the
     // *whole* enclosing trace with `VableBoxNotSeeded`.
     //
-    // A zero-param callee has no positional argument to seed, so the
-    // convention holds vacuously and the strict path serves it like any other
-    // straight-line leaf.  The residual it used to fall back to is not cheap:
-    // `def f0(): return 1` called from a `while` loop measured 569 ns/iter
-    // against 1.16 ns for the same call with one parameter.  Keep the decline
-    // for a zero-param callee the strict path cannot serve, so such a body
-    // still takes the residual rather than the decline-to-interpretation below.
     // A param-bearing Python callee that is otherwise inline-eligible but
     // whose body is not a straight-line leaf (loop / branch / non-static
     // vable) cannot be served by the fast-path register seeding.  Emitting
@@ -1794,6 +1787,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         .unwrap_or(u16::MAX);
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
+    // A zero-param callee has no positional argument to seed, so the register
+    // convention above holds vacuously and the strict path serves it like any
+    // other straight-line leaf.  The residual it would otherwise fall back to
+    // is not cheap: `def f0(): return 1` called from a `while` loop measured
+    // 569 ns/iter against 1.16 ns for the same call with one parameter.  Only a
+    // zero-param callee the strict path cannot serve declines here, so such a
+    // body still takes the residual rather than the decline-to-interpretation
+    // below.
     if nparams == 0 && !strict_inlinable {
         return Ok(None);
     }
