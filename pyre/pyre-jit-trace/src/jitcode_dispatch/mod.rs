@@ -1753,6 +1753,11 @@ pub enum DispatchError {
     /// the callee return correctly.  The loop-rejoin case (same-frame handler)
     /// still routes.
     ExcEdgeCrossFrameReturnUnsupported { pc: usize },
+    /// The recorded trace passed `warmstate.trace_limit` (`rlib/jit.py:592`
+    /// default 6000). RPython checks this after every traced step —
+    /// `pyjitpl.py:2865 _interpret` calls `blackhole_if_trace_too_long()` right
+    /// after `run_one_step()` — and raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
+    TraceTooLong { pc: usize, ops: usize },
 }
 
 impl DispatchError {
@@ -1821,6 +1826,7 @@ impl DispatchError {
                 "InplaceContainerMutationUnsupported"
             }
             Self::ExcEdgeCrossFrameReturnUnsupported { .. } => "ExcEdgeCrossFrameReturnUnsupported",
+            Self::TraceTooLong { .. } => "TraceTooLong",
         }
     }
 
@@ -2018,6 +2024,30 @@ pub fn walk<Sym: WalkSym>(
         let opcode_position = pc;
         let (outcome, next_pc) = step(code, pc, ctx)?;
         pc = next_pc;
+        // pyjitpl.py:2865 `_interpret`: `blackhole_if_trace_too_long()` runs
+        // after every `run_one_step()`. This loop is that loop's counterpart —
+        // `step` is `run_one_step` — and the check came with the per-opcode
+        // tracing loop it replaced (`pyre-jit/src/eval.rs` still runs it on
+        // that path), so nothing bounded a walk that kept recording without
+        // reaching a close. `TraceCtx::is_too_long` is the `history.length() >
+        // warmrunnerstate.trace_limit` test and `num_ops` is a `Vec::len`, so
+        // this is one comparison per step.
+        //
+        // The walker layer holds `&mut TraceCtx` and cannot reach
+        // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
+        // `note_root_trace_too_long` is the warm-state half the retired loop
+        // called (`trace_next_iteration` + `mark_force_finish_tracing`, so the
+        // next attempt cuts the trace instead of growing it again). The
+        // `find_biggest_function` → `disable_noninlinable_function` half
+        // (pyjitpl.py:2793) still only runs on the per-opcode path.
+        if ctx.trace_ctx.is_too_long() {
+            let ops = ctx.trace_ctx.num_recorded_ops();
+            crate::state::note_root_trace_too_long(ctx.trace_ctx.root_green_key());
+            return Err(DispatchError::TraceTooLong {
+                pc: opcode_position,
+                ops,
+            });
+        }
         match outcome {
             DispatchOutcome::Continue => {}
             DispatchOutcome::Terminate
