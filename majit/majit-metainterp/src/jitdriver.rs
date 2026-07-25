@@ -5284,6 +5284,42 @@ impl<S: JitState> JitDriver<S> {
             self.last_bridge_is_exception_guard = false;
             return false;
         }
+        // resume.py:1050-1056 pushes a real MIFrame per encoded section and
+        // resumes in the INNERMOST one.  A state-field bridge seeds only the
+        // root frame: `setup_bridge_sym` reads `frames.first()` and maps its
+        // per-bank live registers onto the sym's identity slots, and the
+        // bridge re-enters at the root dispatch coordinate.  When the guard
+        // failed inside an inlined `#[jit_inline]` callee the stream carries
+        // that callee's frame too, and neither its registers nor its resume pc
+        // have any representation here — re-entering at the root opcode would
+        // re-run a helper that already committed part of its effect (e.g.
+        // `stack.head` stored, `stack.size` not).  Seeding cannot paper over a
+        // missing frame, so give up on the bridge instead of compiling one that
+        // resumes at the wrong coordinate: compile.py:725-729 `compile.giveup()`
+        // is the sanctioned outcome when a bridge cannot be built, and the
+        // guard keeps deopting through the blackhole, which does rebuild every
+        // frame (resume.py:1437-1442).
+        //
+        // Scoped to state-field drivers by the `dispatch_jitcode` probe — a
+        // JitState that overrides `setup_bridge_sym` with real multi-frame
+        // support (pyre) registers no dispatch JitCode and is unaffected.
+        if self.dispatch_jitcode.is_some()
+            && resume_data_result
+                .as_ref()
+                .is_some_and(|r| r.frames.len() > 1)
+        {
+            if crate::bridge_debug_enabled() {
+                eprintln!(
+                    "[bridgeB] multi-frame resume ({} frames) — only the root frame is seedable, giving up on the bridge",
+                    resume_data_result.as_ref().map_or(0, |r| r.frames.len()),
+                );
+            }
+            self.meta.abort_trace(false);
+            self.clear_tracing_session_state();
+            self.resume_data_result = None;
+            self.last_bridge_is_exception_guard = false;
+            return false;
+        }
 
         let mut sym = S::create_sym(&trace_meta, resume_pc);
         state.initialize_sym(&mut sym, &trace_meta);

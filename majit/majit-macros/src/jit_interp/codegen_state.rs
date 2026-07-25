@@ -2355,25 +2355,46 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 fail_arg_types: &[majit_ir::Type],
                 storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
             ) -> Option<majit_metainterp::ResumeDataResult> {
-                // The macro mainloop trace is single-frame (storage/helper calls
-                // are residuals, not inlined traced sub-frames), so the generic
-                // single-frame fallback (None frame_value_count) recovers the one
-                // frame's full register slice from rd_numb.
+                // resume.py:1049-1055 rebuild_from_resumedata:
+                //     while not resumereader.done_reading():
+                //         jitcode_pos, pc = resumereader.read_jitcode_pos_pc()
+                //         jitcode = metainterp.staticdata.jitcodes[jitcode_pos]
+                //         f = metainterp.newframe(jitcode); f.setup_resume_at_op(pc)
+                //         resumereader.consume_boxes(f.get_current_position_info(), ..)
                 //
-                // PART B TODO: the single-frame fallback returns the frame in
-                // OPENCODER order (greens+reds interleaved); `setup_bridge_sym`
-                // must map that to the sym's red slots.  A `frame_value_count`
-                // callback (pyre `frame_value_count_at` parity) may be needed
-                // here once part B lands.
+                // Every section is delimited by ITS OWN jitcode's `-live-`
+                // liveness at ITS OWN pc (jitcode.py:147 `enumerate_vars` ->
+                // length_i + length_r + length_f); RPython never consumes "the
+                // rest of the stream" as one frame.  The writer already honours
+                // that contract — `build_state_field_snapshot`
+                // (pyjitpl/dispatch.rs) emits one section per MIFrame, outermost
+                // to innermost, each stamping its own absolute jitcode index —
+                // so a `#[jit_inline]` callee on the frame stack at guard time
+                // publishes a multi-frame stream.  Decoding that with the `None`
+                // fallback folds the next section's [jitcode_index, pc, py_pc]
+                // header and values into frame 0, so frame 0 stops matching its
+                // own liveness and the per-bank register -> sym-slot map in
+                // `setup_bridge_sym` is meaningless.
+                //
+                // `register_dispatch_jitcode` installs the liveness splitter
+                // (`install_state_field_fvc`); decode through it exactly like
+                // the other compile-time decoders of the same `rd_numb` already
+                // do.  Deliberately not `.expect()`ed: a state whose
+                // `lower_dispatch_body` failed never calls
+                // `register_dispatch_jitcode`, so an absent callback is
+                // legitimate and keeps the previous fallback behaviour.
                 let storage = storage?;
                 let rd_numb = storage.rd_numb.as_slice();
                 let rd_consts = storage.rd_consts();
+                let __fvc = majit_ir::resumedata::get_frame_value_count_fn();
+                let __fvc_ref: ::std::option::Option<&dyn Fn(i32, i32) -> usize> =
+                    __fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let (num_failargs, vable_values, vref_values, frames) =
                     majit_ir::resumedata::rebuild_from_numbering(
                         rd_numb,
                         rd_consts,
                         fail_arg_types,
-                        None,
+                        __fvc_ref,
                         storage.rd_virtuals.len(),
                     );
                 if frames.is_empty() {
