@@ -2273,6 +2273,9 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "anext", || {
         make_module_builtin_function("anext", crate::async_operation::builtin_anext)
     });
+    crate::module_ns_get_or_insert_with(ns, "breakpoint", || {
+        make_module_builtin_function("breakpoint", builtin_breakpoint)
+    });
     crate::module_ns_get_or_insert_with(ns, "callable", || {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
@@ -12406,6 +12409,46 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
+/// Call `callable` with a builtin's own argument slice, re-splitting the
+/// trailing `__pyre_kw__` marker back into real keyword arguments.  This is
+/// what a builtin that forwards `*args, **kwargs` onward needs: passing the
+/// slice through unchanged would hand the marker dict over as a positional.
+pub(crate) fn call_forwarding_args(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if !has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(callable, positional);
+    }
+    let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error("call has no current frame"));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, positional, &keyword_args)
+    })
+}
+
+/// `app_breakpoint.py breakpoint` — forward to `sys.breakpointhook`, which
+/// must accept whatever arguments are passed.  By default that drops into pdb.
+fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    call_forwarding_args(hook, args)
+}
+
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.
 fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `__import__(name, globals, locals, fromlist, level)` — PyPy's gateway

@@ -2,8 +2,8 @@
 //!
 //! PyPy equivalent: `pypy/module/sys/vm.py`.
 
-use crate::{make_builtin_function_with_arity, module_ns_store};
 use crate::executioncontext::ActionFlagOps;
+use crate::{make_builtin_function, make_builtin_function_with_arity, module_ns_store};
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -492,6 +492,49 @@ fn sys_set_asyncgen_hooks_impl(args: &[PyObjectRef]) -> crate::PyResult {
         }
     }
     Ok(w_none())
+}
+
+/// `app.py breakpointhook` — the hook `breakpoint()` calls.
+///
+/// `$PYTHONBREAKPOINT` names the callable to run: unset or empty means
+/// `pdb.set_trace`, `"0"` disables the hook outright, and any other value is
+/// imported as a dotted path (a bare name resolves against `builtins`).  An
+/// unimportable value warns and returns None rather than propagating, so a
+/// stray environment variable cannot break an otherwise working program.
+fn sys_breakpointhook(args: &[PyObjectRef]) -> crate::PyResult {
+    let hookname = match crate::importing::host::os::var("PYTHONBREAKPOINT") {
+        Ok(name) if name == "0" => return Ok(w_none()),
+        Ok(name) if !name.is_empty() => name,
+        _ => "pdb.set_trace".to_string(),
+    };
+    let (modname, funcname) = match hookname.rsplit_once('.') {
+        Some((modname, funcname)) => (modname, funcname),
+        None => ("builtins", hookname.as_str()),
+    };
+
+    // `dunder_import` returns the root package, so reach the leaf through
+    // `sys.modules` before pulling the attribute off it.
+    let hook = crate::importing::dunder_import(
+        modname,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        0,
+        std::ptr::null(),
+    )
+    .ok()
+    .and_then(|_| crate::importing::get_sys_module(modname))
+    .and_then(|module| crate::baseobjspace::getattr_str(module, funcname).ok());
+    let Some(hook) = hook else {
+        crate::warn::warn_category(
+            &format!("Ignoring unimportable $PYTHONBREAKPOINT: \"{hookname}\""),
+            "RuntimeWarning",
+            1,
+        )?;
+        return Ok(w_none());
+    };
+    // The hook "must accept whatever arguments are passed".
+    crate::builtins::call_forwarding_args(hook, args)
 }
 
 fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
@@ -1613,6 +1656,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "excepthook",
         make_builtin_function_with_arity("excepthook", |_| Ok(w_none()), 3),
     );
+    // sys.breakpointhook — `app.py breakpointhook`, called by `breakpoint()`.
+    // `__breakpointhook__` keeps the original so code can restore it.
+    let breakpointhook_fn = make_builtin_function("breakpointhook", sys_breakpointhook);
+    module_ns_store(ns, "breakpointhook", breakpointhook_fn);
+    module_ns_store(ns, "__breakpointhook__", breakpointhook_fn);
     // sys.unraisablehook(unraisable) — handles exceptions raised where they
     // cannot propagate (e.g. __del__).  Stored alongside the read-only
     // `__unraisablehook__` original so code can save and restore it.
