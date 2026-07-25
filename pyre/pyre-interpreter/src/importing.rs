@@ -357,8 +357,8 @@ pub fn mount_embedded_stdlib(mount: &Path) {
 // PyPy equivalent: `space.sys.get('modules')`, `space.sys.path`, and
 // `space.builtin_modules` are object-space/process state, shared by every
 // ExecutionContext.  Raw GC references use the established process-global
-// `usize` representation; the GIL serializes semantic access while the mutex
-// also makes foreign STW root walks well-defined.
+// `usize` representation; the mutex serializes semantic access and keeps
+// foreign STW root walks well-defined.
 static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);

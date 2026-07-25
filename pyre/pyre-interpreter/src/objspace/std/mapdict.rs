@@ -43,12 +43,33 @@ static INSTANCE_LOCKS: LazyLock<Vec<ForkReentrantLock>> =
 static CODE_CACHE_LOCKS: LazyLock<Vec<ForkReentrantLock>> =
     LazyLock::new(|| (0..256).map(|_| ForkReentrantLock::new()).collect());
 
-fn instance_lock_for(obj: PyObjectRef) -> &'static ReentrantMutex<()> {
-    INSTANCE_LOCKS[(obj as usize >> 4) & (INSTANCE_LOCKS.len() - 1)].get()
+type MapDictGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+/// A contended stripe must not be waited on from inside the running-mutator
+/// census: the owner can allocate under the stripe and request a collection,
+/// which then waits for this thread while this thread waits for the stripe.
+/// Leave the census around the blocking acquire, as `w_list_lock` does.
+fn lock_stripe(lock: &'static ReentrantMutex<()>) -> MapDictGuard {
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = crate::module::thread::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
 }
 
-fn code_cache_lock_for(code: PyObjectRef) -> &'static ReentrantMutex<()> {
-    CODE_CACHE_LOCKS[(code as usize >> 4) & (CODE_CACHE_LOCKS.len() - 1)].get()
+fn instance_lock(obj: PyObjectRef) -> MapDictGuard {
+    lock_stripe(INSTANCE_LOCKS[(obj as usize >> 4) & (INSTANCE_LOCKS.len() - 1)].get())
+}
+
+fn code_cache_lock(code: PyObjectRef) -> MapDictGuard {
+    lock_stripe(CODE_CACHE_LOCKS[(code as usize >> 4) & (CODE_CACHE_LOCKS.len() - 1)].get())
 }
 
 pub fn after_fork_child() {
@@ -384,7 +405,7 @@ pub unsafe fn instance_node_setdictvalue(
     name: &Wtf8,
     value: PyObjectRef,
 ) -> bool {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -409,7 +430,7 @@ pub unsafe fn instance_node_setdictvalue(
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -434,7 +455,7 @@ pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Optio
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -460,7 +481,7 @@ pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool 
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -480,7 +501,7 @@ pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> bool {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -494,7 +515,7 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
 /// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -511,7 +532,7 @@ pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef>
 /// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef) -> bool {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -525,7 +546,7 @@ pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef)
 /// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
-    let _instance_guard = instance_lock_for(obj).lock();
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -1193,8 +1214,8 @@ pub unsafe fn load_attr_caching(
     // `_mapdict_caches` entry one atomic observation.  Preserve those exact
     // owners under free threading with narrow synchronization around the
     // upstream cache operation.
-    let _instance_guard = instance_lock_for(w_obj).lock();
-    let _code_cache_guard = code_cache_lock_for(pycode).lock();
+    let _instance_guard = instance_lock(w_obj);
+    let _code_cache_guard = code_cache_lock(pycode);
     let entry = unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) };
     // mapdict.py:1482 `map = w_obj._get_mapdict_map()`.
     let map = unsafe { mapdict_map_or_null(w_obj) };
@@ -1597,8 +1618,8 @@ pub unsafe fn store_attr_caching(
     name: &str,
     w_value: PyObjectRef,
 ) -> Result<(), PyError> {
-    let _instance_guard = instance_lock_for(w_obj).lock();
-    let _code_cache_guard = code_cache_lock_for(pycode).lock();
+    let _instance_guard = instance_lock(w_obj);
+    let _code_cache_guard = code_cache_lock(pycode);
     let entry = unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) };
     // mapdict.py:1577 `map = w_obj._get_mapdict_map()`.
     let map = unsafe { mapdict_map_or_null(w_obj) };
@@ -2943,6 +2964,7 @@ static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea;
 /// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let mut res: usize = 0;
@@ -2964,6 +2986,7 @@ pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
 /// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_clear(obj: PyObjectRef) {
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -3002,6 +3025,7 @@ unsafe fn dict_nodes_in_order(inst: &pyre_object::W_ObjectObject) -> Vec<MapRef>
 /// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let nodes = dict_nodes_in_order(inst);
@@ -3034,6 +3058,7 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let nodes = dict_nodes_in_order(inst);
@@ -3057,6 +3082,7 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// `obj` must be a live `W_ObjectObject` backing a hasdict instance.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+    let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let nodes = dict_nodes_in_order(inst);
