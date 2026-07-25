@@ -384,17 +384,32 @@ pub fn init_typeobjects() {
         // list — PyPy: listobject.py, bases=(object,)
         reg.insert(
             &LIST_TYPE as *const PyType as usize,
-            new_typeobject_with_base("list", init_list_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "list",
+                init_list_type,
+                object_type,
+                &LIST_TYPE as *const PyType,
+            ) as usize,
         );
 
         // tuple — PyPy: tupleobject.py, bases=(object,)
         reg.insert(
             &TUPLE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("tuple", init_tuple_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "tuple",
+                init_tuple_type,
+                object_type,
+                &TUPLE_TYPE as *const PyType,
+            ) as usize,
         );
 
         // dict — PyPy: dictmultiobject.py, bases=(object,)
-        let dict_type = new_typeobject_with_base("dict", init_dict_type, object_type);
+        let dict_type = new_typeobject_with_base_and_layout(
+            "dict",
+            init_dict_type,
+            object_type,
+            &DICT_TYPE as *const PyType,
+        );
         reg.insert(&DICT_TYPE as *const PyType as usize, dict_type as usize);
         // `pypy/objspace/std/dictmultiobject.py:67
         // allocate_instance(W_ModuleDictObject, space.w_dict)` —
@@ -601,7 +616,12 @@ pub fn init_typeobjects() {
         // property — PyPy: descriptor.py W_Property, bases=(object,)
         reg.insert(
             &pyre_object::descriptor::PROPERTY_TYPE as *const PyType as usize,
-            new_typeobject_with_base("property", init_property_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "property",
+                init_property_type,
+                object_type,
+                &pyre_object::descriptor::PROPERTY_TYPE as *const PyType,
+            ) as usize,
         );
 
         // exception — pyre uses one shared W_TypeObject for all builtin
@@ -717,13 +737,23 @@ pub fn init_typeobjects() {
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
         reg.insert(
             &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType as usize,
-            new_typeobject_with_base("bytearray", init_bytearray_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "bytearray",
+                init_bytearray_type,
+                object_type,
+                &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
+            ) as usize,
         );
 
         // bytes — PyPy: bytesobject.py W_BytesObject, bases=(object,)
         reg.insert(
             &pyre_object::bytesobject::BYTES_TYPE as *const PyType as usize,
-            new_typeobject_with_base("bytes", init_bytes_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "bytes",
+                init_bytes_type,
+                object_type,
+                &pyre_object::bytesobject::BYTES_TYPE as *const PyType,
+            ) as usize,
         );
 
         // set / frozenset — PyPy: setobject.py, bases=(object,).
@@ -771,7 +801,12 @@ pub fn init_typeobjects() {
         // the typedef itself stays empty.
         reg.insert(
             &pyre_object::descriptor::SUPER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("super", init_super_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "super",
+                init_super_type,
+                object_type,
+                &pyre_object::descriptor::SUPER_TYPE as *const PyType,
+            ) as usize,
         );
         let generator_type =
             new_typeobject_with_base("generator", init_generator_type, object_type);
@@ -942,23 +977,48 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::functional::ENUMERATE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("enumerate", init_enumerate_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "enumerate",
+                init_enumerate_type,
+                object_type,
+                &pyre_object::functional::ENUMERATE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::REVERSED_TYPE as *const PyType as usize,
-            new_typeobject_with_base("reversed", init_reversed_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "reversed",
+                init_reversed_type,
+                object_type,
+                &pyre_object::functional::REVERSED_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::FILTER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("filter", init_filter_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "filter",
+                init_filter_type,
+                object_type,
+                &pyre_object::functional::FILTER_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::MAP_TYPE as *const PyType as usize,
-            new_typeobject_with_base("map", init_map_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "map",
+                init_map_type,
+                object_type,
+                &pyre_object::functional::MAP_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
-            new_typeobject_with_base("zip", init_zip_type, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "zip",
+                init_zip_type,
+                object_type,
+                &pyre_object::functional::ZIP_TYPE as *const PyType,
+            ) as usize,
         );
         // `iter(callable, sentinel)` produces a `_CallableIterator`; register
         // its type so `type(it)` / `it.__class__` resolve like the other
@@ -1707,8 +1767,18 @@ pub fn make_builtin_type_with_bases(
     init: impl FnOnce(PyObjectRef),
     bases: &[PyObjectRef],
 ) -> PyObjectRef {
-    let layout_pytype = &INSTANCE_TYPE as *const PyType;
     let base = bases[0];
+    // A multi-base builtin class introduces no instance layout of its own, so
+    // it names the primary base's typedef and the reuse rule below hands back
+    // that same Layout.
+    let layout_pytype = unsafe {
+        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
+        if parent_layout.is_null() {
+            &INSTANCE_TYPE as *const PyType
+        } else {
+            (*parent_layout).typedef
+        }
+    };
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new();
@@ -8748,10 +8818,18 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                             } else {
                                 "<generic property>"
                             };
+                        // `%N` names a type argument directly — the attribute
+                        // belongs to `w_obj` itself, not to `type(w_obj)`.
                         let type_name = unsafe {
-                            match crate::typedef::r#type(w_obj) {
-                                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                                None => (*(*w_obj).ob_type).name.to_string(),
+                            if pyre_object::is_type(w_obj) {
+                                pyre_object::w_type_get_name(w_obj).to_string()
+                            } else {
+                                match crate::typedef::r#type(w_obj) {
+                                    Some(tp) => {
+                                        pyre_object::w_type_get_name(tp.as_ptr()).to_string()
+                                    }
+                                    None => (*(*w_obj).ob_type).name.to_string(),
+                                }
                             }
                         };
                         return Err(crate::PyError::attribute_error(format!(
@@ -9615,6 +9693,25 @@ unsafe fn mro_subclasses(w_type: PyObjectRef) {
     }
 }
 
+/// Whether `w_type` appears in `w_base`'s MRO — the `w_type in
+/// w_newbase.compute_mro()` test of `descr_set__bases__`.  A non-type entry
+/// answers `false`; the type check that rejects it follows separately.
+unsafe fn type_in_mro(w_base: PyObjectRef, w_type: PyObjectRef) -> bool {
+    if std::ptr::eq(w_base, w_type) {
+        return true;
+    }
+    if !unsafe { pyre_object::is_type(w_base) } {
+        return false;
+    }
+    let mro = unsafe { pyre_object::w_type_get_mro(w_base) };
+    if mro.is_null() {
+        return false;
+    }
+    unsafe { (*mro).as_slice() }
+        .iter()
+        .any(|&entry| std::ptr::eq(entry, w_type))
+}
+
 /// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
 /// Heap types only; the new bases must be a non-empty tuple of classes whose
 /// best base shares the current instance layout (so instances stay valid).
@@ -9632,7 +9729,8 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         if w_value.is_null() || !pyre_object::is_tuple(w_value) {
             return Err(crate::PyError::type_error(format!(
-                "can only assign tuple to {type_name}.__bases__"
+                "can only assign tuple to {type_name}.__bases__, not {}",
+                pyre_object::type_name_of(w_value)
             )));
         }
         let n = pyre_object::w_tuple_len(w_value);
@@ -9648,7 +9746,11 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let Some(w_base) = pyre_object::w_tuple_getitem(w_value, i as i64) else {
                 continue;
             };
-            if std::ptr::eq(w_base, w_type) {
+            // `descr_set__bases__` tests `w_type in w_newbase.compute_mro()`,
+            // not just identity: a base that already derives from `w_type`
+            // closes the same loop one step further out, and the subsequent
+            // `mro_subclasses` walk would never terminate.
+            if type_in_mro(w_base, w_type) {
                 return Err(crate::PyError::type_error(
                     "a __bases__ item causes an inheritance cycle",
                 ));
@@ -9682,6 +9784,11 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 pyre_object::w_type_get_name(pyre_object::typeobject::w_type_get_best_base(w_type))
             )));
         }
+        // The linearization has to hold for the new bases before anything is
+        // mutated; recomputing it afterwards would leave the type half-changed
+        // (typeobject.py:1148 restores the old bases when `mro_subclasses`
+        // raises).
+        crate::baseobjspace::validate_c3_mro(w_value)?;
         // Invalidate the method cache of w_type and every subclass before the
         // hierarchy changes (typeobject.py:1130 `w_type.mutated(None)`).
         crate::baseobjspace::mutated(w_type, None);

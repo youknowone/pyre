@@ -5360,7 +5360,12 @@ fn make_exc_type_with_init(
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
-    let cls = crate::typedef::make_builtin_type_with_base(
+    // Every exception class shares one instance layout, distinct from
+    // `object`'s: `class E(Exception, ValueError)` is fine, `class E(Exception,
+    // list)` is an instance lay-out conflict.  The subclasses reach the same
+    // Layout object through the reuse rule (their parent layout already names
+    // this typedef).
+    let cls = crate::typedef::make_builtin_type_with_layout(
         name,
         move |ns| {
             unsafe {
@@ -5558,6 +5563,7 @@ fn make_exc_type_with_init(
             }
         },
         base,
+        &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const pyre_object::PyType,
     );
     // Record the class so typedef::r#type can map a raised exception
     // back to its specific builtin class (TypeError, ValueError, ...).

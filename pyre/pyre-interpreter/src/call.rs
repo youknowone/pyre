@@ -1181,6 +1181,32 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
     Ok(Some(bound))
 }
 
+/// descroperation.py `descr__call__` — `space.lookup(w_obj, '__call__')`.
+///
+/// Consulted once the builtin callables above have had their turn, so it
+/// admits only the receivers none of them claim: an object carrying a generic
+/// payload (`weakref.ref` and friends, whose class holds the `__call__`), and
+/// an instance of a user-defined class — including one deriving from a builtin
+/// type, where `class C(int)` carries its `__call__` on the type just as a
+/// plain `class C` does.
+fn user_call_slot(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    let Some(w_type) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
+    let w_type = w_type.as_ptr();
+    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) } {
+        return Ok(None);
+    }
+    let Some(call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") }) else {
+        return Ok(None);
+    };
+    // `A.__call__ = A()` makes this edge feed itself, and the callers below
+    // recurse natively.  The interpreter-level check turns that into
+    // RecursionError instead of exhausting the machine stack.
+    crate::stack_check::stack_check()?;
+    Ok(Some(call_fn))
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -1226,15 +1252,11 @@ fn call_callable_with_mode(
     // The base ClassMethod defines no descr_call (function.py), so a raw
     // classmethod object falls through to the not-callable error.
 
-    // Instance with __call__ — PyPy: descroperation.py descr_call
-    if unsafe { pyre_object::is_instance(callable) } {
-        let w_type = unsafe { pyre_object::w_instance_get_type(callable) };
-        if let Some(call_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") } {
-            let mut call_args = Vec::with_capacity(1 + args.len());
-            call_args.push(callable);
-            call_args.extend_from_slice(args);
-            return call_callable_with_mode(frame, call_fn, &call_args, mode);
-        }
+    if let Some(call_fn) = user_call_slot(callable)? {
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        call_args.push(callable);
+        call_args.extend_from_slice(args);
+        return call_callable_with_mode(frame, call_fn, &call_args, mode);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2391,15 +2413,11 @@ pub fn call_with_kwargs(
         return call_with_kwargs(frame, func, &full_args, kwargs);
     }
 
-    // For instances with __call__: dispatch
-    if unsafe { pyre_object::is_instance(callable) } {
-        let w_type = unsafe { pyre_object::w_instance_get_type(callable) };
-        if let Some(call_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") } {
-            let mut call_args = Vec::with_capacity(1 + pos_args.len());
-            call_args.push(callable);
-            call_args.extend_from_slice(pos_args);
-            return call_with_kwargs(frame, call_fn, &call_args, kwargs);
-        }
+    if let Some(call_fn) = user_call_slot(callable)? {
+        let mut call_args = Vec::with_capacity(1 + pos_args.len());
+        call_args.push(callable);
+        call_args.extend_from_slice(pos_args);
+        return call_with_kwargs(frame, call_fn, &call_args, kwargs);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2580,15 +2598,11 @@ pub fn call_function_impl_result(
             set_orig_class(result, callable)?;
             return Ok(result);
         }
-        // Instance with __call__ — PyPy: descroperation.py
-        if pyre_object::is_instance(callable) {
-            let w_type = pyre_object::w_instance_get_type(callable);
-            if let Some(call_fn) = crate::baseobjspace::lookup_in_type(w_type, "__call__") {
-                let mut call_args = Vec::with_capacity(1 + args.len());
-                call_args.push(callable);
-                call_args.extend_from_slice(args);
-                return call_function_impl_result(call_fn, &call_args);
-            }
+        if let Some(call_fn) = user_call_slot(callable)? {
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(callable);
+            call_args.extend_from_slice(args);
+            return call_function_impl_result(call_fn, &call_args);
         }
     }
     let type_name = crate::typedef::r#type(callable)
