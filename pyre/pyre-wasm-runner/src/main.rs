@@ -106,8 +106,50 @@ struct Host {
     guest_profiler: Option<wasmtime::GuestProfiler>,
 }
 
+/// Report `PYRE_*` / `MAJIT_*` settings the guest cannot see.
+///
+/// The module is built for `wasm32-unknown-unknown`, whose `std::env` is
+/// permanently empty: every `std::env::var_os` reached from inside the guest
+/// returns `None` regardless of this process's environment. That covers every
+/// JIT knob and probe that lives in the guest crates — `PYRE_NO_JIT`,
+/// `PYRE_GC_INTERP`, `MAJIT_STRICT`, `MAJIT_LOG`, the `PYRE_FBW_*` /
+/// `PYRE_P2_DIAG` / `PYRE_JD1*` diagnostics — so setting one here changes
+/// nothing at all. Silently ignoring them is the trap: an A/B run through such
+/// a knob measures the same build twice and reads as a result. Name them
+/// instead, once, on stderr (`check.py` shows a run's stderr only when it
+/// fails, so this is invisible to a green suite and present in every failure
+/// dump and interactive run).
+///
+/// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
+/// `PYRE_STDLIB`, `MAJIT_STATS`) and `check.py`'s own `PYRE_CHECK_*`
+/// interpreter paths. A knob that later becomes host-interpreted must be added
+/// here; the prefix match needs no upkeep for new guest-side knobs.
+fn warn_inert_guest_env() {
+    const HOST_HANDLED: &[&str] = &["PYRE_STDLIB", "MAJIT_STATS"];
+    let mut inert: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with("PYRE_") || name.starts_with("MAJIT_"))
+        .filter(|name| {
+            !name.starts_with("PYRE_WASM_")
+                && !name.starts_with("PYRE_CHECK_")
+                && !HOST_HANDLED.contains(&name.as_str())
+        })
+        .collect();
+    if inert.is_empty() {
+        return;
+    }
+    inert.sort();
+    inert.dedup();
+    eprintln!(
+        "[pyre-wasm-runner] ignoring {}: the wasm guest has no environment, so \
+         guest-side knobs and probes do nothing here",
+        inert.join(", ")
+    );
+}
+
 fn main() {
     let t0_main = std::time::Instant::now();
+    warn_inert_guest_env();
     let startup_trace = std::env::var_os("PYRE_WASM_STARTUP_TRACE").is_some();
     let mut module_path: Option<PathBuf> = None;
     let mut script: Option<PathBuf> = None;
