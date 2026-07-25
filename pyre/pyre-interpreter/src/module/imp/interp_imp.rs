@@ -834,10 +834,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "source_hash",
             |args| {
-                // `interp_imp.py source_hash`: siphash-2-4 of the source
-                // bytes keyed by the pyc magic (k0=magic, k1=0), serialized
-                // low-byte-first — the 8-byte hash field of hash-based pycs
-                // (`_code_to_hash_pyc` asserts `len(source_hash) == 8`).
+                // `_imp_source_hash_impl` hashes the source bytes with
+                // `_Py_KeyedHash`, which is siphash-1-3 keyed by the pyc magic
+                // (k0=magic, k1=0) and serialized low-byte-first — the 8-byte
+                // hash field of hash-based pycs (`_code_to_hash_pyc` asserts
+                // `len(source_hash) == 8`).  The pyc header this fills already
+                // carries the 3.14 magic number, so the digest has to agree
+                // with the one that format specifies.
                 use std::hash::Hasher;
                 let magic = crate::baseobjspace::int_w(args[0])? as u64;
                 let content = if unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
@@ -849,7 +852,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "source_hash() argument 2 must be a bytes-like object",
                     ));
                 };
-                let mut hasher = siphasher::sip::SipHasher24::new_with_keys(magic, 0);
+                let mut hasher = siphasher::sip::SipHasher13::new_with_keys(magic, 0);
                 hasher.write(&content);
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(
                     &hasher.finish().to_le_bytes(),
