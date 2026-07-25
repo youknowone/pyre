@@ -1822,6 +1822,36 @@ impl JitCodeBuilder {
         );
     }
 
+    /// Unsigned `/` — the `int.udiv` oopspec residual call
+    /// (`rint.py:434 ll_uint_py_div`).  RPython has no unsigned division
+    /// resop at all: `UINT_FLOORDIV` was deleted in 2016 in favour of this
+    /// oopspec call, so unlike the unsigned comparisons (which do have
+    /// `uint_lt`/`uint_le` primitives reachable through `record_binop_i`)
+    /// there is nothing here to record but the call.  Same
+    /// `rhs != 0` precondition as [`Self::record_int_py_div`]; unsigned has no
+    /// `INT_MIN / -1` corner.
+    pub fn record_uint_py_div(&mut self, dst: u16, lhs: u16, rhs: u16) {
+        self.record_int_py_helper(
+            dst,
+            lhs,
+            rhs,
+            crate::blackhole::ll_uint_py_div as *const (),
+            crate::call_descr::UINT_PY_DIV_EFFECT_INFO,
+        );
+    }
+
+    /// Unsigned `%` — the `int.umod` oopspec residual call
+    /// (`rint.py:525 ll_uint_py_mod`).  See [`Self::record_uint_py_div`].
+    pub fn record_uint_py_mod(&mut self, dst: u16, lhs: u16, rhs: u16) {
+        self.record_int_py_helper(
+            dst,
+            lhs,
+            rhs,
+            crate::blackhole::ll_uint_py_mod as *const (),
+            crate::call_descr::UINT_PY_MOD_EFFECT_INFO,
+        );
+    }
+
     fn record_int_py_helper(
         &mut self,
         dst: u16,
