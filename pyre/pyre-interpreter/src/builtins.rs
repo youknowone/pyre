@@ -6725,6 +6725,17 @@ fn parse_int_from_str(
     } else {
         (1i64, s)
     };
+    // intobject.py passes `disallow_whitespace_after_sign=True` to
+    // NumberStringParser.  Its sign branch advances `start` without calling
+    // `_strip_spaces`, so whitespace immediately after either sign remains
+    // part of the digit stream and makes the literal invalid.
+    if rest
+        .as_bytes()
+        .first()
+        .is_some_and(|c| matches!(c, b' ' | b'\x0c' | b'\n' | b'\r' | b'\t' | b'\x0b'))
+    {
+        return Err(invalid_int_literal(w_source, base));
+    }
     let (radix, digits, had_base_prefix, implicit_zero_only) = if base == 0 {
         if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
             (16u32, r, true, false)
@@ -12674,6 +12685,16 @@ mod tests {
             err.message
                 .starts_with("invalid literal for int() with base 10:")
         );
+    }
+
+    #[test]
+    fn int_string_rejects_whitespace_after_sign() {
+        crate::typedef::init_typeobjects();
+        for text in ["- 1", "+ 1", " + 1 "] {
+            let source = w_str_new(text);
+            let err = parse_int_from_str(source, text, 10).unwrap_err();
+            assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        }
     }
 
     /// PyPy `interp_io._open` constructs `W_FileIO`, and
