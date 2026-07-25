@@ -2185,14 +2185,30 @@ pub fn walk<Sym: WalkSym>(
         //
         // The walker layer holds `&mut TraceCtx` and cannot reach
         // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
-        // `note_root_trace_too_long` is the warm-state half the retired loop
-        // called (`trace_next_iteration` + `mark_force_finish_tracing`, so the
-        // next attempt cuts the trace instead of growing it again). The
-        // `find_biggest_function` → `disable_noninlinable_function` half
-        // (pyjitpl.py:2793) still only runs on the per-opcode path.
-        if ctx.trace_ctx.is_too_long() {
+        // `note_root_trace_too_long` carries the warm-state half, split into
+        // the loop and bridge arms `prepare_trace_segmenting` (pyjitpl.py:2833)
+        // keeps apart. The `find_biggest_function` →
+        // `disable_noninlinable_function` half (pyjitpl.py:2817) still only
+        // runs on the per-opcode path.
+        //
+        // DEVIATION from `SwitchToBlackhole(ABORT_TOO_LONG)`, which resumes in
+        // the blackhole from the traced state: a `DispatchError` resumes by
+        // re-interpreting the iteration from the trace entry, so an effect the
+        // walk already executed and cannot roll back would be applied twice.
+        // Every other walker abort upholds that invariant by declining BEFORE
+        // it executes such an effect (see `InplaceContainerMutationUnsupported`
+        // and the `FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS` effect-free check); a
+        // length check fires at an arbitrary opcode instead, so it must consult
+        // the odometer itself. `fbw_executed_effect_count` is reset per walk, so
+        // zero means nothing the replay would redo has run yet. A walk that is
+        // already past that point keeps recording — the pre-existing unbounded
+        // behaviour — rather than corrupt the heap.
+        if ctx.trace_ctx.is_too_long() && fbw_executed_effect_count() == 0 {
             let ops = ctx.trace_ctx.num_recorded_ops();
-            crate::state::note_root_trace_too_long(ctx.trace_ctx.root_green_key());
+            crate::state::note_root_trace_too_long(
+                ctx.trace_ctx.current_merge_points_first_greenkey(),
+                ctx.trace_ctx.resumekey_original_loop_token().cloned(),
+            );
             return Err(DispatchError::TraceTooLong {
                 pc: opcode_position,
                 ops,

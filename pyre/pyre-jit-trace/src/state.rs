@@ -2904,15 +2904,43 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     boxed
 }
 
-pub(crate) fn note_root_trace_too_long(green_key: u64) {
-    let (driver, _) = crate::driver::driver_pair();
-    let warm_state = driver.meta_interp_mut().warm_state_mut();
-    warm_state.trace_next_iteration(green_key);
-    warm_state.mark_force_finish_tracing(green_key);
+/// The warm-state half of `prepare_trace_segmenting` (pyjitpl.py:2833),
+/// callable from the walker, which holds `&mut TraceCtx` and so cannot take
+/// `MetaInterp` to run the method itself.  The two arms are independent and
+/// upstream applies each on its own condition, so both arguments are read
+/// straight off the walk's `TraceCtx`:
+///
+/// * `merge_key` — `if self.current_merge_points:` (pyjitpl.py:2839). A loop's
+///   outermost green key; `None` while tracing a bridge, which has no merge
+///   point to boost.
+/// * `source_token` — `if not isinstance(self.resumekey, ResumeFromInterpDescr):`
+///   (pyjitpl.py:2849). A bridge has no room in its `ResumeGuardDescr` for the
+///   segmenting bit, so upstream sets it on the source `JitCellToken` instead,
+///   where it applies to every bridge off that token. Marking the root green key
+///   for a bridge would leave the real culprit untouched and let the same
+///   oversized bridge re-record on each failure of that guard.
+pub(crate) fn note_root_trace_too_long(
+    merge_key: Option<u64>,
+    source_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+) {
+    if let Some(merge_key) = merge_key {
+        let (driver, _) = crate::driver::driver_pair();
+        let warm_state = driver.meta_interp_mut().warm_state_mut();
+        // pyjitpl.py:2843-2844.
+        warm_state.trace_next_iteration(merge_key);
+        warm_state.mark_force_finish_tracing(merge_key);
+    }
+    if let Some(source_jct) = source_token.as_ref() {
+        // pyjitpl.py:2857 `loop_token.retraced_count |= FORCE_BRIDGE_SEGMENTING`.
+        let cur = source_jct.retraced_count.get();
+        source_jct
+            .retraced_count
+            .set(cur | majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING);
+    }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][trace-too-long] trace_next_iteration + mark_force_finish_tracing key={}",
-            green_key
+            "[jit][trace-too-long] merge_key={merge_key:?} bridge_segmenting={}",
+            source_token.is_some()
         );
     }
 }
