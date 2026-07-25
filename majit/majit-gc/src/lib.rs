@@ -1603,7 +1603,13 @@ pub fn gc_is_nursery_object(addr: usize) -> bool {
 /// root. During a minor collection this follows an already-installed nursery
 /// forwarding pointer; otherwise it returns `addr` unchanged.
 pub fn gc_current_object_address(addr: usize) -> usize {
-    if addr == 0 || !gc_owns_object(addr) {
+    // Only a nursery address can carry a forwarding stub: `_trace_drag_out`
+    // installs one at the young object's old address, and the major collection
+    // is mark-and-sweep, so nothing outside the nursery ever moves.  The
+    // nursery test is a two-word range compare, where the full ownership query
+    // also walks the old-generation arena index and the rawmalloc set — and
+    // every root pin and every root reload asks this question.
+    if addr == 0 || !gc_is_nursery_object(addr) {
         return addr;
     }
     let hdr = unsafe { header::header_of(addr) };
