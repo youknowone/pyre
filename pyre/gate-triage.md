@@ -185,29 +185,51 @@ PyFrames heap-authoritative before the chain is built, whereas pyre's walker
 keeps inlined callee frames unmaterialized (`fbw_strict_fold_frame_reg`,
 `vable_ops.rs:184-192`).  So the remaining work is a materialization step
 upstream does not have — a consequence of pyre's virtual-callee-frame inlining —
-plus per-frame vable binding, since `PyjitplBlackholeFrameConfig` stamps one
-shared `virtualizable_ptr` onto every frame in the chain and the adopt writes
-only `last_instr`.  Both of those sit *below* an adopt-side gate that never
-opens.  `try_adopt_multi_frame_blackhole` (`pyre-jit-trace/src/trace.rs`)
-declines whenever the recovered chain's root is not the walked frame, and its
-comment attributes that to "a chain rooted at an intermediate frame" and names
-the `jit.virtual_ref` emit at the inline push as the prerequisite.  **Measured
-2026-07-26: both halves of that attribution are wrong.**  The chain *is* rooted
-at the walked frame — the two sides of the comparison are two representations of
-the same frame.  `per_frame[0]` is recovered from the trace's frame register,
-which is baked against the **live** frame address (`set_live_vable_frame_addr`,
-set before `init_symbolic` precisely so the root vable identity is not the
-discarded snapshot's), while `cf_addr` is the **snapshot** copy
-(`&*concrete_frame as *const PyFrame`).  Five events printed
-`per_frame[0] == live == 0xa4be2db40` against `cf_addr == 0xa4c0515e8`.  The
-same live/snapshot split is already handled explicitly further down the same
-file, where the non-adopted leg mirrors the live frame's resume state into the
-snapshot under a `live != cf_addr` test.  So the decline is unconditional for
-this shape, and no `VIRTUAL_REF` emit is involved in it.  (The emit is still
-absent — `opimpl_virtual_ref` / `_finish` are ported in both
-`majit-metainterp/src/pyjitpl.rs` and `pyre-jit-trace/src/state.rs` and
-**neither has a caller outside a `#[test]`**, so `virtualref_boxes` is empty in
-every live trace.  That is a real gap; it is simply not this one.)
+and that is the whole of it.  The per-frame vable binding this section used to
+list beside it is already done: `PyjitplBlackholeFrameConfig` carries a
+`per_frame` slice and `convert_and_run_from_pyjitpl` overrides each level's
+`virtualizable_ptr` / `virtualizable_stack_base` from it (`blackhole.rs`), so
+every level already runs against its own frame instead of a shared pointer.
+
+**Resolved 2026-07-26 — the adopt's root-mismatch decline.**
+`try_adopt_multi_frame_blackhole` (`pyre-jit-trace/src/trace.rs`) declined
+whenever the recovered chain's root was not the walked frame, and its comment
+attributed that to "a chain rooted at an intermediate frame", naming the
+`jit.virtual_ref` emit at the inline push as the prerequisite.  Both halves of
+that attribution were wrong.  The chain *is* rooted at the walked frame; the two
+sides of the comparison were two representations of it.  `per_frame[0]` is
+recovered from the trace's frame register, whose root vable identity
+`seed_virtualizable_boxes` bakes against the **live** frame address
+(`set_live_vable_frame_addr`, set before `init_symbolic` precisely so it is not
+the discarded snapshot's), while `cf_addr` is the **snapshot** copy.  Five
+events printed `per_frame[0] == live == 0xa4be2db40` against
+`cf_addr == 0xa4c0515e8`, so the decline was unconditional and no `VIRTUAL_REF`
+emit was involved.  (The emit is still absent — `opimpl_virtual_ref` / `_finish`
+are ported in both `majit-metainterp/src/pyjitpl.rs` and
+`pyre-jit-trace/src/state.rs` and **neither has a caller outside a `#[test]`**,
+so `virtualref_boxes` is empty in every live trace.  That is a real gap; it was
+simply not this one.)
+
+The fix points the two *identity* uses at the live address, under the same
+`!= 0` fallback the identity bake itself uses, and leaves every other use where
+it was:
+
+| use of the walked frame | address | why |
+|---|---|---|
+| root-mismatch comparison | live | must be asked against the address the identity was baked from |
+| root `f_backref` operand | live | the `ptr::eq` skip has to fire for `frames[0]`; the snapshot is freed at walk end, so linking to it would leave a dangling `f_back` for a later `sys._getframe().f_back` |
+| `apply_blackhole_crn` | snapshot | the portal epilogue propagates snapshot → live, the same contract the single-frame arm relies on |
+| `drive_multi_frame_blackhole` vable root + `stack_base` | dead | `per_frame` is always `Some` here and overrides both, per level |
+| `concrete_nlocals`, the `ec` read | either | pycode-derived, and the snapshot copies `execution_context` verbatim |
+
+Opening the comparison exposes one consequence that could not fire while it was
+shut: frame 0's blackhole level runs against `per_frame[0]`, the **live** frame,
+so its `setfield_vable` stores land there while `apply_blackhole_crn` writes the
+snapshot — and the epilogue then copies the snapshot's *whole* locals array onto
+the live frame (`restore_resume_state_from`), reverting every such store the CRN
+write does not happen to cover.  The adopt therefore folds the live frame's
+state into the snapshot before the CRN write, restoring "the snapshot is the
+committed image".
 
 **Measured 2026-07-25: the multi-frame path has no corpus coverage.**  The
 vable-escape latch site was instrumented and all **318** benchmarks
@@ -226,11 +248,18 @@ zero-argument `sys._getframe` reaches the site.  `for` is what every existing
 nested residual is declined by `fbw_abort_nested_unjournaled_residual` before
 `execute_residual_call` runs, so the force never happens inside the sub-walk.
 Under that shape `build_multi_frame_miframe` **succeeds at depth 2**, so the
-build side is not what blocks and the materialization / per-frame-vable items
-above are downstream of the adopt-side comparison, not ahead of it.  A depth-3
-variant (two nested inlined levels) additionally reports
+build side was never what blocked.  It is landed as
+`synth/getframe_while_inlined_callee_subwalk`; the three shape choices in its
+header are load-bearing and changing any of them silently stops exercising the
+path.  With the comparison fixed, that fixture under `PYRE_FBW_MULTIFRAME=1`
+reports **5 `BUILT multi-frame depth=2` and 5 `adopted multi-frame terminal`,
+zero declines** (the other 5 escapes in the run have `inline_subwalk=false` and
+take the single-frame arm, as before), and prints the same result as CPython and
+PyPy.  A depth-3 variant (two nested inlined levels) still reports
 `frame 1: parent.blackhole None (capture missing)` — a separate, deeper gap in
-the nested-parent capture.  Note the multi-frame latch is
+the nested-parent capture, since the two bridge parent-frame constructors latch
+`blackhole: None` while only `capture_inline_parent_blackhole` fills it.  Note
+the multi-frame latch is
 nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
 `_BLACKHOLE_RESUME` to stay ON.  The pre-existing `[s2-gate]` eprintln (under
 `PYRE_FBW_DEBUG_ABORT`) already reports `inline_subwalk` at that site.
