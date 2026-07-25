@@ -78,7 +78,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
 ] }
+# Builds the `WideCStr` key/value-name arguments the `rustpython_host_env::winreg`
+# Reg* wrappers take. Same 1.x line host_env resolves to.
+widestring = "1.2"
 
 [build-dependencies]
 # Compresses the embedded stdlib VFS blob at build time (only does work when the
