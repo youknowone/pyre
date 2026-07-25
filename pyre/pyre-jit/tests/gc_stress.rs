@@ -50,7 +50,10 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    importing::init_sys_path(&cwd);
+    importing::init_sys_path(&cwd, &cwd.to_string_lossy());
+    // This harness never imports `site`, so perform the post-site `sys.path[0]`
+    // insert directly.
+    importing::add_sys_path_0();
     importing::set_sys_argv(&[name.to_string()]);
 
     let code = compile_source_with_filename(program, Mode::Exec, name)

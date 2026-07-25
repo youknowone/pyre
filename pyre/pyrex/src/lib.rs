@@ -544,9 +544,11 @@ fn real_main(binary_name: &str) {
 
     match mode {
         RunMode::Command(cmd) => {
-            // Initialize sys.path with CWD for -c mode.
+            // `_PyPathConfig_ComputeSysPath0` yields "" for a `-c` argv[0]. The
+            // cwd is still the anchor the shadowing check compares module
+            // origins against.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd);
+            importing::init_sys_path(&cwd, "");
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -559,7 +561,7 @@ fn real_main(binary_name: &str) {
             // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
             // module's resolved origin via `_run_module_as_main`).
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd);
+            importing::init_sys_path(&cwd, &cwd.to_string_lossy());
             let mut argv = vec![module.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -593,12 +595,20 @@ fn real_main(binary_name: &str) {
                 .unwrap_or(Path::new("."))
                 .to_path_buf();
             #[cfg(not(feature = "sandbox"))]
-            let script_dir = Path::new(&path)
-                .parent()
-                .unwrap_or(Path::new("."))
-                .canonicalize()
-                .unwrap_or_else(|_| Path::new(".").to_path_buf());
-            importing::init_sys_path(&script_dir);
+            let script_dir = {
+                // `parent()` of a bare `x.py` is the empty path;
+                // `_PyPathConfig_ComputeSysPath0` absolutizes the script's
+                // directory, so resolve the empty case against the cwd rather
+                // than leaving a relative `.` on `sys.path`.
+                let parent = Path::new(&path).parent().unwrap_or(Path::new("."));
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
+            };
+            importing::init_sys_path(&script_dir, &script_dir.to_string_lossy());
             // sys.argv[0] is the script path; remaining values go to argv[1:].
             let mut argv = vec![path.clone()];
             argv.extend(args);
@@ -609,9 +619,11 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Repl => {
-            // Initialize sys.path with CWD for REPL mode.
+            // The REPL and piped stdin both take "" for `sys.path[0]`
+            // (`_PyPathConfig_ComputeSysPath0` on an argv[0] of "" / "-"); the
+            // cwd stays the shadowing-check anchor.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd);
+            importing::init_sys_path(&cwd, "");
             repl::run_repl(quiet, no_site);
         }
         RunMode::Interact {
@@ -746,22 +758,26 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
     execution_context
 }
 
-/// app_main.py:875-882 — unless `-S` (`no_site`) was given, `import site`
-/// once `__main__` is registered so the standard `site` initialization runs
-/// before user code (sys.path finalization, the `quit`/`exit`/`help`
-/// builtins). The import failing is non-fatal (the bare `except`): print
-/// "'import site' failed" to stderr and continue.
+/// app_main.py — unless `-S` (`no_site`) was given, `import site` once
+/// `__main__` is registered so the standard `site` initialization runs before
+/// user code (sys.path finalization, the `quit`/`exit`/`help` builtins). The
+/// import failing is non-fatal (the bare `except`): print "'import site'
+/// failed" to stderr and continue.
+///
+/// `pymain_run_python` then prepends the startup `sys.path[0]`, so that step
+/// happens here too — after `site`, whose `removeduppaths()` would otherwise
+/// rewrite the `-c` / REPL empty entry into the absolute cwd.
 pub(crate) fn import_site(
     no_site: bool,
     w_main_globals: pyre_object::PyObjectRef,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) {
-    if no_site {
-        return;
-    }
-    if importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err() {
+    if !no_site
+        && importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err()
+    {
         eprintln!("'import site' failed");
     }
+    importing::add_sys_path_0();
 }
 
 /// Run the `init_importlib` / `init_importlib_external` sequence

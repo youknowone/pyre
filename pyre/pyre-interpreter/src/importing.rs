@@ -1155,7 +1155,11 @@ fn canonical_startup_dir(dir: &Path) -> String {
     dir.to_string_lossy().into_owned()
 }
 
-pub fn init_sys_path(script_dir: &Path) {
+/// `script_dir` is the shadowing-check anchor (`config->sys_path_0`'s
+/// directory); `path0` is the literal entry `add_sys_path_0` later prepends to
+/// `sys.path` — `""` for `-c` / stdin / the REPL, the cwd for `-m`, the
+/// script's directory for a script.
+pub fn init_sys_path(script_dir: &Path, path0: &str) {
     // Register builtin modules (PyPy: make_builtins / setup_builtin_modules)
     install_builtin_modules();
 
@@ -1167,34 +1171,21 @@ pub fn init_sys_path(script_dir: &Path) {
         *p.borrow_mut() = Some(canonical_startup_dir(script_dir));
     });
 
+    // `pymain_run_python` prepends `sys.path[0]` only after `site` has run, so
+    // `site.removeduppaths()` never absolutizes the `-c` / REPL empty entry into
+    // the cwd.  Stage the entry here; `add_sys_path_0` performs the insert.
+    // `-P` (safe_path) suppresses it entirely.
+    SYS_PATH_0_PENDING.with(|p| {
+        *p.borrow_mut() = (!safe_path_flag()).then(|| path0.to_string());
+    });
+
     SYS_PATH.with(|p| {
         let mut path = p.borrow_mut();
         path.clear();
-        if !safe_path_flag() {
-            // Script directory first.
-            path.push(script_dir.to_path_buf());
-            // Current working directory as fallback. Under sandbox read it through
-            // the seam so it resolves to the controller's virtual cwd (`/tmp`)
-            // rather than leaking the trusted parent's real working directory.
-            #[cfg(feature = "sandbox")]
-            let cwd = {
-                use std::os::unix::ffi::OsStrExt;
-                crate::host_seam::ops::getcwd()
-                    .ok()
-                    .map(|b| PathBuf::from(std::ffi::OsStr::from_bytes(&b)))
-            };
-            #[cfg(not(feature = "sandbox"))]
-            let cwd = host_os::current_dir().ok();
-            if let Some(cwd) = cwd {
-                if cwd != script_dir {
-                    path.push(cwd);
-                }
-            }
-        }
-        // PYTHONPATH entries follow the script/cwd seed and precede the
-        // stdlib (pathconfig.c), split on the platform path-list separator.
-        // Honoured regardless of the safe-path flag, which only suppresses the
-        // script/cwd seed, but skipped under `-E` / `-I` (ignore_environment),
+        // PYTHONPATH entries head the seed and precede the stdlib
+        // (pathconfig.c), split on the platform path-list separator.  Honoured
+        // regardless of the safe-path flag, which only suppresses the
+        // `sys.path[0]` entry, but skipped under `-E` / `-I` (ignore_environment),
         // which ignore every `PYTHON*` variable. The sandbox interpreter takes
         // its search path from the controller, so it does not read the host
         // environment here.
@@ -1340,6 +1331,44 @@ pub fn add_sys_path(dir: &Path) {
         }
     }
     unsafe { pyre_object::listobject::w_list_append(w_path, shadow_stack_get(slot)) };
+}
+
+/// `pymain_sys_path_add_path0` — prepend the startup `sys.path[0]` entry staged
+/// by `init_sys_path`.  Called after `site` has run so `removeduppaths` cannot
+/// absolutize an empty entry into the cwd, and inserted unconditionally (no
+/// dedup).  The entry is taken, so a second call is a no-op.
+#[cfg(feature = "host_env")]
+pub fn add_sys_path_0() {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let Some(entry) = SYS_PATH_0_PENDING.with(|p| p.borrow_mut().take()) else {
+        return;
+    };
+    // No `sys` yet (an embedder that never imports `site`): stage at the front
+    // of the seed instead, which `create_sys_path_list` flushes in order.
+    if get_sys_module("sys").is_none() {
+        SYS_PATH.with(|p| p.borrow_mut().insert(0, PathBuf::from(&entry)));
+        return;
+    }
+    // Pin the new entry before any further allocation (`get_sys_module` and the
+    // dict lookup allocate) can relocate it — `add_sys_path` parity.
+    let _roots = push_roots();
+    let slot = shadow_stack_len();
+    pin_root(pyre_object::w_str_new(&entry));
+    let Some(sys_mod) = get_sys_module("sys") else {
+        return;
+    };
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
+    if w_dict.is_null() {
+        return;
+    }
+    let Some(w_path) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }) else {
+        return;
+    };
+    if !unsafe { pyre_object::is_list(w_path) } {
+        return;
+    }
+    unsafe { pyre_object::listobject::w_list_insert(w_path, 0, shadow_stack_get(slot)) };
 }
 
 // ── check_sys_modules ────────────────────────────────────────────────
@@ -1555,6 +1584,12 @@ thread_local! {
     /// `init_sys_path`; read by the shadowing check, which must not see later
     /// `sys.path` mutations.
     static SYS_PATH_0: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The literal `sys.path[0]` entry staged by `init_sys_path` and prepended
+    /// by `add_sys_path_0` once `site` has run (`pymain_sys_path_add_path0`):
+    /// `""` for `-c` / stdin / the REPL, the cwd for `-m`, the script's
+    /// directory for a script.  `None` under `-P`, and taken on first insert so
+    /// the `-i` REPL-after-script path does not prepend it twice.
+    static SYS_PATH_0_PENDING: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 // The launcher flags belong to the interpreter, not to whichever thread
