@@ -2686,15 +2686,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
-        // The wasm backend miscompiles the resulting resize/append bridge
-        // (#389b-class element drop, wasm-only — `comprehension_object_append_hot`
-        // / `nested_list_comprehension_hot` return short), the same wasm-append
-        // codegen hazard `wasm_unboxed_append_fold_declined` guards the unboxed
-        // fold against. Keep the safeguard abort on wasm so the loop falls back
-        // to correct interpretation; only native backends take the fall-through.
-        if cfg!(target_arch = "wasm32") {
-            return Err(DispatchError::UnfoldableListAppendResidualUnsupported { pc: op.pc });
-        }
     }
 
     // `len(x)` on an exact canonical list: inline the strategy-guarded
