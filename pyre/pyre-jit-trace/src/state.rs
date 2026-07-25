@@ -5605,6 +5605,17 @@ impl PyreJitState {
             Some("frame"),
         );
         descriptor.is_recursive = true;
+        // The portal's frames are numbered in the CodeObject-keyed runtime
+        // store this crate grows, so name that decoder on the driver rather
+        // than leaning on the process-global slot. The global has one writer
+        // per store and no arbitration between them
+        // (`ensure_finish_setup` here, `install_state_field_fvc` in
+        // majit-metainterp), so a driver that leaves this `None` decodes
+        // against whichever store registered last — and the wrong store
+        // returns a mistyped count instead of failing (see the field's doc).
+        // jd1 names its build-time store the same way
+        // (`unpackiterable_driver_descriptor`).
+        descriptor.frame_value_count_fn = Some(frame_value_count_at);
         descriptor
     }
 
