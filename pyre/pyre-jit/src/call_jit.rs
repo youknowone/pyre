@@ -641,33 +641,28 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 
     // `assembler_call_helper` (warmspot.py:1021-1028) resumes the callee
     // frame the rewritten CALL_ASSEMBLER passed as arg 0.
-    portal_runner_from_raw_frame_ptr(frame_ptr)
+    run_frame_through_portal(frame_ptr)
 }
 
-/// warmspot.py:941-959 `ll_portal_runner` core — reconstruct a proper
-/// interpreter frame from a raw JitFrame-like block pointer and run it
-/// through the portal.
+/// warmspot.py:941-959 `ll_portal_runner` core — run the frame the JIT handed
+/// in through the portal (`maybe_compile_and_run` + interpreter main loop;
+/// ContinueRunningNormally re-enters the JIT via the portal,
+/// warmspot.py:961-983).
 ///
-/// Nursery-safe force: read code/namespace/exec_ctx via raw offsets (valid
-/// for both a callee `PyFrame` AND nursery-allocated raw blocks), build a proper
-/// `PyFrame`, then hand it to `portal_runner` (`maybe_compile_and_run` +
-/// interpreter main loop; ContinueRunningNormally re-enters the JIT via the
-/// portal, warmspot.py:961-983). The callee frame may be a nursery-allocated
-/// JitFrame-like block, so the fields are recovered from raw offsets.
-fn portal_runner_from_raw_frame_ptr(frame_ptr: i64) -> i64 {
-    let (code, w_globals, exec_ctx) = unsafe {
-        use pyre_interpreter::pyframe::*;
-        let p = frame_ptr as *const u8;
-        let code = *(p.add(PYFRAME_PYCODE_OFFSET) as *const *const ());
-        let w_globals = *(p.add(PYFRAME_W_GLOBALS_OFFSET) as *const pyre_object::PyObjectRef);
-        let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
-            as *const *const pyre_interpreter::PyExecutionContext);
-        (code, w_globals, ec)
-    };
-    let mut func_frame = PyFrame::new_for_call_with_globals_obj(code, &[], w_globals, exec_ctx);
-    func_frame.fix_array_ptrs();
-
-    let result = crate::eval::portal_runner(&mut func_frame);
+/// The pointer is the callee `PyFrame` the trace itself built —
+/// `emit_new_pyframe_inline_with_params` emits `NewWithVtable` +
+/// `SetfieldGc` for `pycode` / `w_globals` / `execution_context` and the
+/// locals array, and the GC rewriter stores that pointer into the callee
+/// jitframe's first slot, which is what every force site reads back. It is
+/// the `frame` red of `jd.portal_calldescr`, and `ll_portal_runner` forwards
+/// its reds unchanged (`warmspot.py:953-954` `portal_ptr(*args)`).
+///
+/// Rebuilding a frame here instead would drop the callee's arguments (its
+/// locals array) and its `last_instr`, and would run the interpreter on a
+/// frame that dies with the C stack.
+fn run_frame_through_portal(frame_ptr: i64) -> i64 {
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let result = crate::eval::portal_runner(frame);
 
     // warmspot.py:449 result_type=REF: always boxed Ref
     result as i64
@@ -698,12 +693,7 @@ pub extern "C" fn ll_portal_runner_shim(
     // constructed — a proper `PyFrame` with `locals_cells_stack_w` already
     // populated (NewWithVtable + SetfieldGc).  Run it directly; the greens
     // (`next_instr` / `pycode`) are redundant because the frame carries them.
-    // (Contrast `jit_force_callee_frame`, whose CA_FORCE_FN deadframe is a raw
-    // JitFrame-like block that must be reconstructed with fresh fields.)
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let result = crate::eval::portal_runner(frame);
-    // warmspot.py:449 result_type=REF: always boxed Ref
-    result as i64
+    run_frame_through_portal(frame_ptr)
 }
 
 /// warmspot.py:1021-1028 — assembler_call_helper.
