@@ -14356,7 +14356,13 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                         )?,
                         _ => return None,
                     };
-                    locals.insert(dst, value);
+                    // rustc computes each assignment at the destination's
+                    // width; re-narrow so a `Shl` that shifted bits out does
+                    // not bake a too-wide constant.
+                    locals.insert(
+                        dst,
+                        const_narrow_to_target(const_literal_ty(llbc, &place.ty), value),
+                    );
                 }
                 _ => return None,
             }
@@ -14563,8 +14569,94 @@ fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
     })
 }
 
+/// Resolve a Charon type reference to its `Literal` payload
+/// (`{"Int": "I32"}` / `{"UInt": "U32"}` / …), following the
+/// `Deduplicated` / `HashConsedValue` indirections the same way
+/// [`Lowering::tyref_literal_int_atom`] does.
+fn const_literal_ty<'t>(llbc: &'t Llbc, tyref: &'t TyRef) -> Option<&'t serde_json::Value> {
+    let value = match tyref {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    value.as_object()?.get("Literal")
+}
+
+/// Re-narrow a folded literal to the width and signedness of the local it
+/// is assigned to.
+///
+/// The `ConstLit` carrier is 64-bit, so an operation whose true result is
+/// computed at a narrower width can come out too wide — `Shl` is the live
+/// case, because Rust does *not* count shifted-out bits as an overflow
+/// (`200u8 << 1` is a legal const equal to 144, while the u64 carrier says
+/// 400).  rustc truncates to the destination type, so doing the same here
+/// keeps the fold bit-exact instead of baking a too-wide constant.  This is
+/// the same width reasoning the `Add`/`Sub`/`Mul` `Wrap` arms use to decline
+/// outright; with the destination type in hand the value can be corrected
+/// rather than residualized.
+///
+/// Only integer destinations narrow: a `Bool`/`Float` destination, a
+/// non-literal one (the tuple a `*Checked` pair is assigned to), or a
+/// 128-bit width leaves the value untouched.
+fn const_narrow_to_target(target: Option<&serde_json::Value>, v: ConstLit) -> ConstLit {
+    let Some(target) = target else {
+        return v;
+    };
+    let raw = match v {
+        ConstLit::Int(n) => n,
+        ConstLit::UInt(n) => n as i64,
+        _ => return v,
+    };
+    let Some(narrowed) = const_cast_int(raw, target) else {
+        return v;
+    };
+    if target.get("UInt").is_some() {
+        ConstLit::UInt(narrowed as u64)
+    } else {
+        ConstLit::Int(narrowed)
+    }
+}
+
 fn const_eval_binop(kind: &serde_json::Value, lhs: ConstLit, rhs: ConstLit) -> Option<ConstLit> {
     let name = operator_name(kind)?;
+    // A mixed-signedness pair is not an ambiguous fold for every operator.
+    // Charon emits one for two shapes that are exactly determined once the
+    // signed side is non-negative, because then both carriers agree on the
+    // mathematical value:
+    //   * a shift, whose RHS is a bit *count* and not a value in the LHS's
+    //     domain — `1u32 << 31` records `Unsigned(U32, 1)` against
+    //     `Signed(I32, 31)` because an unsuffixed shift amount defaults to
+    //     `i32`;
+    //   * a comparison, where a `Cast` upstream dropped one side's
+    //     signedness into the other carrier (`31i32 as u32 < 32u32`, the
+    //     shift-overflow assert Charon plants ahead of the shift itself).
+    // Arithmetic is deliberately excluded: its result *type* is what the
+    // mixed pair leaves undetermined, and Rust needs an explicit cast to
+    // write it, so it does not occur in a real initializer.
+    let mixed = match (lhs, rhs) {
+        (ConstLit::UInt(a), ConstLit::Int(b)) if b >= 0 => Some((a, b as u64)),
+        (ConstLit::Int(a), ConstLit::UInt(b)) if a >= 0 => Some((a as u64, b)),
+        _ => None,
+    };
+    if let Some((a, b)) = mixed {
+        return match name {
+            "Shl" => u32::try_from(b)
+                .ok()
+                .and_then(|shift| a.checked_shl(shift))
+                .map(ConstLit::UInt),
+            "Shr" => u32::try_from(b)
+                .ok()
+                .and_then(|shift| a.checked_shr(shift))
+                .map(ConstLit::UInt),
+            "Lt" => Some(ConstLit::Bool(a < b)),
+            "Le" => Some(ConstLit::Bool(a <= b)),
+            "Gt" => Some(ConstLit::Bool(a > b)),
+            "Ge" => Some(ConstLit::Bool(a >= b)),
+            "Eq" => Some(ConstLit::Bool(a == b)),
+            "Ne" => Some(ConstLit::Bool(a != b)),
+            _ => None,
+        };
+    }
     match (lhs, rhs) {
         (ConstLit::Int(a), ConstLit::Int(b)) => match name {
             // Wrapping Add/Sub/Mul: the correct result depends on the
@@ -17083,6 +17175,99 @@ mod tests {
         assert!(matches!(
             const_eval_binop(&json!("AddChecked"), ConstLit::Int(1i64 << 62), ConstLit::Int(1)),
             Some(ConstLit::Checked(v, false)) if v == (1i64 << 62) + 1
+        ));
+    }
+
+    /// `pub const MEMBER_DIRECT_FLAG: u32 = 1 << 31` (typedef.rs) records a
+    /// mixed-signedness pair, because an unsuffixed shift amount defaults to
+    /// `i32` while the shifted value is `u32`.  Charon plants the
+    /// shift-overflow assert (`31i32 as u32 < 32u32`) ahead of it, which is a
+    /// mixed pair too, so both halves have to fold or the const falls through
+    /// to a residual accessor call no registry can bind.
+    #[test]
+    fn const_eval_binop_folds_mixed_signedness_shifts_and_comparisons() {
+        use super::{ConstLit, const_eval_binop};
+        use serde_json::json;
+
+        // The shift itself: `1u32 << 31i32`.
+        assert!(matches!(
+            const_eval_binop(
+                &json!({ "Shl": "Wrap" }),
+                ConstLit::UInt(1),
+                ConstLit::Int(31)
+            ),
+            Some(ConstLit::UInt(v)) if v == 1u64 << 31
+        ));
+        // The overflow assert's comparison: `31u32 < 32u32` reached with the
+        // cast's signedness dropped into the `Int` carrier.
+        assert!(matches!(
+            const_eval_binop(&json!("Lt"), ConstLit::Int(31), ConstLit::UInt(32)),
+            Some(ConstLit::Bool(true))
+        ));
+        assert!(matches!(
+            const_eval_binop(&json!("Ge"), ConstLit::UInt(32), ConstLit::Int(31)),
+            Some(ConstLit::Bool(true))
+        ));
+
+        // A negative signed side makes the two carriers disagree on the
+        // value — stay declined, as the `Shr` sign guard already does.
+        assert!(
+            const_eval_binop(
+                &json!({ "Shl": "Wrap" }),
+                ConstLit::UInt(1),
+                ConstLit::Int(-1)
+            )
+            .is_none()
+        );
+        assert!(const_eval_binop(&json!("Lt"), ConstLit::Int(-1), ConstLit::UInt(0)).is_none());
+
+        // Mixed arithmetic stays declined: the pair leaves the result *type*
+        // undetermined, and Rust needs an explicit cast to write it at all.
+        assert!(
+            const_eval_binop(
+                &json!({ "Add": "Panic" }),
+                ConstLit::UInt(1),
+                ConstLit::Int(1)
+            )
+            .is_none()
+        );
+    }
+
+    /// A `Shl` folded at the 64-bit carrier can be wider than the local it is
+    /// assigned to — Rust does not treat shifted-out bits as an overflow, so
+    /// `200u8 << 1` is a legal const equal to 144, not 400.  rustc truncates
+    /// to the destination type and so must the fold.
+    #[test]
+    fn const_narrow_to_target_truncates_to_the_destination_width() {
+        use super::{ConstLit, const_narrow_to_target};
+        use serde_json::json;
+
+        let u8_ty = json!({ "UInt": "U8" });
+        assert!(matches!(
+            const_narrow_to_target(Some(&u8_ty), ConstLit::UInt(400)),
+            ConstLit::UInt(144)
+        ));
+        // A signed destination re-extends rather than masking.
+        let i8_ty = json!({ "Int": "I8" });
+        assert!(matches!(
+            const_narrow_to_target(Some(&i8_ty), ConstLit::UInt(200)),
+            ConstLit::Int(-56)
+        ));
+        // The u32 flag itself is already in range and must survive intact.
+        let u32_ty = json!({ "UInt": "U32" });
+        assert!(matches!(
+            const_narrow_to_target(Some(&u32_ty), ConstLit::UInt(1 << 31)),
+            ConstLit::UInt(v) if v == 1u64 << 31
+        ));
+        // Non-integer and absent destinations pass the value through.
+        assert!(matches!(
+            const_narrow_to_target(None, ConstLit::Int(7)),
+            ConstLit::Int(7)
+        ));
+        let bool_ty = json!({ "Bool": [] });
+        assert!(matches!(
+            const_narrow_to_target(Some(&bool_ty), ConstLit::Bool(true)),
+            ConstLit::Bool(true)
         ));
     }
 
