@@ -1,4 +1,10 @@
-# pyre-check: max-pypy-ratio=40
+# No `max-pypy-ratio` gate: pypy runs this in ~0.019s, two ticks of the 10ms
+# user-CPU resolution, so the ratio's own granularity is ~30-50%. A run where
+# pyre got FASTER (1.22s -> 1.09s) still reddened a ratio=40 gate, because pypy
+# happened to measure 0.03s instead of 0.04s. Raising the bound far enough to
+# absorb one tick leaves it too loose to catch anything, so the bench keeps only
+# its output check — which is what it was written for. The comprehension's flat
+# constant factor against pypy is tracked separately.
 # An inlined list comprehension whose LIST_APPEND element lands in a list
 # Object-strategy (tuple / None / str / dict / f-string) folds through the #171
 # orthodox append. Its Object arm stores a GC ref and runs list_write_barrier,

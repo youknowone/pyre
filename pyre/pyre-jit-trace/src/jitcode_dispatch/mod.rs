@@ -6106,6 +6106,20 @@ fn walker_float_specialization_operands<Sym: WalkSym>(
     };
     let (lhs_is_int, lhs_f64) = coerce(lhs_obj)?;
     let (rhs_is_int, rhs_f64) = coerce(rhs_obj)?;
+    // A numeric subclass keeps the builtin `ob_type` layout while its
+    // Python-visible class lives in `w_class`.  The raw float specialization
+    // bypasses special-method dispatch — and the `guard_class` it emits reads
+    // `ob_type`, so it would not catch the subclass at runtime either — so only
+    // exact builtin floats/ints/bools may enter it; subclasses continue through
+    // the residual BINARY_OP / COMPARE_OP.  Mirrors the same check in
+    // `walker_int_specialization_operands`.
+    unsafe {
+        if !pyre_object::is_exact_builtin_instance(lhs_obj)
+            || !pyre_object::is_exact_builtin_instance(rhs_obj)
+        {
+            return None;
+        }
+    }
     if lhs_is_int && rhs_is_int {
         return None;
     }
