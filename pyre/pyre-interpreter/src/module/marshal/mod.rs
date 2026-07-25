@@ -514,6 +514,16 @@ fn loads_impl(args: &[PyObjectRef]) -> PyResult {
     Ok(result)
 }
 
+/// `PyMarshal_ReadObjectFromString` — deserialize one object out of a raw byte
+/// buffer.  `_imp.get_frozen_object` unmarshals caller-supplied frozen data
+/// through this and rewrites any failure into its own diagnostic.
+pub(crate) fn loads_bytes(data: &[u8]) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut reader: &[u8] = data;
+    let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
+    Ok(result.get())
+}
+
 fn dump_impl(args: &[PyObjectRef]) -> PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["version", "allow_code"], "dump")?;

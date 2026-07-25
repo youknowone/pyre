@@ -144,18 +144,54 @@ fn frozen_name(args: &[pyre_object::PyObjectRef], function: &str) -> Result<Stri
     };
     if !unsafe { pyre_object::is_str(name) } {
         return Err(crate::PyError::type_error(format!(
-            "{function}() argument 1 must be str"
+            "{function}() argument 1 must be str, not {}",
+            bad_argument_type_name(name)
         )));
     }
     Ok(unsafe { pyre_object::w_str_get_value(name) }.to_owned())
 }
 
-fn missing_frozen_error(name: &str) -> crate::PyError {
+/// `set_frozen_error` — both frozen diagnostics carry the module name as
+/// `.name` with no `.path`, and render it the way `%R` does.
+fn frozen_error(message: String, name: &str) -> crate::PyError {
     crate::PyError::import_error_name_path(
-        format!("No such frozen object named {name:?}"),
+        message,
         pyre_object::w_str_new(name),
         pyre_object::w_none(),
     )
+}
+
+/// `%R` on the module name: quote selection and escaping identical to
+/// `repr(str)`, which Rust's `{:?}` does not reproduce (it always
+/// double-quotes).
+fn frozen_name_repr(name: &str) -> String {
+    let w_name = pyre_object::w_str_new(name);
+    crate::display::format_wtf8_repr(unsafe { pyre_object::w_str_get_wtf8(w_name) })
+}
+
+fn missing_frozen_error(name: &str) -> crate::PyError {
+    frozen_error(
+        format!("No such frozen object named {}", frozen_name_repr(name)),
+        name,
+    )
+}
+
+/// `set_frozen_error(FROZEN_INVALID)` — the frozen data was supplied by the
+/// caller but does not unmarshal.
+fn invalid_frozen_error(name: &str) -> crate::PyError {
+    frozen_error(
+        format!("Frozen object named {} is invalid", frozen_name_repr(name)),
+        name,
+    )
+}
+
+/// The type name `_PyArg_BadArgument` prints for a rejected argument: `None`
+/// rather than `NoneType`.
+fn bad_argument_type_name(obj: pyre_object::PyObjectRef) -> String {
+    if unsafe { pyre_object::is_none(obj) } {
+        return "None".to_string();
+    }
+    type_name(obj)
 }
 
 /// The receiver's type name, for argument-type error messages.
@@ -336,7 +372,48 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "get_frozen_object",
             |args| {
-                let name = frozen_name(args, "get_frozen_object")?;
+                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                if crate::builtins::has_real_kwargs(kwargs) {
+                    return Err(crate::PyError::type_error(
+                        "_imp.get_frozen_object() takes no keyword arguments",
+                    ));
+                }
+                if positional.len() > 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "get_frozen_object expected at most 2 arguments, got {}",
+                        positional.len()
+                    )));
+                }
+                let name = frozen_name(positional, "get_frozen_object")?;
+                // `_imp_get_frozen_object_impl`: a `data` buffer stands in for
+                // the frozen table entry, so those bytes are unmarshalled
+                // directly and a stream that does not decode reports the object
+                // as invalid rather than as missing.
+                let data = positional
+                    .get(1)
+                    .copied()
+                    .filter(|&data| !unsafe { pyre_object::is_none(data) });
+                if let Some(data) = data {
+                    let Some(buffer) = crate::typedef::buffer_as_bytes_like(data)? else {
+                        return Err(crate::PyError::type_error(format!(
+                            "get_frozen_object() argument 2 must be bytes, not {}",
+                            bad_argument_type_name(data)
+                        )));
+                    };
+                    // Owned before the unmarshal allocates: the buffer may be a
+                    // freshly minted bytes that nothing roots.
+                    let bytes =
+                        unsafe { pyre_object::bytesobject::bytes_like_data(buffer) }.to_vec();
+                    let code = crate::module::marshal::loads_bytes(&bytes)
+                        .map_err(|_| invalid_frozen_error(&name))?;
+                    if !unsafe { crate::is_code(code) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "frozen object {} is not a code object",
+                            frozen_name_repr(&name)
+                        )));
+                    }
+                    return Ok(code);
+                }
                 let entry =
                     served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
                 let (source, code_name) = frozen_source(entry)?;
