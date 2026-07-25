@@ -407,27 +407,6 @@ fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
 }
-/// TEMP DIAGNOSTIC (remove before commit): `MAJIT_BRIDGE_ONLY=a,b,c` restricts
-/// bridge formation to the listed guard `fail_index` values, so a miscompiling
-/// bridge can be bisected out of a run. Unset = allow all.
-fn bridge_only_allows(fail_index: u32) -> bool {
-    static LIST: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
-    let list = LIST.get_or_init(|| {
-        std::env::var("MAJIT_BRIDGE_ONLY").ok().map(|v| {
-            v.split(',')
-                .filter_map(|t| t.trim().parse::<u32>().ok())
-                .collect()
-        })
-    });
-    let ok = match list {
-        None => true,
-        Some(allowed) => allowed.contains(&fail_index),
-    };
-    if crate::bridge_debug_enabled() {
-        eprintln!("[bridgeONLY] fail_index={fail_index} allowed={ok}");
-    }
-    ok
-}
 fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
@@ -3525,8 +3504,7 @@ impl<S: JitState> JitDriver<S> {
             // pending-field prologue (resume.py:993-1007).
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled()
-                && bridge_only_allows(fail_index);
+                && !no_bridge_enabled();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -5887,8 +5865,7 @@ impl<S: JitState> JitDriver<S> {
             // resume defects from the blackhole path.
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled()
-                && bridge_only_allows(fail_index);
+                && !no_bridge_enabled();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
