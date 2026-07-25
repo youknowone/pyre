@@ -1620,16 +1620,41 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     let r_err = forward_alias(graph, &r_b, &err_link)
         .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
     let err_ops = &graph.blocks[err_target].operations;
-    let ctor_idx = err_ops
+    // `PyErrorKind::StopIteration` reaches the `eq` below in either of two
+    // lowered forms: as a niladic `SyntheticTransparentCtor` while the
+    // fieldless variant is still carried as an ADT constructor, or as a plain
+    // `ConstInt` once the fieldless enum lowers to its discriminant. Accept
+    // both. The constant form is value-checked, so a comparison against a
+    // different kind (`e.kind == PyErrorKind::ValueError`) can never be fused
+    // into a StopIteration test; the operand is additionally pinned by the
+    // `PyErrorKind::eq` argument check below.
+    //
+    // 9 == `PyErrorKind::StopIteration` (pyre-interpreter error.rs); like the
+    // `ExcKind::StopIteration` 10 used by the synthesised handler, the two are
+    // coupled — renumbering that variant makes this recognizer decline, which
+    // `unpackiterable_drain_match_fuses_to_kind_test` reports as a failure.
+    const PYERRORKIND_STOP_ITERATION: i64 = 9;
+    let (ctor_idx, sc) = err_ops
         .iter()
-        .position(|op| matches!(&op.kind,
-            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name: n, owner_path }, .. }
-                if n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind")))
-        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the StopIteration ctor"))?;
-    let sc = err_ops[ctor_idx]
-        .result
-        .clone()
-        .ok_or_else(|| format!("{name}: drain fuse: StopIteration ctor without result"))?;
+        .enumerate()
+        .find_map(|(i, op)| {
+            let is_stop_iteration = match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            name: n,
+                            owner_path,
+                        },
+                    ..
+                } => n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind"),
+                OpKind::ConstInt(v) => *v == PYERRORKIND_STOP_ITERATION,
+                _ => false,
+            };
+            is_stop_iteration.then(|| op.result.clone().map(|s| (i, s)))?
+        })
+        .ok_or_else(|| {
+            format!("{name}: drain fuse: Err arm lacks the StopIteration ctor or discriminant")
+        })?;
     let (errpay_idx, err_payload) = err_ops
         .iter()
         .enumerate()
