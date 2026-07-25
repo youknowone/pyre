@@ -5861,9 +5861,12 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     }
 
     // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
-    // Pointer identity, infallible — never publishes BH_LAST_EXC_VALUE.
+    // `space.is_w`, not raw pointer identity: `W_AbstractIntObject.is_w`
+    // (`intobject.py:44`) and `W_FloatObject.is_w` (`floatobject.py:196`)
+    // compare two plain `int`s / `float`s by value, so a freshly boxed equal
+    // value is identical.  Infallible — never publishes BH_LAST_EXC_VALUE.
     if op_code == 8 || op_code == 9 {
-        let same = std::ptr::eq(lhs, rhs);
+        let same = pyre_interpreter::baseobjspace::is_w(lhs, rhs);
         let result = if op_code == 9 { !same } else { same };
         return pyre_object::w_bool_from(result) as i64;
     }
