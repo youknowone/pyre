@@ -574,9 +574,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "get_frozen_object",
-        crate::make_builtin_function_with_arity(
-            "get_frozen_object",
-            |args| {
+        // `data` is optional, so there is no fixed natural arity to fast-path
+        // on; registering one would declare a call shape the closure does not
+        // actually require.
+        crate::make_builtin_function("get_frozen_object", |args| {
                 let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
                 if crate::builtins::has_real_kwargs(kwargs) {
                     return Err(crate::PyError::type_error(
@@ -632,9 +633,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Ok(crate::w_code_new(
                     Box::into_raw(Box::new(code)) as *const ()
                 ))
-            },
-            1,
-        ),
+            }),
     );
     crate::module_ns_store(
         ns,
