@@ -564,6 +564,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "unknown"
         }),
     );
+    // sys.winver — the "major.minor" tag Windows uses for the per-user site
+    // directory and the PythonCore registry keys. site.getusersitepackages
+    // reads it to build USER_SITE.
+    #[cfg(windows)]
+    module_ns_store(ns, "winver", w_str_new("3.14"));
     module_ns_store(
         ns,
         "byteorder",
