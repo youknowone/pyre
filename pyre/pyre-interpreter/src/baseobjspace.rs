@@ -3662,9 +3662,15 @@ unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 /// `&str`, so a miss allocates neither the wrapped key nor the exception.
 /// Every other receiver falls through to `baseobjspace.py:868-871`, which
 /// wraps the key and defers to the generic `finditem`.
+///
+/// The probe still compares against whatever the bucket holds, so a stored
+/// non-string key whose hash collides can reach a user `__eq__` that raises.
+/// Take the `_checked` variant so that surfaces as an error rather than a
+/// miss; only that path wraps the key, to name it in a 3.14 hash-error.
 pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
-        return Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(obj, key) });
+        return unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked(obj, key) }
+            .map_err(|_| take_pending_dict_key_error(w_str_new(key)));
     }
     finditem(obj, w_str_new(key))
 }
@@ -4285,6 +4291,29 @@ fn getdict_backing(obj: PyObjectRef) -> PyObjectRef {
         return w_dict;
     }
     crate::type_methods::resolve_dict_backing(w_dict)
+}
+
+/// `baseobjspace.py:46-50 W_Root.getdictvalue`.
+///
+/// ```python
+/// def getdictvalue(self, space, attr):
+///     w_dict = self.getdict(space)
+///     if w_dict is not None:
+///         return space.finditem_str(w_dict, attr)
+///     return None
+/// ```
+///
+/// Going through `finditem_str` rather than the raw layout accessor is what
+/// makes a dict probe that raises reach the caller: a borrowed-`&str` key is
+/// still compared against whatever the bucket holds, so a stored non-string
+/// key whose hash collides can run a user `__eq__`, and the raw accessor
+/// reports that as an ordinary miss — the attribute would look absent.
+fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    let w_dict = getdict_backing(obj);
+    if w_dict.is_null() {
+        return Ok(None);
+    }
+    finditem_str(w_dict, name)
 }
 
 /// interpreter/baseobjspace.py:142-143 W_Root.getweakref().
@@ -6205,11 +6234,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                         }
                     }
                 }
-                let w_dict = getdict_backing(obj);
-                if !w_dict.is_null() {
-                    if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
-                        return Ok(value);
-                    }
+                if let Some(value) = getdictvalue(obj, name)? {
+                    return Ok(value);
                 }
                 if let Some(descr) = w_descr {
                     if crate::is_function(descr) {
@@ -6258,11 +6284,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     }
                 }
             }
-            let w_dict = getdict_backing(obj);
-            if !w_dict.is_null() {
-                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                    return Ok(value);
-                }
+            if let Some(value) = getdictvalue(obj, name)? {
+                return Ok(value);
             }
             if let Some(method) = w_descr {
                 match unsafe { get(method, obj, w_type.as_ptr()) } {
@@ -6307,13 +6330,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // Function object attributes — PyPy: function.py Function
     // Check the live W_DictObject (functions are hasdict per typedef.py:735
     // __dict__ = getset_func_dict).
-    if unsafe { crate::is_function(obj) } {
-        let w_dict = getdict_backing(obj);
-        if !w_dict.is_null() {
-            if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                return Ok(v);
-            }
-        }
+    if unsafe { crate::is_function(obj) }
+        && let Some(v) = getdictvalue(obj, name)?
+    {
+        return Ok(v);
     }
     unsafe {
         if crate::is_function(obj) {
@@ -6472,11 +6492,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     if name == "__doc__" || name == "__module__" || name == "__annotations__" {
         // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
         // instance dict (exception `w_dict` slot, hasdict objects).
-        let w_dict = getdict_backing(obj);
-        if !w_dict.is_null() {
-            if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                return Ok(value);
-            }
+        if let Some(value) = getdictvalue(obj, name)? {
+            return Ok(value);
         }
         // `__module__` is not a universal attribute: an object whose
         // type-MRO carries no `__module__` (e.g. a builtin instance like
