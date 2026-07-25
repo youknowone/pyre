@@ -178,6 +178,21 @@ Kept as-is; listed for completeness.
   targets: the *ON* path is the unattested one.
   `_BLACKHOLE_RESUME` graduated out of this bucket on 2026-07-25 (flipped
   default-ON, now in §4).
+
+  `_CALLEE_VSTACK` was evaluated for the same flip on 2026-07-25 and
+  **declined — no payoff**.  It is fully implemented and correctness-clean:
+  a 306-bench corpus A/B on both backends changes the `[vstack-reconcile]`
+  boundary count in 60 benches (i.e. the mirror really is seeded and used)
+  with byte-identical output everywhere, and `check.py --backend cranelift`
+  is 303/303 with it on.  But an interleaved wall-clock A/B on the four
+  highest-firing benches — fib_recursive, depth7_inline_chain_typeflip,
+  calls_closures, bridge_branchy_callee — is indistinguishable
+  (0.50/0.50, 0.20/0.19, 0.87/0.87, 0.08/0.08 s).  The only check.py
+  interaction is `nested_loop`, a bench that already sits at its x2.0 gate
+  (baseline 1.5x/1.9x/1.8x, with-flag 2.0x/2.1x/1.5x) — not separable from
+  noise at that sample size, and not worth a 60-bench behaviour change that
+  buys nothing.  Re-evaluate only when a consumer that *needs* the callee
+  mirror lands; do not re-run this A/B expecting a different answer.
 - **Config / value / master switches (~18)** — tuning, paths, modes; keep:
   `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
