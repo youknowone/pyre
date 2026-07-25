@@ -11749,6 +11749,40 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Vec::new()
         };
 
+        // `W_FileIO.descr_init` opens a pathname immediately: `w`/`w+` create
+        // and truncate, `x` reports EEXIST, `a` creates without truncating.
+        // The in-memory buffer above otherwise postpones the on-disk file to
+        // the first flush, so `open(p, "w").close()` (no write) would never
+        // create the file and `x` would not enforce exclusivity.  Perform the
+        // eager open-time create here to match the fd-backed path.
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+        if writing {
+            let create_res = if mode.contains('x') {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map(|_| ())
+            } else if mode.contains('a') {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&path)
+                    .map(|_| ())
+            } else {
+                std::fs::write(&path, b"")
+            };
+            if let Err(e) = create_res {
+                let errno = match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => libc::EEXIST,
+                    std::io::ErrorKind::NotFound => libc::ENOENT,
+                    std::io::ErrorKind::PermissionDenied => libc::EACCES,
+                    _ => io_error_posix_errno(&e, libc::EACCES),
+                };
+                return Err(crate::PyError::os_error_syscall(errno, path_obj));
+            }
+        }
+
         let wrapper = pyre_object::w_instance_new(file_wrapper_type());
         let _ = crate::baseobjspace::setattr_str(
             wrapper,
