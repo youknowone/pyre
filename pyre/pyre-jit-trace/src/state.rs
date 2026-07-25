@@ -7578,14 +7578,18 @@ fn materialize_concrete_virtual_ptr(
             }
             // Pyre adaptation: bh_new_with_vtable writes vtable at
             // vtable_offset but PyObject.w_class needs separate init
-            // (pyobject.rs:51). Matches materialize_virtual_object at
-            // state.rs:7220.
-            if vtable != 0 {
+            // (pyobject.rs:51). Matches materialize_virtual_object.
+            //
+            // `w_class_obj()` — not `get_instantiate(vtable)` — is the source:
+            // a vtable word is only a `PyType` pointer for a pyre object
+            // descr.  `JitVirtualRef` carries the `jit_virtual_ref_vtable`
+            // type-id constant there (`virtualref.py:21-23`) and its offset-8
+            // slot is `virtual_token`, not `w_class`, so it returns None and
+            // this seeding is skipped.
+            if let Some(w_class) = size_descr.w_class_obj() {
                 unsafe {
                     let pyobj = ptr as *mut pyre_object::PyObject;
-                    (*pyobj).w_class = pyre_object::pyobject::get_instantiate(
-                        &*(vtable as *const pyre_object::pyobject::PyType),
-                    );
+                    (*pyobj).w_class = w_class as pyre_object::pyobject::PyObjectRef;
                 }
             }
             let gcref = majit_ir::GcRef(ptr as usize);
@@ -9975,9 +9979,7 @@ fn materialize_virtual_object(
     fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
-    use pyre_object::pyobject::{
-        OB_TYPE_OFFSET, PyObject, PyType, W_CLASS_OFFSET, get_instantiate,
-    };
+    use pyre_object::pyobject::{OB_TYPE_OFFSET, PyObject, PyType, W_CLASS_OFFSET};
 
     let size_descr = descr.as_size_descr()?;
     let vtable = size_descr.vtable();
@@ -9996,24 +9998,21 @@ fn materialize_virtual_object(
         return None;
     }
 
-    if vtable as u64 == majit_metainterp::virtualref::JIT_VIRTUAL_REF_VTABLE {
-        // `JitVirtualRef` is a `GcStruct` whose `('super', rclass.OBJECT)` slot
-        // holds the type-id constant itself, not a `PyType *`.  It has no
-        // `w_class`, and running the arm below would dereference the
-        // `JIT_VIRTUAL_REF_VTABLE` magic as a type object.  The field replay
-        // then fills `virtual_token` and `forced` from the traced values, the
-        // same two the optimizer seeds when it lowers `VIRTUAL_REF`.
-        unsafe { (raw as *mut u64).write(vtable as u64) };
-    } else {
-        unsafe {
-            let ptr = raw as *mut PyObject;
-            (*ptr).ob_type = vtable as *const PyType;
-            // rclass.py:739-743 set `w_class` from the cached instantiate
-            // pointer on the PyType. Tracing may later overwrite this via
-            // an explicit `SetfieldGc(w_class)`; the field replay below
-            // takes precedence for that case (heaptracker.py:66-style
-            // "typeptr" filter does NOT apply to w_class in pyre).
-            (*ptr).w_class = get_instantiate(&*(vtable as *const PyType));
+    unsafe {
+        let ptr = raw as *mut PyObject;
+        (*ptr).ob_type = vtable as *const PyType;
+        // rclass.py:739-743 set `w_class` from the cached instantiate
+        // pointer on the PyType. Tracing may later overwrite this via
+        // an explicit `SetfieldGc(w_class)`; the field replay below
+        // takes precedence for that case (heaptracker.py:66-style
+        // "typeptr" filter does NOT apply to w_class in pyre).
+        //
+        // `w_class_obj()` is None when the vtable word is not a `PyType`
+        // pointer — `JitVirtualRef` stores the `jit_virtual_ref_vtable`
+        // type-id constant at offset 0 (`virtualref.py:21-23`) and keeps
+        // `virtual_token` where `w_class` would sit.
+        if let Some(w_class) = size_descr.w_class_obj() {
+            (*ptr).w_class = w_class as *mut PyObject;
         }
     }
 
