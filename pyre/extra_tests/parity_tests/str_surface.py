@@ -16,3 +16,5 @@ class Index:
 
 assert str.__rmul__("xy", Index()) == "xyxy"
 print("str surface: ok")
+
+print("OK")

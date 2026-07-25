@@ -80,3 +80,5 @@ def shift_guards(rounds):
 
 
 assert shift_guards(20_000) == (True, -1)
+
+print("OK")

@@ -254,3 +254,5 @@ assert format(x, "021_._f") == "0_000_123_456.123_456"
 assert format(x, "023_.10_f") == "0_123_456.123_456_000_0"
 
 print("float/complex 3.14 surface: ok")
+
+print("OK")

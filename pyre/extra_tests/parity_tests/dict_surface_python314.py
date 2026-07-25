@@ -59,3 +59,5 @@ assert {}.__sizeof__() > 0
 assert {"x": 1}.__sizeof__() > {}.__sizeof__()
 assert dict.__doc__.startswith("dict() -> new empty dictionary")
 print("dict surface: ok")
+
+print("OK")

@@ -106,3 +106,5 @@ else:
     raise AssertionError("Python 3.14 compress unexpectedly became picklable")
 
 print("itertools.compress Python 3.14 parity ok")
+
+print("OK")

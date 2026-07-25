@@ -383,6 +383,15 @@ jobs:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/check.py
+    - name: Run pyre/extra_tests/parity_tests
+      # Every script must exit 0 and print "OK" as its last line under CPython
+      # AND under each pyre backend, so a divergence from CPython observable
+      # semantics fails here. check.py has just built the release pyre-dynasm
+      # and pyre-cranelift binaries the runner drives, so this costs only the
+      # per-script process spawns.
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py
     - name: JIT structural stats vs committed baseline (Linux, informational)
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided

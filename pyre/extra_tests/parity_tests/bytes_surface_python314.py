@@ -19,3 +19,5 @@ else:
     raise AssertionError("bytes buffer must be read-only")
 
 print("bytes surface: ok")
+
+print("OK")

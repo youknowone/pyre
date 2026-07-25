@@ -29,3 +29,5 @@ assert str(True) == "True"
 assert str(False) == "False"
 assert bool.__doc__.startswith("Returns True when the argument is true")
 print("bool 3.14 surface: ok")
+
+print("OK")

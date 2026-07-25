@@ -13,3 +13,5 @@ for value in (0, 1, -1, 2**30 - 1, 2**30, 2**60, -(2**60)):
 
 assert int.__doc__.startswith("int([x]) -> integer")
 print("int 3.14 surface: ok")
+
+print("OK")

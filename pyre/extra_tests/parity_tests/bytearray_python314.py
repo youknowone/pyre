@@ -77,3 +77,5 @@ assert repr(child) == "Child(b'x')"
 assert child.__reduce__() == (Child, ("x", "latin-1"), {"attr": 1})
 assert bytearray.__doc__.startswith("bytearray(iterable_of_ints)")
 print("bytearray 3.14 surface: ok")
+
+print("OK")

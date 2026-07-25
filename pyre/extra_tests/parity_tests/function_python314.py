@@ -144,3 +144,5 @@ for method_name, args in (
         pass
     else:
         raise AssertionError(f"function {method_name} accepted a foreign receiver")
+
+print("OK")

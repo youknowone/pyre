@@ -89,3 +89,5 @@ assert type(sub) is StarMapSubclass
 assert list(sub) == [16]
 
 print("itertools.starmap Python 3.14 parity ok")
+
+print("OK")

@@ -82,3 +82,5 @@ else:
 
 assert object.__doc__.startswith("The base class of the class hierarchy.")
 print("object surface: ok")
+
+print("OK")

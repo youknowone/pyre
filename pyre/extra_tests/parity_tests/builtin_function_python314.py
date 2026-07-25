@@ -99,3 +99,5 @@ assert len.__module__ is None
 len.__module__ = "builtins"
 
 print("builtin_function_or_method Python 3.14 parity: ok")
+
+print("OK")

@@ -121,3 +121,5 @@ for obj in (itertools.count(), itertools.repeat(None)):
         raise AssertionError("Python 3.14 non-picklable iterator became picklable")
 
 print("itertools count/repeat Python 3.14 parity ok")
+
+print("OK")

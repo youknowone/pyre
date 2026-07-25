@@ -93,3 +93,5 @@ else:
 assert events == [1, 2]
 
 print("itertools predicate type Python 3.14 parity ok")
+
+print("OK")
