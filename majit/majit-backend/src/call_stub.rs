@@ -550,10 +550,87 @@ pub fn collect_call_args_positional(
     out
 }
 
+/// Dispatch a residual call described by `arg_classes`, picking the signature
+/// strategy the active backend supports.
+///
+/// `bh_call_*_dispatch` transmutes the funcptr to an `extern "C" fn` guessed
+/// from the *bucketed* `(int, float)` arity. That is sound only on a C ABI that
+/// tolerates a signature mismatch: SysV/AAPCS pass the surplus in registers the
+/// callee ignores, and a `usize` parameter is register-width either way. wasm32
+/// has neither property — `call_indirect` type-checks the callee's declared
+/// type on every call, and a pointer parameter is `i32` where the transmute
+/// says `i64` — so a mistyped guess traps with `indirect call type mismatch`
+/// instead of silently working.
+///
+/// Where a host trampoline is installed (`set_residual_host_call`, wasm32) the
+/// call must therefore go through it with the *positional* argument list.
+/// [`collect_call_args`] discards the interleaving `arg_classes` encodes, so
+/// the choice cannot be recovered downstream: it belongs here, at the last
+/// point that still holds `arg_classes`.
+///
+/// # Safety
+/// On the transmute path, `func` must match the ABI [`collect_call_args`]
+/// derives from `arg_classes` — see [`bh_call_i_dispatch`].
+pub unsafe fn bh_call_i_by_classes(
+    func: usize,
+    arg_classes: &str,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> i64 {
+    if let Some(hook) = residual_host_call() {
+        let args = collect_call_args_positional(arg_classes, args_i, args_r, args_f);
+        return hook(func, &args);
+    }
+    let (int_args, float_args) = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_i_dispatch(func, &int_args, &float_args) }
+}
+
+/// f64-returning parallel of [`bh_call_i_by_classes`].
+///
+/// # Safety
+/// See [`bh_call_i_by_classes`].
+pub unsafe fn bh_call_f_by_classes(
+    func: usize,
+    arg_classes: &str,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> f64 {
+    if let Some(hook) = residual_host_call() {
+        let args = collect_call_args_positional(arg_classes, args_i, args_r, args_f);
+        // The trampoline returns an f64 callee result as its raw bits.
+        return f64::from_bits(hook(func, &args) as u64);
+    }
+    let (int_args, float_args) = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_f_dispatch(func, &int_args, &float_args) }
+}
+
+/// Result-discarding parallel of [`bh_call_i_by_classes`].
+///
+/// # Safety
+/// See [`bh_call_i_by_classes`].
+pub unsafe fn bh_call_v_by_classes(
+    func: usize,
+    arg_classes: &str,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) {
+    if let Some(hook) = residual_host_call() {
+        let args = collect_call_args_positional(arg_classes, args_i, args_r, args_f);
+        let _ = hook(func, &args);
+        return;
+    }
+    let (int_args, float_args) = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_v_dispatch(func, &int_args, &float_args) }
+}
+
 /// A host-provided trampoline that performs a residual call by reflecting the
 /// callee's real signature, rather than transmuting the raw funcptr to a
 /// statically-guessed `extern "C" fn`.
 ///
+
 /// `func_ptr` is the raw callee address (a table index on wasm32); `args` is
 /// the positional argument list (floats as raw bits). The return value is the
 /// callee result as a 64-bit pattern (Void callees return 0; Ref returns the

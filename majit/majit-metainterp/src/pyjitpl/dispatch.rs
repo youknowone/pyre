@@ -5378,17 +5378,13 @@ where
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
                     if !concrete_ptr.is_null() {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_v_dispatch(
+                            majit_backend::call_stub::bh_call_v_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             );
                         }
                     }
@@ -5473,17 +5469,13 @@ where
                     //    `extern "C" fn(...) -> i64` and reads garbage from
                     //    rax/x0).
                     if !concrete_ptr.is_null() {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_v_dispatch(
+                            majit_backend::call_stub::bh_call_v_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             );
                         }
                     }
@@ -5693,17 +5685,13 @@ where
                     // int destination register, and abort on exception.
                     self.clear_exception();
                     if !concrete_ptr.is_null() {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_v_dispatch(
+                            majit_backend::call_stub::bh_call_v_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             );
                         }
                     }
@@ -5769,17 +5757,13 @@ where
                     let concrete = if concrete_ptr.is_null() {
                         0
                     } else {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_i_dispatch(
+                            majit_backend::call_stub::bh_call_i_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             )
                         }
                     };
@@ -5983,17 +5967,13 @@ where
                     // branch for the full citation.
                     self.clear_exception();
                     if !concrete_ptr.is_null() {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_v_dispatch(
+                            majit_backend::call_stub::bh_call_v_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             );
                         }
                     }
@@ -6056,17 +6036,13 @@ where
                     let concrete = if concrete_ptr.is_null() {
                         0
                     } else {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_i_dispatch(
+                            majit_backend::call_stub::bh_call_i_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             )
                         }
                     };
@@ -6232,17 +6208,13 @@ where
                     // branch for the full citation.
                     self.clear_exception();
                     if !concrete_ptr.is_null() {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_v_dispatch(
+                            majit_backend::call_stub::bh_call_v_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             );
                         }
                     }
@@ -6299,17 +6271,13 @@ where
                     let concrete = if concrete_ptr.is_null() {
                         0.0f64
                     } else {
-                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                            &calldescr.arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
                         unsafe {
-                            majit_backend::call_stub::bh_call_f_dispatch(
+                            majit_backend::call_stub::bh_call_f_by_classes(
                                 concrete_ptr as usize,
-                                &int_args,
-                                &float_args,
+                                &calldescr.arg_classes,
+                                Some(&raw_i),
+                                Some(&raw_r),
+                                Some(&raw_f),
                             )
                         }
                     };
