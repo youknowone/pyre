@@ -635,7 +635,8 @@ struct TracebackNodeSite {
     /// `PyTraceback.frame`.  `OpRef::NONE` when the walk has no materialized
     /// frame for this level — a branchless leaf inlined without one leaves
     /// the color unseeded.  Recording NONE as a `SetfieldGc` operand would
-    /// put a bogus box in the trace, so every caller has to resolve it.
+    /// put a bogus box in the trace, so every caller has to DECLINE on it and
+    /// leave the node to the frame-fabricating hook.
     frame: OpRef,
     w_code: usize,
     last_instruction: i32,
@@ -764,10 +765,11 @@ fn emit_traceback_node<Sym: WalkSym>(
 ///
 /// Every op is optimizer-visible, so escape analysis deletes the node when
 /// the exception never escapes.  The opaque
-/// `record_{,inline_,top_level_}application_traceback` hooks cannot be:
-/// they are `CanRaise` `call_void_typed_with_effect`s that force all lazy
-/// sets and materialize the exception, and the top-level one additionally
-/// passes the virtualizable frame box, forcing the vable.
+/// `record_{,inline_,top_level_}application_traceback` hooks cannot be: they
+/// carry `default_effect_info()` — `EffectInfo::MOST_GENERAL`, i.e. random
+/// effects — so the optimizer escapes every argument, forces all lazy sets
+/// and drops the whole heapcache, and the top-level one additionally passes
+/// the virtualizable frame box, forcing the vable.
 ///
 /// Returns `false` when nothing was emitted; the caller then keeps the
 /// opaque hook.
@@ -815,30 +817,37 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
 /// exception's current traceback.  Sound only where the caller has proven
 /// the exception carries no prior node (`fbw_built_exc_take`); the general
 /// case is [`record_prepend_application_traceback`].
+///
+/// Returns `false` when nothing was emitted; the caller then keeps the
+/// opaque hook.
 fn record_fresh_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) {
+) -> bool {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return;
+        return false;
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return;
+        return false;
     }
-    let Some(mut site) = traceback_node_site(ctx, opcode_position) else {
-        return;
+    let Some(site) = traceback_node_site(ctx, opcode_position) else {
+        return false;
     };
     if site.frame.is_none() {
-        // No hook fallback on this route — the exception is one this walk
-        // built, so a frameless node still beats dropping it.  `tb_frame`
-        // answers None and the GC custom trace skips the null edge.
-        site.frame = ctx.trace_ctx.const_ref(0);
+        // No materialized frame for this level.  The opaque inline hook
+        // fabricates one from the promoted callee metadata
+        // (`record_inline_traceback_for_recording`), so `tb_frame` keeps
+        // answering a real frame; a null one answers None and breaks every
+        // consumer that follows `tb_frame.f_code` — `traceback.print_exc`
+        // among them.
+        return false;
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
     emit_traceback_node(ctx, exc, kind, &site, w_next);
+    true
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -9313,31 +9322,32 @@ fn handle<Sym: WalkSym>(
             if !recording_instruction_is_bare_reraise(ctx, op.pc) {
                 let caught_in_frame = try_catch_exception_at(code, op.next_pc).is_some();
                 if caught_in_frame {
-                    if freshly_normalized {
-                        record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc);
+                    // Unless this walk built the exception it may already
+                    // carry callee nodes, so the general case prepends onto
+                    // its chain rather than starting a fresh one.  Either
+                    // recorder declining leaves the node to the opaque hook,
+                    // which fabricates the frame the walk has no box for.
+                    let emit_runtime = if freshly_normalized {
+                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)
                     } else {
-                        // The exception may already carry callee nodes, so
-                        // the node prepends onto its chain rather than
-                        // starting a fresh one.
-                        let emit_runtime =
-                            !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc);
-                        record_inline_application_traceback(
-                            ctx,
-                            exc,
-                            concrete_exc,
-                            op.pc,
-                            false,
-                            emit_runtime,
-                        );
-                        record_top_level_application_traceback(
-                            ctx,
-                            exc,
-                            concrete_exc,
-                            op.pc,
-                            false,
-                            emit_runtime,
-                        );
-                    }
+                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)
+                    };
+                    record_inline_application_traceback(
+                        ctx,
+                        exc,
+                        concrete_exc,
+                        op.pc,
+                        false,
+                        emit_runtime,
+                    );
+                    record_top_level_application_traceback(
+                        ctx,
+                        exc,
+                        concrete_exc,
+                        op.pc,
+                        false,
+                        emit_runtime,
+                    );
                 }
             }
             // Route the top-level raise through `SubRaise` so walk()'s
