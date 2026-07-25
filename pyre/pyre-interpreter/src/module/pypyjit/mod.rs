@@ -16,7 +16,9 @@
 ///   * `set_param(name=value, ...)` — keyword arguments.
 ///
 /// Both forms funnel through the JIT's authoritative `set_user_param` parser
-/// (`call::set_jit_param_string`) so no parameter table is duplicated here.
+/// (`call::set_jit_param_string`); the keyword form additionally validates each
+/// name against `unroll_parameters`, reading the JIT's own table rather than
+/// duplicating it.
 fn set_param(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -41,10 +43,12 @@ fn set_param(
         }
     }
 
-    // interp_jit.py:157-167 — keyword arguments. Re-serialize each `name=value`
+    // interp_jit.py:159-170 — keyword arguments. Re-serialize each `name=value`
     // pair into one parameter string so the JIT-side parser stays the single
     // source of truth. `enable_opts` carries a string value; every other
-    // parameter is an integer (`space.int_w` rejects a non-int value here).
+    // parameter is an integer (`space.int_w` rejects a non-int value here) whose
+    // name is looked up in `unroll_parameters` (rlib/jit.py:606) before it is
+    // accepted.
     if let Some(kw_dict) = kwds {
         let mut parts: Vec<String> = Vec::new();
         for (k, v) in unsafe { pyre_object::dictmultiobject::w_dict_items(kw_dict) } {
@@ -60,6 +64,14 @@ fn set_param(
                 parts.push(format!("{key}={value}"));
             } else {
                 let value = crate::baseobjspace::int_w(v)?;
+                let known = majit_metainterp::jit::UNROLL_PARAMETERS
+                    .iter()
+                    .any(|&(name, _)| name == key && name != "enable_opts");
+                if !known {
+                    return Err(crate::PyError::type_error(format!(
+                        "no JIT parameter '{key}'"
+                    )));
+                }
                 parts.push(format!("{key}={value}"));
             }
         }

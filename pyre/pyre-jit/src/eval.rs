@@ -4474,24 +4474,35 @@ fn apply_jit_param_string(
     } else if text == "default" {
         ws.set_default_params();
     } else {
-        // rlib/jit.py:850-862 — "name=value,name=value"
+        // rlib/jit.py:850-874 — "name=value,name=value"
         for s in text.split(',') {
             let s = s.trim();
             if s.is_empty() {
                 continue;
             }
-            // rlib/jit.py:853 — len(parts) != 2 → raise ValueError
-            let Some((name, value)) = s.split_once('=') else {
-                return Err(());
-            };
-            let value = value.trim();
-            if name == "enable_opts" {
-                ws.set_param_enable_opts(value);
-            } else if let Ok(parsed) = value.parse::<i64>() {
-                ws.set_param(name, parsed);
-            } else {
+            // rlib/jit.py:852-856 — len(parts) != 2 → raise ValueError
+            let parts: Vec<&str> = s.split('=').collect();
+            if parts.len() != 2 {
                 return Err(());
             }
+            let name = parts[0];
+            let value = parts[1].trim();
+            if name == "enable_opts" {
+                ws.set_param_enable_opts(value);
+                continue;
+            }
+            // rlib/jit.py:860-874 — the name must be one of unroll_parameters;
+            // anything else falls through to the loop's `else: raise ValueError`.
+            let known = majit_metainterp::jit::UNROLL_PARAMETERS
+                .iter()
+                .any(|&(name1, _)| name1 == name && name1 != "enable_opts");
+            if !known {
+                return Err(());
+            }
+            let Ok(parsed) = value.parse::<i64>() else {
+                return Err(());
+            };
+            ws.set_param(name, parsed);
         }
     }
     Ok(())

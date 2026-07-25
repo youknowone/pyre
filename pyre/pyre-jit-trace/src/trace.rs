@@ -1720,8 +1720,11 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     unsafe {
         for i in 0..per_frame.len() {
             let callee = per_frame[i].0 as *mut pyre_interpreter::PyFrame;
-            let f_back = if i == 0 { cf_addr as i64 } else { per_frame[i - 1].0 }
-                as *mut pyre_interpreter::PyFrame;
+            let f_back = if i == 0 {
+                cf_addr as i64
+            } else {
+                per_frame[i - 1].0
+            } as *mut pyre_interpreter::PyFrame;
             if std::ptr::eq(callee, f_back) {
                 continue;
             }
