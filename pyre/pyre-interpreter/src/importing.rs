@@ -516,6 +516,10 @@ pub fn install_builtin_modules() {
     // `_winapi` import even though the Windows build installs `posix`.
     #[cfg(windows)]
     pyre_install_module!(_winapi);
+    // `importlib._bootstrap_external` eagerly `import winreg`s on win32; the
+    // module must exist for the import machinery (and `import site`) to start.
+    #[cfg(windows)]
+    pyre_install_module!(winreg);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));

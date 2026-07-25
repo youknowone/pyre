@@ -104,4 +104,6 @@ pub mod termios;
 pub mod thread;
 pub mod time;
 pub mod unicodedata;
+#[cfg(windows)]
+pub mod winreg;
 pub mod zlib;
