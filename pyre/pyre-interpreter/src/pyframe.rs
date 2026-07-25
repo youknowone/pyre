@@ -2235,8 +2235,17 @@ impl PyFrame {
     /// `createframe` (PyPy `baseobjspace.py:796`) so every heap-allocated
     /// `PyFrame` flows through the canonical entry point.
     pub fn new(code: CodeObject) -> FrameBox {
-        Self::new_with_context(code, Rc::new(PyExecutionContext::default()))
-            .expect("PyFrame::new: test entry code must not carry freevars")
+        let frame = Self::new_with_context(code, Rc::new(PyExecutionContext::default()))
+            .expect("PyFrame::new: test entry code must not carry freevars");
+        // `threadlocals.py:enter_thread` — the ExecutionContext slot belongs to
+        // the OS-thread locals and is installed once at thread entry, not
+        // re-stamped per frame.  The other entry points do this themselves
+        // (`pyrex/src/lib.rs`, `pyre-wasm/src/lib.rs`); as the remaining entry
+        // point this one must too, or `space.getexecutioncontext()` stays null
+        // and every context reached through it — the class-body frame's
+        // builtins among them — falls back to the empty default.
+        crate::call::set_last_exec_ctx(frame.execution_context);
+        frame
     }
 
     /// Module-entry adapter for `createframe` — leaks owned arguments
