@@ -2938,6 +2938,19 @@ impl TraceCtx {
     }
 
     /// Record GUARD_NOT_FORCED (must follow a call_may_force).
+    ///
+    /// Recorder-layer primitive only — `history.record0(rop.GUARD_NOT_FORCED,
+    /// None)` (`pyjitpl.py:2598`), NOT `generate_guard`.  The op leaves this
+    /// call with `rd_resume_position == -1`; the metainterp layer owns the
+    /// matching `capture_resumedata(resumepc, after_residual_call=True)`
+    /// (`pyjitpl.py:2603`) and must attach it, or
+    /// `store_final_boxes_in_guard` reaches `resume.py:396-397`
+    /// `assert resume_position >= 0` with nothing to read.  The two production
+    /// recorders both do: `pyjitpl/dispatch.rs
+    /// finalize_standard_virtualizable_may_force` goes through
+    /// `record_state_guard`, and the walker pairs its
+    /// `record_guard(GuardNotForced, …)` with
+    /// `walker_capture_snapshot_for_last_guard`.
     pub fn guard_not_forced(&mut self, num_live: usize) -> OpRef {
         self.record_guard(OpCode::GuardNotForced, &[], num_live)
     }

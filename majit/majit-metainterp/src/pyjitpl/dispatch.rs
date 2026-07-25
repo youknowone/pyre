@@ -1040,6 +1040,7 @@ where
     }
 
     fn finalize_standard_virtualizable_may_force(
+        &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
         active: Option<ActiveStandardVirtualizable>,
@@ -1054,7 +1055,31 @@ where
                 Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
             TraceAction::Abort
         } else {
-            ctx.guard_not_forced(sym.total_slots());
+            // pyjitpl.py:2079 `generate_guard(rop.GUARD_NOT_FORCED)` runs the
+            // recorded guard through `capture_resumedata(resumepc,
+            // after_residual_call=True)` (pyjitpl.py:2599-2603) exactly like
+            // the exception guards that follow it, so the guard reaches
+            // `store_final_boxes_in_guard` with a valid `rd_resume_position`
+            // (resume.py:396-397).  A bare `record_guard` leaves it at -1,
+            // which the optimizer can only rescue through a patchguardop
+            // ancestor.
+            //
+            // `code_cursor` is post-call and already points at this residual
+            // call's trailing `-live-` marker, which the `after_residual_call`
+            // snapshot reads directly (frame.rs:846-849); `MIFrame::pc` is
+            // only the saved resume position and stays 0 in an inline
+            // sub-frame.  Same source as
+            // `finish_residual_call_exception_path`, which records the
+            // GUARD_NO_EXCEPTION that follows this guard.
+            let resume_pc = self.frames.current_mut().code_cursor;
+            self.record_state_guard(
+                ctx,
+                sym,
+                OpCode::GuardNotForced,
+                &[],
+                resume_pc,
+                /* after_residual_call */ true,
+            );
             TraceAction::Continue
         }
     }
@@ -2609,7 +2634,7 @@ where
         }
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         if matches!(
-            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
             TraceAction::Abort
         ) {
             return TraceAction::Abort;
@@ -5586,7 +5611,7 @@ where
                     //    GUARD_NO_EXCEPTION.
                     if is_forces
                         && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable,),
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
                         )
                     {
@@ -5896,7 +5921,7 @@ where
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable,),
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
                         )
                     {
@@ -6150,7 +6175,7 @@ where
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable,),
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
                         )
                     {
@@ -6392,7 +6417,7 @@ where
                     self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
                     if is_forces
                         && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable,),
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
                         )
                     {
@@ -6480,7 +6505,7 @@ where
                 //    (pyjitpl.py:2078-2079)
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
-                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
@@ -6716,7 +6741,7 @@ where
                 self.set_int_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
-                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
@@ -6789,7 +6814,7 @@ where
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
-                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
@@ -6873,7 +6898,7 @@ where
                 self.set_float_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
-                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                     TraceAction::Abort
                 ) {
                     return TraceAction::Abort;
