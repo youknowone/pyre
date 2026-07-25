@@ -1343,6 +1343,44 @@ pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
     Some(python_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc) as usize)
 }
 
+/// Every pc in `body_code` that some op can branch to: the `goto` family and
+/// `catch_exception` carry their target as the label operand, and
+/// `int_*_jump_if_ovf` carries an overflow target ahead of its operands.
+///
+/// `None` when an op carries a label this decode cannot locate — a var-list
+/// or a pyre payload ahead of the `L` — since a missed target would let a
+/// freshness claim survive a join it does not hold across.
+fn body_branch_targets(body_code: &[u8]) -> Option<std::collections::HashSet<usize>> {
+    let mut targets = std::collections::HashSet::new();
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let d = crate::jitcode_runtime::decode_op_at(body_code, pc)?;
+        if d.argcodes.contains('L') {
+            // Operand widths follow `decode_op_at`; only the fixed-width forms
+            // can precede the label, so anything else gives up.
+            let mut cursor = d.pc + 1;
+            let mut target = None;
+            for operand in d.argcodes.chars() {
+                match operand {
+                    'L' => {
+                        target = Some(u16::from_le_bytes([
+                            *body_code.get(cursor)?,
+                            *body_code.get(cursor + 1)?,
+                        ]) as usize);
+                        break;
+                    }
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'd' | 'j' => cursor += 2,
+                    _ => break,
+                }
+            }
+            targets.insert(target?);
+        }
+        pc = d.next_pc;
+    }
+    Some(targets)
+}
+
 /// Replay safety of one inline candidate's body inside a FOR_ITER body, as
 /// judged by [`fbw_callee_body_replay_safety`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1377,8 +1415,9 @@ pub(crate) enum CalleeReplaySafety {
 /// `BUILD_LIST` fill their backing block this way).  Freshness may pass
 /// through `ref_copy`, but every other Ref-producing instruction clears it,
 /// so a later store cannot accidentally be classified as an initialization of
-/// an earlier allocation, and every branch drops the whole set — past control
-/// flow the scan cannot say which allocation a register holds.
+/// an earlier allocation, and every branch target drops the whole set — a
+/// register reaching a join can hold whichever allocation the taken path put
+/// there, which this straight-line scan cannot name.
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
     args_all_numeric: bool,
@@ -1386,10 +1425,16 @@ pub(crate) fn fbw_callee_body_replay_safety(
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
 ) -> CalleeReplaySafety {
+    let Some(branch_targets) = body_branch_targets(body_code) else {
+        return CalleeReplaySafety::Dirty;
+    };
     let mut fresh_ref_regs = [false; u8::MAX as usize + 1];
     let mut deferred_call = false;
     let mut pc = 0usize;
     while pc < body_code.len() {
+        if branch_targets.contains(&pc) {
+            fresh_ref_regs = [false; u8::MAX as usize + 1];
+        }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             return CalleeReplaySafety::Dirty;
         };
@@ -1491,11 +1536,6 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // Interior/raw stores and non-residual call forms cannot be proven
             // replay-safe from this single callee body.
             return CalleeReplaySafety::Dirty;
-        } else if d.opname.starts_with("goto") || d.opname.starts_with("label") {
-            // Freshness is a straight-line property.  Past a branch or a join
-            // the scan cannot say which allocation a register holds, so drop
-            // every freshness claim rather than carry one across control flow.
-            fresh_ref_regs = [false; u8::MAX as usize + 1];
         }
 
         // The result byte is always the final operand for `>r` forms.
