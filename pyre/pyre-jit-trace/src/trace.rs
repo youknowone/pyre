@@ -3733,6 +3733,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                         finish_args: vec![],
                         finish_arg_types: vec![],
                         exit_with_exception: false,
+                        exc_value: 0,
                     },
                     // A top-level uncaught raise stashes the exception box as an
                     // `is_exception` payload (`fbw_terminate_with_raise`): build
@@ -3745,11 +3746,17 @@ fn full_body_walk_trace<Sym: WalkSym>(
                         finish_args: vec![exc],
                         finish_arg_types: vec![majit_ir::Type::Ref],
                         exit_with_exception: true,
+                        // The full-body walk delivers its own uncaught raise
+                        // through `WALK_END_PROPAGATED_EXCEPTION` (:557), so the
+                        // `raise` half of `finishframe_exception` is already
+                        // covered and no value needs to ride the action.
+                        exc_value: 0,
                     },
                     Some((finish_value, finish_type)) => TraceAction::Finish {
                         finish_args: vec![finish_value],
                         finish_arg_types: vec![finish_type],
                         exit_with_exception: false,
+                        exc_value: 0,
                     },
                     None => {
                         crate::jitcode_dispatch::census_record("Terminate::NoFinishPayload");

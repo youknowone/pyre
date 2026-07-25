@@ -2796,6 +2796,10 @@ impl<S: JitState> JitDriver<S> {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception,
+                // The full-body walk delivers the `raise` half of
+                // `pyjitpl.py:2558-2562` itself (`WALK_END_PROPAGATED_EXCEPTION`),
+                // so this consumer only runs the compile half.
+                exc_value: _,
             } => {
                 // A terminal dispatch return is also a valid single-pass
                 // handoff: the interpreted function has returned, so native

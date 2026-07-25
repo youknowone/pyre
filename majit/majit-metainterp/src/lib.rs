@@ -368,6 +368,17 @@ pub enum TraceAction {
         finish_args: Vec<OpRef>,
         finish_arg_types: Vec<Type>,
         exit_with_exception: bool,
+        /// The concrete exception object this finish escapes with, as a raw
+        /// GC-ref word (`0` when `exit_with_exception` is false).
+        ///
+        /// `pyjitpl.py:2530-2562 finishframe_exception` snapshots
+        /// `excvalue = self.last_exc_value` *before* calling
+        /// `compile_exit_frame_with_exception(self.last_exc_box)` and then
+        /// raises `jitexc.ExitFrameWithExceptionRef(excvalue)`, which
+        /// `warmspot.py:998-1005` re-raises out of `ll_portal_runner`.  The
+        /// compile half consumes only the symbolic `finish_args`; the raise
+        /// half needs the value, so it travels alongside them.
+        exc_value: i64,
     },
     /// Close and compile a segmented loop (force_finish_trace).
     /// pyjitpl.py:1622 _create_segmented_trace_and_blackhole parity.

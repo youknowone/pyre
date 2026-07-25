@@ -1783,10 +1783,24 @@ where
         // shortcuts to Abort for that case, so here the exception slot
         // is guaranteed non-zero).
         if let Some(exc_box) = self.last_exception_box {
+            // `pyjitpl.py:2531 excvalue = self.last_exc_value`, snapshotted
+            // next to `last_exc_box` so the consumer can raise it after the
+            // compile (`pyjitpl.py:2558-2562`).
+            let exc_value = self.last_exception_value;
+            // Upstream's `last_exc_value` dies with the MetaInterp the moment
+            // `finishframe_exception` raises out of it.  Pyre's half of that
+            // state is the `BH_LAST_EXC_VALUE` TLS shared with the blackhole,
+            // and every *other* way out of a frame clears it (`clear_exception`
+            // at each `BC_*_RETURN`).  This exit hands the value to the caller
+            // on the action instead, so the channel closes here too — leaving it
+            // set makes the interpreter re-surface the trace's exception at its
+            // next residual-call boundary.
+            self.clear_exception();
             TraceAction::Finish {
                 finish_args: vec![exc_box],
                 finish_arg_types: vec![majit_ir::Type::Ref],
                 exit_with_exception: true,
+                exc_value,
             }
         } else {
             TraceAction::Abort
@@ -5168,6 +5182,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Int],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5202,6 +5217,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Int],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5232,6 +5248,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Ref],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5262,6 +5279,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Float],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5279,6 +5297,7 @@ where
                         finish_args: vec![],
                         finish_arg_types: vec![],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
                 // Sub-frame void return: caller resumes; nothing to write.
@@ -8633,6 +8652,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => (finish_args, finish_arg_types),
             other => panic!("expected Finish[Int] from recursive-call portal, got {other:?}"),
         };
@@ -8847,6 +8867,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
                 finish_args
@@ -8931,6 +8952,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Ref]);
                 finish_args
@@ -8995,6 +9017,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Float]);
                 finish_args
@@ -9059,6 +9082,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert!(finish_args.is_empty(), "void return has no finish args");
                 assert!(
@@ -9206,6 +9230,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
                 finish_args
@@ -10399,6 +10424,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception,
+                ..
             } => (finish_args, finish_arg_types, exit_with_exception),
             other => panic!(
                 "expected TraceAction::Finish for handler-less raise, got {:?}",
