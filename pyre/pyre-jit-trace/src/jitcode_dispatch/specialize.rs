@@ -2197,6 +2197,100 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// FBW virtualization of the array-backed BUILD_TUPLE — the arities
+/// `makespecialisedtuple2` does not claim.  Sibling of
+/// [`try_walker_specialize_newtuple`] (arity-2 plain-int `spec_ii`) and
+/// [`try_walker_specialize_newlist`], reached only after the `spec_ii` fold
+/// declines, so that path stays byte-identical.
+///
+/// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` +
+/// per-index `setarrayitem_gc` + a `newtuple_from_array` residual.  Re-emit the
+/// canonical `W_TupleObject` shape walker-native (`new_with_vtable` +
+/// `w_class` / `wrappeditems` `setfield_gc` over a fresh items block), reading
+/// the elements straight out of the array heap-cache so the array build keeps
+/// no consumer and DCEs.  A tuple that never escapes then folds away entirely,
+/// and one that does escape materializes from the same fields the residual
+/// would have written.
+///
+/// Arity 2 is `makespecialisedtuple2` territory (`Cls_ii` / `Cls_ff` /
+/// `Cls_oo`, `specialisedtupleobject.py`): the runtime never builds an
+/// array-backed tuple there, so emitting one would diverge from what the
+/// blackhole rebuilds on deopt.  Declined here — the `spec_ii` fold owns the
+/// int-int case and the residual owns the rest.  The empty tuple is declined
+/// too (no element to recover a length from).
+///
+/// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
+/// residual, which stays correct for any shape — a non-const array length or
+/// an element without a concrete Ref shadow is not declined, just not folded.
+pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+    let arr = r_args[0];
+    // Const backing-array length (`new_array_clear(Const(len))` seeded
+    // `heapcache.arraylen`; a cleared array has every slot set, so read the
+    // length directly rather than probing getarrayitem until a miss).
+    let len = {
+        let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+            return Ok(None);
+        };
+        match len_op.inline_const_to_value() {
+            Some(majit_ir::Value::Int(n)) if n >= 1 => n as usize,
+            _ => return Ok(None),
+        }
+    };
+    if len == 2 {
+        return Ok(None);
+    }
+
+    // Element boxes the BUILD_TUPLE `setarrayitem_gc` ops stored; a cache miss
+    // (clobbered array / non-const index) bails to the opaque residual.
+    let descr_idx = crate::state::pyobject_gcarray_descr().index();
+    let mut items: Vec<OpRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        let Some(elem) =
+            ctx.trace_ctx
+                .heapcache_getarrayitem(arr, OpRef::ConstInt(i as i64), descr_idx)
+        else {
+            return Ok(None);
+        };
+        items.push(elem);
+    }
+    let mut concretes: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for &it in &items {
+        let Some(obj) = walker_concrete_ref_object(ctx, it) else {
+            return Ok(None);
+        };
+        concretes.push(obj);
+    }
+
+    // Concrete shadow: a fresh array-backed tuple from the element shadows
+    // (`w_tuple_new` parity for every arity but 2). A new allocation with no
+    // heap mutation, safe during the walk like `wrapint`.  Built before the
+    // emit so a failure leaves no orphan ops in the trace.
+    let result_concrete = pyre_object::w_tuple_new_array_backed(concretes);
+    if result_concrete.is_null() {
+        return Ok(None);
+    }
+
+    let tuple_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items);
+    ctx.trace_ctx.set_opref_concrete(
+        tuple_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_concrete as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple_op)?;
+    Ok(Some(()))
+}
+
 /// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual

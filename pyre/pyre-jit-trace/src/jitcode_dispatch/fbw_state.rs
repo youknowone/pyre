@@ -1369,12 +1369,16 @@ pub(crate) enum CalleeReplaySafety {
 /// [`fbw_abort_nested_unjournaled_residual`], which aborts before executing a
 /// residual that did not inline.  Every other unproven residual is `Dirty`.
 ///
-/// A `new_with_vtable/d>r` result is fresh within this body.  Its
-/// initialization write is benign only when the target field is immutable;
-/// `wrapint` is the important instance (`W_IntObject.intval`).  Freshness may
-/// pass through `ref_copy`, but every other Ref-producing instruction clears
-/// it, so a later `setfield_gc` cannot accidentally be classified as an
-/// initialization of an earlier allocation.
+/// A `new_with_vtable/d>r` or `new_array*` result is fresh within this body.
+/// A `setfield_gc` initialization write into one is benign only when the
+/// target field is immutable (`wrapint` is the important instance,
+/// `W_IntObject.intval`); a `setarrayitem_gc` into a fresh array is benign
+/// outright, since replay writes the replay's own array (`BUILD_TUPLE` /
+/// `BUILD_LIST` fill their backing block this way).  Freshness may pass
+/// through `ref_copy`, but every other Ref-producing instruction clears it,
+/// so a later store cannot accidentally be classified as an initialization of
+/// an earlier allocation, and every branch drops the whole set — past control
+/// flow the scan cannot say which allocation a register holds.
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
     args_all_numeric: bool,
@@ -1410,12 +1414,16 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // `load_const` / `load_global` / `box_int` are tagged `CanRaise`
             // only to keep the `_OS_CANRAISE` invariant (effectinfo.rs); each
             // is a read or a fresh allocation, so re-running one commits
-            // nothing to the live heap.
+            // nothing to the live heap.  The BUILD_TUPLE / BUILD_LIST array
+            // consumers are the same shape one level up: they read a
+            // freshly-built backing array and return a brand-new container.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
                     | majit_ir::PyreHelperKind::LoadGlobal
                     | majit_ir::PyreHelperKind::BoxInt
+                    | majit_ir::PyreHelperKind::NewtupleFromArray
+                    | majit_ir::PyreHelperKind::NewlistFromArray
             );
             let provably_side_effect_free = replay_safe_read
                 || ei.check_is_elidable()
@@ -1438,7 +1446,9 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 // inline.
                 if matches!(
                     ei.pyre_helper,
-                    majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
+                    majit_ir::PyreHelperKind::CallFn
+                        | majit_ir::PyreHelperKind::CallKw
+                        | majit_ir::PyreHelperKind::CallFunctionEx
                 ) {
                     deferred_call = true;
                 } else {
@@ -1459,16 +1469,33 @@ pub(crate) fn fbw_callee_body_replay_safety(
             if !fresh_ref_regs[target_reg as usize] || !immutable_field {
                 return CalleeReplaySafety::Dirty;
             }
-        } else if d.opname.starts_with("setarrayitem_gc")
-            || d.opname.starts_with("setinteriorfield_gc")
+        } else if d.opname.starts_with("setarrayitem_gc") {
+            // The dual of the `setfield_gc` rule: a store into an array this
+            // body just allocated is an initialization, not a live-heap write,
+            // so replaying it writes the replay's own fresh array.  The
+            // canonical shapes put the array register in operand 0 (`r…`); the
+            // `iiid` raw-address form carries no array register to prove fresh.
+            let target_fresh = d.argcodes.starts_with('r')
+                && body_code
+                    .get(d.pc + 1)
+                    .is_some_and(|reg| fresh_ref_regs[*reg as usize]);
+            if !target_fresh {
+                return CalleeReplaySafety::Dirty;
+            }
+        } else if d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
             || d.opname.starts_with("cond_call")
             || d.opname.starts_with("call_assembler")
             || d.opname.starts_with("inline_call")
         {
-            // Array/interior/raw stores and non-residual call forms cannot be
-            // proven replay-safe from this single callee body.
+            // Interior/raw stores and non-residual call forms cannot be proven
+            // replay-safe from this single callee body.
             return CalleeReplaySafety::Dirty;
+        } else if d.opname.starts_with("goto") || d.opname.starts_with("label") {
+            // Freshness is a straight-line property.  Past a branch or a join
+            // the scan cannot say which allocation a register holds, so drop
+            // every freshness claim rather than carry one across control flow.
+            fresh_ref_regs = [false; u8::MAX as usize + 1];
         }
 
         // The result byte is always the final operand for `>r` forms.
@@ -1477,6 +1504,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 return CalleeReplaySafety::Dirty;
             };
             fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
+                || d.opname.starts_with("new_array")
                 || (d.key == "ref_copy/r>r"
                     && body_code
                         .get(d.pc + 1)

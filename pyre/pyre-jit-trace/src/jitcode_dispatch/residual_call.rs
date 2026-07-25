@@ -2575,6 +2575,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // The arities `makespecialisedtuple2` does not claim take the canonical
+    // array-backed `W_TupleObject` shape instead, so a non-escaping BUILD_TUPLE
+    // of any width folds away rather than allocating through the opaque
+    // residual.  Reached only after the `spec_ii` fold above declines; falls
+    // through to the residual for any shape it cannot reproduce (SAFE — never
+    // declined).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::NewtupleFromArray
+        && try_walker_specialize_newtuple_object(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // #171: virtualize a non-escaping BUILD_LIST (`newlist_from_array`) by
     // decomposing it into the `opimpl_newlist` shape (`pyjitpl.py`) —
     // `new_with_vtable` + `new_array` + `setarrayitem_gc` + `setfield_gc` —

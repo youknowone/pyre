@@ -1346,6 +1346,65 @@ unsafe fn fbw_reorder_call_kw_args(
     Some((out_args, out_conc))
 }
 
+/// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
+/// kwargs_or_null)` star tuple into the positional argument boxes the inline
+/// path seeds from, or `None` to leave the call a residual.
+///
+/// The elements are read out of the heap cache rather than off the tuple, so
+/// this folds exactly when the star tuple is virtual at the call — the
+/// `args = (...)` / `f(*args)` pair the walker just recorded, whose
+/// `wrappeditems` block and per-index stores are still cached
+/// (`try_walker_specialize_newtuple_object`).  A tuple that arrived from
+/// anywhere else has no cached block and declines, as does any `**kwargs`
+/// merge (the helper's `kwargs_or_null` is then a real mapping) and any arity
+/// that is not the callee's exact parameter count.
+fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+    arg_concretes: &[ConcreteValue],
+    nparams: usize,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if r_args.len() < 4 || arg_concretes.len() < 4 || nparams == 0 {
+        return None;
+    }
+    // `kwargs_or_null` is the checked `PY_NULL` sentinel for a call with no
+    // `**` merge; anything else is a real mapping this fold does not bind.
+    match arg_concretes[3] {
+        ConcreteValue::Null => {}
+        ConcreteValue::Ref(kwargs) if kwargs.is_null() || kwargs == pyre_object::PY_NULL => {}
+        _ => return None,
+    }
+    let starargs = r_args[2];
+    let items_descr = crate::descr::tuple_wrappeditems_descr();
+    let block = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(starargs, items_descr.index())?;
+    // The cached length pins the arity: the callee takes exactly `nparams`
+    // positional parameters, and a mismatch is a runtime TypeError the inline
+    // path does not model.
+    let len_op = ctx.trace_ctx.heap_cache().arraylen(block)?;
+    match len_op.inline_const_to_value() {
+        Some(majit_ir::Value::Int(n)) if n as usize == nparams => {}
+        _ => return None,
+    }
+    let array_descr_index = crate::state::pyobject_gcarray_descr().index();
+    let mut args = Vec::with_capacity(nparams);
+    let mut concretes = Vec::with_capacity(nparams);
+    for index in 0..nparams {
+        let elem = ctx.trace_ctx.heapcache_getarrayitem(
+            block,
+            OpRef::ConstInt(index as i64),
+            array_descr_index,
+        )?;
+        // Take each concrete from the element box itself, not from the tuple,
+        // so the seeded shadow is the one the symbolic argument carries.
+        let concrete = walker_concrete_ref_object(ctx, elem)?;
+        args.push(elem);
+        concretes.push(ConcreteValue::Ref(concrete));
+    }
+    Some((args, concretes))
+}
+
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -1375,7 +1434,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // residual_call site (inlinable calls get their own inline_call jitcodes);
     // this restores that invariant for the pyre FBW inline-at-residual lever.
     let is_call_kw = pyre_helper == majit_ir::PyreHelperKind::CallKw;
-    if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw {
+    let is_call_function_ex = pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
+    if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw && !is_call_function_ex {
         return Ok(None);
     }
     if r_args.is_empty() {
@@ -1427,6 +1487,19 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             return Ok(None);
         };
         reordered
+    } else if is_call_function_ex {
+        // `f(*args)` unpacks the star tuple into positional arguments, which is
+        // a trace-time reorder whenever the tuple is the one this trace just
+        // built: its element boxes are still in the heap cache, so the callee
+        // seeds from them and the tuple keeps no consumer.
+        if method_form {
+            return Ok(None);
+        }
+        let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
+        else {
+            return Ok(None);
+        };
+        unpacked
     } else {
         let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
         let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
