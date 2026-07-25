@@ -43,6 +43,13 @@ pub struct LiveVars {
     /// RPython JitCode treats stack as registers with liveness.
     /// For Python bytecodes, stack depth determines which slots are live.
     stack_depth_at: Vec<usize>,
+    /// Memoized per-Python-PC `u16` depth table (`stack_depth_at`
+    /// truncated to `n`, `usize::MAX` sentinel → 0, saturated to
+    /// `u16::MAX`).  Built once on first `depth_at_py_pc` call: the
+    /// resume/handback paths query it repeatedly per compiled code
+    /// object, and `LiveVars` is immutable after construction and
+    /// cached per code pointer by `liveness_for`.
+    depth_u16: std::sync::OnceLock<Vec<u16>>,
 }
 
 impl LiveVars {
@@ -57,6 +64,7 @@ impl LiveVars {
                 defined_bits: Vec::new(),
                 words_per_pc: 0,
                 stack_depth_at: Vec::new(),
+                depth_u16: std::sync::OnceLock::new(),
             };
         }
         let nlocals = code.varnames.len().max(1);
@@ -422,6 +430,7 @@ impl LiveVars {
             defined_bits,
             words_per_pc,
             stack_depth_at,
+            depth_u16: std::sync::OnceLock::new(),
         }
     }
 
@@ -486,21 +495,26 @@ impl LiveVars {
     /// guards or be the resume target.  `usize` values exceeding
     /// `u16::MAX` saturate; CPython's max stack depth fits comfortably
     /// inside `u16` for realistic bytecode.
-    pub fn depth_at_py_pc(&self) -> Vec<u16> {
-        // `stack_depth_at` has length `n + 1` (entry + each instr's
-        // post-state); the metadata table indexes per Python PC, so
-        // truncate to `n`.
-        let n = self.stack_depth_at.len().saturating_sub(1);
-        self.stack_depth_at[..n]
-            .iter()
-            .map(|&d| {
-                if d == usize::MAX {
-                    0
-                } else {
-                    u16::try_from(d).unwrap_or(u16::MAX)
-                }
-            })
-            .collect()
+    pub fn depth_at_py_pc(&self) -> &[u16] {
+        // Built once and memoized: `liveness_for` caches this `LiveVars`
+        // per code pointer, and the resume/handback callers query the
+        // table repeatedly per code object.
+        self.depth_u16.get_or_init(|| {
+            // `stack_depth_at` has length `n + 1` (entry + each instr's
+            // post-state); the metadata table indexes per Python PC, so
+            // truncate to `n`.
+            let n = self.stack_depth_at.len().saturating_sub(1);
+            self.stack_depth_at[..n]
+                .iter()
+                .map(|&d| {
+                    if d == usize::MAX {
+                        0
+                    } else {
+                        u16::try_from(d).unwrap_or(u16::MAX)
+                    }
+                })
+                .collect()
+        })
     }
 }
 
