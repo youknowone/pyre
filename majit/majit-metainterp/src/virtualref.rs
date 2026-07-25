@@ -122,6 +122,22 @@ pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
     }
 }
 
+/// `virtualref.py:177 return vref.forced` — the object a vref has already
+/// been forced to, read without forcing.
+///
+/// For readers that cannot run `force_virtual` at all: forcing materializes an
+/// object, and a garbage collection has no allocator to do it with.  Inside a
+/// collection the only object a vref can name is the one it was already forced
+/// to, so a null result means "still virtual" and the reader must stop there
+/// rather than invent one.
+///
+/// # Safety
+/// `ptr` must satisfy [`ptr_is_virtual_ref`], which the caller checks first.
+#[inline]
+pub unsafe fn vref_forced(ptr: *const u8) -> *mut u8 {
+    unsafe { (*(ptr as *const JitVirtualRef)).forced }
+}
+
 /// `rpython/rlib/jit.py:487 class InvalidVirtualRef(Exception)` —
 /// `force_virtual` raises this when `virtual_token == TOKEN_NONE`
 /// but `forced` is null (`virtualref.py:174-176`).  Pyre's single

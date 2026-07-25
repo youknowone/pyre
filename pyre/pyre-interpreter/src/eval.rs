@@ -537,6 +537,26 @@ pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
 
+/// Advance the root walk one link along the `f_backref` chain.
+///
+/// `f_backref` holds a `jit.virtual_ref`, which at interpreter level is the
+/// caller frame pointer itself; once the JIT virtualizes an inlined callee the
+/// slot instead holds a `JitVirtualRef`, and reading that as a `PyFrame` would
+/// interpret its `virtual_token` word as frame fields.  Hop through the vref
+/// instead.  A still-virtual vref ends the walk: the frames it stands for have
+/// no heap image to visit, and `virtualref.py:157 force_virtual_if_necessary`
+/// cannot run here because materializing one allocates.
+#[inline]
+unsafe fn chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
+    unsafe {
+        if majit_metainterp::virtualref::ptr_is_virtual_ref(f_backref as *const u8) {
+            majit_metainterp::virtualref::vref_forced(f_backref as *const u8) as *mut PyFrame
+        } else {
+            f_backref
+        }
+    }
+}
+
 /// Walk one captured thread's active frame and interpreter root state.
 ///
 /// # Safety
@@ -787,7 +807,7 @@ pub unsafe fn walk_pyframe_roots_area(
                     }
                 }
                 let f = &*frame;
-                let next_frame = (*frame).f_backref;
+                let next_frame = chain_next_frame((*frame).f_backref);
                 if f.locals_cells_stack_w.is_null() {
                     (std::ptr::null_mut::<PyObjectRef>(), 0, next_frame)
                 } else {
