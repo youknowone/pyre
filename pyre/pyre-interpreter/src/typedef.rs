@@ -13931,6 +13931,14 @@ fn init_int_type(ns: PyObjectRef) {
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
+                // `rbigint.tobytes` skips its final sign-fit check when
+                // `nbytes == 0` (rbigint.py:450), and `-1` is the one value
+                // whose two's complement emits no bytes at all, so it falls
+                // through as `b''`.  `_PyLong_AsByteArray` rejects every
+                // nonzero value that does not fit the requested width.
+                if length_i == 0 && signed && val.get_sign() == -1 {
+                    return Err(crate::PyError::overflow_error("int too big to convert"));
+                }
                 // intobject.py:129-141 `descr_to_bytes`: route directly through
                 // rbigint.tobytes.  Besides preserving its exact exception
                 // contract, this is linear in the output length; shifting the

@@ -1412,7 +1412,12 @@ pub unsafe fn alloc_nursery_typed_with_placement(
 ) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_TYPED_WITH_PLACEMENT.get() {
         Some(f) => unsafe { f(type_id, payload_size, needs_write_barrier) },
-        None => GcRef(0),
+        None => {
+            // No backend installed placement reporting, so keep the
+            // conservative creation barrier the sibling fallbacks report.
+            unsafe { *needs_write_barrier = true };
+            GcRef(0)
+        }
     }
 }
 
@@ -1504,7 +1509,12 @@ pub unsafe fn alloc_nursery_collecting_typed_rooted(
 ) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
         Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
-        None => GcRef(0),
+        None => {
+            // No backend installed placement reporting, so keep the
+            // conservative creation barrier the sibling fallbacks report.
+            unsafe { *needs_write_barrier = true };
+            GcRef(0)
+        }
     }
 }
 

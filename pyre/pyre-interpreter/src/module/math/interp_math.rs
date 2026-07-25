@@ -702,9 +702,17 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
     }
     let mut result = get_bigint(args[0])?;
     for &arg in &args[1..] {
+        // Every argument goes through `__index__` even once the running result
+        // is zero: `math_lcm_impl` only short-circuits the arithmetic, so
+        // `math.lcm(0, 1.5)` still raises TypeError.  `app_math.lcm` returns
+        // early instead and skips the remaining conversions.
         let value = get_bigint(arg)?;
-        if result.is_zero() || value.is_zero() {
-            return Ok(w_int_new(0));
+        if result.is_zero() {
+            continue;
+        }
+        if value.is_zero() {
+            result = BigInt::zero();
+            continue;
         }
         let divisor = result.gcd(&value).map_err(map_rbigint_err)?;
         result = result
