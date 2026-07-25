@@ -1355,6 +1355,7 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// state, exactly like PyPy. The next append will pick a fresh typed
 /// strategy via switch_to_correct_strategy.
 pub unsafe fn w_list_clear(obj: PyObjectRef) {
+    let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
     list.drop_object_items();
     list.int_items = IntArray::from_vec(Vec::new());
