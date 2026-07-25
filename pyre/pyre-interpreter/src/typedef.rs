@@ -3344,10 +3344,10 @@ fn super_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 fn super_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if !unsafe { pyre_object::is_str(args[1]) } {
-        return Err(crate::PyError::type_error("attribute name must be string"));
-    }
-    crate::baseobjspace::getattr_str(args[0], unsafe { pyre_object::w_str_get_value(args[1]) })
+    // Routed by name object rather than by `&str` so a name that carries a
+    // lone surrogate takes the surrogate-aware lookup instead of demanding a
+    // view its buffer cannot give; the string check comes with it.
+    crate::baseobjspace::getattr(args[0], args[1])
 }
 
 fn super_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -9712,11 +9712,9 @@ fn init_type_type(ns: PyObjectRef) {
 
     let qualname_getter = make_builtin_function_with_arity(
         "__qualname__",
-        |args| unsafe {
-            Ok(pyre_object::w_str_new(pyre_object::w_type_get_qualname(
-                args[1],
-            )))
-        },
+        // The name object rather than its `&str` view, so an assigned
+        // qualname that carries a lone surrogate reads back unchanged.
+        |args| unsafe { Ok(pyre_object::w_type_get_qualname_obj(args[1])) },
         2,
     );
     let qualname_setter = make_builtin_function_with_arity(
@@ -15961,7 +15959,7 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         // bytearrayobject.py:217 — str source shares bytesobject.newbytesdata_w
         if pyre_object::is_str(arg) {
             let encoding = match w_encoding {
-                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => {
                     return Err(crate::PyError::type_error(
                         "string argument without an encoding",
@@ -15969,7 +15967,7 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 }
             };
             let errors = match w_errors {
-                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => "strict",
             };
             let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
@@ -18734,15 +18732,15 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         }
     }
     let encoding = match w_encoding {
-        Some(e) if unsafe { pyre_object::is_str(e) } => unsafe {
-            pyre_object::w_str_get_value(e).to_string()
-        },
+        Some(e) if unsafe { pyre_object::is_str(e) } => {
+            crate::baseobjspace::str_utf8_w(e)?.to_string()
+        }
         _ => "utf-8".to_string(),
     };
     let errors = match w_errors {
-        Some(e) if unsafe { pyre_object::is_str(e) } => unsafe {
-            pyre_object::w_str_get_value(e).to_string()
-        },
+        Some(e) if unsafe { pyre_object::is_str(e) } => {
+            crate::baseobjspace::str_utf8_w(e)?.to_string()
+        }
         _ => "strict".to_string(),
     };
     let s = decode_bytes_to_wtf8(data, &encoding, errors.as_str())?;
@@ -18975,7 +18973,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     unsafe {
         if pyre_object::is_str(arg) {
             let encoding = match w_encoding {
-                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => {
                     return Err(crate::PyError::type_error(
                         "string argument without an encoding",
@@ -18983,7 +18981,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 }
             };
             let errors = match w_errors {
-                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => "strict",
             };
             let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;

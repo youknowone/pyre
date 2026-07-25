@@ -64,8 +64,11 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let read = |obj: PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
         unsafe {
             if is_str(obj) {
-                let s = w_str_get_value(obj);
-                if !s.is_ascii() {
+                // The ASCII check runs on the raw buffer: a lone surrogate is
+                // non-ASCII, so it takes the same rejection as any other
+                // non-ASCII character.
+                let s = w_str_get_wtf8(obj);
+                if !s.as_bytes().is_ascii() {
                     return Err(crate::PyError::type_error(
                         "comparing strings with non-ASCII characters is not supported",
                     ));

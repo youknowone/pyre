@@ -1359,7 +1359,11 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "memoryview: format argument must be a string",
             ));
         }
-        let fmt = pyre_object::w_str_get_value(fmt_obj).to_owned();
+        // Read through the raw buffer: only the handful of native single-
+        // character codes are accepted, so a lone surrogate is rejected by the
+        // format check below (with the replacement character `Wtf8`'s `Display`
+        // substitutes) the same way any other unsupported format is.
+        let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
         let has_shape = shape_obj.is_some_and(|s| !pyre_object::is_none(s));
         let orig_ndim = w_memoryview_ndim(mv);
         // Casts are restricted to C-contiguous source views.
@@ -3878,7 +3882,7 @@ fn type_descr_new_with_metaclass(
                 crate::baseobjspace::object_functionstr_type_name(w_namespace_dict)
             )));
         }
-        let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+        let name = crate::baseobjspace::str_utf8_w(name_obj)?;
 
         // CPython: calculate_metaclass — if bases have a custom metaclass,
         // delegate to that metaclass instead of using type.__new__ directly.
@@ -7788,19 +7792,15 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
         crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
     })?;
-    let filename = unsafe {
-        if pyre_object::is_str(filename_obj) {
-            pyre_object::w_str_get_value(filename_obj).to_string()
-        } else {
-            "<string>".to_string()
-        }
+    let filename = if unsafe { pyre_object::is_str(filename_obj) } {
+        crate::baseobjspace::str_utf8_w(filename_obj)?.to_string()
+    } else {
+        "<string>".to_string()
     };
-    let mode = unsafe {
-        if pyre_object::is_str(mode_obj) {
-            pyre_object::w_str_get_value(mode_obj).to_string()
-        } else {
-            "exec".to_string()
-        }
+    let mode = if unsafe { pyre_object::is_str(mode_obj) } {
+        crate::baseobjspace::str_utf8_w(mode_obj)?.to_string()
+    } else {
+        "exec".to_string()
     };
     // flags / dont_inherit / optimize are positional-or-keyword ints
     // (unwrap_spec flags=int, dont_inherit=int, optimize=int).
@@ -10404,7 +10404,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "FileIO() argument 'mode' must be str",
         ));
     }
-    let mode = unsafe { pyre_object::w_str_get_value(mode_obj) };
+    let mode = crate::baseobjspace::str_utf8_w(mode_obj)?;
     // PyPy `decode_mode`: exactly one r/w/x/a flag, at most one '+', and
     // optional 'b'.  Keep the individual booleans because `_mode()` derives
     // the public canonical mode from capabilities, not from input spelling
@@ -11438,7 +11438,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             crate::type_methods::arg_type_name(w_mode)
         )));
     }
-    let mode = unsafe { pyre_object::w_str_get_value(w_mode).to_string() };
+    let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();
     let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
         .unwrap_or_else(|| w_int_new(-1));
     // A buffering value outside the machine-int range is an OverflowError, not a
@@ -11670,11 +11670,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let str_or_none =
         |obj: Option<PyObjectRef>, name: &str| -> Result<Option<String>, crate::PyError> {
             match obj {
-                Some(o) if unsafe { pyre_object::is_str(o) } => Ok(Some(unsafe {
-                    pyre_object::w_str_get_value(o)
+                Some(o) if unsafe { pyre_object::is_str(o) } => Ok(Some(
+                    crate::baseobjspace::str_utf8_w(o)?
                         .to_ascii_lowercase()
-                        .replace('_', "-")
-                })),
+                        .replace('_', "-"),
+                )),
                 Some(o) if unsafe { pyre_object::is_none(o) } => Ok(None),
                 Some(o) => Err(crate::PyError::type_error(format!(
                     "open() argument '{name}' must be str or None, not {}",
@@ -11686,9 +11686,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let encoding = str_or_none(encoding_obj, "encoding")?.unwrap_or_else(|| "utf-8".to_string());
     let errors = str_or_none(errors_obj, "errors")?.unwrap_or_else(|| "strict".to_string());
     let mode: String = match mode_obj {
-        Some(m) if unsafe { pyre_object::is_str(m) } => unsafe {
-            pyre_object::w_str_get_value(m).to_string()
-        },
+        Some(m) if unsafe { pyre_object::is_str(m) } => {
+            crate::baseobjspace::str_utf8_w(m)?.to_string()
+        }
         Some(m) if unsafe { pyre_object::is_none(m) } => "r".to_string(),
         Some(m) => {
             return Err(crate::PyError::type_error(format!(
@@ -11738,7 +11738,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     let path = unsafe {
         if pyre_object::is_str(path_obj) {
-            pyre_object::w_str_get_value(path_obj).to_string()
+            crate::baseobjspace::str_utf8_w(path_obj)?.to_string()
         } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
             let data = pyre_object::bytesobject::bytes_like_data(path_obj);
             String::from_utf8_lossy(data).into_owned()
@@ -11748,7 +11748,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // `type(path).__fspath__(path)` — unbound descriptor + single arg.
             let result = crate::call::call_function_impl_result(fspath_fn, &[path_obj])?;
             if pyre_object::is_str(result) {
-                pyre_object::w_str_get_value(result).to_string()
+                crate::baseobjspace::str_utf8_w(result)?.to_string()
             } else if pyre_object::bytesobject::is_bytes_like(result) {
                 let data = pyre_object::bytesobject::bytes_like_data(result);
                 String::from_utf8_lossy(data).into_owned()
@@ -12548,7 +12548,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let spec = if args.len() > 1 {
         crate::type_methods::read_format_spec(args[1], "format() argument 2")?
     } else {
-        String::new()
+        rustpython_wtf8::Wtf8Buf::new()
     };
     crate::type_methods::format_value_dispatch_w(value, &spec)
 }

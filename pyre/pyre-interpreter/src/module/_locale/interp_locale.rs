@@ -282,7 +282,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "setlocale: locale must be a string or None",
                         ));
                     }
-                    Some(unsafe { pyre_object::w_str_get_value(args[1]).to_string() })
+                    Some(crate::baseobjspace::str_utf8_w(args[1])?.to_string())
                 } else {
                     None
                 };
@@ -383,8 +383,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "strcoll: arguments must be strings",
                         ));
                     }
-                    let s1 = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
-                    let s2 = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                    let s1 = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
+                    let s2 = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
                     let c1 = std::ffi::CString::new(s1.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let c2 = std::ffi::CString::new(s2.as_bytes())
@@ -406,8 +406,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // to lexical bytewise comparison.  Pure computation, no I/O;
                     // under sandbox this keeps the fixed "C" collation and never
                     // calls host libc collation, which would leak host LC_COLLATE.
-                    let s1 = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
-                    let s2 = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                    let s1 = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
+                    let s2 = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
                     let ord = match s1.as_str().cmp(s2.as_str()) {
                         std::cmp::Ordering::Less => -1,
                         std::cmp::Ordering::Equal => 0,
@@ -433,7 +433,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let sv = unsafe { pyre_object::w_str_get_value(s).to_string() };
+                    let sv = crate::baseobjspace::str_utf8_w(s)?.to_string();
                     let c = std::ffi::CString::new(sv.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let out = rustpython_host_env::locale::strxfrm(&c, sv.len() + 1);

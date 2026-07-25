@@ -317,7 +317,7 @@ fn exception_encoding(exc: &CodecException) -> Result<(usize, StandardEncoding),
     if !unsafe { is_str(w_encoding) } {
         return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
     }
-    standard_encoding(unsafe { w_str_get_value(w_encoding) })
+    standard_encoding(crate::baseobjspace::str_utf8_w(w_encoding)?)
         .ok_or_else(|| unsafe { crate::PyError::from_exc_object(exc.w_exc) })
 }
 
@@ -496,7 +496,7 @@ fn lookup_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "lookup_error() argument must be str",
         ));
     }
-    let errors = unsafe { w_str_get_value(w_errors) };
+    let errors = crate::baseobjspace::str_utf8_w(w_errors)?;
     if let Some(w_handler) = with_codec_state(|state| unsafe {
         pyre_object::dictmultiobject::w_dict_getitem_str(state.codec_error_registry, errors)
     }) {
@@ -522,7 +522,7 @@ fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !is_callable(w_handler) {
         return Err(crate::PyError::type_error("argument must be callable"));
     }
-    let errors = unsafe { w_str_get_value(w_errors) };
+    let errors = crate::baseobjspace::str_utf8_w(w_errors)?;
     with_codec_state(|state| unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
             state.codec_error_registry,
@@ -590,7 +590,7 @@ fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_encoding) } {
         return Err(crate::PyError::type_error("lookup() argument must be str"));
     }
-    let encoding = unsafe { w_str_get_value(w_encoding) }.to_string();
+    let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
     let normalized_encoding = normalize(&encoding);
 
     with_codec_state(|state| {
@@ -732,7 +732,7 @@ fn forget_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_encoding) } {
         return Ok(w_none());
     }
-    let normalized_encoding = normalize(unsafe { w_str_get_value(w_encoding) });
+    let normalized_encoding = normalize(crate::baseobjspace::str_utf8_w(w_encoding)?);
     with_codec_state(|state| {
         let w_cache = state.codec_search_cache;
         let w_key = w_str_new(&normalized_encoding);
@@ -806,7 +806,7 @@ fn utf16_32_ex_decode_impl(
     let errors = if unsafe { pyre_object::is_none(errors) } {
         "strict"
     } else if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
@@ -846,7 +846,7 @@ fn utf16_32_decode_impl(
     let errors = if unsafe { pyre_object::is_none(errors) } {
         "strict"
     } else if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
@@ -876,7 +876,7 @@ fn utf8_decode_impl(
     let errors = if unsafe { pyre_object::is_none(errors) } {
         "strict"
     } else if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
@@ -906,7 +906,7 @@ fn charmap_encode_impl(
         ));
     }
     let errors_s = if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         "strict"
     };
@@ -983,7 +983,7 @@ fn charmap_decode_impl(
         ));
     }
     let errors_s = if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         "strict"
     };
@@ -1277,7 +1277,7 @@ fn utf7_decode_impl(
     }
     // PyPy `unicodehelper.py:str_decode_utf_7`.
     let errors_s = if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         "strict"
     };
@@ -1604,7 +1604,7 @@ fn unicode_escape_decode_impl(
         ));
     };
     let errors_s = if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else {
         "strict"
     };
@@ -1733,7 +1733,7 @@ fn escape_decode_impl(
         ));
     };
     let errors_s = if unsafe { is_str(errors) } {
-        unsafe { w_str_get_value(errors) }
+        crate::baseobjspace::str_utf8_w(errors)?
     } else if unsafe { pyre_object::is_none(errors) } {
         "strict"
     } else {

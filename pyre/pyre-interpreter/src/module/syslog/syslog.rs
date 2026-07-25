@@ -20,15 +20,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("openlog", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
-                let ident = args.first().and_then(|&a| unsafe {
-                    if pyre_object::is_str(a) {
-                        std::ffi::CString::new(pyre_object::w_str_get_value(a))
+                let ident = match args.first() {
+                    Some(&a) if unsafe { pyre_object::is_str(a) } => {
+                        // openlog(3) keeps the ident pointer, so it has to be a
+                        // C string.
+                        std::ffi::CString::new(crate::baseobjspace::str_utf8_w(a)?)
                             .ok()
                             .map(|c| c.into_boxed_c_str())
-                    } else {
-                        None
                     }
-                });
+                    _ => None,
+                };
                 if args
                     .iter()
                     .skip(1)
@@ -85,7 +86,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "syslog(): message must be a string",
                     ));
                 }
-                let msg = unsafe { pyre_object::w_str_get_value(msg_obj) };
+                let msg = crate::baseobjspace::str_utf8_w(msg_obj)?;
                 if let Ok(cmsg) = std::ffi::CString::new(msg) {
                     // `lib_pypy/syslog.py:42-44` — auto-call openlog() with
                     // a NULL ident (libc falls back to argv[0]) so the

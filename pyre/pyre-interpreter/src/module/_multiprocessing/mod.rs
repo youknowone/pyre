@@ -157,7 +157,7 @@ crate::py_module! {
                                 "SemLock: name must be a string",
                             ));
                         }
-                        w_str_get_value(args[3]).to_string()
+                        crate::baseobjspace::str_utf8_w(args[3])?.to_string()
                     };
                     let unlink = unsafe { w_int_get_value(args[4]) } != 0;
                     let (handle, _kept_name) =

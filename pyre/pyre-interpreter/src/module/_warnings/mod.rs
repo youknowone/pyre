@@ -453,13 +453,22 @@ fn show_warning(
         "__name__",
     )?;
     let name_slot = pin_root_slot(name);
-    let line = format!(
-        "{}:{}: {}: {}\n",
-        crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(filename_slot))?,
-        lineno,
-        crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(name_slot))?,
-        crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(text_slot))?,
-    );
+    // Assembled in WTF-8: the message is whatever `warn()` was given, so a
+    // filename or text carrying a lone surrogate is written out as-is and
+    // stderr's error handler decides how it appears.
+    let mut line = rustpython_wtf8::Wtf8Buf::new();
+    line.push_wtf8(crate::baseobjspace::text_wtf8_w(
+        pyre_object::gc_roots::shadow_stack_get(filename_slot),
+    )?);
+    line.push_str(&format!(":{lineno}: "));
+    line.push_wtf8(crate::baseobjspace::text_wtf8_w(
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    )?);
+    line.push_str(": ");
+    line.push_wtf8(crate::baseobjspace::text_wtf8_w(
+        pyre_object::gc_roots::shadow_stack_get(text_slot),
+    )?);
+    line.push_str("\n");
     if let Some(sys) = crate::importing::get_sys_module("sys")
         && let Ok(stderr) = crate::baseobjspace::getattr_str(sys, "stderr")
         && !unsafe { is_none(stderr) }
@@ -468,7 +477,7 @@ fn show_warning(
         let write_slot = pin_root_slot(write);
         crate::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(write_slot),
-            &[w_str_new(&line)],
+            &[pyre_object::w_str_from_wtf8(line)],
         )?;
         let source_line = pyre_object::gc_roots::shadow_stack_get(source_line_slot);
         let source_line = if source_line.is_null() || unsafe { is_none(source_line) } {

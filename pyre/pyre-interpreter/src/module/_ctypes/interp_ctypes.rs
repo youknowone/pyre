@@ -79,7 +79,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     String::from_utf8_lossy(pyre_object::bytesobject::w_bytes_data(args[0]))
                         .into_owned()
                 } else if pyre_object::is_str(args[0]) {
-                    pyre_object::w_str_get_value(args[0]).to_string()
+                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                 } else {
                     return Err(crate::PyError::type_error(
                         "dlopen: name must be a string, bytes or None",
@@ -112,7 +112,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error("dlsym: name must be a string"));
                     }
-                    pyre_object::w_str_get_value(args[1]).to_string()
+                    crate::baseobjspace::str_utf8_w(args[1])?.to_string()
                 };
                 let addr =
                     rustpython_host_env::ctypes::lookup_function_symbol_addr(h, name.as_bytes())
@@ -192,7 +192,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                         "_sizeof_typecode() needs typecode string",
                     ));
                 }
-                let code = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                let code = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
                 match rustpython_host_env::ctypes::simple_type_size(&code) {
                     Some(n) => Ok(pyre_object::w_int_new(n as i64)),
                     None => Err(crate::PyError::value_error(format!(
@@ -214,7 +214,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                         "_alignof_typecode() needs typecode string",
                     ));
                 }
-                let code = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                let code = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
                 match rustpython_host_env::ctypes::simple_type_align(&code) {
                     Some(n) => Ok(pyre_object::w_int_new(n as i64)),
                     None => Err(crate::PyError::value_error(format!(
@@ -283,7 +283,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             if !unsafe { pyre_object::is_str(path) } {
                 return Err(crate::PyError::type_error("path must be a string"));
             }
-            let path = unsafe { pyre_object::w_str_get_value(path) };
+            let path = crate::baseobjspace::str_utf8_w(path)?;
             let found = host_ctypes::dyld_shared_cache_contains_path(path)
                 .map_err(|_| crate::PyError::value_error("path contains null byte"))?;
             Ok(pyre_object::w_bool_from(found))

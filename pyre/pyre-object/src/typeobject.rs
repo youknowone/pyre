@@ -853,7 +853,12 @@ pub unsafe fn w_type_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
 
 pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
     let t = &mut *(obj as *mut W_TypeObject);
-    *t.qualname = crate::w_str_get_value(w_qualname).to_string();
+    // `qualname` is the `&str` view display and error messages read, so a name
+    // carrying a lone surrogate is stored there with the replacement character
+    // `Wtf8`'s `Display` substitutes.  `w_qualname` keeps the name object
+    // itself, and `w_type_get_qualname_obj` hands that back verbatim, so
+    // `__qualname__` still reads the code points that were assigned.
+    *t.qualname = crate::w_str_get_wtf8(w_qualname).to_string();
     t.w_qualname = w_qualname;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }

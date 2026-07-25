@@ -237,8 +237,9 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             "array() argument 1 must be a unicode character, not a different type",
         ));
     }
-    let tc_str = unsafe { pyre_object::unicodeobject::w_str_get_value(w_typecode) };
-    let tc_bytes = tc_str.as_bytes();
+    // Read as the raw buffer: a typecode is a single ASCII character, so a
+    // lone surrogate simply fails the length and membership checks below.
+    let tc_bytes = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_typecode) }.as_bytes();
     if tc_bytes.len() != 1 {
         return Err(PyError::type_error(
             "array() argument 1 must be a unicode character, not str",
@@ -1237,8 +1238,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Err(PyError::type_error("typecode must be a unicode character"));
     }
-    let typecode_text = unsafe { pyre_object::unicodeobject::w_str_get_value(args[1]) };
-    let typecode_bytes = typecode_text.as_bytes();
+    let typecode_bytes = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(args[1]) }.as_bytes();
     if typecode_bytes.len() != 1 || arr::typecode_itemsize(typecode_bytes[0]).is_none() {
         return Err(PyError::value_error("invalid type code"));
     }

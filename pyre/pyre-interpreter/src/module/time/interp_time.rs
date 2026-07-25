@@ -281,8 +281,8 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             crate::type_methods::arg_type_name(name_obj)
         )));
     }
-    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
-    let (implementation, monotonic, adjustable) = match name {
+    let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
+    let (implementation, monotonic, adjustable) = match name.as_str().unwrap_or_default() {
         "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
         "monotonic" | "perf_counter" => {
             #[cfg(target_os = "macos")]
@@ -938,7 +938,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "strftime() argument 1 must be str",
             ));
         }
-        w_str_get_value(fmt)
+        w_str_get_wtf8(fmt).as_bytes()
     };
 
     let c_fmt = std::ffi::CString::new(fmt_str)
@@ -974,8 +974,15 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     &libc_tm,
                 );
                 if n != 0 {
-                    let s = String::from_utf8_lossy(&buf[..n]);
-                    return Ok(w_str_new(&s));
+                    return Ok(w_str_from_wtf8(
+                        rustpython_wtf8::Wtf8Buf::from_bytes(buf[..n].to_vec()).unwrap_or_else(
+                            |b| {
+                                rustpython_wtf8::Wtf8Buf::from_string(
+                                    String::from_utf8_lossy(&b).into_owned(),
+                                )
+                            },
+                        ),
+                    ));
                 }
                 if buf.len() > 16384 {
                     return Ok(w_str_new(""));
@@ -1005,8 +1012,15 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     &msvc_tm,
                 );
                 if n != 0 {
-                    let s = String::from_utf8_lossy(&buf[..n]);
-                    return Ok(w_str_new(&s));
+                    return Ok(w_str_from_wtf8(
+                        rustpython_wtf8::Wtf8Buf::from_bytes(buf[..n].to_vec()).unwrap_or_else(
+                            |b| {
+                                rustpython_wtf8::Wtf8Buf::from_string(
+                                    String::from_utf8_lossy(&b).into_owned(),
+                                )
+                            },
+                        ),
+                    ));
                 }
                 if buf.len() > 16384 {
                     return Ok(w_str_new(""));

@@ -191,7 +191,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "getpwnam(): name should be a string",
                     ));
                 }
-                let name = unsafe { pyre_object::w_str_get_value(args[0]) };
+                let name = crate::baseobjspace::str_utf8_w(args[0])?;
                 // `interp_pwd.py:111 @unwrap_spec(name='text0')` rejects
                 // embedded NULs.  CString::new() enforces that here.
                 let c_name = std::ffi::CString::new(name).map_err(|_| {

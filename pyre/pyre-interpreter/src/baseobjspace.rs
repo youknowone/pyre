@@ -7469,9 +7469,13 @@ fn expect_str(obj: PyObjectRef) -> Result<(), PyError> {
 }
 
 /// baseobjspace.py:1784 text_w.
+///
+/// The `&str` view is what the callers need, so a value whose buffer has none
+/// — one carrying a lone surrogate — is reported through [`str_utf8_w`].
+/// [`text_wtf8_w`] is the accessor for a caller that can take the raw buffer.
 pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
     expect_str(obj)?;
-    Ok(unsafe { pyre_object::w_str_get_value(obj) })
+    str_utf8_w(obj)
 }
 
 /// `text_w` on the raw buffer.  `W_UnicodeObject.text_w` hands back
@@ -7480,6 +7484,33 @@ pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
 pub fn text_wtf8_w(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
     expect_str(obj)?;
     Ok(unsafe { pyre_object::w_str_get_wtf8(obj) })
+}
+
+/// The `&str` view of a value already known to be a `str`, for a native
+/// parameter that has to reach Rust as `&str`.
+///
+/// A lone surrogate has no UTF-8 encoding, so it is reported the way the
+/// strict utf-8 encoder reports one (unicodehelper.py:245) —
+/// `UnicodeEncodeError` with "surrogates not allowed" — instead of demanding a
+/// view the backing `Wtf8Buf` cannot give.
+pub fn str_utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
+    match wtf8.as_str() {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let pos = wtf8
+                .code_points()
+                .position(|cp| cp.to_char().is_none())
+                .unwrap_or(0);
+            Err(crate::typedef::unicode_encode_error(
+                "utf-8",
+                obj,
+                pos,
+                pos + 1,
+                "surrogates not allowed",
+            ))
+        }
+    }
 }
 
 /// baseobjspace.py:1791 utf8_w.

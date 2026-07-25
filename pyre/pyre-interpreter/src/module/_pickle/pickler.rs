@@ -1261,8 +1261,10 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
     pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if ctx.bin {
-        let s = unsafe { pyre_object::unicodeobject::w_str_get_value(w_obj) };
-        let data = s.as_bytes();
+        // The binary opcodes carry the string's `surrogatepass` UTF-8, which is
+        // exactly the backing WTF-8, so the raw buffer is written as-is and a
+        // lone surrogate round-trips instead of demanding a `&str` view.
+        let data = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_obj) }.as_bytes();
         let n = data.len();
         if n <= 0xff && ctx.proto >= 4 {
             buf.push(op::SHORT_BINUNICODE);

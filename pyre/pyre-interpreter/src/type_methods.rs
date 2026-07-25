@@ -1567,7 +1567,7 @@ fn format_render(
                 }
             },
         };
-        let formatted = format_value_dispatch(converted, resolved_spec.as_str().unwrap_or(""))?;
+        let formatted = format_value_dispatch(converted, &resolved_spec)?;
         result.push_wtf8(&formatted);
     }
     Ok(result)
@@ -1761,7 +1761,10 @@ fn format_parse_err(
 /// cannot format correctly — integer `c` and non-finite floats — read
 /// this back; every other case parses through `FormatSpec` directly.
 struct ParsedSpec {
-    fill: char,
+    /// The fill is the one position in a spec that may hold an arbitrary code
+    /// point — including a lone surrogate, which has no `char` — so it is kept
+    /// as a `CodePoint`.  Every other position is ASCII.
+    fill: CodePoint,
     align: Option<char>,
     sign: Option<char>,
     alt_form: bool,
@@ -1776,19 +1779,31 @@ struct ParsedSpec {
     /// The equivalent pre-3.14 spec accepted by rustpython-common's format
     /// engine (the fractional grouping marker, its otherwise-empty dot, and
     /// the `z` option are removed).
-    engine_spec: String,
+    engine_spec: Wtf8Buf,
     width_start: usize,
     width_end: usize,
 }
 
-fn parse_spec(spec: &str) -> ParsedSpec {
-    let chars: Vec<char> = spec.chars().collect();
+/// The lossy `char` view of a spec, for the scans that only test for ASCII
+/// delimiters.  A code point with no `char` (a lone surrogate) matches none of
+/// them, so substituting it changes no decision.
+fn spec_chars(spec: &Wtf8) -> Vec<char> {
+    spec.code_points().map(|cp| cp.to_char_lossy()).collect()
+}
+
+fn parse_spec(spec: &Wtf8) -> ParsedSpec {
+    let cps: Vec<CodePoint> = spec.code_points().collect();
+    // The structural scan below tests for ASCII delimiters only, so it runs on
+    // the lossy `char` view; a code point with no `char` matches none of them
+    // either way.  `cps` keeps the true code points for the fill and for the
+    // engine spec.
+    let chars: Vec<char> = cps.iter().map(|cp| cp.to_char_lossy()).collect();
     let mut i = 0;
     let n = chars.len();
-    let mut fill = ' ';
+    let mut fill = CodePoint::from_char(' ');
     let mut align: Option<char> = None;
     if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
-        fill = chars[0];
+        fill = cps[0];
         align = Some(chars[1]);
         i = 2;
     } else if n >= 1 && matches!(chars[0], '<' | '>' | '=' | '^') {
@@ -1820,7 +1835,7 @@ fn parse_spec(spec: &str) -> ParsedSpec {
             align = Some('=');
         }
         if fill == ' ' {
-            fill = '0';
+            fill = CodePoint::from_char('0');
         }
         i += 1;
     }
@@ -1866,20 +1881,16 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         }
     }
     let ty = if i < n { chars[i] } else { '\0' };
-    let engine_spec = chars
-        .iter()
-        .enumerate()
-        .filter_map(|(index, ch)| {
-            if Some(index) == fractional_grouping_index
-                || Some(index) == empty_precision_dot
-                || Some(index) == z_index
-            {
-                None
-            } else {
-                Some(*ch)
-            }
-        })
-        .collect();
+    let mut engine_spec = Wtf8Buf::with_capacity(spec.len());
+    for (index, cp) in cps.iter().enumerate() {
+        if Some(index) == fractional_grouping_index
+            || Some(index) == empty_precision_dot
+            || Some(index) == z_index
+        {
+            continue;
+        }
+        engine_spec.push(*cp);
+    }
     // `z` precedes the width, so dropping it from `engine_spec` shifts the
     // width slice left by one; `float_engine_spec_with_width` indexes the
     // engine spec, so bias the recorded bounds to match.
@@ -1939,7 +1950,7 @@ fn complex_component_spec(p: &ParsedSpec, sign: char) -> String {
 /// deliberately retains it.
 fn format_complex_component(
     value: f64,
-    spec: &str,
+    spec: &Wtf8,
     default_type: bool,
     alternate: bool,
 ) -> Result<String, crate::PyError> {
@@ -1962,19 +1973,19 @@ fn format_complex_component(
 /// grouping is applied after rustpython-common has rounded the number; reducing
 /// the engine width by the number of inserted separators keeps Python's width
 /// measured against the final grouped result.
-fn float_engine_spec_with_width(p: &ParsedSpec, width: Option<usize>) -> String {
-    let chars: Vec<char> = p.engine_spec.chars().collect();
-    let mut out = String::new();
-    for ch in &chars[..p.width_start] {
-        out.push(*ch);
+fn float_engine_spec_with_width(p: &ParsedSpec, width: Option<usize>) -> Wtf8Buf {
+    let cps: Vec<CodePoint> = p.engine_spec.code_points().collect();
+    let mut out = Wtf8Buf::new();
+    for cp in &cps[..p.width_start] {
+        out.push(*cp);
     }
     if let Some(width) = width
         && width != 0
     {
         out.push_str(&width.to_string());
     }
-    for ch in &chars[p.width_end..] {
-        out.push(*ch);
+    for cp in &cps[p.width_end..] {
+        out.push(*cp);
     }
     out
 }
@@ -2016,30 +2027,24 @@ fn group_fractional_digits(s: String, separator: char, digits: usize) -> String 
 /// Pad `body` to `width` characters with `fill`, honouring the numeric
 /// alignments.  `=` splits a leading sign (and `0x`/`0o`/`0b` base prefix)
 /// from the digits and inserts the fill between them.
-fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
+fn pad_to_width(body: String, fill: CodePoint, align: char, width: usize) -> Wtf8Buf {
     if body.chars().count() >= width {
-        return body;
+        return Wtf8Buf::from_string(body);
     }
     let need = width - body.chars().count();
     match align {
         '<' => {
-            let mut s = body;
-            for _ in 0..need {
-                s.push(fill);
-            }
+            let mut s = Wtf8Buf::from_string(body);
+            push_cp_repeated(&mut s, fill, need);
             s
         }
         '^' => {
             let left = need / 2;
             let right = need - left;
-            let mut s = String::with_capacity(width);
-            for _ in 0..left {
-                s.push(fill);
-            }
+            let mut s = Wtf8Buf::with_capacity(width);
+            push_cp_repeated(&mut s, fill, left);
             s.push_str(&body);
-            for _ in 0..right {
-                s.push(fill);
-            }
+            push_cp_repeated(&mut s, fill, right);
             s
         }
         '=' => {
@@ -2062,19 +2067,15 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
                 }
             }
             let digits: String = chars.collect();
-            let mut s = String::with_capacity(width);
+            let mut s = Wtf8Buf::with_capacity(width);
             s.push_str(&prefix);
-            for _ in 0..need {
-                s.push(fill);
-            }
+            push_cp_repeated(&mut s, fill, need);
             s.push_str(&digits);
             s
         }
         _ => {
-            let mut s = String::with_capacity(width);
-            for _ in 0..need {
-                s.push(fill);
-            }
+            let mut s = Wtf8Buf::with_capacity(width);
+            push_cp_repeated(&mut s, fill, need);
             s.push_str(&body);
             s
         }
@@ -2109,7 +2110,7 @@ fn separate_integer_digits(
 /// The shared parser remains the authority for format-spec syntax and error
 /// ordering; radix conversion, grouping, signs, prefixes, and padding operate
 /// directly on rbigint digits.
-fn format_rbigint(num: &BigInt, spec: &str, type_name: &str) -> Result<Wtf8Buf, crate::PyError> {
+fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf, crate::PyError> {
     let parsed = rustpython_common::format::FormatSpec::parse(spec)
         .map_err(|e| format_spec_err(e, spec, type_name, true))?;
     let p = parse_spec(spec);
@@ -2171,12 +2172,12 @@ fn format_rbigint(num: &BigInt, spec: &str, type_name: &str) -> Result<Wtf8Buf, 
         };
         magnitude = separate_integer_digits(magnitude, interval, separator, displayed_digits);
     }
-    Ok(Wtf8Buf::from_string(pad_to_width(
+    Ok(pad_to_width(
         format!("{sign_prefix}{magnitude}"),
         p.fill,
         p.align.unwrap_or('>'),
         p.width,
-    )))
+    ))
 }
 
 /// A `&str` paired with its precomputed code-point count, adapting a
@@ -2200,10 +2201,15 @@ impl rustpython_common::format::CharLen for CharLenStr<'_> {
 /// Render a presentation-type code for the "Unknown format code" message:
 /// printable ASCII (`0x21..=0x7f`) verbatim, anything else as `\x{hex}`.
 fn unknown_code_display(c: char) -> String {
-    if ('\u{21}'..='\u{7f}').contains(&c) {
-        c.to_string()
-    } else {
-        format!("\\x{:x}", c as u32)
+    unknown_code_point_display(CodePoint::from_char(c))
+}
+
+/// [`unknown_code_display`] for a code point that may have no `char` — a
+/// presentation slot holding a lone surrogate prints as its own escape.
+fn unknown_code_point_display(cp: CodePoint) -> String {
+    match cp.to_char() {
+        Some(c) if ('\u{21}'..='\u{7f}').contains(&c) => c.to_string(),
+        _ => format!("\\x{:x}", cp.to_u32()),
     }
 }
 
@@ -2213,7 +2219,7 @@ fn unknown_code_display(c: char) -> String {
 /// for the `z` presentation code.
 fn format_spec_err(
     err: rustpython_common::format::FormatSpecError,
-    spec: &str,
+    spec: &Wtf8,
     type_name: &str,
     integer: bool,
 ) -> crate::PyError {
@@ -2267,7 +2273,7 @@ fn format_spec_err(
 /// Public entry point for the f-string `FormatWithSpec` opcode in
 /// `eval.rs::format_with_spec`. Forwards to the same parser used by
 /// `str.format` so both surfaces share the spec semantics.
-pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+pub fn format_with_spec_public(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     format_with_spec(val, spec)
 }
 
@@ -2301,7 +2307,7 @@ pub(crate) fn call_format_dispatch(
 /// apply the shared builtin spec parser, with an empty spec collapsing to
 /// `str(value)`.  Shared by `format()`, the `FormatSimple`/`FormatWithSpec`
 /// f-string opcodes, and `str.format` field formatting.
-pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     // Fast path for common types.  An exact `str` or `int` cannot carry a
     // `__format__` override, and with an empty spec its builtin `__format__`
     // is `str(value)` — so resolve and call nothing.  `bool` is excluded (it
@@ -2327,7 +2333,7 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, cr
         if unsafe { is_instance(val) }
             || !unsafe { py_type_check(meth, &crate::function::BUILTIN_FUNCTION_TYPE) }
         {
-            let spec_obj = pyre_object::w_str_new(spec);
+            let spec_obj = pyre_object::w_str_from_wtf8(spec.to_wtf8_buf());
             return call_format_dispatch(val, meth, spec_obj);
         }
     }
@@ -2386,9 +2392,12 @@ pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
 pub(crate) fn read_format_spec(
     spec_obj: PyObjectRef,
     arg_desc: &str,
-) -> Result<String, crate::PyError> {
+) -> Result<Wtf8Buf, crate::PyError> {
     if !spec_obj.is_null() && unsafe { is_str(spec_obj) } {
-        return Ok(unsafe { w_str_get_value(spec_obj) }.to_string());
+        // Read through the raw buffer: the fill character may be any code
+        // point, so `format(x, '\ud800<6')` pads with the lone surrogate it
+        // was given rather than demanding a `&str` view of the buffer.
+        return Ok(unsafe { pyre_object::w_str_get_wtf8(spec_obj) }.to_wtf8_buf());
     }
     Err(crate::PyError::type_error(format!(
         "{arg_desc} must be str, not {}",
@@ -2404,7 +2413,7 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let spec = if args.len() > 1 {
         read_format_spec(args[1], "__format__() argument")?
     } else {
-        String::new()
+        Wtf8Buf::new()
     };
     if spec.is_empty() {
         // `format_string` (newformat.py:602-608) wraps the receiver's own utf8
@@ -2429,7 +2438,7 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::FormatSpec;
     unsafe {
         // `int` / `bool` / `long` share the integer formatter.  The `c`
@@ -2453,7 +2462,7 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                     "Negative zero coercion (z) not allowed",
                 ));
             }
-            if spec.ends_with('c') && parsed.is_ok() {
+            if spec.ends_with("c") && parsed.is_ok() {
                 return format_char(&big, spec);
             }
             // A float presentation code formats the `f64` conversion (`n` and
@@ -2525,8 +2534,10 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 '+'
             };
             let imag_spec = complex_component_spec(&p, imag_sign);
-            let real_text = format_complex_component(re, &real_spec, default_type, p.alt_form)?;
-            let imag_text = format_complex_component(im, &imag_spec, default_type, p.alt_form)?;
+            let real_text =
+                format_complex_component(re, real_spec.as_str().into(), default_type, p.alt_form)?;
+            let imag_text =
+                format_complex_component(im, imag_spec.as_str().into(), default_type, p.alt_form)?;
             let text = if default_type && re == 0.0 && re.is_sign_positive() {
                 format!("{imag_text}j")
             } else if default_type {
@@ -2546,7 +2557,7 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
             // A `0` fill flag at the start of the width pads text with the
             // default-left alignment; the shared formatter treats it as a
             // numeric alignment, so handle it here.
-            let sc: Vec<char> = spec.chars().collect();
+            let sc = spec_chars(spec);
             let zero_fill = if sc.len() >= 2 && matches!(sc[1], '<' | '>' | '=' | '^') {
                 sc.get(2) == Some(&'0')
             } else if sc
@@ -2561,8 +2572,10 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
                 return format_surrogate_str(full, spec);
             }
             // A valid-UTF-8 body goes through the shared string formatter,
-            // which pads by code point.
-            if let Ok(valid) = full.as_str() {
+            // which pads by code point.  A spec carrying a lone surrogate —
+            // its fill — has to be padded here instead, since the shared
+            // formatter yields a `String`.
+            if let (Ok(valid), Ok(_)) = (full.as_str(), spec.as_str()) {
                 let parsed =
                     FormatSpec::parse(spec).map_err(|e| format_spec_err(e, spec, "str", false))?;
                 let s = parsed
@@ -2592,8 +2605,8 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
 /// formatter.  Only the *explicit* alignment is inspected: a leading `0` flag
 /// (which the shared parser normalises to `=`) is a zero fill and stays legal
 /// for text, and a `#` used as a fill character precedes the alignment.
-fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
-    let chars: Vec<char> = spec.chars().collect();
+fn reject_string_sign_align(spec: &Wtf8) -> Result<(), crate::PyError> {
+    let chars = spec_chars(spec);
     let n = chars.len();
     let mut i = 0;
     let mut align: Option<char> = None;
@@ -2630,14 +2643,15 @@ fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
 /// and an optional `s` type — are honoured; a numeric presentation type
 /// raises the same "unknown format code" error the valid-UTF-8 path does.
 /// A sign / `=` alignment is rejected by the caller.
-fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
-    let chars: Vec<char> = spec.chars().collect();
+fn format_surrogate_str(body: &Wtf8, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
+    let cps: Vec<CodePoint> = spec.code_points().collect();
+    let chars: Vec<char> = cps.iter().map(|cp| cp.to_char_lossy()).collect();
     let n = chars.len();
     let mut i = 0;
-    let mut fill = ' ';
+    let mut fill = CodePoint::from_char(' ');
     let mut align = '<';
     if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
-        fill = chars[0];
+        fill = cps[0];
         align = chars[1];
         i = 2;
     } else if n >= 1 && matches!(chars[0], '<' | '>' | '=' | '^') {
@@ -2645,7 +2659,7 @@ fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyErr
         i = 1;
     }
     if i < n && chars[i] == '0' {
-        fill = '0';
+        fill = CodePoint::from_char('0');
         i += 1;
     }
     let mut width = 0usize;
@@ -2664,10 +2678,10 @@ fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyErr
         precision = Some(p);
     }
     if i < n {
-        let ty = chars[i];
-        if ty != 's' {
+        if chars[i] != 's' {
             return Err(crate::PyError::value_error(format!(
-                "Unknown format code '{ty}' for object of type 'str'"
+                "Unknown format code '{}' for object of type 'str'",
+                unknown_code_point_display(cps[i])
             )));
         }
         i += 1;
@@ -2696,7 +2710,7 @@ fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyErr
 /// that make no sense for a single character, map the value to its code
 /// point, then pad by code point.  The caller has already confirmed the
 /// spec parses and ends in `c`.
-fn format_char(num: &BigInt, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     // Rejection order matches the reference: grouping, then precision, then
     // sign, then alternate form — each beats the value range check.
@@ -2745,7 +2759,7 @@ fn format_char(num: &BigInt, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
 /// signed word (`inf` / `nan`, upper-cased for `E`/`F`/`G`, `%`-suffixed
 /// for the percentage type) padded to width.  Grouping only validates
 /// here — a non-finite value has no digits to separate.
-fn format_nonfinite(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+fn format_nonfinite(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     validate_float_spec(spec, &p)?;
     let upper = matches!(p.ty, 'E' | 'F' | 'G');
@@ -2771,12 +2785,7 @@ fn format_nonfinite(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
         }
     };
     let body = format!("{sign}{magnitude}");
-    Ok(Wtf8Buf::from_string(pad_to_width(
-        body,
-        p.fill,
-        p.align.unwrap_or('>'),
-        p.width,
-    )))
+    Ok(pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width))
 }
 
 /// Validate a float presentation spec against the reference rules,
@@ -2784,8 +2793,8 @@ fn format_nonfinite(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
 /// precision beyond `i32`, trailing garbage) come from the shared parser
 /// for their exact messages; the type and grouping-with-`n` checks are
 /// applied on top.
-fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError> {
-    rustpython_common::format::FormatSpec::parse(p.engine_spec.as_str())
+fn validate_float_spec(spec: &Wtf8, p: &ParsedSpec) -> Result<(), crate::PyError> {
+    rustpython_common::format::FormatSpec::parse(&p.engine_spec)
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     if !matches!(p.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
         return Err(crate::PyError::value_error(format!(
@@ -2814,7 +2823,7 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
 /// the unpadded rendering is `0` — so PEP 682's `z` option coerces its sign.
 fn float_rounds_to_zero(v: f64, p: &ParsedSpec) -> bool {
     let probe_spec = float_engine_spec_with_width(p, Some(0));
-    let Some(rendered) = rustpython_common::format::FormatSpec::parse(probe_spec.as_str())
+    let Some(rendered) = rustpython_common::format::FormatSpec::parse(&probe_spec)
         .ok()
         .and_then(|f| f.format_float(v).ok())
     else {
@@ -2836,7 +2845,7 @@ fn float_rounds_to_zero(v: f64, p: &ParsedSpec) -> bool {
 /// (`\0`/`e`/`E`/`f`/`F`/`g`/`G`/`n`/`%`) pads, groups, and rounds through the
 /// shared engine.  `validate_float_spec` still supplies the type and
 /// grouping-with-`n` messages before delegating.
-fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     validate_float_spec(spec, &p)?;
     // PEP 682 `z`: a value that rounds to a zero magnitude renders its sign
@@ -2849,7 +2858,7 @@ fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     };
     if let Some(separator) = p.fractional_grouping {
         let unpadded_spec = float_engine_spec_with_width(&p, None);
-        let unpadded = rustpython_common::format::FormatSpec::parse(unpadded_spec.as_str())
+        let unpadded = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
             .map_err(|e| format_spec_err(e, spec, "float", false))?
             .format_float(v)
             .map_err(|e| format_spec_err(e, spec, "float", false))?;
@@ -2857,7 +2866,7 @@ fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
         let separators = digits.saturating_sub(1) / 3;
         let adjusted_width = p.width.saturating_sub(separators);
         let adjusted_spec = float_engine_spec_with_width(&p, Some(adjusted_width));
-        let rendered = rustpython_common::format::FormatSpec::parse(adjusted_spec.as_str())
+        let rendered = rustpython_common::format::FormatSpec::parse(&adjusted_spec)
             .map_err(|e| format_spec_err(e, spec, "float", false))?
             .format_float(v)
             .map_err(|e| format_spec_err(e, spec, "float", false))?;
@@ -2865,7 +2874,17 @@ fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
             rendered, separator, digits,
         )));
     }
-    let parsed = rustpython_common::format::FormatSpec::parse(p.engine_spec.as_str())
+    if p.fill.to_char().is_none() {
+        // A fill with no `char` cannot come back out of the `String`-typed
+        // engine, so render the value unpadded and pad it by code point.
+        let unpadded_spec = float_engine_spec_with_width(&p, None);
+        let body = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        return Ok(pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width));
+    }
+    let parsed = rustpython_common::format::FormatSpec::parse(&p.engine_spec)
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     let s = parsed
         .format_float(v)
@@ -2876,13 +2895,12 @@ fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
 /// Pad a WTF-8 string body to `width` code points with `fill`,
 /// honouring `<` / `^` / `>` alignment.  String bodies never use the
 /// numeric `=` alignment, so any non-`<`/`^` alignment right-aligns.
-fn pad_wtf8(body: &Wtf8, fill: char, align: char, width: usize) -> Wtf8Buf {
+fn pad_wtf8(body: &Wtf8, fill_cp: CodePoint, align: char, width: usize) -> Wtf8Buf {
     let body_len = body.code_points().count();
     if body_len >= width {
         return body.to_wtf8_buf();
     }
     let need = width - body_len;
-    let fill_cp = CodePoint::from_char(fill);
     let mut out = Wtf8Buf::with_capacity(body.len() + need * 4);
     match align {
         '<' => {
@@ -3046,7 +3064,7 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             None => Ok(default.to_string()),
             Some(o) if o.is_null() => Ok(default.to_string()),
             Some(o) if unsafe { pyre_object::is_str(o) } => {
-                Ok(unsafe { w_str_get_value(o) }.to_string())
+                Ok(crate::baseobjspace::str_utf8_w(o)?.to_string())
             }
             Some(o) => {
                 let tname = unsafe { pyre_object::type_name_of(o) };

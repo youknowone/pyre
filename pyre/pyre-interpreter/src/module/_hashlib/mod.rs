@@ -33,7 +33,7 @@ fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(name_obj) } {
         return Err(crate::PyError::type_error("digest name must be a string"));
     }
-    let name = unsafe { w_str_get_value(name_obj) }.to_string();
+    let name = crate::baseobjspace::str_utf8_w(name_obj)?.to_string();
     let data = match args.get(1).copied() {
         Some(obj) if unsafe { bytesobject::is_bytes_like(obj) } => {
             unsafe { bytesobject::bytes_like_data(obj) }.to_vec()
@@ -85,8 +85,11 @@ fn compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let read = |obj: PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
         unsafe {
             if is_str(obj) {
-                let s = w_str_get_value(obj);
-                if !s.is_ascii() {
+                // The ASCII check runs on the raw buffer: a lone surrogate is
+                // non-ASCII, so it takes the same rejection as any other
+                // non-ASCII character.
+                let s = w_str_get_wtf8(obj);
+                if !s.as_bytes().is_ascii() {
                     return Err(crate::PyError::type_error(
                         "comparing strings with non-ASCII characters is not supported",
                     ));

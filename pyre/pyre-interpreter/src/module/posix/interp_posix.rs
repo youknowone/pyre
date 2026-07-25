@@ -2599,7 +2599,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             let key = unsafe {
                 if pyre_object::is_str(args[0]) {
-                    pyre_object::w_str_get_value(args[0]).to_string()
+                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                 } else {
                     return Ok(pyre_object::w_none());
                 }
@@ -3627,7 +3627,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let cmd = unsafe {
                         if pyre_object::is_str(args[0]) {
-                            pyre_object::w_str_get_value(args[0]).to_string()
+                            crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                         } else {
                             return Err(crate::PyError::type_error(
                                 "system(): command must be a string",
@@ -3806,7 +3806,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map(|s| {
                         let bytes = unsafe {
                             if pyre_object::is_str(s) {
-                                pyre_object::w_str_get_value(s).as_bytes().to_vec()
+                                crate::baseobjspace::str_utf8_w(s)?.as_bytes().to_vec()
                             } else if pyre_object::is_bytes(s) {
                                 pyre_object::w_bytes_data(s).to_vec()
                             } else {
@@ -4156,7 +4156,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let user = unsafe {
                         if pyre_object::is_str(args[0]) {
-                            pyre_object::w_str_get_value(args[0]).to_string()
+                            crate::baseobjspace::str_utf8_w(args[0])?.to_string()
                         } else {
                             return Err(crate::PyError::type_error(
                                 "initgroups(): username must be str",

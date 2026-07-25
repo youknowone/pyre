@@ -55,7 +55,7 @@ fn set_param(
             if !unsafe { pyre_object::is_str(k) } {
                 continue;
             }
-            let key = unsafe { pyre_object::w_str_get_value(k) };
+            let key = unsafe { pyre_object::w_str_get_wtf8(k) };
             if key == "__pyre_kw__" {
                 continue;
             }
@@ -66,7 +66,7 @@ fn set_param(
                 let value = crate::baseobjspace::int_w(v)?;
                 let known = majit_metainterp::jit::UNROLL_PARAMETERS
                     .iter()
-                    .any(|&(name, _)| name == key && name != "enable_opts");
+                    .any(|&(name, _)| key == name && name != "enable_opts");
                 if !known {
                     return Err(crate::PyError::type_error(format!(
                         "no JIT parameter '{key}'"

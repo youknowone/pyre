@@ -1760,7 +1760,7 @@ fn parser_create3(
     }
     if unsafe { is_none(namespace_separator) } {
     } else if unsafe { is_str(namespace_separator) } {
-        let value = unsafe { w_str_get_value(namespace_separator) };
+        let value = crate::baseobjspace::str_utf8_w(namespace_separator)?;
         if value.chars().count() > 1 {
             return Err(crate::PyError::value_error(
                 "namespace_separator must be at most one character, omitted, or None",

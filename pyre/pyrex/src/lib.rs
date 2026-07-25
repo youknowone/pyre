@@ -26,7 +26,9 @@ enum RunMode {
     /// literal `sys.argv[0]` the launcher records — `"-"` when the dash was
     /// given, `""` when it was not. Whether this drives the prompt or executes
     /// stdin as one unit is decided at dispatch by `stdin_is_interactive`.
-    Stdin { argv0: String },
+    Stdin {
+        argv0: String,
+    },
     /// `pyre interact <executable> [args…]` — run the trusted sandbox
     /// controller (`pypy/sandbox/pypy_interact.py`) over an untrusted child.
     Interact {

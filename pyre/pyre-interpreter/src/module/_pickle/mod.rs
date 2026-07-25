@@ -412,8 +412,12 @@ pub(crate) fn read_int_le(data: &[u8]) -> i64 {
 }
 
 pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
-    let s = std::str::from_utf8(data).map_err(|_| unpickling_error("invalid utf-8 in pickle"))?;
-    Ok(pyre_object::w_str_new(s))
+    // The binary string opcodes carry `surrogatepass` UTF-8, which is exactly
+    // the WTF-8 the pickler wrote, so a lone surrogate decodes back to the
+    // code point it was pickled from.
+    let buf = rustpython_wtf8::Wtf8Buf::from_bytes(data.to_vec())
+        .map_err(|_| unpickling_error("invalid utf-8 in pickle"))?;
+    Ok(pyre_object::w_str_from_wtf8(buf))
 }
 
 crate::py_module! {

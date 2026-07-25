@@ -28,7 +28,7 @@
 //! * `i64` / `i32` / `u32` / `usize` — `w_int_get_value` + cast.
 //! * `f64` — `w_float_get_value`.
 //! * `bool` — `w_bool_get_value`.
-//! * `&str` — `w_str_get_value`.
+//! * `&str` — `str_utf8_w` (a lone surrogate raises `UnicodeEncodeError`).
 //! * `pyre_object::PyObjectRef` — passthrough (`args[i]`).
 //! * `&[pyre_object::PyObjectRef]` — passthrough of the whole slice (varargs).
 //!
@@ -593,11 +593,13 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
         }
-        // `&str` — borrow from `w_str_get_value`.
+        // `&str` — borrow the utf-8 view.  A lone surrogate has no such view,
+        // so it is reported as the `UnicodeEncodeError` the strict utf-8
+        // encoder raises rather than demanding one.
         if let Type::Path(p) = &*r.elem {
             if path_is_ident(&p.path, "str") {
                 return Ok(quote! {
-                    unsafe { ::pyre_object::w_str_get_value(args[#idx]) }
+                    crate::baseobjspace::str_utf8_w(args[#idx])?
                 });
             }
         }

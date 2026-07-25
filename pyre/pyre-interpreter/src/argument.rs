@@ -115,9 +115,11 @@ pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
             return true;
         }
         unsafe {
+            // Compared as raw buffers: `**{'\ud800': 1}` puts a lone surrogate
+            // in a keyword name, which has no `&str` spelling.
             if pyre_object::is_str(w_other)
                 && pyre_object::is_str(w_key)
-                && pyre_object::w_str_get_value(w_other) == pyre_object::w_str_get_value(w_key)
+                && pyre_object::w_str_get_wtf8(w_other) == pyre_object::w_str_get_wtf8(w_key)
             {
                 return true;
             }
@@ -152,7 +154,7 @@ pub fn check_not_duplicate_kwargs(
         if contains_w_names(w_key, existingkeywords_w) {
             let key_repr = unsafe {
                 if pyre_object::is_str(w_key) {
-                    pyre_object::w_str_get_value(w_key).to_string()
+                    pyre_object::w_str_get_wtf8(w_key).to_string()
                 } else {
                     crate::display::py_str(w_key)?
                 }

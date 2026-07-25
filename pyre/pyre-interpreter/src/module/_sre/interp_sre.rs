@@ -14,6 +14,7 @@ use pyre_object::interp_sre::{
     w_sre_match_get_span, w_sre_match_new, w_sre_pattern_new, w_sre_scanner_new,
 };
 use pyre_object::*;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::StrDrive;
 
@@ -598,22 +599,22 @@ fn get_code(pat: PyObjectRef) -> Option<&'static [u32]> {
 }
 
 #[inline]
-fn char_len(s: &str) -> usize {
-    s.chars().count()
+fn char_len(s: &Wtf8) -> usize {
+    s.code_points().count()
 }
 
 #[inline]
-fn char_to_byte(s: &str, char_pos: usize) -> usize {
+fn char_to_byte(s: &Wtf8, char_pos: usize) -> usize {
     if char_pos == 0 {
         return 0;
     }
-    s.char_indices()
+    s.code_point_indices()
         .nth(char_pos)
         .map(|(byte_pos, _)| byte_pos)
         .unwrap_or_else(|| s.len())
 }
 
-fn char_slice(s: &str, start: i64, end: i64) -> Option<&str> {
+fn char_slice(s: &Wtf8, start: i64, end: i64) -> Option<&Wtf8> {
     if start < 0 || end < start {
         return None;
     }
@@ -654,9 +655,14 @@ fn normalize_bounds(len: usize, pos: i64, endpos: i64) -> (usize, usize) {
 /// character positions and slices back to `str`) or a bytes-like buffer
 /// (byte positions, slices back to `bytes`).  Mirrors make_ctx's
 /// Utf8/Str/BufMatchContext split (interp_sre.py:220-285).
+///
+/// A `str` subject is driven over its `Wtf8` backing rather than a `&str`
+/// view: the engine walks code points, and a lone surrogate is a code point
+/// with no `&str` spelling, so `re.split('\\.', '\ud800')` matches on it the
+/// same way it matches on any other character.
 #[derive(Clone, Copy)]
 enum Subject {
-    Str(&'static str),
+    Str(&'static Wtf8),
     Bytes(&'static [u8]),
 }
 
@@ -734,7 +740,7 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
                 "cannot use a bytes pattern on a string-like object",
             ));
         }
-        Ok(Subject::Str(unsafe { w_str_get_value(string) }))
+        Ok(Subject::Str(unsafe { w_str_get_wtf8(string) }))
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(string) } {
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
@@ -779,7 +785,7 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
 /// itself (`w_buffer` is `PY_NULL` and unused).
 unsafe fn subject_of(string: PyObjectRef, w_buffer: PyObjectRef) -> Subject {
     if unsafe { is_str(string) } {
-        Subject::Str(unsafe { w_str_get_value(string) })
+        Subject::Str(unsafe { w_str_get_wtf8(string) })
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(string) } {
         Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(string) })
     } else {
@@ -792,7 +798,9 @@ unsafe fn subject_of(string: PyObjectRef, w_buffer: PyObjectRef) -> Subject {
 /// group (span `(-1, -1)` or otherwise out of range).
 fn slice_subject(subj: Subject, span: (i64, i64), w_default: PyObjectRef) -> PyObjectRef {
     match subj {
-        Subject::Str(s) => char_slice(s, span.0, span.1).map(w_str_new).unwrap_or(w_default),
+        Subject::Str(s) => char_slice(s, span.0, span.1)
+            .map(|s| w_str_from_wtf8(s.to_owned()))
+            .unwrap_or(w_default),
         Subject::Bytes(b) => byte_slice(b, span.0, span.1)
             .map(pyre_object::bytesobject::w_bytes_from_bytes)
             .unwrap_or(w_default),
@@ -812,7 +820,7 @@ fn empty_subject(subj: Subject) -> PyObjectRef {
 /// subject), for building `sub`/`expand` replacement output.
 fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> {
     match subj {
-        Subject::Str(s) => char_slice(s, span.0, span.1).map(str::as_bytes),
+        Subject::Str(s) => char_slice(s, span.0, span.1).map(Wtf8::as_bytes),
         Subject::Bytes(b) => byte_slice(b, span.0, span.1),
     }
 }
@@ -821,7 +829,7 @@ fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> 
 /// the (valid UTF-8) builder, or `bytes` (subx result, interp_sre.py:541-548).
 fn finish_output(subj: Subject, out: Vec<u8>) -> PyObjectRef {
     match subj {
-        Subject::Str(_) => w_str_new(&String::from_utf8(out).unwrap_or_default()),
+        Subject::Str(_) => w_str_from_wtf8(Wtf8Buf::from_bytes(out).unwrap_or_default()),
         Subject::Bytes(_) => pyre_object::bytesobject::w_bytes_from_bytes(&out),
     }
 }
@@ -1196,7 +1204,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                         "sub: replacement must be str or callable",
                     ));
                 }
-                (unsafe { w_str_get_value(w_repl) }.as_bytes(), false)
+                (unsafe { w_str_get_wtf8(w_repl) }.as_bytes(), false)
             }
             Subject::Bytes(_) => {
                 if !unsafe { pyre_object::bytesobject::is_bytes_like(w_repl) } {
@@ -1242,7 +1250,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                                 "sub callable must return a string",
                             ));
                         }
-                        out.extend_from_slice(unsafe { w_str_get_value(w_piece) }.as_bytes());
+                        out.extend_from_slice(unsafe { w_str_get_wtf8(w_piece) }.as_bytes());
                     }
                     Subject::Bytes(_) => {
                         if !unsafe { pyre_object::bytesobject::is_bytes_like(w_piece) } {
@@ -1370,7 +1378,7 @@ fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, 
             ));
         } else if unsafe { is_str(elem) } {
             items.push(TemplateItem::Literal(
-                unsafe { w_str_get_value(elem) }.as_bytes().to_vec(),
+                unsafe { w_str_get_wtf8(elem) }.as_bytes().to_vec(),
             ));
         } else if unsafe { pyre_object::bytesobject::is_bytes_like(elem) } {
             items.push(TemplateItem::Literal(
@@ -1604,7 +1612,7 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             if !unsafe { is_str(w_template) } {
                 return Err(crate::PyError::type_error("expand: template must be str"));
             }
-            (unsafe { w_str_get_value(w_template) }.as_bytes(), false)
+            (unsafe { w_str_get_wtf8(w_template) }.as_bytes(), false)
         }
         Subject::Bytes(_) => {
             if !unsafe { pyre_object::bytesobject::is_bytes_like(w_template) } {

@@ -21,7 +21,7 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "shm_open: path must be a string",
             ));
         }
-        w_str_get_value(args[0]).to_string()
+        crate::baseobjspace::str_utf8_w(args[0])?.to_string()
     };
     let flags = (unsafe { w_int_get_value(args[1]) }) as libc::c_int;
     let mode = if args.len() >= 3 {
@@ -58,7 +58,7 @@ fn shm_unlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "shm_unlink: path must be a string",
             ));
         }
-        w_str_get_value(args[0]).to_string()
+        crate::baseobjspace::str_utf8_w(args[0])?.to_string()
     };
     let c_name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
