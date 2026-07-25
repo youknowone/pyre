@@ -7906,12 +7906,15 @@ impl CodeWriter {
                     // dispatch after `attach_catch_exception_edge` — the
                     // canraise op attaches its exception edge but the walker
                     // is expected to continue processing the canraise op's
-                    // normal-flow result and subsequent ops.  `emit_abort_
-                    // permanent!` is excluded by checking `exits.is_empty()`
-                    // — it inserts a runtime abort marker without closing
-                    // the block, so subsequent ops still need dispatch for
-                    // stack-depth parity (e.g. `Instruction::LoadName` +
-                    // `Instruction::StoreName` patterns at module scope).
+                    // normal-flow result and subsequent ops.
+                    //
+                    // `emit_abort_permanent!` is NOT excluded: it appends a
+                    // returnblock link, so `exits` is non-empty and every
+                    // later PC lands here and skips dispatch.  A body that
+                    // aborts therefore stops emitting at that opcode — which
+                    // is why `merge_entry_by_green` drops the loop headers
+                    // behind it instead of taking every header a bytecode
+                    // scan finds.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
                     // loop-header `jit_merge_point` gate: the merge emission
@@ -13600,7 +13603,33 @@ impl CodeWriter {
         // otherwise the derivable resume marker. This is deliberately only
         // the set of trace-entry greens (function entry and loop headers), not
         // a general coordinate inverse.
-        let mut trace_entry_pcs: Vec<usize> = find_loop_header_pcs(code).iter().copied().collect();
+        //
+        // A header this body never lowered does NOT qualify.  `abort_permanent`
+        // closes its block, so every later PC is skipped as dead code and
+        // nothing at-or-after such a header emitted an op — exactly the case
+        // `derive_resume_marker` answers `None` for.  The dense carry-forward
+        // still has a value for it (the last `-live-` that WAS emitted, in the
+        // prologue), so the disagreement lands in `carryfwd_resume_pc` and
+        // `resolve_marker` would publish that unrelated offset as the header's
+        // walk entry.  `run_perfn_walk` seeds an entry marker's abstract
+        // registers from the live frame BY SLOT, so entering the prologue with
+        // the frame parked at the loop header fills the prologue's registers
+        // with the header's operand stack (for a `for` header, the iterator)
+        // and the replayed prologue stores them into locals.  Publishing no
+        // entry makes `merge_entry_for` answer `None`, which both the walk and
+        // `compile_and_run_once` read as "interpret this green".
+        let mut trace_entry_pcs: Vec<usize> = find_loop_header_pcs(code)
+            .iter()
+            .copied()
+            .filter(|&py_pc| {
+                pyre_jit_trace::pyjitcode::derive_resume_marker(
+                    &first_jit_pc_by_py_pc,
+                    &block_head_py_by_jit_pc,
+                    py_pc,
+                )
+                .is_some()
+            })
+            .collect();
         trace_entry_pcs.push(0);
         trace_entry_pcs.sort_unstable();
         trace_entry_pcs.dedup();

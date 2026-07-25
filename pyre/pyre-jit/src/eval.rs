@@ -7573,8 +7573,12 @@ fn compile_and_run_once(
     }
     let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
         .expect("registered portal must have a drained PyJitCode");
-    pjc.merge_entry_for(target_pc)
-        .expect("registered portal must have a static merge entry for the hot green");
+    // A body that stopped lowering at an `abort_permanent` carries no entry for
+    // the greens behind the abort, so the hot loop header has none.  There is
+    // no coordinate to start the walk from; interpret instead.
+    if pjc.merge_entry_for(target_pc).is_none() {
+        return None;
+    }
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     let had_compiled = driver.has_compiled_loop(green_key);
