@@ -87,7 +87,7 @@ Options:
 -q     : don't print version on interactive startup
 -s     : don't add user site directory to sys.path
 -S     : don't imply 'import site' on initialization
--P     : don't prepend a potentially unsafe path to sys.path
+-P     : don't prepend a potentially unsafe path to sys.path (also PYTHONSAFEPATH)
 -V     : print the Python version number and exit (also --version)
 -X opt : set implementation-specific option
 file   : program read from script file
@@ -195,10 +195,28 @@ fn resolve_dont_write_bytecode(flags: &LaunchFlags) -> bool {
     false
 }
 
+/// `-P` folded with PYTHONSAFEPATH (`config_read_env_vars`). The variable is a
+/// bare presence flag read through `_Py_GetEnv`, not an integer one: any
+/// non-empty value enables safe path — `"0"` included — while an empty value
+/// counts as unset. It only ever sets the flag, so an explicit `-P` survives
+/// `-E`.
+fn resolve_safe_path(flags: &LaunchFlags) -> bool {
+    if flags.safe_path {
+        return true;
+    }
+    if !flags.ignore_environment {
+        if let Ok(value) = std::env::var("PYTHONSAFEPATH") {
+            return !value.is_empty();
+        }
+    }
+    false
+}
+
 fn finalize_flags(mut flags: LaunchFlags) -> LaunchFlags {
     flags.utf8_mode = Some(resolve_utf8_mode(&flags));
     flags.optimize = resolve_optimize(&flags);
     flags.dont_write_bytecode = resolve_dont_write_bytecode(&flags);
+    flags.safe_path = resolve_safe_path(&flags);
     flags
 }
 

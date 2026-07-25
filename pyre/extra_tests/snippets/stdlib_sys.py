@@ -143,10 +143,31 @@ proc = subprocess.run(args, stdout=subprocess.PIPE, universal_newlines=True, env
 assert proc.stdout.rstrip() == "True", proc
 assert proc.returncode == 0, proc
 
+
+def safe_path_flag(env, *opts):
+    proc = subprocess.run(
+        (sys.executable,) + opts + ("-c", code),
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+        env=env,
+    )
+    assert proc.returncode == 0, proc
+    return proc.stdout.rstrip()
+
+
+# The variable alone enables safe path; it is a presence flag, so any non-empty
+# value counts and an empty one is treated as unset.
 env["PYTHONSAFEPATH"] = "1"
-proc = subprocess.run(args, stdout=subprocess.PIPE, universal_newlines=True, env=env)
-assert proc.stdout.rstrip() == "True"
-assert proc.returncode == 0, proc
+assert safe_path_flag(env) == "True"
+env["PYTHONSAFEPATH"] = "0"
+assert safe_path_flag(env) == "True"
+env["PYTHONSAFEPATH"] = ""
+assert safe_path_flag(env) == "False"
+
+# -E ignores every PYTHON* variable, but an explicit -P still wins.
+env["PYTHONSAFEPATH"] = "1"
+assert safe_path_flag(env, "-E") == "False"
+assert safe_path_flag(env, "-E", "-P") == "True"
 
 assert sys._getframemodulename() == "__main__", sys._getframemodulename()
 
