@@ -3184,6 +3184,11 @@ impl Optimizer {
                         // loop/peeled-loop path (optimize_peeled_loop
                         // unroll.py:135-145) keeps this fatal.
                         if building_bridge {
+                            if crate::bridge_debug_enabled() {
+                                eprintln!(
+                                    "[bridgeB] preview virtual-state mismatch — leaving the export empty for the jump_to_existing_trace ladder"
+                                );
+                            }
                             break 'export None;
                         }
                         return Err(crate::optimize::InvalidLoop(
