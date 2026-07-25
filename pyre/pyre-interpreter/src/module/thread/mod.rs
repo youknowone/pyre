@@ -11,7 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
-const TIMEOUT_MAX: f64 = i64::MAX as f64 / 1_000_000.0;
+/// `_thread.TIMEOUT_MAX` — the whole-second bound of the nanosecond timestamp
+/// an acquire timeout is converted to.  PyPy exposes the microsecond bound
+/// instead (`moduledef.py:27` `float(os_lock.TIMEOUT_MAX // 1000000)`), which
+/// is a thousand times larger and is its 3.11-era surface.
+const TIMEOUT_MAX: f64 = (i64::MAX / 1_000_000_000) as f64;
 static THREAD_COUNT: AtomicI64 = AtomicI64::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FINALIZING: AtomicBool = AtomicBool::new(false);
@@ -339,6 +343,13 @@ fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `os_lock.py:23-40 parse_acquire_args`.  The result is the `microseconds`
 /// argument of the `RPyThreadAcquireLockTimed` ABI: negative blocks forever,
 /// zero polls once.
+///
+/// The argument is rejected the way `lock_acquire_parse_args` does in 3.14,
+/// which is stricter than `os_lock.py`: upstream converts the seconds straight
+/// to microseconds, while 3.14 first builds a nanosecond timestamp, so NaN and
+/// anything outside the nanosecond range are rejected before the microsecond
+/// bound is ever reached — and that bound, being a thousand times wider than
+/// the nanosecond one, is then unreachable and is not tested here.
 fn parse_acquire_args(
     blocking: i64,
     w_timeout: Option<PyObjectRef>,
@@ -352,6 +363,23 @@ fn parse_acquire_args(
         Some(w_timeout) => crate::baseobjspace::float_w(w_timeout)?,
         None => -1.0,
     };
+    // `_PyTime_FromSecondsObject(&timeout, timeout_obj, _PyTime_ROUND_TIMEOUT)`
+    // runs before either check below, so a value it cannot represent is
+    // reported even for a non-blocking call.
+    if timeout.is_nan() {
+        return Err(crate::PyError::value_error(
+            "Invalid value NaN (not a number)",
+        ));
+    }
+    // `rarithmetic.ovfcheck_float_to_longlong` bounds, the ones `time.sleep`
+    // converts its own argument against (`interp_time.rs:122-126`).
+    const NS_MIN: f64 = -9223372036854776832.0;
+    const NS_MAX: f64 = 9223372036854775296.0;
+    if !(NS_MIN..NS_MAX).contains(&(timeout * 1e9).ceil()) {
+        return Err(crate::PyError::overflow_error(
+            "timestamp out of range for platform time_t",
+        ));
+    }
     if !blocking && timeout != -1.0 {
         return Err(crate::PyError::value_error(
             "can't specify a timeout for a non-blocking call",
@@ -359,16 +387,13 @@ fn parse_acquire_args(
     }
     if timeout < 0.0 && timeout != -1.0 {
         return Err(crate::PyError::value_error(
-            "timeout value must be strictly positive",
+            "timeout value must be a non-negative number",
         ));
     }
     if !blocking {
         Ok(0)
     } else if timeout == -1.0 {
         Ok(-1)
-    } else if timeout > TIMEOUT_MAX {
-        // `ovfcheck_float_to_longlong(timeout * 1e6)`.
-        Err(crate::PyError::overflow_error("timeout value is too large"))
     } else {
         Ok((timeout * 1e6) as i64)
     }

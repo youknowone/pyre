@@ -126,24 +126,33 @@ assert rlock.acquire() is True
 rlock.release()
 rlock.release()
 
-# The wording of these differs between implementations; only the type is part
-# of the interface.
-for call in (
-    lambda: lock.acquire(False, 1.0),
-    lambda: lock.acquire(True, -2.0),
-):
+# `TIMEOUT_MAX` is the whole-second bound of the nanosecond timestamp the
+# argument is converted to, and that conversion runs before either the
+# blocking or the sign check.
+assert _thread.TIMEOUT_MAX == 9223372036.0
+
+for timeout, exc_type, message in [
+    (float("nan"), ValueError, "Invalid value NaN (not a number)"),
+    (9223372036.9, OverflowError, "timestamp out of range for platform time_t"),
+    (float("inf"), OverflowError, "timestamp out of range for platform time_t"),
+    (-1e18, OverflowError, "timestamp out of range for platform time_t"),
+    (-2.0, ValueError, "timeout value must be a non-negative number"),
+]:
     try:
-        call()
-    except ValueError:
-        pass
+        _thread.allocate_lock().acquire(True, timeout)
+    except exc_type as exc:
+        assert str(exc) == message, (timeout, exc)
     else:
-        raise AssertionError("bad acquire arguments accepted")
+        raise AssertionError("%r accepted" % (timeout,))
 
 try:
-    lock.acquire(True, _thread.TIMEOUT_MAX * 2.0)
-except OverflowError:
-    pass
+    _thread.allocate_lock().acquire(False, 1.0)
+except ValueError as exc:
+    assert str(exc) == "can't specify a timeout for a non-blocking call", exc
 else:
-    raise AssertionError("oversized timeout accepted")
+    raise AssertionError("non-blocking acquire accepted a timeout")
+
+# The fractional tail below the nanosecond bound is still in range.
+assert _thread.allocate_lock().acquire(True, 9223372036.854) is True
 
 print("OK")
