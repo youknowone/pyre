@@ -977,8 +977,13 @@ fn run_module(module: &str, no_site: bool) {
         if e.kind == PyErrorKind::SystemExit {
             finalize_system_exit(e, canonical, ec_ptr);
         }
-        maybe_print_jit_stats();
+        // targetpypystandalone.py:88 `finally: space.finish()` — finalize on
+        // every exit path, not only on SystemExit.  Print first: the raw
+        // `PyObjectRef` fields of `e` are not GC-visible and `finalize_runtime`
+        // collects.
         pyre_interpreter::eprint_exception(&e, true);
+        finalize_runtime(canonical, ec_ptr);
+        maybe_print_jit_stats();
         std::process::exit(1);
     }
     finalize_runtime(canonical, ec_ptr);
@@ -1103,8 +1108,13 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             if e.kind == PyErrorKind::SystemExit {
                 finalize_system_exit(e, canonical, ec_ptr);
             }
-            maybe_print_jit_stats();
+            // targetpypystandalone.py:88 `finally: space.finish()` — finalize
+            // on every exit path, not only on SystemExit.  Print first: the raw
+            // `PyObjectRef` fields of `e` are not GC-visible and
+            // `finalize_runtime` collects.
             pyre_interpreter::eprint_exception(&e, true);
+            finalize_runtime(canonical, ec_ptr);
+            maybe_print_jit_stats();
             std::process::exit(1);
         }
     }
