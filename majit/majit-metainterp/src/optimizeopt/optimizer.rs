@@ -398,6 +398,17 @@ pub struct Optimizer {
     /// after setup(). RPython calls deserialize_optimizer_knowledge after the
     /// optimizer is constructed.
     pending_bridge_rd: Option<PendingBridgeRd>,
+    /// unroll.py:183-236 `optimize_bridge` vs unroll.py:100-110
+    /// `optimize_preamble`: the bridge path's `propagate_all_forward`
+    /// (unroll.py:193) does NOT build the short-preamble/export preview, and
+    /// its virtual-state matching is deferred to `jump_to_existing_trace`
+    /// (unroll.py:207), which catches `VirtualStatesCantMatch` and falls back
+    /// to `jump_to_preamble` (unroll.py:209-210). pyre folds the preview export
+    /// into the shared `optimize_with_constants_and_inputs_at`; this flag marks
+    /// the bridge call so the preview's `make_inputargs_and_virtuals` mismatch
+    /// is NON-fatal (exported_loop_state = None) instead of escaping as an
+    /// InvalidLoop that discards the bridge (the pi guard-9 infinite-deopt hang).
+    building_bridge: bool,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Taken from MIStaticData at optimizer construction, returned after.
     /// descr.py:25-47: descriptors get descr_index assigned inline during
@@ -1394,6 +1405,7 @@ impl Optimizer {
             terminal_op: None,
             final_ctx: None,
             pending_bridge_rd: None,
+            building_bridge: false,
             all_descrs: Vec::new(),
             constant_fold_alloc: None,
             string_length_resolver: None,
@@ -2956,8 +2968,9 @@ impl Optimizer {
         // `match` (not `jump.map(|jump| ...)`) so the `return Err(InvalidLoop)`
         // for the preview virtual-state mismatch below propagates out of
         // `optimize_with_constants_and_inputs_at`, not just the closure.
+        let building_bridge = self.building_bridge;
         self.exported_loop_state = match jump {
-            Some(jump) => {
+            Some(jump) => 'export: {
                 // RPython unroll.py:454-457 order:
                 //   end_args = [force_box_for_end_of_preamble(a) for a ...]
                 //   self.optimizer.flush()
@@ -3157,6 +3170,22 @@ impl Optimizer {
                 {
                     Ok(pair) => pair,
                     Err(()) => {
+                        // unroll.py:193,207-210: on the BRIDGE path the
+                        // short-preamble/export preview does not exist — VS
+                        // matching is deferred to `jump_to_existing_trace`,
+                        // which catches `VirtualStatesCantMatch` and falls back
+                        // to `jump_to_preamble`. Do not surface the preview
+                        // mismatch as a fatal InvalidLoop; leave
+                        // exported_loop_state = None (the flush + force above
+                        // already committed the bridge's heap writebacks into
+                        // `ctx.new_operations`) and let `optimize_bridge`'s own
+                        // ladder route the bridge to the always-matching
+                        // preamble target (unroll.py:238-242). Only the
+                        // loop/peeled-loop path (optimize_peeled_loop
+                        // unroll.py:135-145) keeps this fatal.
+                        if building_bridge {
+                            break 'export None;
+                        }
                         return Err(crate::optimize::InvalidLoop(
                             "preview virtual state mismatch (VirtualStatesCantMatch)",
                         ));
@@ -3920,6 +3949,14 @@ impl Optimizer {
             && has_body_guard;
         let skip_flush_saved = self.skip_flush;
         self.skip_flush = retarget_close_jump;
+        // unroll.py:193 `optimize_bridge` propagate_all_forward builds NO
+        // short-preamble/export preview; mark the bridge call so the shared
+        // `optimize_with_constants_and_inputs_at` preview treats a
+        // VirtualStatesCantMatch as non-fatal (deferred to the
+        // jump_to_existing_trace → jump_to_preamble ladder below) rather than
+        // escaping as an InvalidLoop that discards the bridge.
+        let building_bridge_saved = self.building_bridge;
+        self.building_bridge = true;
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
             ops,
             constants,
@@ -3928,6 +3965,7 @@ impl Optimizer {
             start_next_pos,
             false,
         );
+        self.building_bridge = building_bridge_saved;
         self.skip_flush = skip_flush_saved;
         let optimized_ops = optimized_ops?;
 
