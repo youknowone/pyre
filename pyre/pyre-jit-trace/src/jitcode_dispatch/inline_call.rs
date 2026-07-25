@@ -1086,21 +1086,23 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
-    let ca_result = if fbw_vable_scalar_ca_enabled() {
-        // `PYRE_FBW_VABLE_SCALAR_CA`: route through the vable-scalar
-        // emitter so loop-carried locals become scalar CALL_ASSEMBLER args +
-        // `VableExpansion` arg_overrides, letting the optimizer elide the
-        // per-call frame-array build. Scaffolding only: the emitter currently
-        // produces the identical red-only CA; the vable_expansion routing lands
-        // in S2.
-        emit_loop_callee_ca_vable_scalar(ctx, callee_frame, callee_ec, token)
-    } else {
-        ctx.trace_ctx.call_assembler_red_only_ref_arc(
-            token,
-            &[callee_frame, callee_ec],
-            &[Type::Ref, Type::Ref],
-        )
-    };
+    // `direct_assembler_call` (`pyjitpl.py`) records the CALL_ASSEMBLER with
+    // exactly the target jitdriver's red args — `assert len(args) ==
+    // targetjitdriver_sd.num_red_args` — and the portal reds are
+    // `['frame', 'ec']` (`interp_jit.py`), the frame at
+    // `index_of_virtualizable`. The callee, not the caller, unpacks the
+    // virtualizable: `patch_new_loop_to_load_virtualizable_fields`
+    // (`compile.py`) truncates the callee loop to `inputargs[:num_red_args]`
+    // and prepends a GETFIELD_GC / GETARRAYITEM_GC per field read off that
+    // vable arg. So the callee loop head dereferences a real heap frame, which
+    // is why forcing the still-virtual frame here — allocation plus one
+    // SETARRAYITEM_GC per known element — is the upstream op sequence rather
+    // than a decline.
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
+        token,
+        &[callee_frame, callee_ec],
+        &[Type::Ref, Type::Ref],
+    );
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
 
     // Run the call concretely to stamp `ca_result` (same rationale as the
@@ -1165,29 +1167,6 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
 
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-}
-
-/// `PYRE_FBW_VABLE_SCALAR_CA` emission seam (scaffolding only).
-///
-/// Emits the loop-callee CALL_ASSEMBLER when the vable-scalar mode is
-/// on. Today it produces the identical red-only `[callee_frame, callee_ec]` CA
-/// as the default path, so flag-ON is byte-identical to flag-OFF. Wiring the
-/// body to `call_assembler_with_vable_expansion` — passing the callee's
-/// loop-carried locals as scalar args plus a `VableExpansion` whose
-/// `arg_overrides` map each scalar to a callee jitframe slot
-/// (`rewrite.py` handle_call_assembler parity) — would let the
-/// optimizer elide the per-call frame-array build.
-pub(crate) fn emit_loop_callee_ca_vable_scalar<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    callee_frame: OpRef,
-    callee_ec: OpRef,
-    token: std::sync::Arc<majit_backend::JitCellToken>,
-) -> OpRef {
-    ctx.trace_ctx.call_assembler_red_only_ref_arc(
-        token,
-        &[callee_frame, callee_ec],
-        &[Type::Ref, Type::Ref],
-    )
 }
 
 /// #62 slice (3c): full-body-walk inline of a recognized user-function

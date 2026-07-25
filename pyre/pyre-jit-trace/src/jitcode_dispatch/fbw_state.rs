@@ -95,27 +95,6 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
 
-/// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of the loop-callee
-/// CALL_ASSEMBLER passes the callee's loop-carried locals as scalar
-/// CALL_ASSEMBLER args plus a `VableExpansion` (`arg_overrides` mapping each
-/// scalar to a callee jitframe slot), so the optimizer can elide the per-call
-/// frame-array build (`NewArrayClear` + per-element `SetarrayitemGc`) instead
-/// of forcing the virtual frame. Mirrors `direct_assembler_call`
-/// (`pyjitpl.py`, raw red boxes) + `handle_call_assembler`
-/// (`rewrite.py`, GC_STORE scalars into the callee jitframe). Default OFF
-/// until the callee scalar contract + optimizer array-elision land and the
-/// path is verified fib-safe on both backends.
-pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_VABLE_SCALAR_CA") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => false,
-    })
-}
-
 /// `PYRE_FBW_CALLEE_VSTACK` (default OFF) — maintain a callee-local
 /// operand-stack mirror while walking an inline sub-call.  The callee enters
 /// with an empty operand stack; subsequent boundaries must use the active
