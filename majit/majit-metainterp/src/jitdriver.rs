@@ -2796,10 +2796,7 @@ impl<S: JitState> JitDriver<S> {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception,
-                // The full-body walk delivers the `raise` half of
-                // `pyjitpl.py:2558-2562` itself (`WALK_END_PROPAGATED_EXCEPTION`),
-                // so this consumer only runs the compile half.
-                exc_value: _,
+                exc_value,
             } => {
                 // A terminal dispatch return is also a valid single-pass
                 // handoff: the interpreted function has returned, so native
@@ -2827,6 +2824,26 @@ impl<S: JitState> JitDriver<S> {
                     .and_then(|ctx| ctx.collect_virtualizable_element_values());
                 if let Some(elems) = virt_elems {
                     self.meta.single_pass_virt_array_values = Some(elems);
+                }
+                // The `raise` half of `pyjitpl.py:2558-2562`.  This arm is the
+                // consumer for `#[jit_interp]`-generated tracers, which reach
+                // it through `merge_point` and whose walk carries an escaping
+                // exception in `BH_LAST_EXC_VALUE` — the only channel a
+                // macro-front-end client has.  The producer
+                // (`dispatch.rs unwind_to_exception_handler`) closes that
+                // channel and hands the value over on the action, so re-open
+                // it here; dropping it would let the portal finish as if the
+                // frame had returned normally.
+                //
+                // Published *before* the compile: upstream snapshots
+                // `excvalue` into a local at :2531 and that local keeps the
+                // ref alive as a GC root across
+                // `compile_exit_frame_with_exception` (:2558).  A raw `i64`
+                // is no root, and `compile_finish_from_active_session`
+                // allocates, so the walked TLS cell has to hold the value
+                // across it.
+                if exit_with_exception && exc_value != 0 {
+                    crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_value));
                 }
                 // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
                 // `compile_done_with_this_frame` and
@@ -6654,6 +6671,59 @@ mod tests {
             state.writeback_applied,
             Some(vec![9]),
             "write-back must run with the walk-final captured values, not be a no-op",
+        );
+    }
+
+    /// Regression: an exception that drains the walk's frame stack must still
+    /// be delivered after the FINISH is compiled.
+    ///
+    /// `dispatch.rs unwind_to_exception_handler` closes the
+    /// `BH_LAST_EXC_VALUE` channel when it builds the exception-carrying
+    /// FINISH (leaving it set makes an interpreter re-surface the trace's
+    /// exception at its next residual-call boundary), and hands the concrete
+    /// value over on the action instead.  `#[jit_interp]` clients reach that
+    /// action through `merge_point` and have no second carrier, so this arm
+    /// re-publishes it — without that, the portal finishes as if the frame had
+    /// returned normally and the exception is silently dropped.
+    #[test]
+    fn finish_with_exception_republishes_the_escaping_exception() {
+        const ESCAPING_EXC: i64 = 0xc0ff_ee00;
+
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let mut state = ScalarWalkState {
+            selected: 3,
+            writeback_applied: None,
+        };
+        let target_pc = 7usize;
+        driver.force_start_tracing(target_pc as u64, target_pc, &mut state, &());
+        assert!(
+            driver.is_tracing(),
+            "force_start_tracing must start a trace"
+        );
+
+        // The producer cleared the channel; only the action carries the value.
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+
+        driver.merge_point(|meta, _sym| {
+            let exc_box = meta
+                .trace_ctx()
+                .expect("tracing ⇒ trace ctx")
+                .const_ref(ESCAPING_EXC);
+            TraceAction::Finish {
+                finish_args: vec![exc_box],
+                finish_arg_types: vec![majit_ir::Type::Ref],
+                exit_with_exception: true,
+                exc_value: ESCAPING_EXC,
+            }
+        });
+
+        let delivered = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        assert_eq!(
+            delivered, ESCAPING_EXC,
+            "the exception the trace finished with must survive the compile half",
         );
     }
 
