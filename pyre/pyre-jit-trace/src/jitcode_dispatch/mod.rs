@@ -2173,32 +2173,51 @@ pub fn walk<Sym: WalkSym>(
                 // `exit_frame_with_exception`, letting the exception escape a
                 // frame that actually catches it.
                 if let Some(target) = try_catch_exception_at(code, pc) {
+                    // `op.key` carries the full `opname/argcodes` spelling;
+                    // `op.opname` is only the part before the `/`.
                     let raised_in_this_frame = decode_op_at(code, opcode_position)
-                        .is_some_and(|op| matches!(op.opname, "raise/r" | "reraise/"));
-                    if !raised_in_this_frame {
-                        // finishframe_exception propagates into this frame
-                        // before catch_exception/L enters its handler. Record
-                        // that frame-boundary step once; handler entry itself
-                        // does not add a traceback node.
-                        record_inline_application_traceback(
+                        .is_some_and(|op| matches!(op.key, "raise/r" | "reraise/"));
+                    // finishframe_exception propagates into this frame
+                    // before catch_exception/L enters its handler. Record
+                    // that frame-boundary step once; handler entry itself
+                    // does not add a traceback node.
+                    //
+                    // The node has to exist on the compiled run too: the
+                    // handler is part of the trace, so this frame never
+                    // surfaces an error the interpreter's `handle_exception`
+                    // could record from.  A raise the `raise/r` / `reraise/`
+                    // arm already routed here is the exception — that arm
+                    // emits the runtime record itself, so emitting again
+                    // would give the frame two nodes.
+                    let recording_opcode_position = ctx.session.borrow().recording_opcode_position;
+                    let node_position = if ctx.is_top_level {
+                        recording_opcode_position
+                    } else {
+                        opcode_position
+                    };
+                    let emit_runtime = !raised_in_this_frame
+                        && !record_prepend_application_traceback(
                             ctx,
                             exc,
                             exc_concrete,
-                            opcode_position,
-                            true,
-                            false,
+                            node_position,
                         );
-                        let recording_opcode_position =
-                            ctx.session.borrow().recording_opcode_position;
-                        record_top_level_application_traceback(
-                            ctx,
-                            exc,
-                            exc_concrete,
-                            recording_opcode_position,
-                            true,
-                            false,
-                        );
-                    }
+                    record_inline_application_traceback(
+                        ctx,
+                        exc,
+                        exc_concrete,
+                        opcode_position,
+                        true,
+                        emit_runtime,
+                    );
+                    record_top_level_application_traceback(
+                        ctx,
+                        exc,
+                        exc_concrete,
+                        recording_opcode_position,
+                        true,
+                        emit_runtime,
+                    );
                     ctx.last_exc_value = Some(exc);
                     ctx.last_exc_value_concrete = exc_concrete;
                     // pyjitpl.py:2530-2558 `finishframe_exception` only
