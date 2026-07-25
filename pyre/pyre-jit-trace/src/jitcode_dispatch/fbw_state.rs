@@ -1285,6 +1285,60 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     Ok(())
 }
 
+/// Publish the raising instruction's Python coordinate into the standard
+/// virtualizable's `last_instr` slot before the top-level frame exits with
+/// an exception.
+///
+/// `handle_exception` (pyre-interpreter) stamps this frame's traceback node
+/// with `frame.last_instr` and keys the exception-table lookup on the same
+/// field, so the value has to be the coordinate the raise actually happened
+/// at.  Compiled code never runs the per-opcode interpreter store: a frame
+/// entered through the function-entry portal still carries the `-1`
+/// initialization sentinel, which `offset2lineno` answers with the code
+/// object's first line — the `def` line — and a loop-entry frame carries the
+/// loop header.  In both shapes the node comes out stamped with a line the
+/// frame was not executing.
+///
+/// Upstream never faces this: `handle_operation_error` runs INSIDE the traced
+/// portal, so the node is recorded from the vable's own `last_instr` box
+/// (`pyopcode.py:147-148`), which every opcode writes.  pyre records the
+/// top-level frame's node from the interpreter instead — the exception
+/// surfaces there as `exit_frame_with_exception` — so the field it reads has
+/// to be published before the trace finishes.
+///
+/// The store is the static-field shape `gen_store_back_in_vable` emits for
+/// this slot, so it reaches the frame on a compiled run; the shadow mirror
+/// keeps the walker's own virtualizable view in step with it.
+pub(crate) fn fbw_publish_raise_last_instr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode_position: usize,
+) {
+    let jitcode_index = ctx.session.borrow().recording_jitcode_index;
+    let Some(py_pc) =
+        crate::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position as i32)
+    else {
+        return;
+    };
+    let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return;
+    };
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return;
+    };
+    let Some(field_index) = info.static_field_index_by_name("last_instr") else {
+        return;
+    };
+    let value = ctx.trace_ctx.const_int(i64::from(py_pc));
+    ctx.trace_ctx
+        .vable_setfield_descr(vbox, value, info.static_field_descr(field_index));
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "last_instr",
+        value,
+        Value::Int(i64::from(py_pc)),
+    );
+}
+
 /// Exception variant of [`fbw_terminate_with_finish`] for the top-level
 /// uncaught raise (`compile_exit_frame_with_exception`, pyjitpl.py).
 /// Stashes the exception box (`exc`, already a `Type::Ref`) as an
