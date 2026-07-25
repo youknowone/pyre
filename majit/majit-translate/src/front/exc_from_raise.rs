@@ -41,9 +41,20 @@
 //!
 //! ```text
 //! evalue = op.simple_call(const(exc_class), *message_args)
-//! etype  = op.type(evalue)
-//! graph.set_raise_values(block, etype, evalue)
+//! graph.set_raise_values(block, evalue, evalue)
 //! ```
+//!
+//! ### The `etype` link arg
+//!
+//! Upstream's tail line is `w_type = op.type(w_value)`, but that value never
+//! reaches a jitcode. `make_bytecode_block` hands the `exceptblock`'s
+//! `inputargs` to `make_return` (`flatten.py:106-108`), whose 2-arg arm emits
+//! `-live-` + `raise self.getcolor(args[1])` and never touches `args[0]`
+//! (`flatten.py:139-143`, mirrored at `flatten.rs:781-793`). So the slot the
+//! `etype` link arg feeds has no consumer in any emitted bytecode.
+//! `set_raise_values` therefore receives `evalue` for both slots instead of a
+//! synthesised `type(evalue)` call, which would be a residual with a dead
+//! result register on every raise tail.
 //!
 //! ### TODO: `Constant` SSA carrier shape
 //!
@@ -118,9 +129,9 @@
 //!
 //! ## What this helper is not
 //!
-//! - It is **not** a synthetic helper. The call targets emitted here
-//!   are the RPython op names themselves (`simple_call`, `type`), so
-//!   any downstream reader sees the same op namespace upstream uses.
+//! - It is **not** a synthetic helper. The call target emitted here
+//!   is the RPython op name itself (`simple_call`), so any downstream
+//!   reader sees the same op namespace upstream uses.
 //! - There are no `__pyre_exc_from_raise__` / `__pyre_exception_type_of__`
 //!   opaque Call targets any more — that earlier deviation is removed
 //!   by the same change that introduced this module.
@@ -129,9 +140,9 @@ use crate::flowspace::model::Variable;
 use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
 
 /// Close `block` with an `(etype, evalue)` Link to `exceptblock`
-/// whose values come from the canonical RPython `exc_from_raise`
-/// op sequence (`op.simple_call(const(exc_class), *args)` followed
-/// by `op.type(evalue)`).
+/// whose value comes from the canonical RPython `exc_from_raise` op
+/// sequence (`op.simple_call(const(exc_class), *args)`).  The `etype`
+/// slot reuses `evalue` — see the module-level "etype link arg" note.
 ///
 /// `exc_class_name` is the Python-layer exception class name
 /// (`"AssertionError"`, `"PanicError"`, …) carried as the second
@@ -175,22 +186,21 @@ pub fn lower_exc_from_raise(
             true,
         )
         .expect("op.simple_call(exc_class, ...) must produce a Ref exception instance");
-    // `op.type(evalue)` — upstream `flowcontext.py:600` tail line
-    // (`w_type = op.type(w_value).eval(self)`).
-    let type_target = CallTarget::function_path(["type"]);
-    let etype_var = graph
-        .push_op_var(
-            block,
-            OpKind::Call {
-                target: type_target,
-                args: vec![evalue_var.clone()],
-                result_ty: ValueType::Ref(None),
-            },
-            true,
-        )
-        .expect("op.type(evalue) must produce a Ref type value");
-    // `flowspace/flowcontext.py:1253 Raise.nomoreblocks` — close
-    // the block with the `(etype, evalue)` Link to the graph's
-    // `exceptblock`.
-    graph.set_raise_values(block, etype_var, evalue_var);
+    // `flowspace/flowcontext.py:1253 Raise.nomoreblocks` — close the block
+    // with the `(etype, evalue)` Link to the graph's `exceptblock`.
+    //
+    // Upstream's `w_type = op.type(w_value)` (`flowcontext.py:634`) lives at
+    // flow-space level only — see the module-level "etype link arg" note: the
+    // 2-arg `make_return` arm emits `raise <args[1]>` and never reads
+    // `args[0]`, and `make_exception_link` drops both for a direct `reraise`.
+    // So the `etype` link arg is write-only in every emitted jitcode. The
+    // emitted drain tail is `-live-` + `raise <evalue>` and nothing else.
+    // Materialising it as a `type(evalue)` call — which pyre
+    // did, because `set_raise_values` takes `Variable`s and every pyre SSA
+    // value needs a producing op (see the `Constant` carrier TODO above) —
+    // left a residual whose result register is dead by construction on every
+    // raise tail in the corpus, and made the raise arm unwalkable in the
+    // blackhole (canonical `inline_call_*` on a callee with no runtime
+    // address). Reuse `evalue`: same ref kind, no new op.
+    graph.set_raise_values(block, evalue_var.clone(), evalue_var);
 }

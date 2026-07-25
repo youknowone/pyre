@@ -33,8 +33,9 @@
 //!   (`PyError::to_exc_object` — the trace-level exception value
 //!   domain is the `W_BaseException` ref, the same value
 //!   `BH_LAST_EXC_VALUE` carries) and closes the block towards
-//!   `exceptblock` with `(op.type(exc), exc)`, exactly the
-//!   `lower_exc_from_raise` tail shape (`flowcontext.py:600`).
+//!   `exceptblock` with `(exc, exc)`, exactly the
+//!   `lower_exc_from_raise` tail shape (`flowcontext.py:600`) — whose
+//!   `etype` slot is write-only, see that module's "etype link arg" note.
 //!
 //! - **Caller rule** ([`rewire_result_exc_call_sites`]): a `?` on a
 //!   call to a scoped callee lowers in MIR as a
@@ -533,20 +534,12 @@ pub(crate) fn lower_result_exc_returns(
                     true,
                 )
                 .expect("to_exc_object call must produce a value");
-            // `op.type(evalue)` — the `lower_exc_from_raise` tail
-            // (`flowcontext.py:600` `w_type = op.type(w_value)`).
-            let v_type = graph
-                .push_op_var(
-                    block_id,
-                    OpKind::Call {
-                        target: CallTarget::function_path(["type"]),
-                        args: vec![v_exc.clone()],
-                        result_ty: ValueType::Ref(None),
-                    },
-                    true,
-                )
-                .expect("op.type(evalue) must produce a value");
-            graph.set_raise_values(block_id, v_type, v_exc);
+            // `graph.set_raise_values(block, etype, evalue)`. The `etype`
+            // link arg is write-only: `make_return`'s 2-arg arm emits
+            // `raise <args[1]>` and never reads `args[0]`
+            // (`flatten.rs:781-793`, `flatten.py:139-143`). Pass the evalue
+            // for it — see `front::exc_from_raise`'s "etype link arg" note.
+            graph.set_raise_values(block_id, v_exc.clone(), v_exc);
         } else {
             // `return Ok(v)` → forward the payload itself.
             for link in &mut graph.blocks[bi].exits {
@@ -2098,21 +2091,13 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         "drain fuse: H references its unused etype inputarg"
     );
 
-    // R: `v_type = type(vb)`; `goto exceptblock [v_type, vb]`.  DO NOT reuse
-    // `va` (the int-kinded etype); `type(evalue)` recomputes the ref-kind
-    // class the raise tail needs.
-    let v_type = graph
-        .push_op_var(
-            r_id,
-            OpKind::Call {
-                target: CallTarget::function_path(["type"]),
-                args: vec![r_vb.clone()],
-                result_ty: ValueType::Ref(None),
-            },
-            true,
-        )
-        .expect("type(evalue) produces a value");
-    graph.set_raise_values(r_id, v_type, r_vb);
+    // R: `goto exceptblock [etype, vb]`, i.e. the drain's `return Err(e)`.
+    // The `etype` slot is write-only (`make_return` emits `raise <args[1]>`
+    // and never reads `args[0]`, `flatten.rs:781-793`), so pass `vb` rather
+    // than the int-kinded `va` — the raise operand must be the ref-kinded
+    // exception value, and a second ref-kinded producer would only add a dead
+    // residual to the arm a guard-failure resume walks.
+    graph.set_raise_values(r_id, r_vb.clone(), r_vb);
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
     // were pruned, so no const rides the surviving edge).
