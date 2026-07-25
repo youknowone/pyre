@@ -212,7 +212,9 @@ fn resolve_safe_path(flags: &LaunchFlags) -> bool {
         return true;
     }
     if !flags.ignore_environment {
-        if let Ok(value) = std::env::var("PYTHONSAFEPATH") {
+        // Read as an `OsString`: the value is a presence flag, so bytes that
+        // are not valid Unicode still count as set.
+        if let Some(value) = std::env::var_os("PYTHONSAFEPATH") {
             return !value.is_empty();
         }
     }
@@ -441,26 +443,49 @@ fn sys_path_cwd() -> std::path::PathBuf {
 
 /// `interactive or sys.stdin.isatty()` — a stdin run drives the prompt when fd
 /// 0 is a terminal or `-i` was given, and executes stdin as a script
-/// otherwise. The query goes through the seam, so a sandboxed child observes
-/// its virtual console rather than the trusted parent's terminal.
+/// otherwise.
 fn stdin_is_interactive(inspect: bool) -> bool {
-    inspect || pyre_interpreter::host_seam::ops::isatty(0).unwrap_or(false)
+    if inspect {
+        return true;
+    }
+    #[cfg(feature = "sandbox")]
+    {
+        // Under sandbox the query goes through the seam, so a sandboxed child
+        // observes its virtual console rather than the trusted parent's
+        // terminal.
+        pyre_interpreter::host_seam::ops::isatty(0).unwrap_or(false)
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
 }
 
-/// `sys.stdin.read()` — the whole of stdin as the program source. The read
-/// routes through the seam for the same reason `stdin_is_interactive` does.
+/// `sys.stdin.read()` — the whole of stdin as the program source.
 fn read_stdin_source() -> std::io::Result<String> {
-    use pyre_interpreter::host_seam::{SeamError, ops};
+    // Under sandbox the read goes through the seam, so a sandboxed child
+    // observes virtual stdin rather than the trusted parent's stdin.
+    #[cfg(feature = "sandbox")]
+    let data = {
+        use pyre_interpreter::host_seam::{SeamError, ops};
 
-    let mut data = Vec::new();
-    loop {
-        match ops::read(0, 65536) {
-            Ok(chunk) if chunk.is_empty() => break,
-            Ok(chunk) => data.extend_from_slice(&chunk),
-            Err(SeamError::Os(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
-            Err(_) => return Err(std::io::Error::other("stdin read failed")),
+        let mut data = Vec::new();
+        loop {
+            match ops::read(0, 65536) {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => data.extend_from_slice(&chunk),
+                Err(SeamError::Os(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
+                Err(_) => return Err(std::io::Error::other("stdin read failed")),
+            }
         }
-    }
+        data
+    };
+    #[cfg(not(feature = "sandbox"))]
+    let data = {
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut data)?;
+        data
+    };
     String::from_utf8(data)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin not utf-8"))
 }
