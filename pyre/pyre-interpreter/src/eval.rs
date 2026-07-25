@@ -1432,7 +1432,10 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         // null `w_type` makes `normalize_exception` take `w_inst = w_type`
         // (null) and raise "exceptions must derive from BaseException".
         let operr_obj = err.to_exc_object();
+        // `executioncontext.py:362` hands the tracer
+        // `operr.get_w_traceback(space)` — the slot read with its mark.
         let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(operr_obj) };
+        unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
         if let Err(trace_err) = unsafe {
             (*ec).exception_trace(frame as *mut PyFrame, operr_obj, pyre_object::PY_NULL, w_tb)
         } {

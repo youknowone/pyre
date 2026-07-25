@@ -810,15 +810,13 @@ pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
-/// `interp_exceptions.py:196-201 descr_gettraceback` parity, minus the
-/// `tb.frame.mark_as_escaped()` side effect.  `PyFrame::mark_as_escaped`
-/// exists, but the flag's only consumer is `ExecutionContext::leave`, whose
-/// `frame_vref()` force stays a no-op until `jit.virtual_ref` is ported —
-/// and a frame a traceback can reach has already left, with `got_exception`
-/// set, so `leave` marked its `f_back` either way.  The mark belongs with
-/// that force, together with the `__traceback__` arm of
-/// `baseobjspace::exception_attr_slot_fold`, which folds this read to a raw
-/// slot load in traced code.
+/// The raw `self.w_traceback` slot read.  `descr_gettraceback`
+/// (`interp_exceptions.py:196-201`) and `OperationError.get_traceback`
+/// (`error.py:359-370`) are this read plus `tb.frame.mark_as_escaped()`;
+/// that mark lives in `pytraceback::mark_traceback_escaped`, since the
+/// frame type is not visible from this crate.  Callers mirroring either
+/// getter pair the two; callers mirroring a direct `_application_traceback`
+/// read (printing, chain trimming) use this alone.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.

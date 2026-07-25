@@ -6494,9 +6494,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // returns the `w_traceback` slot stamped by
                 // `descr_settraceback` and the `raise` machinery's
                 // `record_application_traceback`; `None` when none has
-                // been set.
+                // been set.  The traceback reaches app level here, so its
+                // frame is marked escaped.
                 let stored =
                     unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
+                unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__cause__" => {
@@ -9610,10 +9612,9 @@ pub unsafe fn exception_attr_slot_fold(
             ExceptionAttrSlot::Filename2
         }
         // `__traceback__` is a `W_BaseException` slot on every exception kind.
-        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`, which
-        // `w_exception_get_traceback` omits while the `ExecutionContext::leave`
-        // vref force it feeds is unported; the fold tracks that getter, so both
-        // sides gain the mark together.
+        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`; the
+        // fold folds only the slot read, so the specializer pairs it with a
+        // residual call that issues the mark.
         "__traceback__" => ExceptionAttrSlot::Traceback,
         // `name` shares the `w_exc_name` slot across the kinds whose getattr
         // arm reads it; other kinds keep the regular attribute fall-through.

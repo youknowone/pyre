@@ -39,11 +39,11 @@ pub struct PyTraceback {
     pub ob_header: PyObject,
     /// `pytraceback.py:29 self.frame = frame` — opaque `*mut PyFrame`.
     /// Not a `PyObjectRef` because `PyFrame` has no `PyObject` header.
-    /// **Dangling-safe note**: by the time a traceback escapes the
-    /// raising frame (the common case — `except` block in a caller),
-    /// the original `PyFrame` allocation has been freed.  Readers
-    /// MUST NOT dereference `frame`; metadata that survives the
-    /// frame's lifetime is snapshotted into the `w_code` slot below.
+    /// Frames are GC-owned non-moving blocks and
+    /// `pytraceback_object_custom_trace` forwards this edge, so the
+    /// pointer stays live for the traceback's whole lifetime and
+    /// `tb_frame` is safe to dereference.  The `w_code` snapshot below
+    /// still exists for readers that run without the GC hook wired.
     pub frame: *mut crate::pyframe::PyFrame,
     /// `pytraceback.py:30 self.lasti = lasti` — bytecode index at
     /// which the exception was raised (in instruction units).
@@ -263,6 +263,46 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> i64 {
     }
 }
 
+/// The side effect shared by `error.py:359-370 OperationError.get_traceback`
+/// and `interp_exceptions.py:195-200 descr_gettraceback`: a traceback that
+/// becomes reachable by app-level code marks its frame escaped, so
+/// `ExecutionContext::leave` forces that frame's vref and the frame stays
+/// inspectable after the JIT frame is gone.
+///
+/// This has no effect once several frames are recorded on the chain — those
+/// are already marked by `leave` running with `got_exception` set.  What it
+/// covers is the single-frame chain: a `raise` caught in the frame that
+/// raised it, where no callee ever left, whose traceback then outlives a
+/// normal return.  Without the mark such a frame keeps the vable shadow of
+/// `last_instr` the JIT never wrote back, and `f_lineno` reads the `def`
+/// line instead of the raising line.
+///
+/// # Safety
+/// `w_traceback` must be `PY_NULL` or point to a valid object.
+pub unsafe fn mark_traceback_escaped(w_traceback: PyObjectRef) {
+    unsafe {
+        if w_traceback.is_null() || !is_pytraceback(w_traceback) {
+            return;
+        }
+        let frame = w_pytraceback_get_frame(w_traceback);
+        if !frame.is_null() {
+            (*frame).mark_as_escaped();
+        }
+    }
+}
+
+/// `extern "C"` entry for the residual call the `__traceback__` attribute
+/// fold emits.  Compiled code folds that read to a raw slot load, so the
+/// getter's escape mark has to be issued separately; the fold pairs the
+/// load with a call here.
+///
+/// Cannot raise, allocates nothing, and writes only the frame's status
+/// byte, which no field descriptor exposes to the trace — so the call
+/// carries `cannot_raise_effect_info` and invalidates no heap cache entry.
+pub extern "C" fn jit_mark_traceback_escaped(w_traceback: i64) {
+    unsafe { mark_traceback_escaped(w_traceback as usize as PyObjectRef) };
+}
+
 /// `pytraceback.py:104-109 record_application_traceback` parity:
 ///
 /// ```python
@@ -340,7 +380,10 @@ pub unsafe fn record_application_traceback(
                 crate::pyframe::offset2lineno(&*code_obj, last_instruction as isize) as i64
             }
         };
+        // `tb = operror.get_traceback()` — the read that grows the chain
+        // marks the previous head's frame, matching `get_traceback`.
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(w_exc_object);
+        mark_traceback_escaped(prev_tb);
         let new_tb = w_pytraceback_new(frame, last_instruction, prev_tb, lineno, w_code);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
     }

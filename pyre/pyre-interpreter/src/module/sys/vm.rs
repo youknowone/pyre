@@ -555,11 +555,13 @@ pub fn exc_info_direct() -> PyObjectRef {
                 exc_type
             };
             // The third tuple slot mirrors
-            // `space.exception_gettraceback(operror)`
-            // (`error.py:140-145`).  Pyre stores the chain on the
-            // typed `w_traceback` slot of `W_BaseException`
-            // (`interp_exceptions.rs:303`); surface it directly here.
+            // `vm.py:147-153 exc_info_with_tb`'s
+            // `operror.get_w_traceback(space)`, i.e. the slot read plus
+            // the escape mark it wraps.  Pyre stores the chain on the
+            // typed `w_traceback` slot of `W_BaseException`; surface it
+            // directly here.
             let tb = pyre_object::interp_exceptions::w_exception_get_traceback(exc);
+            crate::pytraceback::mark_traceback_escaped(tb);
             let w_tb = if tb.is_null() { w_none() } else { tb };
             w_tuple_new(vec![exc_type, exc, w_tb])
         }
