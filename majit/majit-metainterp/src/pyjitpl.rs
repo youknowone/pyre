@@ -8992,6 +8992,17 @@ impl<M: Clone> MetaInterp<M> {
     pub fn remove_compiled_loop(&mut self, green_key: u64) {
         self.compiled_loops.swap_remove(&green_key);
         self.pending_preamble_tokens.swap_remove(&green_key);
+        self.forget_loop_side_tables(green_key);
+    }
+
+    /// Drop the per-loop side tables (`loop_header_pcs`, `loop_header_greens`)
+    /// when a loop is retired, so they cannot outlive `compiled_loops`.
+    /// `compiled_key_for_greens` already skips keys without compiled targets,
+    /// so a leftover entry could not mis-target a bridge — but keeping them
+    /// would grow both maps without bound over a long run.
+    fn forget_loop_side_tables(&mut self, green_key: u64) {
+        self.loop_header_pcs.swap_remove(&green_key);
+        self.loop_header_greens.swap_remove(&green_key);
     }
 
     /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to
@@ -9085,6 +9096,7 @@ impl<M: Clone> MetaInterp<M> {
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
                 self.compiled_loops.swap_remove(&gk);
+                self.forget_loop_side_tables(gk);
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-mem-collect",

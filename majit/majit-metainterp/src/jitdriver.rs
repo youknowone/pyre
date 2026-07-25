@@ -2059,7 +2059,7 @@ impl<S: JitState> JitDriver<S> {
                 // `last_compiled_key` is registered: on a cross-loop cut that
                 // is the inner loop the close point belongs to, whereas
                 // `loop_green_key` is the outer trace-start key.
-                if let Some(greens) = loop_close_greens.clone() {
+                if let Some(greens) = loop_close_greens {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CLOSE LOOP-GREENS key={} greens={greens:?}", k as i64);
                     }
