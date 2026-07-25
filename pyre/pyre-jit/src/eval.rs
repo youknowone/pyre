@@ -6180,6 +6180,12 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame(None, None);
     }
+    // A traced frame runs interpreted: `call_trace` / `return_trace` /
+    // `bytecode_trace` are driven from the plain eval path, so a frame the JIT
+    // takes over reports no events at all.
+    if pyre_interpreter::pyframe::frame_tracing_active(frame) {
+        return frame.execute_frame(None, None);
+    }
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     pyre_interpreter::call::register_eval_override(eval_with_jit);
