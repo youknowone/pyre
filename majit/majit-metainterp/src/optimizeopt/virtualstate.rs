@@ -3255,6 +3255,56 @@ mod tests {
         );
     }
 
+    /// The export preview in `optimize_with_constants_and_inputs_at` builds the
+    /// state from a list of oprefs and immediately re-matches it against that
+    /// SAME list, so `make_inputargs_and_virtuals` cannot raise
+    /// `VirtualStatesCantMatch` there: every `state[i]` was derived from
+    /// `args[i]`.
+    ///
+    /// That self-match is why the optimizer's `building_bridge` branch — which
+    /// keeps a preview mismatch non-fatal on the bridge path (unroll.py:193,
+    /// 207-210) — is unreachable today; probing it with five virtual-carrying
+    /// fixtures, two of which do compile bridges, produced zero hits.
+    ///
+    /// Upstream matches a preamble's exported state against a DIFFERENT loop's
+    /// stored state in `jump_to_existing_trace` (unroll.py:207). Whoever moves
+    /// the preview to that shape will break this test — and that is the signal
+    /// that the `building_bridge` branch has become live and needs its own
+    /// coverage.
+    #[test]
+    fn export_state_re_matched_against_its_own_args_cannot_fail() {
+        let descr = test_descr(10);
+        let mut ctx = OptContext::new(32);
+        let object = OpRef::ref_op(10);
+        let field = OpRef::int_op(11);
+        let scalar = OpRef::int_op(12);
+        ctx.materialize_operand_at(object);
+        ctx.materialize_operand_at(field);
+        ctx.materialize_operand_at(scalar);
+
+        let object_box = ctx
+            .get_box_replacement_operand_opt(object)
+            .expect("object box is bound");
+        let mut info = PtrInfo::virtual_obj(descr, None);
+        info.setfield(
+            0,
+            crate::history::test_support::rooted_resop_operand(Type::Int, field.raw()),
+        );
+        ctx.set_ptr_info(&object_box, info);
+
+        let args = [object, field, scalar];
+        let state = export_state(&args, &ctx);
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let matched = state.make_inputargs_and_virtuals(&args, &mut optimizer, &mut ctx, false);
+
+        assert!(
+            matched.is_ok(),
+            "a state exported from `args` must re-match `args`; \
+             a failure here means the preview is no longer a self-match and the \
+             optimizer's `building_bridge` branch is now reachable"
+        );
+    }
+
     /// virtualstate.py:196 / 274 / 352 — `state.position > self.position`
     /// shared-substate dedup parity. When two top-level state entries
     /// reference the same `Rc<VirtualStateInfoNode>` (an aliased nested box),
