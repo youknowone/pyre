@@ -322,10 +322,27 @@ pub(crate) fn after_fork_child() {
     majit_gc::gc_sync::after_fork_child();
 }
 
+// os_lock.py:20 `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
+const RPY_LOCK_FAILURE: i64 = 0;
+const RPY_LOCK_ACQUIRED: i64 = 1;
+const RPY_LOCK_INTR: i64 = 2;
+
+/// A `pthread_mutex_t` has no poison state — `thread_pthread.c` inspects only
+/// the status code — so a panic taken while lock bookkeeping was held must not
+/// turn every later acquire into an error.
+fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `os_lock.py:23-40 parse_acquire_args`.  The result is the `microseconds`
+/// argument of the `RPyThreadAcquireLockTimed` ABI: negative blocks forever,
+/// zero polls once.
 fn parse_acquire_args(
     blocking: i64,
     w_timeout: Option<PyObjectRef>,
-) -> Result<Option<Duration>, crate::PyError> {
+) -> Result<i64, crate::PyError> {
     // os_lock.py `@unwrap_spec(blocking=int, timeout=float)`: unlike the
     // macro's concrete `f64` receiver, `space.float_w` performs Python's
     // numeric coercion first, so integer timeout arguments retain their
@@ -345,18 +362,74 @@ fn parse_acquire_args(
             "timeout value must be strictly positive",
         ));
     }
-    if timeout > TIMEOUT_MAX {
-        return Err(crate::PyError::overflow_error("timeout value is too large"));
-    }
-    Ok(if blocking && timeout >= 0.0 {
-        Some(Duration::from_secs_f64(timeout))
+    if !blocking {
+        Ok(0)
+    } else if timeout == -1.0 {
+        Ok(-1)
+    } else if timeout > TIMEOUT_MAX {
+        // `ovfcheck_float_to_longlong(timeout * 1e6)`.
+        Err(crate::PyError::overflow_error("timeout value is too large"))
     } else {
-        None
-    })
+        Ok((timeout * 1e6) as i64)
+    }
+}
+
+/// `os_lock.py:49 space.getexecutioncontext().checksignals()`.  The signal
+/// module is not built for wasm32 (`module/mod.rs:94`), where no handler can
+/// be pending, so there the check has nothing to run.
+fn checksignals() -> Result<(), crate::PyError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::module::signal::interp_signal::checksignals_now()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(())
+    }
+}
+
+/// `os_lock.py:43-60 acquire_timed` — "Helper to acquire an interruptible lock
+/// with a timeout."  `RPY_LOCK_INTR` reports a wait that a signal handler cut
+/// short: deliver the signal, then retry with whatever time is left.
+///
+/// `acquire` is the `RPyThreadAcquireLockTimed` primitive of the lock being
+/// taken; upstream reaches it as `lock.acquire_timed`
+/// (`rthread.py:192-197 Lock.acquire_timed`, `intr_flag=1`).
+fn acquire_timed(
+    mut microseconds: i64,
+    mut acquire: impl FnMut(i64) -> i64,
+) -> Result<i64, crate::PyError> {
+    // os_lock.py:45 `endtime`, measured here on the monotonic clock the
+    // `time_sleep` retry loop already uses for its deadline.
+    let start = Instant::now();
+    let endtime = microseconds;
+    loop {
+        let mut result = acquire(microseconds);
+        if result == RPY_LOCK_INTR {
+            // Run signal handlers if we were interrupted
+            checksignals()?;
+            if microseconds >= 0 {
+                microseconds = endtime - start.elapsed().as_micros() as i64;
+                // Check for negative values, since those mean block forever
+                if microseconds <= 0 {
+                    result = RPY_LOCK_FAILURE;
+                }
+            }
+        }
+        if result != RPY_LOCK_INTR {
+            return Ok(result);
+        }
+    }
 }
 
 mod lock_class {
     use super::*;
+    // `pthread_cond_wait` returning without the lock is how
+    // `RPyThreadAcquireLockTimed` detects a signal (thread_pthread.c:466-471),
+    // so the wait must be the bare one-shot call that propagates spurious
+    // wakeups.  `parking_lot`'s condition variable retries internally and
+    // would swallow exactly the wakeup that carries the interrupt.
+    use std::sync::{Condvar, Mutex};
 
     #[crate::pyre_class("_thread.lock")]
     #[derive(Default)]
@@ -380,51 +453,74 @@ mod lock_class {
             Ok(obj)
         }
 
+        /// `thread_pthread.c:427-485 RPyThreadAcquireLockTimed`, the mutex and
+        /// condition-variable build — the shape this lock has — with
+        /// `intr_flag=1`, which is what `rthread.py:195` passes.
+        fn acquire_timed(&self, microseconds: i64) -> i64 {
+            // A potentially blocking native lock wait leaves the collector's
+            // RUNNING census.  This does not serialize Python execution.  The
+            // guard ends with the primitive, so the signal handlers the caller
+            // runs on `RPY_LOCK_INTR` execute back inside the census.
+            let _blocked = before_external_block();
+            let mut locked = lock_state(&self.locked);
+            let mut success;
+            if !*locked {
+                success = RPY_LOCK_ACQUIRED;
+            } else if microseconds == 0 {
+                success = RPY_LOCK_FAILURE;
+            } else {
+                let deadline = (microseconds > 0)
+                    .then(|| Instant::now() + Duration::from_micros(microseconds as u64));
+                success = RPY_LOCK_FAILURE;
+                while success == RPY_LOCK_FAILURE {
+                    if let Some(deadline) = deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (guard, timeout) = self
+                            .ready
+                            .wait_timeout(locked, deadline - now)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        locked = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    } else {
+                        locked = self
+                            .ready
+                            .wait(locked)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if *locked {
+                        // We were woken up, but didn't get the lock.  We
+                        // probably received a signal.  Return RPY_LOCK_INTR to
+                        // allow the caller to handle it and retry.
+                        success = RPY_LOCK_INTR;
+                    } else {
+                        success = RPY_LOCK_ACQUIRED;
+                    }
+                }
+            }
+            if success == RPY_LOCK_ACQUIRED {
+                *locked = true;
+            }
+            success
+        }
+
+        /// `os_lock.py:75-85 descr_lock_acquire`.
         fn acquire(
             &self,
             #[default(1)] blocking: i64,
             timeout: Option<PyObjectRef>,
         ) -> Result<bool, crate::PyError> {
-            let timeout = parse_acquire_args(blocking, timeout)?;
-            let blocking = blocking != 0;
-            // A potentially blocking native lock wait leaves the collector's
-            // RUNNING census.  This does not serialize Python execution.
-            let _blocked = before_external_block();
-            let mut locked = self.locked.lock();
-            if !*locked {
-                *locked = true;
-                return Ok(true);
-            }
-            if !blocking {
-                return Ok(false);
-            }
-            match timeout {
-                None => {
-                    while *locked {
-                        self.ready.wait(&mut locked);
-                    }
-                    *locked = true;
-                    Ok(true)
-                }
-                Some(duration) => {
-                    let deadline = Instant::now() + duration;
-                    while *locked {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            return Ok(false);
-                        }
-                        if self.ready.wait_for(&mut locked, deadline - now).timed_out() && *locked {
-                            return Ok(false);
-                        }
-                    }
-                    *locked = true;
-                    Ok(true)
-                }
-            }
+            let microseconds = parse_acquire_args(blocking, timeout)?;
+            let result = super::acquire_timed(microseconds, |us| self.acquire_timed(us))?;
+            Ok(result == RPY_LOCK_ACQUIRED)
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
-            let mut locked = self.locked.lock();
+            let mut locked = lock_state(&self.locked);
             if !*locked {
                 return Err(crate::PyError::runtime_error("release unlocked lock"));
             }
@@ -434,7 +530,7 @@ mod lock_class {
         }
 
         fn locked(&self) -> bool {
-            *self.locked.lock()
+            *lock_state(&self.locked)
         }
 
         fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -468,6 +564,8 @@ use lock_class::W_Lock;
 
 mod rlock_class {
     use super::*;
+    // Same interrupt-detection requirement as `lock_class`.
+    use std::sync::{Condvar, Mutex};
 
     #[derive(Default)]
     struct RLockState {
@@ -501,59 +599,96 @@ mod rlock_class {
             Ok(obj)
         }
 
+        /// The native-lock half of `os_lock.py:206-241 acquire_w`, shaped to
+        /// the `RPyThreadAcquireLockTimed` ABI (thread_pthread.c:427-485) so
+        /// `acquire_timed` can deliver signals between attempts.
+        ///
+        /// Upstream keeps `rlock_count`/`rlock_owner` outside the native lock
+        /// because the GIL serializes them; free-threaded pyre has no such
+        /// serialization, so ownership is claimed under the same mutex the
+        /// wait releases — the place `thread_pthread.c:479` sets `locked`.
+        fn acquire_timed(&self, microseconds: i64, ident: i64) -> i64 {
+            let _blocked = before_external_block();
+            let mut state = lock_state(&self.state);
+            let mut success;
+            if state.count == 0 {
+                success = RPY_LOCK_ACQUIRED;
+            } else if microseconds == 0 {
+                success = RPY_LOCK_FAILURE;
+            } else {
+                let deadline = (microseconds > 0)
+                    .then(|| Instant::now() + Duration::from_micros(microseconds as u64));
+                success = RPY_LOCK_FAILURE;
+                while success == RPY_LOCK_FAILURE {
+                    if let Some(deadline) = deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (guard, timeout) = self
+                            .ready
+                            .wait_timeout(state, deadline - now)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    } else {
+                        state = self
+                            .ready
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if state.count != 0 {
+                        // Woken without the lock — probably a signal.
+                        success = RPY_LOCK_INTR;
+                    } else {
+                        success = RPY_LOCK_ACQUIRED;
+                    }
+                }
+            }
+            if success == RPY_LOCK_ACQUIRED {
+                state.owner = ident;
+                state.count = 1;
+            }
+            success
+        }
+
+        /// `os_lock.py:206-241 acquire_w`.
         fn acquire(
             &self,
             #[default(1)] blocking: i64,
             timeout: Option<PyObjectRef>,
         ) -> Result<bool, crate::PyError> {
-            let timeout = parse_acquire_args(blocking, timeout)?;
-            let blocking = blocking != 0;
-            let ident = current_ident();
-            let _blocked = before_external_block();
-            let mut state = self.state.lock();
-            if state.count > 0 && state.owner == ident {
-                state.count = state.count.checked_add(1).ok_or_else(|| {
-                    crate::PyError::overflow_error("internal lock count overflowed")
-                })?;
-                return Ok(true);
-            }
-            if state.count == 0 {
-                state.owner = ident;
-                state.count = 1;
-                return Ok(true);
-            }
-            if !blocking {
-                return Ok(false);
-            }
-            match timeout {
-                None => {
-                    while state.count != 0 {
-                        self.ready.wait(&mut state);
-                    }
-                }
-                Some(duration) => {
-                    let deadline = Instant::now() + duration;
-                    while state.count != 0 {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            return Ok(false);
-                        }
-                        if self.ready.wait_for(&mut state, deadline - now).timed_out()
-                            && state.count != 0
-                        {
-                            return Ok(false);
-                        }
-                    }
+            let microseconds = parse_acquire_args(blocking, timeout)?;
+            let tid = current_ident();
+            {
+                let mut state = lock_state(&self.state);
+                if state.count > 0 && state.owner == tid {
+                    state.count = state.count.checked_add(1).ok_or_else(|| {
+                        crate::PyError::overflow_error("internal lock count overflowed")
+                    })?;
+                    return Ok(true);
                 }
             }
-            state.owner = ident;
-            state.count = 1;
-            Ok(true)
+            // os_lock.py:231-235 — `self.lock.acquire(False)` first; only a
+            // failed poll waits, and only when `blocking`.  The count check
+            // upstream pairs it with is the same predicate the poll tests,
+            // because here the count is the lock.
+            let mut r = self.acquire_timed(0, tid) == RPY_LOCK_ACQUIRED;
+            if !r {
+                if blocking == 0 {
+                    return Ok(false);
+                }
+                r = super::acquire_timed(microseconds, |us| self.acquire_timed(us, tid))?
+                    == RPY_LOCK_ACQUIRED;
+            }
+            Ok(r)
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
             let ident = current_ident();
-            let mut state = self.state.lock();
+            let mut state = lock_state(&self.state);
             if state.count == 0 || state.owner != ident {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
@@ -568,16 +703,16 @@ mod rlock_class {
         }
 
         fn locked(&self) -> bool {
-            self.state.lock().count != 0
+            lock_state(&self.state).count != 0
         }
 
         fn _is_owned(&self) -> bool {
-            let state = self.state.lock();
+            let state = lock_state(&self.state);
             state.count > 0 && state.owner == current_ident()
         }
 
         fn _recursion_count(&self) -> i64 {
-            let state = self.state.lock();
+            let state = lock_state(&self.state);
             if state.owner == current_ident() {
                 state.count
             } else {
@@ -586,7 +721,7 @@ mod rlock_class {
         }
 
         fn _release_save(&self) -> Result<PyObjectRef, crate::PyError> {
-            let mut state = self.state.lock();
+            let mut state = lock_state(&self.state);
             if state.count == 0 {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
@@ -611,15 +746,13 @@ mod rlock_class {
             }
             let count = unsafe { w_int_get_value(items[0]) };
             let owner = unsafe { w_int_get_value(items[1]) };
-            let _blocked = before_external_block();
-            let mut state = self.state.lock();
-            if state.count != 0 {
-                while state.count != 0 {
-                    self.ready.wait(&mut state);
-                }
-            }
-            state.count = count;
-            state.owner = owner;
+            // os_lock.py:286-287 `self.lock.acquire(True)` reaches
+            // `RPyThreadAcquireLockTimed` with `intr_flag=0`
+            // (rthread.py:169-174), so an interrupted wait is retried rather
+            // than reported: restoring a saved state is not a place where a
+            // signal may be delivered.
+            while self.acquire_timed(-1, owner) != RPY_LOCK_ACQUIRED {}
+            lock_state(&self.state).count = count;
             Ok(())
         }
 
@@ -634,7 +767,7 @@ mod rlock_class {
         }
 
         fn __repr__(&self) -> String {
-            let state = self.state.lock();
+            let state = lock_state(&self.state);
             let locked = if state.count == 0 {
                 "unlocked"
             } else {
