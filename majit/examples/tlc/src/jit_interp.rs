@@ -49,7 +49,16 @@ struct TlcState {
 /// CALL on ROLL) is strictly simpler than RPython's two-residual sequence,
 /// and reverting to inline would require a state-field-array `insert`/`pop_at`
 /// lowering that the macro does not yet provide.
-#[majit_macros::dont_look_inside]
+///
+/// The hoisted residual is MAY-FORCE. Upstream reaches that row through
+/// `call.py:287-289 getcalldescr`, which consults `virtualizable_analyzer`
+/// before `_canraise`; there it does not fire, because tlc.py's `Frame` holds a
+/// plain list. This port models the stack as `stack: [int; virt]` (see the
+/// module header), so the array IS virtualizable here and a residual writing it
+/// through a raw base pointer takes that row. `#[dont_look_inside]` would
+/// instead assert `EF_CAN_RAISE` with an empty write set, which the mutation
+/// contradicts.
+#[majit_macros::jit_may_force]
 extern "C" fn tlc_roll(stack_ptr: usize, stackpos: i64, r: i64) {
     let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
     let len = stack.len();

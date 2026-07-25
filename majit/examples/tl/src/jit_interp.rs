@@ -15,10 +15,20 @@ pub static SPIKE_COMPILES: core::sync::atomic::AtomicU32 = core::sync::atomic::A
 ///
 /// Operates on the live portion of the stack `stack[0..stackpos]`.
 /// The JIT does not trace into this function; it emits a residual CALL.
+///
+/// The residual is a MAY-FORCE call, not a plain can-raise one.
+/// `call.py:287-289 getcalldescr` consults `virtualizable_analyzer` BEFORE
+/// `_canraise`, and `roll` writes `self.stack[...]`, a field `tl.py:14`
+/// declares in `Stack._virtualizable_ = ['stackpos', 'stack[*]']` — so the
+/// analyzer picks `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` there. `@dont_look_inside`
+/// only clears `_jit_look_inside_` (`rlib/jit.py:132`); it does not change the
+/// effect row. pyre runs no analyzer over this helper, so the row is declared:
+/// `#[dont_look_inside]` would assert `EF_CAN_RAISE` with an empty write set
+/// this raw-pointer mutation of the virtualizable array has not earned.
 #[cfg(test)]
 pub static ROLL_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-#[majit_macros::dont_look_inside]
+#[majit_macros::jit_may_force]
 extern "C" fn storage_roll(stack_ptr: usize, stackpos: i64, r: i64) {
     #[cfg(test)]
     ROLL_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
