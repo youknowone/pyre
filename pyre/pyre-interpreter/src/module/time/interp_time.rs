@@ -169,12 +169,17 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(w_none());
     }
     let dur = std::time::Duration::from_nanos(timeout_ns as u64);
-    // interp_time.py's `time_sleep` is an `@rffi` external call.  In pyre the
-    // blocking mutator leaves the free-threaded GC's STW RUNNING census.
-    let _blocking = crate::module::thread::before_external_block();
+    // `nanosleep` is a `releasegil=True` external (interp_time.py:504-506), so
+    // only the blocking call itself runs outside the free-threaded GC's STW
+    // RUNNING census.  `checksignals` runs with the GIL re-acquired
+    // (interp_time.py:707), i.e. with the mutator back in the census — so the
+    // guard is scoped to each call, not to the whole retry loop.  A Python
+    // signal handler running outside the census would trip the running-mutator
+    // assertions on its first allocation or blocking call.
     #[cfg(feature = "sandbox")]
     {
         // The controller services the sleep; signal handling is its concern.
+        let _blocking = crate::module::thread::before_external_block();
         crate::host_seam::ops::sleep(dur.as_secs_f64())
             .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
         Ok(w_none())
@@ -187,7 +192,11 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let deadline = std::time::Instant::now() + dur;
         let mut remaining = dur;
         loop {
-            match host_time::nanosleep(remaining) {
+            let slept = {
+                let _blocking = crate::module::thread::before_external_block();
+                host_time::nanosleep(remaining)
+            };
+            match slept {
                 Ok(()) => return Ok(w_none()),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
                     crate::module::signal::interp_signal::checksignals_now()?;
@@ -208,6 +217,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     #[cfg(not(any(all(unix, feature = "host_env"), feature = "sandbox")))]
     {
+        let _blocking = crate::module::thread::before_external_block();
         std::thread::sleep(dur);
         Ok(w_none())
     }
