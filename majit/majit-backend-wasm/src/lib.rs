@@ -305,6 +305,10 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
         wasm_alloc_nursery_typed_with_placement,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed(Some(wasm_alloc_nursery_collecting_typed));
+    majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
+        wasm_alloc_nursery_collecting_typed_rooted,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
@@ -522,6 +526,32 @@ unsafe fn wasm_alloc_nursery_typed_with_placement(
 ) -> GcRef {
     with_wasm_active_gc_mut(|gc| unsafe {
         gc.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
+}
+
+/// Host-side collecting nursery allocation used by elidable bigint payload
+/// helpers. This is the wasm twin of the dynasm/cranelift hooks: the active
+/// backend must replace every process-global allocation hook as one unit so a
+/// previously-installed native backend cannot receive wasm allocations.
+fn wasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
+    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// Rooted collecting companion for a result whose GC child exists only in a
+/// native Rust slot while the parent allocation may collect.
+///
+/// # Safety
+/// `root` and `needs_write_barrier` must remain valid mutable slots until this
+/// call returns.
+unsafe fn wasm_alloc_nursery_collecting_typed_rooted(
+    type_id: u32,
+    size: usize,
+    root: *mut GcRef,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_wasm_active_gc_mut(|gc| unsafe {
+        gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
     })
     .unwrap_or(GcRef(0))
 }

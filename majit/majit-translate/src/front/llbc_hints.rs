@@ -126,6 +126,7 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                     for hint in *hints {
                         push_hint(&mut out, key.clone(), hint);
                     }
+                    break;
                 }
             }
         }

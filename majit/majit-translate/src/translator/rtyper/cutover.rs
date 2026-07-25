@@ -1938,6 +1938,7 @@ pub(crate) fn lift_callee_to_pygraph(
     } else {
         AlwaysInline::Absent
     };
+    graph.borrow_mut().func = Some(func.clone());
     let pygraph = Rc::new(PyGraph {
         graph,
         func,
@@ -4521,6 +4522,15 @@ mod tests {
             pygraph.func._always_inline_,
             AlwaysInline::True,
             "legacy always_inline hint must land on graph.func"
+        );
+        assert!(
+            pygraph
+                .graph
+                .borrow()
+                .func
+                .as_ref()
+                .is_some_and(|func| func._always_inline_ == AlwaysInline::True),
+            "legacy always_inline hint must land on the registered FunctionGraph.func"
         );
         // Capture the callee's flowspace graph `Rc` before the pygraph
         // is moved into `register_callee`; this is the identity that

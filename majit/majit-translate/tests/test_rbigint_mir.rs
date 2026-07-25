@@ -495,6 +495,10 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
         "missing upstream _always_inline_='try' marker for rbigint::<Impl>::rshift: {hints:?}"
     );
     assert!(
+        !hints.contains_key("rbigint::<Impl>::rshift::try_rshift"),
+        "_always_inline_try_ must not also match the shorter _always_inline_ prefix"
+    );
+    assert!(
         hints
             .get("rbigint::_AsDouble")
             .is_some_and(|values| values.iter().any(|hint| hint == "dont_look_inside")),
@@ -937,6 +941,8 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "objspace::descroperation::jit_bigint_int_xor",
         "objspace::descroperation::jit_bigint_shl",
         "objspace::descroperation::jit_bigint_pow_nomod",
+        "objspace::descroperation::jit_bigint_div",
+        "objspace::descroperation::jit_bigint_rem",
         "objspace::descroperation::jit_bigint_div_floor",
         "objspace::descroperation::jit_bigint_mod_floor",
         "jit_compiler_bigint_to_rbigint",
@@ -1336,5 +1342,29 @@ fn rbigint_operator_calls_retarget_to_gc_reference_residuals() {
     assert_eq!(
         constructor_residuals, 1,
         "RBigInt::from(i64) must return one GC reference through its residual"
+    );
+
+    let clone_caller = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "box_bigint_constant" && function.module_path == "longobject"
+        })
+        .expect("longobject::box_bigint_constant graph");
+    assert!(
+        clone_caller
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|operation| matches!(
+                &operation.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    result_ty: ValueType::Ref(None),
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
+            )),
+        "RBigInt::clone must allocate a translated shallow-copy payload, not collapse to an alias"
     );
 }

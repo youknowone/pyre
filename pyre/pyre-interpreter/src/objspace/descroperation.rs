@@ -209,7 +209,7 @@ pub extern "C" fn jit_bigint_bit_count(value: i64) -> i64 {
 /// its operand pointers rooted across the alloc), matching the arithmetic
 /// residuals. Returns a freshly heap-allocated `*mut BigInt` encoded as the
 /// JIT's uniform i64 word; the MIR retarget keeps the result modeled as GcRef.
-#[majit_macros::elidable]
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
@@ -225,7 +225,7 @@ pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> pyre_object::longobject::Jit
 
 /// `_divrem`'s truncated remainder.
 /// See [`jit_bigint_div`]; both project the same upstream helper.
-#[majit_macros::elidable]
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {

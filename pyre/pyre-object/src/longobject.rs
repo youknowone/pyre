@@ -221,6 +221,18 @@ pub extern "C" fn jit_bigint_from_u64(value: u64) -> JitBigIntResult {
     )))
 }
 
+/// Rust handle clone for the translated one-GC-reference rbigint shape.
+///
+/// `RBigInt::clone` shares the immutable digit array but returns a new by-value
+/// handle. Translation therefore needs a fresh GC payload containing that
+/// shallow handle, rather than either descending into the classdef-less Rust
+/// fields or collapsing the clone to reference identity.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_clone(value: i64) -> JitBigIntResult {
+    let value = value as *const BigInt;
+    unsafe { encode_jit_bigint_result(alloc_bigint_nursery_collecting((*value).clone())) }
+}
+
 macro_rules! bigint_comparison_residual {
     ($name:ident, $method:ident) => {
         #[doc = "Bare-RBigInt comparison residual using the translated GC-reference ABI."]
@@ -717,9 +729,12 @@ mod tests {
     fn test_bare_bigint_constructor_comparison_and_scalar_residuals() {
         let a = jit_bigint_from_i64(-42);
         let b = jit_bigint_from_u64(42);
+        let cloned = jit_bigint_clone(a as i64);
         unsafe {
             assert_eq!(&*a, &BigInt::from(-42));
             assert_eq!(&*b, &BigInt::from(42));
+            assert_eq!(&*cloned, &*a);
+            assert_ne!(cloned, a);
         }
         assert_eq!(jit_bigint_eq(a as i64, b as i64), 0);
         assert_eq!(jit_bigint_lt(a as i64, b as i64), 1);

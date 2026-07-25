@@ -52,7 +52,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             KnownType::LongLongLong,
         ))),
         ValueType::UInt128 => Some(SomeValue::Integer(SomeInteger::new_with_knowntype(
-            false,
+            true,
             KnownType::ULongLongLong,
         ))),
         // RPython `SomeBool` (`annotator/model.py:185-198`) is a
@@ -171,5 +171,15 @@ mod tests {
             }
             other => panic!("typed Ref must use fallback Instance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn uint128_shell_is_nonnegative() {
+        let shell = valuetype_to_someshell(&ValueType::UInt128).expect("UInt128 projects");
+        let SomeValue::Integer(integer) = shell else {
+            panic!("UInt128 must project to SomeInteger");
+        };
+        assert!(integer.nonneg);
+        assert_eq!(integer.base.knowntype, KnownType::ULongLongLong);
     }
 }

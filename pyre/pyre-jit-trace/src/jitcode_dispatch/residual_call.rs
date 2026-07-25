@@ -3514,49 +3514,46 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     } else {
                         // int specialization first; float (incl. mixed int/float)
                         // as a fallback so two-int operands keep int arithmetic.
-                        match try_walker_specialize_binary_op_int(
+                        let mut specialized = try_walker_specialize_binary_op_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                        )? {
-                            Some(()) => Some(()),
+                        )?;
+                        if specialized.is_none() {
                             // longobject.py `_make_generic_descr_binop` and
                             // `descr_sub` use the rbigint.int_* family for
                             // mixed Long/Int operands.
-                            None => match try_walker_specialize_binary_op_long_int(
+                            specialized = try_walker_specialize_binary_op_long_int(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )? {
-                                Some(()) => Some(()),
-                                // `_make_descr_binop` gives shifts with an Int
-                                // count their own `_int_lshift` /
-                                // `_int_rshift` path before Long/Long.
-                                None => match try_walker_specialize_binary_op_long_int_shift(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )? {
-                                    Some(()) => Some(()),
-                                    // W_LongObject operands take the long fast
-                                    // path before float so bigint arithmetic
-                                    // retains its payload representation.
-                                    None => match try_walker_specialize_binary_op_long(
-                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                        dst_bank,
-                                    )? {
-                                        Some(()) => Some(()),
-                                        // Two-long true-divide → float fast
-                                        // path (CallPureF + wrapfloat).
-                                        None => match try_walker_specialize_truediv_op_long(
-                                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
-                                            dst, dst_bank,
-                                        )? {
-                                            Some(()) => Some(()),
-                                            None => try_walker_specialize_binary_op_float(
-                                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
-                                                dst, dst_bank,
-                                            )?,
-                                        },
-                                    },
-                                },
-                            },
+                            )?;
                         }
+                        if specialized.is_none() {
+                            // `_make_descr_binop` gives shifts with an Int
+                            // count their own `_int_lshift` / `_int_rshift`
+                            // path before Long/Long.
+                            specialized = try_walker_specialize_binary_op_long_int_shift(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
+                            // W_LongObject operands take the long fast path
+                            // before float so bigint arithmetic retains its
+                            // payload representation.
+                            specialized = try_walker_specialize_binary_op_long(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
+                            // Two-long true-divide → float fast path
+                            // (CallPureF + wrapfloat).
+                            specialized = try_walker_specialize_truediv_op_long(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
+                            specialized = try_walker_specialize_binary_op_float(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        specialized
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // B3: `op_tag == 10` is CHECK_EXC_MATCH

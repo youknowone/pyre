@@ -6406,24 +6406,6 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
-                // Rust's shallow `Clone` shim has no RPython operation:
-                // `rbigint` values are immutable GC references, so cloning a
-                // reference is an identity assignment. Preserve that exact
-                // owner shape instead of descending into field copies of a
-                // classdef-less external declaration.
-                if args.len() == 1
-                    && segments.last().is_some_and(|leaf| leaf == "clone")
-                    && first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-                    && tyref_is_rbigint(&call.dest.ty, self.llbc)
-                {
-                    self.local_var[dest_local] = Some(args[0].clone());
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,
@@ -6847,6 +6829,36 @@ impl<'a> Lowering<'a> {
             OpKind::Hint {
                 value: args[0].clone(),
                 kind,
+            }
+        } else {
+            op_kind
+        };
+
+        // Rust's `RBigInt::clone` returns a new by-value handle sharing the
+        // immutable digit array. In the translated one-GC-reference shape that
+        // requires a fresh payload allocation: neither a reference-identity
+        // assignment nor descending into the classdef-less `_digits` field is
+        // correct. Retarget the exact receiver/result pair to the GC-aware
+        // shallow-clone residual.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && tyref_is_rbigint(&call.dest.ty, self.llbc)
+            && let Some(segments) = match target {
+                CallTarget::FunctionPath { segments } => segments
+                    .last()
+                    .and_then(|leaf| crate::front::rbigint_call::clone_residual_for_method(leaf)),
+                CallTarget::Method { name, .. } => {
+                    crate::front::rbigint_call::clone_residual_for_method(name)
+                }
+                _ => None,
+            } {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
             }
         } else {
             op_kind
@@ -12294,7 +12306,10 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path().ends_with("rbigint::RBigInt"))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            path == "rbigint::RBigInt" || path.ends_with("::rbigint::RBigInt")
+        })
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to

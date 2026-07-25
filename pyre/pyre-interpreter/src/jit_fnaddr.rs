@@ -1095,6 +1095,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::longobject::jit_bigint_clone",
+        "pyre_object::jit_bigint_clone",
+        pyre_object::jit_bigint_clone as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::longobject::jit_bigint_eq",
         "pyre_object::jit_bigint_eq",
         pyre_object::jit_bigint_eq as *const (),

@@ -31,7 +31,9 @@ pub(crate) fn constructor_residual_path(
     let matches_constructor = match leaf {
         "from" => true,
         "fromint" => !unsigned,
-        "from_u128" => unsigned,
+        // RPython's JIT has no longlonglong register kind. Keep the decline
+        // local to this mapper instead of relying on the caller's width gate.
+        "from_u128" => return None,
         _ => false,
     };
     if !matches_constructor
@@ -54,6 +56,23 @@ pub(crate) fn constructor_residual_path(
         .to_string(),
     );
     Some(path)
+}
+
+/// Translate Rust's shallow handle clone to a fresh one-GC-reference payload.
+///
+/// The caller proves both the receiver and destination are the exact local
+/// RBigInt ADT. The residual preserves `Clone`'s shared immutable digit array
+/// while giving the returned by-value handle its own translated GC object.
+pub(crate) fn clone_residual_for_method(leaf: &str) -> Option<Vec<String>> {
+    if leaf != "clone" {
+        return None;
+    }
+    Some(
+        ["pyre_object", "longobject", "jit_bigint_clone"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Bare-payload residual for scalar RBigInt queries. The caller has already
@@ -276,7 +295,19 @@ mod tests {
         assert!(
             constructor_residual_path(&segs(&["rbigint", "RBigInt", "fromint"]), true).is_none()
         );
+        assert!(
+            constructor_residual_path(&segs(&["rbigint", "RBigInt", "from_u128"]), true).is_none()
+        );
         assert!(constructor_residual_path(&segs(&["rbigint", "RBigInt", "add"]), false).is_none());
+    }
+
+    #[test]
+    fn maps_only_the_exact_clone_method() {
+        assert_eq!(
+            clone_residual_for_method("clone"),
+            Some(segs(&["pyre_object", "longobject", "jit_bigint_clone"]))
+        );
+        assert!(clone_residual_for_method("clone_from").is_none());
     }
 
     #[test]

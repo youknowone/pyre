@@ -515,10 +515,10 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
 ) -> Result<H::Value, PyError> {
     match constant {
         ConstantData::Integer { value } => {
-            let value = crate::compiler_bigint_to_rbigint(value);
-            if pyre_object::longobject::jit_bigint_to_i64_fits(&value) != 0 {
-                handler.int_constant(pyre_object::longobject::jit_bigint_to_i64_value(&value))
+            if let Some(value) = num_traits::ToPrimitive::to_i64(value) {
+                handler.int_constant(value)
             } else {
+                let value = crate::compiler_bigint_to_rbigint(value);
                 handler.bigint_constant(&value)
             }
         }

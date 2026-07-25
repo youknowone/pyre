@@ -1869,7 +1869,7 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
         match next(it) {
             Ok(item) => {
                 if is_true(compare(item, needle, CompareOp::Eq)?)? {
-                    count += BigInt::from(1);
+                    count = count.int_add(1);
                 }
             }
             Err(e) if e.kind == PyErrorKind::StopIteration => break,

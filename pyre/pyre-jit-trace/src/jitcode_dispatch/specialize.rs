@@ -738,6 +738,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
             as *const i64)
     };
+    let fits_concrete = pyre_object::longobject::jit_bigint_fits_int(raw_concrete);
+    if fits_concrete != 0 {
+        return Ok(None);
+    }
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
@@ -787,7 +791,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         majit_metainterp::cannot_raise_effect_info(),
     );
     ctx.trace_ctx
-        .set_opref_concrete(fits, majit_ir::Value::Int(0));
+        .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
 
     let result = crate::helpers::emit_box_long_inline(
@@ -882,6 +886,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
             as *const i64)
     };
+    let fits_concrete = pyre_object::longobject::jit_bigint_fits_int(raw_concrete);
+    if fits_concrete != 0 {
+        return Ok(None);
+    }
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
@@ -941,7 +949,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         majit_metainterp::cannot_raise_effect_info(),
     );
     ctx.trace_ctx
-        .set_opref_concrete(fits, majit_ir::Value::Int(0));
+        .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
 
     let result = crate::helpers::emit_box_long_inline(

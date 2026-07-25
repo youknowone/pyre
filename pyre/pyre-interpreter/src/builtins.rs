@@ -12429,7 +12429,11 @@ mod tests {
             -BigInt::from(u128::MAX),
         ];
         for b in &bigs {
-            assert_eq!(_hash_long(b), _hash_long(b), "rbigint.hash vs _hash_long");
+            assert_eq!(
+                _hash_long(b),
+                rustpython_common::hash::hash_bigint(&crate::rbigint_to_compiler_bigint(b)),
+                "rbigint.hash vs independent compiler-bigint hash"
+            );
         }
     }
 
