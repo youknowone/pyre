@@ -92,6 +92,8 @@ pub fn run_repl(quiet: bool, no_site: bool) {
         eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
     }
 
+    crate::seed_main_loader(canonical, None, Rc::as_ptr(&execution_context));
+
     crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
 
     let runtime = ReplRuntime {
