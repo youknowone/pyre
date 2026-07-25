@@ -8682,6 +8682,27 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
+    // The scalar builtins are not subclassable in place: an *exact* instance
+    // can only ever reach the `__hash__` these arms of `hash_value` already
+    // compute, so the slot lookup and the call protocol below would just
+    // route back here.  This is the digest every interpreter-level dict probe
+    // needs, and it is on the path of every module / `sys.modules` /
+    // namespace lookup — `UnicodeDictStrategy`'s upstream storage hashes its
+    // unwrapped key the same way, without an app-level call.
+    unsafe {
+        for tp in [
+            &pyre_object::STR_TYPE,
+            &pyre_object::INT_TYPE,
+            &pyre_object::BOOL_TYPE,
+            &pyre_object::LONG_TYPE,
+            &pyre_object::FLOAT_TYPE,
+            &pyre_object::bytesobject::BYTES_TYPE,
+        ] {
+            if is_exact_type(obj, tp) {
+                return Ok(hash_value(obj));
+            }
+        }
+    }
     unsafe {
         let kind = if pyre_object::is_dict(obj) {
             Some("dict")
@@ -8762,6 +8783,11 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
         if is_tuple(obj) {
+            // The element walk is the one recursive step here, and the scalar
+            // fast path above no longer reaches the call protocol's own
+            // guard, so a nest deep enough to exhaust the C stack has to be
+            // caught on the way down.
+            crate::stack_check::stack_check()?;
             let n = w_tuple_len(obj);
             let mut hashes = Vec::with_capacity(n);
             for i in 0..(n as i64) {
