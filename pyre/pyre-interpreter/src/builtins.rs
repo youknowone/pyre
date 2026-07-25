@@ -10409,7 +10409,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .unwrap_or_else(|| w_bool_from(true));
     let closefd = crate::baseobjspace::is_true(closefd_obj)?;
     if unsafe { pyre_object::is_bool(file) } {
-        crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 1)?;
+        crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 2)?;
     }
     if !unsafe { pyre_object::is_int(file) } && !closefd {
         return Err(crate::PyError::value_error(

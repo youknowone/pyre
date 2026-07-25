@@ -3286,7 +3286,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
     crate::warn::warn_category(
         "can't resolve package from __spec__ or __package__, falling back on __name__ and __path__",
         "ImportWarning",
-        3,
+        2,
     )?;
 
     // Fallback: __name__ (for modules inside packages)

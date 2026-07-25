@@ -38,9 +38,26 @@ fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
     })
 }
 
+/// The `State` fields, which this module keeps in its own namespace instead
+/// of a space cache.  Read straight out of the namespace dict when the name
+/// still holds the module: upstream reaches them as plain attributes of a
+/// translated-away `State` instance, so routing a read as hot as the filters
+/// version through the attribute protocol would be pure overhead.  Anything
+/// else bound under the name goes back through `space.getattr`, which is the
+/// only form that copes with an arbitrary object.
 fn native_attr(name: &str) -> Result<PyObjectRef, PyError> {
-    module_attr("_warnings", name)
-        .ok_or_else(|| PyError::runtime_error(format!("_warnings.{name} is not initialized")))
+    let module = crate::importing::get_sys_module("_warnings")
+        .ok_or_else(|| PyError::runtime_error("_warnings is not initialized"))?;
+    if unsafe { pyre_object::module::is_module(module) } {
+        let w_dict = unsafe { w_module_get_w_dict(module) };
+        if !w_dict.is_null()
+            && let Some(value) = unsafe { w_dict_getitem_str(w_dict, name) }
+        {
+            return Ok(value);
+        }
+    }
+    crate::baseobjspace::getattr_str(module, name)
+        .map_err(|_| PyError::runtime_error(format!("_warnings.{name} is not initialized")))
 }
 
 fn native_store(name: &str, value: PyObjectRef) -> Result<(), PyError> {
@@ -98,7 +115,9 @@ fn filters_mutated_impl() -> Result<(), PyError> {
 
 fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let warning = warning_class("Warning");
-    if crate::baseobjspace::isinstance(message, warning)? {
+    // `space.isinstance_w` — the type-only test, not the `__instancecheck__`
+    // protocol the `isinstance()` builtin runs.
+    if unsafe { crate::baseobjspace::isinstance_w(message, warning) } {
         return crate::typedef::r#type(message)
             .map(|p| p.as_ptr())
             .ok_or_else(|| PyError::type_error("warning instance has no type"));
@@ -597,7 +616,9 @@ fn do_warn_explicit(
     let warning = warning_class("Warning");
     let input_message = pyre_object::gc_roots::shadow_stack_get(input_message_slot);
     let category = pyre_object::gc_roots::shadow_stack_get(category_slot);
-    let (text, message, category) = if crate::baseobjspace::isinstance(input_message, warning)? {
+    let (text, message, category) = if unsafe {
+        crate::baseobjspace::isinstance_w(input_message, warning)
+    } {
         (
             crate::builtins::builtin_str(&[pyre_object::gc_roots::shadow_stack_get(
                 input_message_slot,
@@ -705,6 +726,52 @@ fn do_warn_explicit(
     Ok(())
 }
 
+/// Whether the `State` this module keeps in its own namespace is readable.
+///
+/// Upstream holds it on a `space.fromcache(State)` instance that no Python
+/// code can reach, so `space.warn` can always match a warning.  pyre's lives
+/// under `sys.modules['_warnings']`, which app code can rebind to anything;
+/// an interpreter warning has to survive that rather than raise out of the
+/// operator that issued it.
+pub fn state_is_readable() -> bool {
+    native_attr(VERSION_ATTR).is_ok()
+}
+
+/// `interp_warnings.do_warn` — the interpreter-level entry point.
+///
+/// `category` must already be a `Warning` subclass; `_warnings.warn` runs
+/// `get_category` first, and `space.warn` names the class outright.
+/// `skip_file_prefixes` reaches `setup_context`'s frame walk; a caller with
+/// no prefix to skip passes an empty slice.
+///
+/// Reachable without `warnings` being imported: the filters, the default
+/// action and the once-registry all live on the native module, so an
+/// interpreter warning is matched and deduplicated whether or not the Python
+/// wrapper has been loaded.
+pub fn do_warn(
+    message: PyObjectRef,
+    category: PyObjectRef,
+    stacklevel: i64,
+    source: PyObjectRef,
+    skip_file_prefixes: &[String],
+) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let message_slot = pin_root_slot(message);
+    let category_slot = pin_root_slot(category);
+    let source_slot = pin_root_slot(source);
+    let (filename, lineno, module, registry) = setup_context(stacklevel, skip_file_prefixes);
+    do_warn_explicit(
+        pyre_object::gc_roots::shadow_stack_get(category_slot),
+        pyre_object::gc_roots::shadow_stack_get(message_slot),
+        filename,
+        lineno,
+        module,
+        registry,
+        PY_NULL,
+        pyre_object::gc_roots::shadow_stack_get(source_slot),
+    )
+}
+
 fn filters_mutated(_: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     filters_mutated_impl()?;
     Ok(w_none())
@@ -762,12 +829,19 @@ crate::py_module! {
             } else {
                 stacklevel.max(2)
             };
-            let category = get_category(message, category)?;
-            let (filename, lineno, module, registry) =
-                setup_context(stacklevel, &skip_file_prefixes);
-            do_warn_explicit(
-                category, message, filename, lineno, module, registry,
-                pyre_object::PY_NULL, source,
+            let _roots = pyre_object::gc_roots::push_roots();
+            let message_slot = pin_root_slot(message);
+            let source_slot = pin_root_slot(source);
+            let category = get_category(
+                pyre_object::gc_roots::shadow_stack_get(message_slot),
+                category,
+            )?;
+            do_warn(
+                pyre_object::gc_roots::shadow_stack_get(message_slot),
+                category,
+                stacklevel,
+                pyre_object::gc_roots::shadow_stack_get(source_slot),
+                &skip_file_prefixes,
             )?;
             Ok(w_none())
         }
