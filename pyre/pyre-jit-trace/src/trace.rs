@@ -1744,34 +1744,25 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
         };
         per_frame.push((frame_ptr, frame_stack_base));
     }
-    // A chain rooted at an intermediate frame means the walk descended into a
-    // residual call and inlined inside it.  Two things then do not hold:
+    // Identity gate: the recovered chain has to be rooted at the frame this
+    // walk is stepping.  A chain rooted at an intermediate frame means the walk
+    // descended into a residual call and inlined inside it, and then
     // `resume_py_pc` is a coordinate in `frames[0]`'s code while the restart
-    // moves `cf_addr`, and — because the walker executes residuals CONCRETELY
-    // while an inline push never runs the interpreter's call sequence — a
-    // `sys._getframe()` inside the inlined body already read `ec.topframeref`
-    // as the CALLER and committed the wrong frame object, which the adopt
-    // would then publish.  Bracketing each inline level's concrete frame with
-    // an `enter`/`leave` does not fix it: levels that run without a
-    // materialized frame have nothing to publish, so the chain stays short by
-    // one and shifts every `_getframe` result up a level.  Closing this needs
-    // the `jit.virtual_ref` emit at the inline push, so decline to legacy
-    // replay until then.
+    // moves `cf_addr`.
     //
-    // Measured by driving the chain with this check lifted, over the
-    // `getframe_inline_subwalk_multiframe` shape: the shift is exactly one
-    // level and it is silent.  A `sys._getframe(2)` meant for the walked frame
-    // lands on the module frame instead, so the same run returns a wrong
-    // integer rather than failing — `f_locals["base"]` raises `KeyError`,
-    // `f_locals.get("base", -1)` scores -1 for 7, `len(f_locals)` scores the
-    // module globals' 12 for the walked frame's 3, and
-    // `len(f_code.co_name)` scores `<module>`'s 8 for `main_loop`'s 9.  The
-    // check is therefore load-bearing for EVERY outcome arm, not only the
-    // `ContinueRunningNormally` one that consumes a `cf_addr` coordinate:
-    // `DoneWithThisFrame*` and `ExitFrameWithExceptionRef` hand back a value
-    // the chain computed off the wrong frame.  It also has to stay AHEAD of
-    // the drive — declining afterwards returns to a legacy replay that
-    // re-executes what the chain already committed.
+    // As spelled, the test cannot pass.  `per_frame[0]` is recovered from the
+    // trace's frame register, which is baked against the LIVE frame
+    // (`set_live_vable_frame_addr` is deliberately set before `init_symbolic`
+    // so the root vable identity is not the discarded snapshot's), while
+    // `cf_addr` is that snapshot copy.  Measured on the one shape that reaches
+    // here — a `while` loop calling an inlined callee that calls a zero-arg
+    // `sys._getframe` — the chain IS rooted at the walked frame and the two
+    // sides still differ, so this declines every time and the single-frame arm
+    // takes it.  Closing it means deciding, per use of `cf_addr` below, which
+    // representation that use wants: the two identity uses (this test and the
+    // root `f_backref` link) ask a different question from the vable root and
+    // the resume-state write, which match the single-frame arm on the
+    // snapshot.
     mfdbg!(
         "chain cf_addr={cf_addr:#x} levels=[{}]",
         per_frame
@@ -1782,8 +1773,7 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     );
     if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(cf_addr as i64) {
         mfdbg!(
-            "chain rooted at {:#x}, not the walked frame {cf_addr:#x} (needs the \
-             virtual_ref emit at the inline push)",
+            "chain rooted at {:#x}, not the walked frame {cf_addr:#x}",
             per_frame.first().map(|&(p, _)| p).unwrap_or(0),
         );
         return false;
