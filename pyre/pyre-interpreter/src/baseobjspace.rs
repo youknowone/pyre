@@ -452,7 +452,7 @@ fn exc_blocking_written(obj: PyObjectRef) -> bool {
 /// wins, then derive the construct-time value from `args_w`, and finally
 /// fall back to the `None` class default.
 pub(crate) fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
-    let w_dict = getdict_backing(obj);
+    let w_dict = getdict_backing_native(obj);
     if !w_dict.is_null() {
         if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
             return v;
@@ -4039,7 +4039,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 /// objspace/std/mapdict.py:817-818 MapdictDictSupport.getdict overrides
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
-pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
+pub fn getdict(obj: PyObjectRef) -> PyResult {
     // pypy/module/thread/os_local.py Local.getdict selects the dictionary
     // belonging to the current ExecutionContext before ordinary mapdict
     // dispatch.  The Local object itself owns the mapping and cache.
@@ -4050,33 +4050,33 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { crate::is_function(obj) }
         && unsafe { std::ptr::eq((*obj).ob_type, &crate::function::FUNCTION_TYPE) }
     {
-        return unsafe { crate::function::function_getdict(obj) };
+        return Ok(unsafe { crate::function::function_getdict(obj) });
     }
     // function.py:678-681 StaticMethod.getdict — the dictionary is a
     // real field on the descriptor object, not mapdict side storage.
     if unsafe { pyre_object::function::is_staticmethod(obj) } {
-        return unsafe { pyre_object::function::w_staticmethod_getdict(obj) };
+        return Ok(unsafe { pyre_object::function::w_staticmethod_getdict(obj) });
     }
     // function.py:726-729 ClassMethod.getdict.
     if unsafe { pyre_object::function::is_classmethod(obj) } {
-        return unsafe { pyre_object::function::w_classmethod_getdict(obj) };
+        return Ok(unsafe { pyre_object::function::w_classmethod_getdict(obj) });
     }
     // exceptions/interp_exceptions.py:222-225 W_BaseException.getdict
     // override — lazily allocates the instance dict on the typed slot.
     if unsafe { pyre_object::is_exception(obj) } {
-        return unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
+        return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
     }
     // bytesobject.py W_BytesObject subclasses inherit mapdict support.  Their
     // dict SPECIAL slot lives on the native bytes payload so the GC sees the
     // `subclass -> dict` edge and can collect cycles through a memoryview.
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         let Some(w_type) = crate::typedef::r#type(obj) else {
-            return PY_NULL;
+            return Ok(PY_NULL);
         };
         if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
             let existing = unsafe { pyre_object::bytesobject::w_bytes_getdict(obj) };
             if !existing.is_null() {
-                return existing;
+                return Ok(existing);
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -4088,17 +4088,17 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
                     w_dict,
                 )
             };
-            return w_dict;
+            return Ok(w_dict);
         }
     }
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         let Some(w_type) = crate::typedef::r#type(obj) else {
-            return PY_NULL;
+            return Ok(PY_NULL);
         };
         if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
             let existing = unsafe { pyre_object::bytearrayobject::w_bytearray_getdict(obj) };
             if !existing.is_null() {
-                return existing;
+                return Ok(existing);
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -4110,18 +4110,18 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
                     w_dict,
                 )
             };
-            return w_dict;
+            return Ok(w_dict);
         }
     }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
-        None => return pyre_object::PY_NULL,
+        None => return Ok(pyre_object::PY_NULL),
     };
     if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::_obj_getdict(obj)
+        Ok(crate::objspace::std::mapdict::_obj_getdict(obj))
     } else {
         // W_Root.getdict default — return None
-        pyre_object::PY_NULL
+        Ok(pyre_object::PY_NULL)
     }
 }
 
@@ -4133,7 +4133,11 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 /// `W_UnicodeObject` itself. Other fixed Rust payloads still fall back to an
 /// exposed instance `__dict__` when their type has one. `None`/`false` means
 /// the receiver has no writable storage.
-pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str, index: u32) -> Option<PyObjectRef> {
+pub(crate) fn native_slot_get(
+    obj: PyObjectRef,
+    name: &str,
+    index: u32,
+) -> Result<Option<PyObjectRef>, PyError> {
     // Python 3.14 permits a native-layout `property` subclass to declare an
     // explicit `__doc__` slot.  PyPy's extended instance layout stores that
     // slot on the object; pyre's equivalent object-resident location is the
@@ -4141,16 +4145,16 @@ pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str, index: u32) -> Optio
     // fallback below (a slots-only subclass deliberately has no dict).
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
-        return (!value.is_null()).then_some(value);
+        return Ok((!value.is_null()).then_some(value));
     }
     if unsafe { pyre_object::is_str(obj) } {
-        return unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) };
+        return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) });
     }
-    let w_dict = getdict(obj);
+    let w_dict = getdict(obj)?;
     if w_dict.is_null() {
-        return None;
+        return Ok(None);
     }
-    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) }
+    Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) })
 }
 
 pub(crate) fn native_slot_set(
@@ -4158,40 +4162,40 @@ pub(crate) fn native_slot_set(
     name: &str,
     index: u32,
     value: PyObjectRef,
-) -> bool {
+) -> Result<bool, PyError> {
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
-        return true;
+        return Ok(true);
     }
     if unsafe { pyre_object::is_str(obj) } {
         unsafe { pyre_object::unicodeobject::w_str_slot_set(obj, index as usize, value) };
-        return true;
+        return Ok(true);
     }
-    let w_dict = getdict(obj);
+    let w_dict = getdict(obj)?;
     if w_dict.is_null() {
-        return false;
+        return Ok(false);
     }
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, name, value) };
-    true
+    Ok(true)
 }
 
-pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> bool {
+pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Result<bool, PyError> {
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         if value.is_null() {
-            return false;
+            return Ok(false);
         }
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
-        return true;
+        return Ok(true);
     }
     if unsafe { pyre_object::is_str(obj) } {
-        return unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) };
+        return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) });
     }
-    let w_dict = getdict(obj);
+    let w_dict = getdict(obj)?;
     if w_dict.is_null() {
-        return false;
+        return Ok(false);
     }
-    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(w_dict, name) }
+    Ok(unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(w_dict, name) })
 }
 
 /// interpreter/baseobjspace.py:70-73 W_Root.setdict(space, w_dict).
@@ -4299,12 +4303,46 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
 /// backing dict.  Plain dicts, module dicts and mapdict views pass
 /// through unchanged.  The `__dict__` getter keeps returning the
 /// stored object itself (identity), so it reads `getdict` directly.
-fn getdict_backing(obj: PyObjectRef) -> PyObjectRef {
-    let w_dict = getdict(obj);
+fn getdict_backing(obj: PyObjectRef) -> PyResult {
+    let w_dict = getdict(obj)?;
     if w_dict.is_null() {
-        return w_dict;
+        return Ok(w_dict);
     }
-    crate::type_methods::resolve_dict_backing(w_dict)
+    Ok(crate::type_methods::resolve_dict_backing(w_dict))
+}
+
+/// [`getdict`] for a receiver whose layout the caller already knows: a native
+/// payload object (ctypes, socket, mmap, structseq, …) or an exception.
+/// `Local.getdict` is the one override that executes Python — the first
+/// access from a thread runs the subclass initializer (`os_local.py:73
+/// create_new_dict`) — and none of those receivers can be a `_local`, so the
+/// lookup is a plain field or mapdict read.
+pub(crate) fn getdict_native(obj: PyObjectRef) -> PyObjectRef {
+    debug_assert!(
+        !crate::module::thread::is_local(obj),
+        "getdict_native on a _thread._local receiver: its dict lookup can raise",
+    );
+    getdict(obj).unwrap_or(PY_NULL)
+}
+
+/// [`getdict_backing`] under the same restriction as [`getdict_native`].
+fn getdict_backing_native(obj: PyObjectRef) -> PyObjectRef {
+    debug_assert!(
+        !crate::module::thread::is_local(obj),
+        "getdict_backing_native on a _thread._local receiver: its dict lookup can raise",
+    );
+    getdict_backing(obj).unwrap_or(PY_NULL)
+}
+
+/// [`setdictvalue`] under the same restriction as [`getdict_native`]: the
+/// receiver's dictionary is a plain field or mapdict slot, so resolving it
+/// cannot run Python and the store is infallible.
+pub(crate) fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+    debug_assert!(
+        !crate::module::thread::is_local(obj),
+        "setdictvalue_native on a _thread._local receiver: its dict lookup can raise",
+    );
+    setdictvalue(obj, name, value).unwrap_or(false)
 }
 
 /// `baseobjspace.py:46-50 W_Root.getdictvalue`.
@@ -4323,7 +4361,7 @@ fn getdict_backing(obj: PyObjectRef) -> PyObjectRef {
 /// key whose hash collides can run a user `__eq__`, and the raw accessor
 /// reports that as an ordinary miss — the attribute would look absent.
 fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
-    let w_dict = getdict_backing(obj);
+    let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
         return Ok(None);
     }
@@ -5330,7 +5368,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
                 }
             }
         }
-        let w_dict = getdict_backing(obj);
+        let w_dict = getdict_backing(obj)?;
         if !w_dict.is_null() {
             if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
                 if !v.is_null() {
@@ -5447,7 +5485,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
                 return Ok(w_none());
             }
         }
-        let w_dict = getdict(obj);
+        let w_dict = getdict(obj)?;
         if !w_dict.is_null() {
             setitem(w_dict, w_name, value)?;
             return Ok(w_none());
@@ -5529,7 +5567,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
             }
             return Err(attr_error_wtf8(obj, name));
         }
-        let w_dict = getdict_backing(obj);
+        let w_dict = getdict_backing(obj)?;
         if !w_dict.is_null() && pyre_object::w_dict_delitem(w_dict, w_name) {
             return Ok(w_none());
         }
@@ -6897,7 +6935,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // __dict__: use getdict() — only returns a dict for hasdict objects,
     // matching PyPy's descriptor-based __dict__ control.
     if name == "__dict__" {
-        let w_dict = getdict(obj);
+        let w_dict = getdict(obj)?;
         if !w_dict.is_null() {
             return Ok(w_dict);
         }
@@ -6923,7 +6961,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // Check the per-instance W_DictObject here (same API PyPy's
     // `descr__getattribute__` uses at descroperation.py:50). This is the
     // second half of the "hasdict instance dict" protocol.
-    let w_dict = getdict_backing(obj);
+    let w_dict = getdict_backing(obj)?;
     if !w_dict.is_null() {
         // `w_dict` may use MapDictStrategy, whose storage is the backing
         // instance rather than a native r_dict. PyPy calls
@@ -8089,7 +8127,13 @@ pub unsafe fn bound_method_attr_fast_path(
     // from it: the emitted fold carries no dict-shape guard, so a later store
     // of `name` into the dict would not side-exit.  Admitting those receivers
     // means emitting that guard first.
-    if !getdict_backing(w_obj).is_null() {
+    // `Local.getdict` runs app-level code (os_local.py:73), which a fold
+    // precondition must not; such a receiver always carries a dict and is
+    // declined by the check below either way.
+    if crate::module::thread::is_local(w_obj) {
+        return None;
+    }
+    if !getdict_backing_native(w_obj).is_null() {
         return None;
     }
     let w_descr = lookup_in_type(w_type, name)?;
@@ -8801,7 +8845,7 @@ pub(crate) unsafe fn get(
                 obj,
                 pyre_object::w_member_get_name(descr),
                 pyre_object::w_member_get_index(descr),
-            )
+            )?
         };
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
@@ -8891,7 +8935,7 @@ unsafe fn set(
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
             let slot_name = pyre_object::w_member_get_name(descr);
-            if !native_slot_set(obj, slot_name, index, value) {
+            if !native_slot_set(obj, slot_name, index, value)? {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
                     format!(
@@ -8967,7 +9011,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
                 obj,
                 pyre_object::w_member_get_name(descr),
                 pyre_object::w_member_get_index(descr),
-            )
+            )?
         };
         if !removed {
             let slot_name = pyre_object::w_member_get_name(descr);
@@ -9620,7 +9664,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // return` — exception extras land in the lazily allocated
     // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225) via
     // the `getdict` exception arm.
-    if setdictvalue(obj, name, value) {
+    if setdictvalue(obj, name, value)? {
         return Ok(w_none());
     }
     Err(raiseattrerror(obj, name, w_descr))
@@ -9923,10 +9967,14 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
 ///         return True
 ///     return False
 /// ```
-pub(crate) fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
-    let w_dict = getdict_backing(obj);
+pub(crate) fn setdictvalue(
+    obj: PyObjectRef,
+    name: &str,
+    value: PyObjectRef,
+) -> Result<bool, PyError> {
+    let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
-        return false;
+        return Ok(false);
     }
     // For a user instance, `getdict` returns the MapDictStrategy view, so this
     // `setitem_str` routes straight to the instance map+storage
@@ -9934,7 +9982,7 @@ pub(crate) fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> 
     // mapdict.py:849-850). The earlier C1 explicit `instance_node_setdictvalue`
     // dual-write is now subsumed by that routing and removed.
     unsafe { pyre_object::w_dict_setitem_str(w_dict, name, value) };
-    true
+    Ok(true)
 }
 
 /// descroperation.py:63-69 raiseattrerror.
@@ -10148,7 +10196,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
         return Err(PyError::type_error("args may not be deleted"));
     }
     // Instance/general: remove from the instance dict.
-    let w_dict = getdict_backing(obj);
+    let w_dict = getdict_backing(obj)?;
     if !w_dict.is_null() {
         let removed = unsafe { pyre_object::w_dict_delitem_str(w_dict, name) };
         if removed {

@@ -942,35 +942,123 @@ mod local_class {
     /// `self.dicts = {}` and keeping every per-ExecutionContext dictionary on the
     /// object's ordinary GC graph.  The integer key is pyre's stable identity for
     /// the current OS-thread ExecutionContext.
+    ///
+    /// `initargs` and `initkwargs` are `Local.__init__`'s `self.initargs`
+    /// (os_local.py:25).  Upstream keeps one `Arguments`; pyre's call surface
+    /// takes the positional and keyword halves separately, so they are stored as
+    /// the positional tuple and the construction call's keyword mapping (null
+    /// when it had none), and `create_new_dict` replays the call from both.
     #[crate::pyre_class("_thread._local")]
     pub struct W_Local {
         dicts: PyObjectRef,
+        initargs: PyObjectRef,
+        initkwargs: PyObjectRef,
         last_dict: PyObjectRef,
         last_ident: i64,
         state_lock: Mutex<()>,
     }
 
     impl W_Local {
-        pub(super) fn current_dict(&self) -> PyObjectRef {
-            let _guard = self.state_lock.lock();
+        /// `os_local.py:47-64 create_new_dict`.
+        fn create_new_dict(&self, ident: i64) -> Result<PyObjectRef, crate::PyError> {
             let this = self as *const Self as *mut Self;
-            let ident = current_ident();
-            if self.last_ident == ident && !self.last_dict.is_null() {
-                return self.last_dict;
+            let obj = this as PyObjectRef;
+            // create a new dict for this thread
+            let w_dict = pyre_object::w_dict_new();
+            let roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_dict);
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // Published before the initializer runs: the `__init__` about to be
+            // entered reaches `getdict` again, and finding this entry is what
+            // stops it recursing back into `create_new_dict` (os_local.py:28-31).
+            {
+                let _guard = self.state_lock.lock();
+                unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
             }
-            let w_dict =
-                unsafe { pyre_object::w_dict_getitem(self.dicts, ident) }.unwrap_or_else(|| {
-                    let w_dict = pyre_object::w_dict_new();
-                    unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
-                    register_local_in_current_ec(self as *const Self as PyObjectRef);
-                    w_dict
+            // call __init__ — `space.call_obj_args(w_init, self, self.initargs)`.
+            // The argument pointers are copied out of the tuple only after the
+            // lookup, which can itself run Python: nothing between the copy and
+            // the callee rooting them allocates, so a collection cannot leave
+            // the copies naming pre-move addresses.
+            let result = crate::typedef::r#type(obj)
+                .ok_or_else(|| crate::PyError::type_error("_local instance has no type"))
+                .and_then(|w_type| crate::baseobjspace::getattr_str(w_type.as_ptr(), "__init__"))
+                .and_then(|w_init| {
+                    let mut call_args = vec![obj];
+                    call_args.extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
+                    self.call_init(w_init, &call_args)
                 });
+            let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            drop(roots);
+            if let Err(err) = result {
+                // failed, forget w_dict and propagate the exception
+                let key = w_int_new(ident);
+                let _guard = self.state_lock.lock();
+                unsafe { pyre_object::w_dict_delitem(self.dicts, key) };
+                return Err(err);
+            }
+            // ready
+            register_local_in_current_ec(obj);
+            Ok(w_dict)
+        }
+
+        /// The call itself of `os_local.py:57 space.call_obj_args(w_init, self,
+        /// self.initargs)`.  `args` is the instance followed by the stored
+        /// positional arguments; the stored keywords are bound by name.
+        ///
+        /// Upstream passes a single `Arguments` to `space.call_args`, which
+        /// binds keywords whatever the caller is.  Pyre splits that surface:
+        /// `call::call_with_kwargs` binds keywords but needs the running frame,
+        /// while the frame-less `call_function_impl_result` is positional only.
+        /// Reaching the frame through the execution context is the same
+        /// resolution `call::call_metaclass_with_kwargs` uses, down to falling
+        /// back to the positional call when there is no frame — a receiver only
+        /// reaches here from Python code, which always has one.
+        fn call_init(
+            &self,
+            w_init: PyObjectRef,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let kwds = crate::builtins::builtin_kwarg_entries(
+                (!self.initkwargs.is_null()).then_some(self.initkwargs),
+            );
+            let frame = {
+                let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+                if ec.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    unsafe { (*ec).gettopframe_raw() }
+                }
+            };
+            if kwds.is_empty() || frame.is_null() {
+                return crate::call::call_function_impl_result(w_init, args);
+            }
+            crate::call::call_with_kwargs(unsafe { &mut *frame }, w_init, args, &kwds)
+        }
+
+        /// `os_local.py:66-76 getdict`.
+        pub(super) fn current_dict(&self) -> Result<PyObjectRef, crate::PyError> {
+            let ident = current_ident();
+            {
+                let _guard = self.state_lock.lock();
+                if self.last_ident == ident && !self.last_dict.is_null() {
+                    return Ok(self.last_dict);
+                }
+            }
+            // `create_new_dict` runs app-level `__init__`, which reenters this
+            // method, so the cache lock is not held across the lookup.
+            let w_dict = match unsafe { pyre_object::w_dict_getitem(self.dicts, ident) } {
+                Some(w_dict) => w_dict,
+                None => self.create_new_dict(ident)?,
+            };
+            let this = self as *const Self as *mut Self;
+            let _guard = self.state_lock.lock();
             unsafe {
                 (*this).last_ident = ident;
                 (*this).last_dict = w_dict;
             }
             pyre_object::gc_hook::try_gc_write_barrier(this as *mut u8);
-            w_dict
+            Ok(w_dict)
         }
 
         pub(super) fn thread_is_stopping(&self, ident: i64) {
@@ -996,41 +1084,87 @@ mod local_class {
 
     #[crate::pyre_methods(doc = "Thread-local data", weakrefable)]
     impl W_Local {
+        /// `os_local.py:78-88 descr_local__new__`.
         #[staticmethod]
         fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::typedef::check_user_subclass(type_object(), cls)?;
-            // os_local.py:81 rejects construction arguments before
-            // `allocate_instance`, and does so for every subtype that inherits
-            // `object.__init__` — not just for the exact type — so a refused
-            // construction never reaches `_register_in_ec` (os_local.py:40).
-            if args.len() > 1
-                && unsafe { crate::baseobjspace::lookup_where_class_uncached(cls, "__init__") }
-                    == Some(crate::typedef::w_object())
-            {
-                return Err(crate::PyError::type_error(
-                    "Initialization arguments are not supported",
-                ));
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+                // Construction arguments are rejected by the initializer the
+                // subtype inherits, not by the requested type: a subclass that
+                // defines its own `__init__` consumes them, and
+                // `create_new_dict` replays that call on every further thread.
+                // os_local.py:81 runs this ahead of `allocate_instance`, so a
+                // refused construction never reaches `_register_in_ec`
+                // (os_local.py:40).
+                let w_parent_init = unsafe { crate::baseobjspace::lookup_where(cls, "__init__") }
+                    .map(|(w_where, _)| w_where);
+                if w_parent_init == Some(crate::typedef::w_object()) {
+                    return Err(crate::PyError::type_error(
+                        "Initialization arguments are not supported",
+                    ));
+                }
             }
-            // os_local.py installs the first dictionary before app-level
-            // __init__ is entered, preventing recursive initialization.
+            // os_local.py:23-38 `Local.__init__` installs the first dictionary
+            // before app-level __init__ is entered, preventing recursive
+            // initialization.
+            let initargs = w_tuple_new(positional.get(1..).unwrap_or(&[]).to_vec());
+            let roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(cls);
+            let initargs_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(initargs);
+            // A plain `_local()` has no keyword mapping, and a null takes no
+            // shadow-stack slot.
+            let initkwargs_slot = kwargs.map(|w_kwargs| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(w_kwargs);
+                slot
+            });
+            let dicts_slot = pyre_object::gc_roots::shadow_stack_len();
             let dicts = pyre_object::w_dict_new();
+            pyre_object::gc_roots::pin_root(dicts);
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let w_dict = pyre_object::w_dict_new();
+            pyre_object::gc_roots::pin_root(w_dict);
             let ident = current_ident();
-            unsafe { pyre_object::w_dict_setitem(dicts, ident, w_dict) };
+            unsafe {
+                pyre_object::w_dict_setitem(
+                    pyre_object::gc_roots::shadow_stack_get(dicts_slot),
+                    ident,
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                )
+            };
+            // The object slots are filled after the allocation, from the
+            // shadow stack, so a collection triggered by `allocate_stable`
+            // cannot leave the fresh instance holding pre-move addresses.
             let obj = Self::allocate_stable(Self {
                 ob: PyObject::default(),
-                dicts,
-                last_dict: w_dict,
+                dicts: PY_NULL,
+                initargs: PY_NULL,
+                initkwargs: PY_NULL,
+                last_dict: PY_NULL,
                 last_ident: ident,
                 state_lock: parking_lot::const_mutex(()),
             });
-            unsafe { (*obj).w_class = cls };
+            unsafe {
+                let this = obj as *mut Self;
+                (*obj).w_class = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+                (*this).dicts = pyre_object::gc_roots::shadow_stack_get(dicts_slot);
+                (*this).initargs = pyre_object::gc_roots::shadow_stack_get(initargs_slot);
+                (*this).initkwargs = initkwargs_slot
+                    .map(pyre_object::gc_roots::shadow_stack_get)
+                    .unwrap_or(PY_NULL);
+                (*this).last_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            }
+            pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            drop(roots);
             register_local_in_current_ec(obj);
             Ok(obj)
         }
 
         #[getter]
-        fn __dict__(&self) -> PyObjectRef {
+        fn __dict__(&self) -> Result<PyObjectRef, crate::PyError> {
             self.current_dict()
         }
     }
@@ -1041,10 +1175,18 @@ fn local_type() -> PyObjectRef {
     local_class::type_object()
 }
 
-/// W_Root.getdict dispatch for `os_local.Local.getdict`.
-pub(crate) fn local_getdict(obj: PyObjectRef) -> Option<PyObjectRef> {
+/// W_Root.getdict dispatch for `os_local.Local.getdict`.  `None` means the
+/// receiver is not a `_local`; `Some(Err(..))` is the app-level `__init__` the
+/// first access from a thread runs (`os_local.py:73 create_new_dict`) raising.
+pub(crate) fn local_getdict(obj: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
     let local = W_Local::from_obj(obj)?;
     Some(local.current_dict())
+}
+
+/// True when `obj` is a `_thread._local`, the one receiver whose `getdict`
+/// runs app-level code.
+pub(crate) fn is_local(obj: PyObjectRef) -> bool {
+    W_Local::from_obj(obj).is_some()
 }
 
 /// `os_local.py:Local._register_in_ec`.

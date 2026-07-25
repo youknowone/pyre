@@ -268,7 +268,7 @@ impl<'a> MiniXmlParser<'a> {
             &[w_str_new(&version), encoding, standalone],
         )?;
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
-            crate::baseobjspace::setdictvalue(
+            crate::baseobjspace::setdictvalue_native(
                 self.parser,
                 "_pyre_not_standalone_pending",
                 w_bool_from(true),
@@ -369,7 +369,7 @@ impl<'a> MiniXmlParser<'a> {
             .unwrap_or(false)
         {
             self.call_not_standalone()?;
-            crate::baseobjspace::setdictvalue(
+            crate::baseobjspace::setdictvalue_native(
                 self.parser,
                 "_pyre_not_standalone_pending",
                 w_bool_from(false),
@@ -765,7 +765,7 @@ impl<'a> MiniXmlParser<'a> {
                 return self.call_handler_raw("CharacterDataHandler", &[w_str_new(text)]);
             }
             self.char_buffer.push_str(text);
-            crate::baseobjspace::setdictvalue(
+            crate::baseobjspace::setdictvalue_native(
                 self.parser,
                 "buffer_used",
                 w_int_new(self.char_buffer.len() as i64),
@@ -803,7 +803,7 @@ impl<'a> MiniXmlParser<'a> {
             return Ok(());
         }
         let text = std::mem::take(&mut self.char_buffer);
-        crate::baseobjspace::setdictvalue(self.parser, "buffer_used", w_int_new(0));
+        crate::baseobjspace::setdictvalue_native(self.parser, "buffer_used", w_int_new(0));
         self.call_handler_raw("CharacterDataHandler", &[w_str_new(&text)])
     }
 
@@ -857,17 +857,17 @@ impl<'a> MiniXmlParser<'a> {
 
     fn set_event_position(&mut self, pos: XmlPos) {
         self.suppress_current = pos.index < self.suppress_until;
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentLineNumber",
             w_int_new(pos.line as i64),
         );
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentColumnNumber",
             w_int_new(pos.col as i64),
         );
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentByteIndex",
             w_int_new(pos.index as i64),
@@ -1120,22 +1120,22 @@ impl<'a> MiniXmlParser<'a> {
 
     fn make_error(&self, msg: &str) -> crate::PyError {
         let code = error_code_for_message(msg);
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "ErrorLineNumber",
             w_int_new(self.pos.line as i64),
         );
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "ErrorColumnNumber",
             w_int_new(self.pos.col as i64),
         );
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "ErrorByteIndex",
             w_int_new(self.pos.index as i64),
         );
-        crate::baseobjspace::setdictvalue(self.parser, "ErrorCode", w_int_new(code));
+        crate::baseobjspace::setdictvalue_native(self.parser, "ErrorCode", w_int_new(code));
         pyexpat_error(
             format!("{msg}: line {}, column {}", self.pos.line, self.pos.col),
             code,
@@ -1145,17 +1145,17 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn update_position_slots(&self) {
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentLineNumber",
             w_int_new(self.pos.line as i64),
         );
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentColumnNumber",
             w_int_new(self.pos.col as i64),
         );
-        crate::baseobjspace::setdictvalue(
+        crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentByteIndex",
             w_int_new(self.pos.index as i64),
@@ -1180,7 +1180,11 @@ fn object_to_xml_string(parser: PyObjectRef, obj: PyObjectRef) -> Result<String,
 fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, crate::PyError> {
     let enc = declared_or_forced_encoding(parser, data)?;
     let normalized = normalize_encoding(&enc);
-    crate::baseobjspace::setdictvalue(parser, "_pyre_forced_encoding", w_str_new(&normalized));
+    crate::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_forced_encoding",
+        w_str_new(&normalized),
+    );
     match normalized.as_str() {
         "utf-8" | "us-ascii" => {
             let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
@@ -1344,7 +1348,7 @@ fn parser_pending(parser: PyObjectRef) -> String {
 }
 
 fn set_parser_pending(parser: PyObjectRef, pending: &str) {
-    crate::baseobjspace::setdictvalue(parser, "_pyre_pending_xml", w_str_new(pending));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new(pending));
 }
 
 fn get_parser_int(parser: PyObjectRef, name: &str, default: i64) -> i64 {
@@ -1359,7 +1363,7 @@ fn get_emit_upto(parser: PyObjectRef) -> usize {
 }
 
 fn set_emit_upto(parser: PyObjectRef, value: usize) {
-    crate::baseobjspace::setdictvalue(parser, "_pyre_emit_upto", w_int_new(value as i64));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(value as i64));
 }
 
 fn parse_impl(
@@ -1402,7 +1406,11 @@ fn parse_impl(
         }
     } else {
         set_parser_pending(parser, &input);
-        crate::baseobjspace::setdictvalue(parser, "_pyre_deferred_incomplete", w_bool_from(true));
+        crate::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_deferred_incomplete",
+            w_bool_from(true),
+        );
         return Ok(w_int_new(1));
     };
     if crate::baseobjspace::getattr_str(parser, "_pyre_use_foreign_dtd")
@@ -1415,11 +1423,19 @@ fn parse_impl(
     let suppress_until = get_emit_upto(parser);
     let parsed = MiniXmlParser::new(parser, &parse_input, final_flag, suppress_until).parse()?;
     if final_flag {
-        crate::baseobjspace::setdictvalue(parser, "_pyre_finished", w_bool_from(true));
-        crate::baseobjspace::setdictvalue(parser, "_pyre_deferred_incomplete", w_bool_from(false));
+        crate::baseobjspace::setdictvalue_native(parser, "_pyre_finished", w_bool_from(true));
+        crate::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_deferred_incomplete",
+            w_bool_from(false),
+        );
         set_parser_pending(parser, "");
     } else {
-        crate::baseobjspace::setdictvalue(parser, "_pyre_deferred_incomplete", w_bool_from(false));
+        crate::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_deferred_incomplete",
+            w_bool_from(false),
+        );
         set_parser_pending(parser, &input);
     }
     set_emit_upto(parser, parsed);
@@ -1475,9 +1491,9 @@ fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> crate::PyE
     if let Some(cls) = crate::builtins::lookup_exc_class("pyexpat.error") {
         let args = [cls, w_str_new(&msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
-            crate::baseobjspace::setdictvalue(exc, "code", w_int_new(code));
-            crate::baseobjspace::setdictvalue(exc, "lineno", w_int_new(lineno));
-            crate::baseobjspace::setdictvalue(exc, "offset", w_int_new(offset));
+            crate::baseobjspace::setdictvalue_native(exc, "code", w_int_new(code));
+            crate::baseobjspace::setdictvalue_native(exc, "lineno", w_int_new(lineno));
+            crate::baseobjspace::setdictvalue_native(exc, "offset", w_int_new(offset));
             err.exc_object = exc;
         }
     }
@@ -1504,12 +1520,12 @@ fn copy_parser_config(src: PyObjectRef, dst: PyObjectRef) {
         "_pyre_base",
     ] {
         if let Ok(value) = crate::baseobjspace::getattr_str(src, name) {
-            crate::baseobjspace::setdictvalue(dst, name, value);
+            crate::baseobjspace::setdictvalue_native(dst, name, value);
         }
     }
     for h in HANDLER_NAMES {
         if let Ok(value) = crate::baseobjspace::getattr_str(src, h) {
-            crate::baseobjspace::setdictvalue(dst, h, value);
+            crate::baseobjspace::setdictvalue_native(dst, h, value);
         }
     }
 }
@@ -1552,7 +1568,7 @@ mod xmlparser_class {
                 if unsafe { !is_str(base) } {
                     return Err(crate::PyError::type_error("SetBase() argument must be str"));
                 }
-                crate::baseobjspace::setdictvalue(self_obj, "_pyre_base", base);
+                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_base", base);
                 Ok(w_none())
             }
             fn GetBase(self_obj: PyObjectRef) -> PyObjectRef {
@@ -1568,7 +1584,7 @@ mod xmlparser_class {
                 } else {
                     is_true_obj(flag)
                 };
-                crate::baseobjspace::setdictvalue(
+                crate::baseobjspace::setdictvalue_native(
                     self_obj,
                     "_pyre_param_entity_parsing",
                     w_int_new(if enabled { 1 } else { 0 }),
@@ -1579,14 +1595,14 @@ mod xmlparser_class {
                 self_obj: PyObjectRef,
                 #[default(w_bool_from(true))] flag: PyObjectRef,
             ) -> PyObjectRef {
-                crate::baseobjspace::setdictvalue(self_obj, "_pyre_use_foreign_dtd", w_bool_from(is_true_obj(flag)));
+                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_use_foreign_dtd", w_bool_from(is_true_obj(flag)));
                 w_none()
             }
             fn GetReparseDeferralEnabled(self_obj: PyObjectRef) -> PyObjectRef {
                 crate::baseobjspace::getattr_str(self_obj, "_pyre_reparse_deferral").unwrap_or_else(|_| w_bool_from(true))
             }
             fn SetReparseDeferralEnabled(self_obj: PyObjectRef, flag: PyObjectRef) -> PyObjectRef {
-                crate::baseobjspace::setdictvalue(self_obj, "_pyre_reparse_deferral", w_bool_from(is_true_obj(flag)));
+                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_reparse_deferral", w_bool_from(is_true_obj(flag)));
                 w_none()
             }
             fn SetBillionLaughsAttackProtectionActivationThreshold(self_obj: PyObjectRef, threshold: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1599,7 +1615,7 @@ mod xmlparser_class {
                 if unsafe { w_int_get_value(threshold) } < 0 {
                     return Err(crate::PyError::value_error("threshold must be non-negative"));
                 }
-                crate::baseobjspace::setdictvalue(self_obj, "_pyre_billion_threshold", threshold);
+                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_threshold", threshold);
                 Ok(w_none())
             }
             fn SetBillionLaughsAttackProtectionMaximumAmplification(self_obj: PyObjectRef, max_factor: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1624,7 +1640,7 @@ mod xmlparser_class {
                         0,
                     ));
                 }
-                crate::baseobjspace::setdictvalue(self_obj, "_pyre_billion_max_is_one", w_bool_from(value <= 1.0));
+                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_max_is_one", w_bool_from(value <= 1.0));
                 Ok(w_none())
             }
             fn ExternalEntityParserCreate(
@@ -1635,11 +1651,11 @@ mod xmlparser_class {
                 let parser = w_instance_new(xmlparser_class::type_object());
                 init_parser_slots(parser);
                 copy_parser_config(self_obj, parser);
-                crate::baseobjspace::setdictvalue(parser, "_pyre_is_subparser", w_bool_from(true));
+                crate::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(true));
                 if unsafe { is_str(encoding) } {
-                    crate::baseobjspace::setdictvalue(parser, "_pyre_forced_encoding", encoding);
+                    crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
                 }
-                crate::baseobjspace::setdictvalue(parser, "_pyre_external_context", context);
+                crate::baseobjspace::setdictvalue_native(parser, "_pyre_external_context", context);
                 parser
             }
             fn __setattr__(self_obj: PyObjectRef, name: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1651,7 +1667,7 @@ mod xmlparser_class {
                     return Err(crate::PyError::attribute_error("returns_unicode"));
                 }
                 if bool_slot_name(name_s) {
-                    crate::baseobjspace::setdictvalue(self_obj, name_s, w_bool_from(is_true_obj(value)));
+                    crate::baseobjspace::setdictvalue_native(self_obj, name_s, w_bool_from(is_true_obj(value)));
                     return Ok(w_none());
                 }
                 if name_s == "buffer_size" {
@@ -1662,10 +1678,10 @@ mod xmlparser_class {
                     if size <= 0 {
                         return Err(crate::PyError::value_error("buffer_size must be greater than zero"));
                     }
-                    crate::baseobjspace::setdictvalue(self_obj, "buffer_size", value);
+                    crate::baseobjspace::setdictvalue_native(self_obj, "buffer_size", value);
                     return Ok(w_none());
                 }
-                crate::baseobjspace::setdictvalue(self_obj, name_s, value);
+                crate::baseobjspace::setdictvalue_native(self_obj, name_s, value);
                 Ok(w_none())
             }
         }
@@ -1674,13 +1690,13 @@ mod xmlparser_class {
 
 fn init_parser_slots(parser: PyObjectRef) {
     for h in HANDLER_NAMES {
-        crate::baseobjspace::setdictvalue(parser, h, w_none());
+        crate::baseobjspace::setdictvalue_native(parser, h, w_none());
     }
     let set_int = |name: &str, v: i64| {
-        crate::baseobjspace::setdictvalue(parser, name, w_int_new(v));
+        crate::baseobjspace::setdictvalue_native(parser, name, w_int_new(v));
     };
     let set_bool = |name: &str, v: bool| {
-        crate::baseobjspace::setdictvalue(parser, name, w_bool_from(v));
+        crate::baseobjspace::setdictvalue_native(parser, name, w_bool_from(v));
     };
     set_bool("buffer_text", false);
     set_int("buffer_size", 8192);
@@ -1695,19 +1711,35 @@ fn init_parser_slots(parser: PyObjectRef) {
     set_int("CurrentLineNumber", 0);
     set_int("CurrentColumnNumber", 0);
     set_int("CurrentByteIndex", 0);
-    crate::baseobjspace::setdictvalue(parser, "intern", w_dict_new());
-    crate::baseobjspace::setdictvalue(parser, "_pyre_pending_xml", w_str_new(""));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_emit_upto", w_int_new(0));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_finished", w_bool_from(false));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_base", w_none());
-    crate::baseobjspace::setdictvalue(parser, "_pyre_use_foreign_dtd", w_bool_from(false));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_reparse_deferral", w_bool_from(true));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_is_subparser", w_bool_from(false));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_deferred_incomplete", w_bool_from(false));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_param_entity_parsing", w_int_new(0));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_billion_threshold", w_int_new(i64::MAX));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_billion_max_is_one", w_bool_from(false));
-    crate::baseobjspace::setdictvalue(parser, "_pyre_not_standalone_pending", w_bool_from(false));
+    crate::baseobjspace::setdictvalue_native(parser, "intern", w_dict_new());
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new(""));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(0));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_finished", w_bool_from(false));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_base", w_none());
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_use_foreign_dtd", w_bool_from(false));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_reparse_deferral", w_bool_from(true));
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(false));
+    crate::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_deferred_incomplete",
+        w_bool_from(false),
+    );
+    crate::baseobjspace::setdictvalue_native(parser, "_pyre_param_entity_parsing", w_int_new(0));
+    crate::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_billion_threshold",
+        w_int_new(i64::MAX),
+    );
+    crate::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_billion_max_is_one",
+        w_bool_from(false),
+    );
+    crate::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_not_standalone_pending",
+        w_bool_from(false),
+    );
 }
 
 /// `ParserCreate(encoding=None, namespace_separator=None, intern=None)`.
@@ -1724,7 +1756,7 @@ fn parser_create3(
                 "ParserCreate() argument 'encoding' must be str or None",
             ));
         }
-        crate::baseobjspace::setdictvalue(parser, "_pyre_forced_encoding", encoding);
+        crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
     }
     if unsafe { is_none(namespace_separator) } {
     } else if unsafe { is_str(namespace_separator) } {
@@ -1734,14 +1766,18 @@ fn parser_create3(
                 "namespace_separator must be at most one character, omitted, or None",
             ));
         }
-        crate::baseobjspace::setdictvalue(parser, "_pyre_namespace_separator", w_str_new(value));
+        crate::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_namespace_separator",
+            w_str_new(value),
+        );
     } else {
         return Err(crate::PyError::type_error(
             "ParserCreate() argument 'namespace_separator' must be str or None, not int",
         ));
     }
     if unsafe { !is_none(intern) } {
-        crate::baseobjspace::setdictvalue(parser, "intern", intern);
+        crate::baseobjspace::setdictvalue_native(parser, "intern", intern);
     }
     Ok(parser)
 }
@@ -1872,7 +1908,7 @@ fn make_namespace(name: &'static str) -> PyObjectRef {
     let tp = crate::typedef::make_builtin_type(name, |_| {});
     unsafe { typeobject::w_type_set_hasdict(tp, true) };
     let obj = w_instance_new(tp);
-    crate::baseobjspace::setdictvalue(obj, "__name__", w_str_new(name));
+    crate::baseobjspace::setdictvalue_native(obj, "__name__", w_str_new(name));
     obj
 }
 
@@ -1912,7 +1948,7 @@ crate::py_module! {
         // model — content-model integer constants.
         let model = make_namespace("pyexpat.model");
         for (name, value) in MODEL_CONSTANTS {
-            crate::baseobjspace::setdictvalue(model, name, w_int_new(*value));
+            crate::baseobjspace::setdictvalue_native(model, name, w_int_new(*value));
         }
         crate::module_ns_store(ns, "model", model);
 
@@ -1928,14 +1964,14 @@ crate::py_module! {
             }
             let (msg, code) = ERROR_TABLE[idx - 1];
             let w_msg = w_str_new(msg);
-            crate::baseobjspace::setdictvalue(errors, name, w_msg);
+            crate::baseobjspace::setdictvalue_native(errors, name, w_msg);
             unsafe {
                 w_dict_setitem_str(codes, msg, w_int_new(code));
                 w_dict_store(messages, w_int_new(code), w_msg);
             }
         }
-        crate::baseobjspace::setdictvalue(errors, "codes", codes);
-        crate::baseobjspace::setdictvalue(errors, "messages", messages);
+        crate::baseobjspace::setdictvalue_native(errors, "codes", codes);
+        crate::baseobjspace::setdictvalue_native(errors, "messages", messages);
         crate::module_ns_store(ns, "errors", errors);
 
         // features — list of (name, value) capability tuples.

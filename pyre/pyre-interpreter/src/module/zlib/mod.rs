@@ -31,7 +31,7 @@ fn next_id() -> u64 {
 }
 
 fn get_id(obj: PyObjectRef) -> u64 {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return 0;
     }
@@ -42,7 +42,7 @@ fn get_id(obj: PyObjectRef) -> u64 {
 }
 
 fn set_id(obj: PyObjectRef, id: u64) {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if !d.is_null() {
         unsafe { w_dict_setitem_str(d, "_id", w_int_new(id as i64)) };
     }

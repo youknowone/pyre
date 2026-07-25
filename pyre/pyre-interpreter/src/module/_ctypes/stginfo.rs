@@ -74,7 +74,7 @@ impl StgInfoData {
 }
 
 fn dict_of(info: PyObjectRef) -> PyObjectRef {
-    crate::baseobjspace::getdict(info)
+    crate::baseobjspace::getdict_native(info)
 }
 
 fn set_int(info: PyObjectRef, key: &str, v: i64) {

@@ -122,7 +122,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     };
     let obj = cdata::new_cdata_obj_from_bytes(cls, host_ctypes::pointer_size(), &[])?;
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error(
             "CFuncPtr instance has no instance dict",
@@ -179,7 +179,7 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
 // ── restype / argtypes descriptors ────────────────────────────────────
 
 fn instance_get(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return None;
     }
@@ -187,7 +187,7 @@ fn instance_get(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
 }
 
 fn instance_set(obj: PyObjectRef, key: &str, value: PyObjectRef) {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if !d.is_null() {
         unsafe { pyre_object::w_dict_setitem_str(d, key, value) };
     }
@@ -295,7 +295,7 @@ fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
 /// Wrap a returned pointer value `p` in a fresh instance of pointer type `rt`.
 fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::PyError> {
     let obj = pyre_object::w_instance_new(rt);
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error("pointer instance has no dict"));
     }
@@ -934,7 +934,7 @@ fn make_aggregate_instance(ty: PyObjectRef, bytes: &[u8]) -> Result<PyObjectRef,
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
     }
     let obj = pyre_object::w_instance_new(ty);
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error(
             "aggregate instance has no instance dict",

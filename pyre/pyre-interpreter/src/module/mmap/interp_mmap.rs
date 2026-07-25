@@ -102,7 +102,7 @@ fn mmap_type() -> pyre_object::PyObjectRef {
 
 #[cfg(unix)]
 fn mmap_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return 0;
     }
@@ -116,7 +116,7 @@ fn mmap_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
 
 #[cfg(unix)]
 fn mmap_set_attr(obj: pyre_object::PyObjectRef, key: &str, v: pyre_object::PyObjectRef) {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return;
     }
@@ -190,7 +190,7 @@ pub(crate) fn mmap_buffer_view(
 
 #[cfg(unix)]
 fn mmap_get_attr_obj(obj: pyre_object::PyObjectRef, key: &str) -> pyre_object::PyObjectRef {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return pyre_object::PY_NULL;
     }

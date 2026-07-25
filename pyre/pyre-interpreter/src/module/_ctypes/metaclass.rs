@@ -591,12 +591,13 @@ fn promote_anonymous_fields(
                 cf_usize(child, "byte_size"),
                 cf_usize(child, "index"),
             );
-            let d = crate::baseobjspace::getdict(promoted);
+            let d = crate::baseobjspace::getdict_native(promoted);
             unsafe {
                 for key in ["size", "bit_size", "bit_offset", "is_bitfield"] {
-                    if let Some(value) =
-                        pyre_object::w_dict_getitem_str(crate::baseobjspace::getdict(child), key)
-                    {
+                    if let Some(value) = pyre_object::w_dict_getitem_str(
+                        crate::baseobjspace::getdict_native(child),
+                        key,
+                    ) {
                         pyre_object::w_dict_setitem_str(d, key, value);
                     }
                 }
@@ -900,7 +901,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         let (field_offset, size, align, bitfield) = pending[index];
         mark_type_final(entry.ty, size, align);
         let cf = cfield_new(&entry.name, entry.ty, field_offset, size, index);
-        let d = crate::baseobjspace::getdict(cf);
+        let d = crate::baseobjspace::getdict_native(cf);
         if let Some((bits, bit_offset)) = bitfield {
             unsafe {
                 pyre_object::w_dict_setitem_str(
@@ -1061,7 +1062,7 @@ fn cfield_new(
     index: usize,
 ) -> PyObjectRef {
     let inst = pyre_object::w_instance_new(cfield_type());
-    let d = crate::baseobjspace::getdict(inst);
+    let d = crate::baseobjspace::getdict_native(inst);
     unsafe {
         pyre_object::w_dict_setitem_str(d, "name", pyre_object::w_str_new(name));
         pyre_object::w_dict_setitem_str(d, "proto", proto);
@@ -1085,7 +1086,7 @@ fn cfield_new(
 }
 
 fn cf_obj(cfield: PyObjectRef, key: &str) -> PyObjectRef {
-    unsafe { pyre_object::w_dict_getitem_str(crate::baseobjspace::getdict(cfield), key) }
+    unsafe { pyre_object::w_dict_getitem_str(crate::baseobjspace::getdict_native(cfield), key) }
         .unwrap_or(pyre_object::PY_NULL)
 }
 
@@ -1482,7 +1483,7 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
                 byte_size * 8,
             )));
         }
-        let d = crate::baseobjspace::getdict(field);
+        let d = crate::baseobjspace::getdict_native(field);
         unsafe {
             pyre_object::w_dict_setitem_str(d, "bit_size", pyre_object::w_int_new(bits));
             pyre_object::w_dict_setitem_str(d, "bit_offset", pyre_object::w_int_new(bit_offset));
@@ -1509,7 +1510,7 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
     let size = stginfo::stginfo_size(info);
     stginfo::stginfo_mark_final(info);
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error("ctypes instance has no dict"));
     }
@@ -1755,7 +1756,7 @@ fn array_new(args: &[PyObjectRef]) -> PyResult {
         .ok_or_else(|| crate::PyError::type_error("abstract class"))?;
     let size = stginfo::stginfo_size(info);
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error("ctypes instance has no dict"));
     }
@@ -2183,7 +2184,7 @@ fn pointer_new(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error("ctypes instance has no dict"));
     }

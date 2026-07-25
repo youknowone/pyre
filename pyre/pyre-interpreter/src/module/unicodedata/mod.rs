@@ -327,7 +327,7 @@ crate::py_module! {
         let ucd_ty = crate::typedef::make_builtin_type("UCD", |_| {});
         unsafe { typeobject::w_type_set_hasdict(ucd_ty, true) };
         let ucd = w_instance_new(ucd_ty);
-        let d = crate::baseobjspace::getdict(ucd);
+        let d = crate::baseobjspace::getdict_native(ucd);
         let bind = |name: &'static str, func: crate::gateway::BuiltinCodeFn| {
             let f = crate::gateway::make_module_builtin_function(name, func);
             unsafe { w_dict_setitem_str(d, name, f) };

@@ -12,7 +12,7 @@ use pyre_object::*;
 
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_get_handle(obj: PyObjectRef) -> *mut libc::sem_t {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return core::ptr::null_mut();
     }
@@ -172,7 +172,7 @@ crate::py_module! {
                     // calls sem_close on instance death.
                     core::mem::forget(handle);
                     let obj = w_instance_new(type_object());
-                    let d = crate::baseobjspace::getdict(obj);
+                    let d = crate::baseobjspace::getdict_native(obj);
                     if !d.is_null() {
                         unsafe {
                             w_dict_setitem_str(

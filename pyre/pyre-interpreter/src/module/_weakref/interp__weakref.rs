@@ -47,7 +47,8 @@ fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
-    let w_dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(root_base));
+    let w_dict =
+        crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(root_base));
     if w_dict.is_null() {
         return PY_NULL;
     }
@@ -72,7 +73,8 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
     pyre_object::gc_roots::pin_root(value);
-    let w_dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(root_base));
+    let w_dict =
+        crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(root_base));
     if !w_dict.is_null() {
         pyre_object::gc_roots::pin_root(w_dict);
         unsafe {

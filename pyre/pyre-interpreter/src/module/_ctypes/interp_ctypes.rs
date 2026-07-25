@@ -528,7 +528,7 @@ fn carg_type() -> pyre_object::PyObjectRef {
                 ns,
                 "__repr__",
                 crate::make_builtin_function("__repr__", |args| {
-                    let d = crate::baseobjspace::getdict(args[0]);
+                    let d = crate::baseobjspace::getdict_native(args[0]);
                     let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
                         .unwrap_or_else(pyre_object::w_none);
                     let rendered = unsafe { crate::display::py_repr(value) }?;
@@ -545,7 +545,7 @@ fn carg_type() -> pyre_object::PyObjectRef {
 #[cfg(all(unix, feature = "host_env"))]
 pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     let carg = pyre_object::w_instance_new(carg_type());
-    let d = crate::baseobjspace::getdict(carg);
+    let d = crate::baseobjspace::getdict_native(carg);
     if !d.is_null() {
         unsafe {
             pyre_object::w_dict_setitem_str(d, "_ptr", pyre_object::w_int_new(addr as i64));
@@ -564,7 +564,7 @@ pub(super) fn is_carg(obj: pyre_object::PyObjectRef) -> bool {
 /// The address a `byref()` carrier points at.
 #[cfg(all(unix, feature = "host_env"))]
 pub(super) fn carg_ptr(carg: pyre_object::PyObjectRef) -> usize {
-    let d = crate::baseobjspace::getdict(carg);
+    let d = crate::baseobjspace::getdict_native(carg);
     if d.is_null() {
         return 0;
     }

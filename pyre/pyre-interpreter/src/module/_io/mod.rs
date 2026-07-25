@@ -55,7 +55,7 @@ fn iobase_internal_closed(obj: PyObjectRef) -> bool {
 }
 
 fn iobase_set_internal_closed(obj: PyObjectRef, closed: bool) -> Result<(), crate::PyError> {
-    if crate::baseobjspace::setdictvalue(obj, "__iobase_closed__", w_bool_from(closed)) {
+    if crate::baseobjspace::setdictvalue(obj, "__iobase_closed__", w_bool_from(closed))? {
         Ok(())
     } else {
         Err(crate::PyError::runtime_error(

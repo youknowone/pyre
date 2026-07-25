@@ -1872,7 +1872,7 @@ fn socket_io_err(e: std::io::Error) -> crate::PyError {
 
 #[cfg(unix)]
 fn socket_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return -1;
     }
@@ -1886,7 +1886,7 @@ fn socket_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
 
 #[cfg(unix)]
 fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, v: pyre_object::PyObjectRef) {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return;
     }
@@ -2477,7 +2477,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "timeout",
                 |args| {
-                    let d = crate::baseobjspace::getdict(args[1]);
+                    let d = crate::baseobjspace::getdict_native(args[1]);
                     if d.is_null() {
                         return Ok(pyre_object::w_none());
                     }
@@ -3910,7 +3910,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             "gettimeout",
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let d = crate::baseobjspace::getdict(obj);
+                let d = crate::baseobjspace::getdict_native(obj);
                 if d.is_null() {
                     return Ok(pyre_object::w_none());
                 }

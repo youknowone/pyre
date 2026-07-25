@@ -122,7 +122,7 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 }
 
 fn cdata_objects_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let d = crate::baseobjspace::getdict(args[1]);
+    let d = crate::baseobjspace::getdict_native(args[1]);
     Ok(if d.is_null() {
         pyre_object::w_none()
     } else {
@@ -132,7 +132,7 @@ fn cdata_objects_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 fn cdata_base_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let d = crate::baseobjspace::getdict(args[1]);
+    let d = crate::baseobjspace::getdict_native(args[1]);
     Ok(if d.is_null() {
         pyre_object::w_none()
     } else {
@@ -391,7 +391,7 @@ pub(super) fn new_simplecdata_obj(
             pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
         }
         if matches!(tc, "z" | "Z" | "O") {
-            let d = crate::baseobjspace::getdict(obj);
+            let d = crate::baseobjspace::getdict_native(obj);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, v) };
         }
     }
@@ -405,7 +405,7 @@ pub(super) fn new_cdata_obj_from_bytes(
 ) -> Result<PyObjectRef, crate::PyError> {
     let ba = pyre_object::w_bytearray_new(size);
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error(
             "ctypes instance has no instance dict",
@@ -472,7 +472,7 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     cdata_write(obj, 0, &bytes);
     if matches!(tc.as_str(), "z" | "Z" | "O") {
-        let d = crate::baseobjspace::getdict(obj);
+        let d = crate::baseobjspace::getdict_native(obj);
         unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, value) };
     }
     Ok(pyre_object::w_none())
@@ -482,7 +482,7 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// Read a `usize`-valued reserved key off the instance dict.
 fn dict_usize(obj: PyObjectRef, key: &str) -> Option<usize> {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return None;
     }
@@ -511,7 +511,7 @@ fn baddr(obj: PyObjectRef) -> Option<usize> {
 
 /// The backing `bytearray` stored under `"_b_"` (the root's, for a sub-view).
 pub(super) fn cdata_buffer(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return None;
     }
@@ -703,7 +703,7 @@ fn struct_pep3118_format(cls: PyObjectRef) -> String {
         let Some(descr) = (unsafe { crate::baseobjspace::lookup_in_type(cls, name) }) else {
             continue;
         };
-        let dd = crate::baseobjspace::getdict(descr);
+        let dd = crate::baseobjspace::getdict_native(descr);
         let integer = |key: &str| {
             unsafe { pyre_object::w_dict_getitem_str(dd, key) }
                 .filter(|value| unsafe { pyre_object::is_int(*value) })
@@ -779,7 +779,7 @@ pub(super) fn cdata_write(obj: PyObjectRef, off: usize, bytes: &[u8]) {
 /// Whether `obj` owns its buffer (a root object, not a sub-view or external
 /// view) — the precondition for `resize`.
 pub(super) fn owns_buffer(obj: PyObjectRef) -> bool {
-    let d = crate::baseobjspace::getdict(obj);
+    let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return false;
     }
@@ -803,7 +803,7 @@ pub(super) fn make_subview(
     size: usize,
 ) -> PyObjectRef {
     let inst = pyre_object::w_instance_new(proto);
-    let d = crate::baseobjspace::getdict(inst);
+    let d = crate::baseobjspace::getdict_native(inst);
     if d.is_null() {
         return inst;
     }
@@ -836,7 +836,7 @@ pub(super) fn make_indexed_subview(
     index: usize,
 ) -> PyObjectRef {
     let view = make_subview(proto, parent, field_offset, size);
-    let d = crate::baseobjspace::getdict(view);
+    let d = crate::baseobjspace::getdict_native(view);
     if !d.is_null() {
         unsafe {
             pyre_object::w_dict_setitem_str(d, BINDEX_KEY, pyre_object::w_int_new(index as i64));
@@ -856,7 +856,7 @@ pub(super) fn make_at_address(
     base: PyObjectRef,
 ) -> PyObjectRef {
     let inst = pyre_object::w_instance_new(proto);
-    let d = crate::baseobjspace::getdict(inst);
+    let d = crate::baseobjspace::getdict_native(inst);
     if !d.is_null() {
         unsafe {
             pyre_object::w_dict_setitem_str(d, BADDR_KEY, pyre_object::w_int_new(address as i64));
@@ -882,7 +882,7 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     let mut composite_key = key.to_string();
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-        let d = crate::baseobjspace::getdict(root);
+        let d = crate::baseobjspace::getdict_native(root);
         if d.is_null() {
             return;
         }
@@ -902,7 +902,7 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
         }
     }
     root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-    let mut d = crate::baseobjspace::getdict(root);
+    let mut d = crate::baseobjspace::getdict_native(root);
     let objs = match unsafe { pyre_object::w_dict_getitem_str(d, OBJECTS_KEY) } {
         Some(o) if !o.is_null() && unsafe { pyre_object::is_dict(o) } => o,
         Some(previous) if !previous.is_null() && !unsafe { pyre_object::is_none(previous) } => {
@@ -911,14 +911,14 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
             }
             let nd = pyre_object::w_dict_new();
             root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-            d = crate::baseobjspace::getdict(root);
+            d = crate::baseobjspace::getdict_native(root);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, nd) };
             nd
         }
         _ => {
             let nd = pyre_object::w_dict_new();
             root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-            d = crate::baseobjspace::getdict(root);
+            d = crate::baseobjspace::getdict_native(root);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, nd) };
             nd
         }
@@ -947,7 +947,7 @@ pub(super) fn objects_for_keep(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(value);
     let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut d = crate::baseobjspace::getdict(value);
+    let mut d = crate::baseobjspace::getdict_native(value);
     if d.is_null() {
         return value;
     }
@@ -956,7 +956,7 @@ pub(super) fn objects_for_keep(value: PyObjectRef) -> PyObjectRef {
         _ => {
             let objects = pyre_object::w_dict_new();
             let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            d = crate::baseobjspace::getdict(value);
+            d = crate::baseobjspace::getdict_native(value);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, objects) };
             objects
         }
@@ -977,7 +977,7 @@ fn keep_alive(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-        let d = crate::baseobjspace::getdict(root);
+        let d = crate::baseobjspace::getdict_native(root);
         if d.is_null() {
             return;
         }
@@ -992,7 +992,7 @@ fn keep_alive(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     }
     root = pyre_object::gc_roots::shadow_stack_get(root_slot);
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let d = crate::baseobjspace::getdict(root);
+    let d = crate::baseobjspace::getdict_native(root);
     if !d.is_null() {
         unsafe { pyre_object::w_dict_setitem_str(d, &format!("_keep_{key}"), obj) };
     }
@@ -1015,7 +1015,7 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
     let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-        let d = crate::baseobjspace::getdict(root);
+        let d = crate::baseobjspace::getdict_native(root);
         if d.is_null() {
             return;
         }
@@ -1029,7 +1029,7 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
         }
     }
     root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-    let mut source_dict = crate::baseobjspace::getdict(root);
+    let mut source_dict = crate::baseobjspace::getdict_native(root);
     if source_dict.is_null() {
         return;
     }
@@ -1040,7 +1040,7 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
             && !unsafe { pyre_object::is_dict(objects) }
     }) {
         let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
-        let result_dict = crate::baseobjspace::getdict(result);
+        let result_dict = crate::baseobjspace::getdict_native(result);
         if !result_dict.is_null() {
             unsafe { pyre_object::w_dict_setitem_str(result_dict, OBJECTS_KEY, objects) };
         }
@@ -1051,7 +1051,7 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
         _ => {
             let objects = pyre_object::w_dict_new();
             root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-            source_dict = crate::baseobjspace::getdict(root);
+            source_dict = crate::baseobjspace::getdict_native(root);
             unsafe { pyre_object::w_dict_setitem_str(source_dict, OBJECTS_KEY, objects) };
             objects
         }
@@ -1068,7 +1068,7 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
     unsafe { pyre_object::w_dict_store(objects, identity_key, source) };
     let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
     let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
-    let result_dict = crate::baseobjspace::getdict(result);
+    let result_dict = crate::baseobjspace::getdict_native(result);
     if !result_dict.is_null() {
         unsafe { pyre_object::w_dict_setitem_str(result_dict, OBJECTS_KEY, objects) };
     }

@@ -11573,7 +11573,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 let found = if unsafe { pyre_object::is_instance(obj) } {
                     unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) }
                 } else {
-                    crate::baseobjspace::native_slot_get(obj, slot_name, index)
+                    crate::baseobjspace::native_slot_get(obj, slot_name, index)?
                 };
                 match found {
                     Some(v) => Ok(v),
@@ -11626,7 +11626,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
                 } else {
                     let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
-                    if !crate::baseobjspace::native_slot_set(obj, slot_name, index, value) {
+                    if !crate::baseobjspace::native_slot_set(obj, slot_name, index, value)? {
                         return Err(crate::PyError::new(
                             crate::PyErrorKind::AttributeError,
                             format!(
@@ -11677,7 +11677,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 let removed = if unsafe { pyre_object::is_instance(obj) } {
                     unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) }
                 } else {
-                    crate::baseobjspace::native_slot_del(obj, slot_name, index)
+                    crate::baseobjspace::native_slot_del(obj, slot_name, index)?
                 };
                 if !removed {
                     return Err(crate::PyError::new(
@@ -23406,7 +23406,7 @@ fn descr_get_dict(
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
-    let w_dict = crate::baseobjspace::getdict(w_obj);
+    let w_dict = crate::baseobjspace::getdict(w_obj)?;
     if w_dict.is_null() {
         let tp_name = unsafe { pyre_object::type_name_of(w_obj) };
         return Err(crate::PyError::type_error(format!(

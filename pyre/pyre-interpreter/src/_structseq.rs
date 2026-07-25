@@ -112,7 +112,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     };
     match resolved {
         Resolved::Extra => {
-            let w_dict = crate::baseobjspace::getdict(inst);
+            let w_dict = crate::baseobjspace::getdict_native(inst);
             if !w_dict.is_null() {
                 if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, &name) } {
                     return Ok(v);
@@ -182,7 +182,7 @@ fn structseq_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let body_tuple = pyre_object::w_tuple_new(items);
     // `self.__dict__` carries the named-only extras for reconstruction.
-    let w_dict = crate::baseobjspace::getdict(inst);
+    let w_dict = crate::baseobjspace::getdict_native(inst);
     let dict = if w_dict.is_null() {
         pyre_object::w_dict_new()
     } else {

@@ -829,7 +829,7 @@ impl W_TextIOWrapper {
             encoding_start_of_stream: false,
             ..Self::default()
         });
-        crate::baseobjspace::setdictvalue(obj, "name", w_str_new(name));
+        crate::baseobjspace::setdictvalue_native(obj, "name", w_str_new(name));
         obj
     }
 }

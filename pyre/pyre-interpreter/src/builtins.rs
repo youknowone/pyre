@@ -3237,6 +3237,22 @@ pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
         .count()
 }
 
+/// The real keyword `(name, value)` pairs in the kwargs dict from
+/// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
+/// marker.  A builtin that has to re-issue its own call as a keyword call
+/// (`_thread._local` replays the constructor per thread, `os_local.py:57`)
+/// hands these to `call::call_with_kwargs`.
+pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf, PyObjectRef)> {
+    let Some(dict) = kwargs else {
+        return Vec::new();
+    };
+    let marker = Wtf8Buf::from_string("__pyre_kw__".to_string());
+    unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+        .into_iter()
+        .filter(|(key, _)| *key != marker)
+        .collect()
+}
+
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
@@ -8397,7 +8413,7 @@ unsafe fn classdir_recurse(
 pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let mut names: Vec<Wtf8Buf> = Vec::new();
     unsafe {
-        let w_dict = crate::baseobjspace::getdict(obj);
+        let w_dict = crate::baseobjspace::getdict(obj)?;
         if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
             for (key, _) in pyre_object::w_dict_items(w_dict) {
                 if pyre_object::is_str(key) {
@@ -10371,9 +10387,9 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // descriptors.  Our generic instance layout stores the corresponding
     // fields under private mapdict names so descriptor writes cannot be
     // shadowed by user attributes.
-    if !crate::baseobjspace::setdictvalue(self_obj, "__file_public_mode__", w_str_new(binary_mode))
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))
+    if !crate::baseobjspace::setdictvalue(self_obj, "__file_public_mode__", w_str_new(binary_mode))?
+        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))?
+        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))?
     {
         return Err(crate::PyError::runtime_error(
             "FileIO instance has no state dictionary",
@@ -10386,7 +10402,8 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .and_then(|fd| crate::host_seam::ops::fstat(fd).ok())
         .map(|st| if st.blksize > 1 { st.blksize } else { 8192 })
         .unwrap_or(8192);
-    if !crate::baseobjspace::setdictvalue(self_obj, "__file_blksize__", w_int_new(blksize as i64)) {
+    if !crate::baseobjspace::setdictvalue(self_obj, "__file_blksize__", w_int_new(blksize as i64))?
+    {
         return Err(crate::PyError::runtime_error(
             "FileIO instance has no state dictionary",
         ));
@@ -10423,7 +10440,7 @@ fn file_is_closed(self_obj: PyObjectRef) -> bool {
 
 fn file_set_closed(self_obj: PyObjectRef, closed: bool) -> Result<(), crate::PyError> {
     if crate::baseobjspace::getattr_str(self_obj, "__file_closed__").is_ok() {
-        if crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(closed)) {
+        if crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(closed))? {
             return Ok(());
         }
     }
@@ -10782,7 +10799,7 @@ fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
     // `__setattr__`, `__file_pos__` is not a descriptor), so the write is
     // the infallible instance-dict store `W_Root.setdictvalue`
     // (baseobjspace.py) that `setattr_str` would itself reach.
-    crate::baseobjspace::setdictvalue(self_obj, "__file_pos__", w_int_new(pos as i64));
+    crate::baseobjspace::setdictvalue_native(self_obj, "__file_pos__", w_int_new(pos as i64));
 }
 
 /// The raw file descriptor for an fd-backed file object (`open(fd, ...)`),
