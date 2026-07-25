@@ -132,7 +132,10 @@ crate::py_module! {
         }
     },
     functions: {
-        "stack_effect"             / 3 = stack_effect,
+        // `stack_effect(opcode, oparg=None, *, jump=None)` — the optional
+        // tail and the keyword-only `jump` leave no single natural arity, so
+        // the body enforces the count itself.
+        "stack_effect"             / * = stack_effect,
         "get_executor"             / 0 = |_| Ok(w_none()),
         "get_specialization_stats" / 0 = |_| Ok(w_none()),
         "get_intrinsic1_descs"     / 0 = get_intrinsic1_descs,

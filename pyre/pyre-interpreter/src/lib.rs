@@ -292,7 +292,7 @@ macro_rules! py_module {
                         $crate::make_module_builtin_function_with_arity_and_maybe_sig(
                             stringify!($ifn_name),
                             $ifn_name,
-                            $crate::pyre_typed_args_arity!($($ifn_args)*),
+                            ::paste::paste! { [<$ifn_name _pyre_arity>]() },
                             ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
                     );
@@ -318,50 +318,6 @@ macro_rules! py_module {
             )?
         }
     };
-}
-
-/// Count typed `name: ty` arguments in a `fn` parameter list.  Used by
-/// `py_module!`'s `inline_functions:` arm to derive arity from the
-/// signature.  Treats `&[PyObjectRef]` varargs as zero (caller should
-/// route those through path-ref `functions:` form instead).  Each
-/// parameter may carry leading attributes (`#[default(...)]`,
-/// `#[kwonly]`, `#[kwargs]`) — they are consumed and ignored here; the
-/// `#[pyre_function]` expansion strips them from the emitted fn.
-#[macro_export]
-macro_rules! pyre_count_typed_args {
-    () => { 0usize };
-    ( $(#[$m:meta])* $a:ident : $t:ty ) => { 1usize };
-    ( $(#[$m:meta])* $a:ident : $t:ty, $($rest:tt)* ) => {
-        1usize + $crate::pyre_count_typed_args!($($rest)*)
-    };
-}
-
-/// Count the leading parameters that a caller must supply — the prefix
-/// before the first `#[default(...)]`.  A `#[default(...)]` arm is listed
-/// ahead of the catch-all so it wins over the `#[$m:meta]` repetition.
-#[macro_export]
-macro_rules! pyre_count_required_typed_args {
-    () => { 0usize };
-    ( #[default($($d:tt)*)] $($rest:tt)* ) => { 0usize };
-    ( $(#[$m:meta])* $a:ident : $t:ty ) => { 1usize };
-    ( $(#[$m:meta])* $a:ident : $t:ty, $($rest:tt)* ) => {
-        1usize + $crate::pyre_count_required_typed_args!($($rest)*)
-    };
-}
-
-/// The `fast_natural_arity` a typed parameter list declares.  A parameter
-/// with a `#[default(...)]` makes the call variadic, so the whole list is
-/// `HOPELESS` rather than a fixed count the call machinery may enforce.
-#[macro_export]
-macro_rules! pyre_typed_args_arity {
-    ( $($args:tt)* ) => {{
-        let total = $crate::pyre_count_typed_args!($($args)*);
-        if total == $crate::pyre_count_required_typed_args!($($args)*) {
-            total as u16
-        } else {
-            $crate::HOPELESS
-        }
-    }};
 }
 
 /// PyPy `class W_X(W_Root) + TypeDef(...)` equivalent — emits a thread-
@@ -572,13 +528,40 @@ macro_rules! py_class_typed {
 /// every mixed-module function to `BuiltinFunction`, whose typedef omits
 /// `__get__`), so storing one on a user class must not synthesize a bound
 /// method — identical to the `module_functions:` arm.
+///
+/// A declared arity is also enforced: the body behind it indexes exactly that
+/// many slots, so `check_declared_arity` runs first and a call that does not
+/// fit raises `TypeError` instead of reading past the end of `args`.  A body
+/// that accepts a range of counts declares `*` and checks itself.
 #[macro_export]
 macro_rules! py_module_fn {
     ($key:literal, *, $path:expr) => {
         $crate::make_module_builtin_function($key, $path)
     };
     ($key:literal, $arity:literal, $path:expr) => {
-        $crate::make_module_builtin_function_with_arity($key, $path, $arity)
+        $crate::make_module_builtin_function_with_arity(
+            $key,
+            $crate::py_checked_arity_fn!($key, $arity, $path),
+            $arity,
+        )
+    };
+}
+
+/// Wrap a declared-arity builtin body in its positional-count check.  The
+/// wrapper captures nothing, so it still coerces to a `BuiltinCodeFn` pointer.
+#[macro_export]
+macro_rules! py_checked_arity_fn {
+    ($key:literal, $arity:literal, $path:expr) => {
+        |args: &[::pyre_object::PyObjectRef]| -> ::std::result::Result<
+                            ::pyre_object::PyObjectRef,
+                            $crate::PyError,
+                        > {
+                            $crate::gateway::check_declared_arity($key, $arity, args.len())?;
+                            // The annotation is what gives a bare `|args| ...` body its
+                            // parameter type; the coercion to a pointer is a no-op.
+                            let __pyre_body: $crate::BuiltinCodeFn = $path;
+                            __pyre_body(args)
+                        }
     };
 }
 
@@ -591,7 +574,11 @@ macro_rules! py_module_module_fn {
         $crate::make_module_builtin_function($key, $path)
     };
     ($key:literal, $arity:literal, $path:expr) => {
-        $crate::make_module_builtin_function_with_arity($key, $path, $arity)
+        $crate::make_module_builtin_function_with_arity(
+            $key,
+            $crate::py_checked_arity_fn!($key, $arity, $path),
+            $arity,
+        )
     };
 }
 

@@ -292,6 +292,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "combinations",
             |args| {
+                crate::gateway::check_declared_arity("combinations", 2, args.len())?;
                 let r = crate::builtins::space_index_w(args[1])?;
                 if r < 0 {
                     return Err(crate::PyError::value_error("r must be non-negative"));

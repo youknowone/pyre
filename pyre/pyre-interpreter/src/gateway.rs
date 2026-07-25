@@ -1002,6 +1002,23 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `gateway.py:824 BuiltinCode.funcrun` reaches the unwrapped body through
+/// `Arguments.parse_obj`, which rejects a call whose positional count does not
+/// fit the signature.  A builtin registered with a declared count carries no
+/// `Signature` to parse against and its body indexes those slots directly, so
+/// the count is checked before the body runs.
+pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<(), crate::PyError> {
+    if given == arity {
+        return Ok(());
+    }
+    let message = match arity {
+        0 => format!("{name}() takes no arguments ({given} given)"),
+        1 => format!("{name}() takes exactly one argument ({given} given)"),
+        n => format!("{name} expected {n} arguments, got {given}"),
+    };
+    Err(crate::PyError::type_error(message))
+}
+
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
 pub fn make_builtin_function_with_arity(
     name: &'static str,

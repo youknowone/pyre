@@ -131,6 +131,29 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // `Arguments.parse_obj` rejects a positional count that does not fit the
+    // signature before `BuiltinCode.funcrun` enters the unwrapped body.  The
+    // unwrap statements below index their slots directly, so the count is
+    // checked here — a missing required slot would otherwise read past the
+    // end of `args`.  A raw whole-args slice takes any count.
+    let count_preamble = if has_varargs {
+        quote! {}
+    } else {
+        let total = param_required.len();
+        let required = param_required.iter().filter(|&&required| required).count();
+        let fn_name = user_name.to_string();
+        let too_few = arity_message(&fn_name, required, total, false);
+        let too_many = arity_message(&fn_name, required, total, true);
+        quote! {
+            if args.len() < #required {
+                return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
+            }
+            if args.len() > #total {
+                return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
+            }
+        }
+    };
+
     let call_inner = quote! { #inner_name( #(#call_args),* ) };
     let body = wrap_return(&user_sig.output, call_inner)?;
 
@@ -159,6 +182,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             args: &[::pyre_object::PyObjectRef],
         ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
             #kwargs_preamble
+            #count_preamble
             #(#unwrap_stmts)*
             #body
         }
@@ -224,10 +248,31 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // Companion `<name>_pyre_arity()` — the `fast_natural_arity` this
+    // builtin may declare.  `BuiltinCode.fast_natural_arity` names the one
+    // argument count at which the body may be entered with its slots filled
+    // directly, so it exists only when every parameter is required: an
+    // optional parameter (`#[default(...)]` or `Option<T>`) and a raw
+    // whole-args slice both admit more than one count, and get `HOPELESS`.
+    let arity_fn_name = format_ident!("{}_pyre_arity", user_name);
+    let natural_arity = if has_varargs || param_required.iter().any(|required| !required) {
+        quote! { crate::HOPELESS }
+    } else {
+        let n = param_required.len() as u16;
+        quote! { #n }
+    };
+    let arity_fn = quote! {
+        #[allow(dead_code)]
+        #vis fn #arity_fn_name() -> u16 {
+            #natural_arity
+        }
+    };
+
     Ok(quote! {
         #inner_fn
         #wrapper
         #sig_fn
+        #arity_fn
     })
 }
 
@@ -674,6 +719,41 @@ fn param_name(idx: usize, pt: &PatType) -> String {
     match &*pt.pat {
         Pat::Ident(pi) => python_keyword_name(&pi.ident.to_string()),
         _ => format!("__pyre_positional_{idx}"),
+    }
+}
+
+/// The `TypeError` text for a positional count that does not fit a builtin
+/// taking `required`..`total` arguments, as a `format!` over `args.len()`.
+///
+/// A signature with no optional slot names one exact count; one with an
+/// optional tail names the bound the call missed, so `too_many` picks
+/// between them.
+fn arity_message(
+    name: &str,
+    required: usize,
+    total: usize,
+    too_many: bool,
+) -> proc_macro2::TokenStream {
+    if required != total {
+        let bound = if too_many { total } else { required };
+        let plural = if bound == 1 { "" } else { "s" };
+        let at = if too_many { "at most" } else { "at least" };
+        let text = format!("{name} expected {at} {bound} argument{plural}, got {{}}");
+        return quote! { format!(#text, args.len()) };
+    }
+    match total {
+        0 => {
+            let text = format!("{name}() takes no arguments ({{}} given)");
+            quote! { format!(#text, args.len()) }
+        }
+        1 => {
+            let text = format!("{name}() takes exactly one argument ({{}} given)");
+            quote! { format!(#text, args.len()) }
+        }
+        n => {
+            let text = format!("{name} expected {n} arguments, got {{}}");
+            quote! { format!(#text, args.len()) }
+        }
     }
 }
 
@@ -1793,7 +1873,30 @@ fn expand_pyre_methods(
                         if visible_max == 1 { "" } else { "s" }
                     )
                 };
+                // A missing required slot is rejected the same way: the
+                // unwrap statements below index their slots directly, so the
+                // body would otherwise read past the end of `args`.
+                let expected_min = receiver_slots + visible_required;
+                let too_few = if visible_required == visible_max {
+                    quote! {
+                        format!(
+                            "{}() takes {} ({} given)",
+                            #fn_name, #expected,
+                            args.len().saturating_sub(#receiver_slots),
+                        )
+                    }
+                } else {
+                    let text = format!(
+                        "{} expected at least {visible_required} argument{}, got {{}}",
+                        fn_name,
+                        if visible_required == 1 { "" } else { "s" },
+                    );
+                    quote! { format!(#text, args.len().saturating_sub(#receiver_slots)) }
+                };
                 quote! {
+                    if args.len() < #expected_min {
+                        return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
+                    }
                     if args.len() > #expected_total {
                         return ::std::result::Result::Err(crate::PyError::type_error(format!(
                             "{}() takes {} ({} given)",

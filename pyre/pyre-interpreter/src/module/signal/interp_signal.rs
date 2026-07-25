@@ -455,7 +455,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "signal",
-        crate::make_builtin_function_with_arity("signal", |args| signal_signal(args[0], args[1]), 2),
+        crate::make_builtin_function_with_arity(
+            "signal",
+            |args| {
+                crate::gateway::check_declared_arity("signal", 2, args.len())?;
+                signal_signal(args[0], args[1])
+            },
+            2,
+        ),
     );
     // interp_signal.py:238-251 `getsignal(signum) -> action`.
     crate::module_ns_store(

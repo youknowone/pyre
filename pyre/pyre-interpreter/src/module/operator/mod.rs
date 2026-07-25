@@ -3,30 +3,16 @@
 use pyre_object::*;
 
 fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "index() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
     let indexed = crate::baseobjspace::space_index(args[0])?;
     unsafe { Ok(range_bigint_to_obj(range_obj_to_bigint(indexed))) }
 }
 
-/// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`): a
-/// wrong argument count is a `TypeError`, not a panic
-/// (`interp_operator.py` `@unwrap_spec` argument checking).  The operand
-/// error propagates, matching the `truediv`/`floordiv` thunks.
-fn op_binary<F>(args: &[PyObjectRef], name: &str, f: F) -> Result<PyObjectRef, crate::PyError>
+/// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`).  The
+/// operand error propagates, matching the `truediv`/`floordiv` thunks.
+fn op_binary<F>(args: &[PyObjectRef], f: F) -> Result<PyObjectRef, crate::PyError>
 where
     F: Fn(PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>,
 {
-    if args.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "{name} expected 2 arguments, got {}",
-            args.len()
-        )));
-    }
     f(args[0], args[1])
 }
 
@@ -163,10 +149,10 @@ crate::py_module! {
     },
     functions: {
         "index"    / 1 = op_index,
-        "add"      / 2 = |args| op_binary(args, "add", add),
-        "sub"      / 2 = |args| op_binary(args, "sub", sub),
-        "mul"      / 2 = |args| op_binary(args, "mul", mul),
-        "matmul"   / 2 = |args| op_binary(args, "matmul", matmul),
+        "add"      / 2 = |args| op_binary(args, add),
+        "sub"      / 2 = |args| op_binary(args, sub),
+        "mul"      / 2 = |args| op_binary(args, mul),
+        "matmul"   / 2 = |args| op_binary(args, matmul),
         "truediv"  / 2 = |args| truediv(args[0], args[1]),
         "floordiv" / 2 = |args| floordiv(args[0], args[1]),
         "mod"      / 2 = |args| mod_(args[0], args[1]),
@@ -181,19 +167,19 @@ crate::py_module! {
         "or_"      / 2 = |args| or_(args[0], args[1]),
         "xor"      / 2 = |args| xor(args[0], args[1]),
         // interp_operator.py:150-210 — in-place operations, each `space.inplace_X`.
-        "iadd"      / 2 = |args| op_binary(args, "iadd", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAdd)),
-        "isub"      / 2 = |args| op_binary(args, "isub", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceSubtract)),
-        "imul"      / 2 = |args| op_binary(args, "imul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMultiply)),
-        "imatmul"   / 2 = |args| op_binary(args, "imatmul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
-        "ifloordiv" / 2 = |args| op_binary(args, "ifloordiv", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceFloorDivide)),
-        "imod"      / 2 = |args| op_binary(args, "imod", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRemainder)),
-        "itruediv"  / 2 = |args| op_binary(args, "itruediv", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceTrueDivide)),
-        "ipow"      / 2 = |args| op_binary(args, "ipow", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplacePower)),
-        "ilshift"   / 2 = |args| op_binary(args, "ilshift", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceLshift)),
-        "irshift"   / 2 = |args| op_binary(args, "irshift", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRshift)),
-        "iand"      / 2 = |args| op_binary(args, "iand", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAnd)),
-        "ior"       / 2 = |args| op_binary(args, "ior", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceOr)),
-        "ixor"      / 2 = |args| op_binary(args, "ixor", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceXor)),
+        "iadd"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAdd)),
+        "isub"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceSubtract)),
+        "imul"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMultiply)),
+        "imatmul"   / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
+        "ifloordiv" / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceFloorDivide)),
+        "imod"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRemainder)),
+        "itruediv"  / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceTrueDivide)),
+        "ipow"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplacePower)),
+        "ilshift"   / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceLshift)),
+        "irshift"   / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRshift)),
+        "iand"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAnd)),
+        "ior"       / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceOr)),
+        "ixor"      / 2 = |args| op_binary(args, |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceXor)),
         "concat"    / 2 = op_concat,
         "iconcat"   / 2 = op_iconcat,
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
@@ -206,12 +192,12 @@ crate::py_module! {
         "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
         "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },
         // Underscore aliases (__add__ / __sub__ / __mul__ via operator).
-        "__add__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__add__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(add(args[0], args[1]).unwrap_or(w_none())) },
-        "__sub__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__sub__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
-        "__mul__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__mul__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
-        "eq" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("eq() takes exactly 2 arguments ({} given)", args.len()))); } baseobjspace::compare(args[0], args[1], CompareOp::Eq) },
-        "lt" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("lt() takes exactly 2 arguments ({} given)", args.len()))); } baseobjspace::compare(args[0], args[1], CompareOp::Lt) },
-        "gt" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("gt() takes exactly 2 arguments ({} given)", args.len()))); } baseobjspace::compare(args[0], args[1], CompareOp::Gt) },
+        "__add__"  / 2 = |args| Ok(add(args[0], args[1]).unwrap_or(w_none())),
+        "__sub__"  / 2 = |args| Ok(sub(args[0], args[1]).unwrap_or(w_none())),
+        "__mul__"  / 2 = |args| Ok(mul(args[0], args[1]).unwrap_or(w_none())),
+        "eq" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Eq),
+        "lt" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Lt),
+        "gt" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Gt),
         "le" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Le),
         "ge" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ge),
         "ne" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ne),
