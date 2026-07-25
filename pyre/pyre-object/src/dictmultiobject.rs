@@ -999,10 +999,7 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
 /// function. It is used when an immortal/prebuilt owner must descend through
 /// an already-old dict during a minor collection; merely visiting the dict
 /// object itself does not rescan that old object's storage.
-pub unsafe fn w_dict_walk_gc_refs(
-    obj: PyObjectRef,
-    visitor: &mut dyn FnMut(&mut PyObjectRef),
-) {
+pub unsafe fn w_dict_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     if obj.is_null() {
         return;
     }
@@ -1236,11 +1233,7 @@ impl ForkDictLock {
     }
 
     unsafe fn reinit_after_fork(&self) {
-        unsafe {
-            self.0
-                .get()
-                .write(parking_lot::ReentrantMutex::new(()))
-        };
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
     }
 }
 

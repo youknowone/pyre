@@ -9,8 +9,8 @@
 //! `_mapdict_setweakref`, etc.
 
 use crate::PyError;
-use pyre_object::PyObjectRef;
 use parking_lot::ReentrantMutex;
+use pyre_object::PyObjectRef;
 
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -3642,10 +3642,7 @@ pub fn delweakref(self_ref: PyObjectRef) {
     if unsafe { pyre_object::is_instance(self_ref) } {
         unsafe { instance_del_weakref_slot(self_ref) };
     } else {
-        WEAKREF_TABLE
-            .lock()
-            .unwrap()
-            .remove(&(self_ref as usize));
+        WEAKREF_TABLE.lock().unwrap().remove(&(self_ref as usize));
     }
 }
 

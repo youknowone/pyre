@@ -361,10 +361,7 @@ impl ExecutionContext {
     /// walker.  PyPy reaches both through the process-owned object space;
     /// pyre stores movable GC refs directly on the EC and must forward those
     /// fields in place.
-    pub(crate) fn walk_builtin_roots(
-        &mut self,
-        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-    ) {
+    pub(crate) fn walk_builtin_roots(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         visitor(unsafe {
             &mut *(&mut self.builtins_module as *mut PyObjectRef as *mut majit_ir::GcRef)
         });
@@ -617,8 +614,7 @@ impl ExecutionContext {
             let w_async_exception_type =
                 crate::module::thread::take_async_exception(self as *mut ExecutionContext);
             if !w_async_exception_type.is_null() {
-                let w_exc =
-                    crate::builtins::exc_exception_new(&[w_async_exception_type])?;
+                let w_exc = crate::builtins::exc_exception_new(&[w_async_exception_type])?;
                 return Err(unsafe { crate::PyError::from_exc_object(w_exc) });
             }
         }

@@ -485,10 +485,9 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                 // object's trace function does.
                 let dict_slot = &mut t.dict as *mut *mut u8 as *mut PyObjectRef;
                 forward(&mut *dict_slot);
-                pyre_object::dictmultiobject::w_dict_walk_gc_refs(
-                    *dict_slot,
-                    &mut |slot| forward(slot),
-                );
+                pyre_object::dictmultiobject::w_dict_walk_gc_refs(*dict_slot, &mut |slot| {
+                    forward(slot)
+                });
                 // `weak_subclasses` holds `w_weakref_new` (`try_gc_alloc`)
                 // young WEAKREF GcStructs whose only strong root is this
                 // off-GC list; forward each slot in place so the WEAKREF
@@ -662,8 +661,7 @@ pub unsafe fn walk_pyframe_roots_area(
             // copy alone is not authoritative for later EC reads).
             let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
             visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
-            let async_exc_slot =
-                unsafe { &mut (*ec).w_async_exception_type as *mut PyObjectRef };
+            let async_exc_slot = unsafe { &mut (*ec).w_async_exception_type as *mut PyObjectRef };
             visitor(unsafe { &mut *(async_exc_slot as *mut majit_ir::GcRef) });
             // Exceptions may use the off-GC malloc_typed fallback.  In that
             // case forwarding the carrier above is a no-op, so trace its raw

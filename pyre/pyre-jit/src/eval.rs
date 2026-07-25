@@ -6336,9 +6336,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             // CheckSignalAction.perform; testing only `needs_trace` here used
             // to bypass the interpreter semantic path and immediately re-enter
             // the compiled loop with the exception still pending.
-            let async_pending = majit_ir::eval_breaker_word::load()
-                & majit_ir::eval_breaker_word::EB_ASYNC
-                != 0;
+            let async_pending =
+                majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0;
             if needs_trace || async_pending {
                 if let Err(mut err) = unsafe {
                     (*ec_ptr)

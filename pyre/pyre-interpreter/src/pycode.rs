@@ -193,10 +193,9 @@ pub struct PyCode {
     /// Owned via `Box::into_raw`; allocated once at construction sized
     /// to `code.names.len()`, never resized.  `null` when `code_ptr`
     /// is null or unaligned (test fixtures, gateway builtins).
-    pub globals_caches:
-        *mut std::sync::Mutex<
-            Vec<Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>>,
-        >,
+    pub globals_caches: *mut std::sync::Mutex<
+        Vec<Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>>,
+    >,
     /// `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     /// len(co_names_w)`.
     ///

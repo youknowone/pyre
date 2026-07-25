@@ -575,12 +575,7 @@ unsafe fn walk_one_global_cache(
 pub struct ModuleDictStrategy {
     pub version: VersionTag,
     pub caches: std::sync::Mutex<
-        Option<
-            std::collections::HashMap<
-                String,
-                std::sync::Arc<std::sync::Mutex<GlobalCache>>,
-            >,
-        >,
+        Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<GlobalCache>>>>,
     >,
     /// JIT loop-invalidation flags watching the `version?` quasi-immutable
     /// field.  Each compiled loop whose trace promoted `self.version`

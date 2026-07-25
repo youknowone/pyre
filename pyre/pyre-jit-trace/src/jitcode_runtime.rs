@@ -244,7 +244,7 @@ pub(crate) fn named_jitcode(name: &str) -> Option<Arc<JitCode>> {
 /// build-time pipeline. See `LIST_APPEND_JITCODE_INDEX`.
 pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
     let idx = LIST_APPEND_JITCODE_INDEX
-        .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_append")))?;
+        .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_append_inner")))?;
     get_jitcode_by_index(idx)
 }
 
@@ -1117,11 +1117,11 @@ mod tests {
         // assembled, carrying the array-op sequence the `list.int_*`
         // oopspecs lower to.  (The shipping arm folds walker-native instead.)
         let jc = list_append_jitcode()
-            .expect("build-time pipeline must contain the charon `w_list_append` jitcode");
-        assert_eq!(jc.name, "w_list_append");
+            .expect("build-time pipeline must contain the charon `w_list_append_inner` jitcode");
+        assert_eq!(jc.name, "w_list_append_inner");
         assert!(
             !jc.code.is_empty(),
-            "w_list_append jitcode should have non-empty bytecode (assembled body)"
+            "w_list_append_inner jitcode should have non-empty bytecode (assembled body)"
         );
     }
 

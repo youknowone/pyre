@@ -7573,9 +7573,9 @@ const METHOD_CACHE_SIZE: usize = 1 << METHOD_CACHE_SIZE_EXP;
 static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
     std::sync::LazyLock::new(|| {
         parking_lot::Mutex::new(MethodCache {
-        versions: vec![0u64; METHOD_CACHE_SIZE],
-        names: vec![None; METHOD_CACHE_SIZE],
-        lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
+            versions: vec![0u64; METHOD_CACHE_SIZE],
+            names: vec![None; METHOD_CACHE_SIZE],
+            lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
         })
     });
 

@@ -37,11 +37,7 @@ impl ForkListLock {
     }
 
     unsafe fn reinit_after_fork(&self) {
-        unsafe {
-            self.0
-                .get()
-                .write(parking_lot::ReentrantMutex::new(()))
-        };
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
     }
 }
 
@@ -896,18 +892,43 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
 
 /// Append an item to a list.
 ///
+/// Splits into a guard-taking wrapper and a lock-free
+/// [`w_list_append_inner`], the same shape the dict side uses
+/// (`w_dict_store_checked` / `w_dict_store_checked_inner`), because the append
+/// fold descends this body:
+///
+/// * the wrapper must stay look-inside — the codewriter only reaches graphs
+///   through look-inside calls from a jitdriver portal
+///   (`grab_initial_jitcodes` / `enum_pending_graphs`), so a
+///   `dont_look_inside` wrapper hides the inner body from the pipeline as
+///   well;
+/// * the descended body must hold no guard — a `w_list_lock` acquire/release
+///   pair inside it declines the fold's sub-walk.
+///
+/// Either way `list_append_jitcode()` resolves to `None`, the fold declines,
+/// and every `list.append` becomes a `Void` residual — a body effect that
+/// refuses in-flight FOR_ITER delivery and silently drops the iteration.
+///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     let _list_guard = w_list_lock(obj);
+    w_list_append_inner(obj, value)
+}
+
+/// [`w_list_append`]'s body, run with the list's guard already held.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`, and the caller must hold
+/// `w_list_lock(obj)`.
+pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py:1170 EmptyListStrategy.append: pick the matching
         // typed strategy first, then fall through to its append.
         ListStrategy::Empty => {
             switch_to_correct_strategy(list, value);
-            w_list_append(obj, value);
+            w_list_append_inner(obj, value);
         }
         // AbstractUnwrappedStrategy.append (listobject.py:1695):
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return

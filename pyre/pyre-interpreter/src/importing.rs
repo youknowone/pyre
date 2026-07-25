@@ -1711,11 +1711,7 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
     // Populate with all modules already in the cache.
     for (name, &module) in SYS_MODULES.lock().unwrap().iter() {
         unsafe {
-            pyre_object::w_dict_store(
-                dict,
-                pyre_object::w_str_new(name),
-                module as PyObjectRef,
-            );
+            pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module as PyObjectRef);
         }
     }
 }
@@ -2521,10 +2517,7 @@ fn load_part(
     // `importlib.machinery` can override the filesystem search.
     // PyPy: interp_import.importhook consults sys.builtin_module_names by
     // the fully-qualified name.
-    let full_is_builtin = BUILTIN_MODULES
-        .lock()
-        .unwrap()
-        .contains_key(modulename);
+    let full_is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(modulename);
     if full_is_builtin {
         // `pypy/interpreter/module.py:18 Module.__init__` keeps a single
         // `Module` per imported module name; `space.builtin` IS the

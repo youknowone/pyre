@@ -95,9 +95,7 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             let ec = unsafe { &mut *(ec_addr as *mut crate::PyExecutionContext) };
             let mut forward = |slot: &mut PyObjectRef| {
                 if !slot.is_null() {
-                    visitor(unsafe {
-                        &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef)
-                    });
+                    visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
                 }
             };
             forward(&mut ec.space);
@@ -137,12 +135,8 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor(unsafe { &mut *(handle as *mut usize as *mut majit_ir::GcRef) });
         }
     }
-    visitor(unsafe {
-        &mut *(&mut *TRACE_ALL_HOOK.lock() as *mut usize as *mut majit_ir::GcRef)
-    });
-    visitor(unsafe {
-        &mut *(&mut *PROFILE_ALL_HOOK.lock() as *mut usize as *mut majit_ir::GcRef)
-    });
+    visitor(unsafe { &mut *(&mut *TRACE_ALL_HOOK.lock() as *mut usize as *mut majit_ir::GcRef) });
+    visitor(unsafe { &mut *(&mut *PROFILE_ALL_HOOK.lock() as *mut usize as *mut majit_ir::GcRef) });
 }
 
 pub(crate) fn register_execution_context(ec: *const crate::PyExecutionContext) {
@@ -288,9 +282,7 @@ pub(crate) fn after_fork_child() {
         let mut contexts = EXECUTION_CONTEXTS.lock();
         contexts.retain(|thread_ident, _| *thread_ident == ident);
         if let Some(&ec) = contexts.get(&ident) {
-            for &wref in unsafe {
-                &(*(ec as *const crate::PyExecutionContext)).thread_local_refs
-            } {
+            for &wref in unsafe { &(*(ec as *const crate::PyExecutionContext)).thread_local_refs } {
                 let local = unsafe {
                     pyre_object::weakref::w_weakref_deref(
                         wref as *const pyre_object::weakref::Weakref,
@@ -347,9 +339,7 @@ fn parse_acquire_args(
         ));
     }
     if timeout > TIMEOUT_MAX {
-        return Err(crate::PyError::overflow_error(
-            "timeout value is too large",
-        ));
+        return Err(crate::PyError::overflow_error("timeout value is too large"));
     }
     Ok(if blocking && timeout >= 0.0 {
         Some(Duration::from_secs_f64(timeout))
@@ -359,414 +349,417 @@ fn parse_acquire_args(
 }
 
 mod lock_class {
-use super::*;
+    use super::*;
 
-#[crate::pyre_class("_thread.lock")]
-#[derive(Default)]
-pub struct W_Lock {
-    locked: Mutex<bool>,
-    ready: Condvar,
-}
-
-#[crate::pyre_methods(
-    doc = "A lock object is a synchronization primitive.",
-    weakrefable
-)]
-impl W_Lock {
-    #[staticmethod]
-    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        if args.len() > 1 {
-            return Err(crate::PyError::type_error(
-                "_thread.lock() takes no arguments",
-            ));
-        }
-        crate::typedef::check_user_subclass(type_object(), cls)?;
-        let obj = Self::allocate_stable(Self::default());
-        unsafe { (*obj).w_class = cls };
-        Ok(obj)
+    #[crate::pyre_class("_thread.lock")]
+    #[derive(Default)]
+    pub struct W_Lock {
+        locked: Mutex<bool>,
+        ready: Condvar,
     }
 
-    fn acquire(
-        &self,
-        #[default(1)] blocking: i64,
-        timeout: Option<PyObjectRef>,
-    ) -> Result<bool, crate::PyError> {
-        let timeout = parse_acquire_args(blocking, timeout)?;
-        let blocking = blocking != 0;
-        // A potentially blocking native lock wait leaves the collector's
-        // RUNNING census.  This does not serialize Python execution.
-        let _blocked = before_external_block();
-        let mut locked = self.locked.lock();
-        if !*locked {
-            *locked = true;
-            return Ok(true);
-        }
-        if !blocking {
-            return Ok(false);
-        }
-        match timeout {
-            None => {
-                while *locked {
-                    self.ready.wait(&mut locked);
-                }
-                *locked = true;
-                Ok(true)
+    #[crate::pyre_methods(doc = "A lock object is a synchronization primitive.", weakrefable)]
+    impl W_Lock {
+        #[staticmethod]
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error(
+                    "_thread.lock() takes no arguments",
+                ));
             }
-            Some(duration) => {
-                let deadline = Instant::now() + duration;
-                while *locked {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(false);
-                    }
-                    if self.ready.wait_for(&mut locked, deadline - now).timed_out() && *locked {
-                        return Ok(false);
-                    }
-                }
+            crate::typedef::check_user_subclass(type_object(), cls)?;
+            let obj = Self::allocate_stable(Self::default());
+            unsafe { (*obj).w_class = cls };
+            Ok(obj)
+        }
+
+        fn acquire(
+            &self,
+            #[default(1)] blocking: i64,
+            timeout: Option<PyObjectRef>,
+        ) -> Result<bool, crate::PyError> {
+            let timeout = parse_acquire_args(blocking, timeout)?;
+            let blocking = blocking != 0;
+            // A potentially blocking native lock wait leaves the collector's
+            // RUNNING census.  This does not serialize Python execution.
+            let _blocked = before_external_block();
+            let mut locked = self.locked.lock();
+            if !*locked {
                 *locked = true;
-                Ok(true)
+                return Ok(true);
+            }
+            if !blocking {
+                return Ok(false);
+            }
+            match timeout {
+                None => {
+                    while *locked {
+                        self.ready.wait(&mut locked);
+                    }
+                    *locked = true;
+                    Ok(true)
+                }
+                Some(duration) => {
+                    let deadline = Instant::now() + duration;
+                    while *locked {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(false);
+                        }
+                        if self.ready.wait_for(&mut locked, deadline - now).timed_out() && *locked {
+                            return Ok(false);
+                        }
+                    }
+                    *locked = true;
+                    Ok(true)
+                }
             }
         }
-    }
 
-    fn release(&self) -> Result<(), crate::PyError> {
-        let mut locked = self.locked.lock();
-        if !*locked {
-            return Err(crate::PyError::runtime_error(
-                "release unlocked lock",
-            ));
+        fn release(&self) -> Result<(), crate::PyError> {
+            let mut locked = self.locked.lock();
+            if !*locked {
+                return Err(crate::PyError::runtime_error("release unlocked lock"));
+            }
+            *locked = false;
+            self.ready.notify_one();
+            Ok(())
         }
-        *locked = false;
-        self.ready.notify_one();
-        Ok(())
-    }
 
-    fn locked(&self) -> bool {
-        *self.locked.lock()
-    }
+        fn locked(&self) -> bool {
+            *self.locked.lock()
+        }
 
-    fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
-        self.acquire(1, None)?;
-        Ok(self as *const Self as PyObjectRef)
-    }
+        fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
+            self.acquire(1, None)?;
+            Ok(self as *const Self as PyObjectRef)
+        }
 
-    fn __exit__(&self, _args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
-        self.release()?;
-        Ok(false)
-    }
+        fn __exit__(&self, _args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
+            self.release()?;
+            Ok(false)
+        }
 
-    fn __repr__(&self) -> String {
-        let state = if self.locked() { "locked" } else { "unlocked" };
-        format!("<{state} _thread.lock object at {:p}>", self)
-    }
+        fn __repr__(&self) -> String {
+            let state = if self.locked() { "locked" } else { "unlocked" };
+            format!("<{state} _thread.lock object at {:p}>", self)
+        }
 
-    fn _at_fork_reinit(&self) {
-        // The old native mutex/condvar may have been owned by a thread which
-        // vanished at fork.  PyPy's rthread lock reinit replaces the native
-        // lock without trying to acquire or destroy the inherited one.
-        let this = self as *const Self as *mut Self;
-        unsafe {
-            std::ptr::write(&mut (*this).locked, Mutex::new(false));
-            std::ptr::write(&mut (*this).ready, Condvar::new());
+        fn _at_fork_reinit(&self) {
+            // The old native mutex/condvar may have been owned by a thread which
+            // vanished at fork.  PyPy's rthread lock reinit replaces the native
+            // lock without trying to acquire or destroy the inherited one.
+            let this = self as *const Self as *mut Self;
+            unsafe {
+                std::ptr::write(&mut (*this).locked, Mutex::new(false));
+                std::ptr::write(&mut (*this).ready, Condvar::new());
+            }
         }
     }
-}
 }
 use lock_class::W_Lock;
 
 mod rlock_class {
-use super::*;
+    use super::*;
 
-#[derive(Default)]
-struct RLockState {
-    count: i64,
-    owner: i64,
-}
-
-#[crate::pyre_class("_thread.RLock")]
-#[derive(Default)]
-pub struct W_RLock {
-    state: Mutex<RLockState>,
-    ready: Condvar,
-}
-
-#[crate::pyre_methods(weakrefable)]
-impl W_RLock {
-    #[staticmethod]
-    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        if args.len() > 1 && cls == type_object() {
-            // CPython 3.14 keeps accepting arguments to the exact native
-            // RLock for compatibility, but deprecates them.  PyPy's
-            // W_RLock allocator likewise ignores construction arguments;
-            // subclasses remain free to consume them in their own __init__.
-            crate::warn::warn_deprecation(
-                "Passing arguments to _thread.RLock() is deprecated",
-            )?;
-        }
-        crate::typedef::check_user_subclass(type_object(), cls)?;
-        let obj = Self::allocate_stable(Self::default());
-        unsafe { (*obj).w_class = cls };
-        Ok(obj)
+    #[derive(Default)]
+    struct RLockState {
+        count: i64,
+        owner: i64,
     }
 
-    fn acquire(
-        &self,
-        #[default(1)] blocking: i64,
-        timeout: Option<PyObjectRef>,
-    ) -> Result<bool, crate::PyError> {
-        let timeout = parse_acquire_args(blocking, timeout)?;
-        let blocking = blocking != 0;
-        let ident = current_ident();
-        let _blocked = before_external_block();
-        let mut state = self.state.lock();
-        if state.count > 0 && state.owner == ident {
-            state.count = state
-                .count
-                .checked_add(1)
-                .ok_or_else(|| crate::PyError::overflow_error("internal lock count overflowed"))?;
-            return Ok(true);
+    #[crate::pyre_class("_thread.RLock")]
+    #[derive(Default)]
+    pub struct W_RLock {
+        state: Mutex<RLockState>,
+        ready: Condvar,
+    }
+
+    #[crate::pyre_methods(weakrefable)]
+    impl W_RLock {
+        #[staticmethod]
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if args.len() > 1 && cls == type_object() {
+                // CPython 3.14 keeps accepting arguments to the exact native
+                // RLock for compatibility, but deprecates them.  PyPy's
+                // W_RLock allocator likewise ignores construction arguments;
+                // subclasses remain free to consume them in their own __init__.
+                crate::warn::warn_deprecation(
+                    "Passing arguments to _thread.RLock() is deprecated",
+                )?;
+            }
+            crate::typedef::check_user_subclass(type_object(), cls)?;
+            let obj = Self::allocate_stable(Self::default());
+            unsafe { (*obj).w_class = cls };
+            Ok(obj)
         }
-        if state.count == 0 {
+
+        fn acquire(
+            &self,
+            #[default(1)] blocking: i64,
+            timeout: Option<PyObjectRef>,
+        ) -> Result<bool, crate::PyError> {
+            let timeout = parse_acquire_args(blocking, timeout)?;
+            let blocking = blocking != 0;
+            let ident = current_ident();
+            let _blocked = before_external_block();
+            let mut state = self.state.lock();
+            if state.count > 0 && state.owner == ident {
+                state.count = state.count.checked_add(1).ok_or_else(|| {
+                    crate::PyError::overflow_error("internal lock count overflowed")
+                })?;
+                return Ok(true);
+            }
+            if state.count == 0 {
+                state.owner = ident;
+                state.count = 1;
+                return Ok(true);
+            }
+            if !blocking {
+                return Ok(false);
+            }
+            match timeout {
+                None => {
+                    while state.count != 0 {
+                        self.ready.wait(&mut state);
+                    }
+                }
+                Some(duration) => {
+                    let deadline = Instant::now() + duration;
+                    while state.count != 0 {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(false);
+                        }
+                        if self.ready.wait_for(&mut state, deadline - now).timed_out()
+                            && state.count != 0
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
             state.owner = ident;
             state.count = 1;
-            return Ok(true);
+            Ok(true)
         }
-        if !blocking {
-            return Ok(false);
+
+        fn release(&self) -> Result<(), crate::PyError> {
+            let ident = current_ident();
+            let mut state = self.state.lock();
+            if state.count == 0 || state.owner != ident {
+                return Err(crate::PyError::runtime_error(
+                    "cannot release un-acquired lock",
+                ));
+            }
+            state.count -= 1;
+            if state.count == 0 {
+                state.owner = 0;
+                self.ready.notify_one();
+            }
+            Ok(())
         }
-        match timeout {
-            None => {
+
+        fn locked(&self) -> bool {
+            self.state.lock().count != 0
+        }
+
+        fn _is_owned(&self) -> bool {
+            let state = self.state.lock();
+            state.count > 0 && state.owner == current_ident()
+        }
+
+        fn _recursion_count(&self) -> i64 {
+            let state = self.state.lock();
+            if state.owner == current_ident() {
+                state.count
+            } else {
+                0
+            }
+        }
+
+        fn _release_save(&self) -> Result<PyObjectRef, crate::PyError> {
+            let mut state = self.state.lock();
+            if state.count == 0 {
+                return Err(crate::PyError::runtime_error(
+                    "cannot release un-acquired lock",
+                ));
+            }
+            let saved = w_tuple_new(vec![w_int_new(state.count), w_int_new(state.owner)]);
+            state.count = 0;
+            state.owner = 0;
+            self.ready.notify_one();
+            Ok(saved)
+        }
+
+        fn _acquire_restore(&self, saved: PyObjectRef) -> Result<(), crate::PyError> {
+            let items = unsafe {
+                if !is_tuple(saved) {
+                    return Err(crate::PyError::type_error("saved state must be a tuple"));
+                }
+                w_tuple_items_copy_as_vec(saved)
+            };
+            if items.len() != 2 || unsafe { !is_int(items[0]) || !is_int(items[1]) } {
+                return Err(crate::PyError::type_error("invalid saved state"));
+            }
+            let count = unsafe { w_int_get_value(items[0]) };
+            let owner = unsafe { w_int_get_value(items[1]) };
+            let _blocked = before_external_block();
+            let mut state = self.state.lock();
+            if state.count != 0 {
                 while state.count != 0 {
                     self.ready.wait(&mut state);
                 }
             }
-            Some(duration) => {
-                let deadline = Instant::now() + duration;
-                while state.count != 0 {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(false);
-                    }
-                    if self.ready.wait_for(&mut state, deadline - now).timed_out()
-                        && state.count != 0
-                    {
-                        return Ok(false);
-                    }
-                }
+            state.count = count;
+            state.owner = owner;
+            Ok(())
+        }
+
+        fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
+            self.acquire(1, None)?;
+            Ok(self as *const Self as PyObjectRef)
+        }
+
+        fn __exit__(&self, _args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
+            self.release()?;
+            Ok(false)
+        }
+
+        fn __repr__(&self) -> String {
+            let state = self.state.lock();
+            let locked = if state.count == 0 {
+                "unlocked"
+            } else {
+                "locked"
+            };
+            format!(
+                "<{locked} _thread.RLock object owner={} count={} at {:p}>",
+                state.owner, state.count, self
+            )
+        }
+
+        fn _at_fork_reinit(&self) {
+            let this = self as *const Self as *mut Self;
+            unsafe {
+                std::ptr::write(&mut (*this).state, Mutex::new(RLockState::default()));
+                std::ptr::write(&mut (*this).ready, Condvar::new());
             }
         }
-        state.owner = ident;
-        state.count = 1;
-        Ok(true)
     }
-
-    fn release(&self) -> Result<(), crate::PyError> {
-        let ident = current_ident();
-        let mut state = self.state.lock();
-        if state.count == 0 || state.owner != ident {
-            return Err(crate::PyError::runtime_error(
-                "cannot release un-acquired lock",
-            ));
-        }
-        state.count -= 1;
-        if state.count == 0 {
-            state.owner = 0;
-            self.ready.notify_one();
-        }
-        Ok(())
-    }
-
-    fn locked(&self) -> bool {
-        self.state.lock().count != 0
-    }
-
-    fn _is_owned(&self) -> bool {
-        let state = self.state.lock();
-        state.count > 0 && state.owner == current_ident()
-    }
-
-    fn _recursion_count(&self) -> i64 {
-        let state = self.state.lock();
-        if state.owner == current_ident() {
-            state.count
-        } else {
-            0
-        }
-    }
-
-    fn _release_save(&self) -> Result<PyObjectRef, crate::PyError> {
-        let mut state = self.state.lock();
-        if state.count == 0 {
-            return Err(crate::PyError::runtime_error(
-                "cannot release un-acquired lock",
-            ));
-        }
-        let saved = w_tuple_new(vec![w_int_new(state.count), w_int_new(state.owner)]);
-        state.count = 0;
-        state.owner = 0;
-        self.ready.notify_one();
-        Ok(saved)
-    }
-
-    fn _acquire_restore(&self, saved: PyObjectRef) -> Result<(), crate::PyError> {
-        let items = unsafe {
-            if !is_tuple(saved) {
-                return Err(crate::PyError::type_error("saved state must be a tuple"));
-            }
-            w_tuple_items_copy_as_vec(saved)
-        };
-        if items.len() != 2 || unsafe { !is_int(items[0]) || !is_int(items[1]) } {
-            return Err(crate::PyError::type_error("invalid saved state"));
-        }
-        let count = unsafe { w_int_get_value(items[0]) };
-        let owner = unsafe { w_int_get_value(items[1]) };
-        let _blocked = before_external_block();
-        let mut state = self.state.lock();
-        if state.count != 0 {
-            while state.count != 0 {
-                self.ready.wait(&mut state);
-            }
-        }
-        state.count = count;
-        state.owner = owner;
-        Ok(())
-    }
-
-    fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
-        self.acquire(1, None)?;
-        Ok(self as *const Self as PyObjectRef)
-    }
-
-    fn __exit__(&self, _args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
-        self.release()?;
-        Ok(false)
-    }
-
-    fn __repr__(&self) -> String {
-        let state = self.state.lock();
-        let locked = if state.count == 0 { "unlocked" } else { "locked" };
-        format!(
-            "<{locked} _thread.RLock object owner={} count={} at {:p}>",
-            state.owner, state.count, self
-        )
-    }
-
-    fn _at_fork_reinit(&self) {
-        let this = self as *const Self as *mut Self;
-        unsafe {
-            std::ptr::write(&mut (*this).state, Mutex::new(RLockState::default()));
-            std::ptr::write(&mut (*this).ready, Condvar::new());
-        }
-    }
-}
 }
 use rlock_class::W_RLock;
 
 mod handle_class {
-use super::*;
+    use super::*;
 
-#[derive(Default)]
-pub(super) struct HandleState {
-    pub(super) started: bool,
-    pub(super) done: bool,
-    pub(super) ident: i64,
-    pub(super) daemon: bool,
-}
-
-#[crate::pyre_class("_thread._ThreadHandle")]
-#[derive(Default)]
-pub struct W_ThreadHandle {
-    pub(super) state: Mutex<HandleState>,
-    pub(super) done: Condvar,
-}
-
-#[crate::pyre_methods]
-impl W_ThreadHandle {
-    #[staticmethod]
-    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        if args.len() > 1 {
-            return Err(crate::PyError::type_error(
-                "_ThreadHandle() takes no arguments",
-            ));
-        }
-        crate::typedef::check_user_subclass(type_object(), cls)?;
-        let obj = Self::allocate_stable(Self::default());
-        unsafe { (*obj).w_class = cls };
-        Ok(obj)
+    #[derive(Default)]
+    pub(super) struct HandleState {
+        pub(super) started: bool,
+        pub(super) done: bool,
+        pub(super) ident: i64,
+        pub(super) daemon: bool,
     }
 
-    #[getter]
-    fn ident(&self) -> i64 {
-        self.state.lock().ident
+    #[crate::pyre_class("_thread._ThreadHandle")]
+    #[derive(Default)]
+    pub struct W_ThreadHandle {
+        pub(super) state: Mutex<HandleState>,
+        pub(super) done: Condvar,
     }
 
-    fn is_done(&self) -> bool {
-        self.state.lock().done
-    }
-
-    pub(super) fn join(&self, #[default(pyre_object::w_none())] timeout: PyObjectRef) -> Result<(), crate::PyError> {
-        let duration = unsafe {
-            if is_none(timeout) {
-                None
-            } else if is_float(timeout) {
-                Some(Duration::from_secs_f64(
-                    floatobject::w_float_get_value(timeout).max(0.0),
-                ))
-            } else if is_int(timeout) {
-                Some(Duration::from_secs(w_int_get_value(timeout).max(0) as u64))
-            } else {
-                return Err(crate::PyError::type_error("timeout must be a number or None"));
+    #[crate::pyre_methods]
+    impl W_ThreadHandle {
+        #[staticmethod]
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error(
+                    "_ThreadHandle() takes no arguments",
+                ));
             }
-        };
-        let mut state = self.state.lock();
-        if !state.started {
-            return Err(crate::PyError::runtime_error("thread not started"));
+            crate::typedef::check_user_subclass(type_object(), cls)?;
+            let obj = Self::allocate_stable(Self::default());
+            unsafe { (*obj).w_class = cls };
+            Ok(obj)
         }
-        if state.ident == current_ident() && !state.done {
-            return Err(crate::PyError::runtime_error("Cannot join current thread"));
+
+        #[getter]
+        fn ident(&self) -> i64 {
+            self.state.lock().ident
         }
-        if state.done {
-            return Ok(());
+
+        fn is_done(&self) -> bool {
+            self.state.lock().done
         }
-        if state.daemon && is_finalizing() {
-            let cls = crate::builtins::lookup_exc_class("PythonFinalizationError")
-                .expect("PythonFinalizationError must be installed");
-            let exc = crate::builtins::exc_exception_new(&[cls])?;
-            return Err(unsafe { crate::PyError::from_exc_object(exc) });
-        }
-        let _blocked = before_external_block();
-        match duration {
-            None => {
-                while !state.done {
-                    self.done.wait(&mut state);
+
+        pub(super) fn join(
+            &self,
+            #[default(pyre_object::w_none())] timeout: PyObjectRef,
+        ) -> Result<(), crate::PyError> {
+            let duration = unsafe {
+                if is_none(timeout) {
+                    None
+                } else if is_float(timeout) {
+                    Some(Duration::from_secs_f64(
+                        floatobject::w_float_get_value(timeout).max(0.0),
+                    ))
+                } else if is_int(timeout) {
+                    Some(Duration::from_secs(w_int_get_value(timeout).max(0) as u64))
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "timeout must be a number or None",
+                    ));
                 }
+            };
+            let mut state = self.state.lock();
+            if !state.started {
+                return Err(crate::PyError::runtime_error("thread not started"));
             }
-            Some(timeout) => {
-                let deadline = Instant::now() + timeout;
-                while !state.done {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    if self.done.wait_for(&mut state, deadline - now).timed_out() {
-                        break;
+            if state.ident == current_ident() && !state.done {
+                return Err(crate::PyError::runtime_error("Cannot join current thread"));
+            }
+            if state.done {
+                return Ok(());
+            }
+            if state.daemon && is_finalizing() {
+                let cls = crate::builtins::lookup_exc_class("PythonFinalizationError")
+                    .expect("PythonFinalizationError must be installed");
+                let exc = crate::builtins::exc_exception_new(&[cls])?;
+                return Err(unsafe { crate::PyError::from_exc_object(exc) });
+            }
+            let _blocked = before_external_block();
+            match duration {
+                None => {
+                    while !state.done {
+                        self.done.wait(&mut state);
                     }
                 }
+                Some(timeout) => {
+                    let deadline = Instant::now() + timeout;
+                    while !state.done {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        if self.done.wait_for(&mut state, deadline - now).timed_out() {
+                            break;
+                        }
+                    }
+                }
             }
+            Ok(())
         }
-        Ok(())
-    }
 
-    fn _set_done(&self) -> Result<(), crate::PyError> {
-        let mut state = self.state.lock();
-        if !state.started {
-            return Err(crate::PyError::runtime_error("thread not started"));
+        fn _set_done(&self) -> Result<(), crate::PyError> {
+            let mut state = self.state.lock();
+            if !state.started {
+                return Err(crate::PyError::runtime_error("thread not started"));
+            }
+            state.done = true;
+            self.done.notify_all();
+            Ok(())
         }
-        state.done = true;
-        self.done.notify_all();
-        Ok(())
     }
-}
 }
 use handle_class::W_ThreadHandle;
 
@@ -792,106 +785,103 @@ impl W_ThreadHandle {
 }
 
 mod local_class {
-use super::*;
+    use super::*;
 
-/// `pypy/module/thread/os_local.py Local`.
-///
-/// `dicts` is deliberately a Python dict, matching upstream's
-/// `self.dicts = {}` and keeping every per-ExecutionContext dictionary on the
-/// object's ordinary GC graph.  The integer key is pyre's stable identity for
-/// the current OS-thread ExecutionContext.
-#[crate::pyre_class("_thread._local")]
-pub struct W_Local {
-    dicts: PyObjectRef,
-    last_dict: PyObjectRef,
-    last_ident: i64,
-    state_lock: Mutex<()>,
-}
-
-impl W_Local {
-    pub(super) fn current_dict(&self) -> PyObjectRef {
-        let _guard = self.state_lock.lock();
-        let this = self as *const Self as *mut Self;
-        let ident = current_ident();
-        if self.last_ident == ident && !self.last_dict.is_null() {
-            return self.last_dict;
-        }
-        let w_dict = unsafe { pyre_object::w_dict_getitem(self.dicts, ident) }
-            .unwrap_or_else(|| {
-                let w_dict = pyre_object::w_dict_new();
-                unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
-                register_local_in_current_ec(self as *const Self as PyObjectRef);
-                w_dict
-            });
-        unsafe {
-            (*this).last_ident = ident;
-            (*this).last_dict = w_dict;
-        }
-        pyre_object::gc_hook::try_gc_write_barrier(this as *mut u8);
-        w_dict
+    /// `pypy/module/thread/os_local.py Local`.
+    ///
+    /// `dicts` is deliberately a Python dict, matching upstream's
+    /// `self.dicts = {}` and keeping every per-ExecutionContext dictionary on the
+    /// object's ordinary GC graph.  The integer key is pyre's stable identity for
+    /// the current OS-thread ExecutionContext.
+    #[crate::pyre_class("_thread._local")]
+    pub struct W_Local {
+        dicts: PyObjectRef,
+        last_dict: PyObjectRef,
+        last_ident: i64,
+        state_lock: Mutex<()>,
     }
 
-    pub(super) fn thread_is_stopping(&self, ident: i64) {
-        let _guard = self.state_lock.lock();
-        let this = self as *const Self as *mut Self;
-        let key = w_int_new(ident);
-        unsafe {
-            pyre_object::w_dict_delitem(self.dicts, key);
-            if (*this).last_ident == ident {
-                (*this).last_ident = 0;
-                (*this).last_dict = PY_NULL;
+    impl W_Local {
+        pub(super) fn current_dict(&self) -> PyObjectRef {
+            let _guard = self.state_lock.lock();
+            let this = self as *const Self as *mut Self;
+            let ident = current_ident();
+            if self.last_ident == ident && !self.last_dict.is_null() {
+                return self.last_dict;
+            }
+            let w_dict =
+                unsafe { pyre_object::w_dict_getitem(self.dicts, ident) }.unwrap_or_else(|| {
+                    let w_dict = pyre_object::w_dict_new();
+                    unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
+                    register_local_in_current_ec(self as *const Self as PyObjectRef);
+                    w_dict
+                });
+            unsafe {
+                (*this).last_ident = ident;
+                (*this).last_dict = w_dict;
+            }
+            pyre_object::gc_hook::try_gc_write_barrier(this as *mut u8);
+            w_dict
+        }
+
+        pub(super) fn thread_is_stopping(&self, ident: i64) {
+            let _guard = self.state_lock.lock();
+            let this = self as *const Self as *mut Self;
+            let key = w_int_new(ident);
+            unsafe {
+                pyre_object::w_dict_delitem(self.dicts, key);
+                if (*this).last_ident == ident {
+                    (*this).last_ident = 0;
+                    (*this).last_dict = PY_NULL;
+                }
+            }
+        }
+
+        pub(super) fn after_fork_reinit(&self) {
+            let this = self as *const Self as *mut Self;
+            unsafe {
+                std::ptr::write(&mut (*this).state_lock, parking_lot::const_mutex(()));
             }
         }
     }
 
-    pub(super) fn after_fork_reinit(&self) {
-        let this = self as *const Self as *mut Self;
-        unsafe {
-            std::ptr::write(&mut (*this).state_lock, parking_lot::const_mutex(()));
+    #[crate::pyre_methods(doc = "Thread-local data", weakrefable)]
+    impl W_Local {
+        #[staticmethod]
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::typedef::check_user_subclass(type_object(), cls)?;
+            // os_local.py installs the first dictionary before app-level
+            // __init__ is entered, preventing recursive initialization.
+            let dicts = pyre_object::w_dict_new();
+            let w_dict = pyre_object::w_dict_new();
+            let ident = current_ident();
+            unsafe { pyre_object::w_dict_setitem(dicts, ident, w_dict) };
+            let obj = Self::allocate_stable(Self {
+                ob: PyObject::default(),
+                dicts,
+                last_dict: w_dict,
+                last_ident: ident,
+                state_lock: parking_lot::const_mutex(()),
+            });
+            unsafe { (*obj).w_class = cls };
+            register_local_in_current_ec(obj);
+
+            // The base `_local` has no app-level initializer accepting arguments.
+            // Subclass initialization is dispatched by the ordinary type call
+            // after this allocator returns, exactly as for PyPy's TypeDef.
+            if args.len() > 1 && cls == type_object() {
+                return Err(crate::PyError::type_error(
+                    "Initialization arguments are not supported",
+                ));
+            }
+            Ok(obj)
+        }
+
+        #[getter]
+        fn __dict__(&self) -> PyObjectRef {
+            self.current_dict()
         }
     }
-}
-
-#[crate::pyre_methods(
-    doc = "Thread-local data",
-    weakrefable
-)]
-impl W_Local {
-    #[staticmethod]
-    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        crate::typedef::check_user_subclass(type_object(), cls)?;
-        // os_local.py installs the first dictionary before app-level
-        // __init__ is entered, preventing recursive initialization.
-        let dicts = pyre_object::w_dict_new();
-        let w_dict = pyre_object::w_dict_new();
-        let ident = current_ident();
-        unsafe { pyre_object::w_dict_setitem(dicts, ident, w_dict) };
-        let obj = Self::allocate_stable(Self {
-            ob: PyObject::default(),
-            dicts,
-            last_dict: w_dict,
-            last_ident: ident,
-            state_lock: parking_lot::const_mutex(()),
-        });
-        unsafe { (*obj).w_class = cls };
-        register_local_in_current_ec(obj);
-
-        // The base `_local` has no app-level initializer accepting arguments.
-        // Subclass initialization is dispatched by the ordinary type call
-        // after this allocator returns, exactly as for PyPy's TypeDef.
-        if args.len() > 1 && cls == type_object() {
-            return Err(crate::PyError::type_error(
-                "Initialization arguments are not supported",
-            ));
-        }
-        Ok(obj)
-    }
-
-    #[getter]
-    fn __dict__(&self) -> PyObjectRef {
-        self.current_dict()
-    }
-}
 }
 pub use local_class::W_Local;
 
@@ -923,9 +913,7 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
     let ident = current_ident();
     for wref in std::mem::take(&mut ec.thread_local_refs) {
         let local = unsafe {
-            pyre_object::weakref::w_weakref_deref(
-                wref as *const pyre_object::weakref::Weakref,
-            )
+            pyre_object::weakref::w_weakref_deref(wref as *const pyre_object::weakref::Weakref)
         };
         if let Some(local) = W_Local::from_obj(local) {
             local.thread_is_stopping(ident);
@@ -1130,9 +1118,8 @@ fn spawn_thread(
             // driver owner is made interpreter-global.
             let _plain_worker = crate::call::force_plain_eval();
             if let Err(mut error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
-                let callable_repr = unsafe {
-                    crate::py_repr(callable).unwrap_or_else(|_| "<unknown>".to_string())
-                };
+                let callable_repr =
+                    unsafe { crate::py_repr(callable).unwrap_or_else(|_| "<unknown>".to_string()) };
                 error.write_unraisable(
                     w_none(),
                     &format!("Exception ignored in thread started by {callable_repr}"),
@@ -1190,17 +1177,16 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         return Err(crate::PyError::type_error("2nd arg must be a tuple"));
     }
     let positional = unsafe { w_tuple_items_copy_as_vec(pos[1]) };
-    let kwargs = pos.get(2).copied().or_else(|| {
-        crate::builtins::kwarg_get(kwargs_marker, "kwargs")
-    });
+    let kwargs = pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs_marker, "kwargs"));
     if kwargs.is_some_and(|d| unsafe { !is_dict(d) }) {
         return Err(crate::PyError::type_error(
             "optional 3rd arg must be a dictionary",
         ));
     }
-    Ok(w_int_new(spawn_thread(
-        callable, positional, kwargs, None,
-    )?))
+    Ok(w_int_new(spawn_thread(callable, positional, kwargs, None)?))
 }
 
 fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

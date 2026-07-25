@@ -920,11 +920,7 @@ fn finalize_system_exit(
 ) -> ! {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    for value in [
-        error.exc_object,
-        error.w_name_context,
-        error.w_obj_context,
-    ] {
+    for value in [error.exc_object, error.w_name_context, error.w_obj_context] {
         pyre_object::gc_roots::pin_root(value);
     }
     finalize_runtime(canonical, ec_ptr);
