@@ -3435,6 +3435,65 @@ mod tests {
             assert_eq!(builder.op_rvmprof_code, 91);
         }
 
+        /// Every canonical `inline_call_*` byte must reach its handler in the
+        /// production builder.
+        ///
+        /// `wire_handler` resolves an opname through `_insns` and returns
+        /// `false` for a key `setup_insns` never registered; both call sites
+        /// discard the bool. So the ten `wire_handler("inline_call_*", …)` calls
+        /// in `wire_bhimpl_handlers` were silent no-ops for as long as the
+        /// curated `build_inline_call_only_bh_builder` map omitted the keys, and
+        /// a build-time (LLBC-extracted) jitcode's `inline_call_*` reached
+        /// `dispatch_step`'s unwired panic instead. `unwired_opnames()` cannot
+        /// catch that — an absent key has no table slot to be a placeholder in.
+        #[test]
+        fn production_bh_builder_wires_every_canonical_inline_call_byte() {
+            use majit_translate::insns;
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for (opname, byte) in [
+                ("inline_call_r_i/dR>i", insns::BC_INLINE_CALL_R_I),
+                ("inline_call_r_r/dR>r", insns::BC_INLINE_CALL_R_R),
+                ("inline_call_r_v/dR", insns::BC_INLINE_CALL_R_V),
+                ("inline_call_ir_i/dIR>i", insns::BC_INLINE_CALL_IR_I),
+                ("inline_call_ir_r/dIR>r", insns::BC_INLINE_CALL_IR_R),
+                ("inline_call_ir_v/dIR", insns::BC_INLINE_CALL_IR_V),
+                ("inline_call_irf_i/dIRF>i", insns::BC_INLINE_CALL_IRF_I),
+                ("inline_call_irf_r/dIRF>r", insns::BC_INLINE_CALL_IRF_R),
+                ("inline_call_irf_f/dIRF>f", insns::BC_INLINE_CALL_IRF_F),
+                ("inline_call_irf_v/dIRF", insns::BC_INLINE_CALL_IRF_V),
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_ne!(
+                    slot as usize, placeholder as usize,
+                    "`{opname}` (byte {byte}) is unwired in the production builder",
+                );
+            }
+        }
+
+        /// The two `fnaddr` classifiers agree with the walker's gate.
+        ///
+        /// `residual_call.rs:1117` declines a funcptr with any bit ≥ 47 set;
+        /// `0` is upstream's "no address" spelling (`jitcode.py:14`) and is a
+        /// no-op — not a decline — for `residual_call`, whose backend
+        /// `bh_call_*` returns `0`/null for it.
+        #[test]
+        fn fnaddr_classifiers_match_the_walker_symbolic_gate() {
+            let real = fnaddr_classifiers_match_the_walker_symbolic_gate as *const () as i64;
+            assert!(!super::is_symbolic_fnaddr(real));
+            assert!(super::is_callable_fnaddr(real));
+
+            // `symbolic_fnaddr_for_path` is a `DefaultHasher` finish() cast to
+            // i64, so its high bits are set with overwhelming probability; the
+            // gate's contract is the bit-47 test, not the hash function.
+            let symbolic = 0x1234_5678_9abc_def0_u64 as i64;
+            assert!(super::is_symbolic_fnaddr(symbolic));
+            assert!(!super::is_callable_fnaddr(symbolic));
+
+            assert!(!super::is_symbolic_fnaddr(0));
+            assert!(!super::is_callable_fnaddr(0));
+        }
+
         #[test]
         fn test_bh_interp_inline_call() {
             // Build sub-jitcode: r0 = arg, result = r0 + r0, return r1.
@@ -6549,6 +6608,29 @@ fn check_residual_call_exception_after(
     Err(DispatchError::LeaveFrame)
 }
 
+/// Refuse to jump to a `residual_call_*` funcptr that is a
+/// `symbolic_fnaddr_for_path` hash (see `is_symbolic_fnaddr`).
+///
+/// `bh_call_*` takes the funcptr straight to an indirect branch, so a hash
+/// there is a wild call. The walker's residual path already declines this exact
+/// case (`ResidualDecline::Symbolic`); the blackhole has no decline channel, so
+/// it aborts the frame, which hands the continuation back to the interpreter.
+///
+/// `func == 0` is deliberately *not* rejected: the backends' `bh_call_*` treat
+/// it as a no-op returning `0`/null, a convention pyre relies on for host calls
+/// left unbound on purpose.
+#[inline]
+fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[bh] residual_call declined: funcptr {func:#x} is a symbolic path hash, not a code \
+             address; register the callee's path in the host's fnaddr bindings"
+        );
+    }
+    bh.aborted = true;
+    DispatchError::LeaveFrame
+}
+
 // residual_call_irf_*
 fn handler_residual_call_irf_i(
     bh: &mut BlackholeInterpreter,
@@ -6556,6 +6638,9 @@ fn handler_residual_call_irf_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -6577,6 +6662,9 @@ fn handler_residual_call_irf_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -6598,6 +6686,9 @@ fn handler_residual_call_irf_f(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -6619,6 +6710,9 @@ fn handler_residual_call_irf_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -6640,6 +6734,9 @@ fn handler_residual_call_ir_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -6660,6 +6757,9 @@ fn handler_residual_call_ir_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -6680,6 +6780,9 @@ fn handler_residual_call_ir_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -6699,6 +6802,9 @@ fn handler_residual_call_r_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
@@ -6718,6 +6824,9 @@ fn handler_residual_call_r_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
@@ -6737,6 +6846,9 @@ fn handler_residual_call_r_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
+    if is_symbolic_fnaddr(func) {
+        return Err(reject_symbolic_residual_call(bh, func));
+    }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
@@ -7341,6 +7453,62 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "residual_call_irf_f/iIRFd>f".to_string(),
         majit_translate::insns::BC_RESIDUAL_CALL_IRF_F,
     );
+    // Canonical `inline_call_*` family (blackhole.py:1278-1319). The ten
+    // handlers and their `wire_bhimpl_handlers` calls already exist, but
+    // `wire_handler` is a no-op for a key `setup_insns` never registered, so
+    // without these entries the bytes reach `dispatch_step`'s unwired panic
+    // instead of their handler. Build-time (LLBC-extracted) jitcodes are the
+    // only producer — the runtime `JitCodeBuilder` emits the pyre-only
+    // `inline_call_pyre_nested/P` byte instead — and any of them a
+    // guard-failure resume forward-executes can reach one.
+    //
+    // A target whose path the host never published has no runtime address;
+    // `read_inline_call_jitcode` + `is_callable_fnaddr` decline it rather than
+    // branch to a `symbolic_fnaddr_for_path` hash.
+    for (key, byte) in [
+        (
+            "inline_call_r_i/dR>i",
+            majit_translate::insns::BC_INLINE_CALL_R_I,
+        ),
+        (
+            "inline_call_r_r/dR>r",
+            majit_translate::insns::BC_INLINE_CALL_R_R,
+        ),
+        (
+            "inline_call_r_v/dR",
+            majit_translate::insns::BC_INLINE_CALL_R_V,
+        ),
+        (
+            "inline_call_ir_i/dIR>i",
+            majit_translate::insns::BC_INLINE_CALL_IR_I,
+        ),
+        (
+            "inline_call_ir_r/dIR>r",
+            majit_translate::insns::BC_INLINE_CALL_IR_R,
+        ),
+        (
+            "inline_call_ir_v/dIR",
+            majit_translate::insns::BC_INLINE_CALL_IR_V,
+        ),
+        (
+            "inline_call_irf_i/dIRF>i",
+            majit_translate::insns::BC_INLINE_CALL_IRF_I,
+        ),
+        (
+            "inline_call_irf_r/dIRF>r",
+            majit_translate::insns::BC_INLINE_CALL_IRF_R,
+        ),
+        (
+            "inline_call_irf_f/dIRF>f",
+            majit_translate::insns::BC_INLINE_CALL_IRF_F,
+        ),
+        (
+            "inline_call_irf_v/dIRF",
+            majit_translate::insns::BC_INLINE_CALL_IRF_V,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
     // Sub-slice C.2.1 + Path 2/3 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
     // vable family (full 14-key coverage).  Path 3 (single-indirection
     // `getfield_vable_*` / `setfield_vable_*` / `hint_force_virtualizable`)
@@ -9439,30 +9607,120 @@ fn handler_setlistitem_gc_f(
 }
 // inline_call — RPython blackhole.py:1278-1319
 // RPython: cpu.bh_call_*(adr2int(jitcode.fnaddr), args_i, args_r, args_f, jitcode.calldescr)
-// The 'j' argcode reads a JitCode descriptor carrying fnaddr + calldescr.
-// pyre: fnaddr is stored in BhDescr::JitCode; calldescr not yet modeled.
-// TODO: Full implementation should use jitcode_index for frame-chain push/pop.
+/// Read the `j` argcode of an `inline_call_*` op.
+///
+/// `blackhole.py:150-157` resolves `'d'` and `'j'` out of the *same* `descrs`
+/// table and differs only in the trailing check — `if argtype == 'j': assert
+/// isinstance(value, JitCode)` — because upstream's `JitCode` is itself an
+/// `AbstractDescr` (`jitcode.py:9`). pyre's runtime pool models that with
+/// `RuntimeBhDescr::JitCode(Arc<JitCode>)`, so this reads the entry as a
+/// jitcode and takes `fnaddr` / `calldescr` off the object, exactly as
+/// `bhimpl_inline_call_*` does (`blackhole.py:1280`).
+///
+/// Reading them off the object also matters for correctness: the flattened
+/// `BhDescr::JitCode.fnaddr` reached through `read_descr` lives in
+/// `ALL_DESCRS`, which no `runtime_fnaddr_patch` pass ever rewrites, so it is
+/// always the build-script process's value. The `Arc<JitCode>` the pool wraps
+/// comes from the patched jitcode table and carries the runtime address.
+///
+/// `descr_at` (not `exec.descrs`) is the resolver: an LLBC-extracted jitcode
+/// carries an empty per-jitcode pool and names its descrs by index into the
+/// process-global build-time pool.
 fn read_inline_call_jitcode(
     bh: &BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> (usize, i64, BhCallDescr, usize) {
-    let (jc_descr, p) = read_descr(bh, code, p);
-    match jc_descr {
-        BhDescr::JitCode {
+    let idx = (code[p] as usize) | ((code[p + 1] as usize) << 8);
+    let entry = bh
+        .jitcode
+        .descr_at(idx)
+        .unwrap_or_else(|| panic!("inline_call: descrs[{idx}] is absent from both descr pools"));
+    if let Some(jitcode) = entry.as_jitcode() {
+        return (
+            jitcode.try_index().unwrap_or(0),
+            jitcode.fnaddr,
+            jitcode.calldescr().clone(),
+            p + 2,
+        );
+    }
+    // A runtime-built pool may still hold the flattened form.
+    match entry.as_bh_descr() {
+        Some(BhDescr::JitCode {
             jitcode_index,
             fnaddr,
             calldescr,
-        } => (*jitcode_index, *fnaddr, calldescr.clone(), p),
-        _ => panic!("expected JitCode descriptor"),
+        }) => (*jitcode_index, *fnaddr, calldescr.clone(), p + 2),
+        _ => panic!("inline_call: descrs[{idx}] is not a JitCode entry: {entry:?}"),
     }
+}
+
+/// Whether `fnaddr` is a `symbolic_fnaddr_for_path` hash rather than a real
+/// code address.
+///
+/// Upstream never has to ask: `CallControl.get_jitcode` binds
+/// `llmemory.cast_ptr_to_adr(getfunctionptr(graph))` (`call.py:181-183`) for
+/// every jitcode it mints, so `jitcode.fnaddr` is always a linker-resolved
+/// address in the same binary as the metainterp. pyre runs its codewriter in
+/// `pyre-jit-trace/build.rs`, a different process, and substitutes a
+/// `symbolic_fnaddr_for_path` hash for any callee whose real address the host
+/// did not publish through `jit_trace_fnaddrs()`; `patch_constants_i_fnaddrs`
+/// is keyed on the build-time address, so a hash is never rebound.
+///
+/// User-space code addresses occupy the canonical low half on every target pyre
+/// builds for, so the top bits separate the two. This is the same discriminator
+/// the walker's residual-call path already uses to decline a symbolic funcptr —
+/// `(func_ptr as u64) >> 47 != 0` → `ResidualDecline::Symbolic`
+/// (`jitcode_dispatch/residual_call.rs:1117`).
+#[inline]
+pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
+    (fnaddr as u64) >> 47 != 0
+}
+
+/// Whether a jitcode's `fnaddr` can be called as a function pointer.
+///
+/// Stricter than `!is_symbolic_fnaddr`: `0` is upstream's own "no address"
+/// spelling (`jitcode.py:14 fnaddr=None`) and must not be called either. The
+/// `func == 0` arm of the backends' `bh_call_*` returns `0`/null instead, which
+/// is a fine no-op convention for a `residual_call` whose funcptr the host
+/// deliberately left unbound, but for an `inline_call` it would fabricate a
+/// return value for a callee that never ran.
+#[inline]
+pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
+    fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
+}
+
+/// Refuse to call an unresolved `inline_call_*` target.
+///
+/// The walker declines the equivalent residual (`ResidualDecline::Symbolic`);
+/// the blackhole has no decline channel, so it aborts the frame — a
+/// guard-failure resume that cannot finish hands the continuation back to the
+/// interpreter, which is always correct, where an indirect branch to a hash is
+/// not.
+#[inline]
+fn reject_unresolved_inline_call(
+    bh: &mut BlackholeInterpreter,
+    jitcode_index: usize,
+    fnaddr: i64,
+) -> DispatchError {
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[bh] inline_call declined: jitcodes[{jitcode_index}] has no runtime address \
+             (fnaddr={fnaddr:#x}); register the callee's path in the host's fnaddr bindings"
+        );
+    }
+    bh.aborted = true;
+    DispatchError::LeaveFrame
 }
 fn handler_inline_call_irf_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9476,7 +9734,10 @@ fn handler_inline_call_irf_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9491,7 +9752,10 @@ fn handler_inline_call_irf_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9506,7 +9770,10 @@ fn handler_inline_call_irf_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9519,7 +9786,10 @@ fn handler_inline_call_ir_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py:1291-1294 → bhimpl_inline_call_ir_i.
@@ -9531,7 +9801,10 @@ fn handler_inline_call_ir_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py:1295-1298 → bhimpl_inline_call_ir_r.
@@ -9544,7 +9817,10 @@ fn handler_inline_call_ir_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py:1299-1302 → bhimpl_inline_call_ir_v.
@@ -9556,7 +9832,10 @@ fn handler_inline_call_r_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py:1279-1281 → bhimpl_inline_call_r_i.
     bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_r_i(fnaddr, &ar, &calldescr);
@@ -9567,7 +9846,10 @@ fn handler_inline_call_r_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py:1282-1285 → bhimpl_inline_call_r_r.
     bh.registers_r[code[p] as usize] = bh.bhimpl_inline_call_r_r(fnaddr, &ar, &calldescr).0 as i64;
@@ -9578,7 +9860,10 @@ fn handler_inline_call_r_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py:1286-1289 → bhimpl_inline_call_r_v.
     bh.bhimpl_inline_call_r_v(fnaddr, &ar, &calldescr);
