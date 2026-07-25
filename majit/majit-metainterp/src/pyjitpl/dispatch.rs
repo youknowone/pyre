@@ -2909,12 +2909,36 @@ where
                         dest,
                     )
                 };
-                // Mirror runner.rs bh_new / bh_new_with_vtable: malloc + zero,
-                // then write the vtable word at offset 0 (the OBJECTPTR typeptr
-                // slot) so a trace-time GuardClass reads the right class.
-                let layout = std::alloc::Layout::from_size_align(size.max(1), 8)
-                    .expect("BC_NEW: invalid struct layout");
-                let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as i64;
+                // A `headerless` descr means the interpreter owns this struct in
+                // its own collected pool (`headerless_structs`), which is what
+                // compiled code allocates it from, through
+                // `call_malloc_nursery_headerless`. Putting it on the host heap
+                // instead hands the interpreter an object its collector cannot
+                // see: a moving collector range-checks its own pool, so it
+                // neither traces through the object nor forwards the references
+                // hanging off it, and the reachable graph below it is lost on
+                // the next collection.
+                //
+                // The allocation must not collect. This runs mid-jitcode with
+                // raw object pointers live in the machine's own register bank —
+                // the `getfield` result feeding the `setfield` that follows this
+                // `new` — and that bank belongs to no root set, so a moving
+                // collection here would strand them.
+                //
+                // Everything else keeps `runner.rs` bh_new / bh_new_with_vtable:
+                // malloc + zero, then the vtable word at offset 0 (the OBJECTPTR
+                // typeptr slot) so a trace-time GuardClass reads the right class.
+                let headerless = descr.as_size_descr().is_some_and(|sd| sd.headerless());
+                let ptr = Some(size.max(1))
+                    .filter(|_| headerless)
+                    .map(|n| majit_gc::alloc_nursery_headerless_no_collect(n).0 as i64)
+                    .filter(|p| *p != 0)
+                    .unwrap_or_else(|| {
+                        let layout = std::alloc::Layout::from_size_align(size.max(1), 8)
+                            .expect("BC_NEW: invalid struct layout");
+                        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+                        raw as i64
+                    });
                 if with_vtable && vtable != 0 {
                     unsafe { *(ptr as *mut usize) = vtable };
                 }

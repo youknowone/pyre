@@ -168,6 +168,16 @@ pub trait GcAllocator: Send {
         );
     }
 
+    /// [`Self::alloc_nursery_headerless`] for a caller that cannot survive a
+    /// collection: the metainterp's jitcode tracer executes `NEW` while holding
+    /// raw object pointers in its own register bank, which is not part of any
+    /// root set, so a moving collection under this call would strand them. The
+    /// allocator must grow instead of evacuating. The default forwards to the
+    /// collecting form, which is correct for a non-moving collector.
+    fn alloc_nursery_headerless_no_collect(&mut self, size: usize) -> GcRef {
+        self.alloc_nursery_headerless(size)
+    }
+
     /// Allocate a fixed-size object with a known GC type id.
     fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         let _ = type_id;
@@ -1309,6 +1319,37 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
     }
 }
 
+/// Process-global callback for a headerless, non-collecting nursery
+/// allocation. Returns `GcRef(0)` when no backend has installed a hook, so
+/// the caller can keep its own non-GC path.
+pub type AllocNurseryHeaderlessNoCollectFn = fn(size: usize) -> GcRef;
+
+global_hook!(
+    static ACTIVE_ALLOC_NURSERY_HEADERLESS_NO_COLLECT: AllocNurseryHeaderlessNoCollectFn
+);
+
+/// Install the active backend's headerless no-collect allocator callback.
+/// Pass `None` to clear.
+pub fn set_active_alloc_nursery_headerless_no_collect(
+    hook: Option<AllocNurseryHeaderlessNoCollectFn>,
+) {
+    ACTIVE_ALLOC_NURSERY_HEADERLESS_NO_COLLECT.set(hook);
+}
+
+/// Allocate a headerless object through the active backend's GC without
+/// letting it collect. Returns `GcRef(0)` when no backend installed a hook.
+///
+/// The metainterp's jitcode tracer reaches its `NEW` allocation through here:
+/// an interpreter that declares `headerless_structs` owns those objects in its
+/// own collected pool, so a plain host-heap block there would be invisible to
+/// its collector for as long as the object stays reachable.
+pub fn alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_HEADERLESS_NO_COLLECT.get() {
+        Some(f) => f(size),
+        None => GcRef(0),
+    }
+}
+
 /// Placement-reporting companion of [`AllocNurseryTypedFn`] for fresh-object
 /// initialization. The allocation remains no-collect; the out-parameter is
 /// `false` for a nursery result and `true` for an old-gen spill.
@@ -1723,5 +1764,87 @@ pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
 pub fn gc_write_barrier(obj: GcRef) {
     if let Some(f) = ACTIVE_WRITE_BARRIER.get() {
         f(obj)
+    }
+}
+
+#[cfg(test)]
+mod headerless_no_collect_tests {
+    use super::*;
+
+    /// A `GcAllocator` that only implements the collecting headerless form, so
+    /// the default `alloc_nursery_headerless_no_collect` has to forward to it.
+    struct ForwardingGc {
+        headerless_calls: usize,
+    }
+
+    impl GcAllocator for ForwardingGc {
+        fn alloc_nursery(&mut self, _size: usize) -> GcRef {
+            GcRef(0x1000)
+        }
+        fn alloc_nursery_headerless(&mut self, _size: usize) -> GcRef {
+            self.headerless_calls += 1;
+            GcRef(0x2000)
+        }
+        fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
+            self.alloc_nursery(size)
+        }
+        fn alloc_varsize(&mut self, base: usize, item: usize, len: usize) -> GcRef {
+            self.alloc_nursery(base + item * len)
+        }
+        fn alloc_varsize_no_collect(&mut self, base: usize, item: usize, len: usize) -> GcRef {
+            self.alloc_varsize(base, item, len)
+        }
+        fn write_barrier(&mut self, _obj: GcRef) {}
+        fn jit_remember_young_pointer_from_array(&mut self, _obj: GcRef) {}
+        fn remember_young_pointer_from_array2(
+            &mut self,
+            _obj: GcRef,
+            _index: usize,
+            _card_page_shift: u32,
+        ) {
+        }
+        fn collect_nursery(&mut self) {}
+        fn collect_full(&mut self) {}
+        fn nursery_free(&self) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+        fn nursery_free_addr(&self) -> usize {
+            0
+        }
+        fn nursery_top(&self) -> *const u8 {
+            std::ptr::null()
+        }
+        fn nursery_top_addr(&self) -> usize {
+            0
+        }
+        fn max_nursery_object_size(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn no_collect_default_forwards_to_the_collecting_headerless_form() {
+        let mut gc = ForwardingGc {
+            headerless_calls: 0,
+        };
+        assert_eq!(gc.alloc_nursery_headerless_no_collect(16), GcRef(0x2000));
+        assert_eq!(gc.headerless_calls, 1);
+    }
+
+    fn stub_alloc(size: usize) -> GcRef {
+        GcRef(0x4000 + size)
+    }
+
+    #[test]
+    fn active_hook_round_trips_and_is_null_when_absent() {
+        // Uninstalled: callers must see null so they can keep their own path.
+        set_active_alloc_nursery_headerless_no_collect(None);
+        assert_eq!(alloc_nursery_headerless_no_collect(16), GcRef(0));
+
+        set_active_alloc_nursery_headerless_no_collect(Some(stub_alloc));
+        assert_eq!(alloc_nursery_headerless_no_collect(16), GcRef(0x4010));
+
+        set_active_alloc_nursery_headerless_no_collect(None);
+        assert_eq!(alloc_nursery_headerless_no_collect(16), GcRef(0));
     }
 }
