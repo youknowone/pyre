@@ -126,8 +126,11 @@ struct Host {
 /// here; the prefix match needs no upkeep for new guest-side knobs.
 fn warn_inert_guest_env() {
     const HOST_HANDLED: &[&str] = &["PYRE_STDLIB", "MAJIT_STATS"];
+    // `to_string_lossy`, not `into_string().ok()`: a name the platform allows
+    // but UTF-8 does not is still a setting the guest silently ignores, and
+    // dropping it here would hide exactly the case worth reporting.
     let mut inert: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
+        .map(|(name, _)| name.to_string_lossy().into_owned())
         .filter(|name| name.starts_with("PYRE_") || name.starts_with("MAJIT_"))
         .filter(|name| {
             !name.starts_with("PYRE_WASM_")
