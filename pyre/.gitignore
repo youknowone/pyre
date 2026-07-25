@@ -5,3 +5,11 @@ Cargo.lock
 # The committed benchmark baselines live at pyre/bench/*.jitstats.
 /check.snap/
 /bench/synth/*.jitstats
+# Exceptions: synthetic benches whose structural counters are a committed gate.
+# check.py's regression floor reads loops_aborted/internal_compile_panics from
+# these on every run, which is the only gate wasm has — run_synthetic_bench
+# passes vs_pypy=None for wasm, so no perf ratio can catch a wasm-only trace
+# abort storm there.
+!/bench/synth/comprehension_object_append_hot.*.jitstats
+!/bench/synth/const_arg_call_resume.*.jitstats
+!/bench/synth/nested_list_comprehension_hot.*.jitstats
