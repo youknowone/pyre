@@ -2957,6 +2957,22 @@ impl TraceCtx {
 
     // ── CALL_MAY_FORCE with virtualizable synchronization ─────────
 
+    /// Shared body of the `call_may_force_with_jitstate_sync_*` family.
+    ///
+    /// Packages the sequence upstream owns one layer up, in
+    /// `MIFrame.do_residual_call` (`pyjitpl.py:1995-2085`):
+    /// `vable_and_vrefs_before_residual_call`, the CALL_MAY_FORCE,
+    /// `vable_after_residual_call`, then
+    /// `generate_guard(rop.GUARD_NOT_FORCED)` (`pyjitpl.py:2078`).
+    ///
+    /// The recorder layer has no framestack, so the GUARD_NOT_FORCED below can
+    /// only be the bare `guard_not_forced` primitive and leaves
+    /// `rd_resume_position == -1`, whereas upstream's `generate_guard` always
+    /// runs `capture_resumedata(resumepc, after_residual_call=True)`
+    /// (`pyjitpl.py:2599-2603`).  A front-end recording through this family
+    /// therefore still owes that capture at its own metainterp layer — see
+    /// `TraceCtx::guard_not_forced` — or `store_final_boxes_in_guard` reaches
+    /// `resume.py:396-397` with nothing to read.
     fn call_may_force_with_jitstate_sync_impl<S, R>(
         &mut self,
         state: &S,
@@ -2978,9 +2994,14 @@ impl TraceCtx {
     /// Callback-based virtualizable sync for CALL_MAY_FORCE.
     ///
     /// Uses JitState's `sync_virtualizable_before/after_residual_call`
-    /// methods to emit the appropriate SETFIELD/GETFIELD ops. This is
-    /// the preferred API for interpreters that implement the JitState
-    /// virtualizable sync hooks.
+    /// methods to emit the appropriate SETFIELD/GETFIELD ops.
+    ///
+    /// No in-tree front-end records through this family; the production
+    /// recorders are `pyjitpl/dispatch.rs
+    /// finalize_standard_virtualizable_may_force` and the pyre walker, both of
+    /// which attach the GUARD_NOT_FORCED resume capture themselves.  Read the
+    /// obligation documented on `call_may_force_with_jitstate_sync_impl` before
+    /// adopting it.
     ///
     /// Returns `(call_result, sync)` where `sync` reports any updated field
     /// OpRefs and whether the residual call forced the standard virtualizable.

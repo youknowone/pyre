@@ -2957,6 +2957,13 @@ fn run_perfn_walk<Sym: WalkSym>(
     // A committed journal therefore never strands into a guard-state re-run:
     // the three decisions (this predicate, the journal commit below, and the
     // caller's consume-vs-rewind) stay in agreement.
+    //
+    // The shortcut itself has no upstream counterpart, and needs none:
+    // `pyjitpl.py:2937-2947 _handle_guard_failure` resumes by continuing from
+    // the framestack `interpret()` already holds and never re-runs a region, so
+    // there is no store journal to commit and no concrete to keep.  pyre's
+    // walker instead executes and journals residual effects while tracing, so
+    // "do not run that region twice" has to be decided here.
     let terminate_no_replay = (!is_bridge_trace
         || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(
