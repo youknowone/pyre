@@ -8994,7 +8994,12 @@ pub(crate) fn _hash_float(v: f64) -> i64 {
 /// it.
 #[inline]
 fn _hash_tuple_xx(items: &[i64]) -> i64 {
-    rustpython_common::hash::hash_tuple(items.iter().map(|&h| Ok::<i64, ()>(h)))
+    _hash_tuple_xx_iter(items.iter().copied())
+}
+
+/// `_hash_tuple_xx` over element digests produced on the fly.
+fn _hash_tuple_xx_iter(items: impl Iterator<Item = i64>) -> i64 {
+    rustpython_common::hash::hash_tuple(items.map(Ok::<i64, ()>))
         .expect("element hashes are precomputed, so the fold cannot fail")
 }
 
@@ -9139,7 +9144,22 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             );
         }
         if is_str(obj) {
-            return _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+            // `unicodeobject.py:339-343 hash_w` digests `self._utf8`, and
+            // `compute_hash` on an RPython string is `ll_strhash`, which keeps
+            // the result in the string and recomputes only while the slot
+            // still reads zero.  Zero doubles as "not computed", so a digest
+            // that lands on it is stored as the same substitute every time
+            // (`rstr.py:409-410`) and stays a consistent hash for the value.
+            let cached = pyre_object::w_str_get_hash(obj);
+            if cached != 0 {
+                return cached;
+            }
+            let mut hash = _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+            if hash == 0 {
+                hash = 29742;
+            }
+            pyre_object::w_str_set_hash(obj, hash);
+            return hash;
         }
         // `bytesobject.py descr_hash` — `compute_hash(self._value)`, the same
         // byte-string digest str uses (bytearray is mutable / unhashable).
@@ -9166,14 +9186,13 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return 0xFCA8_6420;
         }
         if is_tuple(obj) {
-            let n = w_tuple_len(obj);
-            let mut hashes = Vec::with_capacity(n);
-            for i in 0..(n as i64) {
-                if let Some(item) = w_tuple_getitem(obj, i) {
-                    hashes.push(hash_value(item));
-                }
-            }
-            return _hash_tuple_xx(&hashes);
+            // `tupleobject.py:409-420 _descr_hash_unroll` folds the element
+            // digests straight into the accumulator; collecting them into a
+            // list first would allocate one per hashed tuple.
+            let n = w_tuple_len(obj) as i64;
+            return _hash_tuple_xx_iter(
+                (0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)),
+            );
         }
         if pyre_object::is_frozenset(obj) {
             return frozenset_hash_from_storage(obj);

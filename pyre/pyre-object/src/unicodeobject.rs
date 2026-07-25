@@ -22,7 +22,7 @@ use crate::pyobject::*;
 /// Python string object.
 ///
 /// Layout:
-/// `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len | w_slots]`
+/// `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len | w_slots | hash]`
 /// `byte_len` is the WTF-8 byte count (RPython STR `rstr.py:1226
 /// Array(Char)` parity — `llmodel.py:667 bh_strlen` reads this).
 /// `len` is the codepoint count (RPython UNICODE parity —
@@ -51,6 +51,12 @@ pub struct W_UnicodeObject {
     /// walker's `is_managed_heap_object` edge guard skips, the same split its
     /// `value` buffer already makes.
     pub index_storage: *mut crate::rutf8::Utf8IndexStorage,
+    /// Memoized digest, `rstr.py:395-412 LLHelpers.ll_strhash`.  RPython
+    /// keeps the hash in the string itself and recomputes only while the
+    /// slot still reads zero (`jit.conditional_call_elidable(s.hash, ...)`);
+    /// `W_UnicodeObject.hash_w` reaches it through `compute_hash(self._utf8)`,
+    /// so a wrapped string digests its bytes at most once.
+    pub hash: i64,
 }
 
 /// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
@@ -154,6 +160,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
         len: char_len,
         w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
+        hash: 0,
     }) as PyObjectRef
 }
 
@@ -191,6 +198,7 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
         len: char_len,
         w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
+        hash: 0,
     }) as PyObjectRef
 }
 
@@ -223,6 +231,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
         len: char_len,
         w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
+        hash: 0,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     if raw.is_null() {
@@ -305,6 +314,7 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         len: char_len,
         w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
+        hash: 0,
     }) as PyObjectRef
 }
 
@@ -330,6 +340,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         len: char_len,
         w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
+        hash: 0,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let obj = if raw.is_null() {
@@ -459,6 +470,29 @@ pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
         let str_obj = obj as *const W_UnicodeObject;
         &*(*str_obj).value
     }
+}
+
+/// `rstr.py:395-400 ll_strhash` — the memoized digest, or zero while it has
+/// not been computed yet ("our malloc initializes the memory to zero, so we
+/// use zero as the value of a string whose hash is not computed yet").
+///
+/// # Safety
+/// `obj` must be a `W_UnicodeObject`.
+#[inline]
+pub unsafe fn w_str_get_hash(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_UnicodeObject)).hash }
+}
+
+/// Publish a computed digest into the memo slot, `rstr.py:411-412`.  Racing
+/// writers store the same value, so no ordering is required; upstream
+/// reaches the field through `conditional_call_elidable`, which likewise
+/// tolerates a repeated computation.
+///
+/// # Safety
+/// `obj` must be a `W_UnicodeObject`.
+#[inline]
+pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
+    unsafe { (*(obj as *mut W_UnicodeObject)).hash = hash }
 }
 
 /// Borrow a known W_UnicodeObject as `&str`, or `None` when it carries a lone
