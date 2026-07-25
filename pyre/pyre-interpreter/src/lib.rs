@@ -556,7 +556,7 @@ macro_rules! py_checked_arity_fn {
                             ::pyre_object::PyObjectRef,
                             $crate::PyError,
                         > {
-                            $crate::gateway::check_declared_arity($key, $arity, args.len())?;
+                            $crate::gateway::check_declared_positional_arity($key, $arity, args)?;
                             // The annotation is what gives a bare `|args| ...` body its
                             // parameter type; the coercion to a pointer is a no-op.
                             let __pyre_body: $crate::BuiltinCodeFn = $path;

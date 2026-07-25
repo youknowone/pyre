@@ -1002,11 +1002,11 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
-/// `gateway.py:824 BuiltinCode.funcrun` reaches the unwrapped body through
+/// `gateway.py BuiltinCode.funcrun` reaches the unwrapped body through
 /// `Arguments.parse_obj`, which rejects a call whose positional count does not
 /// fit the signature.  A builtin registered with a declared count carries no
 /// `Signature` to parse against and its body indexes those slots directly, so
-/// the count is checked before the body runs.
+/// the positional count is checked before the body runs.
 pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<(), crate::PyError> {
     if given == arity {
         return Ok(());
@@ -1017,6 +1017,18 @@ pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<()
         n => format!("{name} expected {n} arguments, got {given}"),
     };
     Err(crate::PyError::type_error(message))
+}
+
+/// Check the declared arity against positional arguments only. Keyword calls
+/// carry a trailing marker dict in the raw builtin slice; the callee still
+/// receives that raw slice after the arity guard.
+pub fn check_declared_positional_arity(
+    name: &str,
+    arity: usize,
+    args: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+    check_declared_arity(name, arity, positional.len())
 }
 
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
