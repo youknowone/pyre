@@ -744,7 +744,7 @@ pub fn materialize_bridge_virtual(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
             );
-            debug_assert_eq!(
+            assert_eq!(
                 fieldnums.len(),
                 2,
                 "VStr/VUniConcatInfo must have exactly 2 fieldnums (left, right)"
@@ -792,7 +792,7 @@ pub fn materialize_bridge_virtual(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
             );
-            debug_assert_eq!(
+            assert_eq!(
                 fieldnums.len(),
                 3,
                 "VStr/VUniSliceInfo must have exactly 3 fieldnums (largerstr, start, length)"
