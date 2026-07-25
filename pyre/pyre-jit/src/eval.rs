@@ -7515,6 +7515,24 @@ fn execute_assembler(
         }
     }
 
+    // `executioncontext.py:91-107 leave` runs from a `finally`, so upstream's
+    // `topframeref` is balanced no matter how a frame is left: a guard failure
+    // inside an inlined callee resumes into that callee's own `MIFrame` level
+    // and its `leave` still executes.  Pyre's compiled trace carries `enter` /
+    // `leave` as walker-recorded field ops rather than as jitcode, so the ops
+    // after a failing guard never run and every `enter` this run performed
+    // without its matching `leave` would leave a `JitVirtualRef` published in
+    // the live slot — read as a `PyFrame` by the interpreter that resumes, and
+    // still carrying an active FORCE_TOKEN naming the JIT frame that has just
+    // died.  Bracket the assembler run the way `install_current_frame` /
+    // `CurrentFrameGuard` bracket a frame: a balanced run restores the same
+    // value it saved, an unbalanced exit restores the caller.
+    let ec_for_topframeref = frame_root.frame().execution_context as *mut PyExecutionContext;
+    let saved_topframeref = if ec_for_topframeref.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec_for_topframeref).topframeref }
+    };
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
     let outcome = {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
@@ -7526,6 +7544,9 @@ fn execute_assembler(
             || {},
         )
     };
+    if !ec_for_topframeref.is_null() {
+        unsafe { (*ec_for_topframeref).topframeref = saved_topframeref };
+    }
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // JIT-overflow flag the backend probe records when it trips. The

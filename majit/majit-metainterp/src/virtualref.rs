@@ -151,31 +151,43 @@ pub use crate::jit::InvalidVirtualRef;
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
 ///
-/// The allocation is a leaked `Box`, not a GC object as
-/// `lltype.malloc(self.JIT_VIRTUAL_REF)` is: the vref outlives every scope
-/// that could free it — the trace stores its address in `virtualref_boxes`
-/// and in resume data, the interpreter stores it in `ec.topframeref` /
-/// `f_backref`, and after `virtual_ref_finish` a forced frame may still be
-/// reached through it — so ownership genuinely belongs to the collector.  Two
-/// consequences follow, and both are why this is safe rather than merely
-/// tolerated: the address never moves, which is what lets `virtualref_boxes`
-/// hold it as a raw pointer across a collection, and the GC skips it as
-/// unowned when it visits the root slot it sits in
-/// (`majit-gc gc_current_object_address` early-out).  What is lost is
-/// reclamation: one 24-byte vref per inlined call, per trace recording, is
-/// never freed.  That is bounded by compilation events rather than by
-/// iterations, and converges the same way the sibling divergence noted on
-/// `set_vref_gc_type_id`'s registration does — by moving this allocation, the
-/// `_dummy`, and the JITFRAME under the GC together.
+/// `lltype.malloc(self.JIT_VIRTUAL_REF)` is a GC allocation, and it has to be
+/// one here too: `forced` is a traced slot (`gc_ptr_offsets = [16]`, registered
+/// with [`set_vref_gc_type_id`]), so once `ExecutionContext.topframeref` holds
+/// the vref instead of the frame, this object is the only edge keeping the
+/// frame it wraps reachable.  A host-heap allocation is invisible to the
+/// collector — the root walker's `gc_current_object_address` early-out returns
+/// an unowned address unchanged — which drops that edge and lets a live frame
+/// be collected out from under the walk.
+///
+/// Old-gen, not nursery: `virtualref_boxes`, the recorded ops' concrete stamps
+/// and the interpreter's `f_backref` chain all hold this address as a raw
+/// pointer that no root walker forwards, and MiniMark's old-gen is mark-sweep,
+/// so the address is stable across a minor collection.  The `forced` frame may
+/// be young, hence the creation write barrier.
+///
+/// The `Box` fallback covers the window before a backend has installed its
+/// allocator hook (`vref_gc_type_id() == 0`, or an old-gen allocation failure);
+/// it is leaked, and reclamation is what it gives up.
 fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
-    let vref = Box::new(JitVirtualRef {
+    let vref = JitVirtualRef {
         super_: ObjectHeader {
             typeptr: JIT_VIRTUAL_REF_VTABLE,
         },
         virtual_token: TOKEN_NONE,
         forced: real_object,
-    });
-    Box::into_raw(vref) as *mut u8
+    };
+    let type_id = vref_gc_type_id();
+    if type_id != 0 {
+        let gcref = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<JitVirtualRef>());
+        if gcref.0 != 0 {
+            unsafe { std::ptr::write(gcref.0 as *mut JitVirtualRef, vref) };
+            // Creation write barrier: an old-gen vref may point at a young frame.
+            majit_gc::gc_write_barrier(gcref);
+            return gcref.0 as *mut u8;
+        }
+    }
+    Box::into_raw(Box::new(vref)) as *mut u8
 }
 
 /// Token value indicating no JIT frame is active.

@@ -429,9 +429,16 @@ impl ExecutionContext {
         frame
     }
 
+    /// `self.topframeref()` without the virtualizable force that
+    /// [`Self::gettopframe`] adds — "raw" is about `force_frame`, not about the
+    /// vref.  The vref force is not optional: `executioncontext.py:68/72/446/451`
+    /// all read the slot *with* the parens, and the only unforced reads upstream
+    /// are `:88`/`:96`, which move the vref along rather than dereference it.
+    /// A `JitVirtualRef` handed out here would be dereferenced at `PyFrame`
+    /// field offsets by every caller.
     #[inline]
     pub fn gettopframe_raw(&self) -> *mut PyFrame {
-        self.topframeref
+        force_vref(self.topframeref)
     }
 
     /// `executioncontext.py gettopframe_nohidden` — follow `f_backref` past every
