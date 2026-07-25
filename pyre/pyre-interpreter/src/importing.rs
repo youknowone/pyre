@@ -2923,6 +2923,25 @@ pub fn dunder_import(
         {
             let import_slot = shadow_stack_len();
             pin_root(w_import);
+            // `PyImport_ImportModuleLevelObject`: a relative import with an
+            // empty fromlist hands back the head package named by the *resolved
+            // absolute name*, and the imported module itself when `name` carries
+            // no dot.  `_bootstrap.__import__` reaches the same slice through
+            // `module.__name__`, so a `sys.modules` entry that is not a module
+            // raises AttributeError there instead of the KeyError the
+            // interpreter entry point reports.
+            if level > 0
+                && !name.is_empty()
+                && !(!fromlist_missing
+                    && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?)
+            {
+                return relative_import_head(
+                    shadow_stack_get(bootstrap_slot),
+                    name,
+                    shadow_stack_get(globals_slot),
+                    level,
+                );
+            }
             let w_name = pyre_object::w_str_new(name);
             let name_slot = shadow_stack_len();
             pin_root(w_name);
@@ -2967,6 +2986,122 @@ pub fn dunder_import(
         level,
         execution_context,
     )
+}
+
+/// `PyImport_ImportModuleLevelObject`, the `level > 0` / empty-fromlist tail:
+/// import `name` relative to `globals`, then return the head package named by
+/// the absolute name the resolution produced.
+///
+/// `_bootstrap.__import__` spells the same slice as
+/// `sys.modules[module.__name__[:len(module.__name__) - cut_off]]`, which
+/// requires the loaded object to carry `__name__`.  A `sys.modules` entry that
+/// is not a module has none, so the interpreter entry point slices the name it
+/// resolved itself and reports a missing head as a KeyError.
+fn relative_import_head(
+    w_bootstrap: PyObjectRef,
+    name: &str,
+    w_globals: PyObjectRef,
+    level: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let bootstrap_slot = shadow_stack_len();
+    pin_root(w_bootstrap);
+    // `_bootstrap.__import__` — `globals_ = globals if globals is not None else {}`.
+    let globals_slot = shadow_stack_len();
+    pin_root(if w_globals.is_null() || unsafe { is_none(w_globals) } {
+        pyre_object::w_dict_new()
+    } else {
+        w_globals
+    });
+    let name_slot = shadow_stack_len();
+    pin_root(pyre_object::w_str_new(name));
+    let level_slot = shadow_stack_len();
+    pin_root(pyre_object::w_int_new(level));
+
+    // `_bootstrap.__import__` — `package = _calc___package__(globals_)`.
+    let w_calc =
+        crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "_calc___package__")?;
+    let calc_slot = shadow_stack_len();
+    pin_root(w_calc);
+    let w_package = crate::call::call_function_impl_result(
+        shadow_stack_get(calc_slot),
+        &[shadow_stack_get(globals_slot)],
+    )
+    .map_err(strip_bootstrap_traceback_frames)?;
+    let package_slot = shadow_stack_len();
+    pin_root(w_package);
+
+    // `_bootstrap.__import__` — `module = _gcd_import(name, package, level)`.
+    // `_sanity_check` / `_resolve_name` validate `package` and `level` in there,
+    // so running it before the slice below keeps their diagnostics first.
+    let w_gcd = crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "_gcd_import")?;
+    let gcd_slot = shadow_stack_len();
+    pin_root(w_gcd);
+    let w_module = crate::call::call_function_impl_result(
+        shadow_stack_get(gcd_slot),
+        &[
+            shadow_stack_get(name_slot),
+            shadow_stack_get(package_slot),
+            shadow_stack_get(level_slot),
+        ],
+    )
+    .map_err(strip_bootstrap_traceback_frames)?;
+    let module_slot = shadow_stack_len();
+    pin_root(w_module);
+
+    // No dot in `name`: the imported module is already the head.
+    let Some(dot) = name.find('.') else {
+        return Ok(shadow_stack_get(module_slot));
+    };
+
+    // `_resolve_name(name, package, level)` is the absolute name just imported;
+    // it ends with `name`, so trimming from `name`'s first dot leaves the head.
+    let w_resolve =
+        crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "_resolve_name")?;
+    let resolve_slot = shadow_stack_len();
+    pin_root(w_resolve);
+    let w_abs_name = crate::call::call_function_impl_result(
+        shadow_stack_get(resolve_slot),
+        &[
+            shadow_stack_get(name_slot),
+            shadow_stack_get(package_slot),
+            shadow_stack_get(level_slot),
+        ],
+    )
+    .map_err(strip_bootstrap_traceback_frames)?;
+    let abs_slot = shadow_stack_len();
+    pin_root(w_abs_name);
+    // Owned: the slicing below outlives the allocations that follow it.
+    let abs_name = crate::baseobjspace::utf8_w(shadow_stack_get(abs_slot))?.to_string();
+    let cut_off = name.len() - dot;
+    let head = abs_name
+        .len()
+        .checked_sub(cut_off)
+        .and_then(|end| abs_name.get(..end))
+        .unwrap_or(abs_name.as_str());
+
+    let head_slot = shadow_stack_len();
+    pin_root(pyre_object::w_str_new(head));
+    // The raw `sys.modules` entry, `None` sentinel included: only a *missing*
+    // key is the KeyError.
+    let w_modules = sys_modules_dict();
+    let found = if w_modules.is_null() {
+        check_sys_modules(head)
+    } else {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_lookup(w_modules, shadow_stack_get(head_slot))
+        }
+        .filter(|w| !w.is_null())
+    };
+    if let Some(w_found) = found {
+        return Ok(w_found);
+    }
+    let head_repr = unsafe { crate::display::py_repr(shadow_stack_get(head_slot)) }?;
+    Err(crate::PyError::key_error(format!(
+        "{head_repr} not in sys.modules as expected"
+    )))
 }
 
 // ── importhook ───────────────────────────────────────────────────────
