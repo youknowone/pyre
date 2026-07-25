@@ -10608,19 +10608,29 @@ fn _unpackiterable_unknown_length(
 /// jitcode. `#[dont_look_inside]` keeps the host plumbing opaque should a
 /// caller ever be traced.
 ///
-/// Pins `items` across the readback: an Integer/Float-strategy `getitem`
-/// boxes each element through the moving collector (`w_int_new` /
-/// `w_float_new`), which can relocate `items`.
+/// Pins `items` and every element read back. This is a liveness bracket, not
+/// a relocation read-back: the `W_ListObject` header is old-gen and non-moving.
+/// The caller's `RootScope` is already gone, so the drained list lives only on
+/// the Rust stack, and an Integer/Float-strategy `getitem` boxes through
+/// `w_int_new` / `w_float_new`, whose allocator slow path parks this mutator at
+/// a `gc_op` — a foreign thread's stop-the-world collection can mark and sweep
+/// while it is parked. The boxes read back so far are reachable from no root at
+/// that moment, so they get the same per-element pins
+/// `alloc_list_items_block_gc` uses.
 #[majit_macros::dont_look_inside]
 pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(items);
     let n = unsafe { pyre_object::listobject::w_list_len(items) };
-    let mut out: Vec<PyObjectRef> = Vec::with_capacity(n);
+    let save = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n as i64 {
-        out.push(unsafe { pyre_object::listobject::w_list_getitem(items, i).unwrap() });
+        pyre_object::gc_roots::pin_root(unsafe {
+            pyre_object::listobject::w_list_getitem(items, i).unwrap()
+        });
     }
-    out
+    (0..n)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(save + i))
+        .collect()
 }
 
 /// pypy/interpreter/baseobjspace.py:1080-1108 `length_hint`.
