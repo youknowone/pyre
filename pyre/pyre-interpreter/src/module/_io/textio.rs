@@ -456,6 +456,29 @@ impl W_TextIOWrapper {
         self.readtranslate = newline.is_none();
     }
 
+    /// The string `write` substitutes for `'\n'`, or `None` for no
+    /// translation.  PyPy `W_TextIOWrapper` `writetranslate`/`writenl`: an
+    /// explicit `'\r'` or `'\r\n'` is honored on every platform; `newline=None`
+    /// writes the platform line separator (`'\r\n'` on Windows, untranslated
+    /// elsewhere); `''` and `'\n'` are written verbatim.
+    fn write_newline(&self) -> Option<&'static str> {
+        match self.configured_newline() {
+            None => {
+                #[cfg(windows)]
+                {
+                    Some("\r\n")
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            }
+            Some("\r") => Some("\r"),
+            Some("\r\n") => Some("\r\n"),
+            _ => None,
+        }
+    }
+
     fn size_limit(w_size: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
         if unsafe { pyre_object::is_none(w_size) } {
             return Ok(None);
@@ -967,9 +990,7 @@ impl W_TextIOWrapper {
 
         let mut to_encode = text;
         if has_lf {
-            if let Some(writenl) = self.configured_newline()
-                && matches!(writenl, "\r" | "\r\n")
-            {
+            if let Some(writenl) = self.write_newline() {
                 to_encode = super::call_method_result(
                     text,
                     "replace",
