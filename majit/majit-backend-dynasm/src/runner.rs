@@ -180,6 +180,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
+        dynasm_alloc_nursery_headerless_no_collect,
+    ));
     majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
         dynasm_alloc_nursery_typed_with_placement,
     ));
@@ -355,6 +358,26 @@ pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
             }
         }
     })
+}
+
+/// Headerless no-collect nursery trampoline for backend-agnostic callers.
+///
+/// The metainterp's jitcode tracer allocates a `NEW` on a `headerless` descr
+/// through here so the object lands in the interpreter's own collected pool
+/// rather than the host heap, where its collector could not see it. Returns
+/// null when no GC is bound, leaving the caller on its own path.
+fn dynasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
+    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut()
+            .as_deref_mut()
+            .map(|g| g.alloc_nursery_headerless_no_collect(size))
+    }) {
+        return r;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_headerless_no_collect(size));
+    }
+    GcRef::NULL
 }
 
 /// Host-side nursery allocation trampoline. Published via
