@@ -5,7 +5,7 @@
 //! text path. The codec registry (`register` / `lookup`) and error
 //! handlers remain stubs; binary transform codecs are not modelled.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -30,54 +30,50 @@ impl CodecState {
     }
 }
 
-thread_local! {
-    static CODEC_STATE: Cell<*mut CodecState> = const { Cell::new(std::ptr::null_mut()) };
-}
+/// The registry is `space.fromcache(CodecState)` upstream — one instance per
+/// interpreter, not per thread — so `codecs.register` / `register_error` and
+/// the search cache stay visible to every reader.  Published once and never
+/// replaced, which is what lets the collector read the slot without
+/// coordinating with a mutator that is inside `with_codec_state`.
+static CODEC_STATE: AtomicPtr<CodecState> = AtomicPtr::new(std::ptr::null_mut());
 
 fn with_codec_state<R>(f: impl FnOnce(&mut CodecState) -> R) -> R {
-    CODEC_STATE.with(|slot| {
-        let mut ptr = slot.get();
-        if ptr.is_null() {
-            ptr = Box::into_raw(Box::new(CodecState::new()));
-            slot.set(ptr);
-        }
-        f(unsafe { &mut *ptr })
-    })
+    let mut ptr = CODEC_STATE.load(Ordering::Acquire);
+    if ptr.is_null() {
+        // `CodecState::new` allocates the registry objects and registers the
+        // builtin error handlers, so build it before publishing the slot.
+        let created = Box::into_raw(Box::new(CodecState::new()));
+        ptr = match CODEC_STATE.compare_exchange(
+            std::ptr::null_mut(),
+            created,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => created,
+            Err(existing) => {
+                drop(unsafe { Box::from_raw(created) });
+                existing
+            }
+        };
+    }
+    f(unsafe { &mut *ptr })
 }
 
-pub(crate) unsafe fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    CODEC_STATE.with(|slot| {
-        let ptr = slot.get();
-        if ptr.is_null() {
-            return;
-        }
-        let state = unsafe { &mut *ptr };
-        visitor(&mut state.codec_search_path);
-        visitor(&mut state.codec_search_cache);
-        visitor(&mut state.codec_error_registry);
-    });
-}
-
-pub(crate) fn capture_codec_state_root_area() -> *const () {
-    CODEC_STATE.with(|state| state as *const _ as *const ())
-}
-
-/// # Safety
-/// `data` must come from [`capture_codec_state_root_area`], and the owning
-/// thread must be quiesced.
-pub(crate) unsafe fn walk_codec_state_root_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut PyObjectRef),
-) {
-    let state = unsafe { &*(data as *const Cell<*mut CodecState>) };
-    let ptr = state.get();
+/// Forward the registry's Python objects.  Upstream reaches the same list and
+/// dicts through the space's object graph; pyre holds them off-heap, so the
+/// collector has to be handed them.
+pub(crate) fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let ptr = CODEC_STATE.load(Ordering::Acquire);
     if ptr.is_null() {
         return;
     }
-    let state = unsafe { &mut *ptr };
-    visitor(&mut state.codec_search_path);
-    visitor(&mut state.codec_search_cache);
-    visitor(&mut state.codec_error_registry);
+    // A collection can run while the mutator is inside `with_codec_state`, so
+    // reach the slots through raw pointers instead of a second `&mut`.
+    unsafe {
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).codec_search_path));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).codec_search_cache));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).codec_error_registry));
+    }
 }
 
 // PyPy `interp_codecs.py:166-190 normalize`.

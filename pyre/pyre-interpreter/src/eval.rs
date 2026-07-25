@@ -49,7 +49,6 @@ thread_local! {
         import_roots: crate::importing::capture_import_root_area(),
         method_cache: crate::baseobjspace::capture_method_cache_root_area(),
         mapdict_method_cache: crate::pycode::capture_mapdict_method_cache_root_area(),
-        codec_state: crate::module::_codecs::capture_codec_state_root_area(),
     };
 }
 
@@ -59,7 +58,6 @@ struct PyFrameRootArea {
     import_roots: *const (),
     method_cache: *const (),
     mapdict_method_cache: *const (),
-    codec_state: *const (),
 }
 use crate::pyframe::PyFrame;
 
@@ -852,9 +850,9 @@ pub unsafe fn walk_pyframe_roots_area(
                     &mut forward,
                 );
                 // _codecs.CodecState is a space-cache object in PyPy; pyre
-                // keeps the same list/dict state in module-local storage, so
-                // its Python objects must be forwarded explicitly.
-                crate::module::_codecs::walk_codec_state_root_area(area.codec_state, &mut forward);
+                // keeps the same list/dict state in an interpreter-global
+                // slot, so its Python objects must be forwarded explicitly.
+                crate::module::_codecs::walk_codec_state_gc(&mut forward);
             }
         }
     }
