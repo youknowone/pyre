@@ -1808,28 +1808,76 @@ fn reverse_compare_op(op: CompareOp) -> CompareOp {
     }
 }
 
-unsafe fn float_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(as_float(a) < as_float(b)))
+#[inline]
+fn compare_f64(f1: f64, f2: f64, op: CompareOp) -> bool {
+    match op {
+        CompareOp::Lt => f1 < f2,
+        CompareOp::Le => f1 <= f2,
+        CompareOp::Gt => f1 > f2,
+        CompareOp::Ge => f1 >= f2,
+        CompareOp::Eq => f1 == f2,
+        CompareOp::Ne => f1 != f2,
+    }
 }
 
-unsafe fn float_le(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(as_float(a) <= as_float(b)))
+/// floatobject.py:106-129 `do_compare_bigint` — compare a float against a
+/// bigint without converting the bigint to a double, which would round it.
+fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
+    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        let ne = matches!(op, CompareOp::Ne);
+        // A non-finite or fractional float is never equal to an integer.
+        if !f1.is_finite() || f1.floor() != f1 {
+            return ne;
+        }
+        return BigInt::_fromfloat_finite(f1).eq(b2) != ne;
+    }
+    if !f1.is_finite() {
+        return compare_f64(f1, 0.0, op);
+    }
+    let f1 = if matches!(op, CompareOp::Gt | CompareOp::Le) {
+        // 'float > long'  <==> 'ceil(float) > long'
+        // 'float <= long' <==> 'ceil(float) <= long'
+        f1.ceil()
+    } else {
+        // 'float < long'  <==> 'floor(float) < long'
+        // 'float >= long' <==> 'floor(float) >= long'
+        f1.floor()
+    };
+    let b1 = BigInt::_fromfloat_finite(f1);
+    match op {
+        CompareOp::Lt => b1.lt(b2),
+        CompareOp::Le => b1.le(b2),
+        CompareOp::Gt => b1.gt(b2),
+        CompareOp::Ge => b1.ge(b2),
+        CompareOp::Eq | CompareOp::Ne => unreachable!("handled above"),
+    }
 }
 
-unsafe fn float_gt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(as_float(a) > as_float(b)))
-}
-
-unsafe fn float_ge(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(as_float(a) >= as_float(b)))
-}
-
-unsafe fn float_eq(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(as_float(a) == as_float(b)))
-}
-
-unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(as_float(a) != as_float(b)))
+/// floatobject.py:132-148 `_compare` — the float side of a numeric
+/// comparison.  `w_float` is a float; `w_other` is a float, an int, a bool
+/// or a long.  The relation is evaluated exactly: only an int small enough
+/// that a double represents it losslessly takes the plain f64 path.
+unsafe fn float_compare(w_float: PyObjectRef, w_other: PyObjectRef, op: CompareOp) -> bool {
+    let f1 = w_float_get_value(w_float);
+    if is_float(w_other) {
+        return compare_f64(f1, w_float_get_value(w_other), op);
+    }
+    if is_long(w_other) {
+        return do_compare_bigint(f1, w_long_get_value(w_other), op);
+    }
+    let i2 = if is_bool(w_other) {
+        w_bool_get_value(w_other) as i64
+    } else {
+        w_int_get_value(w_other)
+    };
+    // (double-)floats have always at least 48 bits of precision, so an int
+    // whose bit 48 and above are a plain sign extension converts exactly.
+    // `int_between(-1, i2 >> 48, 1)` (rarithmetic.py) is `-1 <= i2 >> 48 < 1`.
+    let top = i2 >> 48;
+    if !(-1..1).contains(&top) {
+        return do_compare_bigint(f1, &BigInt::from(i2), op);
+    }
+    compare_f64(f1, i2 as f64, op)
 }
 
 // ── Complex arithmetic operations ────────────────────────────────────
@@ -3931,14 +3979,14 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             }));
         }
         if is_float_pair(a, b) {
-            return match op {
-                CompareOp::Lt => float_lt(a, b),
-                CompareOp::Le => float_le(a, b),
-                CompareOp::Gt => float_gt(a, b),
-                CompareOp::Ge => float_ge(a, b),
-                CompareOp::Eq => float_eq(a, b),
-                CompareOp::Ne => float_ne(a, b),
-            };
+            // `_compare` is a method on the float operand; the int-left order
+            // reaches it through the reflected comparison, with the relation
+            // reversed.
+            return Ok(w_bool_from(if is_float(a) {
+                float_compare(a, b, op)
+            } else {
+                float_compare(b, a, reverse_compare_op(op))
+            }));
         }
         // complexobject.py only implements equality here.  Its ordering
         // dunders return NotImplemented, which must continue through the

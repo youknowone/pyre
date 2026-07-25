@@ -3274,8 +3274,10 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     }
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64)?;
-    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64)?;
+    let lhs_raw =
+        walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, false)?;
+    let rhs_raw =
+        walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, false)?;
     // rint.py `_ovf_zer` analogue for float true-division: emit a
     // `float_eq(rhs, 0.0) → guard_false` precondition ahead of the bare
     // `FloatTrueDiv` llop so a future zero divisor deopts to the checked
@@ -6178,9 +6180,22 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // floatobject.py:139-146 — an int wider than a double represents exactly
+    // is compared through its bigint, which this fold cannot express.  Decline
+    // so the residual call decides it; the in-range case emits the same
+    // precondition as a guard (`exact_int` below).
+    let out_of_range = |is_int: bool, obj| {
+        is_int && !int_is_exact_as_float(unsafe { pyre_object::w_int_get_value(obj) })
+    };
+    if out_of_range(lhs_is_int, lhs_obj) || out_of_range(rhs_is_int, rhs_obj) {
+        return Ok(None);
+    }
+
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64)?;
-    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64)?;
+    let lhs_raw =
+        walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, true)?;
+    let rhs_raw =
+        walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, true)?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded =
         majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);

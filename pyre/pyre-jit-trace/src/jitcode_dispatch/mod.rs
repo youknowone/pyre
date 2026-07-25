@@ -6358,11 +6358,49 @@ fn walker_unbox_float<Sym: WalkSym>(
     ))
 }
 
+/// floatobject.py:139 `int_between(-1, i2 >> 48, 1)` — true while a double
+/// represents `value` exactly, doubles carrying at least 48 bits of precision.
+/// A wider int must be compared through its bigint, not through a rounded
+/// double.
+pub(crate) fn int_is_exact_as_float(value: i64) -> bool {
+    (-1..1).contains(&(value >> 48))
+}
+
+/// Emit [`int_is_exact_as_float`] as a trace precondition, lowered exactly as
+/// `int_between` is (`INT_SUB` + `UINT_LT`), so a re-entered trace carrying a
+/// wider int bails out to the exact comparison instead of comparing rounded
+/// doubles.
+fn walker_guard_int_exact_as_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw_int: OpRef,
+    value: i64,
+) -> Result<(), DispatchError> {
+    let shift = ctx.trace_ctx.const_int(48);
+    let top = ctx.trace_ctx.record_op(OpCode::IntRshift, &[raw_int, shift]);
+    ctx.trace_ctx
+        .set_opref_concrete(top, majit_ir::Value::Int(value >> 48));
+    let low = ctx.trace_ctx.const_int(-1);
+    let offset = ctx.trace_ctx.record_op(OpCode::IntSub, &[top, low]);
+    ctx.trace_ctx
+        .set_opref_concrete(offset, majit_ir::Value::Int((value >> 48) + 1));
+    let width = ctx.trace_ctx.const_int(2);
+    let fits = ctx.trace_ctx.record_op(OpCode::UintLt, &[offset, width]);
+    ctx.trace_ctx
+        .set_opref_concrete(fits, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[fits])
+}
+
 /// Coerce a boxed operand to a raw `f64` OpRef for a float op: float →
 /// `walker_unbox_float`; int → `walker_unbox_int` then `cast_int_to_float`
 /// (`space.float_w` dispatches int through int2float).  Stamps the result
 /// with the already-known concrete `val` so downstream `box_value` sees it.
 /// Shared by the float-binary and float-compare specializations.
+///
+/// `exact_int` additionally guards that an int operand converts losslessly.
+/// A float arithmetic operand legitimately rounds (`space.float_w`), but a
+/// comparison is decided against the int's exact value (`_compare`), so only
+/// the compare specialization sets it.
 fn walker_coerce_operand_to_float<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6370,11 +6408,16 @@ fn walker_coerce_operand_to_float<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     is_int: bool,
     val: f64,
+    exact_int: bool,
 ) -> Result<OpRef, DispatchError> {
     let raw = if is_int {
         // bool shares int's `intval`; guard its own &BOOL_TYPE before the cast.
         let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_obj);
         let raw_int = walker_unbox_int_typed(ctx, op_pc, obj, type_addr, descr)?;
+        if exact_int {
+            let value = unsafe { pyre_object::w_int_get_value(concrete_obj) };
+            walker_guard_int_exact_as_float(ctx, op_pc, raw_int, value)?;
+        }
         ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
     } else {
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
