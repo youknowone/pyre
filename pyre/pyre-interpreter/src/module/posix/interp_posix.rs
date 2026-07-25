@@ -731,7 +731,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "faccessat",
         "chflags",
         "lchflags",
-        "utime",
         "futimens",
         "futimes",
         "fdopendir",
@@ -1382,6 +1381,129 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "replace",
         crate::make_builtin_function("replace", |args| rename_impl(args, "replace")),
     );
+
+    // os.utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True)
+    // PyPy `interp_posix.utime` → rposix `utimensat`/`SetFileTime`.  `times` is a
+    // `(atime, mtime)` pair in seconds; `ns` the same pair in integer
+    // nanoseconds; the two are mutually exclusive.  Both `None` means "now".
+    fn utime_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        if pos.is_empty() {
+            return Err(crate::PyError::type_error(
+                "utime() missing required argument 'path' (pos 1)",
+            ));
+        }
+        if pos.len() > 2 {
+            return Err(crate::PyError::type_error(format!(
+                "utime() takes from 1 to 2 positional arguments but {} were given",
+                pos.len()
+            )));
+        }
+        crate::builtins::kwarg_reject_unknown(kwargs, &["ns", "dir_fd", "follow_symlinks"], "utime")?;
+        let path = extract_path(pos[0])?;
+
+        let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
+        let times = pos.get(1).copied().and_then(present);
+        let ns = crate::builtins::kwarg_get(kwargs, "ns").and_then(present);
+        let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+            Some(v) => crate::baseobjspace::is_true(v)?,
+            None => true,
+        };
+        let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd").and_then(present) {
+            Some(v) => {
+                if !unsafe { pyre_object::is_int(v) } {
+                    return Err(crate::PyError::type_error(
+                        "argument should be integer or None, not object",
+                    ));
+                }
+                Some(unsafe { pyre_object::w_int_get_value(v) } as i32)
+            }
+            None => None,
+        };
+
+        let unpack_two =
+            |obj: PyObjectRef, what: &str| -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+                if !unsafe { pyre_object::is_tuple(obj) } || unsafe { pyre_object::w_tuple_len(obj) } != 2
+                {
+                    return Err(crate::PyError::type_error(format!(
+                        "utime: '{what}' must be a tuple of two ints"
+                    )));
+                }
+                Ok((
+                    unsafe { pyre_object::w_tuple_getitem(obj, 0) }.unwrap(),
+                    unsafe { pyre_object::w_tuple_getitem(obj, 1) }.unwrap(),
+                ))
+            };
+        let dur_from_secs = |v: PyObjectRef| -> Result<std::time::Duration, crate::PyError> {
+            let f = crate::builtins::builtin_float(&[v])?;
+            let secs = unsafe { pyre_object::w_float_get_value(f) };
+            std::time::Duration::try_from_secs_f64(secs)
+                .map_err(|_| crate::PyError::value_error("utime: timestamp out of range"))
+        };
+        let dur_from_ns = |v: PyObjectRef| -> Result<std::time::Duration, crate::PyError> {
+            let n = crate::builtins::space_index_w(v)?;
+            if n < 0 {
+                return Err(crate::PyError::value_error("utime: timestamp out of range"));
+            }
+            Ok(std::time::Duration::from_nanos(n as u64))
+        };
+
+        let (access, modified) = match (times, ns) {
+            (Some(_), Some(_)) => {
+                return Err(crate::PyError::value_error(
+                    "utime: you may specify either 'times' or 'ns' but not both",
+                ));
+            }
+            (Some(t), None) => {
+                let (a, m) = unpack_two(t, "times")?;
+                (dur_from_secs(a)?, dur_from_secs(m)?)
+            }
+            (None, Some(n)) => {
+                let (a, m) = unpack_two(n, "ns")?;
+                (dur_from_ns(a)?, dur_from_ns(m)?)
+            }
+            (None, None) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::ZERO);
+                (now, now)
+            }
+        };
+
+        #[cfg(all(windows, feature = "host_env"))]
+        {
+            if dir_fd.is_some() || !follow_symlinks {
+                return Err(crate::PyError::not_implemented(
+                    "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
+                ));
+            }
+            host_os::set_file_times(std::path::Path::new(&path), access, modified)
+                .map_err(|e| io_err(e, &path))?;
+            return Ok(pyre_object::w_none());
+        }
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let c_path = std::ffi::CString::new(path.as_bytes())
+                .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+            rustpython_host_env::posix::set_file_times_at(
+                dir_fd.unwrap_or(libc::AT_FDCWD),
+                &c_path,
+                access,
+                modified,
+                follow_symlinks,
+            )
+            .map_err(|e| io_err(e, &path))?;
+            return Ok(pyre_object::w_none());
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = (access, modified, dir_fd, follow_symlinks, &path);
+            Err(crate::PyError::not_implemented(
+                "utime is unavailable on this platform",
+            ))
+        }
+    }
+    crate::module_ns_store(ns, "utime", crate::make_builtin_function("utime", utime_impl));
 
     // ── posix._path_splitroot(path) → (root, tail) ──
     // Registered only where `sys.platform` is `win32`, the same condition
