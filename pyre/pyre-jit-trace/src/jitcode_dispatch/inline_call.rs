@@ -1711,10 +1711,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if fbw_foriter_inflight_active() {
         let safety = fbw_callee_body_replay_safety(
             body.code,
+            nparams,
             args_all_exact_numeric,
             args_all_exact_plain_int,
             body.num_regs_i,
             body.constants_i,
+            body.num_regs_r,
+            body.constants_r,
             callee_descr_refs,
         );
         let admit = match safety {
