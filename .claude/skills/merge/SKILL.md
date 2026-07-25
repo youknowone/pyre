@@ -108,7 +108,7 @@ Never "commit and fix later". `<MERGE>` must stay green at every commit.
 
 ## Step 5 — Commit on success
 
-When `pyre/check.py` is green, commit with a factual message (no speculation about goals, no `Co-Authored-By`, English only):
+When `pyre/check.py` is green, commit with a factual message (no speculation about goals, no `Co-Authored-By` but use `Assisted-By`, English only):
 
 ```bash
 git add <files>
