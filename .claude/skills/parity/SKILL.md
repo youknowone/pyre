@@ -230,6 +230,6 @@ Keep the tone direct and the citations concrete. No vague "I'll make sure this m
 
 ## Interaction with other mindsets
 
-- The user's `CLAUDE.md` already carries "majit ↔ RPython Parity Rules" (section 1–5). This skill is the stronger form of that: under `/parity`, there is no wiggle room for "Rust language adaptations" except where the RPython line is explicitly cited. If CLAUDE.md and this skill conflict, this skill wins for the duration of the `/parity` invocation.
+- This skill is the strict enforced form of the "First principles" above: under `/parity`, there is no wiggle room for "Rust language adaptations" except where the RPython line is explicitly cited.
 - `/commit` (the commit skill) is compatible — parity auditing should happen before committing, not after.
 - If the user invokes `/parity` inside a larger plan document (e.g. `jtransform_optimize_goto_if_not_port.md`), the plan's existing PRE-EXISTING-ADAPTATION annotations are respected; the audit focuses only on changes introduced since the plan was written.

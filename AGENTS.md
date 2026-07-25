@@ -136,7 +136,7 @@ collection looks more convenient.
    direct port is acceptable only when (a) every alternative has been
    tried, (b) the deviation is the smallest possible, and (c) a comment
    cites the RPython original it stands in for. See the
-   "majit ↔ RPython Parity Rules" section in `~/.claude/CLAUDE.md`.
+   "RPython Parity Rules" section below.
 
 4. **Removing an RPython method to "simplify" things is not allowed.**
    If `optimizer.py` defines `ensure_ptr_info_arg0`, the Rust port has

@@ -108,7 +108,7 @@ Never "commit and fix later". `<MERGE>` must stay green at every commit.
 
 ## Step 5 — Commit on success
 
-When `pyre/check.py` is green, commit with a factual message (CLAUDE.md convention — no speculation about goals, no `Co-Authored-By`, English only):
+When `pyre/check.py` is green, commit with a factual message (no speculation about goals, no `Co-Authored-By`, English only):
 
 ```bash
 git add <files>
@@ -132,7 +132,7 @@ When the user decides to stop (either the diff is empty or the remaining work is
 - Report what landed on `<MERGE>` (`git log upstream/main..<MERGE> --oneline`).
 - Report what is deferred, per-file, with the reason it could not land.
 - Confirm the original `WORK` branch is untouched (`git log <WORK>` unchanged vs. when we started).
-- Do **not** push, merge, or open a PR unless the user explicitly asks — CLAUDE.md rule.
+- Do **not** push, merge, or open a PR unless the user explicitly asks.
 
 ## Hard rules (recap)
 

@@ -34,7 +34,7 @@ Goal: enter the rebase with a clean, conceptually-coherent commit history. Messy
    git rev-parse --verify upstream/main
    ```
 
-2. **Unstaged / untracked changes** — if there is real uncommitted work, commit it. Use the `commit` convention from CLAUDE.md: factual English message, no `Co-Authored-By`, no speculation about goals. If the changes are clearly WIP/scratch that should not land, confirm with the user before discarding or stashing.
+2. **Unstaged / untracked changes** — if there is real uncommitted work, commit it. Use this convention: factual English message, no `Co-Authored-By`, no speculation about goals. If the changes are clearly WIP/scratch that should not land, confirm with the user before discarding or stashing.
 
 3. **Squash WIP noise** — if `git log upstream/main..HEAD` shows obvious fixups, revert-my-last-change, "typo", "trying X" commits, consolidate them with `git rebase -i upstream/main` (**before** the real rebase) or `git reset --soft` + fresh commits. Rationale: during the real rebase, each small WIP commit will re-apply and may re-introduce conflicts that were already resolved one commit later. Squashing these out collapses the noise.
 
@@ -128,7 +128,7 @@ After the rebase completes:
    - For each non-trivial resolution: file:line on our side, file:line upstream consulted, one-sentence justification.
    - Whether `pyre/check.py` is green.
 
-Do **not** push, merge, or force-push unless the user explicitly asks. CLAUDE.md rule.
+Do **not** push, merge, or force-push unless the user explicitly asks.
 
 ## Hard rules (recap)
 
