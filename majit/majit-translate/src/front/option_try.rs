@@ -326,6 +326,20 @@ fn rewire_one_option_try_site(
             },
         });
     }
+    // The niche switch value is the `ne` pointer null-test — a `SomeBool`, so
+    // its exits must carry `ExitCase::Bool` (`Some` = non-null = true, `None` =
+    // null = false).  An `ExitCase::Const(Int)` here would disagree with the
+    // `BoolRepr` exitswitch at rtype (`BoolRepr::convert_const(Int)` → "not a
+    // bool").  The non-niche branch switches on a real `__discriminant`
+    // `FieldRead` (an `Int` tag / `IntegerRepr`), which keeps the `Int` cases.
+    let (some_case, none_case) = if site.niche {
+        (ExitCase::Bool(true), ExitCase::Bool(false))
+    } else {
+        (
+            ExitCase::Const(ConstValue::Int(1)),
+            ExitCase::Const(ConstValue::Int(0)),
+        )
+    };
     graph.set_control_flow_metadata(
         graph.blocks[a].id,
         Some(ExitSwitch::Value(opt_disc)),
@@ -333,13 +347,9 @@ fn rewire_one_option_try_site(
             Link::new_mixed(
                 some_sources.iter().cloned().map(LinkArg::Value).collect(),
                 some_bb,
-                Some(ExitCase::Const(ConstValue::Int(1))),
+                Some(some_case),
             ),
-            Link::new_mixed(
-                Vec::new(),
-                none_bb,
-                Some(ExitCase::Const(ConstValue::Int(0))),
-            ),
+            Link::new_mixed(Vec::new(), none_bb, Some(none_case)),
         ],
     );
     Ok(())

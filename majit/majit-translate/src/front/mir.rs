@@ -2236,6 +2236,17 @@ struct Lowering<'a> {
     /// `front::option_closure_select` post-pass synthesizes (see
     /// [`crate::front::option_closure_select::ClosureSelectSite`]).
     closure_select_sites: Vec<crate::front::option_closure_select::ClosureSelectSite>,
+    /// Result-var ids of niche `Option<NonNull>` discriminant reads folded to
+    /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
+    /// `Rvalue::Discriminant` niche arm).  Such a discriminant is a `SomeBool`
+    /// (the `ne` result), so a `SwitchInt` terminator on it must close with
+    /// `ExitCase::Bool` — not `ExitCase::Const(Int)` — or the bool exitswitch
+    /// disagrees with its exitcases at rtype (`BoolRepr::convert_const(Int)`
+    /// → "not a bool").  `lower_switch` consults this set to route the
+    /// terminator through the `If` (`set_branch`) bool path; genuine
+    /// two-variant enum tag switches (real `__discriminant` reads) are absent
+    /// and keep the `Int`-exitcase path.
+    niche_disc_vars: std::collections::HashSet<u64>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2413,6 +2424,7 @@ impl<'a> Lowering<'a> {
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
+            niche_disc_vars: std::collections::HashSet::new(),
         })
     }
 
@@ -4275,6 +4287,11 @@ impl<'a> Lowering<'a> {
                 if self.tyref_is_niche_option_ptr(&place.ty) {
                     let base = self.resolve_place(mir_bb, place)?;
                     let nullc = self.push_niche_null_ptr(mir_bb);
+                    // The `ne` result is a `SomeBool`; a `SwitchInt` terminator
+                    // on it must close with `ExitCase::Bool`.  Record the
+                    // result-var id so `lower_switch` routes it through the
+                    // `If` bool path instead of the `Int`-exitcase path.
+                    self.niche_disc_vars.insert(res.id());
                     return Ok((
                         Some(OpKind::BinOp {
                             op: "ne".to_string(),
@@ -10594,6 +10611,21 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             SwitchTargets::SwitchInt(_int_ty, arms, default) => {
+                // A `SwitchInt` on a niche `Option<NonNull>` discriminant
+                // switches on the pointer null-test `ne(base, null)` — a
+                // `SomeBool`, not an `Int` tag.  RPython never switches on a
+                // bool: `None`/`Some` on a maybe-null `Ptr` is a True/False
+                // `If` (`ptr_nonzero`).  Route it through `set_branch` so the
+                // bool exitswitch closes with `ExitCase::Bool`, matching the
+                // `If` terminator path; a `SwitchInt` here would emit
+                // `ExitCase::Const(Int)`, which rtype rejects against the
+                // `BoolRepr` exitswitch (`BoolRepr::convert_const(Int)` → "not
+                // a bool").  Genuine two-variant enum tag switches (real
+                // `__discriminant` reads, `Int`/`IntegerRepr`) are not recorded
+                // in `niche_disc_vars` and keep the `Int`-exitcase path below.
+                if self.niche_disc_vars.contains(&discr_var.id()) {
+                    return self.lower_niche_option_switch(mir_bb, bb_id, discr_var, arms, default);
+                }
                 let mut links: Vec<Link> = Vec::new();
                 for (scalar, bb) in arms {
                     let case = scalar_to_const_value(&scalar).ok_or_else(|| {
@@ -10630,6 +10662,69 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Close a `SwitchInt` whose discriminant is a niche `Option<NonNull>`
+    /// null-test (`ne(base, null)`, a `SomeBool`) as a True/False `If` via
+    /// [`FunctionGraph::set_branch`], so the bool exitswitch closes with
+    /// `ExitCase::Bool` instead of `ExitCase::Const(Int)`.  `Some` = tag 1 =
+    /// non-null → the `if_true` arm; `None` = tag 0 = null → the `if_false`
+    /// arm.  A two-variant match lowers to one explicit `(scalar, bb)` arm
+    /// plus a `default` covering the complementary tag, so whichever of {0,1}
+    /// is absent from `arms` is taken from `default` (the same 0/1/default
+    /// triage as [`crate::front::result_exc::split_diamond_exits`]); a
+    /// both-explicit shape (`arms.len() == 2`, no live default) is tolerated.
+    fn lower_niche_option_switch(
+        &mut self,
+        mir_bb: usize,
+        bb_id: BlockId,
+        discr_var: Variable,
+        arms: Vec<(serde_json::Value, u64)>,
+        default: u64,
+    ) -> Result<(), LowerError> {
+        let mut some_bb: Option<u64> = None;
+        let mut none_bb: Option<u64> = None;
+        for (scalar, bb) in &arms {
+            let case = scalar_to_const_value(scalar).ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: niche-Option SwitchInt case scalar shape not supported: {scalar}"
+                ))
+            })?;
+            match case {
+                ConstValue::Int(1) => some_bb = Some(*bb),
+                ConstValue::Int(0) => none_bb = Some(*bb),
+                other => {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: niche-Option SwitchInt has non-0/1 case {other:?}"
+                    )));
+                }
+            }
+        }
+        // The tag absent from `arms` is the `default` target; if both are
+        // explicit there is no live default to place.
+        match (some_bb, none_bb) {
+            (Some(_), None) => none_bb = Some(default),
+            (None, Some(_)) => some_bb = Some(default),
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: niche-Option SwitchInt lacks a 0/1 case"
+                )));
+            }
+        }
+        let some_bb = some_bb.expect("some arm resolved above");
+        let none_bb = none_bb.expect("none arm resolved above");
+        let true_args = self.edge_args(mir_bb, some_bb as usize)?;
+        let false_args = self.edge_args(mir_bb, none_bb as usize)?;
+        self.graph.set_branch(
+            bb_id,
+            discr_var,
+            self.block_id[some_bb as usize],
+            true_args,
+            self.block_id[none_bb as usize],
+            false_args,
+        );
+        Ok(())
     }
 
     fn edge_args(&mut self, from_bb: usize, target_bb: usize) -> Result<Vec<Variable>, LowerError> {
@@ -19666,7 +19761,7 @@ mod tests {
     #[test]
     #[ignore]
     fn option_try_recast_break_arm_real_lookup() {
-        use crate::model::{CallTarget, OpKind};
+        use crate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../build/llbc/pyre-interpreter.ullbc"
@@ -19688,6 +19783,36 @@ mod tests {
         assert_eq!(
             branch_calls, 0,
             "lookup: residual Try::branch Method-call after the recast-break-arm fold"
+        );
+        // `lookup`'s `r#type(obj)?` is a niche `Option<NonNull>` `?`, rewritten
+        // by `option_try` into a `ne` pointer null-test switch.  Because the
+        // switch value is a `SomeBool` (`ne`), the some/none exits MUST carry
+        // `ExitCase::Bool`, not `ExitCase::Const(Int)` — else rtype rejects the
+        // bool exitswitch against Int cases ("not a bool: Int(1)").
+        let mut niche_try_switches = 0usize;
+        for b in &graph.blocks {
+            let Some(ExitSwitch::Value(sw)) = &b.exitswitch else {
+                continue;
+            };
+            let switches_on_ne = b.operations.iter().any(|op| {
+                op.result.as_ref() == Some(sw)
+                    && matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")
+            });
+            if !switches_on_ne {
+                continue;
+            }
+            for l in &b.exits {
+                assert!(
+                    matches!(&l.exitcase, Some(ExitCase::Bool(_))),
+                    "lookup: niche `?` null-test switch exit must be ExitCase::Bool, got {:?}",
+                    l.exitcase
+                );
+            }
+            niche_try_switches += 1;
+        }
+        assert!(
+            niche_try_switches >= 1,
+            "lookup: expected a niche `?` `ne` null-test switch block"
         );
     }
 
@@ -19853,6 +19978,79 @@ mod tests {
         assert_eq!(
             discriminant_reads, 0,
             "gettypeobject: niche Option must not read an aggregate __discriminant"
+        );
+    }
+
+    /// `object_functionstr_type_name` is a pure `match r#type(w_obj) { Some(tp)
+    /// => .., None => .. }` on the niche `Option<NonNull<PyObject>>`.  The
+    /// `match` lowers `Rvalue::Discriminant` to a `ne(base, null_mut())` bool
+    /// null-test and closes the block with a `SwitchInt` on that bool.  Because
+    /// the switch value is a `SomeBool` (`ne`), its exits MUST carry
+    /// `ExitCase::Bool` — not `ExitCase::Const(Int)` — or rtype rejects the
+    /// bool exitswitch against its Int exitcases (`BoolRepr::convert_const(Int)`
+    /// → "not a bool: Int(1)").  Guards the `lower_switch` niche bool-route.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn niche_option_match_switch_closes_with_bool_exitcase() {
+        use crate::model::{ExitCase, ExitSwitch, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "object_functionstr_type_name")
+            .expect("lower object_functionstr_type_name");
+
+        // The niche match's discriminant is a `ne` pointer null-test.  It is
+        // routed through the `If` path (`set_branch`), which wraps the `ne` in
+        // an idempotent `bool` UnaryOp and switches on that wrapped var — so
+        // locate the block whose exitswitch is a `bool` UnaryOp over a `ne`.
+        let ne_result_ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op: name, .. } if name == "ne" => {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut checked = 0usize;
+        for b in &graph.blocks {
+            let Some(ExitSwitch::Value(sw)) = &b.exitswitch else {
+                continue;
+            };
+            // The exitswitch is a `bool(ne)` wrap (set_branch) or the raw `ne`.
+            let switches_on_nulltest = b.operations.iter().any(|op| {
+                op.result.as_ref() == Some(sw)
+                    && match &op.kind {
+                        OpKind::BinOp { op: name, .. } => name == "ne",
+                        OpKind::UnaryOp { op: name, operand, .. } => {
+                            name == "bool" && ne_result_ids.contains(&operand.id())
+                        }
+                        _ => false,
+                    }
+            });
+            if !switches_on_nulltest {
+                continue;
+            }
+            // Every exit of a niche null-test switch must be a bool case, never
+            // an Int const case.
+            for l in &b.exits {
+                assert!(
+                    matches!(&l.exitcase, Some(ExitCase::Bool(_))),
+                    "object_functionstr_type_name: niche null-test switch exit must be \
+                     ExitCase::Bool, got {:?}",
+                    l.exitcase
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 1,
+            "object_functionstr_type_name: expected a niche `ne` null-test switch block"
         );
     }
 }
