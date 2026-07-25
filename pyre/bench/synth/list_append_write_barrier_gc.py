@@ -86,7 +86,30 @@ def none_then_objects():
     return total
 
 
+def big_live_len_regrow():
+    # The resize itself is the case under test: `grow_list_items_block_gc` roots
+    # the OLD BLOCK across the (collecting) allocation of the new one and copies
+    # the items out of it afterwards, rather than rooting each item separately.
+    # A collection landing inside that allocation therefore has to relocate the
+    # block AND update every slot in it — so this drives resizes at the largest
+    # live lengths it can, with fresh young elements and allocation pressure
+    # right up against the growth boundary. Distinct identities per slot catch a
+    # copy that reads pre-collection addresses.
+    r = []
+    for i in range(N * 4):
+        r.append([i, str(i)])
+        if i % 64 == 0:
+            churn(20)
+    assert len(r) == N * 4, len(r)
+    total = 0
+    for i, v in enumerate(r):
+        assert v[0] == i and v[1] == str(i), (i, v)
+        total += v[0]
+    return total
+
+
 print(old_list_young_appends())
 print(interleaved_growth())
 print(strings_and_dicts())
 print(none_then_objects())
+print(big_live_len_regrow())
