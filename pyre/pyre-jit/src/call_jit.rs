@@ -3022,11 +3022,14 @@ pub fn trace_and_compile_from_bridge(
     // `bench/synth/nested_callee_chain_mutation_abort.py`).
     //
     // The CALL_ASSEMBLER callback (`allow_finish_direct_return == false`)
-    // hands a kept stash to its back-to-back blackhole hook through
-    // `CA_WALK_FINISHED_FRAME`, which reconstructs one live frame; keep that
-    // caller on the single-frame arming it already had.
-    let bridge_noreplay_armed = allow_finish_direct_return || !is_multiframe_resume;
-    pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(bridge_noreplay_armed);
+    // cannot carry the concrete itself, so it hands a kept stash to its
+    // back-to-back blackhole hook through `CA_WALK_FINISHED_FRAME`.  That hook
+    // does not rebuild a framestack — it returns the stashed value as the CA
+    // callee's result once `ca_finished_frame == fail_values[0]` proves the
+    // walk's live frame IS the frame whose guard failed — so it takes the same
+    // any-frame-count arming.  Only the guard-state blackhole fallback below it
+    // rebuilds frames, and a kept stash never reaches that path.
+    pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -3097,14 +3100,12 @@ pub fn trace_and_compile_from_bridge(
     // (`jit_blackhole_resume_from_guard`) take the stash and complete the
     // callee with it — the finishframe `DoneWithThisFrame` /
     // `ExitFrameWithExceptionRef` the assembler caller catches
-    // (pyjitpl.py:1688-1698, jitexc.py).
+    // (pyjitpl.py:1688-1698, jitexc.py).  `Terminate` is the LIVE frame's
+    // return at any resume frame count, and the live frame here IS the CA
+    // callee, so the hook's `ca_finished_frame == fail_values[0]` handshake
+    // matches for a multi-frame resume exactly as for a single-frame one.
     if !allow_finish_direct_return {
         if pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_peek().is_some() {
-            debug_assert!(
-                !is_multiframe_resume,
-                "bridge Terminate no-replay stash kept for a multiframe resume \
-                 (frames={num_resume_frames})"
-            );
             let finished_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
             CA_WALK_FINISHED_FRAME.with(|c| c.set(finished_frame));
             if majit_metainterp::majit_log_enabled() {
