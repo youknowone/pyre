@@ -57,6 +57,20 @@ check(reduced[0] is iter and reduced[1][0] is values and reduced[2] == 1,
       "forward reduce state")
 it.__setstate__(-5)
 check(next(it, "STOP") == "STOP", "forward negative setstate exhausts in 3.14")
+check(it.__length_hint__() == 0, "exhausted-by-setstate forward hint")
+check(it.__reduce__() == (iter, ([],)), "exhausted-by-setstate forward reduce")
+# The sentinel keeps the source list, so an in-range state revives the cursor.
+it.__setstate__(1)
+check(next(it, "STOP") == 20, "forward revives from the exhausted sentinel")
+it.__setstate__(99)
+check(it.__reduce__()[2] == len(values), "forward setstate upper clamp")
+check(next(it, "STOP") == "STOP", "forward upper clamp exhausts")
+
+# Running off the end drops the source list, and no state revives that.
+it = iter([7])
+check(list(it) == [7], "forward drain")
+it.__setstate__(0)
+check(next(it, "STOP") == "STOP", "drained forward iterator stays exhausted")
 
 values = [1, 2, 3]
 rit = reversed(values)
@@ -72,5 +86,17 @@ check(reduced[0] is reversed and reduced[1][0] is values and reduced[2] == 0,
       "reverse reduce state")
 rit.__setstate__(999)
 check(next(rit) == 4, "reverse setstate upper clamp")
+rit.__setstate__(-5)
+check(next(rit, "STOP") == "STOP", "reverse negative setstate exhausts")
+check(rit.__length_hint__() == 0, "exhausted-by-setstate reverse hint")
+check(rit.__reduce__() == (reversed, ([],)), "exhausted-by-setstate reverse reduce")
+rit.__setstate__(1)
+check(next(rit, "STOP") == 2, "reverse revives from the exhausted sentinel")
+# A drained reverse iterator keeps its source list and is revivable too.
+rit2 = reversed([5, 6])
+check(list(rit2) == [6, 5], "reverse drain")
+check(rit2.__reduce__() == (reversed, ([],)), "drained reverse reduce")
+rit2.__setstate__(0)
+check(next(rit2, "STOP") == 5, "drained reverse iterator revives")
 
 print("OK")

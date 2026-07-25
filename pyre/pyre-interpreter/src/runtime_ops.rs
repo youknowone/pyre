@@ -1409,7 +1409,8 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
         }
         if is_list_iter(iter) {
             let si = &*(iter as *const W_ListIterObject);
-            return Ok(!si.seq.is_null() && si.index < w_list_len(si.seq) as i64);
+            // A negative cursor is the `__setstate__` exhausted sentinel.
+            return Ok(!si.seq.is_null() && si.index >= 0 && si.index < w_list_len(si.seq) as i64);
         }
         if is_tuple_iter(iter) {
             let si = &*(iter as *const W_TupleIterObject);
@@ -1493,7 +1494,10 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
         }
         if is_list_iter(iter) {
             let si = &mut *(iter as *mut W_ListIterObject);
-            if si.seq.is_null() {
+            // The `__setstate__` sentinel keeps the sequence so a later
+            // in-range state can revive the iterator (mirrors
+            // `baseobjspace::next`).
+            if si.seq.is_null() || si.index < 0 {
                 return Ok(PY_NULL);
             }
             if let Some(item) = w_list_getitem(si.seq, si.index) {

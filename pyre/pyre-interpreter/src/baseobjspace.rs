@@ -2136,7 +2136,10 @@ fn iterator_reduce_tuple(
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(callable);
-    if seq.is_null() {
+    // A negative cursor is the exhausted sentinel the list iterators store,
+    // and `listiter_reduce`/`listreviter_reduce` report the empty producer for
+    // it even while the source list is still referenced.
+    if seq.is_null() || index < 0 {
         // CPython 3.14 retains the concrete producer shape for the
         // specialized string/list iterators; generic sequence, bytes and
         // tuple iterators use the canonical empty tuple.
@@ -2312,12 +2315,16 @@ pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
         if seq.is_null() {
             return Ok(w_none());
         }
-        if index < 0 {
-            pyre_object::w_list_iter_set_seq(args[0], PY_NULL);
-            return Ok(w_none());
-        }
+        // `listiter_setstate`: a negative cursor becomes the -1 exhausted
+        // sentinel rather than being clamped to zero, and an over-long one
+        // stops at the current length.  The source list stays referenced, so a
+        // later in-range `__setstate__` revives the iterator.  PyPy's
+        // `W_AbstractSeqIterObject.descr_setstate` clamps negatives to zero
+        // instead, which resumes iteration from the front.
         let length = pyre_object::w_list_len(seq) as i64;
-        if index > length {
+        if index < 0 {
+            index = -1;
+        } else if index > length {
             index = length;
         }
         pyre_object::w_list_iter_set_index(args[0], index);
@@ -2328,11 +2335,12 @@ pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn list_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_list_iter_seq(args[0]);
-        if seq.is_null() {
+        let index = pyre_object::w_list_iter_index(args[0]);
+        if seq.is_null() || index < 0 {
             return Ok(w_int_new(0));
         }
         Ok(w_int_new(
-            (pyre_object::w_list_len(seq) as i64 - pyre_object::w_list_iter_index(args[0])).max(0),
+            (pyre_object::w_list_len(seq) as i64 - index).max(0),
         ))
     }
 }
@@ -2426,6 +2434,10 @@ pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResul
             index = -1;
         } else if index >= length {
             index = length - 1;
+        } else if index < 0 {
+            // `listreviter_setstate` keeps -1 as the single exhausted
+            // sentinel, so every negative cursor normalizes to it.
+            index = -1;
         }
         pyre_object::w_list_reverse_iter_set_index(args[0], index);
     }
@@ -12576,6 +12588,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let index = pyre_object::w_list_iter_index(obj);
+            // A negative cursor is the `__setstate__` exhausted sentinel; it
+            // keeps the source list so an in-range `__setstate__` can revive
+            // the iterator, unlike running off the end.
+            if index < 0 {
+                return Err(PyError::stop_iteration());
+            }
             if let Some(item) = pyre_object::w_list_getitem(seq, index) {
                 pyre_object::w_list_iter_set_index(obj, index + 1);
                 return Ok(item);
@@ -12595,8 +12613,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(item);
                 }
             }
-            // The descending cursor alone marks exhaustion; the list stays
-            // referenced so `__setstate__` can put the cursor back on it.
+            // `listreviter_next` only parks the -1 sentinel; the source list
+            // stays referenced so `__setstate__` can restart the descent.
             pyre_object::w_list_reverse_iter_set_index(obj, -1);
             return Err(PyError::stop_iteration());
         }
