@@ -41,10 +41,9 @@ pub fn emit_trace_call_int_typed(
     // virtualizable / quasi-immut analyzers; the gap is the trace-side
     // plumbing — pyre-jit-trace helpers live outside the codewriter
     // pipeline so the analyzer's per-callee EI never reaches this
-    // emit site. Until per-helper EI registration lands,
-    // fall back to the conservative `default_effect_info()`
-    // (≡ `effectinfo.MOST_GENERAL` for unanalyzed callees: CanRaise +
-    // all-writes-set bitmasks).
+    // emit site. Until per-helper EI registration lands, the callee is
+    // `graphanalyze.py:109-112`'s no-graph case, so
+    // `default_effect_info()` hands out `effectinfo.MOST_GENERAL`.
     ctx.call_int_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
@@ -65,9 +64,8 @@ pub fn emit_trace_call_float_typed(
 /// exc=False, pure=True)` parity for direct trace emit paths.
 ///
 /// `emit_trace_call_int_typed` calls into the tracer with
-/// `default_effect_info()` (`effectinfo.MOST_GENERAL`, CanRaise +
-/// all-writes-set), so even an `#[elidable_cannot_raise]` callee is
-/// recorded as a plain `CallI`.  This wrapper threads an explicit
+/// `default_effect_info()` (`effectinfo.MOST_GENERAL`), so even an
+/// `#[elidable_cannot_raise]` callee is recorded as a plain `CallI`.  This wrapper threads an explicit
 /// `ElidableCannotRaise` `EffectInfo` through
 /// `record_result_of_call_pure` (`pyjitpl.py:3553-3579`) and patches the
 /// trace to `CallPureI`.

@@ -4425,8 +4425,9 @@ mod tests {
         // call_has_random_effects` then routes through `clean_caches`,
         // so the per-cached-field flush runs and `setfield_gc` survives
         // in front of the call. The test threads `MOST_GENERAL` directly
-        // to exercise the analyzer-absent path orthogonally to the
-        // production `default_effect_info()` shape.
+        // rather than through `default_effect_info()`, which returns the
+        // same constant, so the assertion stays pinned to the shape
+        // under test.
         let sd = size_descr(2);
         let fd = field_descr(11);
         let call_descr = crate::call_descr::make_call_descr_with_effect(

@@ -2944,13 +2944,10 @@ impl JitCodeBuilder {
     ) {
         // pyjitpl.py:2655 do_residual_call invalidates the heapcache from
         // descriptor effects before recording the call. `default_effect_info()`
-        // returns the PyPy `call.py:300-301` `EF_CAN_RAISE` shape with empty
-        // raw sets (`effectinfo.py:293-299` else-branch) + empty bitstrings +
-        // `can_collect=true`, matching the analyzer-empty external-call
-        // outcome (`graphanalyze.py:60 bottom_result()`). Using
-        // `EffectInfo::default()` (also empty) would drop the `CanRaise`
-        // extraeffect, suppressing the `GUARD_NO_EXCEPTION` the walker emits
-        // per `effectinfo.py:236 check_can_raise()`.
+        // returns `EffectInfo::MOST_GENERAL`, the `graphanalyze.py:109-112`
+        // no-analyzed-graph outcome; `check_can_raise()`
+        // (`effectinfo.py:236 extraeffect > EF_CANNOT_RAISE`) stays true so
+        // the walker keeps emitting `GUARD_NO_EXCEPTION`.
         self.residual_call_void_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -3614,8 +3611,8 @@ impl JitCodeBuilder {
             majit_ir::descr::EffectInfo {
                 // effectinfo.py:149-155: `EF_RANDOM_EFFECTS` keeps every
                 // readonly/write descr set as `None`; spread MOST_GENERAL
-                // for the wildcard rather than `default_effect_info()`'s
-                // saturated `Some(vec![0xff; 8])` bitstrings.
+                // directly so the `call_release_gil_target` sentinel below
+                // rides on the same constant.
                 // `(1, 0)` is the unresolved sentinel — the inner
                 // `emit_canonical_call_*_via_target` helper looks up the
                 // `JitCallTarget` from `descrs[fn_ptr_idx]` and calls
@@ -3743,8 +3740,8 @@ impl JitCodeBuilder {
             majit_ir::descr::EffectInfo {
                 // effectinfo.py:149-155: `EF_RANDOM_EFFECTS` keeps every
                 // readonly/write descr set as `None`; spread MOST_GENERAL
-                // for the wildcard rather than `default_effect_info()`'s
-                // saturated `Some(vec![0xff; 8])` bitstrings.
+                // directly so the `call_release_gil_target` sentinel below
+                // rides on the same constant.
                 // `(1, 0)` is the unresolved sentinel — the inner
                 // `emit_canonical_call_*_via_target` helper looks up the
                 // `JitCallTarget` from `descrs[fn_ptr_idx]` and calls

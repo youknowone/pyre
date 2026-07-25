@@ -700,15 +700,11 @@ fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
-        // `EF_CAN_RAISE` — `call.py:300-301 elif self._canraise(op):`
-        // row of `getcalldescr`, fed through
-        // `effectinfo_from_writeanalyze` with the
-        // `graphanalyze.py:60 analyze_external_call` default
-        // (`bottom_result()` = empty set). `effectinfo.py:285` only
-        // force-promotes to `EF_RANDOM_EFFECTS` when
-        // `effects is top_set`; the no-analyzer-output case takes the
-        // `else` branch at `:293-299` and lands at
-        // `extraeffect=CanRaise + Some([])` raw sets.
+        // `EffectInfo::MOST_GENERAL` — the callee has no analyzed
+        // graph, which is `graphanalyze.py:109-112`'s `top_result()`
+        // and `effectinfo.py:285-292`'s `EF_RANDOM_EFFECTS` promotion,
+        // not the `graphanalyze.py:60 analyze_external_call`
+        // `bottom_result()` reserved for external C functions.
         CallFlavor::Plain => majit_metainterp::default_effect_info(),
         // `EF_CANNOT_RAISE` — `call.py:303 else:` row of `getcalldescr`
         // (non-elidable + `_canraise(op) == False`). Same
@@ -865,10 +861,11 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
 /// would push the wrong path back into the residual_call shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallFlavor {
-    /// Plain residual call, conservative `EF_CAN_RAISE` default
-    /// (`rpython/jit/codewriter/effectinfo.py:22`). `call.py:301
-    /// getcalldescr` picks this when the analyzer reports the callee
-    /// can raise but is not elidable / loop-invariant / forces.
+    /// Plain residual call to a callee no analyzer has looked at.
+    /// Resolves to `EffectInfo::MOST_GENERAL` (`EF_RANDOM_EFFECTS`,
+    /// `effectinfo.py:271-273`), the `graphanalyze.py:109-112`
+    /// no-graph `top_result()` outcome. Producers that know more pick
+    /// one of the flavors below.
     Plain,
     /// `EF_CANNOT_RAISE` (`effectinfo.py:19`). `call.py:303 getcalldescr`
     /// picks this on the non-elidable `else` branch when
