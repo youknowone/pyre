@@ -4123,12 +4123,11 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
 /// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// A subclass of a builtin type with a fixed Rust payload (e.g. a subclass
-/// of `array.array`) keeps that native layout and has no mapdict, so the
-/// slot is instead backed by the instance `__dict__` — the same side table
-/// (`mapdict::INSTANCE_DICT`) that already holds the subclass's regular
-/// attributes. `None`/`false` means the receiver has no writable dict.
-pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// Native `str` subclasses carry their PyPy-shaped indexed storage on the
+/// `W_UnicodeObject` itself. Other fixed Rust payloads still fall back to an
+/// exposed instance `__dict__` when their type has one. `None`/`false` means
+/// the receiver has no writable storage.
+pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str, index: u32) -> Option<PyObjectRef> {
     // Python 3.14 permits a native-layout `property` subclass to declare an
     // explicit `__doc__` slot.  PyPy's extended instance layout stores that
     // slot on the object; pyre's equivalent object-resident location is the
@@ -4138,6 +4137,9 @@ pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         return (!value.is_null()).then_some(value);
     }
+    if unsafe { pyre_object::is_str(obj) } {
+        return unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) };
+    }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
         return None;
@@ -4145,9 +4147,18 @@ pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
     unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) }
 }
 
-pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+pub(crate) fn native_slot_set(
+    obj: PyObjectRef,
+    name: &str,
+    index: u32,
+    value: PyObjectRef,
+) -> bool {
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
+        return true;
+    }
+    if unsafe { pyre_object::is_str(obj) } {
+        unsafe { pyre_object::unicodeobject::w_str_slot_set(obj, index as usize, value) };
         return true;
     }
     let w_dict = getdict(obj);
@@ -4158,7 +4169,7 @@ pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) 
     true
 }
 
-pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
+pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> bool {
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         if value.is_null() {
@@ -4166,6 +4177,9 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
         }
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
         return true;
+    }
+    if unsafe { pyre_object::is_str(obj) } {
+        return unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) };
     }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
@@ -8751,7 +8765,11 @@ pub(crate) unsafe fn get(
             crate::objspace::std::mapdict::getslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
-            native_slot_get(obj, pyre_object::w_member_get_name(descr))
+            native_slot_get(
+                obj,
+                pyre_object::w_member_get_name(descr),
+                pyre_object::w_member_get_index(descr),
+            )
         };
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
@@ -8841,7 +8859,7 @@ unsafe fn set(
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
             let slot_name = pyre_object::w_member_get_name(descr);
-            if !native_slot_set(obj, slot_name, value) {
+            if !native_slot_set(obj, slot_name, index, value) {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
                     format!(
@@ -8913,7 +8931,11 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
             crate::objspace::std::mapdict::delslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
-            native_slot_del(obj, pyre_object::w_member_get_name(descr))
+            native_slot_del(
+                obj,
+                pyre_object::w_member_get_name(descr),
+                pyre_object::w_member_get_index(descr),
+            )
         };
         if !removed {
             let slot_name = pyre_object::w_member_get_name(descr);

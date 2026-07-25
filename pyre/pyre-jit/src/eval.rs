@@ -1869,15 +1869,20 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // value (an immortal holder cannot grey an old-gen box), which the
     // `is_managed_heap_object` guard on the edge skips. Managed subclass
     // instances also need the header's `w_class` traced, matching
-    // W_ObjectObject's instance-class edge. No `.with_destructor_fn`: the box
-    // tid's drop glue is the sole reclaimer (a holder destructor would
-    // double-free a box swept before its owner).
+    // W_ObjectObject's instance-class edge. A slots-bearing `str` subclass
+    // also owns a normal list in `w_slots`; tracing that list edge gives the
+    // list's custom tracer ownership of the individual slot values, matching
+    // PyPy's object-resident BaseUserClassMapdict storage. No
+    // `.with_destructor_fn`: the value-box tid's drop glue is the sole
+    // reclaimer (a holder destructor would double-free a box swept before its
+    // owner).
     let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
         object_tid,
         vec![
             pyre_object::pyobject::W_CLASS_OFFSET,
             pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
+            pyre_object::unicodeobject::UNICODE_W_SLOTS_OFFSET,
         ],
     ));
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);

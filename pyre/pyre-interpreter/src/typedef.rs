@@ -11335,7 +11335,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 let found = if unsafe { pyre_object::is_instance(obj) } {
                     unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) }
                 } else {
-                    crate::baseobjspace::native_slot_get(obj, slot_name)
+                    crate::baseobjspace::native_slot_get(obj, slot_name, index)
                 };
                 match found {
                     Some(v) => Ok(v),
@@ -11388,7 +11388,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
                 } else {
                     let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
-                    if !crate::baseobjspace::native_slot_set(obj, slot_name, value) {
+                    if !crate::baseobjspace::native_slot_set(obj, slot_name, index, value) {
                         return Err(crate::PyError::new(
                             crate::PyErrorKind::AttributeError,
                             format!(
@@ -11439,7 +11439,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 let removed = if unsafe { pyre_object::is_instance(obj) } {
                     unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) }
                 } else {
-                    crate::baseobjspace::native_slot_del(obj, slot_name)
+                    crate::baseobjspace::native_slot_del(obj, slot_name, index)
                 };
                 if !removed {
                     return Err(crate::PyError::new(

@@ -21,7 +21,8 @@ use crate::pyobject::*;
 
 /// Python string object.
 ///
-/// Layout: `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len]`
+/// Layout:
+/// `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len | w_slots]`
 /// `byte_len` is the WTF-8 byte count (RPython STR `rstr.py:1226
 /// Array(Char)` parity — `llmodel.py:667 bh_strlen` reads this).
 /// `len` is the codepoint count (RPython UNICODE parity —
@@ -33,6 +34,13 @@ pub struct W_UnicodeObject {
     pub value: *mut Wtf8Buf,
     pub byte_len: usize,
     pub len: usize,
+    /// PyPy `BaseUserClassMapdict` slot storage for a `str` subclass.
+    ///
+    /// Exact strings and subclasses without populated slots keep `PY_NULL`.
+    /// A slots-bearing subclass owns an object-strategy list indexed by the
+    /// `Member.index` from its layout. Keeping this on the object mirrors
+    /// PyPy's `_mapdict_*storage` owner and avoids an address-keyed side table.
+    pub w_slots: PyObjectRef,
 }
 
 /// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
@@ -41,6 +49,8 @@ pub const UNICODE_VALUE_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, va
 pub const UNICODE_BYTE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, byte_len);
 /// Field offset of `len` (codepoint count) for UNICODE UNICODELEN parity.
 pub const UNICODE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, len);
+/// Field offset of the subclass slot-storage list.
+pub const UNICODE_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, w_slots);
 
 /// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
 pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
@@ -113,6 +123,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
+        w_slots: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -148,6 +159,7 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
+        w_slots: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -178,6 +190,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
+        w_slots: PY_NULL,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     if raw.is_null() {
@@ -215,6 +228,7 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
+        w_slots: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -238,6 +252,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         value,
         byte_len,
         len: char_len,
+        w_slots: PY_NULL,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let obj = if raw.is_null() {
@@ -250,6 +265,60 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     };
     crate::gc_hook::maybe_register_finalizer(obj);
     obj
+}
+
+/// Read one app-level `__slots__` entry from a `str` subclass.
+///
+/// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
+/// storage list by `Member.index`.  `PY_NULL` is the unbound-slot sentinel.
+pub unsafe fn w_str_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
+    if slots.is_null() {
+        return None;
+    }
+    unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
+        .filter(|value| !value.is_null())
+}
+
+/// Write one app-level `__slots__` entry on a `str` subclass.
+pub unsafe fn w_str_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(obj);
+    crate::gc_roots::pin_root(value);
+    let obj_slot = crate::gc_roots::shadow_stack_len() - 2;
+    let value_slot = crate::gc_roots::shadow_stack_len() - 1;
+
+    let mut rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let mut slots = unsafe { (*(rooted_obj as *const W_UnicodeObject)).w_slots };
+    if slots.is_null() {
+        slots = crate::listobject::w_list_new(vec![PY_NULL; index + 1]);
+        rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        unsafe { (*(rooted_obj as *mut W_UnicodeObject)).w_slots = slots };
+        crate::gc_hook::try_gc_write_barrier(rooted_obj as *mut u8);
+    } else {
+        while unsafe { crate::listobject::w_list_len(slots) } <= index {
+            unsafe { crate::listobject::w_list_append(slots, PY_NULL) };
+        }
+    }
+    unsafe {
+        crate::listobject::w_list_setitem(
+            slots,
+            index as i64,
+            crate::gc_roots::shadow_stack_get(value_slot),
+        );
+    }
+}
+
+/// Clear one app-level `__slots__` entry on a `str` subclass.
+pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
+    if slots.is_null()
+        || unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
+            .is_none_or(|value| value.is_null())
+    {
+        return false;
+    }
+    unsafe { crate::listobject::w_list_setitem(slots, index as i64, PY_NULL) }
 }
 
 thread_local! {
@@ -446,6 +515,7 @@ mod tests {
         assert_eq!(UNICODE_VALUE_OFFSET, 16);
         assert_eq!(UNICODE_BYTE_LEN_OFFSET, 24);
         assert_eq!(UNICODE_LEN_OFFSET, 32);
+        assert_eq!(UNICODE_W_SLOTS_OFFSET, 40);
     }
 
     #[test]

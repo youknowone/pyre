@@ -12,6 +12,9 @@ MESSAGE_B = b"bbbbb"
 # TCP
 
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+assert type(listener) is socket.socket
+assert isinstance(listener, _socket.socket)
+assert hasattr(listener, "makefile")
 listener.bind(("127.0.0.1", 0))
 listener.listen(1)
 
@@ -26,6 +29,11 @@ recv_a = connection.recv(len(MESSAGE_A))
 recv_b = connector.recv(len(MESSAGE_B))
 assert recv_a == MESSAGE_A
 assert recv_b == MESSAGE_B
+
+raw = connection.makefile("rb", buffering=0)
+connector.send(MESSAGE_A)
+assert raw.read(len(MESSAGE_A)) == MESSAGE_A
+raw.close()
 
 fd = open("README.md", "rb")
 connector.sendfile(fd)
