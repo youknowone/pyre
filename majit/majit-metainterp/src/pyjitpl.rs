@@ -1066,6 +1066,13 @@ pub struct MetaInterp<M: Clone> {
     /// at this header pc — not at the bridge's own `resume_pc`. Recorded when
     /// a loop compiles; queried at `start_bridge_tracing`.
     pub(crate) loop_header_pcs: indexmap::IndexMap<u64, usize>,
+    /// warmstate.py:564-582 `JitCell.get_jit_cell_at_key` analog for the
+    /// merge-point green vocabulary: the header greens (`(ints, refs,
+    /// floats)`) each compiled loop was traced under, keyed by its green key.
+    /// Lets a bridge that closes on a merge point resolve the procedure token
+    /// of the loop living AT that merge point (pyjitpl.py:3005), which the
+    /// `u64` key alone cannot be inverted to.
+    pub(crate) loop_header_greens: indexmap::IndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
     pub(crate) tracing: Option<TraceCtx>,
     /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
     /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
@@ -2433,6 +2440,7 @@ impl<M: Clone> MetaInterp<M> {
             backend: BackendImpl::new(),
             compiled_loops: indexmap::IndexMap::new(),
             loop_header_pcs: indexmap::IndexMap::new(),
+            loop_header_greens: indexmap::IndexMap::new(),
             tracing: None,
             single_pass_outcome: None,
             single_pass_finish: false,
@@ -8193,6 +8201,28 @@ impl<M: Clone> MetaInterp<M> {
     /// Loop-header bytecode pc recorded for a compiled-loop green key.
     pub fn loop_header_pc_for(&self, green_key: u64) -> Option<usize> {
         self.loop_header_pcs.get(&green_key).copied()
+    }
+
+    /// Record the merge-point green constants a compiled loop was traced
+    /// under, so `compiled_key_for_greens` can invert them back to its key.
+    pub fn record_loop_header_greens(
+        &mut self,
+        green_key: u64,
+        greens: (Vec<i64>, Vec<i64>, Vec<i64>),
+    ) {
+        self.loop_header_greens.insert(green_key, greens);
+    }
+
+    /// pyjitpl.py:3005-3006 `ptoken = self.get_procedure_token(greenboxes)` /
+    /// `has_compiled_targets(ptoken)`: the green key of the compiled loop
+    /// whose header greens equal `greens`, or `None` when no loop lives at
+    /// those greens.  Compared element-wise like pyjitpl.py:3912
+    /// `same_greenkey`, over every green rather than the pc alone.
+    pub fn compiled_key_for_greens(&self, greens: &(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64> {
+        self.loop_header_greens
+            .iter()
+            .find(|(key, header)| *header == greens && self.has_compiled_targets(**key))
+            .map(|(key, _)| *key)
     }
 
     /// Actual key the last compile_loop stored under. Returns inner key

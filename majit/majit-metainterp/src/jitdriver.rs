@@ -1997,6 +1997,13 @@ impl<S: JitState> JitDriver<S> {
         meta: S::Meta,
     ) -> crate::CompileOutcome {
         let loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
+        // The merge-point greens this loop closed on — the vocabulary a later
+        // bridge closing at the same merge point will present
+        // (pyjitpl.py:3005). Captured before `compile_loop` drains the ctx.
+        let loop_close_greens = self
+            .meta
+            .trace_ctx()
+            .and_then(|c| c.close_greens.clone().or_else(|| c.header_greens.clone()));
         let loop_green_key = self.current_trace_green_key();
         if crate::closedbg_enabled() {
             eprintln!(
@@ -2024,6 +2031,19 @@ impl<S: JitState> JitDriver<S> {
             if let Some(k) = self.meta.last_compiled_key() {
                 if let Some(hp) = loop_header_pc {
                     self.meta.record_loop_header_pc(k, hp);
+                }
+                // Key the loop by the greens it closed on, so a bridge reaching
+                // this merge point resolves THIS loop's procedure token. Only
+                // `last_compiled_key` is registered: on a cross-loop cut that
+                // is the inner loop the close point belongs to, whereas
+                // `loop_green_key` is the outer trace-start key.
+                if let Some(greens) = loop_close_greens.clone() {
+                    if crate::closedbg_enabled() {
+                        eprintln!("@@@CLOSE LOOP-GREENS key={} greens={greens:?}", k as i64);
+                    }
+                    self.meta.record_loop_header_greens(k, greens);
+                } else if crate::closedbg_enabled() {
+                    eprintln!("@@@CLOSE LOOP-GREENS key={} greens=NONE", k as i64);
                 }
                 // Stash the just-compiled loop's key so the merge-point hook
                 // can arm the CRN/lazy back-edge label entry with the
@@ -2389,13 +2409,40 @@ impl<S: JitState> JitDriver<S> {
                     // pyjitpl.py:2981-2982:
                     //     ptoken = self.get_procedure_token(greenboxes)
                     //     if has_compiled_targets(ptoken): ...
-                    // `greenboxes` is the *current* loop header — i.e. the
-                    // trace ctx's typed green_key after `set_green_key`,
-                    // not the bridge origin from the failed guard.  Bridge
-                    // origin only applies when the trace has not yet been
-                    // retargeted by `reached_loop_header`.
-                    let target_key = self.current_trace_green_key().unwrap_or(bridge_key);
-                    let has_targets = self.meta.has_compiled_targets(target_key);
+                    // `greenboxes` is the *current* merge point's greens — the
+                    // one this trace just reached — not the bridge origin from
+                    // the failed guard.  A bridge that closes on an inner merge
+                    // point (the cross-loop cut) must JUMP into the loop living
+                    // AT that merge point: `pc` is a green, baked into each
+                    // compiled loop as a constant, so jumping into the origin
+                    // loop instead would enter it carrying another pc's reds.
+                    let close_greens = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.close_greens.clone());
+                    let resolved_key = match close_greens.as_ref() {
+                        // Closed on a merge point: the token is the one keyed by
+                        // THOSE greens.  When no compiled loop lives there the
+                        // greenkey simply has no procedure token, and upstream
+                        // keeps tracing / compiles a loop (pyjitpl.py:3012-3060)
+                        // — it never falls back to the origin loop's token.
+                        Some(greens) => self.meta.compiled_key_for_greens(greens),
+                        // No merge-point greens recorded (the walk did not close
+                        // on one): the trace's own key stands in.
+                        None => self.current_trace_green_key(),
+                    };
+                    if crate::closedbg_enabled() {
+                        eprintln!(
+                            "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",
+                            resolved_key.map(|k| k as i64).unwrap_or(-1),
+                            self.current_trace_green_key()
+                                .map(|k| k as i64)
+                                .unwrap_or(-1),
+                        );
+                    }
+                    let has_targets =
+                        resolved_key.is_some_and(|k| self.meta.has_compiled_targets(k));
+                    let target_key = resolved_key.unwrap_or(bridge_key);
                     if crate::closedbg_enabled() {
                         let hp = self
                             .meta

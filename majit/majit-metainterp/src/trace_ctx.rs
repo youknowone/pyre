@@ -293,6 +293,14 @@ pub struct TraceCtx {
     /// `green_key_values`, the back-edge/can_enter_jit key, which carries a
     /// different arity and cannot be compared against a merge point directly.
     pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// pyjitpl.py:3005 `greenboxes` at the merge point the trace actually
+    /// closed on, in the same `(ints, refs, floats)` slot grouping as
+    /// `header_greens`.  Upstream reads `get_procedure_token(greenboxes)` off
+    /// the greens of the merge point just reached, so a bridge that closes on
+    /// an inner merge point must name THAT loop, not the parent it originated
+    /// from.  Set by both close paths; `None` when the trace did not close on
+    /// a merge point.
+    pub(crate) close_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// pyjitpl.py:2979 reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
@@ -1212,6 +1220,7 @@ impl TraceCtx {
                 header_pc: 0,
             }],
             header_greens: None,
+            close_greens: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1289,6 +1298,7 @@ impl TraceCtx {
                 header_pc: 0,
             }],
             header_greens: None,
+            close_greens: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,

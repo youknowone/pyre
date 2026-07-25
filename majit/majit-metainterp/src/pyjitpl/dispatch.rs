@@ -4793,6 +4793,13 @@ where
                             ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
                             ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                         }
+                        // pyjitpl.py:3005 `get_procedure_token(greenboxes)` —
+                        // the greens of the merge point just reached.
+                        ctx.close_greens = Some((
+                            mp_green_ints.clone(),
+                            mp_green_refs.clone(),
+                            mp_green_floats.clone(),
+                        ));
                         // GUARD_FUTURE_CONDITION already emitted unconditionally at
                         // the reached_loop_header entry above (pyjitpl.py:2993).
                         return TraceAction::CloseLoop;
@@ -4845,6 +4852,15 @@ where
                                 // Setting cut_inner_green_key routes compile_loop
                                 // through cross_loop_cut (compile.py:269-270).
                                 ctx.cut_inner_green_key = Some(inner_key);
+                                // pyjitpl.py:3005 `get_procedure_token(greenboxes)`
+                                // reads the greens of the merge point just
+                                // reached — here the INNER loop's, not the
+                                // trace-start header's.
+                                ctx.close_greens = Some((
+                                    mp_green_ints.clone(),
+                                    mp_green_refs.clone(),
+                                    mp_green_floats.clone(),
+                                ));
                                 if capture_walk_reds {
                                     // Single-pass: resume at the inner loop's
                                     // interpreter green pc (the loop variable the
