@@ -505,8 +505,11 @@ unsafe fn alloc_frame_locals_array(
     unsafe { alloc_fixed_array_with_header(len, fill) }
 }
 
+/// Write barrier for a batch of stores into a frame's
+/// `locals_cells_stack_w`: the array is its own GC object, so an old array
+/// receiving young values must join the remembered set.
 #[inline]
-fn remember_frame_locals_array(array: *mut FixedObjectArray) {
+pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
     if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
         pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
     }
@@ -2942,10 +2945,15 @@ impl PyFrame {
         unsafe { (*self.execution_context).get_builtin() }
     }
 
-    /// PyPy-compatible `get_f_back`.
+    /// `frame.f_backref()` — force the caller vref.  `f_backref` holds a
+    /// `jit.virtual_ref`; calling it materializes the caller frame (identity
+    /// at interp level, `force_virtual` once the JIT virtualized it).  Callers
+    /// that need the raw unforced vref (e.g. `ExecutionContext::leave`'s
+    /// `topframeref = frame.f_backref` restore, no parens) read the field
+    /// directly instead.
     #[inline]
     pub fn get_f_back(&self) -> *mut PyFrame {
-        self.f_backref
+        crate::executioncontext::force_vref(self.f_backref)
     }
 
     /// pyframe.py:768-771 `fget_f_builtins` — `self.get_builtin()

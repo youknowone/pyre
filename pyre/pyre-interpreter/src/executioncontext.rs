@@ -17,6 +17,39 @@ fn force_frame(frame: *mut PyFrame) {
     }
 }
 
+/// `_jit_vref.py:48-52` `vref()` = `jit_force_virtual`.
+///
+/// `topframeref` and every frame's `f_backref` hold a `jit.virtual_ref` — at
+/// interpreter level (`_jit_vref.py:40 VRefRepr.lowleveltype = OBJECTPTR`) that
+/// is just the frame pointer itself, so forcing is the identity.  Once the JIT
+/// virtualizes an inlined callee, the slot instead holds a `JitVirtualRef`
+/// whose `virtualref.py:135 force_virtual_if_necessary` materializes the real
+/// frame.  The JIT installs that materialization via
+/// [`register_force_vref_hook`]; interp-level code never stores a
+/// `JitVirtualRef`, so `is_virtual_ref` is always false and this stays the
+/// identity fast path.
+pub type ForceVRefFn = unsafe extern "C" fn(*mut PyFrame) -> *mut PyFrame;
+static FORCE_VREF_HOOK: OnceLock<ForceVRefFn> = OnceLock::new();
+
+pub fn register_force_vref_hook(f: ForceVRefFn) {
+    let _ = FORCE_VREF_HOOK.set(f);
+}
+
+/// Force a vref stored in the frame chain (`topframeref` / `f_backref`).
+/// `virtualref.py:135`: `if inst.typeptr != jit_virtual_ref_vtable: return inst`
+/// (the pointer already *is* the frame) else materialize via `force_virtual`.
+#[inline]
+pub(crate) fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
+    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
+        match FORCE_VREF_HOOK.get() {
+            Some(f) => unsafe { f(ptr) },
+            None => ptr,
+        }
+    } else {
+        ptr
+    }
+}
+
 /// Return the live `PyFrame` as the Python-visible `frame` object passed
 /// to a trace / profile callback.
 ///
@@ -301,8 +334,11 @@ impl ExecutionContext {
 
     #[inline]
     pub fn gettopframe(&self) -> *mut PyFrame {
-        force_frame(self.topframeref);
-        self.topframeref
+        // `executioncontext.py:_gettopframe` → `self.topframeref()` (vref
+        // force), then the virtualizable force materializes the fastlocals.
+        let frame = force_vref(self.topframeref);
+        force_frame(frame);
+        frame
     }
 
     #[inline]
@@ -311,7 +347,7 @@ impl ExecutionContext {
     }
 
     pub fn gettopframe_nohidden(&self) -> *mut PyFrame {
-        let mut frame = self.topframeref;
+        let mut frame = force_vref(self.topframeref);
         while !frame.is_null() {
             force_frame(frame);
             // SAFETY: frame pointers are owned by interpreter call stack and can be
@@ -355,8 +391,10 @@ impl ExecutionContext {
         unsafe {
             (*frame).f_backref = self.topframeref;
         }
-        // `jit.virtual_ref(frame)` — vref allocation, no-op until
-        // jit.virtual_ref is ported.
+        // `self.topframeref = jit.virtual_ref(frame)`.  At interp level
+        // `virtual_ref(frame)` is the frame pointer itself
+        // (`_jit_vref.py:40 lowleveltype = OBJECTPTR`, no allocation); the
+        // JIT rewrites it to a `JitVirtualRef` when it virtualizes the frame.
         self.topframeref = frame;
     }
 
@@ -377,19 +415,26 @@ impl ExecutionContext {
         } else {
             Ok(())
         };
-        let _frame_vref = self.topframeref;
+        let frame_vref = self.topframeref;
         unsafe {
+            // `self.topframeref = frame.f_backref` (no parens — move the raw
+            // caller vref back, do not force it).
             self.topframeref = (*frame).f_backref;
             if (*frame).escaped() || got_exception {
+                // `f_back = frame.f_backref()` — forced (get_f_back forces).
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
                     (*f_back).mark_as_escaped();
                 }
-                // `frame_vref()` — vref force, no-op until jit.virtual_ref is ported.
+                // `frame_vref()` — force the leaving frame's own vref so it
+                // stays reachable after the JIT frame is gone (identity at
+                // interp level).
+                force_vref(frame_vref);
             }
         }
-        // `jit.virtual_ref_finish(frame_vref, frame)` — no-op until
-        // jit.virtual_ref is ported.
+        // `jit.virtual_ref_finish(frame_vref, frame)` — keepalives only at
+        // interp level (both operands are already live in Rust); the JIT
+        // records VIRTUAL_REF_FINISH during tracing.
         self._revdb_leave(got_exception);
         trace_result
     }

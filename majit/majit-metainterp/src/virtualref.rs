@@ -102,6 +102,26 @@ pub struct JitVirtualRef {
 /// upstream's `inst.typeptr == self.jit_virtual_ref_vtable`.
 pub const JIT_VIRTUAL_REF_VTABLE: u64 = 0x4A49_5456_5245_4621; // "JITVREF!"
 
+/// Free-function form of [`VirtualRefInfo::is_virtual_ref`] for callers that
+/// don't hold a `VirtualRefInfo` — e.g. the interpreter's frame-chain force
+/// path (`ExecutionContext::force_vref`).  The check reads only the module
+/// constant `JIT_VIRTUAL_REF_VTABLE`, so no receiver state is needed.
+/// `virtualref.py:94-98 is_virtual_ref(gcref)`.
+///
+/// # Safety
+/// `ptr` must be null or point to a valid object whose first 8 bytes are the
+/// `('super', rclass.OBJECT)` typeptr word.
+#[inline]
+pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
+    unsafe {
+        if ptr.is_null() {
+            return false;
+        }
+        let header = ptr as *const ObjectHeader;
+        (*header).typeptr == JIT_VIRTUAL_REF_VTABLE
+    }
+}
+
 /// `rpython/rlib/jit.py:487 class InvalidVirtualRef(Exception)` —
 /// `force_virtual` raises this when `virtual_token == TOKEN_NONE`
 /// but `forced` is null (`virtualref.py:174-176`).  Pyre's single
@@ -462,13 +482,7 @@ impl VirtualRefInfo {
     /// `ptr` must point to a valid GCREF object whose first 8 bytes
     /// are the typeptr word, or be null.
     pub unsafe fn is_virtual_ref(&self, ptr: *const u8) -> bool {
-        unsafe {
-            if ptr.is_null() {
-                return false;
-            }
-            let header = ptr as *const ObjectHeader;
-            (*header).typeptr == JIT_VIRTUAL_REF_VTABLE
-        }
+        unsafe { ptr_is_virtual_ref(ptr) }
     }
 }
 
