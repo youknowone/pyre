@@ -464,29 +464,19 @@ fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyErro
 /// to build the `PyInit_<name>` symbol from it, so a name outside ASCII is
 /// rejected by the codec before the builtin registry is ever consulted.
 fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
-    if let Ok(name) = unsafe { pyre_object::w_str_get_wtf8(w_name) }.as_str() {
-        if name.is_ascii() {
-            return Ok(name.to_owned());
-        }
+    // Read straight off the buffer: reaching the name through `encode` would
+    // run a `str` subclass's override, which decides which builtin is loaded.
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    if let Some(pos) = name.code_points().position(|cp| cp.to_u32() > 127) {
+        return Err(crate::typedef::unicode_encode_error(
+            "ascii",
+            w_name,
+            pos,
+            pos + 1,
+            "ordinal not in range(128)",
+        ));
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_name);
-    // The strict ascii codec raises here, so the `UnicodeEncodeError` carries
-    // the encoding, object, position and reason `name.encode("ascii")` reports.
-    // Should it ever encode, the bytes are ASCII and the lossy decode below
-    // cannot substitute anything.
-    let encode_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(name_slot),
-        "encode",
-    )?);
-    let encoded = crate::call::call_function_impl_result(
-        pyre_object::gc_roots::shadow_stack_get(encode_slot),
-        &[pyre_object::w_str_new("ascii")],
-    )?;
-    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(encoded) };
-    Ok(String::from_utf8_lossy(bytes).into_owned())
+    Ok(name.to_string())
 }
 
 /// The code object a frozen table entry stands for.  A real frozen module ships
@@ -634,12 +624,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     positional.len()
                 )));
             }
+            let name = frozen_name(positional, "find_frozen")?;
             // `withdata: bool(accept={int})` — any object, read for truth.
             let withdata = match crate::builtins::kwarg_get(kwargs, "withdata") {
                 Some(value) => crate::baseobjspace::is_true(value)?,
                 None => false,
             };
-            let name = frozen_name(positional, "find_frozen")?;
             let Some(entry) = served_frozen_module(&name) else {
                 return Ok(pyre_object::w_none());
             };
