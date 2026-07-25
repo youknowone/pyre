@@ -7834,10 +7834,16 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // self._pure_lookup_where_with_method_cache(name, version_tag)`.  The
     // tuple is split across two single-register elidable residuals over the
     // same cache entry (see `_pure_lookup_class_with_method_cache`), so the
-    // thread-local `MethodCache` read stays off the trace surface and the
-    // lookup folds to a `CALL_PURE_R` instead of aborting the trace.  The
-    // interned, immortal `w_name` (`box_str_constant`) is the green token the
-    // trace folds on; both residuals share it.
+    // `MethodCache` read stays off the trace surface and the lookup folds to
+    // a `CALL_PURE_R` instead of aborting the trace.  The interned, immortal
+    // `w_name` (`box_str_constant`) is the green token the trace folds on;
+    // both residuals share it.  Upstream reads the pair atomically because it
+    // returns one tuple, whereas each residual here takes the cache mutex
+    // separately, so a concurrent `mutated()` can land between them.  That is
+    // no weaker than the `version_tag` promotion above, which is likewise
+    // only stable while no other thread invalidates the type: both halves are
+    // then read under a tag that is no longer current, exactly as a lookup
+    // that had completed one instruction earlier would have been.
     let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
     let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {
