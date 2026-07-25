@@ -1,10 +1,10 @@
 //! _winapi module — partial port of `lib_pypy/_winapi.py`.
 //!
-//! The Windows build reports `sys.platform == "win32"` while `posix` is the
-//! installed filesystem module, so `os.name` is `"posix"` and the stdlib's
-//! `os.name == "nt"` branches stay dormant while its `sys.platform` ones do
-//! not.  Those reach for `_winapi`, and without the module `import shutil`
-//! — hence `tempfile`, and everything downstream — fails outright.
+//! The Windows build reports `sys.platform == "win32"` and installs the posix
+//! module under `os.name == "nt"`, so both the stdlib's `os.name == "nt"` and
+//! its `sys.platform == "win32"` branches are live.  The latter reach for
+//! `_winapi`, and without the module `import shutil` — hence `tempfile`, and
+//! everything downstream — fails outright.
 //!
 //! The one name a shutil call then goes on to need is
 //! `NeedCurrentDirectoryForExePath`, which `shutil.which` invokes on every
