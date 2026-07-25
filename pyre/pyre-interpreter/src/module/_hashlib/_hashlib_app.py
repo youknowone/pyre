@@ -23,6 +23,8 @@ _BLOCK_SIZE = {
 
 class HASH:
     def __init__(self, name, data=b""):
+        import _hashlib
+        _hashlib._check_digest_name(name)
         self._name = name
         self._data = bytearray()
         if data:

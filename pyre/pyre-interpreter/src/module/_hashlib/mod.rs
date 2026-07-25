@@ -54,6 +54,23 @@ fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
+/// `HASH(name)` name check.  OpenSSL resolves the digest when the context is
+/// created, so an unknown name is reported there rather than when the digest
+/// is finally taken.
+fn check_digest_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name_obj = args.first().copied().unwrap_or_else(w_none);
+    if !unsafe { is_str(name_obj) } {
+        return Err(crate::PyError::type_error("digest name must be a string"));
+    }
+    let name = crate::baseobjspace::str_utf8_w(name_obj)?;
+    if !ALGORITHMS.contains(&name) {
+        return Err(unsupported_digestmod(&format!(
+            "unsupported hash type {name}"
+        )));
+    }
+    Ok(w_none())
+}
+
 /// Build a `PyError` raising `_hashlib.UnsupportedDigestmodError` with `msg`.
 /// `hmac.py` catches this to fall back to its pure-Python HMAC, so the OpenSSL
 /// HMAC entry points always raise it: we have no streaming HMAC primitive.
@@ -137,6 +154,7 @@ crate::py_module! {
     },
     functions: {
         "_oneshot_digest" / * = oneshot_digest,
+        "_check_digest_name" / 1 = check_digest_name,
         "compare_digest" / 2 = compare_digest,
         "hmac_new" / * = hmac_new,
         "hmac_digest" / * = hmac_digest,
