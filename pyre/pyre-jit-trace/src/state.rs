@@ -5491,7 +5491,12 @@ impl PyreSym {
 /// records VIRTUAL_REF(box, cindex), and pushes
 /// [virtualbox, vrefbox] onto virtualref_boxes.
 ///
-/// Called from metainterp push_inline_frame (executioncontext.enter parity).
+/// Upstream's caller is `executioncontext.py:89 enter`, which the tracer
+/// reaches by tracing through the interpreter's own frame-entry code.  The
+/// pyre walker builds its inline levels itself and never traces `enter`, so
+/// this has no caller yet and `virtualref_boxes` stays empty in every live
+/// trace.  Wiring it is a prerequisite for the multi-frame blackhole adopt
+/// (`try_adopt_multi_frame_blackhole`, `trace.rs`).
 pub(crate) fn opimpl_virtual_ref(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
@@ -11953,13 +11958,11 @@ mod tests {
 /// (`rpython/jit/metainterp/pyjitpl.py`) for pyre.  RPython constructs
 /// and pushes the callee `MIFrame` directly inside `perform_call`; pyre
 /// returns this struct from the trace step so the framestack mutation
-/// happens in `MetaInterpreter::push_inline_frame` after the trace
-/// handler releases its borrow on `MetaInterpFrame`.  No upstream
-/// counterpart.
+/// happens after the trace handler releases its borrow on
+/// `MetaInterpFrame`.  No upstream counterpart.
 pub struct PendingInlineFrame {
     pub sym: PyreSym,
     pub concrete_frame: pyre_interpreter::pyframe::PyFrame,
-    pub drop_frame_opref: Option<OpRef>,
     pub green_key: u64,
     /// Raw `(code_ptr, target_pc)` greenkey components for element-
     /// wise recursion-depth comparison. `green_key` above is the u64
@@ -12038,8 +12041,9 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// the bridge's root concrete frame.
 ///
 /// `parent_frames` is the OUTER chain (immediate parent first) the drain
-/// builds from the framestack; `push_inline_frame` stamps
-/// `parent_frames.first().pending_result_*` with the caller result slot.
+/// builds from the framestack.  The caller result slot travels in this
+/// struct's own `caller_result_stack_idx` / `caller_result_type`; nothing
+/// stamps `parent_frames.first().pending_result_*`, which stays `None`.
 pub(crate) fn assemble_bridge_inline_pending(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
@@ -12149,10 +12153,6 @@ pub(crate) fn assemble_bridge_inline_pending(
     PendingInlineFrame {
         sym,
         concrete_frame,
-        // No virtual_ref for a reconstructed frame: the forward trace's
-        // virtual_ref was already finished/encoded; None skips the
-        // opimpl_virtual_ref emission in push_inline_frame.
-        drop_frame_opref: None,
         // The reconstructed frame represents the same inlined call the
         // forward trace pushed at function entry; match its (code, 0)
         // greenkey identity for recursion-depth + inline-position tracking.
@@ -12313,11 +12313,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
     }
 
     Some((pending, argboxes_r))
-}
-
-pub enum InlineTraceStepAction {
-    Trace(TraceAction),
-    PushFrame(PendingInlineFrame),
 }
 
 pub fn execute_inline_residual_call(

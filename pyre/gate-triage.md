@@ -118,7 +118,7 @@ upstream lines:
 | gate | orthodox side | outcome |
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
-| PYRE_FBW_MULTIFRAME | **ON** | keep; the ON path is the port, and it is unfinished |
+| PYRE_FBW_MULTIFRAME | **ON** | keep; the ON path is the port, it is unfinished, and §1 measures it as never reached by the corpus |
 | PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
 The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
@@ -187,7 +187,29 @@ keeps inlined callee frames unmaterialized (`fbw_strict_fold_frame_reg`,
 upstream does not have — a consequence of pyre's virtual-callee-frame inlining —
 plus per-frame vable binding, since `PyjitplBlackholeFrameConfig` stamps one
 shared `virtualizable_ptr` onto every frame in the chain and the adopt writes
-only `last_instr`.
+only `last_instr`.  A third item sits below both: `try_adopt_multi_frame_blackhole`
+(`pyre-jit-trace/src/trace.rs`) declines outright when the recovered chain is not
+rooted at the walked frame, and names the `jit.virtual_ref` emit at the inline
+push as the prerequisite.  That emit does not exist — `opimpl_virtual_ref` /
+`_finish` are ported in both `majit-metainterp/src/pyjitpl.rs` and
+`pyre-jit-trace/src/state.rs`, and **neither has a caller outside a `#[test]`**,
+so `virtualref_boxes` is empty and no live trace records a `VIRTUAL_REF`.
+
+**Measured 2026-07-25: the multi-frame path has no corpus coverage.**  The
+vable-escape latch site was instrumented and all **318** benchmarks
+(`pyre/bench` + `pyre/bench/synth`) run under `PYRE_FBW_MULTIFRAME=1`.  The site
+is reached in **3 benches** (`getframe_escape_flush_writethrough_regression`,
+`synth/getframe_inlined_callee_own_frame`, `synth/getframe_stored_fback_walk`),
+5 events each, and **all 15 have `inline_subwalk=false`** — every one takes the
+single-frame arm and adopts.  `build_multi_frame_miframe` is therefore never
+called, the image is never latched, and the adopt never sees a candidate.  So
+flipping `_MULTIFRAME` ON is a no-op across the corpus, none of the three items
+above is exercised, and any port of them would be unvalidatable until a
+benchmark that reaches `inline_subwalk=true` at a vable escape exists.  Building
+that benchmark is the prerequisite for the rest.  Note the multi-frame latch is
+nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
+`_BLACKHOLE_RESUME` to stay ON.  The pre-existing `[s2-gate]` eprintln (under
+`PYRE_FBW_DEBUG_ABORT`) already reports `inline_subwalk` at that site.
 
 ## §2 — Not gates (11): Rust identifiers, not env vars
 
@@ -229,7 +251,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retire once the multi-frame twin (`_MULTIFRAME`) lands and the escape/replay fallback is no longer the only other leg |
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement was conditioned on the multi-frame twin (`_MULTIFRAME`) landing, but §1 now measures that twin as having zero corpus coverage, so the condition is unevaluable — keep the gate and re-open the question only once a benchmark reaches `inline_subwalk=true` at a vable escape |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
