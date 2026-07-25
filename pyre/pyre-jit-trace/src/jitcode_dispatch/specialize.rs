@@ -1325,6 +1325,20 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     }
 }
 
+/// The tuple `descr_getargs` would build from an exception's `args_w` list.
+/// Built only to read the representation `newtuple` picks off it, so the caller
+/// keeps the shape and drops the tuple.
+unsafe fn args_tuple_shape_probe(stored: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    let len = unsafe { pyre_object::w_list_len(stored) };
+    let items = (0..len)
+        .map(|index| {
+            unsafe { pyre_object::w_list_getitem(stored, index as i64) }
+                .unwrap_or(pyre_object::PY_NULL)
+        })
+        .collect();
+    pyre_object::w_tuple_new(items)
+}
+
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
@@ -1408,6 +1422,35 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         {
             return Ok(None);
         }
+        // `descr_getargs` copies `args_w` through `newtuple`, which picks the
+        // tuple representation from the arity and the element types.  Ask
+        // `newtuple` itself which shape this read produces, rather than second-
+        // guessing its dispatch, and settle it here — before any guard is
+        // recorded, so a decline stays clean (a bail-out after the class pin
+        // would leave the caller reading this attribute as already guarded).
+        //
+        // Only the shape crosses into the emit below; the probe tuple is
+        // dropped rather than held, since nothing roots it across the guards.
+        let args_specialised_oo = if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args
+        {
+            let ob_type = unsafe { (*args_tuple_shape_probe(stored)).ob_type };
+            if std::ptr::eq(
+                ob_type,
+                &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+            ) {
+                true
+            } else if std::ptr::eq(ob_type, &pyre_object::TUPLE_TYPE) {
+                false
+            } else {
+                // The unboxed arity-2 specialisations (`Cls_ii` / `Cls_ff`)
+                // hold machine values in their inline fields, which this copy
+                // has no unboxed operand for.  Only an Object-strategy `args_w`
+                // holding exactly two plain ints or two plain floats gets here.
+                return Ok(None);
+            }
+        } else {
+            false
+        };
         walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
         let raw_value = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -1502,7 +1545,17 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                         .unwrap_or(pyre_object::PY_NULL),
                 );
             }
-            let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items);
+            // Emit the representation `newtuple` picks, settled above.  Emitting
+            // the array-backed shape for an arity the runtime specialises leaves
+            // the trace disagreeing with its own record-time concrete, and the
+            // `except <tuple>:` match fold — which dispatches on that concrete's
+            // layout — then guards for a shape this trace never builds, so the
+            // loop aborts instead of compiling.
+            let tuple = if args_specialised_oo {
+                crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, items[0], items[1])
+            } else {
+                crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items)
+            };
             let concrete_tuple = pyre_object::w_tuple_new(concrete_items);
             ctx.trace_ctx.set_opref_concrete(
                 tuple,

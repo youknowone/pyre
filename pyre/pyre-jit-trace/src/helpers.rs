@@ -657,6 +657,44 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     list
 }
 
+/// Trace-visible `W_SpecialisedTupleObject_oo` construction from two boxed
+/// items — the shape `makespecialisedtuple2` builds for an arity-2 tuple whose
+/// elements are not both plain ints or both plain floats.
+///
+/// `newtuple` picks the representation, so a fold that reproduces a `newtuple`
+/// must pick the same one: emitting the array-backed shape for an arity the
+/// runtime specialises leaves the trace disagreeing with its own record-time
+/// concrete, and a consumer that dispatches on the concrete's layout (the
+/// `except <tuple>:` match fold) then guards for a shape the trace never
+/// builds.
+///
+/// `ob_type` is the JIT vtable and differs per variant so `GuardClass` can
+/// dispatch on the inline-field layout; Python-level `type()` reads `w_class`,
+/// which every variant shares at the public `tuple` typedef.
+pub fn emit_specialised_tuple_oo_inline(ctx: &mut TraceCtx, value0: OpRef, value1: OpRef) -> OpRef {
+    let tuple = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::specialised_tuple_oo_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(tuple);
+    let w_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    if !w_class.is_null() {
+        let w_class = ctx.const_ref(w_class as i64);
+        let class_descr = crate::descr::specialised_tuple_oo_w_class_descr();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, w_class], class_descr.clone());
+        ctx.heapcache_setfield_cached(tuple, class_descr.index(), w_class);
+    }
+    for (value, descr) in [
+        (value0, crate::descr::specialised_tuple_oo_value0_descr()),
+        (value1, crate::descr::specialised_tuple_oo_value1_descr()),
+    ] {
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, value], descr.clone());
+        ctx.heapcache_setfield_cached(tuple, descr.index(), value);
+    }
+    tuple
+}
+
 /// Trace-visible canonical `W_TupleObject` construction from boxed items.
 /// This is the allocation half of `W_BaseException.descr_getargs`: the raw
 /// `args_w` list is copied into a fresh tuple on every public attribute read.
