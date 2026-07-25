@@ -1236,14 +1236,28 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
 
 /// FBW fold of the UNPACK_SEQUENCE two-residual lowering (`unpack_sequence_fn`
 /// validator + per-index `unpack_item_fn` reader emitted by the codewriter
-/// UNPACK_SEQUENCE arm) for an arity-2 specialised int tuple: guard the
-/// `spec_ii` class once, then read `value0` / `value1` directly
-/// (`getfield_gc_pure_i` + `wrapint`) so the unpacked items stay unboxed ints
-/// through the downstream BINARY_OP int fold — the walker analogue of the
-/// retired MIFrame `W_SpecialisedTupleObject_ii` value0/value1 reads. Returns
-/// `Ok(Some(()))` when folded (the caller returns `Continue`); `Ok(None)` to
-/// fall through to the opaque residual record, which stays correct for any
-/// other shape — so a non-foldable sequence is not declined.
+/// UNPACK_SEQUENCE arm) for an arity-2 specialised tuple: guard the
+/// specialisation's class once, then read `value0` / `value1` directly instead
+/// of leaving three opaque `CALL_MAY_FORCE` residuals in the loop.
+///
+/// `objspace.py:519-523 fixedview` reaches `tolist()` for every
+/// `W_AbstractTupleObject`, and `specialisedtupleobject.py:32,58-64 tolist`
+/// unrolls over `_immutable_fields_` value slots, so upstream traces the whole
+/// unpack inline and the optimizer virtualizes the pair away. Both arity-2
+/// layouts are covered here because `makespecialisedtuple2`
+/// (`specialisedtupleobject.py:169-179`) never falls back to a plain tuple:
+///   * `ii` — `value0`/`value1` are inline machine ints, so the read is
+///     `getfield_gc_pure_i` + `wrapint` and the items stay unboxed through the
+///     downstream BINARY_OP int fold (the walker analogue of the retired
+///     MIFrame `W_SpecialisedTupleObject_ii` reads);
+///   * `oo` — `wraps[i]` for an object slot is the identity
+///     (`specialisedtupleobject.py:26-27`), so the `getfield_gc_r` result is
+///     already the item. This is the layout a `divmod(long, long)` result pair
+///     takes, since neither half satisfies `is_plain_int1`.
+///
+/// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
+/// `Ok(None)` to fall through to the opaque residual record, which stays
+/// correct for any other shape — so a non-foldable sequence is not declined.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -1268,29 +1282,27 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     let Some(concrete_seq) = walker_concrete_ref_object(ctx, seq) else {
         return Ok(None);
     };
-    // Only the arity-2 int specialised tuple is folded today; any other shape
-    // falls through to the opaque residual (correct, slower).
+    // Both arity-2 specialisations fold; any other shape (a plain tuple, a
+    // longer unpack, a list) falls through to the opaque residual (correct,
+    // slower).
     let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
         as *const pyre_object::pyobject::PyType;
-    if !std::ptr::eq(unsafe { (*concrete_seq).ob_type }, spec_ii) {
+    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
+        as *const pyre_object::pyobject::PyType;
+    let seq_type = unsafe { (*concrete_seq).ob_type };
+    let is_oo = std::ptr::eq(seq_type, spec_oo);
+    if !is_oo && !std::ptr::eq(seq_type, spec_ii) {
         return Ok(None);
     }
+    let spec_type = if is_oo { spec_oo } else { spec_ii };
     match helper {
         majit_ir::PyreHelperKind::UnpackSequence => {
-            // `spec_ii` is always arity 2, so the class guard subsumes the
-            // exact-length check `unpack_sequence_fn` performs.
+            // Either specialisation is always arity 2, so the class guard
+            // subsumes the exact-length check `unpack_sequence_fn` performs.
             if int_val != 2 {
                 return Ok(None);
             }
-            if !ctx.trace_ctx.heap_cache().is_class_known(seq) {
-                let type_const = ctx.trace_ctx.const_int(spec_ii as i64);
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[seq, type_const], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(seq, spec_ii as i64);
-            }
+            walker_guard_specialised_pair_class(ctx, op_pc, seq, spec_type)?;
             // Pass `seq` through as the validated tuple; the per-index
             // `unpack_item_fn` reads below fold off it.
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, seq)?;
@@ -1300,13 +1312,29 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
             if !(0..2).contains(&int_val) {
                 return Ok(None);
             }
+            // Normally the partner `unpack_sequence_fn` fold already guarded
+            // the class (its validated-tuple passthrough reg == `seq`), in
+            // which case this is a no-op; guard here too so a fold that only
+            // catches the item reads still proves the layout it loads from.
+            walker_guard_specialised_pair_class(ctx, op_pc, seq, spec_type)?;
+            if is_oo {
+                let descr = if int_val == 0 {
+                    crate::descr::specialised_tuple_oo_value0_descr()
+                } else {
+                    crate::descr::specialised_tuple_oo_value1_descr()
+                };
+                // `wraps[i]` is the identity for an object slot, so the field
+                // read is the whole item — no re-boxing, and no `may_force`
+                // execution needed to recover a box identity.
+                let item = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, seq, descr);
+                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
+                return Ok(Some(()));
+            }
             // Authentic boxed element (small-int caching / identity); fall
             // through to the opaque residual if it cannot be executed.
             let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
                 return Ok(None);
             };
-            // The class was already guarded by the partner `unpack_sequence_fn`
-            // fold (its validated-tuple passthrough reg == `seq`).
             let descr = if int_val == 0 {
                 crate::descr::specialised_tuple_ii_value0_descr()
             } else {
@@ -1337,6 +1365,29 @@ unsafe fn args_tuple_shape_probe(stored: pyre_object::PyObjectRef) -> pyre_objec
         })
         .collect();
     pyre_object::w_tuple_new(items)
+}
+
+/// `guard_class(seq, spec)` for one of the arity-2 tuple specialisations,
+/// emitted once per traced `seq` — the heap cache turns every later fold on the
+/// same register into a no-op, the way upstream's optimizer keeps a single
+/// class guard for a value it already proved.
+fn walker_guard_specialised_pair_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq: OpRef,
+    spec_type: *const pyre_object::pyobject::PyType,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.heap_cache().is_class_known(seq) {
+        return Ok(());
+    }
+    let type_const = ctx.trace_ctx.const_int(spec_type as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardClass, &[seq, type_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(seq, spec_type as i64);
+    Ok(())
 }
 
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
