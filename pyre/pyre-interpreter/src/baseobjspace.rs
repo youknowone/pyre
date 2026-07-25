@@ -13123,11 +13123,7 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__set__")?;
         let obj = args[1];
-        let value = if args.len() > 2 {
-            args[2]
-        } else {
-            pyre_object::PY_NULL
-        };
+        let value = args[2];
         let fset = w_property_get_fset(prop);
         if fset.is_null() || is_none(fset) {
             return Err(property_no_accessor(prop, obj, "setter")?);

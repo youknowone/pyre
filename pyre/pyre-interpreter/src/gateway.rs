@@ -683,10 +683,11 @@ pub unsafe fn builtin_code_set_owner(obj: PyObjectRef, owner: &'static MethodOwn
     unsafe { (*(obj as *mut BuiltinCode)).owner = owner };
 }
 
-/// Invoke a `BuiltinCode` after applying the receiver check its owning type
-/// requires.  Every dispatch path — the interpreter's call paths, the JIT's
-/// residual call, and the bound-method fast paths — goes through here, so a
-/// call can never reach the implementation with an unchecked receiver.
+/// Invoke a `BuiltinCode` after applying the receiver and arity checks its
+/// registration requires.  Every dispatch path — the interpreter's call paths,
+/// the JIT's residual call, and the bound-method fast paths — goes through
+/// here, so a call can never reach the implementation with an unchecked
+/// receiver or a slice the implementation is not written for.
 ///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.
@@ -704,7 +705,52 @@ pub unsafe fn builtin_code_call(
             return Err(receiver_mismatch(owner, unsafe { (*code).name }, args));
         }
     }
+    // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
+    // count the implementation was registered for; `HOPELESS`,
+    // `PASSTHROUGHARGS1` and the `FLATPYCALL` bit all exceed 4.  A body with a
+    // fixed arity indexes its slice directly, so a call that supplies a
+    // different number of arguments is rejected before the body runs.  The
+    // slice length is the positional count on every call but a keyword one, so
+    // the trailing marker dict is only looked for once a length already
+    // mismatched.
+    let arity = unsafe { (*code).fast_natural_arity } as usize;
+    if arity <= 4 && args.len() != arity {
+        let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+        if positional.len() != arity {
+            return Err(arity_mismatch(unsafe { &*code }, arity, positional.len()));
+        }
+    }
     unsafe { ((*code).func)(args) }
+}
+
+/// The `_match_signature` wording (argument.py:283-297) for a call whose
+/// positional count does not match the implementation's.  The qualified name
+/// follows `func.qualname`: a method descriptor reports `type.name`, a
+/// module-level builtin its bare name.
+///
+/// The too-few form omits the `: 'name'` tail upstream appends, because a
+/// builtin registered by arity alone carries no parameter names.
+#[cold]
+#[inline(never)]
+fn arity_mismatch(code: &BuiltinCode, expected: usize, given: usize) -> crate::PyError {
+    let qualname = match unsafe { code.owner.as_ref() } {
+        Some(owner) => format!("{}.{}", owner.type_name, code.name),
+        None => code.name.to_string(),
+    };
+    let message = if given > expected {
+        format!(
+            "{qualname}() takes {expected} positional argument{} but {given} {} given",
+            if expected == 1 { "" } else { "s" },
+            if given == 1 { "was" } else { "were" },
+        )
+    } else {
+        let missing = expected - given;
+        format!(
+            "{qualname}() missing {missing} required positional argument{}",
+            if missing == 1 { "" } else { "s" },
+        )
+    };
+    crate::PyError::type_error(message)
 }
 
 /// Python 3.14 fills a type's slots with `wrapper_descriptor`s and its

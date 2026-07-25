@@ -1798,11 +1798,7 @@ pub fn make_builtin_type_with_layout(
 /// If cls is a subclass of int, returns a W_ObjectObject with the
 /// int value stored internally (for int subclasses like IntFlag).
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = if args.is_empty() {
-        std::ptr::null_mut() as PyObjectRef
-    } else {
-        args[0]
-    };
+    let cls = new_descr_class(args, "int")?;
     // intobject.py _new_int → check_user_subclass
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
         if let Some(w_int) = gettypefor(&pyre_object::INT_TYPE) {
@@ -1844,11 +1840,7 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// returns a fresh W_FloatObject with `w_class = cls` so `type(obj) == cls`
 /// and `__ceil__`/`__floor__`/`__trunc__` dunders on the subclass dispatch.
 fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = if args.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        args[0]
-    };
+    let cls = new_descr_class(args, "float")?;
     // floatobject.py descr__new__: `w_x` is positional-only, so a surplus
     // positional or any keyword is rejected by builtinclass_new_args_check
     // (skipped when a subtype overrides __init__, which absorbs the surplus).
@@ -1880,11 +1872,7 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = if args.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        args[0]
-    };
+    let cls = new_descr_class(args, "complex")?;
     let value = crate::builtins::builtin_complex(&args[1..])?;
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return Ok(value);
@@ -1925,6 +1913,15 @@ pub(crate) fn make_new_descr(
     // stamped at type-finalisation via `stamp_new_descr_self`.
     let f = crate::gateway::make_builtin_function_as_builtin("__new__", func);
     pyre_object::w_staticmethod_new(f)
+}
+
+/// `typeobject.c tp_new_wrapper` — `__new__` takes the class to instantiate
+/// as its first argument, so a call without one is rejected before the body
+/// reads the value positionals behind it.
+fn new_descr_class(args: &[PyObjectRef], type_name: &str) -> Result<PyObjectRef, crate::PyError> {
+    args.first().copied().ok_or_else(|| {
+        crate::PyError::type_error(format!("{type_name}.__new__(): not enough arguments"))
+    })
 }
 
 /// Wrap a `maketrans` builtin function in a staticmethod descriptor.
@@ -3164,8 +3161,12 @@ fn super_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 fn super_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // The owning type is bound as `args[0]`; `obj` is required and the class
+    // it is looked up on is optional.
+    crate::type_methods::arity_at_least(args, "__get__", 1)?;
+    crate::type_methods::arity_at_most(args, "__get__", 2)?;
     let self_ = args[0];
-    let obj = args.get(1).copied().unwrap_or_else(w_none);
+    let obj = args[1];
     let bound = unsafe { pyre_object::descriptor::w_super_get_obj(self_) };
     if !bound.is_null() || unsafe { pyre_object::is_none(obj) } {
         return Ok(self_);
@@ -8611,8 +8612,10 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
             ns,
             "__get__",
             make_builtin_function("__get__", |args| {
+                crate::type_methods::arity_at_least(args, "__get__", 1)?;
+                crate::type_methods::arity_at_most(args, "__get__", 2)?;
                 let w_self = args[0];
-                let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                let w_obj = args[1];
                 let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
                 let w_obj_is_none = !w_obj.is_null() && unsafe { pyre_object::is_none(w_obj) };
                 let none_type = crate::typedef::r#type(pyre_object::w_none())
@@ -12816,7 +12819,11 @@ fn init_property_type(ns: PyObjectRef) {
         ),
         (
             "__set__",
-            make_builtin_function("__set__", crate::baseobjspace::property_descr_set_impl),
+            make_builtin_function_with_arity(
+                "__set__",
+                crate::baseobjspace::property_descr_set_impl,
+                3,
+            ),
         ),
         (
             "__delete__",
@@ -13801,8 +13808,9 @@ fn init_int_type(ns: PyObjectRef) {
             ),
         )
     };
+    // A getset `fget` is always called as `(descriptor, receiver)`.
     let denom_getter =
-        make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 1);
+        make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 2);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -13921,7 +13929,6 @@ fn init_int_type(ns: PyObjectRef) {
         ("__rmod__", int_dunder_rmod),
         ("__divmod__", int_dunder_divmod),
         ("__rdivmod__", int_dunder_rdivmod),
-        ("__rpow__", int_dunder_rpow),
         ("__lshift__", int_dunder_lshift),
         ("__rlshift__", int_dunder_rlshift),
         ("__rshift__", int_dunder_rshift),
@@ -13941,14 +13948,19 @@ fn init_int_type(ns: PyObjectRef) {
             )
         };
     }
-    // `__pow__` takes an optional modulus, so it is variadic.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__pow__",
-            make_builtin_function("__pow__", int_dunder_pow),
-        )
-    };
+    // `__pow__` and `__rpow__` take an optional modulus, so they are variadic.
+    for (name, func) in [
+        ("__pow__", int_dunder_pow as DunderFn),
+        ("__rpow__", int_dunder_rpow),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, func),
+            )
+        };
+    }
     for (name, func) in [
         ("__eq__", int_dunder_eq as DunderFn),
         ("__ne__", int_dunder_ne),
@@ -14219,14 +14231,25 @@ fn init_complex_type(ns: PyObjectRef) {
         ("__rmul__", complex_dunder_rmul),
         ("__truediv__", complex_dunder_truediv),
         ("__rtruediv__", complex_dunder_rtruediv),
-        ("__pow__", complex_dunder_pow),
-        ("__rpow__", complex_dunder_rpow),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
                 make_builtin_function_with_arity(name, func, 2),
+            )
+        };
+    }
+    // `__pow__` and `__rpow__` take an optional modulus, so they are variadic.
+    for (name, func) in [
+        ("__pow__", complex_dunder_pow as DunderFn),
+        ("__rpow__", complex_dunder_rpow),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, func),
             )
         };
     }
@@ -14670,7 +14693,7 @@ fn init_float_type(ns: PyObjectRef) {
         )
     };
     // Binary arithmetic dunders (forward + reflected).  float has no
-    // bitwise ops; `__pow__` takes no modulus.
+    // bitwise ops.
     for (name, func) in [
         ("__add__", float_dunder_add as DunderFn),
         ("__radd__", float_dunder_radd),
@@ -14686,14 +14709,26 @@ fn init_float_type(ns: PyObjectRef) {
         ("__rmod__", float_dunder_rmod),
         ("__divmod__", float_dunder_divmod),
         ("__rdivmod__", float_dunder_rdivmod),
-        ("__pow__", float_dunder_pow),
-        ("__rpow__", float_dunder_rpow),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
                 make_builtin_function_with_arity(name, func, 2),
+            )
+        };
+    }
+    // A float rejects a non-`None` modulus, but still accepts the argument,
+    // so `__pow__` and `__rpow__` are variadic.
+    for (name, func) in [
+        ("__pow__", float_dunder_pow as DunderFn),
+        ("__rpow__", float_dunder_rpow),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, func),
             )
         };
     }
@@ -16930,7 +16965,8 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             unsafe { pyre_object::type_name_of(pos[0]) }
         )));
     }
-    assert!(pos.len() >= 3, "replace() takes at least 2 arguments");
+    crate::type_methods::arity_at_least(pos, "replace", 2)?;
+    crate::type_methods::arity_at_most(pos, "replace", 3)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let old = require_bytes_like(pos[1])?;
     let new = require_bytes_like(pos[2])?;
@@ -18894,7 +18930,20 @@ fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `bytearrayobject.py descr_releasebuffer` — the Python 3.12
 /// `__release_buffer__` protocol entry for a released bytearray export.
 fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    unsafe { pyre_object::bytearrayobject::w_bytearray_exports_decref(args[0]) };
+    // `bytearray_releasebuffer` drops one export, so the view handed back has
+    // to be one this bytearray exported — the export count is an invariant
+    // the accessor asserts, and Python may pass anything.
+    unsafe {
+        if !pyre_object::memoryview::is_w_memoryview(args[1]) {
+            return Err(crate::PyError::type_error("expected a memoryview object"));
+        }
+        if !std::ptr::eq(pyre_object::memoryview::w_memoryview_backing(args[1]), args[0]) {
+            return Err(crate::PyError::value_error(
+                "memoryview's buffer is not this object",
+            ));
+        }
+        pyre_object::bytearrayobject::w_bytearray_exports_decref(args[0]);
+    }
     Ok(pyre_object::w_none())
 }
 

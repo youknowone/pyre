@@ -65,9 +65,9 @@ crate::py_module! {
         "DEBUG_LEAK"          => w_int_new(38),
     },
     functions: {
-        // `interp_gc.py:7-26 collect` — argument `generation` ignored per
-        // upstream.
-        "collect"       / 1 = |_| {
+        // `interp_gc.py:7-26 collect` — the optional `generation` argument is
+        // ignored per upstream.
+        "collect"       / * = |_| {
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
@@ -112,7 +112,8 @@ crate::py_module! {
             };
             Ok(w_bool_from(enabled))
         },
-        "get_objects"   / 1 = |_| Ok(w_list_new(vec![])),
+        // `generation` is optional.
+        "get_objects"   / * = |_| Ok(w_list_new(vec![])),
         "get_referrers" / * = |_| Ok(w_list_new(vec![])),
         "get_referents" / * = |_| Ok(w_list_new(vec![])),
         "set_threshold" / 0 = |_| Ok(w_none()),

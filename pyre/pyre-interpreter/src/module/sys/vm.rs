@@ -1494,11 +1494,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "getsizeof",
-        make_builtin_function_with_arity(
+        make_builtin_function(
             "getsizeof",
             |args| {
-                if unsafe { pyre_object::is_str(args[0]) } {
-                    let method = crate::baseobjspace::getattr_str(args[0], "__sizeof__")?;
+                let Some(&w_obj) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "getsizeof() takes at least 1 argument (0 given)",
+                    ));
+                };
+                if unsafe { pyre_object::is_str(w_obj) } {
+                    let method = crate::baseobjspace::getattr_str(w_obj, "__sizeof__")?;
                     return crate::call::call_function_impl_result(method, &[]);
                 }
                 match args.get(1).copied() {
@@ -1508,7 +1513,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     )),
                 }
             },
-            1,
         ),
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes

@@ -9806,14 +9806,14 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "readline",
-            make_builtin_function_with_arity("readline", file_method_readline, 1),
+            make_builtin_function("readline", file_method_readline),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "readlines",
-            make_builtin_function_with_arity("readlines", file_method_readlines, 1),
+            make_builtin_function("readlines", file_method_readlines),
         )
     };
     unsafe {

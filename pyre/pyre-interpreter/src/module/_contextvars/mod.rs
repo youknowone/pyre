@@ -60,10 +60,12 @@ fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         obj,
         "get",
         // `W_ContextVar.get(*default)` raises LookupError when no
-        // current value and no default supplied.
+        // current value and no default supplied.  Both accessors live in the
+        // instance dict, which is read without the descriptor protocol, so
+        // they receive no bound receiver.
         crate::make_builtin_function("get", |args| {
-            if args.len() > 1 {
-                return Ok(args[1]);
+            if let Some(&w_default) = args.first() {
+                return Ok(w_default);
             }
             Err(crate::PyError::lookup_error(
                 "context variable has no value and no default supplied",
@@ -73,7 +75,7 @@ fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = crate::baseobjspace::setattr_str(
         obj,
         "set",
-        crate::make_builtin_function_with_arity("set", |_| Ok(w_none()), 2),
+        crate::make_builtin_function_with_arity("set", |_| Ok(w_none()), 1),
     );
     Ok(obj)
 }

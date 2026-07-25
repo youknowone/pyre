@@ -415,7 +415,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(
             ns,
             "poll",
-            crate::make_builtin_function_with_arity(
+            // A module-level function, not a descriptor: `selectors.py` keeps
+            // it as a class attribute (`_selector_cls = select.poll`) and
+            // calling it through the instance must not bind a receiver.
+            crate::make_module_builtin_function_with_arity(
                 "poll",
                 |_args| Ok(Poll::allocate(Poll::default())),
                 0,

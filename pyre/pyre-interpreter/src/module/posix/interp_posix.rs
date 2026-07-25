@@ -1541,7 +1541,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "get_terminal_size",
-        crate::make_builtin_function_with_arity(
+        crate::make_builtin_function(
             "get_terminal_size",
             |_args| {
                 let (cols, rows) = {
@@ -1562,7 +1562,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 };
                 Ok(make_terminal_size(cols, rows))
             },
-            0,
         ),
     );
     // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
