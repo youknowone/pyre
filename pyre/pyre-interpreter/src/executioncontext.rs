@@ -351,6 +351,8 @@ impl ExecutionContext {
         // builtins_module, matching a fresh PyPy ExecutionContext.
         ec.builtin_dict_cache = std::cell::Cell::new(pyre_object::PY_NULL);
         ec.sys_exc_value = pyre_object::PY_NULL;
+        // executioncontext.py:53 — a fresh ExecutionContext starts at 0.
+        ec.coroutine_origin_tracking_depth = 0;
         ec.current_gen_or_coroutine = pyre_object::PY_NULL;
         ec.w_asyncgen_firstiter_fn = pyre_object::PY_NULL;
         ec.w_asyncgen_finalizer_fn = pyre_object::PY_NULL;

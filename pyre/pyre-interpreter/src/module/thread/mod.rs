@@ -707,11 +707,24 @@ mod handle_class {
                 if is_none(timeout) {
                     None
                 } else if is_float(timeout) {
-                    Some(Duration::from_secs_f64(
-                        floatobject::w_float_get_value(timeout).max(0.0),
-                    ))
+                    // os_lock.py:33-39 parse_acquire_args — a timeout past the
+                    // microsecond clock's range is an OverflowError, never a
+                    // native abort.  The negated comparison rejects NaN too.
+                    let secs = floatobject::w_float_get_value(timeout);
+                    if !(secs <= TIMEOUT_MAX) {
+                        return Err(crate::PyError::overflow_error(
+                            "timeout value is too large",
+                        ));
+                    }
+                    Some(Duration::from_secs_f64(secs.max(0.0)))
                 } else if is_int(timeout) {
-                    Some(Duration::from_secs(w_int_get_value(timeout).max(0) as u64))
+                    let secs = w_int_get_value(timeout);
+                    if secs as f64 > TIMEOUT_MAX {
+                        return Err(crate::PyError::overflow_error(
+                            "timeout value is too large",
+                        ));
+                    }
+                    Some(Duration::from_secs(secs.max(0) as u64))
                 } else {
                     return Err(crate::PyError::type_error(
                         "timeout must be a number or None",
@@ -857,6 +870,18 @@ mod local_class {
         #[staticmethod]
         fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::typedef::check_user_subclass(type_object(), cls)?;
+            // os_local.py:81 rejects construction arguments before
+            // `allocate_instance`, and does so for every subtype that inherits
+            // `object.__init__` — not just for the exact type — so a refused
+            // construction never reaches `_register_in_ec` (os_local.py:40).
+            if args.len() > 1
+                && unsafe { crate::baseobjspace::lookup_where_class_uncached(cls, "__init__") }
+                    == Some(crate::typedef::w_object())
+            {
+                return Err(crate::PyError::type_error(
+                    "Initialization arguments are not supported",
+                ));
+            }
             // os_local.py installs the first dictionary before app-level
             // __init__ is entered, preventing recursive initialization.
             let dicts = pyre_object::w_dict_new();
@@ -872,15 +897,6 @@ mod local_class {
             });
             unsafe { (*obj).w_class = cls };
             register_local_in_current_ec(obj);
-
-            // The base `_local` has no app-level initializer accepting arguments.
-            // Subclass initialization is dispatched by the ordinary type call
-            // after this allocator returns, exactly as for PyPy's TypeDef.
-            if args.len() > 1 && cls == type_object() {
-                return Err(crate::PyError::type_error(
-                    "Initialization arguments are not supported",
-                ));
-            }
             Ok(obj)
         }
 
@@ -1260,7 +1276,10 @@ fn stack_size(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let old = STACK_SIZE.load(Ordering::Relaxed);
     if let Some(&arg) = args.first() {
-        let size = unsafe { w_int_get_value(arg) };
+        // `@unwrap_spec(size=int)` (os_thread.py:216) unwraps through
+        // `space.int_w`, which rejects a non-integer instead of reading its
+        // payload word as one.
+        let size = crate::baseobjspace::int_w(arg)?;
         if size < 0 || (size != 0 && size < 32_768) {
             return Err(crate::PyError::value_error(format!(
                 "size not valid: {size} bytes"
