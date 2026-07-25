@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 // `Path` is used only by the host_env source/package loaders; keep it gated
 // so an host_env-off build does not warn on an unused import. `PathBuf`
 // appears in the host_env-independent module-search surface
@@ -1549,15 +1550,6 @@ pub fn set_sys_argv(args: &[String]) {
 thread_local! {
     static SYS_ARGV_PENDING: std::cell::Cell<pyre_object::PyObjectRef> =
         const { std::cell::Cell::new(pyre_object::PY_NULL) };
-    static SYS_NO_SITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_NO_USER_SITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_IGNORE_ENVIRONMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_ISOLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_DEV_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_UTF8_MODE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
-    static SYS_SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_OPTIMIZE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
-    static SYS_DONT_WRITE_BYTECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The directory prepended to `sys.path` at startup (`config->sys_path_0`):
     /// the script's directory, or the cwd for `-c` / `-m`.  Captured once by
     /// `init_sys_path`; read by the shadowing check, which must not see later
@@ -1565,16 +1557,31 @@ thread_local! {
     static SYS_PATH_0: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+// The launcher flags belong to the interpreter, not to whichever thread
+// happened to parse the command line: `space.sys.get_flag(...)` reads them
+// off the one `space`.  Keeping them process-global means a reader on any
+// thread — a codec lookup, `sys.flags`, an embedder calling in — observes
+// the values the launcher recorded instead of the per-thread default.
+static SYS_NO_SITE: AtomicBool = AtomicBool::new(false);
+static SYS_NO_USER_SITE: AtomicBool = AtomicBool::new(false);
+static SYS_IGNORE_ENVIRONMENT: AtomicBool = AtomicBool::new(false);
+static SYS_ISOLATED: AtomicBool = AtomicBool::new(false);
+static SYS_DEV_MODE: AtomicBool = AtomicBool::new(false);
+static SYS_UTF8_MODE: AtomicI64 = AtomicI64::new(0);
+static SYS_SAFE_PATH: AtomicBool = AtomicBool::new(false);
+static SYS_OPTIMIZE: AtomicI64 = AtomicI64::new(0);
+static SYS_DONT_WRITE_BYTECODE: AtomicBool = AtomicBool::new(false);
+
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
 /// before the first `import sys`.
 pub fn set_no_site(no_site: bool) {
-    SYS_NO_SITE.with(|p| p.set(no_site));
+    SYS_NO_SITE.store(no_site, Ordering::Relaxed);
 }
 
 /// Read the `-S` flag for `sys.flags.no_site`.
 pub fn no_site_flag() -> bool {
-    SYS_NO_SITE.with(|p| p.get())
+    SYS_NO_SITE.load(Ordering::Relaxed)
 }
 
 /// Record the command-line flags consumed by `app_main.py` before `sys` is
@@ -1591,38 +1598,38 @@ pub fn set_runtime_flags(
     optimize: i64,
     dont_write_bytecode: bool,
 ) {
-    SYS_NO_USER_SITE.with(|p| p.set(no_user_site));
-    SYS_IGNORE_ENVIRONMENT.with(|p| p.set(ignore_environment));
-    SYS_ISOLATED.with(|p| p.set(isolated));
-    SYS_DEV_MODE.with(|p| p.set(dev_mode));
-    SYS_UTF8_MODE.with(|p| p.set(utf8_mode));
-    SYS_SAFE_PATH.with(|p| p.set(safe_path));
-    SYS_OPTIMIZE.with(|p| p.set(optimize));
-    SYS_DONT_WRITE_BYTECODE.with(|p| p.set(dont_write_bytecode));
+    SYS_NO_USER_SITE.store(no_user_site, Ordering::Relaxed);
+    SYS_IGNORE_ENVIRONMENT.store(ignore_environment, Ordering::Relaxed);
+    SYS_ISOLATED.store(isolated, Ordering::Relaxed);
+    SYS_DEV_MODE.store(dev_mode, Ordering::Relaxed);
+    SYS_UTF8_MODE.store(utf8_mode, Ordering::Relaxed);
+    SYS_SAFE_PATH.store(safe_path, Ordering::Relaxed);
+    SYS_OPTIMIZE.store(optimize, Ordering::Relaxed);
+    SYS_DONT_WRITE_BYTECODE.store(dont_write_bytecode, Ordering::Relaxed);
 }
 
 pub fn no_user_site_flag() -> bool {
-    SYS_NO_USER_SITE.with(|p| p.get())
+    SYS_NO_USER_SITE.load(Ordering::Relaxed)
 }
 
 pub fn ignore_environment_flag() -> bool {
-    SYS_IGNORE_ENVIRONMENT.with(|p| p.get())
+    SYS_IGNORE_ENVIRONMENT.load(Ordering::Relaxed)
 }
 
 pub fn isolated_flag() -> bool {
-    SYS_ISOLATED.with(|p| p.get())
+    SYS_ISOLATED.load(Ordering::Relaxed)
 }
 
 pub fn dev_mode_flag() -> bool {
-    SYS_DEV_MODE.with(|p| p.get())
+    SYS_DEV_MODE.load(Ordering::Relaxed)
 }
 
 pub fn utf8_mode_flag() -> i64 {
-    SYS_UTF8_MODE.with(|p| p.get())
+    SYS_UTF8_MODE.load(Ordering::Relaxed)
 }
 
 pub fn safe_path_flag() -> bool {
-    SYS_SAFE_PATH.with(|p| p.get())
+    SYS_SAFE_PATH.load(Ordering::Relaxed)
 }
 
 /// `-O` / `-OO` / PYTHONOPTIMIZE level for the default compile `optimize`
@@ -1630,20 +1637,22 @@ pub fn safe_path_flag() -> bool {
 /// docstrings), clamped into the compiler's byte-wide field.  Levels above 2
 /// behave as 2.
 pub fn optimize_flag() -> u8 {
-    SYS_OPTIMIZE.with(|p| p.get()).clamp(0, i64::from(u8::MAX)) as u8
+    SYS_OPTIMIZE
+        .load(Ordering::Relaxed)
+        .clamp(0, i64::from(u8::MAX)) as u8
 }
 
 /// The raw optimization level for `sys.flags.optimize`, mirroring a large
 /// `PYTHONOPTIMIZE` value verbatim; `optimize_flag` clamps this for the
 /// compiler.
 pub fn optimize_level() -> i64 {
-    SYS_OPTIMIZE.with(|p| p.get())
+    SYS_OPTIMIZE.load(Ordering::Relaxed)
 }
 
 /// `-B` / PYTHONDONTWRITEBYTECODE, driving `sys.flags.dont_write_bytecode` and
 /// `sys.dont_write_bytecode`.
 pub fn dont_write_bytecode_flag() -> bool {
-    SYS_DONT_WRITE_BYTECODE.with(|p| p.get())
+    SYS_DONT_WRITE_BYTECODE.load(Ordering::Relaxed)
 }
 
 /// Called from sys module init to pick up any pending argv.
