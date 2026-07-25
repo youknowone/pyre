@@ -215,10 +215,18 @@ impl<'c> Lowerer<'c> {
             }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
                 let binding = self.lower_value_expr(expr)?;
-                if !matches!(binding.kind, BindingKind::Int) {
-                    return None;
+                match binding.kind {
+                    BindingKind::Int => self.lower_int_cast(binding, ty),
+                    // A FLOAT operand is the `cast_int_to_float` arm above run
+                    // backwards. Only a word-width target lowers: Rust saturates
+                    // an `as` cast at the TARGET type's bounds, so `300.0 as i8`
+                    // is `127`, which a float->i64 followed by an int narrowing
+                    // (`44`) would not reproduce.
+                    BindingKind::Float if is_word_width_int(ty) => {
+                        self.lower_float_to_int_cast(binding)
+                    }
+                    _ => None,
                 }
-                self.lower_int_cast(binding, ty)
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
@@ -2055,6 +2063,33 @@ impl<'c> Lowerer<'c> {
         Some(Binding {
             reg,
             kind: BindingKind::Float,
+            depends_on_stack: binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Lower a `<float> as i64` cast to RPython's `cast_float_to_int`
+    /// (`bhimpl_cast_float_to_int`), the inverse of
+    /// [`Self::lower_int_to_float_cast`]. The operand is read from the float
+    /// bank and truncated toward zero into the int bank; the result is an int
+    /// binding. `UnaryI` is the op-kind label, as for the neighbouring
+    /// `convert_float_bytes_to_longlong`; the float bank of the SOURCE and the
+    /// int bank of the result are carried by the `Register`s, which is what
+    /// liveness/regalloc read.
+    fn lower_float_to_int_cast(&mut self, binding: Binding) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                vec![Register::float(src_reg)],
+                vec![Register::int(reg)],
+            ),
+            quote! { __builder.record_cast_float_to_int(#reg, #src_reg); },
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
             depends_on_stack: binding.depends_on_stack,
             struct_type: None,
         })

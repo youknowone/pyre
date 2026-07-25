@@ -4450,6 +4450,19 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// Narrow a float-bank value to the int bank — RPython `cast_float_to_int`
+    /// (`blackhole.py:801-810 bhimpl_cast_float_to_int`). The inverse of
+    /// [`Self::record_cast_int_to_float`]: a VALUE cast that truncates toward
+    /// zero, NOT the `convert_float_bytes_to_longlong` bitcast below. Same
+    /// `f>i` operand crossing — float source, int result, `[src][dst]`.
+    pub fn record_cast_float_to_int(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_float_reg(src);
+        self.write_insn("cast_float_to_int/f>i");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
     /// Reinterpret a float's 64-bit pattern as an int — RPython
     /// `convert_float_bytes_to_longlong` (`blackhole.py:828-830`). A bitcast
     /// (`f>i`), NOT a value cast: float source, int result, `[src][dst]` layout.

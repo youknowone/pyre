@@ -6866,6 +6866,7 @@ where
             jitcode::insns::BC_FLOAT_GT => self.trace_compare_f(ctx, OpCode::FloatGt),
             jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
             jitcode::insns::BC_CAST_INT_TO_FLOAT => self.trace_cast_int_to_float(ctx),
+            jitcode::insns::BC_CAST_FLOAT_TO_INT => self.trace_cast_float_to_int(ctx),
             jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG => {
                 self.trace_convert_float_bytes_to_longlong(ctx)
             }
@@ -7562,6 +7563,28 @@ where
         let opref = ctx.record_op(OpCode::CastIntToFloat, &[src]);
         ctx.set_opref_concrete(opref, majit_ir::Value::Float(fvalue));
         self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
+    }
+
+    /// `cast_float_to_int/f>i`: truncate a float-bank value toward zero into the
+    /// int bank — the inverse of `trace_cast_int_to_float`, and a VALUE cast, not
+    /// the bitcast below. `[src][dst]`. The float travels as its `i64` bits, so
+    /// the concrete value is `f64::from_bits(bits) as i64`, matching
+    /// `bhimpl_cast_float_to_int` (`blackhole.py:801-810`) exactly — including
+    /// Rust's saturating behaviour on non-finite and out-of-range inputs, which
+    /// `execute_cast_const` deliberately refuses to constant-fold so the runtime
+    /// stays the single source of that policy.
+    fn trace_cast_float_to_int(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_float_reg(src_idx);
+        let ivalue = f64::from_bits(bits as u64) as i64;
+        let opref = ctx.record_op(OpCode::CastFloatToInt, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(ivalue));
+        self.set_int_reg(dst, Some(opref), Some(ivalue));
     }
 
     /// `convert_float_bytes_to_longlong/f>i`: reinterpret a float's 64-bit

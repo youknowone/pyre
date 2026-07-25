@@ -41,7 +41,7 @@ mod reexports {
         extract_pat_switch_case_tokens, extract_pat_value_tokens, extract_stmts,
         inline_builder_path, inline_call_tokens, inline_call_tokens_void, inline_float_arg_tokens,
         inline_int_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, int_arg_regs,
-        is_supported_float_type, is_supported_int_cast, is_supported_ref_type,
+        is_supported_float_type, is_supported_int_cast, is_supported_ref_type, is_word_width_int,
         opcode_for_assign_binop, opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f,
         stmt_has_loop_control, typed_call_arg_tokens,
     };
