@@ -6282,10 +6282,9 @@ pub extern "C" fn bh_unbound_local_error_fn(w_code_ptr: i64, name_idx: i64) -> i
     } else {
         "<cell>"
     };
-    pyre_interpreter::PyError::unbound_local_error_with_name(
-        format!("cannot access local variable '{name}' where it is not associated with a value"),
-        name,
-    )
+    pyre_interpreter::PyError::unbound_local_error(format!(
+        "cannot access local variable '{name}' where it is not associated with a value"
+    ))
     .to_exc_object() as i64
 }
 

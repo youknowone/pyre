@@ -666,11 +666,12 @@ impl PyError {
         err
     }
 
-    /// UnboundLocalError(NameError) carrying the undefined local name.
-    pub fn unbound_local_error_with_name(msg: impl Into<String>, name: &str) -> Self {
-        let mut err = Self::new(PyErrorKind::UnboundLocalError, msg);
-        err.w_name_context = pyre_object::w_str_new(name);
-        err
+    /// UnboundLocalError(NameError) for an unbound local.  The undefined name
+    /// rides only in the message: `format_exc_check_arg` stamps the `name`
+    /// slot when the raised class is exactly `NameError`, so an
+    /// `UnboundLocalError` reaches Python with `name` still `None`.
+    pub fn unbound_local_error(msg: impl Into<String>) -> Self {
+        Self::new(PyErrorKind::UnboundLocalError, msg)
     }
 
     /// A ModuleNotFoundError carrying the unresolved module `name` so

@@ -1843,7 +1843,7 @@ pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
     if is_free {
         crate::PyError::name_error_with_name(message, name)
     } else {
-        crate::PyError::unbound_local_error_with_name(message, name)
+        crate::PyError::unbound_local_error(message)
     }
 }
 

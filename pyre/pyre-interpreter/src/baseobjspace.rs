@@ -6726,10 +6726,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             // Shared `name` attribute for the kinds that expose it —
-            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`,
-            // and `W_AttributeError` (Python 3.10+).  Read from the shared
-            // `w_exc_name` slot (default `None`); falls through to normal
-            // attribute lookup on every other exception kind.
+            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`
+            // (and `W_UnboundLocalError`, which subclasses it and so inherits
+            // the descriptor), and `W_AttributeError` (Python 3.10+).  Read
+            // from the shared `w_exc_name` slot (default `None`); falls
+            // through to normal attribute lookup on every other exception
+            // kind.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
@@ -6737,6 +6739,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     pyre_object::interp_exceptions::ExcKind::ImportError
                         | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
                     let stored =
@@ -9469,8 +9472,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 }
             }
             // Shared writable `name` slot for ImportError / ModuleNotFoundError
-            // / NameError / AttributeError; the matching getattr arm reads it
-            // back.
+            // / NameError (and its UnboundLocalError subclass) / AttributeError;
+            // the matching getattr arm reads it back.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
@@ -9478,6 +9481,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     pyre_object::interp_exceptions::ExcKind::ImportError
                         | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
                     unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
@@ -9611,7 +9615,7 @@ pub unsafe fn exception_attr_slot_fold(
         // vref force it feeds is unported; the fold tracks that getter, so both
         // sides gain the mark together.
         "__traceback__" => ExceptionAttrSlot::Traceback,
-        // `name` shares the `w_exc_name` slot across the four kinds whose getattr
+        // `name` shares the `w_exc_name` slot across the kinds whose getattr
         // arm reads it; other kinds keep the regular attribute fall-through.
         "name"
             if matches!(
@@ -9619,6 +9623,7 @@ pub unsafe fn exception_attr_slot_fold(
                 pyre_object::interp_exceptions::ExcKind::ImportError
                     | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                     | pyre_object::interp_exceptions::ExcKind::NameError
+                    | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
                     | pyre_object::interp_exceptions::ExcKind::AttributeError
             ) =>
         {

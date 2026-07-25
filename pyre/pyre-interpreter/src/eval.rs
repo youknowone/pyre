@@ -1925,12 +1925,9 @@ impl LocalOpcodeHandler for PyFrame {
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
         let value = self.locals_w()[idx];
         if value.is_null() {
-            return Err(PyError::unbound_local_error_with_name(
-                format!(
-                    "cannot access local variable '{name}' where it is not associated with a value"
-                ),
-                name,
-            ));
+            return Err(PyError::unbound_local_error(format!(
+                "cannot access local variable '{name}' where it is not associated with a value"
+            )));
         }
         // Cell objects are valid even if their contents are PY_NULL
         // (needed for __class__ cell during class body execution).
@@ -3329,12 +3326,9 @@ impl OpcodeStepExecutor for PyFrame {
             } else {
                 ""
             };
-            return Err(PyError::unbound_local_error_with_name(
-                format!(
-                    "cannot access local variable '{name}' where it is not associated with a value"
-                ),
-                name,
-            ));
+            return Err(PyError::unbound_local_error(format!(
+                "cannot access local variable '{name}' where it is not associated with a value"
+            )));
         }
         self.locals_w_mut()[idx] = PY_NULL;
         Ok(())
