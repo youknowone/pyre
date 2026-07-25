@@ -9877,8 +9877,6 @@ mod tests {
             let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let mut driver = majit_metainterp::JitDriver::new(1);
             driver.set_virtualizable_info(info.clone());
-            driver.meta_interp_mut().num_scalar_inputargs =
-                crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             (driver, info)
         });
     }

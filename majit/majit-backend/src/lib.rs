@@ -1147,12 +1147,6 @@ pub struct JitCellToken {
     /// once through `&JitCellToken` (the token may already have `Arc`
     /// clones on recorded CALL_ASSEMBLER ops). Read via `inputarg_types()`.
     pub inputarg_types: OnceLock<Vec<Type>>,
-    /// virtualizable.py:86 read_boxes: number of scalar inputargs
-    /// (frame + static fields). First local is at this index.
-    ///
-    /// `Cell<usize>` — written by `configure_loop_token_for_driver`
-    /// through `&JitCellToken`.
-    pub num_scalar_inputargs: Cell<usize>,
     /// warmspot.py / rewrite.py parity: JitDriverSD.index_of_virtualizable.
     /// Index inside the original CALL_ASSEMBLER arglist before rewrite
     /// collapses it to `[frame]` or `[frame, virtualizable]`.
@@ -1344,7 +1338,6 @@ impl JitCellToken {
             number,
             green_key: Cell::new(0),
             inputarg_types: OnceLock::new(),
-            num_scalar_inputargs: Cell::new(0),
             virtualizable_arg_index: Cell::new(None),
             outermost_jitdriver_index: None,
             compiled: OnceLock::new(),
@@ -1515,12 +1508,6 @@ impl JitCellToken {
     #[inline]
     pub fn virtualizable_arg_index(&self) -> Option<usize> {
         self.virtualizable_arg_index.get()
-    }
-
-    /// The scalar-inputarg count, set by `configure_loop_token_for_driver`.
-    #[inline]
-    pub fn num_scalar_inputargs(&self) -> usize {
-        self.num_scalar_inputargs.get()
     }
 
     /// model.py: reset_compiled()
@@ -1982,14 +1969,12 @@ pub trait Backend: Send {
         token_number: u64,
         input_types: Vec<Type>,
         num_inputs: usize,
-        num_scalar_inputargs: usize,
         index_of_virtualizable: i32,
     ) {
         let _ = (
             token_number,
             input_types,
             num_inputs,
-            num_scalar_inputargs,
             index_of_virtualizable,
         );
     }

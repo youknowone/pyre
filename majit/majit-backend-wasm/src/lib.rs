@@ -1458,7 +1458,6 @@ impl majit_backend::Backend for WasmBackend {
         token_number: u64,
         input_types: Vec<majit_ir::Type>,
         _num_inputs: usize,
-        _num_scalar_inputargs: usize,
         _index_of_virtualizable: i32,
     ) {
         register_pending_call_assembler_target(token_number, input_types);

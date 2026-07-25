@@ -1210,9 +1210,6 @@ pub struct MetaInterp<M: Clone> {
     /// Dependency registration uses the artifact generation rather than
     /// always registering the root token's flag.
     pub(crate) last_compiled_artifact_invalidation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// virtualizable.py:86 NUM_SCALAR_INPUTARGS: number of scalar inputargs
-    /// (frame + static fields). Set by the interpreter at JIT init.
-    pub num_scalar_inputargs: usize,
     /// pyjitpl.py:3182: trace position saved before compile_trace records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
@@ -2470,7 +2467,6 @@ impl<M: Clone> MetaInterp<M> {
             internal_compile_panics: 0,
             last_compiled_key: None,
             last_compiled_artifact_invalidation_flag: None,
-            num_scalar_inputargs: 0,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
@@ -3122,19 +3118,14 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(1);
         // pyjitpl.py:3290-3307 `initialize_virtualizable` only gates on
         // `vinfo is not None` and unconditionally calls
-        // `vinfo.read_boxes(cpu, virtualizable, startindex)`. Pyre's
-        // current callers (descriptor=None default) supply `live_values`
-        // already in the expanded shape that `read_boxes` would produce,
-        // so the function reuses those slots instead of re-minting
-        // inputargs. The `live_values.len() < num_reds + total_vable`
-        // gate below preserves the descriptor=None contract:
-        // re-minting under descriptor=None breaks pyre's downstream
-        // virtualizable_boxes consumers (dynasm nested_loop crashes
-        // exit 101 if the gate is removed without also flipping
-        // descriptor=Some + heap-writeback). The gate is the
-        // convergence-debt marker; the fully-RPython-orthodox shape
-        // lands together with descriptor activation
-        // (state.rs:4058 driver_descriptor).
+        // `vinfo.read_boxes(cpu, virtualizable, startindex)`. Callers
+        // without a driver descriptor supply `live_values` already in the
+        // expanded shape that `read_boxes` would produce, so the function
+        // reuses those slots instead of re-minting inputargs. The
+        // `live_values.len() < num_reds + total_vable` gate below preserves
+        // that contract: re-minting under descriptor=None breaks pyre's
+        // downstream virtualizable_boxes consumers (dynasm nested_loop
+        // crashes exit 101 if the gate is removed).
         // Cluster 2 (b): allow heap-read fallback when live_values is the
         // reds-only `[frame, ec]` shape that descriptor=Some emits. The
         // expanded-tail path still uses live_values directly; the short
@@ -3867,7 +3858,6 @@ impl<M: Clone> MetaInterp<M> {
                         pending_num,
                         input_types,
                         num_inputs,
-                        self.num_scalar_inputargs,
                         index_of_virtualizable,
                     );
                 }
@@ -4147,7 +4137,6 @@ impl<M: Clone> MetaInterp<M> {
                 pending_num,
                 input_types,
                 num_inputs,
-                self.num_scalar_inputargs,
                 index_of_virtualizable,
             );
         }
@@ -5175,13 +5164,11 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:168 jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
         // is already set by `make_jitcell_token` at the call site; this
         // helper only fills the pyre-specific fields (`green_key`,
-        // `num_scalar_inputargs`, `virtualizable_arg_index`) used by
-        // warmstate cell lookup and the backend's
-        // `handle_call_assembler` rewrite.  These are interior-mutable so
-        // they can be written even when a self-recursive trace already holds
-        // `Arc` clones of this pending token.
+        // `virtualizable_arg_index`) used by warmstate cell lookup and the
+        // backend's `handle_call_assembler` rewrite.  These are
+        // interior-mutable so they can be written even when a self-recursive
+        // trace already holds `Arc` clones of this pending token.
         token.green_key.set(green_key);
-        token.num_scalar_inputargs.set(self.num_scalar_inputargs);
         token
             .virtualizable_arg_index
             .set(driver_descriptor.and_then(JitDriverStaticData::virtualizable_arg_index));
@@ -10306,10 +10293,9 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(original_green_key);
 
         let token = make_jitcell_token(self.warm_state.alloc_token_number(), None);
-        // `green_key` / `num_scalar_inputargs` are interior-mutable, so they
-        // are written through the shared `Arc`.
+        // `green_key` is interior-mutable, so it is written through the
+        // shared `Arc`.
         token.green_key.set(original_green_key);
-        token.num_scalar_inputargs.set(self.num_scalar_inputargs);
 
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:

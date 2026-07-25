@@ -3507,8 +3507,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
     d.set_virtualizable_info(info.clone());
-    d.meta_interp_mut().num_scalar_inputargs =
-        pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
     // `W_UnicodeObject` length reader so constant STRLEN / UNICODELEN ops
     // fold to `IntBound::from_constant(len)` during intbounds
