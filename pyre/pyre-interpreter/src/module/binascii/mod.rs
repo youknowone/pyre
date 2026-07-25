@@ -13,11 +13,21 @@ mod transforms;
 
 use pyre_object::*;
 
-/// Accept a str (ASCII) or any bytes-like and surface the raw bytes.
+/// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
+/// surface the raw bytes.  Only the `a2b_*` decoders take a str source.
 fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     unsafe {
         if is_str(obj) {
-            Ok(w_str_get_value(obj).as_bytes().to_vec())
+            // The ASCII check runs on the raw buffer: a lone surrogate is
+            // non-ASCII, so it takes the same rejection as any other
+            // non-ASCII character.
+            let s = w_str_get_wtf8(obj);
+            if !s.as_bytes().is_ascii() {
+                return Err(crate::PyError::value_error(
+                    "string argument should contain only ASCII characters",
+                ));
+            }
+            Ok(s.as_bytes().to_vec())
         } else {
             match crate::typedef::buffer_as_bytes_like(obj)? {
                 Some(src) => Ok(bytesobject::bytes_like_data(src).to_vec()),
@@ -26,6 +36,20 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
                 )),
             }
         }
+    }
+}
+
+/// The `Py_buffer` converter — the `b2a_*` encoders and the checksums take a
+/// bytes-like source only, so a str of any kind is rejected by its type.
+fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    match unsafe { crate::typedef::buffer_as_bytes_like(obj) }? {
+        Some(src) if !unsafe { is_str(obj) } => {
+            Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec())
+        }
+        _ => Err(crate::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            crate::baseobjspace::object_functionstr_type_name(obj)
+        ))),
     }
 }
 
@@ -150,13 +174,13 @@ crate::py_module! {
     functions: {
         "b2a_hex" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let (sep, bytes_per_sep) = arg_sep(pos, kwargs)?;
             Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
         },
         "hexlify" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let (sep, bytes_per_sep) = arg_sep(pos, kwargs)?;
             Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
         },
@@ -172,13 +196,13 @@ crate::py_module! {
         },
         "crc32" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let init = arg_u32(pos, kwargs, "crc", 1, 0)?;
             Ok(w_int_new(transforms::crc32(&data, init) as i64))
         },
         "crc_hqx" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let init = match crate::builtins::kwarg_get(kwargs, "crc").or_else(|| pos.get(1).copied()) {
                 Some(o) => crate::baseobjspace::int_w(o)? as u32,
                 None => return Err(crate::PyError::type_error(
@@ -196,7 +220,7 @@ crate::py_module! {
         },
         "b2a_base64" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let newline = arg_bool(pos, kwargs, "newline", 1, true);
             Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
         },
@@ -208,7 +232,7 @@ crate::py_module! {
         },
         "b2a_qp" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let quotetabs = arg_bool(pos, kwargs, "quotetabs", 1, false);
             let istext = arg_bool(pos, kwargs, "istext", 2, true);
             let header = arg_bool(pos, kwargs, "header", 3, false);
@@ -221,7 +245,7 @@ crate::py_module! {
         },
         "b2a_uu" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
             let backtick = arg_bool(pos, kwargs, "backtick", 1, false);
             let out = transforms::b2a_uu(&data, backtick).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
