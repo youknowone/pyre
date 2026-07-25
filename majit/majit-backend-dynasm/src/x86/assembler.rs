@@ -7398,10 +7398,6 @@ impl<'a> Assembler386<'a> {
     ///   4. Path B (fast): MOV result, [frame + ofs]
     ///   5. join paths
     ///
-    /// RPython allocates the callee jitframe via malloc_jitframe (heap).
-    /// We use malloc for parity: the callee's frame-slot model needs
-    /// frame_depth slots (not just num_args), and heap allocation avoids
-    /// stack overflow on deep recursion.
     /// llsupport/assembler.py:295 `call_assembler` + x86/assembler.py:2267
     /// `_call_assembler_emit_call` parity. Line-by-line port:
     /// 1. simple_call(target, [jf, threadlocal_loc])
@@ -7418,394 +7414,128 @@ impl<'a> Assembler386<'a> {
     /// may have moved the caller jitframe; the popped rbp is the
     /// pre-GC address while the shadow stack carries the updated one.
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
+        // handle_call_assembler (rewrite.py:665-695) always pre-builds the
+        // callee jitframe — storing every inputarg, and for a virtualizable
+        // passing the forced vable object as the second arg — so the backend
+        // only loads arglocs[0] (the rewritten frame) and invokes the target.
         let __descr_arc_call_descr = op.getdescr();
-        let call_descr = __descr_arc_call_descr
-            .as_ref()
-            .and_then(|d| d.as_call_descr());
-        let expansion = call_descr.and_then(|d| d.vable_expansion());
-        if expansion.is_none() {
-            let frame_loc = arglocs
-                .first()
-                .copied()
-                .expect("call_assembler missing rewritten jitframe arg");
-            let vable_loc = arglocs.get(1).copied();
+        let frame_loc = arglocs
+            .first()
+            .copied()
+            .expect("call_assembler missing rewritten jitframe arg");
+        let vable_loc = arglocs.get(1).copied();
 
-            let target_addr =
-                self.resolve_call_assembler_target_addr(__descr_arc_call_descr.as_ref());
-            let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
-            let result_type = op.opcode.result_type();
-            let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-            let helper_addr = crate::call_assembler_helper_addr() as i64;
-            let green_key = self.header_pc as i64;
-
-            if !is_resolved {
-                // Unresolved target: emit force-fn dispatch through
-                // r12-saved rbp (kept as-is — this path is rare and not
-                // on the recursive hot path).
-                self.emit_load_to_rax(frame_loc);
-                dynasm!(self.mc ; .arch x64 ; mov rdx, rax);
-                let force_addr = crate::call_assembler_force_fn_addr() as i64;
-                if force_addr != 0 {
-                    if let Some(vloc) = vable_loc {
-                        self.emit_load_to_rax(vloc);
-                        self.emit_abi_int_arg_from_reg(0, 0);
-                    } else {
-                        dynasm!(self.mc ; .arch x64
-                            ; mov rax, [rdx + FIRST_ITEM_OFFSET as i32]
-                        );
-                        self.emit_abi_int_arg_from_reg(0, 0);
-                    }
-                    let pushed_gcmap = self.push_pending_call_gcmap();
-                    dynasm!(self.mc ; .arch x64 ; mov rax, QWORD force_addr);
-                    self.emit_abi_call_rax_aligned();
-                    self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-                } else {
-                    dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-                }
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
-                }
-                return;
-            }
-
-            // ── x86/assembler.py:2267 _call_assembler_emit_call ──
-            // simple_call(target, [argloc]).  Branch directly to the
-            // resolved callee entry — skip the Rust trampoline, which
-            // would otherwise add an extra indirect call and (when
-            // MAJIT_LOG was probed) a `std::env::var_os` per recursion.
-            let pushed_gcmap = self.push_pending_call_gcmap();
-            self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
-            self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
-            if let Some(addr) = target_addr.immediate {
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
-                self.emit_abi_call_rax_aligned();
-            } else {
-                let addr_ptr = self.self_entry_addr_ptr as i64;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, QWORD addr_ptr
-                    ; mov rax, [rax]
-                );
-                self.emit_abi_call_rax_aligned();
-            }
-            // Callee's _call_footer popped caller's rbp (= pre-GC
-            // address). Reload from shadow stack so subsequent
-            // frame-relative ops hit the moved jitframe.
-            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-
-            // ── x86/assembler.py:2274 _call_assembler_check_descr ──
-            // CMP [eax + jf_descr_ofs], imm(done_descr).
-            // x86 has no 64-bit-immediate compare-with-memory, so
-            // stage the pointer through R11 (LARGE_IMM_SCRATCH) — one
-            // mov + one cmp instead of the previous load-into-reg +
-            // load-imm + reg-reg compare. PyPy's `mc.CMP(mem, imm)`
-            // does the same staging internally.
-            let fast_path = self.mc.new_dynamic_label();
-            let merge = self.mc.new_dynamic_label();
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(scratch), QWORD done_descr_ptr
-                ; cmp [rax + JF_DESCR_OFS], Rq(scratch)
-                ; je =>fast_path
-            );
-
-            // ── Path A: x86/assembler.py:2271 _call_assembler_emit_helper_call ──
-            // simple_call(asm_helper, [tmploc=rax, vloc], result_loc).
-            // pyre's helper signature is (cpu_handle, callee_jf,
-            // green_key) — see compile.py:665.
-            let cpu_ptr = self.cpu_handle_ptr();
-            self.emit_abi_int_arg_from_imm(0, cpu_ptr);
-            self.emit_abi_int_arg_from_reg(1, 0); // arg1 = rax (callee jf)
-            self.emit_abi_int_arg_from_imm(2, green_key);
-            dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
-            let pushed_gcmap = self.push_pending_call_gcmap();
-            self.emit_abi_call_rax_aligned();
-            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-            dynasm!(self.mc ; .arch x64
-                ; jmp =>merge
-                ; =>fast_path
-            );
-
-            // ── Path B: x86/assembler.py:2291 _call_assembler_load_result ──
-            // MOV result, [eax + first_item_ofs].
-            if result_type == Type::Float {
-                dynasm!(self.mc ; .arch x64
-                    ; movsd xmm0, [rax + FIRST_ITEM_OFFSET as i32]
-                    ; movq rax, xmm0
-                    ; =>merge
-                );
-            } else {
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, [rax + FIRST_ITEM_OFFSET as i32]
-                    ; =>merge
-                );
-            }
-            if !op.pos.get().is_none() {
-                self.store_rax_to_result(op.pos.get());
-            }
-            let _ = vable_loc;
-            return;
-        }
-
-        let num_args = op.num_args();
-        let num_expanded_items = expansion
-            .map(|exp| 1 + exp.scalar_fields.len() + exp.num_array_items)
-            .unwrap_or(num_args);
-        // llmodel.py:298 malloc_jitframe parity: callee needs frame_depth
-        // slots (frame-slot model stores ALL intermediates in jitframe).
-        let jf_slots = self.frame_depth.max(num_expanded_items);
-        let jf_alloc_bytes = crate::jitframe::JitFrame::alloc_size(jf_slots) as i64;
-        let jf_frame_len = jf_slots as i64;
-        let calloc_ptr = libc::calloc as *const () as i64;
-        let free_ptr = libc::free as *const () as i64;
-
-        // Save callee-saved regs used as scratch by this sequence.
-        // genop_call_assembler uses x19 (caller jf_ptr) and x20 (callee jf_ptr)
-        // across calloc/call/free. These are callee-saved by ABI and saved
-        // in _call_header, but the regalloc may have assigned them to
-        // live variables. Push/pop to preserve the outer state.
-        dynasm!(self.mc ; .arch x64
-            ; mov r12, rbp            // save caller's jf_ptr in r12
-        );
-
-        // Allocate callee jitframe on heap via calloc.
-        // Stack alignment: after prologue (push rbp + push r12) + return
-        // addr, rsp ≡ -8 (mod 16). sub 8 aligns to 16 for ABI call.
-        self.emit_abi_int_arg_from_imm(0, 1);
-        self.emit_abi_int_arg_from_imm(1, jf_alloc_bytes);
-        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD calloc_ptr);
-        self.emit_abi_call_rax_aligned();
-
-        // rdx/x20 = heap jf_ptr (held across arg stores).
-        // load_arg_to_rax reads from [rbp+offset], rbp still = caller's jf.
-        // Wait: rbp was saved to r12 but NOT changed yet. Actually we did
-        // `mov r12, rbp` above, so rbp still points to caller's jf. ✓
-        dynasm!(self.mc ; .arch x64
-            ; mov rdx, rax            // rdx = heap jf_ptr
-            ; mov QWORD [rdx + JF_DESCR_OFS], 0
-            ; mov QWORD [rdx + JF_FRAME_OFS as i32], jf_frame_len as i32
-        );
-
-        // rewrite.py:665-695 handle_call_assembler parity:
-        // if VableExpansion is present, expand the caller frame reference
-        // into the callee's full inputarg layout. Otherwise, copy the
-        // raw CALL_ASSEMBLER arguments as ordinary loop inputs.
-        //
-        // All callee inputs live at absolute jitframe slots
-        // [JITFRAME_FIXED_SIZE + relative_input_index].
-        if let Some(expansion) = expansion {
-            for slot in 0..num_expanded_items {
-                let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + slot);
-
-                if let Some(&(_, cval)) = expansion.const_overrides.iter().find(|(s, _)| *s == slot)
-                {
-                    dynasm!(self.mc ; .arch x64
-                        ; mov rax, QWORD cval
-                        ; mov [rdx + dest_offset], rax
-                    );
-                    continue;
-                }
-
-                if let Some(&(_, arg_idx)) =
-                    expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
-                {
-                    let src = arglocs
-                        .get(arg_idx)
-                        .copied()
-                        .expect("call_assembler arg override out of bounds");
-                    self.emit_load_to_rax(src);
-                    dynasm!(self.mc ; .arch x64
-                        ; mov [rdx + dest_offset], rax
-                    );
-                    continue;
-                }
-
-                if slot == 0 {
-                    let frame_loc = arglocs
-                        .first()
-                        .copied()
-                        .expect("call_assembler vable expansion missing frame arg");
-                    self.emit_load_to_rax(frame_loc);
-                    dynasm!(self.mc ; .arch x64
-                        ; mov [rdx + dest_offset], rax
-                    );
-                    continue;
-                }
-
-                if slot <= expansion.scalar_fields.len() {
-                    let (field_ofs, _) = expansion.scalar_fields[slot - 1];
-                    let frame_loc = arglocs
-                        .first()
-                        .copied()
-                        .expect("call_assembler vable expansion missing frame arg");
-                    self.emit_load_to_rax(frame_loc);
-                    dynasm!(self.mc ; .arch x64
-                        ; mov rax, [rax + field_ofs as i32]
-                        ; mov [rdx + dest_offset], rax
-                    );
-                    continue;
-                }
-
-                let array_index = slot - 1 - expansion.scalar_fields.len();
-                let data_ptr_ofs = expansion.array_struct_offset + expansion.array_ptr_offset;
-                let item_ofs = (array_index * 8) as i32;
-                let frame_loc = arglocs
-                    .first()
-                    .copied()
-                    .expect("call_assembler vable expansion missing frame arg");
-                self.emit_load_to_rax(frame_loc);
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, [rax + data_ptr_ofs as i32]
-                    ; mov rax, [rax + item_ofs]
-                    ; mov [rdx + dest_offset], rax
-                );
-            }
-        } else {
-            for (i, loc) in arglocs.iter().enumerate() {
-                let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + i);
-                self.emit_load_to_rax(*loc);
-                dynasm!(self.mc ; .arch x64
-                    ; mov [rdx + dest_offset], rax
-                );
-            }
-        }
-
-        // _call_assembler_emit_call (assembler.py:2267-2269):
-        // rdi/x0 = callee jf_ptr.
-        self.emit_abi_int_arg_from_reg(0, 2);
-
-        // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
-        // Resolve target address from descr.call_target_token() or self_entry_label.
-        let descr_arc = op.getdescr();
-        let target_addr = self.resolve_call_assembler_target_addr(descr_arc.as_ref());
+        let target_addr = self.resolve_call_assembler_target_addr(__descr_arc_call_descr.as_ref());
         let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
-
-        // assembler.py:324-336 call_assembler: select done_descr by op.type.
         let result_type = op.opcode.result_type();
         let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
         let helper_addr = crate::call_assembler_helper_addr() as i64;
         let green_key = self.header_pc as i64;
 
         if !is_resolved {
-            // Defensive unresolved-target fallback. Production
-            // CALL_ASSEMBLER descrs carry a token with a real body; direct
-            // backend callers can still hand us an unstamped token.
-            // Read the first argument slot of the callee jitframe, free the
-            // heap jf, then call force_fn(frame_ptr).
+            // Unresolved target: emit force-fn dispatch through
+            // r12-saved rbp (kept as-is — this path is rare and not
+            // on the recursive hot path).
+            self.emit_load_to_rax(frame_loc);
+            dynasm!(self.mc ; .arch x64 ; mov rdx, rax);
             let force_addr = crate::call_assembler_force_fn_addr() as i64;
             if force_addr != 0 {
-                dynasm!(self.mc ; .arch x64
-                    ; mov r13, [rdx + Self::slot_offset(JITFRAME_FIXED_SIZE) as i32]
-                );
-                self.emit_abi_int_arg_from_reg(0, 2);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
-                self.emit_abi_call_rax_aligned();
-                dynasm!(self.mc ; .arch x64 ; mov rbp, r12); // restore caller jf_ptr
-                self.emit_abi_int_arg_from_reg(0, 13);
+                if let Some(vloc) = vable_loc {
+                    self.emit_load_to_rax(vloc);
+                    self.emit_abi_int_arg_from_reg(0, 0);
+                } else {
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rax, [rdx + FIRST_ITEM_OFFSET as i32]
+                    );
+                    self.emit_abi_int_arg_from_reg(0, 0);
+                }
+                let pushed_gcmap = self.push_pending_call_gcmap();
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD force_addr);
                 self.emit_abi_call_rax_aligned();
-                self.reload_frame_if_necessary();
+                self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
             } else {
-                // No force_fn registered — free and return 0.
-                self.emit_abi_int_arg_from_reg(0, 2);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
-                self.emit_abi_call_rax_aligned();
-                dynasm!(self.mc ; .arch x64
-                    ; mov rbp, r12                   // restore caller jf_ptr
-                    ; xor eax, eax                   // result = 0
-                );
+                dynasm!(self.mc ; .arch x64 ; xor eax, eax);
             }
-        } else {
-            // Resolved target: branch directly to the compiled callee
-            // entry.  The previous trampoline indirection re-read
-            // MAJIT_LOG on every recursive call (Win32 env lookup is
-            // slow); a direct call matches cranelift's dispatch.
-            if let Some(addr) = target_addr.immediate {
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
-                self.emit_abi_call_rax_aligned();
-            } else if self.self_entry_label.is_some() {
-                let addr_ptr = self.self_entry_addr_ptr as i64;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, QWORD addr_ptr
-                    ; mov rax, [rax]
-                );
-                self.emit_abi_call_rax_aligned();
+            if !op.pos.get().is_none() {
+                self.store_rax_to_result(op.pos.get());
             }
+            return;
+        }
 
-            // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
-            // Restore caller's jf_ptr.
-            dynasm!(self.mc ; .arch x64
-                ; mov rbp, r12            // restore caller's jf_ptr
-            );
-            self.reload_frame_if_necessary();
-
-            // rax = callee's returned jf_ptr (heap-allocated).
-            // Save it in rdx for descr check and free.
-            dynasm!(self.mc ; .arch x64
-                ; mov rdx, rax            // rdx = callee jf_ptr
-            );
-
-            // _call_assembler_check_descr (assembler.py:2274-2278):
-            //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr_{type}
-            let fast_path = self.mc.new_dynamic_label();
-            let merge = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch x64
-                ; mov rcx, [rdx + JF_DESCR_OFS]     // rcx = jf_descr
-                ; mov rax, QWORD done_descr_ptr
-                ; cmp rcx, rax
-                ; je =>fast_path
-            );
-
-            // Path A (slow): guard failure.
-            // assembler.py:345-350 _call_assembler_emit_helper_call.
-            // `compile.py:665` parity: pass `cpu_ptr` as arg0 so the
-            // trampoline resolves `self.cpu.done_with_this_frame_descr_*` /
-            // `exit_frame_with_exception_descr_ref` through the owning
-            // backend instance rather than a per-thread fallback.
-            let cpu_ptr = self.cpu_handle_ptr();
-            self.emit_abi_int_arg_from_imm(0, cpu_ptr);
-            self.emit_abi_int_arg_from_reg(1, 2);
-            self.emit_abi_int_arg_from_imm(2, green_key);
-            dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
+        // ── x86/assembler.py:2267 _call_assembler_emit_call ──
+        // simple_call(target, [argloc]).  Branch directly to the
+        // resolved callee entry — skip the Rust trampoline, which
+        // would otherwise add an extra indirect call and (when
+        // MAJIT_LOG was probed) a `std::env::var_os` per recursion.
+        let pushed_gcmap = self.push_pending_call_gcmap();
+        self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
+        self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
+        if let Some(addr) = target_addr.immediate {
+            dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
             self.emit_abi_call_rax_aligned();
-            self.reload_frame_if_necessary();
-            dynasm!(self.mc ; .arch x64 ; jmp =>merge);
-
-            // Path B (fast): _call_assembler_load_result (assembler.py:2291-2303)
+        } else {
+            let addr_ptr = self.self_entry_addr_ptr as i64;
             dynasm!(self.mc ; .arch x64
-                ; =>fast_path
+                ; mov rax, QWORD addr_ptr
+                ; mov rax, [rax]
             );
-            if result_type == Type::Float {
-                dynasm!(self.mc ; .arch x64
-                    ; movsd xmm0, [rdx + FIRST_ITEM_OFFSET as i32]
-                    ; movq r12, xmm0               // preserve bits across free
-                );
-                self.emit_abi_int_arg_from_reg(0, 2);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
-                self.emit_abi_call_rax_aligned();
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, r12                  // float bits in rax
-                    ; =>merge
-                );
-            } else {
-                dynasm!(self.mc ; .arch x64
-                    ; mov r12, [rdx + FIRST_ITEM_OFFSET as i32]
-                );
-                self.emit_abi_int_arg_from_reg(0, 2);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
-                self.emit_abi_call_rax_aligned();
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, r12                  // rax = result
-                    ; =>merge
-                );
-            }
-        } // end if is_resolved
+            self.emit_abi_call_rax_aligned();
+        }
+        // Callee's _call_footer popped caller's rbp (= pre-GC
+        // address). Reload from shadow stack so subsequent
+        // frame-relative ops hit the moved jitframe.
+        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
 
-        // Store result to the output slot (rax/x0 holds result).
+        // ── x86/assembler.py:2274 _call_assembler_check_descr ──
+        // CMP [eax + jf_descr_ofs], imm(done_descr).
+        // x86 has no 64-bit-immediate compare-with-memory, so
+        // stage the pointer through R11 (LARGE_IMM_SCRATCH) — one
+        // mov + one cmp instead of the previous load-into-reg +
+        // load-imm + reg-reg compare. PyPy's `mc.CMP(mem, imm)`
+        // does the same staging internally.
+        let fast_path = self.mc.new_dynamic_label();
+        let merge = self.mc.new_dynamic_label();
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD done_descr_ptr
+            ; cmp [rax + JF_DESCR_OFS], Rq(scratch)
+            ; je =>fast_path
+        );
+
+        // ── Path A: x86/assembler.py:2271 _call_assembler_emit_helper_call ──
+        // simple_call(asm_helper, [tmploc=rax, vloc], result_loc).
+        // pyre's helper signature is (cpu_handle, callee_jf,
+        // green_key) — see compile.py:665.
+        let cpu_ptr = self.cpu_handle_ptr();
+        self.emit_abi_int_arg_from_imm(0, cpu_ptr);
+        self.emit_abi_int_arg_from_reg(1, 0); // arg1 = rax (callee jf)
+        self.emit_abi_int_arg_from_imm(2, green_key);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
+        let pushed_gcmap = self.push_pending_call_gcmap();
+        self.emit_abi_call_rax_aligned();
+        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+        dynasm!(self.mc ; .arch x64
+            ; jmp =>merge
+            ; =>fast_path
+        );
+
+        // ── Path B: x86/assembler.py:2291 _call_assembler_load_result ──
+        // MOV result, [eax + first_item_ofs].
+        if result_type == Type::Float {
+            dynasm!(self.mc ; .arch x64
+                ; movsd xmm0, [rax + FIRST_ITEM_OFFSET as i32]
+                ; movq rax, xmm0
+                ; =>merge
+            );
+        } else {
+            dynasm!(self.mc ; .arch x64
+                ; mov rax, [rax + FIRST_ITEM_OFFSET as i32]
+                ; =>merge
+            );
+        }
         if !op.pos.get().is_none() {
             self.store_rax_to_result(op.pos.get());
         }
-
-        // Restore callee-saved regs clobbered by this sequence.
     }
 
     // ----------------------------------------------------------------

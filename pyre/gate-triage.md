@@ -142,12 +142,22 @@ gate wanted to elide — is the upstream op sequence, not a pyre decline.
 
 The retirement is byte-identical: the ON emitter was scaffolding that produced
 the same red-only CALL_ASSEMBLER as OFF, and the only
-`call_assembler_with_vable_expansion` constructor is `#[cfg(test)]`.
-NOT done in that commit, and still open: the `VableExpansion` type itself
-(`majit-ir`) and its consumer arms in `majit-metainterp` + both dynasm and
-cranelift backends are still present and unreachable from production.  Deleting
-them is a separate, larger change.  Note `state.rs` already calls it "the broken
-VableExpansion path".
+`call_assembler_with_vable_expansion` constructor was `#[cfg(test)]`.
+A follow-up commit deletes the `VableExpansion` type itself (`majit-ir`), the
+`CallAssemblerDescr` accessor and `..._with_vable`/`..._with_expansion`
+constructors (`majit-metainterp`), and the consumer arms in both backends —
+including `genop_call_assembler`'s expansion tail, which allocated a callee
+jitframe with `libc::calloc` and materialised the mapped fields into its slots.
+Nothing in that tail has an upstream counterpart: the callee frame is built by
+`handle_call_assembler` (`rpython/jit/backend/llsupport/rewrite.py:665-695`) and
+the backend only loads `arglocs[0]` and calls the target.
+
+The remaining gap this exposes is on the CALLEE side, not the caller's: pyre
+does not yet run `patch_new_loop_to_load_virtualizable_fields`, so a callee loop
+still carries the vable-expanded inputarg list instead of being truncated to
+`inputargs[:num_red_args]` with per-field GETFIELD_GC/GETARRAYITEM_GC prepended
+(see `majit-backend-cranelift/src/compiler.rs`, where it is held disabled pending
+vable heap-writeback).  Enabling that shrink is the orthodox fix.
 
 **`_MULTIFRAME` — the ON path is the upstream structure.**  Upstream's
 `convert_and_run_from_pyjitpl` (`rpython/jit/metainterp/blackhole.py:1799-1826`)

@@ -4680,66 +4680,17 @@ impl TraceCtx {
         self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Float)
     }
 
-    /// rewrite.py:665-695 handle_call_assembler parity.
-    /// Emit CALL_ASSEMBLER with only the frame reference as arg; the backend
-    /// expands to the full callee inputarg layout via `VableExpansion`.
-    #[cfg(test)]
-    pub fn call_assembler_with_vable_expansion(
-        &mut self,
-        target_number: u64,
-        frame_arg: OpRef,
-        result_type: Type,
-        expansion: majit_ir::VableExpansion,
-    ) -> OpRef {
-        self.call_assembler_with_vable_expansion_args(
-            target_number,
-            &[frame_arg],
-            &[Type::Ref],
-            result_type,
-            expansion,
-        )
-    }
-
-    /// pyjitpl.py:3589-3609 direct_assembler_call parity.
-    /// Emit CALL_ASSEMBLER with multiple red args + VableExpansion.
-    /// The backend reads some fields from args[0] (frame) and uses
-    /// arg_overrides/const_overrides for callee-specific values.
-    #[cfg(test)]
-    pub fn call_assembler_with_vable_expansion_args(
-        &mut self,
-        target_number: u64,
-        args: &[OpRef],
-        arg_types: &[Type],
-        result_type: Type,
-        expansion: majit_ir::VableExpansion,
-    ) -> OpRef {
-        let opcode = match result_type {
-            Type::Int => OpCode::CallAssemblerI,
-            Type::Ref => OpCode::CallAssemblerR,
-            Type::Float => OpCode::CallAssemblerF,
-            Type::Void => OpCode::CallAssemblerN,
-        };
-        let descr = crate::call_descr::make_call_assembler_descr_with_vable_by_number(
-            target_number,
-            arg_types,
-            result_type,
-            expansion,
-        );
-        self.record_op_with_descr(opcode, args, descr)
-    }
-
     /// RPython `direct_assembler_call` red-args-only emission
-    /// (pyjitpl.py:3589-3609). Takes the JitDriver reds directly and emits
-    /// a CALL_ASSEMBLER with no `VableExpansion` — the callee's compiled
-    /// loop reconstructs each virtualizable field via its GETFIELD_GC /
-    /// GETARRAYITEM_GC preamble emitted by
+    /// (pyjitpl.py:3589-3609). Takes the JitDriver reds directly — the
+    /// callee's compiled loop reconstructs each virtualizable field via
+    /// its GETFIELD_GC / GETARRAYITEM_GC preamble emitted by
     /// `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461).
     ///
     /// `virtualizable_arg_index` of the emitted descriptor comes from the
     /// active `JitDriverStaticData`, matching RPython's
     /// `rewrite.py:684 jd.index_of_virtualizable` lookup.
     ///
-    /// Covered by `call_assembler_red_only_ref_emits_no_vable_expansion`
+    /// Covered by `call_assembler_red_only_ref_emits_red_args_descr`
     /// to verify the emitted descriptor shape.
     #[cfg(test)]
     pub fn call_assembler_red_only_ref(
@@ -5143,7 +5094,7 @@ mod history_record_tests {
     }
 
     #[test]
-    fn call_assembler_red_only_ref_emits_no_vable_expansion() {
+    fn call_assembler_red_only_ref_emits_red_args_descr() {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let frame = OpRef::input_arg_ref(0);
         ctx.set_driver_descriptor(JitDriverStaticData::with_virtualizable(
@@ -5170,9 +5121,5 @@ mod history_record_tests {
         assert_eq!(call_descr.arg_types(), &[Type::Ref]);
         assert_eq!(call_descr.call_target_token(), Some(999));
         assert_eq!(call_descr.call_virtualizable_index(), Some(0));
-        assert!(
-            call_descr.vable_expansion().is_none(),
-            "red-only emission must not attach a VableExpansion",
-        );
     }
 }

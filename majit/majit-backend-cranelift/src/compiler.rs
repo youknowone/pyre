@@ -4733,15 +4733,9 @@ fn resolve_call_assembler_target(
         return Ok(None);
     }
 
-    // RPython rewrite.py:665-695 handle_call_assembler: when VableExpansion
-    // is present, the CALL_ASSEMBLER op carries fewer args than the callee's
-    // inputarg_types. The EXPANDED arity (1 frame + scalar_fields + array_items)
-    // must match the target. Without VableExpansion, op.args matches directly.
-    let expected_arity = if let Some(exp) = call_descr.vable_expansion() {
-        1 + exp.scalar_fields.len() + exp.num_array_items
-    } else {
-        call_descr.arg_types().len()
-    };
+    // The CALL_ASSEMBLER descriptor's arg_types are the caller-side red-arg
+    // list and must match the callee's compiled inputarg list directly.
+    let expected_arity = call_descr.arg_types().len();
     if target.inputarg_types.len() != expected_arity {
         // TODO: pyre's `direct_assembler_call`
         // emits CALL_ASSEMBLER with `arg_types = [frame]` (or
@@ -4770,14 +4764,9 @@ fn resolve_call_assembler_target(
         return Err(unsupported_semantics(
             opcode,
             &format!(
-                "call-assembler target arity {} does not match expected {}{}",
+                "call-assembler target arity {} does not match expected {}",
                 target.inputarg_types.len(),
                 expected_arity,
-                if call_descr.vable_expansion().is_some() {
-                    " (with VableExpansion)"
-                } else {
-                    ""
-                },
             ),
         ));
     }
@@ -11101,7 +11090,9 @@ impl CraneliftBackend {
                         )
                     })?;
                     let descr_token = call_assembler_jitcell_token(&descr);
-                    let resolved_target = resolve_call_assembler_target(
+                    // Validate the target for its error side effects; the
+                    // resolved handle itself is unused on the direct-frame path.
+                    let _ = resolve_call_assembler_target(
                         op.opcode,
                         call_descr,
                         descr_token.map(|token| token.as_ref()),
@@ -11150,111 +11141,8 @@ impl CraneliftBackend {
                     // Allocate callee jitframe from nursery (heap), not stack.
                     // The callee's prologue pushes jf_ptr onto shadow stack,
                     // so GC tracks it during callee execution. After return,
-                    let (args_ptr, args_data_ptr) =
-                        if let Some(expansion) = call_descr.vable_expansion() {
-                            let callee_depth = resolved_target
-                                .as_ref()
-                                .map_or(16, |t| (t.max_output_slots + t.num_ref_roots).max(1));
-                            let num_expanded_items =
-                                1 + expansion.scalar_fields.len() + expansion.num_array_items;
-                            let jf_depth = num_expanded_items.max(callee_depth).max(1);
-                            let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
-                            let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot,
-                                jf_bytes,
-                                3,
-                            ));
-                            let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
-                            let frame_val =
-                                resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                            builder.ins().store(
-                                MemFlags::trusted(),
-                                frame_val,
-                                args_ptr,
-                                JF_FRAME_ITEM0_OFS,
-                            );
-                            for (i, &(offset, _tp)) in expansion.scalar_fields.iter().enumerate() {
-                                let slot = i + 1;
-                                let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
-                                if let Some(&(_, cval)) =
-                                    expansion.const_overrides.iter().find(|(s, _)| *s == slot)
-                                {
-                                    let cv = builder.ins().iconst(cl_types::I64, cval);
-                                    builder.ins().stack_store(cv, args_slot, ofs);
-                                } else {
-                                    let val = builder.ins().load(
-                                        cl_types::I64,
-                                        MemFlags::trusted(),
-                                        frame_val,
-                                        offset as i32,
-                                    );
-                                    builder.ins().stack_store(val, args_slot, ofs);
-                                }
-                            }
-                            let num_scalars_with_frame = 1 + expansion.scalar_fields.len();
-                            // Only load array data pointer if at least one item
-                            // needs to be read from the frame (not covered by
-                            // const_overrides or arg_overrides).
-                            let needs_array_load = (0..expansion.num_array_items).any(|i| {
-                                let slot = num_scalars_with_frame + i;
-                                !expansion.const_overrides.iter().any(|(s, _)| *s == slot)
-                                    && !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
-                            });
-                            let arr_data_ptr_val = if needs_array_load {
-                                let arr_struct_addr = builder
-                                    .ins()
-                                    .iadd_imm(frame_val, expansion.array_struct_offset as i64);
-                                builder.ins().load(
-                                    ptr_type,
-                                    MemFlags::trusted(),
-                                    arr_struct_addr,
-                                    expansion.array_ptr_offset as i32,
-                                )
-                            } else {
-                                builder.ins().iconst(ptr_type, 0)
-                            };
-                            for i in 0..expansion.num_array_items {
-                                let slot = num_scalars_with_frame + i;
-                                let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
-                                // Match dynasm x86 assembler.rs:4544 / aarch64
-                                // assembler.rs:4673: const_overrides take precedence
-                                // for any slot, including array items.
-                                if let Some(&(_, cval)) =
-                                    expansion.const_overrides.iter().find(|(s, _)| *s == slot)
-                                {
-                                    let cv = builder.ins().iconst(cl_types::I64, cval);
-                                    builder.ins().stack_store(cv, args_slot, ofs);
-                                } else if let Some(&(_, arg_idx)) =
-                                    expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
-                                {
-                                    let val = resolve_opref(
-                                        &mut builder,
-                                        &constants,
-                                        op.arg(arg_idx).to_opref(),
-                                    );
-                                    builder.ins().stack_store(val, args_slot, ofs);
-                                } else {
-                                    let val = builder.ins().load(
-                                        cl_types::I64,
-                                        MemFlags::trusted(),
-                                        arr_data_ptr_val,
-                                        (i * 8) as i32,
-                                    );
-                                    builder.ins().stack_store(val, args_slot, ofs);
-                                }
-                            }
-                            let args_data_ptr =
-                                builder
-                                    .ins()
-                                    .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
-                            (args_ptr, args_data_ptr)
-                        } else {
-                            let args_ptr =
-                                resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                            let args_data_ptr =
-                                builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
-                            (args_ptr, args_data_ptr)
-                        };
+                    let args_ptr = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
+                    let args_data_ptr = builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                     let token_val = descr_token
                         .map(|token| token.number)
                         .or_else(|| call_descr.call_target_token())

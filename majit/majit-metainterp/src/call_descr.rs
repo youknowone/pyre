@@ -12,10 +12,7 @@ use std::sync::Arc;
 
 use majit_backend::JitCellToken;
 use majit_ir::effectinfo::EffectInfoCell;
-use majit_ir::{
-    CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, PyreHelperKind, Type,
-    VableExpansion,
-};
+use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, PyreHelperKind, Type};
 
 /// Generic CallDescr for function call operations.
 ///
@@ -50,7 +47,6 @@ struct MetaCallAssemblerDescr {
     arg_types: Vec<Type>,
     result_type: Type,
     target_token: Arc<JitCellToken>,
-    vable_expansion: Option<VableExpansion>,
 }
 
 impl majit_ir::Descr for MetaCallDescr {
@@ -134,9 +130,6 @@ impl CallDescr for MetaCallAssemblerDescr {
     fn get_extra_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
         &INFO
-    }
-    fn vable_expansion(&self) -> Option<&VableExpansion> {
-        self.vable_expansion.as_ref()
     }
 }
 
@@ -738,7 +731,6 @@ pub fn make_call_assembler_descr(
         arg_types: arg_types.to_vec(),
         result_type,
         target_token,
-        vable_expansion: None,
     })
 }
 
@@ -759,35 +751,6 @@ pub fn make_call_assembler_descr_by_number(
     let tok = JitCellToken::new(target_number);
     tok.virtualizable_arg_index.set(virtualizable_arg_index);
     make_call_assembler_descr(Arc::new(tok), arg_types, result_type)
-}
-
-/// rewrite.py:665-695 handle_call_assembler: create a CallDescr that carries
-/// virtualizable expansion info. The backend reads fields from the frame
-/// reference to populate the callee's full inputarg jitframe layout.
-pub fn make_call_assembler_descr_with_vable(
-    target_token: Arc<JitCellToken>,
-    arg_types: &[Type],
-    result_type: Type,
-    expansion: VableExpansion,
-) -> DescrRef {
-    Arc::new(MetaCallAssemblerDescr {
-        arg_types: arg_types.to_vec(),
-        result_type,
-        target_token,
-        vable_expansion: Some(expansion),
-    })
-}
-
-/// Test-only number sibling of `make_call_assembler_descr_with_vable`.
-#[cfg(test)]
-pub fn make_call_assembler_descr_with_vable_by_number(
-    target_number: u64,
-    arg_types: &[Type],
-    result_type: Type,
-    expansion: VableExpansion,
-) -> DescrRef {
-    let tok = Arc::new(JitCellToken::new(target_number));
-    make_call_assembler_descr_with_vable(tok, arg_types, result_type, expansion)
 }
 
 #[cfg(test)]

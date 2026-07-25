@@ -2640,19 +2640,17 @@ impl TraceCtx {
     /// + `GETARRAYITEM_GC` for every array item of the virtualizable
     /// referenced by `vable`. Returns the freshly recorded OpRefs in
     /// `[scalar_0, ..., scalar_{N-1}, array_0_item_0, ...,
-    /// array_K_item_M]` order — matching `VableExpansion`'s slot
-    /// layout (excluding the leading frame ref at slot 0).
+    /// array_K_item_M]` order — the callee inputarg order minus the
+    /// leading frame reference.
     ///
     /// `array_lengths[i]` is the live element count of the i-th array
     /// field, mirroring `vinfo.get_array_length(vable, arrayindex)`
     /// at compile.py:443. The caller is expected to have read these
     /// off the concrete virtualizable before tracing the call.
     ///
-    /// Dormant — call-site migration from
-    /// `call_assembler_with_vable_expansion_args` to
-    /// `call_assembler_red_only_*` will plug this in once the callee
-    /// JUMP-terminated paths run `patch_new_loop_to_load_virtualizable
-    /// _fields` (pyjitpl.rs:3090-3098 deferred epic). Covered by
+    /// Dormant — the `call_assembler_red_only_*` call sites will plug
+    /// this in once the callee JUMP-terminated paths run
+    /// `patch_new_loop_to_load_virtualizable_fields`. Covered by
     /// `emit_vable_field_reads_emits_compile_py_shape` so the helper
     /// stays honest until the call-site flip lands.
     #[cfg_attr(not(test), allow(dead_code))]

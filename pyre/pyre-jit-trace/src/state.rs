@@ -7810,10 +7810,9 @@ impl JitState for PyreJitState {
         let num_locals = self.local_count();
         let vsd = self.valuestackdepth();
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
-        // The valuestackdepth → heap array capacity flip is not used here
-        // because it activates the broken VableExpansion path. The
-        // `capacity` reference uses the pre-flip semantics:
-        // array_capacity == self.array_capacity().
+        // `capacity` is the frame's real heap array capacity, not the
+        // valuestackdepth: the meta describes the allocated slot count that
+        // vable array accesses are bounds-checked against.
         let capacity = self.array_capacity();
         PyreMeta {
             num_locals,

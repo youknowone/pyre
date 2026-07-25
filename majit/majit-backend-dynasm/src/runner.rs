@@ -3651,7 +3651,6 @@ mod tests {
         arg_types: Vec<Type>,
         result_type: Type,
         target_token: u64,
-        vable_expansion: Option<majit_ir::VableExpansion>,
     }
 
     #[derive(Debug)]
@@ -3702,10 +3701,6 @@ mod tests {
                 EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
             &INFO
         }
-
-        fn vable_expansion(&self) -> Option<&majit_ir::VableExpansion> {
-            self.vable_expansion.as_ref()
-        }
     }
 
     impl majit_ir::Descr for TestPlainCallDescr {
@@ -3754,21 +3749,6 @@ mod tests {
             arg_types,
             result_type,
             target_token: target.number,
-            vable_expansion: None,
-        })
-    }
-
-    fn make_call_assembler_descr_with_expansion(
-        target: &JitCellToken,
-        arg_types: Vec<Type>,
-        result_type: Type,
-        expansion: majit_ir::VableExpansion,
-    ) -> DescrRef {
-        Arc::new(TestCallAssemblerDescr {
-            arg_types,
-            result_type,
-            target_token: target.number,
-            vable_expansion: Some(expansion),
         })
     }
 
@@ -4558,92 +4538,6 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(32)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_ref_value(&frame, 0), payload);
-    }
-
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    #[ignore = "bodyless self-recursive backend token path retired; production uses compile_tmp_callback"]
-    fn test_call_assembler_uses_gc_rewritten_vable_frame_without_double_materializing() {
-        let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 1 << 20,
-            large_object_threshold: 1 << 20,
-            ..GcConfig::default()
-        });
-        gc.register_type(TypeInfo::simple(16));
-        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
-        let payload_tid = gc.register_type(TypeInfo::simple(24));
-        let payload = gc.alloc_with_type(payload_tid, 24);
-        const MARKER: i64 = 0x3456_789a_i64;
-        unsafe {
-            *((payload.0 as *mut u8).add(16) as *mut i64) = MARKER;
-        }
-
-        crate::set_jitframe_gc_type_id(jitframe_tid);
-        install_call_assembler_test_layout();
-        install_test_libc_jitframe_tracer();
-
-        let mut backend = DynasmBackend::new();
-        backend.attach_default_test_descrs();
-        backend.set_gc_allocator(Box::new(gc));
-
-        let callee_inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let field_descr: DescrRef =
-            Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
-        let entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        entry_getfield.setdescr(field_descr);
-        let callee_ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
-                OpRef::NONE.raw(),
-            ),
-            entry_getfield,
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(1), OpRef::int_op(2)],
-                3,
-            ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
-        ];
-        let mut callee_token = JitCellToken::new(1617);
-        callee_token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
-        backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
-            .unwrap();
-
-        let expansion = majit_ir::VableExpansion {
-            scalar_fields: vec![(16, Type::Int)],
-            array_struct_offset: 0,
-            array_ptr_offset: 0,
-            num_array_items: 0,
-            const_overrides: vec![],
-            arg_overrides: vec![],
-        };
-        let call = mk_op(
-            OpCode::CallAssemblerI,
-            &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
-            2,
-        );
-        call.setdescr(make_call_assembler_descr_with_expansion(
-            &callee_token,
-            vec![Type::Ref, Type::Int],
-            Type::Int,
-            expansion,
-        ));
-        let caller_inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let caller_ops = vec![
-            call,
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-        ];
-        let mut caller_token = JitCellToken::new(1618);
-        caller_token.virtualizable_arg_index = std::cell::Cell::new(Some(0));
-        backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
-            .unwrap();
-
-        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload), Value::Int(7)]);
-        assert!(backend.get_latest_descr(&frame).is_finish());
-        assert_eq!(backend.get_int_value(&frame, 0), MARKER + 7);
     }
 
     #[test]
