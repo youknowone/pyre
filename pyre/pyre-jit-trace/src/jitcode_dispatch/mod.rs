@@ -6377,7 +6377,9 @@ fn walker_guard_int_exact_as_float<Sym: WalkSym>(
     value: i64,
 ) -> Result<(), DispatchError> {
     let shift = ctx.trace_ctx.const_int(48);
-    let top = ctx.trace_ctx.record_op(OpCode::IntRshift, &[raw_int, shift]);
+    let top = ctx
+        .trace_ctx
+        .record_op(OpCode::IntRshift, &[raw_int, shift]);
     ctx.trace_ctx
         .set_opref_concrete(top, majit_ir::Value::Int(value >> 48));
     let low = ctx.trace_ctx.const_int(-1);

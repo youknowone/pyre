@@ -796,9 +796,8 @@ pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, MethodOwner,
     PASSTHROUGHARGS1, Signature, SignatureBuilder, builtin_code_call, builtin_code_get,
-    builtin_code_get_fast_natural_arity,
-    builtin_code_get_signature, builtin_code_name, builtin_code_new,
-    builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
+    builtin_code_get_fast_natural_arity, builtin_code_get_signature, builtin_code_name,
+    builtin_code_new, builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
     builtin_code_new_with_signature, is_builtin_code, make_builtin_function,
     make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
     make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,

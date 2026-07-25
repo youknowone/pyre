@@ -19044,7 +19044,10 @@ fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, 
         if !pyre_object::memoryview::is_w_memoryview(args[1]) {
             return Err(crate::PyError::type_error("expected a memoryview object"));
         }
-        if !std::ptr::eq(pyre_object::memoryview::w_memoryview_backing(args[1]), args[0]) {
+        if !std::ptr::eq(
+            pyre_object::memoryview::w_memoryview_backing(args[1]),
+            args[0],
+        ) {
             return Err(crate::PyError::value_error(
                 "memoryview's buffer is not this object",
             ));
