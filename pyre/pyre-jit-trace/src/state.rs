@@ -652,6 +652,15 @@ pub fn install_jitcode_for(
 /// import-time `_get_exports_list` at slot 0 is dead by the time user code
 /// drives jd1).  Reconciling the two index spaces into one absolute table is
 /// the standing follow-up.
+///
+/// Dropping the install is NOT an available shortcut, measured: without it the
+/// jd1 live-enter blackhole resume resolves slot 0 to the user jitcode that
+/// happens to own it and decodes garbage —
+/// `synth/slots_class_var_conflict` SIGSEGVs in
+/// `blackhole_resume_via_rd_numb` on dynasm and cranelift, and passes again
+/// under `PYRE_NO_JD1=1` / `PYRE_JD1_NO_ENTER=1`.  The resume path does not
+/// reach the build-time store on its own; only the index-space unification
+/// removes the collision.
 pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate::PyJitCode>) {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
