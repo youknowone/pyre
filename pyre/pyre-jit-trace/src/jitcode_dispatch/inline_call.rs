@@ -1687,9 +1687,14 @@ fn walker_ec_enter(
 /// jit.virtual_ref_finish(frame_vref, frame)
 /// ```
 ///
-/// The profile-hook half stays with the interpreter's own
-/// [`pyre_interpreter::PyExecutionContext::leave`]; a traced call never runs a
-/// profile hook, which is why upstream can inline this frame at all.
+/// The profile-hook half (`if self.profilefunc: self._trace(frame,
+/// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
+/// [`pyre_interpreter::PyExecutionContext::leave`].  Omitting it here does not
+/// lose a leave event, because `is_being_profiled` is a portal-driver GREEN
+/// (`interp_jit.py:68 greens = ['next_instr', 'is_being_profiled', 'pycode']`):
+/// a trace is keyed on it, so one recorded with profiling off is only ever
+/// entered with profiling off, and turning profiling on selects a different
+/// green key rather than reusing this trace.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and
 /// forces the leaving vref; in the trace it records the force as

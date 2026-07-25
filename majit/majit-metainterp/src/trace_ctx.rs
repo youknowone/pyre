@@ -1115,22 +1115,28 @@ impl TraceCtx {
         // pyjitpl.py:1823 `assert box.getref_base() == lastbox.getref_base()`
         // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
         // alias boxes that share `getref_base()` but differ in box identity;
-        // an `OpRef`-identity assert would reject those.  Read `virtual_obj`'s
-        // ref value off its variant tag when it is a ConstPtr, falling back to
-        // the pre-pop side-table pointer the matching `opimpl_virtual_ref`
-        // recorded as `lastbox_ptr`.
-        let virtual_obj_ptr = match virtual_obj.inline_const_to_value() {
-            Some(Value::Ref(r)) => r.as_usize(),
-            _ => lastbox_ptr,
-        };
-        // RPython's plain `assert` fires in both untranslated and translated
-        // builds, so this is an `assert_eq!`: a release build must fail at the
-        // divergence rather than silently corrupt the vref stack.
-        assert_eq!(
-            virtual_obj_ptr, lastbox_ptr,
-            "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
-             (virtual_obj={virtual_obj:?}, lastbox={lastbox:?})"
-        );
+        // an `OpRef`-identity assert would reject those.
+        //
+        // `concrete_of_opref` is pyre's `getref_base()`: it reads a ConstPtr's
+        // value inline and otherwise resolves the `opref_concrete` stamp that
+        // every recording site writes.  Sourcing it that way is what gives the
+        // assert teeth — deriving it from `lastbox_ptr` on a non-const box, as
+        // an earlier spelling did, compared the popped pointer against itself
+        // and could never fire, which is exactly the mismatched-nesting bug
+        // upstream is asserting against.  A box with no stamp at all is not a
+        // mismatch, only an unknown, so it is skipped rather than failed.
+        if let Some(Value::Ref(r)) = self.concrete_of_opref(virtual_obj) {
+            // RPython's plain `assert` fires in both untranslated and
+            // translated builds, so this is an `assert_eq!`: a release build
+            // must fail at the divergence rather than silently corrupt the
+            // vref stack.
+            assert_eq!(
+                r.as_usize(),
+                lastbox_ptr,
+                "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
+                 (virtual_obj={virtual_obj:?}, lastbox={lastbox:?})"
+            );
+        }
         // pyjitpl.py:1826-1832 `if vrefinfo.is_virtual_ref(vref): record
         // VIRTUAL_REF_FINISH`.  False once `stop_tracking_virtualref` has
         // replaced the box with ConstPtr(NULL) — the finish already ran.
