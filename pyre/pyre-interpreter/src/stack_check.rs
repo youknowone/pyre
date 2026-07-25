@@ -428,6 +428,45 @@ pub fn is_jit_overflow_pending() -> bool {
     TL_JIT_PENDING_EXCEPTION.with(|slot| slot.get() != 0)
 }
 
+/// Park `err` in this thread's pending slot so the next interpreter call
+/// boundary re-raises it through [`drain_jit_pending_exception`].
+///
+/// The prologue stack check is one producer; the other is a JIT driver whose
+/// compiled loop raised while the Rust caller loop, not a portal runner, owns
+/// the continuation. `warmspot.py:998-1005` re-raises an
+/// `ExitFrameWithExceptionRef` out of `ll_portal_runner` straight into the
+/// portal's caller; pyre's second driver (`unpackiterable_driver`) is entered
+/// from a merge-point hook returning `()`, so the error travels through this
+/// slot instead of a return value. Delivery is at the caller loop's next
+/// dispatch, which for the drain is the `next(w_iterator)` that immediately
+/// follows the hook — before `__next__` re-runs, so no side effect repeats.
+///
+/// Overwrites any slot content: a stack overflow raised while a driver error
+/// is parked (or vice versa) is one thread unwinding for two reasons, and the
+/// caller sees whichever was stored last, as it would with `pos_exception()`.
+pub fn park_jit_pending_error(mut err: PyError) {
+    let obj = err.to_exc_object();
+    if !obj.is_null() {
+        set_jit_pending_exception(obj);
+    }
+}
+
+/// Shadow-stack root walker for the pending-exception slot: a parked
+/// `W_BaseException` is reachable from nothing else until the next call
+/// boundary drains it, and the drain crosses collecting code
+/// (`next()`/`__next__`). Registered once at JIT init next to the other
+/// `register_extra_root_walker` slots.
+pub fn walk_jit_pending_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    TL_JIT_PENDING_EXCEPTION.with(|slot| {
+        let obj = slot.get();
+        if obj != 0 {
+            let mut r = majit_ir::GcRef(obj as usize);
+            visitor(&mut r);
+            slot.set(r.0 as i64);
+        }
+    });
+}
+
 /// rpython/translator/c/src/stack.h:42 `LL_stack_criticalcode_start`.
 /// Clears this thread's `report_error` mirror so its slowpath will not signal
 /// a stack overflow during short critical-code sections.
