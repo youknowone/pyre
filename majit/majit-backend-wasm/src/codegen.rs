@@ -3659,6 +3659,20 @@ fn build_function(
                     || missing_layout_descr("size descr", op),
                     |sd| (sd.size() as i64, sd.type_id() as i64, sd.vtable()),
                 );
+                // `(w_class_offset, w_class)` — the `PyObject.w_class` field
+                // and the class pointer instances of this type carry
+                // (`get_instantiate(vtable_type)`). `fuse_boxing_alloc` drops
+                // the boxing ctor's `ob_header` stores expecting the runtime to
+                // stamp both `ob_type` and `w_class` from the size descr; the
+                // vtable write above covers `ob_type`, this covers `w_class`.
+                let w_class_init = sd.and_then(|sd| {
+                    sd.w_class_obj().and_then(|w_class| {
+                        sd.gc_fielddescrs()
+                            .iter()
+                            .find(|fd| fd.is_w_class())
+                            .map(|fd| (fd.offset() as u64, w_class))
+                    })
+                });
 
                 // Inline nursery bump (rewrite.py malloc fast path, x86
                 // `malloc_cond`): total = align8(max(header+size, MIN)); if
@@ -3811,6 +3825,28 @@ fn build_function(
                             align: 2,
                             memory_index: 0,
                         });
+                    }
+                    // Stamp `w_class = get_instantiate(vtable_type)` so the
+                    // materialized builtin box carries the class pointer
+                    // OptVirtualize folded its `w_class` header reads to. Mirrors
+                    // dynasm `genop_new_with_vtable` (aarch64/assembler.rs).
+                    // Pointer-width (4 bytes on wasm32): store the low 32 bits.
+                    // Without it the nursery-zeroed `w_class` stays 0 and the
+                    // promoted-`w_class` GuardValue fails every iteration on any
+                    // escaping-builtin loop (e.g. `while: lst.append(i)`).
+                    if op.opcode == OpCode::NewWithVtable {
+                        if let Some((w_class_offset, w_class)) = w_class_init {
+                            if w_class != 0 {
+                                sink.local_get(1 + vi);
+                                sink.i32_wrap_i64();
+                                sink.i32_const(w_class as i32);
+                                sink.i32_store(MemArg {
+                                    offset: w_class_offset,
+                                    align: 2,
+                                    memory_index: 0,
+                                });
+                            }
+                        }
                     }
                 }
                 // The collecting allocation may have moved every other live
