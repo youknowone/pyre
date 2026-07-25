@@ -7456,16 +7456,30 @@ pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
     Ok(value as i32)
 }
 
-/// baseobjspace.py:1784 text_w.
-pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+/// The `str` check the `text_w` family shares —
+/// `_typed_unwrap_error(space, "str")`, `"expected %s, got %T object"`.
+fn expect_str(obj: PyObjectRef) -> Result<(), PyError> {
     if unsafe { !isinstance_str_w(obj) } {
-        // `_typed_unwrap_error(space, "str")` — `"expected %s, got %T object"`.
         return Err(PyError::type_error(format!(
             "expected str, got {} object",
             object_functionstr_type_name(obj)
         )));
     }
+    Ok(())
+}
+
+/// baseobjspace.py:1784 text_w.
+pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    expect_str(obj)?;
     Ok(unsafe { pyre_object::w_str_get_value(obj) })
+}
+
+/// `text_w` on the raw buffer.  `W_UnicodeObject.text_w` hands back
+/// `self._utf8` unchanged, so a lone surrogate survives instead of demanding a
+/// `&str` view the buffer cannot give.
+pub fn text_wtf8_w(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
+    expect_str(obj)?;
+    Ok(unsafe { pyre_object::w_str_get_wtf8(obj) })
 }
 
 /// baseobjspace.py:1791 utf8_w.
@@ -7485,6 +7499,15 @@ pub fn realunicode_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
 pub fn text0_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
     let s = text_w(obj)?;
     if s.contains('\0') {
+        return Err(PyError::value_error("embedded null character"));
+    }
+    Ok(s)
+}
+
+/// `text0_w` on the raw buffer — see `text_wtf8_w`.
+pub fn text0_wtf8_w(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
+    let s = text_wtf8_w(obj)?;
+    if s.as_bytes().contains(&0) {
         return Err(PyError::value_error("embedded null character"));
     }
     Ok(s)

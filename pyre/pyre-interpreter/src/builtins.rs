@@ -12612,7 +12612,6 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if !unsafe { pyre_object::is_str(name_obj) } {
         return Err(crate::PyError::type_error("module name must be a string"));
     }
-    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let globals = scope[1];
     let locals = scope[2];
     let fromlist = scope[3];
@@ -12632,6 +12631,13 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             unsafe { (*frame).execution_context }
         }
     });
+    // The native importer keys every lookup by `&str`, so a name that has no
+    // such spelling goes straight to the app-level bootstrap.
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
+        return crate::importing::dunder_import_name_obj(
+            name_obj, globals, locals, fromlist, level,
+        );
+    };
     crate::importing::dunder_import(name, globals, locals, fromlist, level, exec_ctx)
 }
 

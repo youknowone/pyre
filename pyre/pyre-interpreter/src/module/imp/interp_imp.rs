@@ -3,6 +3,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use crate::importing::BUILTIN_MODULES;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 struct FrozenModule {
@@ -317,8 +318,10 @@ fn reinit_lock() {
     getimportlock().reinit_lock();
 }
 
-fn frozen_module(name: &str) -> Option<&'static FrozenModule> {
-    FROZEN_MODULES.iter().find(|entry| entry.name == name)
+fn frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
+    FROZEN_MODULES
+        .iter()
+        .find(|entry| name == Wtf8::new(entry.name))
 }
 
 fn is_bootstrap_frozen(name: &str) -> bool {
@@ -337,11 +340,22 @@ fn frozen_module_served(entry: &FrozenModule) -> bool {
     mode >= 0 || is_bootstrap_frozen(entry.name)
 }
 
-fn served_frozen_module(name: &str) -> Option<&'static FrozenModule> {
+fn served_frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
     frozen_module(name).filter(|entry| frozen_module_served(entry))
 }
 
-fn frozen_name(args: &[pyre_object::PyObjectRef], function: &str) -> Result<String, crate::PyError> {
+/// The module-name argument, kept in WTF-8.
+///
+/// `find_frozen` reads the name with `PyUnicode_AsUTF8` and treats one that
+/// does not encode as `FROZEN_BAD_NAME`, clearing the error rather than
+/// propagating it and reporting the status exactly as `FROZEN_NOT_FOUND` is
+/// reported.  The frozen table is keyed by `&'static str`, so such a name
+/// matches nothing; carrying it as WTF-8 keeps the code points for the `%R` in
+/// that report instead of demanding a `&str` view the buffer cannot give.
+fn frozen_name(
+    args: &[pyre_object::PyObjectRef],
+    function: &str,
+) -> Result<Wtf8Buf, crate::PyError> {
     let Some(&name) = args.first() else {
         return Err(crate::PyError::type_error(format!(
             "{function} expected at least 1 argument, got 0"
@@ -353,15 +367,15 @@ fn frozen_name(args: &[pyre_object::PyObjectRef], function: &str) -> Result<Stri
             bad_argument_type_name(name)
         )));
     }
-    Ok(unsafe { pyre_object::w_str_get_value(name) }.to_owned())
+    Ok(unsafe { pyre_object::w_str_get_wtf8(name) }.to_owned())
 }
 
 /// `set_frozen_error` — both frozen diagnostics carry the module name as
 /// `.name` with no `.path`, and render it the way `%R` does.
-fn frozen_error(message: String, name: &str) -> crate::PyError {
+fn frozen_error(message: String, name: &Wtf8) -> crate::PyError {
     crate::PyError::import_error_name_path(
         message,
-        pyre_object::w_str_new(name),
+        pyre_object::w_str_from_wtf8(name.to_owned()),
         pyre_object::w_none(),
     )
 }
@@ -369,12 +383,11 @@ fn frozen_error(message: String, name: &str) -> crate::PyError {
 /// `%R` on the module name: quote selection and escaping identical to
 /// `repr(str)`, which Rust's `{:?}` does not reproduce (it always
 /// double-quotes).
-fn frozen_name_repr(name: &str) -> String {
-    let w_name = pyre_object::w_str_new(name);
-    crate::display::format_wtf8_repr(unsafe { pyre_object::w_str_get_wtf8(w_name) })
+fn frozen_name_repr(name: &Wtf8) -> String {
+    crate::display::format_wtf8_repr(name)
 }
 
-fn missing_frozen_error(name: &str) -> crate::PyError {
+fn missing_frozen_error(name: &Wtf8) -> crate::PyError {
     frozen_error(
         format!("No such frozen object named {}", frozen_name_repr(name)),
         name,
@@ -383,7 +396,7 @@ fn missing_frozen_error(name: &str) -> crate::PyError {
 
 /// `set_frozen_error(FROZEN_INVALID)` — the frozen data was supplied by the
 /// caller but does not unmarshal.
-fn invalid_frozen_error(name: &str) -> crate::PyError {
+fn invalid_frozen_error(name: &Wtf8) -> crate::PyError {
     frozen_error(
         format!("Frozen object named {} is invalid", frozen_name_repr(name)),
         name,
@@ -455,9 +468,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_int_new(0));
                 }
+                // The name is compared against every `_inittab` entry with
+                // `_PyUnicode_EqualToASCIIString`, which never decodes;
+                // `BUILTIN_MODULES` is `&'static str`-keyed and cannot hold a
+                // lone surrogate either, so such a name is not a builtin.
                 let name = unsafe {
                     if pyre_object::is_str(args[0]) {
-                        pyre_object::w_str_get_value(args[0])
+                        match pyre_object::w_str_get_value_opt(args[0]) {
+                            Some(name) => name,
+                            None => return Ok(pyre_object::w_int_new(0)),
+                        }
                     } else {
                         return Ok(pyre_object::w_int_new(0));
                     }
@@ -654,7 +674,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if !unsafe { pyre_object::is_str(w_name) } {
                     return Err(crate::PyError::type_error("spec.name must be a string"));
                 }
-                let name = unsafe { pyre_object::w_str_get_value(w_name) }.to_string();
+                // The builtin registry is `&'static str`-keyed, so a name
+                // carrying a lone surrogate names no builtin and takes the
+                // not-found report; those code points have no `&str` spelling,
+                // so it is rendered the way `%R` does.
+                let w_name_wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+                let Ok(name) = w_name_wtf8.as_str() else {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        format!(
+                            "no built-in module named {}",
+                            crate::display::format_wtf8_repr(w_name_wtf8)
+                        ),
+                    ));
+                };
+                let name = name.to_string();
                 if let Some(module) = crate::importing::get_sys_module(&name) {
                     return Ok(module);
                 }
@@ -708,8 +742,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "create_dynamic() missing required argument 'spec'",
                     ));
                 };
-                crate::baseobjspace::text0_w(crate::baseobjspace::getattr_str(spec, "name")?)?;
-                crate::baseobjspace::text0_w(crate::baseobjspace::getattr_str(spec, "origin")?)?;
+                crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(spec, "name")?)?;
+                crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
+                    spec, "origin",
+                )?)?;
                 Err(crate::PyError::new(
                     crate::PyErrorKind::ImportError,
                     "Not implemented".to_string(),
@@ -770,7 +806,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         type_name(args[1])
                     )));
                 }
-                let newname = unsafe { pyre_object::w_str_get_value(args[1]) }.to_owned();
+                // `co_filename` is stored as UTF-8, so the name is encoded
+                // strictly: one carrying a lone surrogate has no such spelling
+                // and is reported the way encoding the string itself reports
+                // it.  The encode succeeded, so the bytes are valid UTF-8 and
+                // the lossy decode below cannot substitute anything.
+                let encoded = crate::type_methods::encode_utf8_with_errors(args[1], "strict")?;
+                let newname = String::from_utf8_lossy(&encoded).into_owned();
                 unsafe { crate::pycode::fix_co_filename(args[0], &newname) };
                 Ok(pyre_object::w_none())
             },

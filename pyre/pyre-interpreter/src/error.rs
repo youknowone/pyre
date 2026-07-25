@@ -682,8 +682,17 @@ impl PyError {
     /// `name` rides the shared `w_n` slot (ImportError / NameError /
     /// AttributeError), stamped by `to_exc_object`.
     pub fn module_not_found_with_name(msg: impl Into<String>, name: &str) -> Self {
+        Self::module_not_found_with_name_obj(msg, pyre_object::w_str_new(name))
+    }
+
+    /// `module_not_found_with_name` for a name with no `&str` spelling, so the
+    /// caller supplies the name object itself.
+    pub fn module_not_found_with_name_obj(
+        msg: impl Into<String>,
+        w_name: pyre_object::PyObjectRef,
+    ) -> Self {
         let mut err = Self::new(PyErrorKind::ModuleNotFoundError, msg);
-        err.w_name_context = pyre_object::w_str_new(name);
+        err.w_name_context = w_name;
         err
     }
 

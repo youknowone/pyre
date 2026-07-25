@@ -2911,7 +2911,7 @@ fn pad_wtf8(body: &Wtf8, fill: char, align: char, width: usize) -> Wtf8Buf {
 /// are routed to the named error handler.  `w_object` is the str being
 /// encoded, threaded through so a strict failure can build a structured
 /// UnicodeEncodeError carrying it.
-fn encode_utf8_with_errors(
+pub(crate) fn encode_utf8_with_errors(
     w_object: PyObjectRef,
     err_mode: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
