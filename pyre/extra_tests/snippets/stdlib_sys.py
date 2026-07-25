@@ -146,9 +146,9 @@ assert proc.returncode == 0, proc
 
 def safe_path_flag(env, *opts):
     proc = subprocess.run(
-        (sys.executable,) + opts + ("-c", code),
+        (sys.executable, *opts, "-c", code),
         stdout=subprocess.PIPE,
-        universal_newlines=True,
+        text=True,
         env=env,
     )
     assert proc.returncode == 0, proc

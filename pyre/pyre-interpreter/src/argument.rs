@@ -1901,6 +1901,24 @@ mod tests {
         assert!(!contains_w_names(pyre_object::w_str_new("c"), &names));
     }
 
+    /// `contains_w_names` compares keyword names without requiring a `&str`
+    /// view.
+    #[test]
+    fn surrogate_keyword_name_matches() {
+        let mut name = rustpython_wtf8::Wtf8Buf::new();
+        name.push(rustpython_wtf8::CodePoint::from_u32(0xD800).unwrap());
+        let w_name = pyre_object::w_str_from_wtf8(name.clone());
+        let existing = vec![pyre_object::w_str_from_wtf8(name.clone())];
+        let new = vec![w_name];
+        let values: Vec<PyObjectRef> = vec![pyre_object::w_int_new(1)];
+
+        assert!(contains_w_names(w_name, &existing));
+        let err = check_not_duplicate_kwargs(&existing, &new, &values, pyre_object::PY_NULL)
+            .expect_err("should raise TypeError on duplicate");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(err.message.contains("got multiple values"));
+    }
+
     /// pypy/interpreter/argument.py:410-417 `_check_not_duplicate_kwargs` —
     /// raises TypeError on overlap.
     #[test]
