@@ -17295,7 +17295,7 @@ mod tests {
     /// GC_STORE against callee jitframes. Mirrors the dynasm test layout
     /// (runner.rs install_call_assembler_test_layout); the offsets match
     /// the production cranelift mapping in pyre-jit call_jit.rs
-    /// arena_jitframe_descrs. Reads jitframe_gc_type_id() after
+    /// jitframe_layout_descrs. Reads jitframe_gc_type_id() after
     /// set_gc_allocator has lazily registered JITFRAME.
     fn install_call_assembler_test_layout() {
         register_jitframe_layout(JitFrameLayoutInfo {

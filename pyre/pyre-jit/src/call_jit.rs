@@ -5,7 +5,6 @@
 
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
 use std::sync::Once;
 
 /// Whether `PYRE_NBODY_DEBUG` is set, cached at first access.
@@ -225,16 +224,9 @@ fn self_recursive_dispatch(green_key: u64) -> Option<u64> {
 // Force cache implementation removed — CallAssemblerI + bridge
 // handles recursive dispatch natively.
 
-// ── Callee frame arena (RPython nursery bump equivalent) ─────────
-// ── Global arena pointers for Cranelift inline access ──────────────
-//
-// Single-threaded JIT invariant: only one thread executes compiled code
-// at a time, so these globals need no synchronization.
-static mut ARENA_BUF_BASE: *mut u8 = std::ptr::null_mut();
-static mut ARENA_TOP: usize = 0;
-static mut ARENA_INITIALIZED: usize = 0;
+// ── JitFrame layout descriptors published to the backends ─────────
 
-fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
+fn jitframe_layout_descrs() -> majit_gc::rewrite::JitFrameDescrs {
     use majit_backend::jitframe::*;
     majit_gc::rewrite::JitFrameDescrs {
         jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
@@ -257,215 +249,90 @@ fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
 
 #[cfg(test)]
 mod tests {
-    use super::arena_jitframe_descrs;
+    use super::jitframe_layout_descrs;
     use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
 
     #[test]
-    fn arena_jitframe_descrs_uses_frame_relative_offsets() {
-        let descrs = arena_jitframe_descrs();
+    fn jitframe_layout_descrs_uses_frame_relative_offsets() {
+        let descrs = jitframe_layout_descrs();
         assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
         assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
     }
 }
 
 #[cfg(feature = "cranelift")]
-pub fn arena_global_info() -> majit_backend_cranelift::JitFrameLayoutInfo {
+pub fn jitframe_layout_info() -> majit_backend_cranelift::JitFrameLayoutInfo {
     majit_backend_cranelift::JitFrameLayoutInfo {
-        jitframe_descrs: Some(arena_jitframe_descrs()),
+        jitframe_descrs: Some(jitframe_layout_descrs()),
     }
 }
 
 #[cfg(feature = "dynasm")]
-pub fn arena_global_info_dynasm() -> majit_backend_dynasm::JitFrameLayoutInfo {
+pub fn jitframe_layout_info_dynasm() -> majit_backend_dynasm::JitFrameLayoutInfo {
     majit_backend_dynasm::JitFrameLayoutInfo {
-        jitframe_descrs: Some(arena_jitframe_descrs()),
+        jitframe_descrs: Some(jitframe_layout_descrs()),
     }
 }
 
-//
-// LIFO stack of pre-allocated PyFrame slots. Recursive call/return
-// order is naturally LIFO, so arena_take/arena_put are O(1).
-// Eliminates heap allocation for recursion depths up to ARENA_CAP.
-
-const ARENA_CAP: usize = 64;
-
-/// GcStruct layout: [GcHeader (8 bytes)] [struct fields].
-/// Every GC object (including PyFrame / W_Root) is prepended by a
-/// zeroed GcHeader. Arena slots and heap fallbacks match this layout.
-/// Single source of truth: [`majit_gc::header::GcHeader::SIZE`].
-const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
-
-/// Arena slot: leading GcHeader (tid 0, flags 0) then the frame payload.
-#[repr(C)]
-struct GcFrameSlot {
-    gc_header: majit_gc::header::GcHeader,
-    frame: MaybeUninit<PyFrame>,
-}
-
-impl GcFrameSlot {
-    const fn zeroed() -> Self {
-        GcFrameSlot {
-            gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
-            frame: MaybeUninit::uninit(),
-        }
-    }
-}
-
-/// Heap-allocated frame with prepended GcHeader.
-#[repr(C)]
-struct GcPyFrame {
-    gc_header: majit_gc::header::GcHeader,
-    frame: PyFrame,
-}
-
-fn heap_alloc_frame(frame: PyFrame) -> *mut PyFrame {
-    let gc_frame = Box::into_raw(Box::new(GcPyFrame {
-        gc_header: majit_gc::header::GcHeader { tid_and_flags: 0 },
-        frame,
-    }));
-    let ptr = unsafe { &mut (*gc_frame).frame as *mut PyFrame };
-    HEAP_CALLEE_FRAMES.with(|cell| unsafe { &mut *cell.get() }.push(ptr));
-    ptr
-}
-
-fn heap_free_frame(ptr: *mut PyFrame) {
-    HEAP_CALLEE_FRAMES.with(|cell| {
-        let frames = unsafe { &mut *cell.get() };
-        if let Some(pos) = frames.iter().position(|p| *p == ptr) {
-            frames.swap_remove(pos);
-        }
-    });
-    let gc_frame = unsafe { (ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcPyFrame };
-    unsafe { drop(Box::from_raw(gc_frame)) };
-}
+// ── Callee frame allocation ───────────────────────────────────────
 
 thread_local! {
-    /// Live heap-fallback callee frames (arena overflow). Walked by
-    /// `walk_jit_callee_frame_roots` alongside armed arena slots.
-    static HEAP_CALLEE_FRAMES: UnsafeCell<Vec<*mut PyFrame>> = const { UnsafeCell::new(Vec::new()) };
-}
-
-struct FrameArena {
-    buf: Box<[GcFrameSlot; ARENA_CAP]>,
-    /// Number of frames currently in use (LIFO stack pointer).
-    top: usize,
-    /// Frames below this index have been initialized at least once.
-    /// Reuse only needs reinit of changed fields, not full new_for_call.
-    initialized: usize,
-    /// Per-slot GC visibility: set once a slot's frame is fully
-    /// initialized for the current call, cleared on `put`. The extra
-    /// root walker (`walk_jit_callee_frame_roots`) visits only armed
-    /// slots — `top` alone cannot be used because a non-LIFO `put`
-    /// leaves dead slots below `top`, and a slot between `take` and
-    /// end-of-init holds an uninitialized or stale frame.
-    armed: [bool; ARENA_CAP],
-}
-
-impl FrameArena {
-    fn new() -> Self {
-        let mut arena = Self {
-            buf: Box::new([const { GcFrameSlot::zeroed() }; ARENA_CAP]),
-            top: 0,
-            initialized: 0,
-            armed: [false; ARENA_CAP],
-        };
-        // Publish stable pointers so Cranelift-generated code can
-        // inline arena take/put without going through TLS.
-        unsafe {
-            ARENA_BUF_BASE = arena.buf.as_mut_ptr() as *mut u8;
-            ARENA_TOP = 0;
-            ARENA_INITIALIZED = 0;
-        }
-        arena
-    }
-
-    /// Take the next frame slot. Returns (ptr, was_previously_initialized).
-    /// The returned pointer points to the PyFrame part (after the GcHeader).
-    #[inline]
-    fn take(&mut self) -> Option<(*mut PyFrame, bool)> {
-        if self.top < ARENA_CAP {
-            let idx = self.top;
-            self.top += 1;
-            unsafe {
-                ARENA_TOP = self.top;
-            }
-            let ptr = self.buf[idx].frame.as_mut_ptr();
-            let was_init = idx < self.initialized;
-            Some((ptr, was_init))
-        } else {
-            None
-        }
-    }
-
-    /// Return a frame to the arena. Must be the most recently taken frame (LIFO).
-    #[inline]
-    fn put(&mut self, ptr: *mut PyFrame) -> bool {
-        if let Some(idx) = self.slot_index(ptr) {
-            self.armed[idx] = false;
-        }
-        if self.top > 0 && ptr == self.buf[self.top - 1].frame.as_mut_ptr() {
-            self.top -= 1;
-            unsafe {
-                ARENA_TOP = self.top;
-            }
-            return true;
-        }
-        // Check if within arena range — don't free, but mark as non-LIFO.
-        self.slot_index(ptr).is_some()
-    }
-
-    /// Slot index for a frame pointer inside the arena buffer, if any.
-    #[inline]
-    fn slot_index(&self, ptr: *mut PyFrame) -> Option<usize> {
-        let base = self.buf.as_ptr() as usize;
-        let end = unsafe { (self.buf.as_ptr()).add(ARENA_CAP) } as usize;
-        let addr = ptr as usize;
-        if addr >= base && addr < end {
-            Some((addr - base) / std::mem::size_of::<GcFrameSlot>())
-        } else {
-            None
-        }
-    }
-
-    /// Mark a fully-initialized in-use slot as visible to the GC root
-    /// walker. Call only after the frame body and its locals array are
-    /// completely written for the current call.
-    #[inline]
-    fn arm(&mut self, ptr: *mut PyFrame) {
-        if let Some(idx) = self.slot_index(ptr) {
-            self.armed[idx] = true;
-        }
-    }
-
-    /// Mark that frames up to `top` have been fully initialized.
-    #[inline]
-    fn mark_initialized(&mut self) {
-        if self.top > self.initialized {
-            self.initialized = self.top;
-            unsafe {
-                ARENA_INITIALIZED = self.top;
-            }
-        }
-    }
-}
-
-thread_local! {
-    static FRAME_ARENA: UnsafeCell<FrameArena> = UnsafeCell::new(FrameArena::new());
+    /// Callee frames the JIT created and has not finished running.
+    /// Their only root between `jit_create_callee_frame_*` and
+    /// `jit_drop_callee_frame` is this list: compiled code holds the
+    /// frame in a register / jitframe slot, and the frame sits on no
+    /// `CURRENT_FRAME` chain. Walked by `walk_jit_callee_frame_roots`.
+    static LIVE_CALLEE_FRAMES: UnsafeCell<Vec<*mut PyFrame>> = const { UnsafeCell::new(Vec::new()) };
 
     static JIT_CALLEE_FRAME_ROOT_AREA: JitCalleeFrameRootArea = JitCalleeFrameRootArea {
-        arena: FRAME_ARENA.with(|cell| cell as *const _),
-        heap_frames: HEAP_CALLEE_FRAMES.with(|cell| cell as *const _),
+        live_frames: LIVE_CALLEE_FRAMES.with(|cell| cell as *const _),
     };
 }
 
 struct JitCalleeFrameRootArea {
-    arena: *const UnsafeCell<FrameArena>,
-    heap_frames: *const UnsafeCell<Vec<*mut PyFrame>>,
+    live_frames: *const UnsafeCell<Vec<*mut PyFrame>>,
 }
 
-#[inline]
-fn arena_ref() -> &'static mut FrameArena {
-    FRAME_ARENA.with(|cell| unsafe { &mut *cell.get() })
+/// Create a callee frame for a JIT call, exactly as the interpreter
+/// creates every other frame: `baseobjspace.py:799-801 createframe` on a
+/// `pyframe.py:52 class PyFrame(W_Root)`, a normal GC object whose
+/// lifetime is its reachability. Nothing recycles the block, so a frame
+/// the program retains past the call — a traceback node, an `f_back`
+/// chain, a `sys._getframe` result — stays valid for as long as Python
+/// can reach it.
+fn alloc_callee_frame(
+    code: *const (),
+    args: &[PyObjectRef],
+    w_globals: PyObjectRef,
+    execution_context: *const pyre_interpreter::PyExecutionContext,
+) -> *mut PyFrame {
+    let ptr = pyre_interpreter::pyframe::FrameBox::new(
+        PyFrame::new_for_call_with_closure_and_globals_obj(
+            code,
+            args,
+            w_globals,
+            execution_context,
+            PY_NULL,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+        ),
+    )
+    .into_raw();
+    LIVE_CALLEE_FRAMES.with(|cell| unsafe { &mut *cell.get() }.push(ptr));
+    ptr
+}
+
+/// Drop the JIT's root on a callee frame that finished running. The
+/// frame itself is not freed — `executioncontext.py:91-107 leave` frees
+/// nothing either; the collector reclaims it once nothing reaches it.
+fn unroot_callee_frame(ptr: *mut PyFrame) {
+    LIVE_CALLEE_FRAMES.with(|cell| {
+        let frames = unsafe { &mut *cell.get() };
+        // Calls return in LIFO order, so the match is normally the last
+        // entry.
+        if let Some(pos) = frames.iter().rposition(|p| *p == ptr) {
+            frames.swap_remove(pos);
+        }
+    });
 }
 
 /// Visit the GC-ref slots of one live callee frame: every
@@ -485,17 +352,16 @@ unsafe fn visit_callee_frame_roots(frame: *mut PyFrame, visitor: &mut dyn FnMut(
     visitor(unsafe { &mut *(&mut frame.w_globals as *mut PyObjectRef as *mut GcRef) });
 }
 
-/// Extra GC root walker for JIT-created callee frames (frame arena +
-/// heap fallbacks). These frames are host-allocated (zeroed GcHeader,
-/// outside the GC heap) and sit on no `CURRENT_FRAME`/`f_backref`
-/// chain while compiled code runs, so neither the standard tracer nor
-/// `walk_pyframe_roots` reaches their locals. Without this walk, a
-/// young object stored into a callee frame slot (argument boxing,
-/// back-edge CALL_ASSEMBLER writeback) is invisible to a minor
-/// collection and the slot is left pointing at evacuated nursery
-/// memory. Registered via `register_extra_root_walker`, mirroring the
-/// framework.py `root_walker.walk_roots` seam the collector already
-/// uses for the other host-side root sources.
+/// Extra GC root walker for the callee frames a JIT call is running.
+/// They sit on no `CURRENT_FRAME`/`f_backref` chain while compiled code
+/// runs, so `walk_pyframe_roots` reaches neither the frames themselves
+/// nor their locals: a major collection would sweep the block compiled
+/// code is executing on, and a young object stored into a frame slot
+/// (argument boxing, back-edge CALL_ASSEMBLER writeback) would be
+/// invisible to a minor collection, leaving the slot pointing at
+/// evacuated nursery memory. Registered via `register_extra_root_walker`,
+/// mirroring the framework.py `root_walker.walk_roots` seam the collector
+/// already uses for the other host-side root sources.
 pub fn walk_jit_callee_frame_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
     let data = capture_jit_callee_frame_root_area();
     unsafe { walk_jit_callee_frame_roots_area(data, visitor) };
@@ -513,15 +379,13 @@ pub unsafe fn walk_jit_callee_frame_roots_area(
     visitor: &mut dyn FnMut(&mut GcRef),
 ) {
     let area = unsafe { &*(data as *const JitCalleeFrameRootArea) };
-    let arena = unsafe { &mut *(*area.arena).get() };
-    for idx in 0..ARENA_CAP {
-        if arena.armed[idx] {
-            unsafe { visit_callee_frame_roots(arena.buf[idx].frame.as_mut_ptr(), visitor) };
-        }
-    }
-    let heap_frames = unsafe { &*(*area.heap_frames).get() };
-    for &ptr in heap_frames.iter() {
-        unsafe { visit_callee_frame_roots(ptr, visitor) };
+    let live_frames = unsafe { &mut *(*area.live_frames).get() };
+    for slot in live_frames.iter_mut() {
+        // Mark the frame object itself — this list is its only root
+        // until the call returns. The frame is a non-moving stable
+        // allocation, so the visitor never rewrites the slot.
+        visitor(unsafe { &mut *(slot as *mut *mut PyFrame as *mut GcRef) });
+        unsafe { visit_callee_frame_roots(*slot, visitor) };
     }
 }
 
@@ -785,7 +649,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 /// through the portal.
 ///
 /// Nursery-safe force: read code/namespace/exec_ctx via raw offsets (valid
-/// for both arena `PyFrame` AND nursery-allocated raw blocks), build a proper
+/// for both a callee `PyFrame` AND nursery-allocated raw blocks), build a proper
 /// `PyFrame`, then hand it to `portal_runner` (`maybe_compile_and_run` +
 /// interpreter main loop; ContinueRunningNormally re-enters the JIT via the
 /// portal, warmspot.py:961-983). The callee frame may be a nursery-allocated
@@ -1537,7 +1401,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
             );
-            majit_backend_cranelift::register_jitframe_layout(arena_global_info());
+            majit_backend_cranelift::register_jitframe_layout(jitframe_layout_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
             // resume.py:763-870 VStr/VUni.allocate parity — Cranelift
             // backend's materialize_virtual_recursive invokes these
@@ -1572,7 +1436,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
             );
-            majit_backend_dynasm::register_jitframe_layout(arena_global_info_dynasm());
+            majit_backend_dynasm::register_jitframe_layout(jitframe_layout_info_dynasm());
             majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
             // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
             // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
@@ -3644,7 +3508,7 @@ fn try_compile_ca_bridge(
 /// that actually finished (a base case, or a chained-bridge finish the arm's
 /// static fast-path set did not recognise) short-circuits to its output slot.
 ///
-/// `frame_ptr` is the deopted callee arena frame; `compiled_ptr` is the source
+/// `frame_ptr` is the deopted callee frame; `compiled_ptr` is the source
 /// loop's `CompiledWasmLoop`, both baked into the trace by `compile_bridge`.
 #[cfg(target_arch = "wasm32")]
 pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64 {
@@ -3828,28 +3692,6 @@ fn fill_positional_defaults_for_jit_call<'a>(
     Cow::Owned(full)
 }
 
-#[inline]
-fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
-    frame.locals_w_mut().as_mut_slice().fill(PY_NULL);
-    let nargs = args.len().min(frame.nlocals());
-    for (idx, value) in args.iter().take(nargs).enumerate() {
-        frame.locals_w_mut()[idx] = *value;
-    }
-    frame.valuestackdepth = frame.stack_base();
-    frame.set_last_instr_from_next_instr(0);
-    frame.vable_token = 0;
-    frame.set_frame_finished_execution(false);
-    frame.f_generator_nowref = PY_NULL;
-    frame.w_yielding_from = PY_NULL;
-    frame.f_backref = std::ptr::null_mut();
-    // pyframe.py:78-86: reused arena frames must look like new frames.
-    // debugdata and lastblock are GC-managed refs — release references only,
-    // never manually free (JIT snapshots may still hold these pointers).
-    frame.debugdata = std::ptr::null_mut();
-    frame.set_escaped(false);
-    frame.set_blocklist(&[]);
-}
-
 fn create_callee_frame_impl_1_boxed(
     caller_frame: i64,
     callable: PyObjectRef,
@@ -3862,60 +3704,7 @@ fn create_callee_frame_impl_1_boxed(
     let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
     let args = args.as_ref();
 
-    let arena = arena_ref();
-    if let Some((ptr, was_init)) = arena.take() {
-        if was_init {
-            let f = unsafe { &mut *ptr };
-            if f.pycode == w_code
-                && f.w_globals == w_globals
-                && f.execution_context == caller.execution_context
-            {
-                reset_reused_call_frame(f, args);
-            } else {
-                unsafe {
-                    // Different function: drop the previous frame before
-                    // overwriting, so PyFrame::drop releases the old
-                    // locals_cells_stack_w (pyframe.rs:150).
-                    std::ptr::drop_in_place(ptr);
-                    std::ptr::write(
-                        ptr,
-                        PyFrame::new_for_call_with_globals_obj(
-                            w_code,
-                            args,
-                            w_globals,
-                            caller.execution_context,
-                        ),
-                    );
-                    (&mut *ptr).fix_array_ptrs();
-                }
-            }
-        } else {
-            unsafe {
-                std::ptr::write(
-                    ptr,
-                    PyFrame::new_for_call_with_globals_obj(
-                        w_code,
-                        args,
-                        w_globals,
-                        caller.execution_context,
-                    ),
-                );
-                (&mut *ptr).fix_array_ptrs();
-            }
-            arena.mark_initialized();
-        }
-        arena.arm(ptr);
-        return ptr as i64;
-    }
-
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
-        w_code,
-        args,
-        w_globals,
-        caller.execution_context,
-    ));
-    unsafe { &mut *frame_ptr }.fix_array_ptrs();
-    frame_ptr as i64
+    alloc_callee_frame(w_code, args, w_globals, caller.execution_context) as i64
 }
 
 fn create_self_recursive_callee_frame_impl_1_boxed(
@@ -3927,70 +3716,11 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let w_globals = caller.w_globals;
     let execution_context = caller.execution_context;
 
-    let arena = arena_ref();
-    if let Some((ptr, was_init)) = arena.take() {
-        if was_init {
-            let f = unsafe { &mut *ptr };
-            if f.pycode == func_code
-                && f.w_globals == w_globals
-                && f.execution_context == execution_context
-            {
-                // Reuse: same code/globals/ec — full reset matching
-                // new_for_call_with_closure() semantics. No partial
-                // shortcuts: blackhole/force paths must see a clean frame.
-                reset_reused_call_frame(f, &[boxed_arg]);
-            } else {
-                unsafe {
-                    std::ptr::drop_in_place(ptr);
-                    std::ptr::write(
-                        ptr,
-                        PyFrame::new_for_call_with_globals_obj(
-                            func_code,
-                            &[boxed_arg],
-                            w_globals,
-                            execution_context,
-                        ),
-                    );
-                    (&mut *ptr).fix_array_ptrs();
-                }
-            }
-        } else {
-            unsafe {
-                std::ptr::write(
-                    ptr,
-                    PyFrame::new_for_call_with_globals_obj(
-                        func_code,
-                        &[boxed_arg],
-                        w_globals,
-                        execution_context,
-                    ),
-                );
-                (&mut *ptr).fix_array_ptrs();
-            }
-            arena.mark_initialized();
-        }
-        arena.arm(ptr);
-        if majit_metainterp::majit_log_enabled() {
-            let f = unsafe { &*ptr };
-            eprintln!(
-                "[jit][ca-frame] ptr={ptr:p} locals=0x{:x} vsd={} reused={} boxed_arg=0x{:x}",
-                f.locals_cells_stack_w as usize, f.valuestackdepth, was_init, boxed_arg as usize,
-            );
-        }
-        return ptr as i64;
-    }
-
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
-        func_code,
-        &[boxed_arg],
-        w_globals,
-        execution_context,
-    ));
-    unsafe { &mut *frame_ptr }.fix_array_ptrs();
+    let frame_ptr = alloc_callee_frame(func_code, &[boxed_arg], w_globals, execution_context);
     if majit_metainterp::majit_log_enabled() {
         let f = unsafe { &*frame_ptr };
         eprintln!(
-            "[jit][ca-frame] ptr={frame_ptr:p} locals=0x{:x} vsd={} reused=false boxed_arg=0x{:x}",
+            "[jit][ca-frame] ptr={frame_ptr:p} locals=0x{:x} vsd={} boxed_arg=0x{:x}",
             f.locals_cells_stack_w as usize, f.valuestackdepth, boxed_arg as usize,
         );
     }
@@ -4005,63 +3735,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
     let args = args.as_ref();
 
-    let arena = arena_ref();
-    if let Some((ptr, was_init)) = arena.take() {
-        if was_init {
-            // Fast reinit: only update fields that change between calls.
-            // code, execution_context, namespace, locals_cells_stack_w.ptr
-            // are stable for self-recursion (same function, same module).
-            let f = unsafe { &mut *ptr };
-            if f.pycode == w_code
-                && f.w_globals == w_globals
-                && f.execution_context == caller.execution_context
-            {
-                reset_reused_call_frame(f, args);
-            } else {
-                // Different function: full reinit (rare for fib)
-                unsafe {
-                    std::ptr::drop_in_place(ptr);
-                    std::ptr::write(
-                        ptr,
-                        PyFrame::new_for_call_with_globals_obj(
-                            w_code,
-                            args,
-                            w_globals,
-                            caller.execution_context,
-                        ),
-                    );
-                    (&mut *ptr).fix_array_ptrs();
-                }
-            }
-        } else {
-            // First-time init for this arena slot
-            unsafe {
-                std::ptr::write(
-                    ptr,
-                    PyFrame::new_for_call_with_globals_obj(
-                        w_code,
-                        args,
-                        w_globals,
-                        caller.execution_context,
-                    ),
-                );
-                (&mut *ptr).fix_array_ptrs();
-            }
-            arena.mark_initialized();
-        }
-        arena.arm(ptr);
-        return ptr as i64;
-    }
-
-    // Arena full: heap fallback (should not happen for recursion < 64)
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
-        w_code,
-        args,
-        w_globals,
-        caller.execution_context,
-    ));
-    unsafe { &mut *frame_ptr }.fix_array_ptrs();
-    frame_ptr as i64
+    alloc_callee_frame(w_code, args, w_globals, caller.execution_context) as i64
 }
 
 #[majit_macros::dont_look_inside]
@@ -4114,62 +3788,11 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
 
-    let arena = arena_ref();
-    if let Some((ptr, was_init)) = arena.take() {
-        let f = unsafe { &mut *ptr };
-        if was_init
-            && f.pycode == func_code
-            && f.w_globals == w_globals
-            && f.execution_context == execution_context
-        {
-            // Reuse: full reset matching new_for_call semantics.
-            reset_reused_call_frame(f, &[boxed]);
-        } else {
-            unsafe {
-                if was_init {
-                    std::ptr::drop_in_place(ptr);
-                }
-                std::ptr::write(
-                    ptr,
-                    PyFrame::new_for_call_with_globals_obj(
-                        func_code,
-                        &[boxed],
-                        w_globals,
-                        execution_context,
-                    ),
-                );
-                (&mut *ptr).fix_array_ptrs();
-            }
-            if !was_init {
-                arena.mark_initialized();
-            }
-        }
-        arena.arm(ptr);
-        if majit_metainterp::majit_log_enabled() {
-            let f = unsafe { &*ptr };
-            eprintln!(
-                "[jit][ca-frame-raw] ptr={ptr:p} locals=0x{:x} local0=0x{:x} vsd={} reused={} raw_arg={}",
-                f.locals_cells_stack_w as usize,
-                f.locals_w()[0] as usize,
-                f.valuestackdepth,
-                was_init,
-                raw_int_arg,
-            );
-        }
-        return ptr as i64;
-    }
-
-    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
-        func_code,
-        &[boxed],
-        w_globals,
-        execution_context,
-    ));
-    unsafe { &mut *frame_ptr }.fix_array_ptrs();
+    let frame_ptr = alloc_callee_frame(func_code, &[boxed], w_globals, execution_context);
     if majit_metainterp::majit_log_enabled() {
         let f = unsafe { &*frame_ptr };
         eprintln!(
-            "[jit][ca-frame-raw] ptr={frame_ptr:p} locals=0x{:x} local0=0x{:x} vsd={} reused=false raw_arg={}",
+            "[jit][ca-frame-raw] ptr={frame_ptr:p} locals=0x{:x} local0=0x{:x} vsd={} raw_arg={}",
             f.locals_cells_stack_w as usize,
             f.locals_w()[0] as usize,
             f.valuestackdepth,
@@ -4273,15 +3896,7 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[jit][ca-drop] ptr={ptr:p}");
     }
-    let arena = arena_ref();
-    let reused = arena.put(ptr);
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!("[jit][ca-drop] ptr={ptr:p} arena_reused={reused}");
-    }
-    if !reused {
-        // Not an arena frame (heap fallback) — free GcPyFrame allocation.
-        heap_free_frame(ptr);
-    }
+    unroot_callee_frame(ptr);
 }
 
 /// Store a W_Root into a callee frame's `locals_cells_stack_w[idx]`.
@@ -6605,8 +6220,8 @@ mod tests_bh_normalize_raise {
     use pyre_interpreter::{PyErrorKind, compile_exec};
 
     #[test]
-    fn arena_jitframe_descrs_uses_frame_relative_offsets() {
-        let descrs = arena_jitframe_descrs();
+    fn jitframe_layout_descrs_uses_frame_relative_offsets() {
+        let descrs = jitframe_layout_descrs();
         assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
         assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
     }

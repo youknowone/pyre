@@ -498,9 +498,9 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 ///     `pyframe_object_custom_trace` recurses into locals/cells/
 ///     valuestack and the `f_backref` chain, so a frame reachable only
 ///     through a live traceback (the whole point of `tb_frame`) is not
-///     reclaimed.  A non-Gc frame (Box tracer snapshot / arena callee,
-///     already freed by the time the traceback escapes) is left
-///     dangling exactly as before — never dereferenced.
+///     reclaimed.  A non-Gc frame (a `FrameBox::new_boxed` tracer
+///     snapshot, freed at the end of its walk) is left dangling exactly
+///     as before — never dereferenced.
 unsafe fn pytraceback_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -1938,12 +1938,12 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // Frames stamped with this type id: JIT-built inline frames
     // (`emit_new_pyframe_inline_self_recursive`, whose locals array is a
     // GC-managed `PY_OBJECT_ARRAY_GC_TYPE_ID` block) AND executing /
-    // generator `FrameBox` frames (`FrameBox::new` via
+    // generator / JIT-callee `FrameBox` frames (`FrameBox::new` via
     // `try_gc_alloc_stable`, whose locals array is a stationary
     // `std::alloc` block).  The custom trace's regime split
-    // (`try_gc_owns_object`) handles both.  Callee-arena JIT frames
-    // remain `type_id = 0` off-GC blocks reached only as roots via
-    // `walk_jit_callee_frame_roots` (S2c).
+    // (`try_gc_owns_object`) handles both.  A callee frame the JIT is
+    // still running is additionally kept reachable by
+    // `walk_jit_callee_frame_roots`, since it sits on no frame chain.
     //
     // Frame-owned locals arrays, debug data, and block-stack nodes are all
     // GC-managed.  The collector reclaims them with the frame once it is

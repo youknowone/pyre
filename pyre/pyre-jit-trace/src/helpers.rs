@@ -948,8 +948,8 @@ pub fn emit_box_float_inline(
 /// self-recursive single-int-argument fast path.
 ///
 /// Replaces the opaque `jit_create_self_recursive_callee_frame_1_raw_int`
-/// CallR that today (`call_jit.rs:2814`) wraps `arena.take()` + reuse
-/// check + locals zero-fill + raw_int boxing in an opaque helper. The
+/// CallR, which wraps the frame allocation, locals fill and raw_int
+/// boxing in an opaque helper. The
 /// helper is `#[dont_look_inside]` so the optimizer cannot virtualize
 /// the new frame nor fold the boxing — every fib(35) iteration pays
 /// the full helper trampoline (~336k calls/run, observed in
