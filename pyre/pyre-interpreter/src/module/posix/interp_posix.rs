@@ -499,27 +499,49 @@ mod win_nt {
     }
 }
 
-/// posix stub — PyPy: pypy/module/posix/ interp_posix.py
+/// A fresh dict holding the current process environment.
 ///
-/// Provides the minimal surface that os.py module init needs to succeed.
-/// Real posix calls are not implemented — they raise or return defaults.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
-    // environ — dict populated from the host environment.
-    // PyPy equivalent: posix.State.startup → _convertenviron copies
-    // os.environ.items() into w_environ at interpreter startup.
-    let w_environ = pyre_object::w_dict_new();
+/// PyPy equivalent: posix.State.startup → `_convertenviron`, which copies the
+/// environment into `posix.environ` at interpreter startup. os.py seeds
+/// `environ` from it at import time and re-reads it from `reload_environ()`.
+fn create_environ() -> pyre_object::PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    // Both halves of an entry stay rooted across the store: either allocation
+    // may move what the other one already produced.
+    #[cfg_attr(
+        not(any(feature = "sandbox", feature = "host_env")),
+        expect(dead_code, reason = "no environment source is compiled in")
+    )]
+    fn store(
+        dict_slot: usize,
+        key: impl FnOnce() -> pyre_object::PyObjectRef,
+        value: impl FnOnce() -> pyre_object::PyObjectRef,
+    ) {
+        let _entry = pyre_object::gc_roots::push_roots();
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(key());
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(value());
+        unsafe {
+            pyre_object::w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            );
+        }
+    }
     #[cfg(feature = "sandbox")]
     {
         // The controller delivers the virtual environment as (bytes, bytes).
         if let Ok(items) = crate::host_seam::ops::envitems() {
             for (k_bytes, v_bytes) in items {
-                unsafe {
-                    pyre_object::w_dict_store(
-                        w_environ,
-                        pyre_object::w_bytes_from_bytes(&k_bytes),
-                        pyre_object::w_bytes_from_bytes(&v_bytes),
-                    );
-                }
+                store(
+                    dict_slot,
+                    || pyre_object::w_bytes_from_bytes(&k_bytes),
+                    || pyre_object::w_bytes_from_bytes(&v_bytes),
+                );
             }
         }
     }
@@ -530,15 +552,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // encodes/decodes via surrogateescape when accessed.
         // (_convertenviron: `space.newbytes(key), space.newbytes(value)`.)
         for (key, value) in host_os::vars_os() {
-            let k_bytes = key.as_encoded_bytes();
-            let v_bytes = value.as_encoded_bytes();
-            unsafe {
-                pyre_object::w_dict_store(
-                    w_environ,
-                    pyre_object::w_bytes_from_bytes(k_bytes),
-                    pyre_object::w_bytes_from_bytes(v_bytes),
-                );
-            }
+            store(
+                dict_slot,
+                || pyre_object::w_bytes_from_bytes(key.as_encoded_bytes()),
+                || pyre_object::w_bytes_from_bytes(value.as_encoded_bytes()),
+            );
         }
     }
     #[cfg(all(feature = "host_env", not(feature = "sandbox"), windows))]
@@ -547,16 +565,96 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // _create_environ_mapping demands str keys/values and upper-cases the
         // keys itself. (_convertenviron: `space.newtext(key), newtext(value)`.)
         for (key, value) in host_os::vars_os() {
-            unsafe {
-                pyre_object::w_dict_store(
-                    w_environ,
-                    pyre_object::w_str_new(&key.to_string_lossy()),
-                    pyre_object::w_str_new(&value.to_string_lossy()),
-                );
-            }
+            store(
+                dict_slot,
+                || pyre_object::w_str_new(&key.to_string_lossy()),
+                || pyre_object::w_str_new(&value.to_string_lossy()),
+            );
         }
     }
-    crate::module_ns_store(ns, "environ", w_environ);
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
+}
+
+/// posix stub — PyPy: pypy/module/posix/ interp_posix.py
+///
+/// Provides the minimal surface that os.py module init needs to succeed.
+/// Real posix calls are not implemented — they raise or return defaults.
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(ns, "environ", create_environ());
+    crate::module_ns_store(
+        ns,
+        "_create_environ",
+        crate::make_builtin_function_with_arity(
+            "_create_environ",
+            |_args| Ok(create_environ()),
+            0,
+        ),
+    );
+
+    // ── posix.putenv(name, value) / posix.unsetenv(name) ──
+    // `os.environ.__setitem__` calls `putenv` before updating its own dict, so
+    // without these the mapping and the real process environment drift apart:
+    // child processes and any native reader of the environment keep seeing the
+    // values captured at startup.
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+    {
+        /// The environment block is a list of NUL-terminated `NAME=VALUE`
+        /// strings, so neither half may embed a NUL.
+        fn env_str(arg: PyObjectRef) -> Result<String, crate::PyError> {
+            let text = crate::gateway::fsencode_w(arg)?;
+            if text.contains('\0') {
+                return Err(crate::PyError::value_error("embedded null byte"));
+            }
+            Ok(text)
+        }
+        /// A name that is empty or contains `=` cannot be expressed in the
+        /// environment block.
+        fn illegal_name(name: &str) -> bool {
+            name.is_empty() || name.contains('=')
+        }
+        crate::module_ns_store(
+            ns,
+            "putenv",
+            crate::make_builtin_function_with_arity(
+                "putenv",
+                |args| {
+                    // interp_posix.py putenv_impl rejects the name itself...
+                    let name = env_str(args[0])?;
+                    if illegal_name(&name) {
+                        return Err(crate::PyError::value_error(
+                            "illegal environment variable name",
+                        ));
+                    }
+                    let value = env_str(args[1])?;
+                    unsafe { host_os::set_var(&name, &value) };
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "unsetenv",
+            crate::make_builtin_function_with_arity(
+                "unsetenv",
+                |args| {
+                    let name = env_str(args[0])?;
+                    // ...while unsetenv leaves the same rejection to the
+                    // syscall, which reports EINVAL.
+                    if illegal_name(&name) {
+                        return Err(crate::PyError::os_error_syscall(
+                            libc::EINVAL,
+                            pyre_object::PY_NULL,
+                        ));
+                    }
+                    unsafe { host_os::remove_var(&name) };
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+    }
+
     // _have_functions — list of HAVE_* macro names that were defined at
     // build time. os.py uses this to populate the supports_* capability sets
     // (supports_dir_fd / supports_fd / supports_follow_symlinks), which
@@ -792,7 +890,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "sysconf_names",
         "pathconf_names",
         "setenv",
+        // putenv/unsetenv are implemented above unless the host environment is
+        // out of reach.
+        #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
         "unsetenv",
+        #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
         "putenv",
         "device_encoding",
         "ttyname",
