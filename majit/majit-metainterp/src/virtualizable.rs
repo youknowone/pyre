@@ -146,8 +146,19 @@ pub struct VirtualizableInfo {
     pub static_fields: Vec<VableFieldInfo>,
     /// Array fields on the virtualizable (e.g., `locals_w`).
     pub array_fields: Vec<VableArrayInfo>,
-    /// Offset of the `vable_token` field in the heap object.
+    /// Offset of the `vable_token` field in the heap object. Meaningless
+    /// unless `has_vable_token` — see [`VirtualizableInfo::has_vable_token`].
     pub token_offset: usize,
+    /// Whether the host object actually carries a `vable_token` field.
+    ///
+    /// `virtualizable.py:28` reads `vable_token` off every VTYPE, so
+    /// upstream has no false case. Pyre's state-field machines do: the
+    /// `#[jit_interp]` `state` struct is a non-GC, stack-resident struct
+    /// the interpreter author declares, with no slot to spare for a token
+    /// — its identity is recovered from the resume snapshot instead. Every
+    /// token read/write must stay inert for those, or it lands on the
+    /// struct's first live field.
+    has_vable_token: bool,
     /// Total number of "boxes" (field slots + array element slots)
     /// that the JIT needs to save/restore for this virtualizable.
     ///
@@ -228,6 +239,7 @@ impl Clone for VirtualizableInfo {
             static_fields: self.static_fields.clone(),
             array_fields: self.array_fields.clone(),
             token_offset: self.token_offset,
+            has_vable_token: self.has_vable_token,
             num_static_extra_boxes: self.num_static_extra_boxes,
             parent_descr: self.parent_descr.clone(),
             array_descrs: self.array_descrs.clone(),
@@ -271,11 +283,25 @@ impl majit_ir::descr::VinfoMarker for VirtualizableInfo {
 impl VirtualizableInfo {
     /// Create a new VirtualizableInfo.
     pub fn new(token_offset: usize) -> Self {
+        Self::with_token(token_offset, true)
+    }
+
+    /// Create a `VirtualizableInfo` for a machine with no `vable_token`
+    /// field — see [`VirtualizableInfo::has_vable_token`]. Its token
+    /// protocol is inert: `tracing_before/after_residual_call`,
+    /// `force_now` and the token read/write pair all no-op instead of
+    /// landing on offset 0.
+    pub fn without_vable_token() -> Self {
+        Self::with_token(0, false)
+    }
+
+    fn with_token(token_offset: usize, has_vable_token: bool) -> Self {
         VirtualizableInfo {
             name: String::new(),
             static_fields: Vec::new(),
             array_fields: Vec::new(),
             token_offset,
+            has_vable_token,
             num_static_extra_boxes: 0,
             parent_descr: None,
             array_descrs: Vec::new(),
@@ -671,6 +697,12 @@ impl VirtualizableInfo {
         self.array_fields.len()
     }
 
+    /// Whether this machine has a real `vable_token` field to operate on.
+    /// False only for [`VirtualizableInfo::without_vable_token`] machines.
+    pub fn has_vable_token(&self) -> bool {
+        self.has_vable_token
+    }
+
     /// Set token to TOKEN_TRACING_RESCALL before a residual call.
     ///
     /// The token tells the runtime that JIT tracing is active and a
@@ -680,6 +712,9 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn tracing_before_residual_call(&self, obj_ptr: *mut u8) {
+        if !self.has_vable_token() {
+            return;
+        }
         unsafe {
             // The token is a word-sized (`Signed`) field: 4 bytes on wasm32.
             // The all-ones sentinel truncates to `usize::MAX` at that width.
@@ -697,6 +732,11 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn tracing_after_residual_call(&self, obj_ptr: *mut u8) -> bool {
+        // No token to consult: the callee had no way to force this machine's
+        // state, so it is never reported as escaped.
+        if !self.has_vable_token() {
+            return false;
+        }
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             if *token_ptr != 0 {
@@ -720,6 +760,9 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_now(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        if !self.has_vable_token() {
+            return;
+        }
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             let token = *token_ptr;
@@ -739,6 +782,9 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_token(&self, obj_ptr: *const u8) -> VableToken {
+        if !self.has_vable_token() {
+            return VableToken::None;
+        }
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *const usize;
             let raw = *token_ptr;
@@ -759,6 +805,9 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_token(&self, obj_ptr: *mut u8, token: VableToken) {
+        if !self.has_vable_token() {
+            return;
+        }
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             *token_ptr = token.to_raw() as usize;
@@ -2906,15 +2955,10 @@ pub(crate) unsafe fn vable_write_array_item(
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
 pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
-    // `token_offset == 0` marks a machine with no real `vable_token` field: a
-    // non-GC, stack-resident `state` struct whose identity is recovered straight
-    // from the resume snapshot rather than via a heap token (see the state-field
-    // `VirtualizableInfo::new(0)` in the `#[jit_interp]` codegen). Offset 0 on a
-    // GC virtualizable is always the type pointer, so a real `vable_token` never
-    // lands there (`PYFRAME_VABLE_TOKEN_OFFSET > 0`). Writing to offset 0 here
-    // would clobber the struct's first field (e.g. a `Vec`'s data pointer), so
-    // honor the documented "inert token protocol" and do nothing.
-    if vinfo.token_offset == 0 {
+    // A machine with no real `vable_token` field (`has_vable_token`) keeps an
+    // inert token protocol: writing to offset 0 would clobber the struct's
+    // first live field (e.g. a `Vec`'s data pointer).
+    if !vinfo.has_vable_token() {
         return;
     }
     unsafe {
@@ -3021,18 +3065,18 @@ mod bh_clear_vable_token_inert_token_protocol {
         token: usize,
     }
 
-    // A state-field machine builds `VirtualizableInfo::new(0)`: there is no heap
-    // `vable_token`, so `token_offset == 0`. Clearing must be inert — writing to
-    // offset 0 would clobber the live first field. This is the guard that lets
+    // A state-field machine builds `VirtualizableInfo::without_vable_token()`:
+    // there is no heap `vable_token` to clear. Clearing must be inert — writing
+    // to offset 0 would clobber the live first field. This is the guard that lets
     // the overflow-deopt blackhole run a `[int; virt]` vable op without corrupting
     // the state struct.
     #[test]
-    fn clear_is_inert_when_token_offset_is_zero() {
+    fn clear_is_inert_when_the_machine_has_no_vable_token() {
         let mut probe = TokenProbe {
             first: 0xDEAD_BEEF,
             token: 0x1234,
         };
-        let info = VirtualizableInfo::new(0);
+        let info = VirtualizableInfo::without_vable_token();
         let p = (&mut probe as *mut TokenProbe) as *mut u8;
         unsafe { bh_clear_vable_token(&info, p) };
         assert_eq!(probe.first, 0xDEAD_BEEF, "offset-0 field must be untouched");

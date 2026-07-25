@@ -114,17 +114,17 @@ fn bh_jitdrivers_sd(
 /// null to leave it unset. A non-null vinfo lets the blackhole run a mid-body
 /// vable-array op (e.g. the `int_*_jump_if_ovf` overflow guard on a `[int; virt]`
 /// state field). Seed when either the portal-inline experiment is on, or the
-/// machine is a state-field one (`token_offset == 0`) whose `bh_clear_vable_token`
-/// is inert so a non-null vinfo cannot corrupt its non-GC `state` struct. A real
-/// heap virtualizable (`token_offset > 0`, e.g. PyFrame) is left with null vinfo
-/// to preserve its existing resume contract.
+/// machine is a state-field one (no `vable_token` field) whose
+/// `bh_clear_vable_token` is inert so a non-null vinfo cannot corrupt its non-GC
+/// `state` struct. A real heap virtualizable (e.g. PyFrame) is left with null
+/// vinfo to preserve its existing resume contract.
 fn seed_deopt_vinfo_ptr(
     vinfo: Option<&std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
 ) -> *const crate::virtualizable::VirtualizableInfo {
     match vinfo {
         Some(info)
             if crate::pyjitpl::dispatch::portal_inline_experiment_enabled()
-                || info.token_offset == 0 =>
+                || !info.has_vable_token() =>
         {
             std::sync::Arc::as_ptr(info)
         }
@@ -3641,7 +3641,7 @@ impl<S: JitState> JitDriver<S> {
                     // `setarrayitem_vable`) can resolve its vinfo during resume.
                     // Two sources:
                     //   * the portal-inline experiment (gated), OR
-                    //   * a state-field machine (`token_offset == 0`), whose
+                    //   * a state-field machine (no `vable_token` field), whose
                     //     `bh_clear_vable_token` is inert (the `state` struct has
                     //     no heap token), so a non-null vinfo cannot corrupt it.
                     //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
@@ -6070,22 +6070,22 @@ mod tests {
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
-    // a non-null `bh.virtualizable_info`. A state-field machine (`token_offset == 0`)
+    // a non-null `bh.virtualizable_info`. A state-field machine (no `vable_token`)
     // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
     // guard on a `[int; virt]` field — resolves its vinfo during resume instead of
-    // panicking. A real heap virtualizable (`token_offset > 0`, e.g. PyFrame) keeps
-    // the prior null-vinfo resume contract unless the portal-inline experiment is on.
+    // panicking. A real heap virtualizable (e.g. PyFrame) keeps the prior
+    // null-vinfo resume contract unless the portal-inline experiment is on.
     #[test]
     fn seed_deopt_vinfo_ptr_seeds_state_field_and_skips_heap_virtualizable() {
         use crate::virtualizable::VirtualizableInfo;
 
-        // token_offset == 0 → seed the reconstructed vinfo pointer (always, since
+        // no vable_token → seed the reconstructed vinfo pointer (always, since
         // its `bh_clear_vable_token` is inert and cannot corrupt the state struct).
-        let state_field = std::sync::Arc::new(VirtualizableInfo::new(0));
+        let state_field = std::sync::Arc::new(VirtualizableInfo::without_vable_token());
         assert_eq!(
             seed_deopt_vinfo_ptr(Some(&state_field)),
             std::sync::Arc::as_ptr(&state_field),
-            "a token_offset==0 state-field machine must seed a non-null vinfo",
+            "a state-field machine with no vable_token must seed a non-null vinfo",
         );
 
         // No vinfo available → null.

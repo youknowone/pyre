@@ -13926,6 +13926,13 @@ impl<M: Clone> MetaInterp<M> {
             Some(info) => info,
             None => return,
         };
+        // A machine with no `vable_token` field (`has_vable_token`) has nowhere
+        // to publish the force token: its `token_field_descr` resolves to offset
+        // 0, the struct's first live field, so recording the SETFIELD would make
+        // the compiled loop overwrite that field on every residual call.
+        if !vinfo.has_vable_token() {
+            return;
+        }
         let vable_ptr = self.vable_ptr;
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,

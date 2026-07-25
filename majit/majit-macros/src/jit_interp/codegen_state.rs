@@ -1806,11 +1806,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn __build_virtualizable_info()
             -> Option<::std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
                 use majit_metainterp::virtualizable::VirtualizableInfo;
-                // token_offset=0: the stack-local state struct is non-GC and
-                // never moved, so the vable_token protocol is inert — the
+                // No `vable_token` field: the stack-local state struct is
+                // non-GC and never moved, so the token protocol is inert — the
                 // identity value (a `&state` pointer) is recovered straight
-                // from the resume snapshot, not via a heap token.
-                let mut __info = VirtualizableInfo::new(0);
+                // from the resume snapshot, not via a heap token. The struct's
+                // offset 0 is a live user field, so every token read/write must
+                // no-op rather than land there.
+                let mut __info = VirtualizableInfo::without_vable_token();
                 __info.name = "state".to_string();
                 // The dispatch lowering binds the green ref `program` to ref
                 // register 0 (it is the base for `program[pc]` reads) and the
