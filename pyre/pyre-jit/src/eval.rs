@@ -3672,8 +3672,14 @@ unsafe extern "C" fn force_pyframe_vref(
     };
     // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means
     // the vref outlived the frame it stood for, which upstream reports as
-    // `jit.py:487 InvalidVirtualRef`.  Nothing in the frame chain may reach
-    // that state: `virtual_ref_finish` runs before the frame is dropped.
+    // `jit.py:487 InvalidVirtualRef`.  Upstream can raise it because the helper
+    // returns into RPython; this hook is a `extern "C"` pointer read from the
+    // frame chain with no exception channel, so the unreachable state is
+    // asserted instead.  Unreachable holds because a vref reaches the chain
+    // only between `virtual_ref` and `virtual_ref_finish`, and `finish` writes
+    // `forced` before the frame is dropped.  Whoever teaches the tracer to
+    // emit `VIRTUAL_REF` owns re-checking that: a trace aborted between the
+    // two leaves a vref naming a JIT frame that is already gone.
     forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
         as *mut pyre_interpreter::PyFrame
 }

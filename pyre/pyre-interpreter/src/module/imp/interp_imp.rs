@@ -277,6 +277,12 @@ impl ImportRLock {
 /// one instance per interpreter, shared by every thread.  That sharing is what
 /// makes `lockowner` meaningful, so this is a global and never a
 /// `thread_local!`.
+///
+/// A static rather than a real per-space cache entry because
+/// `ObjSpace::fromcache` re-runs `build` instead of memoizing it, and pyre runs
+/// one space per process — the same reason `sys.modules` and the builtin-module
+/// table are globals.  A second space in one process would need all of them
+/// moved together, not this one alone.
 static IMPORT_LOCK: ImportRLock = ImportRLock::new();
 
 fn getimportlock() -> &'static ImportRLock {

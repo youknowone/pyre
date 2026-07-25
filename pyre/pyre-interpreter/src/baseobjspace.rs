@@ -312,13 +312,15 @@ impl Lock {
         true
     }
 
-    /// `rthread.py:199 release` — upstream raises when the lock was not
-    /// previously acquired.  Every caller here releases only what it owns, so
-    /// the unheld case is a bug in this crate rather than a Python-visible
-    /// error, and it is reported as one.
+    /// `rthread.py:198 release` — `if c_thread_releaselock(...) != 0: raise
+    /// error(...)`.  The check is live in every build upstream, so it is an
+    /// `assert!` and not a `debug_assert!`: releasing a lock nobody holds must
+    /// not fall through to the notify.  Every caller here releases only what it
+    /// owns, which makes this an invariant of this crate rather than a
+    /// Python-visible error.
     pub fn release(&self) {
         let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
-        debug_assert!(*acquired, "the lock was not previously acquired");
+        assert!(*acquired, "the lock was not previously acquired");
         *acquired = false;
         self.released.notify_one();
     }
