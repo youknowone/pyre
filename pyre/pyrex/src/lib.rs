@@ -21,7 +21,12 @@ enum RunMode {
     Script(String),
     Command(String),
     Module(String),
-    Repl,
+    /// Program read from stdin: an explicit `-` argument, or no script
+    /// argument at all (app_main.py `options["run_stdin"]`). `argv0` is the
+    /// literal `sys.argv[0]` the launcher records — `"-"` when the dash was
+    /// given, `""` when it was not. Whether this drives the prompt or executes
+    /// stdin as one unit is decided at dispatch by `stdin_is_interactive`.
+    Stdin { argv0: String },
     /// `pyre interact <executable> [args…]` — run the trusted sandbox
     /// controller (`pypy/sandbox/pypy_interact.py`) over an untrusted child.
     Interact {
@@ -294,7 +299,15 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                     return Ok((mode, finalize_flags(flags), vec![]));
                 }
                 if script == "-" {
-                    return Ok((RunMode::Repl, finalize_flags(flags), vec![]));
+                    // A leading `-` selects stdin and stays `sys.argv[0]`; the
+                    // words after it are the program's arguments, exactly as
+                    // for a script path.
+                    let rest = drain_args(&mut parser)?;
+                    return Ok((
+                        RunMode::Stdin { argv0: script },
+                        finalize_flags(flags),
+                        rest,
+                    ));
                 }
                 let rest = drain_args(&mut parser)?;
                 return Ok((RunMode::Script(script), finalize_flags(flags), rest));
@@ -302,7 +315,14 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok((RunMode::Repl, finalize_flags(flags), vec![]))
+    // No script argument at all reads stdin too, with an empty `sys.argv[0]`.
+    Ok((
+        RunMode::Stdin {
+            argv0: String::new(),
+        },
+        finalize_flags(flags),
+        vec![],
+    ))
 }
 
 /// Parse a `--heapsize` value (`pypy_interact.py:88-102`): a byte count with an
@@ -417,6 +437,32 @@ fn sys_path_cwd() -> std::path::PathBuf {
     }
 }
 
+/// `interactive or sys.stdin.isatty()` — a stdin run drives the prompt when fd
+/// 0 is a terminal or `-i` was given, and executes stdin as a script
+/// otherwise. The query goes through the seam, so a sandboxed child observes
+/// its virtual console rather than the trusted parent's terminal.
+fn stdin_is_interactive(inspect: bool) -> bool {
+    inspect || pyre_interpreter::host_seam::ops::isatty(0).unwrap_or(false)
+}
+
+/// `sys.stdin.read()` — the whole of stdin as the program source. The read
+/// routes through the seam for the same reason `stdin_is_interactive` does.
+fn read_stdin_source() -> std::io::Result<String> {
+    use pyre_interpreter::host_seam::{SeamError, ops};
+
+    let mut data = Vec::new();
+    loop {
+        match ops::read(0, 65536) {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => data.extend_from_slice(&chunk),
+            Err(SeamError::Os(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
+            Err(_) => return Err(std::io::Error::other("stdin read failed")),
+        }
+    }
+    String::from_utf8(data)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin not utf-8"))
+}
+
 pub fn main_entry(binary_name: &'static str) {
     // The sandboxed child runs single-threaded like pypy-c-sandbox: it neither
     // manages signals (the controller does) nor spawns a worker thread, so it
@@ -511,9 +557,12 @@ fn real_main(binary_name: &str) {
 
     // The interactive REPL drives raw stdin/stdout directly, which under sandbox
     // are the controller's marshalling pipes — running it would corrupt the
-    // protocol and bypass fd-0 mediation. Reject REPL / `-i` in sandbox builds.
+    // protocol and bypass fd-0 mediation. Reject the prompt / `-i` in sandbox
+    // builds; a piped stdin program reads through the seam and is fine.
     #[cfg(feature = "sandbox")]
-    if !is_interact && (matches!(mode, RunMode::Repl) || inspect) {
+    if !is_interact
+        && (inspect || (matches!(mode, RunMode::Stdin { .. }) && stdin_is_interactive(false)))
+    {
         eprintln!("{binary_name}: interactive mode is unavailable in the sandbox");
         std::process::exit(2);
     }
@@ -640,13 +689,33 @@ fn real_main(binary_name: &str) {
                 repl::run_repl(true, no_site);
             }
         }
-        RunMode::Repl => {
-            // The REPL and piped stdin both take "" for `sys.path[0]`
+        RunMode::Stdin { argv0 } => {
+            // The prompt and piped stdin both take "" for `sys.path[0]`
             // (`_PyPathConfig_ComputeSysPath0` on an argv[0] of "" / "-"); the
             // cwd stays the shadowing-check anchor.
             let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd, "");
-            repl::run_repl(quiet, no_site);
+            // `sys.argv` is `['']` with no script argument and `['-', …]` for
+            // an explicit dash.
+            let mut argv = vec![argv0];
+            argv.extend(args);
+            importing::set_sys_argv(&argv);
+            if stdin_is_interactive(inspect) {
+                // A tty (or `-i`) prints the banner unless `-q` and drops into
+                // the prompt.
+                repl::run_repl(quiet, no_site);
+            } else {
+                // Otherwise stdin is read to EOF and executed as a single
+                // `exec` unit named `<stdin>`.
+                let source = match read_stdin_source() {
+                    Ok(source) => source,
+                    Err(e) => {
+                        eprintln!("{binary_name}: cannot read stdin: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                run_source(&source, Mode::Exec, "<stdin>", no_site);
+            }
         }
         RunMode::Interact {
             exe,
@@ -1065,35 +1134,48 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     // A script run by path gets `__file__` / `__cached__` in `__main__`
     // (pythonrun.c `_PyRun_SimpleFileObject`); the `-c "<string>"` command
     // path does not. `__file__` is absolutized (os.path.abspath, 3.9+) while
-    // `sys.argv[0]` keeps the literal command-line path.
-    let script_file = if filename != "<string>" {
-        // Resolve a relative path against `sys_path_cwd()` — the seam-provided
-        // virtual cwd under sandbox — before normalizing, so `std::path::absolute`
-        // never consults (and leaks) the trusted process cwd. Off sandbox this is
-        // identical to `absolute(filename)`.
-        let path = Path::new(filename);
-        let to_absolutize = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            sys_path_cwd().join(path)
-        };
-        let abs_file = match std::path::absolute(&to_absolutize) {
-            Ok(p) => p.to_string_lossy().into_owned(),
-            Err(_) => filename.to_string(),
-        };
+    // `sys.argv[0]` keeps the literal command-line path. A stdin run records
+    // the literal `<stdin>`: there is no path to absolutize and no file to
+    // bind a `SourceFileLoader` to.
+    let main_file: Option<String> = match filename {
+        "<string>" => None,
+        "<stdin>" => Some(filename.to_string()),
+        _ => {
+            // Resolve a relative path against `sys_path_cwd()` — the
+            // seam-provided virtual cwd under sandbox — before normalizing, so
+            // `std::path::absolute` never consults (and leaks) the trusted
+            // process cwd. Off sandbox this is identical to
+            // `absolute(filename)`.
+            let path = Path::new(filename);
+            let to_absolutize = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                sys_path_cwd().join(path)
+            };
+            Some(match std::path::absolute(&to_absolutize) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => filename.to_string(),
+            })
+        }
+    };
+    if let Some(file) = main_file.as_deref() {
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
             "__file__",
-            pyre_object::w_str_new(&abs_file),
+            pyre_object::w_str_new(file),
         );
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
             "__cached__",
             pyre_object::w_none(),
         );
-        Some(abs_file)
-    } else {
+    }
+    // Only a real file gets a `SourceFileLoader`; `-c` and stdin keep the
+    // `BuiltinImporter` `seed_main_loader` installs for a `None` path.
+    let script_file = if filename == "<stdin>" {
         None
+    } else {
+        main_file.as_deref()
     };
 
     // Import `sys` up front so its creation flushes the native search-path seed
@@ -1109,7 +1191,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
         eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
     }
 
-    seed_main_loader(canonical, script_file.as_deref(), ec_ptr);
+    seed_main_loader(canonical, script_file, ec_ptr);
 
     import_site(no_site, canonical, ec_ptr);
 
