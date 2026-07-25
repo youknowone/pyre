@@ -3599,6 +3599,21 @@ where
                     _ => self.read_int_reg(value_reg),
                 };
                 let descr_index = descr.index();
+                // `execute_setarrayitem_gc` (pyjitpl.py:2742) records through
+                // `execute_and_record` → `_record_helper` (pyjitpl.py:2694),
+                // which runs `heapcache.invalidate_caches` → `mark_escaped` →
+                // `_escape_from_write` (heapcache.py:217-241) *before* the op is
+                // appended: a ref written into an already-escaped array escapes
+                // too, or `invalidate_unescaped` keeps its cached fields alive
+                // across the next residual call while the callee can reach and
+                // mutate it through the array.  `clear_caches_not_necessary`
+                // (heapcache.py:314) lists SETARRAYITEM_GC, so only the
+                // mark-escaped half runs.  Same shape as BC_RAW_STORE_I above.
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::SetarrayitemGc,
+                    None,
+                    &[array_opref, index_opref, value_opref],
+                );
                 ctx.record_op_with_descr(
                     OpCode::SetarrayitemGc,
                     &[array_opref, index_opref, value_opref],
