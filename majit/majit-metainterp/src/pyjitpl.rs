@@ -9053,6 +9053,21 @@ impl<M: Clone> MetaInterp<M> {
         self.forget_loop_side_tables(green_key);
     }
 
+    /// Drop every compiled loop whose root trace is `trace_id`, with the
+    /// per-loop side tables that belong to it.
+    pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
+        let stale: Vec<u64> = self
+            .compiled_loops
+            .iter()
+            .filter(|(_, entry)| entry.root_trace_id == trace_id)
+            .map(|(green_key, _)| *green_key)
+            .collect();
+        for green_key in stale {
+            self.compiled_loops.swap_remove(&green_key);
+            self.forget_loop_side_tables(green_key);
+        }
+    }
+
     /// Drop the per-loop side tables (`loop_header_pcs`, `loop_header_greens`)
     /// when a loop is retired, so they cannot outlive `compiled_loops`.
     /// `compiled_key_for_greens` already skips keys without compiled targets,
@@ -9684,8 +9699,15 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Remove all compiled loops. Used when guard-fail recovery is
     /// unrecoverable (null Ref in resume data).
+    ///
+    /// Bulk form of `remove_compiled_loop`, so it drops the per-loop side
+    /// tables too — see `forget_loop_side_tables`. `pending_preamble_tokens`
+    /// is left alone: it is keyed by green key but holds tokens for a
+    /// recompile that has not happened yet, not for the loops being dropped.
     pub fn clear_compiled_loops(&mut self) {
         self.compiled_loops.clear();
+        self.loop_header_pcs.clear();
+        self.loop_header_greens.clear();
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
@@ -21847,5 +21869,80 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+    }
+}
+
+/// Every path that retires a `compiled_loops` entry must also retire the
+/// per-loop side tables keyed by the same green key, so they cannot outlive
+/// the loop and grow without bound over a long run.
+#[cfg(test)]
+mod loop_side_table_tests {
+    use super::*;
+
+    fn compiled_entry(root_trace_id: u64) -> CompiledEntry<()> {
+        CompiledEntry {
+            token: std::sync::Weak::new(),
+            meta: (),
+            front_target_tokens: Vec::new(),
+            front_target_source_positions: None,
+            root_trace_id,
+            traces: indexmap::IndexMap::new(),
+            previous_tokens: Vec::new(),
+            next_global_opref: 0,
+        }
+    }
+
+    /// Register a loop at `green_key` with both side tables populated.
+    fn record_loop(meta: &mut MetaInterp<()>, green_key: u64, root_trace_id: u64) {
+        meta.compiled_loops
+            .insert(green_key, compiled_entry(root_trace_id));
+        meta.record_loop_header_pc(green_key, green_key as usize);
+        meta.record_loop_header_greens(green_key, (vec![green_key as i64], vec![], vec![]));
+    }
+
+    fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
+        meta.loop_header_pcs.contains_key(&green_key)
+            || meta.loop_header_greens.contains_key(&green_key)
+    }
+
+    #[test]
+    fn remove_compiled_loop_drops_the_side_tables() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        record_loop(&mut meta, 8, 101);
+
+        meta.remove_compiled_loop(7);
+
+        assert!(!has_side_tables(&meta, 7));
+        assert!(has_side_tables(&meta, 8));
+    }
+
+    #[test]
+    fn clear_compiled_loops_drops_every_side_table() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        record_loop(&mut meta, 8, 101);
+
+        meta.clear_compiled_loops();
+
+        assert!(meta.compiled_loops.is_empty());
+        assert!(meta.loop_header_pcs.is_empty());
+        assert!(meta.loop_header_greens.is_empty());
+    }
+
+    #[test]
+    fn invalidate_compiled_trace_drops_the_side_tables_of_the_matching_loops_only() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        record_loop(&mut meta, 8, 100);
+        record_loop(&mut meta, 9, 101);
+
+        meta.invalidate_compiled_trace(100);
+
+        assert_eq!(meta.compiled_loops.len(), 1);
+        assert!(meta.compiled_loops.contains_key(&9));
+        assert!(!has_side_tables(&meta, 7));
+        assert!(!has_side_tables(&meta, 8));
+        assert!(has_side_tables(&meta, 9));
     }
 }

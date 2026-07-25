@@ -4967,15 +4967,13 @@ impl<S: JitState> JitDriver<S> {
         // a strong owner of every running loop, so releasing here
         // is the only path that drops those Arcs.
         self.meta.warm_state.memory_manager.release_all_loops();
-        self.meta.compiled_loops.clear();
+        self.meta.clear_compiled_loops();
     }
 
     /// Invalidate compiled code for a specific trace_id, removing the
     /// compiled_loops entry whose root_trace_id matches.
     pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
-        self.meta
-            .compiled_loops
-            .retain(|_, entry| entry.root_trace_id != trace_id);
+        self.meta.invalidate_compiled_trace(trace_id);
     }
 
     /// warmspot.py:449 — set the per-driver result_type.
@@ -7297,5 +7295,35 @@ mod tests {
         // return None from index().
         let driver = JitDriver::<TypedRestoreState>::new(1);
         assert_eq!(driver.index(), None);
+    }
+}
+
+#[cfg(test)]
+mod bridge_only_parse_tests {
+    use super::parse_bridge_only;
+
+    #[test]
+    fn parses_a_comma_separated_list_with_surrounding_space() {
+        assert_eq!(parse_bridge_only("3, 7 ,11"), vec![3, 7, 11]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a valid guard fail_index")]
+    fn rejects_an_unparsable_entry() {
+        parse_bridge_only("3,seven");
+    }
+
+    /// An allowlist matching no guard suppresses every bridge, which is the
+    /// confidently-wrong bisection result this parser exists to prevent.
+    #[test]
+    #[should_panic(expected = "names no guard fail_index")]
+    fn rejects_a_value_that_names_no_index() {
+        parse_bridge_only(" , ,");
+    }
+
+    #[test]
+    #[should_panic(expected = "names no guard fail_index")]
+    fn rejects_an_empty_value() {
+        parse_bridge_only("");
     }
 }
