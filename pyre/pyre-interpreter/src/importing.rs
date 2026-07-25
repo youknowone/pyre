@@ -507,7 +507,10 @@ pub fn install_builtin_modules() {
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(time);
     pyre_install_module!(sys);
-    pyre_install_module!(operator);
+    // `moduledef.py:5 applevel_name = '_operator'` — the interp-level table
+    // is reachable only as `_operator`; `import operator` resolves to
+    // `operator.py`, whose `from _operator import *` drops the underscore
+    // names the table also carries.
     pyre_install_module!("_operator"(operator));
     pyre_install_module!("builtins"(__builtin__));
     pyre_install_module!(_io);
