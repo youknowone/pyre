@@ -1314,6 +1314,20 @@ impl<'a> GraphFlattener<'a> {
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
+        // Forced-alive `-live-` args (`liveness.py:8-12`) are graph-side
+        // information: `make_dependencies` reads them off the graph op to
+        // keep co-live frame slots interfering (and so on distinct colors).
+        // The serialized marker stays argless — `compute_liveness` derives
+        // the runtime resume window from actual uses, so a mid-body entry
+        // (bridge sub-walk reconstruction) is never asked to source a
+        // register whose value only lives in the virtualizable.
+        let stripped_live;
+        let op = if self.lowering_ctx.is_some() && op.opname == OPNAME_LIVE && !op.args.is_empty() {
+            stripped_live = SpaceOperation::new(OPNAME_LIVE, Vec::new(), None, op.offset);
+            &stripped_live
+        } else {
+            op
+        };
         // Record FIRST insn position per
         // non-negative `op.offset` (Python PC) into
         // `ssarepr.pc_first_insn_pos`.  Drives `pc_map` construction at
@@ -1321,7 +1335,12 @@ impl<'a> GraphFlattener<'a> {
         // `offset = -1` (insert_renamings ref_copy / overflow
         // trampolines / catch-landing entries) are skipped — they have
         // no Python PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>`.
-        if op.offset >= 0 {
+        // `-live-` markers are also skipped: a PC whose only insn is its
+        // own resume marker must stay "stack-only" for the resolver
+        // (`derive_pc_live_indices_from_sparse`'s can-raise fallthrough
+        // re-key fires only for PCs with no real op), matching the pc
+        // ownership the stream had before per-PC marker emission.
+        if op.offset >= 0 && op.opname != OPNAME_LIVE {
             let py_pc = op.offset;
             let already_seen = self
                 .ssarepr

@@ -1447,17 +1447,23 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
     // `stack_slot_color_map` — the result is not a live Variable here, so it
     // carries no pcdep entry.
-    let result_color = match resume_marker_jit_pc {
-        Some(marker) => unsafe { &(*caller_sym.jitcode()).payload }
-            .result_color_trivia_for_jitcode_pc(marker)
+    let result_color = {
+        let payload = unsafe { &(*caller_sym.jitcode()).payload };
+        // The trivia twin resolves the return marker only while that marker
+        // doubles as the fallthrough PC's own resume marker (a pc_map
+        // block-head).  A CALL whose fallthrough carries its own per-PC
+        // marker leaves the trailing marker un-keyed there — the
+        // after-residual twin keys the same fallthrough coordinate by the
+        // CALL's byte offset and stays exact in both shapes.
+        resume_marker_jit_pc
+            .and_then(|marker| payload.result_color_trivia_for_jitcode_pc(marker))
             .filter(|&color| color != u16::MAX)
-            .map(|color| color as usize),
-        // Marker-miss: the after-residual result-color twin keys the same
-        // fallthrough coordinate by JitCode byte offset, retiring the py read.
-        None => unsafe { &(*caller_sym.jitcode()).payload }
-            .result_color_after_residual_for_jitcode_pc(call_jit_pc)
-            .filter(|&color| color != u16::MAX)
-            .map(|color| color as usize),
+            .or_else(|| {
+                payload
+                    .result_color_after_residual_for_jitcode_pc(call_jit_pc)
+                    .filter(|&color| color != u16::MAX)
+            })
+            .map(|color| color as usize)
     }
     .ok_or(InlineCallerFrameDecline::Unavailable)?;
     // Null the not-yet-produced result slot, build the box list, then restore

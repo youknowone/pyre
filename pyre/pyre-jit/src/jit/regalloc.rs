@@ -368,34 +368,6 @@ impl<'a> RegAllocator<'a> {
         }
     }
 
-    /// Record an interference edge between two frame-local slot
-    /// representatives so the chordal coloring assigns them DISTINCT
-    /// colors, even when their SSA register live ranges are disjoint.
-    ///
-    /// Complement of [`try_coalesce_pin_ids`]: that merges Variables onto
-    /// one color, this forces them apart.  Used by the splice regalloc to
-    /// reproduce the walker's bijective slot→register assignment so the
-    /// per-slot resume reverse map is injective.  Both endpoints are
-    /// projected through `_unionfind.find_rep`, so a slot whose Variables
-    /// were already coalesced into one rep (by the same-slot coalesce
-    /// pairs) contributes a single node; self-edges are skipped before
-    /// calling the shared RPython `DependencyGraph`.  `add_node` registers
-    /// each rep in `_depgraph.all_nodes` so `find_node_coloring`'s
-    /// `getnodes` filter keeps it (matching `try_coalesce_pin_ids`).
-    fn add_interference_pin_ids(
-        &mut self,
-        v_id: super::flow::VariableId,
-        w_id: super::flow::VariableId,
-    ) {
-        let v0 = self._unionfind.find_rep(v_id);
-        let w0 = self._unionfind.find_rep(w_id);
-        self._depgraph.add_node(v0);
-        self._depgraph.add_node(w0);
-        if v0 != w0 {
-            self._depgraph.add_edge(v0, w0);
-        }
-    }
-
     fn find_node_coloring(&mut self) {
         self._coloring = self
             ._depgraph
@@ -476,33 +448,6 @@ pub fn perform_register_allocation_with_pairs(
     kind: Kind,
     extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> GraphAllocationResult {
-    perform_register_allocation_with_pairs_and_interference(graph, kind, extra_coalesce_pairs, &[])
-}
-
-/// Splice adaptation: like [`perform_register_allocation_with_pairs`] but
-/// also records an interference edge between the union-find reps named in
-/// each `interference_pairs` entry, forcing those reps onto DISTINCT
-/// colors.
-///
-/// `interference_pairs` is the complement of `extra_coalesce_pairs`:
-/// where the coalesce pairs merge same-slot Variables onto one color, the
-/// interference pairs separate distinct frame-local slots whose SSA
-/// register live ranges happen to be disjoint (each `LOAD_FAST` re-reads
-/// the local, so a local's SSA value dies between reads).  Without this
-/// the chordal coloring is free to give two frame-live locals one color,
-/// and the splice resume reverse map (`pcdep_color_slots` →
-/// `semantic_ref_slot_for_reg_color`) collapses them onto one slot.
-/// The edges are added after `make_dependencies` (the base liveness graph
-/// must exist) and before `coalesce_variables` (so a cross-slot coalesce
-/// is blocked by the `try_coalesce` `has_edge` guard) and
-/// `find_node_coloring`.  Splice-only — production callers pass `&[]`,
-/// leaving the coloring byte-identical.
-pub fn perform_register_allocation_with_pairs_and_interference(
-    graph: &FlowGraph,
-    kind: Kind,
-    extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-) -> GraphAllocationResult {
     // `rpython/tool/algo/regalloc.py:11-15`:
     //     regalloc = RegAllocator(graph, consider_var, ListOfKind)
     //     regalloc.make_dependencies()
@@ -528,13 +473,6 @@ pub fn perform_register_allocation_with_pairs_and_interference(
         }
     }
     allocator.make_dependencies();
-    // Record interference between the named slot reps so the
-    // chordal coloring keeps distinct frame-local slots on distinct
-    // colors.  Added after `make_dependencies` so the base graph exists,
-    // before `coalesce_variables`/`find_node_coloring` so both honour it.
-    for &(a_id, b_id) in interference_pairs {
-        allocator.add_interference_pin_ids(a_id, b_id);
-    }
     allocator.coalesce_variables();
     // External pins — re-apply via `try_coalesce_pin_ids` after
     // `make_dependencies` so the surviving rep is explicitly added to
@@ -625,33 +563,18 @@ pub fn perform_register_allocation_with_pairs_and_interference(
 /// canonical coloring still matches the walker's emit, while the
 /// interfering `(i, PHI)` pair is rejected.
 ///
-/// `extra_interference` seeds additional edges into the dependency graph
-/// (via `add_interference_pin_ids`) before the coalesce replay, so a pair
-/// whose endpoints are co-live under a liveness `make_dependencies` does not
-/// see — the CPython-slot co-live locals whose SSA ranges are disjoint —
-/// is also rejected.  Callers pass `&[]` to honour SSA-liveness alone.
+/// The per-PC `-live-` graph ops carry every frame-live Ref Variable as a
+/// force-alive arg (`liveness.py:8-12`), so `make_dependencies` here
+/// already models CPython frame-slot liveness: a pair whose endpoints'
+/// frame lifetimes overlap interferes structurally and is rejected by the
+/// same `has_edge` guard — no external interference seeding.
 pub fn filter_coalesce_pairs_by_interference(
     graph: &FlowGraph,
     kind: Kind,
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    extra_interference: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
     let mut allocator = RegAllocator::new(graph, kind);
     allocator.make_dependencies();
-    // Inject caller-supplied interference edges into the dependency graph
-    // before replaying `_try_coalesce`, so the `has_edge` guard (regalloc.py:105)
-    // rejects a coalesce whose endpoints are separated by an interference the
-    // SSA `make_dependencies` graph does not model.  The splice caller
-    // (codewriter.rs) supplies the slot-identity edges
-    // (`build_slot_disjoint_interference`): two Variables at distinct CPython
-    // frame slots whose SSA live ranges are disjoint between `LOAD_FAST`
-    // re-reads.  Injecting them here is what retired the walker-slot
-    // `filter_cross_slot_coalesce_pairs` — slot rejection now happens through
-    // this `has_edge` guard rather than a separate post-filter.  An empty
-    // slice is a no-op: the filter then honours SSA-liveness interference only.
-    for &(a_id, b_id) in extra_interference {
-        allocator.add_interference_pin_ids(a_id, b_id);
-    }
     let mut kept = Vec::with_capacity(pairs.len());
     for &(v_id, w_id) in pairs {
         if v_id == w_id {
@@ -721,29 +644,6 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
     [
         perform_register_allocation(graph, Kind::Int),
         perform_register_allocation_with_pairs(graph, Kind::Ref, ref_coalesce_pairs),
-        perform_register_allocation(graph, Kind::Float),
-    ]
-}
-
-/// Like [`perform_register_allocation_all_kinds_with_pairs`] but also
-/// records `ref_interference_pairs` as Ref-kind interference edges (the
-/// liveness-correct CPython-co-live separation that keeps two frame
-/// locals simultaneously live at a guard on distinct colors).  Int and
-/// Float take the empty-pair path — `walker_slot_for_variable` tracks
-/// only Ref slots.
-pub fn perform_register_allocation_all_kinds_with_pairs_and_interference(
-    graph: &FlowGraph,
-    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    ref_interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-) -> [GraphAllocationResult; 3] {
-    [
-        perform_register_allocation(graph, Kind::Int),
-        perform_register_allocation_with_pairs_and_interference(
-            graph,
-            Kind::Ref,
-            ref_coalesce_pairs,
-            ref_interference_pairs,
-        ),
         perform_register_allocation(graph, Kind::Float),
     ]
 }
@@ -1592,15 +1492,16 @@ mod tests {
     }
 
     #[test]
-    fn filter_coalesce_pairs_by_interference_extra_edge_rejects_ssa_disjoint_pair() {
+    fn filter_coalesce_pairs_by_interference_live_marker_rejects_ssa_disjoint_pair() {
         // v0 (inputarg) is copied into v1 and dies at the copy, so v0 and v1
         // have DISJOINT SSA live ranges: `make_dependencies` records no edge
-        // between them and the coalesce pair (v0, v1) is accepted.  A
-        // caller-supplied `extra_interference` edge models a CPython-slot
-        // co-live separation the SSA graph cannot see (two locals co-live at a
-        // guard across `LOAD_FAST` re-reads); the `has_edge` guard must then
-        // reject the pair.
-        let build = || {
+        // between them and the coalesce pair (v0, v1) is accepted.  A `-live-`
+        // graph op carrying both as force-alive args (`liveness.py:8-12`)
+        // models a CPython-slot co-live separation the plain SSA graph cannot
+        // see (two locals co-live at a guard across `LOAD_FAST` re-reads);
+        // `make_dependencies` then records the edge and the `has_edge` guard
+        // rejects the pair.
+        let build = |with_live_marker: bool| {
             let v0 = flow_var(0, Kind::Ref);
             let v1 = flow_var(1, Kind::Ref);
             let start = Block::shared(vec![v0.into()]);
@@ -1609,6 +1510,17 @@ mod tests {
                 &start,
                 SpaceOperation::new("ref_copy", vec![v0.into()], Some(v1.into()), 0),
             );
+            if with_live_marker {
+                push_op(
+                    &start,
+                    SpaceOperation::new(
+                        super::super::flatten::OPNAME_LIVE,
+                        vec![v0.into(), v1.into()],
+                        None,
+                        0,
+                    ),
+                );
+            }
             start.closeblock(vec![
                 Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
             ]);
@@ -1616,21 +1528,20 @@ mod tests {
         };
 
         // SSA-liveness only: the disjoint pair is accepted.
-        let (g_ssa, a, b) = build();
-        let kept_ssa = filter_coalesce_pairs_by_interference(&g_ssa, Kind::Ref, &[(a, b)], &[]);
+        let (g_ssa, a, b) = build(false);
+        let kept_ssa = filter_coalesce_pairs_by_interference(&g_ssa, Kind::Ref, &[(a, b)]);
         assert_eq!(
             kept_ssa,
             vec![(a, b)],
-            "SSA-disjoint pair must be accepted when no extra interference is supplied"
+            "SSA-disjoint pair must be accepted without a forcing -live- marker"
         );
 
-        // With an injected co-live edge, the has_edge guard rejects it.
-        let (g_colive, a, b) = build();
-        let kept_colive =
-            filter_coalesce_pairs_by_interference(&g_colive, Kind::Ref, &[(a, b)], &[(a, b)]);
+        // With a force-alive `-live-` marker, the has_edge guard rejects it.
+        let (g_colive, a, b) = build(true);
+        let kept_colive = filter_coalesce_pairs_by_interference(&g_colive, Kind::Ref, &[(a, b)]);
         assert!(
             kept_colive.is_empty(),
-            "an injected co-live interference edge must reject the otherwise-accepted pair"
+            "a forcing -live- marker must reject the otherwise-accepted pair"
         );
     }
 
