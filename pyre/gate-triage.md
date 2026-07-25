@@ -152,12 +152,18 @@ Nothing in that tail has an upstream counterpart: the callee frame is built by
 `handle_call_assembler` (`rpython/jit/backend/llsupport/rewrite.py:665-695`) and
 the backend only loads `arglocs[0]` and calls the target.
 
-The remaining gap this exposes is on the CALLEE side, not the caller's: pyre
-does not yet run `patch_new_loop_to_load_virtualizable_fields`, so a callee loop
-still carries the vable-expanded inputarg list instead of being truncated to
-`inputargs[:num_red_args]` with per-field GETFIELD_GC/GETARRAYITEM_GC prepended
-(see `majit-backend-cranelift/src/compiler.rs`, where it is held disabled pending
-vable heap-writeback).  Enabling that shrink is the orthodox fix.
+This left an apparent CALLEE-side gap — "pyre does not yet run
+`patch_new_loop_to_load_virtualizable_fields`, so a callee loop still carries
+the vable-expanded inputarg list" — sourced from a comment in
+`majit-backend-cranelift/src/compiler.rs` claiming the helper is held disabled
+pending vable heap-writeback.  **That was false and is now measured.**  Both
+sites were instrumented and the whole 313-benchmark corpus swept: the helper
+truncated **2044 times with zero early returns** (`inputargs=14/15/16 → reds=2`),
+and the caller-side resolver saw **38/38 CALL_ASSEMBLER targets at the expected
+arity**.  The shrink has been universally active since `driver_descriptor()`
+started returning `Some(...)`; the comment predated that flip.  The dead
+fallback it guarded, and the `num_scalar_inputargs` plumbing that fed it, are
+deleted.
 
 **`_MULTIFRAME` — the ON path is the upstream structure.**  Upstream's
 `convert_and_run_from_pyjitpl` (`rpython/jit/metainterp/blackhole.py:1799-1826`)
