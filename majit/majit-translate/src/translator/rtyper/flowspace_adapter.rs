@@ -708,6 +708,35 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
         && segments[3] == "reverse"
 }
 
+/// `Vec::with_capacity(n)` / `Vec::new()` (Rust MIR `vec::Vec::{with_capacity,
+/// new}`) — the resizable-list constructor. Routed in [`translate_op`] to the
+/// `newlist` operation with no element args, the shape `rtype_newlist`
+/// (`rlist.py:338-344`) lowers through `newlist(llops, r_list, [])`.
+///
+/// The capacity operand is dropped: upstream keeps a size hint only through
+/// `objectmodel.newlist_hint` (`objectmodel.py:443-447`), whose
+/// `rtype_newlist(hop, v_sizehint)` path our `rtype_newlist` does not take —
+/// the hint is an allocation optimization, not a semantic difference, so an
+/// empty `newlist` is the faithful lowering of both constructors.
+///
+/// Recognizing the constructor is what lets [`is_vec_push_segments`] and
+/// [`is_slice_reverse_segments`] work at all: they emit `getattr(recv, ...)`
+/// method shapes that require the receiver to annotate as a `SomeList`. While
+/// the constructor stayed a residual host call its result was the
+/// classdef-less opaque `SomeInstance` that `foreign_container_ctor` types,
+/// and the `getattr` against it aborted annotation.
+///
+/// Like [`is_vec_push_segments`], this recognizer fires only on the
+/// `CallTarget::FunctionPath` shape, which is complete for the foreign `vec`
+/// crate: `front::mir::impl_method_owner` cannot resolve `vec::Vec` to a
+/// classdef-bound owner, so every constructor call arrives as these segments.
+fn is_vec_ctor_segments(segments: &[String]) -> bool {
+    segments.len() == 3
+        && segments[0] == "vec"
+        && segments[1] == "Vec"
+        && (segments[2] == "with_capacity" || segments[2] == "new")
+}
+
 /// `Vec::push(l, item)` (Rust MIR `vec::Vec::push`) — the resizable-list
 /// append. Routed to the resized `ListRepr.rtype_method("append")`
 /// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
@@ -814,6 +843,15 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments },
             ..
         } if is_slice_reverse_segments(segments) => false,
+        // `vec::Vec::{with_capacity,new}` lowers (in `translate_op`) to the
+        // `newlist` operation, whose `canraise` is `[]` (operation.py:551-553
+        // `class NewList`); classify the originating Call non-raising so a `?`
+        // tail op installs no exception edge the lowered op cannot take.
+        // Matched before the general `Call` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            ..
+        } if is_vec_ctor_segments(segments) => false,
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -1489,6 +1527,37 @@ pub fn translate_op(
                         ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `front::range_iter`'s synthesized `range(start, stop)`
+                    // (the exclusive int-`Range` for-loop divert).  It carries
+                    // the reserved `__pyre_range` spelling rather than a bare
+                    // `["range"]` because the registry ladder below resolves a
+                    // single-segment path against the `PyreCallRegistry`
+                    // *first* (the `frame.globals`-before-`__builtin__` order
+                    // of `flowcontext.py:845-853`), and pyre's registry is one
+                    // flat namespace keyed by leaf-only `CallPath`s.  A pyre
+                    // free function whose leaf happens to be a builtin name —
+                    // `pyre_interpreter::module::_ast::convert::range`
+                    // registers as `["range"]` — would therefore bind this
+                    // synthesized call to *its* `HostObject`, and since
+                    // `BUILTIN_TYPER` is keyed by Arc identity
+                    // (`rbuiltin.rs:98-101`) the rtyper then fails
+                    // `findbltintyper` with "don't know about built-in
+                    // function <host range>".  Resolving the reserved
+                    // spelling straight to the `HOST_ENV` singleton keeps the
+                    // Arc identity that keys `rtype_builtin_range`
+                    // (`rrange.py:96-126`), the same discipline the
+                    // `__pyre_cast_instance` arm above documents.
+                    if segments.len() == 1 && segments[0] == "__pyre_range" {
+                        let callable_host = HOST_ENV.lookup_builtin("range").ok_or_else(|| {
+                            TyperError::message("range missing from HOST_ENV bootstrap".to_string())
+                        })?;
+                        let callable =
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                        call_args.push(callable);
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     // The `len` operation in its three spellings: the
                     // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
                     // (and the `<str>::is_empty` decomposition) to; the
@@ -1566,6 +1635,15 @@ pub fn translate_op(
                             ),
                             FlowspaceOp::new("simple_call", vec![bound_method], result),
                         ]);
+                    }
+                    // `Vec::with_capacity(n)` / `Vec::new()` lower (in Rust
+                    // MIR) to a call to `vec::Vec::{with_capacity,new}`.  Emit
+                    // the `newlist` operation with no element args, which
+                    // `rtype_newlist` (`rlist.py:338-344`) lowers through
+                    // `newlist(llops, r_list, [])`.  The capacity operand is
+                    // dropped — see [`is_vec_ctor_segments`].
+                    if is_vec_ctor_segments(segments) {
+                        return Ok(vec![FlowspaceOp::new("newlist", vec![], result)]);
                     }
                     // `Vec::push(recv, item)` lowers (in Rust MIR) to a call
                     // to `vec::Vec::push`. Emit the *method* shape

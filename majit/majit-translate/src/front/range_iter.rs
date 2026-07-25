@@ -29,7 +29,9 @@
 //!     ... next(r) folded by front::iter_next into the native `next` op
 //! ```
 //!
-//! `range` resolves through `HOST_ENV.lookup_builtin("range")` →
+//! `range` is emitted under the reserved `["__pyre_range"]` spelling (see
+//! [`range_builtin_call`]) and resolves through
+//! `HOST_ENV.lookup_builtin("range")` →
 //! `SomeBuiltin("range")` → `builtin_range` (`SomeList` with `range_step`);
 //! `["core","slice","iter"]` is the same `iter`-op bridge the slice/Vec
 //! for-loop uses (`is_concrete_iter_constructor`), and on a range-`SomeList`
@@ -327,16 +329,24 @@ fn graph_defines(graph: &FunctionGraph, var: &Variable) -> bool {
     })
 }
 
-/// `t = range(start, end)` — the single-segment `range` builtin call the
-/// adapter resolves through `HOST_ENV.lookup_builtin("range")` →
-/// `SomeBuiltin("range")` → `builtin_range` (a `SomeList` carrying
-/// `range_step`).
+/// `t = range(start, end)` — the `range` builtin call the adapter resolves
+/// through `HOST_ENV.lookup_builtin("range")` → `SomeBuiltin("range")` →
+/// `builtin_range` (a `SomeList` carrying `range_step`).
+///
+/// Spelled with the reserved `__pyre_range` segment rather than a bare
+/// `["range"]`: the adapter resolves a single-segment path against the
+/// `PyreCallRegistry` before `HOST_ENV`, and pyre's registry is one flat
+/// namespace keyed by leaf-only `CallPath`s, so a pyre free function named
+/// `range` (`pyre_interpreter::module::_ast::convert::range`) registers as
+/// `["range"]` and would capture this call. The reserved spelling has a
+/// dedicated `translate_op` arm that binds the `HOST_ENV` singleton, keeping
+/// the Arc identity `BUILTIN_TYPER` keys `rtype_builtin_range` on.
 fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> SpaceOperation {
     SpaceOperation {
         result: Some(result),
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["range".to_string()],
+                segments: vec!["__pyre_range".to_string()],
             },
             args: vec![start, end],
             result_ty: ValueType::Ref(None),
@@ -475,7 +485,7 @@ mod tests {
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
-            count_calls_ending(&g, &["range"]),
+            count_calls_ending(&g, &["__pyre_range"]),
             1,
             "one range() builtin emitted"
         );
@@ -554,7 +564,7 @@ mod tests {
         assert_eq!(rewritten, 0, "a second range consumer declines the divert");
         assert_eq!(count_range_ctors(&g), 1, "range ctor survives");
         assert_eq!(
-            count_calls_ending(&g, &["range"]),
+            count_calls_ending(&g, &["__pyre_range"]),
             0,
             "no range() builtin emitted"
         );
