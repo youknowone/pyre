@@ -69,6 +69,16 @@ lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
 ], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# The two nt calls host_env does not wrap (AddDllDirectory/RemoveDllDirectory and
+# GetFileInformationByHandle). Kept on the same 0.61 line rustpython-host_env's
+# nt module resolves to, so HANDLE types match at the boundary.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+] }
+
 [build-dependencies]
 # Compresses the embedded stdlib VFS blob at build time (only does work when the
 # wasm_vfs feature is enabled; otherwise build.rs returns early).

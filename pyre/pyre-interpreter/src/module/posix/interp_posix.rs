@@ -208,81 +208,15 @@ fn split_root(path: &str) -> (&str, &str) {
 /// `if _WIN32` blocks of interp_posix.py. Registered under the `nt` module
 /// name on Windows (moduledef.py `applevel_name = os.name`); `ntpath` reaches
 /// for these through `from nt import _getfullpathname` and friends.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 mod win_nt {
     use pyre_object::PyObjectRef;
-    use std::ffi::c_void;
+    use rustpython_host_env::nt as host_nt;
+    use std::path::Path;
 
-    type Handle = *mut c_void;
-
-    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
-    // winbase.h HANDLE_FLAG_INHERIT.
-    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
-    // winbase.h STD_ERROR_HANDLE — (DWORD)-12.
-    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
-    // consoleapi.h ENABLE_VIRTUAL_TERMINAL_PROCESSING.
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-    // fileapi.h OPEN_EXISTING and winbase.h FILE_FLAG_BACKUP_SEMANTICS.
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    // winbase.h VOLUME_NAME_DOS (the default) and winerror.h ERROR_DIRECTORY.
-    const VOLUME_NAME_DOS: u32 = 0x0;
-    const ERROR_DIRECTORY: u32 = 267;
-
-    // minwinbase.h BY_HANDLE_FILE_INFORMATION; FILETIME is two DWORDs.
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        dw_file_attributes: u32,
-        ft_creation_time: [u32; 2],
-        ft_last_access_time: [u32; 2],
-        ft_last_write_time: [u32; 2],
-        dw_volume_serial_number: u32,
-        n_file_size_high: u32,
-        n_file_size_low: u32,
-        n_number_of_links: u32,
-        n_file_index_high: u32,
-        n_file_index_low: u32,
-    }
-
-    unsafe extern "system" {
-        fn GetFullPathNameW(name: *const u16, len: u32, buf: *mut u16, part: *mut *mut u16)
-            -> u32;
-        fn GetFileInformationByHandle(handle: Handle, info: *mut ByHandleFileInformation) -> i32;
-        fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64)
-            -> i32;
-        fn GetHandleInformation(handle: Handle, flags: *mut u32) -> i32;
-        fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
-        fn AddDllDirectory(dir: *const u16) -> *mut c_void;
-        fn RemoveDllDirectory(cookie: *mut c_void) -> i32;
-        fn GetStdHandle(which: u32) -> Handle;
-        fn GetConsoleMode(handle: Handle, mode: *mut u32) -> i32;
-        fn CreateFileW(
-            name: *const u16,
-            access: u32,
-            share: u32,
-            security: *mut c_void,
-            disposition: u32,
-            flags: u32,
-            template: Handle,
-        ) -> Handle;
-        fn GetFinalPathNameByHandleW(handle: Handle, path: *mut u16, cch: u32, flags: u32) -> u32;
-        fn CloseHandle(handle: Handle) -> i32;
-        fn GetLastError() -> u32;
-    }
-
-    // <io.h> — maps a CRT file descriptor to its underlying OS handle.
-    unsafe extern "C" {
-        fn _get_osfhandle(fd: i32) -> isize;
-    }
-
-    fn to_wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    /// rwin32.lastSavedWindowsError parity — wrap the live GetLastError value
-    /// as an OSError carrying the offending path.
-    fn last_error(path: &str) -> crate::PyError {
-        let errno = crate::builtins::io_error_posix_errno(&std::io::Error::last_os_error(), 0);
+    /// Wrap a host-layer `io::Error` as an OSError carrying the offending path.
+    fn io_err(error: &std::io::Error, path: &str) -> crate::PyError {
+        let errno = crate::builtins::io_error_posix_errno(error, 0);
         let filename = if path.is_empty() {
             pyre_object::PY_NULL
         } else {
@@ -304,40 +238,22 @@ mod win_nt {
         Ok((path, as_bytes))
     }
 
-    fn wrap_path(s: &str, as_bytes: bool) -> PyObjectRef {
+    fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
+        let text = s.to_string_lossy();
         if as_bytes {
-            pyre_object::w_bytes_from_bytes(s.as_bytes())
+            pyre_object::w_bytes_from_bytes(text.as_bytes())
         } else {
-            pyre_object::w_str_new(s)
+            pyre_object::w_str_new(&text)
         }
     }
 
     /// ntpath.abspath helper — resolves `.`/`..` and the drive without
-    /// requiring the path to exist. GetFullPathNameW, called twice to size the
-    /// buffer.
+    /// requiring the path to exist.
     pub fn _getfullpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, as_bytes) = arg_path(args, "_getfullpathname")?;
-        let wide = to_wide(&path);
-        unsafe {
-            let needed = GetFullPathNameW(
-                wide.as_ptr(),
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            if needed == 0 {
-                return Err(last_error(&path));
-            }
-            let mut buf = vec![0u16; needed as usize];
-            let written =
-                GetFullPathNameW(wide.as_ptr(), needed, buf.as_mut_ptr(), std::ptr::null_mut());
-            if written == 0 || written >= needed {
-                return Err(last_error(&path));
-            }
-            Ok(wrap_path(
-                &String::from_utf16_lossy(&buf[..written as usize]),
-                as_bytes,
-            ))
+        match host_nt::getfullpathname(Path::new(&path)) {
+            Ok(result) => Ok(wrap_path(&result, as_bytes)),
+            Err(error) => Err(io_err(&error, &path)),
         }
     }
 
@@ -348,103 +264,51 @@ mod win_nt {
         if path.contains('\0') {
             return Err(crate::PyError::value_error("embedded null character"));
         }
-        let wide = to_wide(&path);
-        unsafe {
-            let handle = CreateFileW(
-                wide.as_ptr(),
-                0,
-                0,
-                std::ptr::null_mut(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                std::ptr::null_mut(),
-            );
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(last_error(&path));
-            }
-            let needed = GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, VOLUME_NAME_DOS);
-            if needed == 0 {
-                CloseHandle(handle);
-                return Err(last_error(&path));
-            }
-            let mut buf = vec![0u16; needed as usize + 1];
-            let written =
-                GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), needed, VOLUME_NAME_DOS);
-            CloseHandle(handle);
-            if written == 0 {
-                return Err(last_error(&path));
-            }
-            Ok(wrap_path(
-                &String::from_utf16_lossy(&buf[..written as usize]),
-                as_bytes,
-            ))
+        match host_nt::getfinalpathname(Path::new(&path)) {
+            Ok(result) => Ok(wrap_path(&result, as_bytes)),
+            Err(error) => Err(io_err(&error, &path)),
         }
     }
 
     /// os.stat helper for ntpath.samefile — (volume serial, file index high,
-    /// file index low) uniquely identifies a file across handles.
+    /// file index low) uniquely identifies a file across handles. host_env has
+    /// no wrapper for GetFileInformationByHandle, so call windows-sys directly.
     pub fn _getfileinformation(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(
                 "_getfileinformation() missing required argument 'fd'",
             ));
         };
         let fd = unsafe { pyre_object::w_int_get_value(arg) } as i32;
-        unsafe {
-            let handle = _get_osfhandle(fd) as Handle;
-            let mut info: ByHandleFileInformation = std::mem::zeroed();
-            if GetFileInformationByHandle(handle, &mut info) == 0 {
-                return Err(last_error(""));
-            }
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(info.dw_volume_serial_number as i64),
-                pyre_object::w_int_new(info.n_file_index_high as i64),
-                pyre_object::w_int_new(info.n_file_index_low as i64),
-            ]))
+        let handle = host_nt::handle_from_fd(fd);
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(io_err(&std::io::Error::last_os_error(), ""));
         }
+        Ok(pyre_object::w_tuple_new(vec![
+            pyre_object::w_int_new(info.dwVolumeSerialNumber as i64),
+            pyre_object::w_int_new(info.nFileIndexHigh as i64),
+            pyre_object::w_int_new(info.nFileIndexLow as i64),
+        ]))
     }
 
-    /// GetDiskFreeSpaceExW over `path`, capturing GetLastError before the
-    /// wide-path buffer drops (HeapFree would clobber it).
-    unsafe fn disk_free(path: &str) -> (i32, u64, u64, u32) {
-        let wide = to_wide(path);
-        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
-        let ret = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
-        let err = if ret == 0 { unsafe { GetLastError() } } else { 0 };
-        (ret, total, free, err)
-    }
-
-    /// shutil.disk_usage helper — (total, free) bytes. A path that names a file
-    /// yields ERROR_DIRECTORY, so retry against its parent directory.
+    /// shutil.disk_usage helper — (total, free) bytes. host_env::getdiskusage
+    /// retries against the parent directory when the path names a file
+    /// (ERROR_DIRECTORY).
     pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, _) = arg_path(args, "_getdiskusage")?;
         if path.contains('\0') {
             return Err(crate::PyError::value_error("embedded null character"));
         }
-        let usage = |total: u64, free: u64| {
-            pyre_object::w_tuple_new(vec![
+        match host_nt::getdiskusage(Path::new(&path)) {
+            Ok((total, free)) => Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(total as i64),
                 pyre_object::w_int_new(free as i64),
-            ])
-        };
-        unsafe {
-            let (ret, total, free, err) = disk_free(&path);
-            if ret != 0 {
-                return Ok(usage(total, free));
-            }
-            if err != ERROR_DIRECTORY {
-                return Err(last_error(&path));
-            }
-            let cut = path.rfind('\\').or_else(|| path.rfind('/'));
-            let parent = match cut {
-                Some(index) => &path[..index],
-                None => path.as_str(),
-            };
-            let (ret, total, free, _) = disk_free(parent);
-            if ret == 0 {
-                return Err(last_error(&path));
-            }
-            Ok(usage(total, free))
+            ])),
+            Err(error) => Err(io_err(&error, &path)),
         }
     }
 
@@ -456,12 +320,11 @@ mod win_nt {
                 "get_handle_inheritable() missing required argument 'handle'",
             ));
         };
-        let handle = (unsafe { pyre_object::w_int_get_value(arg) } as usize) as Handle;
-        let mut flags = 0u32;
-        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
-            return Err(last_error(""));
+        let handle = unsafe { pyre_object::w_int_get_value(arg) } as libc::intptr_t;
+        match host_nt::get_handle_inheritable(handle) {
+            Ok(value) => Ok(pyre_object::w_bool_from(value)),
+            Err(error) => Err(io_err(&error, "")),
         }
-        Ok(pyre_object::w_bool_from(flags & HANDLE_FLAG_INHERIT != 0))
     }
 
     /// os.set_handle_inheritable.
@@ -471,36 +334,39 @@ mod win_nt {
                 "set_handle_inheritable() takes 2 arguments",
             ));
         }
-        let handle = (unsafe { pyre_object::w_int_get_value(args[0]) } as usize) as Handle;
+        let handle = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::intptr_t;
         let inheritable = crate::baseobjspace::is_true(args[1])?;
-        let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
-        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags) } == 0 {
-            return Err(last_error(""));
+        match host_nt::set_handle_inheritable(handle, inheritable) {
+            Ok(()) => Ok(pyre_object::w_none()),
+            Err(error) => Err(io_err(&error, "")),
         }
-        Ok(pyre_object::w_none())
     }
 
     /// os._add_dll_directory. PyPy hands back a W_DLLCapsule; os.py only
     /// round-trips the value into `_remove_dll_directory`, so the opaque
-    /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead.
+    /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
+    /// no AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _) = arg_path(args, "_add_dll_directory")?;
-        let wide = to_wide(&path);
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
         if cookie.is_null() {
-            return Err(last_error(&path));
+            return Err(io_err(&std::io::Error::last_os_error(), &path));
         }
         Ok(pyre_object::w_int_new(cookie as usize as i64))
     }
 
     /// os._remove_dll_directory — takes the cookie returned above.
     pub fn _remove_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(
                 "_remove_dll_directory() missing required argument 'cookie'",
             ));
         };
-        let cookie = (unsafe { pyre_object::w_int_get_value(arg) } as usize) as *mut c_void;
+        let cookie =
+            (unsafe { pyre_object::w_int_get_value(arg) } as usize) as *mut std::ffi::c_void;
         let ok = unsafe { RemoveDllDirectory(cookie) };
         Ok(pyre_object::w_bool_from(ok != 0))
     }
@@ -508,19 +374,9 @@ mod win_nt {
     /// os._supports_virtual_terminal — whether stderr's console mode carries
     /// ENABLE_VIRTUAL_TERMINAL_PROCESSING.
     pub fn _supports_virtual_terminal(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        unsafe {
-            let handle = GetStdHandle(STD_ERROR_HANDLE);
-            if handle == INVALID_HANDLE_VALUE {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-            let mut mode = 0u32;
-            if GetConsoleMode(handle, &mut mode) == 0 {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-            Ok(pyre_object::w_bool_from(
-                mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0,
-            ))
-        }
+        Ok(pyre_object::w_bool_from(
+            host_nt::supports_virtual_terminal(),
+        ))
     }
 }
 
@@ -1424,7 +1280,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // ── Windows-only nt calls — moduledef.py `if os.name == 'nt'` block ──
     // ntpath imports these from `nt` behind try/except ImportError, so a build
     // that omits one silently falls back to its pure-Python path implementation.
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "host_env"))]
     {
         for (name, func, arity) in [
             (
