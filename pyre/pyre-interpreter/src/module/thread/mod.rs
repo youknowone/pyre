@@ -208,7 +208,7 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 // PyPy `_thread.get_ident` returns the pthread handle; pyre routes
 // through `rustpython_host_env::thread::current_thread_id`.  Without
 // host_env we always return 1 (single-threaded sentinel).
-fn current_ident() -> i64 {
+pub(crate) fn current_ident() -> i64 {
     let logical = LOGICAL_THREAD_IDENT.with(Cell::get);
     if logical != 0 {
         return logical;

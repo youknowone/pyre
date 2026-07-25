@@ -3,7 +3,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use crate::importing::BUILTIN_MODULES;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 struct FrozenModule {
     name: &'static str,
@@ -106,11 +106,210 @@ static FROZEN_MODULES: &[FrozenModule] = &[
 
 static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(0);
 
-/// `importing.py:159 ImportRLock` reentrant depth. With one execution context
-/// the owner collapses to held/not-held and the real lock never blocks, so the
-/// recursion counter is the whole observable state; it is per-interpreter
-/// (shared across threads), so a global — not thread-local — is correct.
-static IMPORT_LOCK_COUNT: AtomicI64 = AtomicI64::new(0);
+/// `importing.py:159 ImportRLock` — the interpreter's reentrant import lock.
+///
+/// Upstream mutates the three fields with the GIL held (`importing.py:175`
+/// "this function runs with the GIL acquired so there is no race condition in
+/// the creation of the lock"); pyre has no GIL, so `lock` is published with a
+/// compare-exchange and `lockowner` is stored only after the real lock has
+/// been taken.
+struct ImportRLock {
+    /// `importing.py:162 self.lock` — what `space.allocate_lock()` returned,
+    /// allocated on the first acquire.  Null is upstream's `None`, and the
+    /// distinction is observable: `release_lock` is silent while it is null.
+    lock: AtomicPtr<crate::baseobjspace::Lock>,
+    /// `importing.py:163 self.lockowner` — the owning thread, held as the
+    /// ident rather than as the context object because only its identity is
+    /// ever read.  Zero is `None`.
+    lockowner: AtomicI64,
+    /// `importing.py:164 self.lockcounter` — recursion depth.  Only the owning
+    /// thread mutates it.
+    lockcounter: AtomicI64,
+}
+
+/// `importing.py:168 me = self.space.getexecutioncontext()  # used as thread
+/// ident`.
+///
+/// The comment states what the value is for, and that is what is ported: the
+/// ident comes from `rthread.get_ident`, the same source `_thread.get_ident`
+/// reads.  Taking the execution context instead would not survive the trip —
+/// `space.getexecutioncontext()` returns the per-thread context
+/// `threadlocals.get_ec()` creates once and caches for the thread's whole life
+/// (`baseobjspace.py:741`), whereas pyre's accessor reads a slot the launcher
+/// re-seeds with a fresh context per phase, so a lock taken while running a
+/// script would be owned by a stranger once the REPL starts.
+fn thread_ident() -> i64 {
+    match crate::module::thread::current_ident() {
+        // Zero is the `None` encoding, so it cannot also name a thread; fall
+        // back to the same single-threaded sentinel `_thread.get_ident` uses.
+        0 => 1,
+        ident => ident,
+    }
+}
+
+impl ImportRLock {
+    const fn new() -> Self {
+        Self {
+            lock: AtomicPtr::new(std::ptr::null_mut()),
+            lockowner: AtomicI64::new(0),
+            lockcounter: AtomicI64::new(0),
+        }
+    }
+
+    /// `importing.py:167 lock_held_by_someone_else`.  No caller upstream
+    /// either; its `true` branch is additionally unreachable while pyre runs a
+    /// single Python thread.
+    #[allow(dead_code)]
+    fn lock_held_by_someone_else(&self) -> bool {
+        let me = thread_ident();
+        let owner = self.lockowner.load(Ordering::Acquire);
+        owner != 0 && owner != me
+    }
+
+    /// `importing.py:171 lock_held_by_anyone` — owner-agnostic, which is what
+    /// makes `_imp.lock_held()` true when read from a non-owning thread.
+    fn lock_held_by_anyone(&self) -> bool {
+        self.lockowner.load(Ordering::Acquire) != 0
+    }
+
+    /// `importing.py:174 acquire_lock`.
+    fn acquire_lock(&self) {
+        // importing.py:177-181 — allocate on first use.  A losing racer drops
+        // its own box and uses the winner's.
+        if self.lock.load(Ordering::Acquire).is_null() {
+            let fresh = crate::baseobjspace::allocate_lock();
+            if self
+                .lock
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    fresh,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                drop(unsafe { Box::from_raw(fresh) });
+            }
+        }
+        let me = thread_ident();
+        // importing.py:183-189
+        if self.lockowner.load(Ordering::Acquire) != me {
+            let lock = unsafe { &*self.lock.load(Ordering::Acquire) };
+            lock.acquire(true);
+            debug_assert_eq!(self.lockowner.load(Ordering::Acquire), 0);
+            debug_assert_eq!(self.lockcounter.load(Ordering::Relaxed), 0);
+            self.lockowner.store(me, Ordering::Release);
+        }
+        // importing.py:190
+        self.lockcounter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `importing.py:192 release_lock(silent_after_fork)`.
+    fn release_lock(&self, silent_after_fork: bool) -> Result<(), crate::PyError> {
+        let me = thread_ident();
+        let owner = self.lockowner.load(Ordering::Acquire);
+        if owner != me {
+            // importing.py:195-198 — a fork() with the import lock held leaves
+            // the child owner-less.  The `is None` conjunct is what keeps a
+            // release by a *foreign* owner an error even here.
+            if owner == 0 && silent_after_fork {
+                return Ok(());
+            }
+            // importing.py:199-200 `if self.lock is None: # CannotHaveLock
+            // occurred` is dropped for the same reason as its partner in
+            // `acquire_lock`: it is the downstream half of a condition pyre
+            // cannot occupy.  Porting it would make the branch live off a
+            // different cause — an import path that never took the lock —
+            // and then the very first unbalanced release of a process would
+            // return silently instead of raising.  CONVERGENCE: have the
+            // native importer bracket module execution with the lock the way
+            // `importing.py:91 importhook` brackets its own, after which the
+            // lock is allocated before user code runs and the branch stops
+            // being observable either way.
+            // importing.py:201-203
+            return Err(crate::PyError::runtime_error(
+                "not holding the import lock",
+            ));
+        }
+        debug_assert!(self.lockcounter.load(Ordering::Relaxed) > 0);
+        // importing.py:204-207 — clear the owner BEFORE releasing, so the
+        // waiter that wakes up finds the state `acquire_lock` asserts.
+        if self.lockcounter.fetch_sub(1, Ordering::Relaxed) - 1 == 0 {
+            self.lockowner.store(0, Ordering::Release);
+            unsafe { &*self.lock.load(Ordering::Acquire) }.release();
+        }
+        Ok(())
+    }
+
+    /// `importing.py:209 reinit_lock` — run in a fork child so it does not
+    /// share the parent's lock.  Branches on the depth, not on ownership:
+    /// a depth above one means the fork happened underneath an import, whose
+    /// `before` hook already acquired.
+    ///
+    /// Registered upstream as the `child` fork hook
+    /// (`pypy/module/imp/moduledef.py:45`, driven by
+    /// `pypy/module/posix/interp_posix.py:1560`) and never exposed to Python.
+    /// pyre has no fork-hook dispatch, so nothing calls this yet.
+    /// CONVERGENCE: port `add_fork_hook`/`run_fork_hooks` into the posix
+    /// module and register the whole trio — `before`→`acquire_lock`,
+    /// `parent`→`release_lock`, `child`→`reinit_lock`.  Wiring the child hook
+    /// alone would make the depth test pick the wrong branch.
+    #[allow(dead_code)]
+    fn reinit_lock(&self) {
+        if self.lockcounter.load(Ordering::Relaxed) > 1 {
+            // importing.py:216-224 — the old lock object is abandoned rather
+            // than freed: a foreign thread could be mid-acquire on it.
+            let fresh = crate::baseobjspace::allocate_lock();
+            self.lock.store(fresh, Ordering::Release);
+            let me = thread_ident();
+            unsafe { &*fresh }.acquire(true);
+            self.lockowner.store(me, Ordering::Release);
+            self.lockcounter.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.lock.store(std::ptr::null_mut(), Ordering::Release);
+            self.lockowner.store(0, Ordering::Release);
+            self.lockcounter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `importing.py:228 getimportlock(space)` = `space.fromcache(ImportRLock)` —
+/// one instance per interpreter, shared by every thread.  That sharing is what
+/// makes `lockowner` meaningful, so this is a global and never a
+/// `thread_local!`.
+static IMPORT_LOCK: ImportRLock = ImportRLock::new();
+
+fn getimportlock() -> &'static ImportRLock {
+    &IMPORT_LOCK
+}
+
+// The `space.config.objspace.usemodules.thread` gate on the four gateways
+// below (`interp_imp.py:140`) is constant-true here: pyre's build always
+// registers `_thread`, so the gateways stay ungated.
+
+/// `interp_imp.py:139 lock_held`.
+fn lock_held() -> bool {
+    getimportlock().lock_held_by_anyone()
+}
+
+/// `interp_imp.py:146 acquire_lock`.
+fn acquire_lock() {
+    getimportlock().acquire_lock();
+}
+
+/// `interp_imp.py:150 release_lock` — `silent_after_fork=False`, which is why
+/// an unbalanced `_imp.release_lock()` from Python raises.
+fn release_lock() -> Result<(), crate::PyError> {
+    getimportlock().release_lock(false)
+}
+
+/// `interp_imp.py:153 reinit_lock`.  Deliberately absent from the `_imp`
+/// namespace: `moduledef.py:26` exposes only `lock_held`, `acquire_lock` and
+/// `release_lock`.
+#[allow(dead_code)]
+fn reinit_lock() {
+    getimportlock().reinit_lock();
+}
 
 fn frozen_module(name: &str) -> Option<&'static FrozenModule> {
     FROZEN_MODULES.iter().find(|entry| entry.name == name)
@@ -440,11 +639,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "acquire_lock",
-        // importing.py:174 acquire_lock — reentrant; bump the depth.
         crate::make_builtin_function_with_arity(
             "acquire_lock",
             |_| {
-                IMPORT_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+                acquire_lock();
                 Ok(pyre_object::w_none())
             },
             0,
@@ -453,14 +651,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "release_lock",
-        // importing.py:192 release_lock — releasing an unheld lock is an error.
         crate::make_builtin_function_with_arity(
             "release_lock",
             |_| {
-                if IMPORT_LOCK_COUNT.load(Ordering::Relaxed) <= 0 {
-                    return Err(crate::PyError::runtime_error("not holding the import lock"));
-                }
-                IMPORT_LOCK_COUNT.fetch_sub(1, Ordering::Relaxed);
+                release_lock()?;
                 Ok(pyre_object::w_none())
             },
             0,
@@ -469,10 +663,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "lock_held",
-        // importing.py:171 lock_held_by_anyone.
         crate::make_builtin_function_with_arity(
             "lock_held",
-            |_| Ok(pyre_object::w_bool_from(IMPORT_LOCK_COUNT.load(Ordering::Relaxed) > 0)),
+            |_| Ok(pyre_object::w_bool_from(lock_held())),
             0,
         ),
     );

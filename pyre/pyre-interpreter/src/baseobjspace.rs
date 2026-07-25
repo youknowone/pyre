@@ -267,6 +267,77 @@ impl ObjSpace {
     }
 }
 
+/// `rpython/rlib/rthread.py:160 Lock` — the interp-level lock object
+/// `allocate_lock` hands back.  Only `acquire`/`release` have callers here;
+/// `is_acquired` / `acquire_timed` are ported when something needs them.
+///
+/// The blocking wait is a plain condvar wait rather than a GIL-dropping one:
+/// pyre has no GIL to drop.  Nothing can wake a waiter yet either, since
+/// `_thread.start_new_thread` runs its target on the caller's stack — so the
+/// wait is reached only by a caller that contends with a lock the same OS
+/// thread holds, which no import path does.  The shape is still the blocking
+/// one so that the single-thread assumption is not baked into the callers.
+pub struct Lock {
+    acquired: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+impl Lock {
+    fn new() -> Self {
+        Self {
+            acquired: std::sync::Mutex::new(false),
+            released: std::sync::Condvar::new(),
+        }
+    }
+
+    /// `rthread.py:169 acquire(flag)` — with `flag` set, wait until the lock
+    /// is free and take it; otherwise take it only if it is free right now.
+    /// Returns whether the lock is now held by the caller.
+    pub fn acquire(&self, flag: bool) -> bool {
+        let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
+        if !flag {
+            if *acquired {
+                return false;
+            }
+            *acquired = true;
+            return true;
+        }
+        while *acquired {
+            acquired = self
+                .released
+                .wait(acquired)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *acquired = true;
+        true
+    }
+
+    /// `rthread.py:199 release` — upstream raises when the lock was not
+    /// previously acquired.  Every caller here releases only what it owns, so
+    /// the unheld case is a bug in this crate rather than a Python-visible
+    /// error, and it is reported as one.
+    pub fn release(&self) {
+        let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(*acquired, "the lock was not previously acquired");
+        *acquired = false;
+        self.released.notify_one();
+    }
+}
+
+/// `pypy/interpreter/baseobjspace.py:803 space.allocate_lock()`.
+///
+/// Upstream picks `rthread.dummy_lock` when the build has no `thread` module;
+/// pyre always registers `_thread`, so the `rthread.allocate_lock()` branch
+/// (`baseobjspace.py:815`) is the one taken.  `CannotHaveLock`
+/// (`baseobjspace.py:421`) guards the translating-but-not-translated case,
+/// which pyre never occupies, so this cannot fail.
+///
+/// The returned pointer is deliberately leaked: locks live for the process,
+/// and freeing one while another thread could be waiting on it is unsound.
+pub fn allocate_lock() -> *mut Lock {
+    Box::into_raw(Box::new(Lock::new()))
+}
+
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
 /// `w_type.mro_w`. Uses the cached MRO when present, otherwise
 /// recomputes via `compute_default_mro`.
