@@ -515,32 +515,8 @@ pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
     }
 }
 
-/// Allocate a `FixedObjectArray` pre-populated from `values`. The
-/// resulting array has `values.len()` slots; allocation layout matches
-/// [`alloc_fixed_array_with_header`].
-pub unsafe fn alloc_fixed_array_from_vec(
-    values: Vec<pyre_object::PyObjectRef>,
-) -> *mut FixedObjectArray {
-    unsafe {
-        let len = values.len();
-        let layout = fixed_array_layout(len);
-        let raw = std::alloc::alloc_zeroed(layout);
-        if raw.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let arr = raw.add(GC_HEADER_SIZE) as *mut FixedObjectArray;
-        (*arr).len = len;
-        let items = (arr as *mut u8).add(pyre_object::FIXED_ARRAY_ITEMS_OFFSET)
-            as *mut pyre_object::PyObjectRef;
-        for (i, v) in values.into_iter().enumerate() {
-            items.add(i).write(v);
-        }
-        arr
-    }
-}
-
 /// Deallocate a `FixedObjectArray` allocated with
-/// [`alloc_fixed_array_with_header`] or [`alloc_fixed_array_from_vec`].
+/// [`alloc_fixed_array_with_header`].
 pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
     if ptr.is_null() {
         return;
@@ -2184,46 +2160,6 @@ impl PyFrame {
         Ok(self.get_w_locals())
     }
 
-    /// Create a minimal frame stub for passing to call dispatch.
-    /// Used by MIFrame Box tracking when concrete_frame is unavailable.
-    pub fn new_minimal(code: *const (), execution_context: *const PyExecutionContext) -> Self {
-        let raw =
-            unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
-        let nlocals = unsafe { (&*raw).varnames.len() };
-        let ncells = unsafe { ncells(&*raw) };
-        let size = nlocals + ncells + 16; // small stack
-        // `pyframe.py:98 __init__(self, space, code, w_globals, ...)`
-        // stores `w_globals` as the canonical W_DictObject directly.
-        // This storage-only builder carries no globals object.
-        let w_globals = PY_NULL;
-        let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
-        // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
-        // gated debugdata snapshot retired in favour of `w_globals`).
-        unsafe {
-            crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
-        }
-        let mut frame = PyFrame {
-            ob_header: frame_ob_header(),
-            execution_context,
-            pycode: code,
-            locals_cells_stack_w: unsafe {
-                alloc_fixed_array_from_vec(vec![pyre_object::PY_NULL; size])
-            },
-            valuestackdepth: nlocals + ncells,
-            last_instr: -1,
-            flags: 0,
-            debugdata: std::ptr::null_mut(),
-            lastblock: std::ptr::null_mut(),
-            vable_token: 0,
-            f_generator_nowref: PY_NULL,
-            w_yielding_from: PY_NULL,
-            f_backref: std::ptr::null_mut(),
-            w_builtin,
-            w_globals,
-        };
-        frame
-    }
-
     /// Test-helper constructor — creates a frame with a fresh execution
     /// context.
     ///
@@ -2297,60 +2233,6 @@ impl PyFrame {
         }
         let ctx_ptr = Rc::into_raw(execution_context);
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
-    }
-
-    /// PyFrame constructor body called from `createframe` (PyPy
-    /// `baseobjspace.py:796`) when `outer_func` is `None` — sets up the
-    /// fixed-array stack, debug data, w_globals binding, and module-level
-    /// `w_locals = w_globals` semantics.  Crate-private helper kept as the
-    /// namespace constructor shape even when call sites allocate directly.
-    pub(crate) fn new_with_namespace(
-        code: *const (),
-        execution_context: *const PyExecutionContext,
-    ) -> Self {
-        let raw =
-            unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
-        let code_ref = unsafe { &*raw };
-        let num_locals = code_ref.varnames.len();
-        let num_cells = ncells(code_ref);
-        let max_stack = code_ref.max_stackdepth as usize;
-
-        // This storage-only builder carries no globals object.
-        let w_globals = PY_NULL;
-        let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
-        // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
-        // gated debugdata snapshot retired in favour of `w_globals`).
-        unsafe {
-            crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
-        }
-        let mut frame = PyFrame {
-            ob_header: frame_ob_header(),
-            execution_context,
-            pycode: code,
-            locals_cells_stack_w: unsafe {
-                alloc_fixed_array_with_header(num_locals + num_cells + max_stack, PY_NULL)
-            },
-            valuestackdepth: num_locals + num_cells,
-            last_instr: -1,
-            flags: 0,
-            debugdata: std::ptr::null_mut(),
-            lastblock: std::ptr::null_mut(),
-            vable_token: 0,
-            f_generator_nowref: PY_NULL,
-            w_yielding_from: PY_NULL,
-            f_backref: std::ptr::null_mut(),
-            w_builtin,
-            w_globals,
-        };
-        // Module-level w_locals = w_globals binding flows naturally
-        // through `createframe → initialize_frame_scopes` since RustPython
-        // codegen emits empty flags for the module seed CodeInfo
-        // (pyframe.py:216-218).  This constructor bypasses
-        // initialize_frame_scopes, so still bind w_locals to w_globals
-        // explicitly to match what `createframe` would observe — in the
-        // object form (the canonical W_DictObject), not the raw storage.
-        frame.getorcreate_debug_data(-1).w_locals = w_globals;
-        frame
     }
 
     /// RPython MetaInterp traces against its own MIFrame stack instead of
@@ -2941,8 +2823,7 @@ impl PyFrame {
     /// pyframe.py:216-220 `get_builtin` — returns `self.builtin` (the
     /// per-frame picked builtin Module, set at frame creation by
     /// `pick_builtin(w_globals)`).  Falls back to the EC's default
-    /// builtin when the frame was constructed without globals (e.g.
-    /// `PyFrame::new_minimal` stub frames).
+    /// builtin when the frame was constructed without globals.
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
         if !self.w_builtin.is_null() {
