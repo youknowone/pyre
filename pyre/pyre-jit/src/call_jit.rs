@@ -325,6 +325,20 @@ fn alloc_callee_frame(
 /// frame itself is not freed — `executioncontext.py:91-107 leave` frees
 /// nothing either; the collector reclaims it once nothing reaches it.
 fn unroot_callee_frame(ptr: *mut PyFrame) {
+    // This list is what makes a minor collection scan the frame's slots.
+    // Once it stops, a young ref stored since the last minor — argument
+    // boxing, the CALL_ASSEMBLER writeback through `jit_frame_set_slot_*` —
+    // is reachable only through the old-gen locals array's own items, which
+    // a minor does not walk. The frame outlives the call whenever the program
+    // retained it (a traceback node, an `f_back` chain), so re-arm the
+    // remembered set here, at the moment root-walking stops: the same barrier
+    // `pyframe.py:52 __init__` arms at creation, for the same reason.
+    unsafe {
+        pyre_interpreter::pyframe::remember_frame_locals_array((*ptr).locals_cells_stack_w);
+    }
+    if pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8) {
+        pyre_object::gc_hook::try_gc_write_barrier(ptr as *mut u8);
+    }
     LIVE_CALLEE_FRAMES.with(|cell| {
         let frames = unsafe { &mut *cell.get() };
         // Calls return in LIFO order, so the match is normally the last
@@ -661,6 +675,15 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 /// locals array) and its `last_instr`, and would run the interpreter on a
 /// frame that dies with the C stack.
 fn run_frame_through_portal(frame_ptr: i64) -> i64 {
+    // `jit_drop_callee_frame` tolerates a tagged word on the same slot because
+    // it only unroots; there is nothing sensible to run here for one. The
+    // portal's result is a Ref whose NULL spelling means "exception stored",
+    // so returning NULL for a non-frame would manufacture an exception-less
+    // error rather than deopt cleanly.
+    debug_assert!(
+        frame_ptr != 0 && frame_ptr & 1 == 0,
+        "CALL_ASSEMBLER arg 0 must be the callee PyFrame"
+    );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
     let result = crate::eval::portal_runner(frame);
 

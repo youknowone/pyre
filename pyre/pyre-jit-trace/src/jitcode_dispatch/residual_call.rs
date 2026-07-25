@@ -317,10 +317,13 @@ pub(crate) struct InlineConcreteFrameGuard(*mut pyre_interpreter::PyFrame);
 
 impl InlineConcreteFrameGuard {
     pub(crate) fn enter(frame: *mut pyre_interpreter::PyFrame) -> Self {
-        let previous = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
-        if !frame.is_null() {
-            INLINE_CONCRETE_FRAME.with(|slot| slot.set(frame));
-        }
+        // Set unconditionally, null included: a nested sub-walk whose seed
+        // block bailed has no frame of its own, and inheriting the enclosing
+        // callee's frame would publish it for the inner callee's residuals —
+        // resolving one level too shallow, the error this guard exists to
+        // stop.  A null slot makes `ResidualFrameChainGuard::enter` publish
+        // nothing.
+        let previous = INLINE_CONCRETE_FRAME.with(|slot| slot.replace(frame));
         Self(previous)
     }
 }

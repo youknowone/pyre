@@ -712,17 +712,13 @@ mod handle_class {
                     // native abort.  The negated comparison rejects NaN too.
                     let secs = floatobject::w_float_get_value(timeout);
                     if !(secs <= TIMEOUT_MAX) {
-                        return Err(crate::PyError::overflow_error(
-                            "timeout value is too large",
-                        ));
+                        return Err(crate::PyError::overflow_error("timeout value is too large"));
                     }
                     Some(Duration::from_secs_f64(secs.max(0.0)))
                 } else if is_int(timeout) {
                     let secs = w_int_get_value(timeout);
                     if secs as f64 > TIMEOUT_MAX {
-                        return Err(crate::PyError::overflow_error(
-                            "timeout value is too large",
-                        ));
+                        return Err(crate::PyError::overflow_error("timeout value is too large"));
                     }
                     Some(Duration::from_secs(secs.max(0) as u64))
                 } else {
