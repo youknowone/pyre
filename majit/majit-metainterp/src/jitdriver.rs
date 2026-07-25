@@ -221,6 +221,18 @@ pub fn drive_single_frame_blackhole(
     result
 }
 
+/// Terminal state from a multi-frame tracing-abort blackhole run.
+///
+/// `terminal` is the bottommost (portal-level) frame's register image, present
+/// whenever its exception propagated out of `_run_forever`.  A
+/// ContinueRunningNormally handoff needs it to materialize that frame's live
+/// operand-stack slots, exactly as the single-frame path uses
+/// [`SingleFrameBlackholeResult`].
+pub struct MultiFrameBlackholeResult {
+    pub outcome: crate::jitexc::JitException,
+    pub terminal: Option<crate::blackhole::BlackholeTerminalImage>,
+}
+
 /// Run a tracing MIFrame chain through the structured multi-frame blackhole
 /// conversion.  Every frame shares the portal-level virtualizable layout, but
 /// retains its own jitcode, register banks, and blackhole interpreter.
@@ -234,7 +246,9 @@ pub fn drive_multi_frame_blackhole(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
     mut last_exc_value: i64,
     raising_exception: bool,
-) -> crate::jitexc::JitException {
+    per_frame: Option<&[(i64, usize)]>,
+    on_enter_level: Option<&dyn Fn(i64)>,
+) -> MultiFrameBlackholeResult {
     let mut ref_locations = Vec::new();
     let mut packed_ref_roots = Vec::new();
     for (frame_index, frame) in framestack.frames.iter().enumerate() {
@@ -271,6 +285,7 @@ pub fn drive_multi_frame_blackhole(
     }
 
     let jitdrivers_sd = bh_jitdrivers_sd(metainterp_sd);
+    let mut terminal = None;
     let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
         builder,
         framestack,
@@ -282,10 +297,13 @@ pub fn drive_multi_frame_blackhole(
             virtualizable_ptr,
             virtualizable_stack_base,
             jitdrivers_sd: &jitdrivers_sd,
+            per_frame,
+            on_enter_level,
         }),
+        Some(&mut terminal),
     );
     majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
-    outcome
+    MultiFrameBlackholeResult { outcome, terminal }
 }
 
 fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
@@ -5884,6 +5902,8 @@ impl<S: JitState> JitDriver<S> {
                                     crate::jitexc::JitException,
                                 >
                         }),
+                        None,
+                        None,
                     );
                     // compile.py:716 assert 0, "unreachable"
                     if crate::majit_log_enabled() {

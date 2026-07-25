@@ -1454,10 +1454,23 @@ fn seed_loop_entry_ref_slots(
     }
 }
 
-fn apply_single_frame_blackhole_crn(
+/// Materialize a blackhole `ContinueRunningNormally` handoff into the live
+/// interpreter frame: write every live local / operand-stack slot from the
+/// terminal register banks, then move the frame to the resume coordinate.
+///
+/// Shared by the single-frame and multi-frame adopt paths — the multi-frame
+/// chain's terminal frame is the portal level, so it needs the exact same
+/// treatment (a chain whose inner levels committed through their own
+/// virtualizable still leaves the portal's `valuestackdepth` at the aborted
+/// mid-expression value).
+fn apply_blackhole_crn(
     frame: usize,
     jitcode_index: i32,
-    terminal: &mut majit_metainterp::SingleFrameBlackholeResult,
+    position: usize,
+    last_opcode_position: usize,
+    registers_i: &[i64],
+    registers_r: &mut [i64],
+    registers_f: &[i64],
     resume_py_pc: usize,
 ) -> bool {
     if frame == 0 {
@@ -1486,8 +1499,8 @@ fn apply_single_frame_blackhole_crn(
     if pf.locals_w().as_slice().len() < live_end {
         return false;
     }
-    let pcdep = crate::state::pcdep_trivia_at(jitcode_index, terminal.last_opcode_position as i32)
-        .or_else(|| crate::state::pcdep_trivia_at(jitcode_index, terminal.position as i32));
+    let pcdep = crate::state::pcdep_trivia_at(jitcode_index, last_opcode_position as i32)
+        .or_else(|| crate::state::pcdep_trivia_at(jitcode_index, position as i32));
     let Some(pcdep) = pcdep else {
         return false;
     };
@@ -1503,9 +1516,9 @@ fn apply_single_frame_blackhole_crn(
         }
         let color = color as usize;
         let present = match bank {
-            0 => color < terminal.registers_i.len(),
-            1 => color < terminal.registers_r.len(),
-            2 => color < terminal.registers_f.len(),
+            0 => color < registers_i.len(),
+            1 => color < registers_r.len(),
+            2 => color < registers_f.len(),
             _ => false,
         };
         if !present {
@@ -1521,16 +1534,19 @@ fn apply_single_frame_blackhole_crn(
 
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(terminal.registers_r.as_mut_slice());
+        majit_gc::shadow_stack::push_resume_ref_roots(registers_r);
     }
     for (slot, bank, color) in writes {
         let value = match bank {
-            0 => majit_ir::Value::Int(terminal.registers_i[color]),
-            1 => majit_ir::Value::Ref(majit_ir::GcRef(terminal.registers_r[color] as usize)),
-            2 => majit_ir::Value::Float(f64::from_bits(terminal.registers_f[color] as u64)),
+            0 => majit_ir::Value::Int(registers_i[color]),
+            1 => majit_ir::Value::Ref(majit_ir::GcRef(registers_r[color] as usize)),
+            2 => majit_ir::Value::Float(f64::from_bits(registers_f[color] as u64)),
             _ => unreachable!("validated blackhole register bank"),
         };
         pf.locals_w_mut()[slot] = crate::state::boxed_slot_value_for_type(value.get_type(), &value);
+        // Per store, not once after the loop: boxing the next slot can collect,
+        // which re-arms the array's write barrier.
+        pyre_interpreter::remember_frame_locals_array(pf.locals_cells_stack_w);
     }
     majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
     pf.valuestackdepth = live_end;
@@ -1575,10 +1591,14 @@ fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool 
                 return false;
             };
             let resume_py_pc = resume_py_pc as usize;
-            if !apply_single_frame_blackhole_crn(
+            if !apply_blackhole_crn(
                 cf_addr,
                 jitcode_index,
-                &mut terminal,
+                terminal.position,
+                terminal.last_opcode_position,
+                &terminal.registers_i,
+                terminal.registers_r.as_mut_slice(),
+                &terminal.registers_f,
                 resume_py_pc,
             ) {
                 return false;
@@ -1646,12 +1666,92 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         return false;
     };
+    // Recover each level's concrete PyFrame ptr and its own fastlocals base.
+    // `build_multi_frame_miframe` emits one frame per inline level's CALLER
+    // plus the innermost callee, so `frames.last()` is the frame being
+    // sub-walked and `frames[0]` is either the walked frame `cf_addr` itself
+    // or — when the inline sits inside a residual call the walk descended
+    // into — that intermediate frame.  Any level whose frame register is not
+    // a concrete PyFrame declines the adopt (legacy replay handles it).
+    let mut per_frame: Vec<(i64, usize)> = Vec::with_capacity(latched.framestack.frames.len());
+    for frame in &latched.framestack.frames {
+        let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+            return false;
+        };
+        let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
+        if frame_reg == u16::MAX {
+            return false;
+        }
+        let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
+            return false;
+        };
+        if frame_ptr == 0 {
+            return false;
+        }
+        let Some(frame_stack_base) = crate::state::concrete_nlocals(frame_ptr as usize) else {
+            return false;
+        };
+        per_frame.push((frame_ptr, frame_stack_base));
+    }
+    // A chain rooted at an intermediate frame means the walk descended into a
+    // residual call and inlined inside it.  Two things then do not hold:
+    // `resume_py_pc` is a coordinate in `frames[0]`'s code while the restart
+    // moves `cf_addr`, and — because the walker executes residuals CONCRETELY
+    // while an inline push never runs the interpreter's call sequence — a
+    // `sys._getframe()` inside the inlined body already read `ec.topframeref`
+    // as the CALLER and committed the wrong frame object, which the adopt
+    // would then publish.  Bracketing each inline level's concrete frame with
+    // an `enter`/`leave` does not fix it: levels that run without a
+    // materialized frame have nothing to publish, so the chain stays short by
+    // one and shifts every `_getframe` result up a level.  Closing this needs
+    // the `jit.virtual_ref` emit at the inline push, so decline to legacy
+    // replay until then.
+    if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(cf_addr as i64) {
+        return false;
+    }
+    // `ExecutionContext::enter` parity for the resumed chain:
+    // `frames[0].f_backref = cf_addr`, `frames[i].f_backref = frames[i - 1]`.
+    // The blackhole re-executes each level's residual `sys._getframe` against
+    // `ec.topframeref`/`f_backref`, so the chain must be live before the run;
+    // it also stays live afterwards for a frame the residual captured.  When
+    // `frames[0]` IS the walked frame it was already entered by its own
+    // caller — linking it would overwrite its `f_backref` with itself and
+    // orphan the frame above it.
+    unsafe {
+        for i in 0..per_frame.len() {
+            let callee = per_frame[i].0 as *mut pyre_interpreter::PyFrame;
+            let f_back = if i == 0 { cf_addr as i64 } else { per_frame[i - 1].0 }
+                as *mut pyre_interpreter::PyFrame;
+            if std::ptr::eq(callee, f_back) {
+                continue;
+            }
+            (*callee).f_backref = f_back;
+            // `enter` stores into a frame whose allocation barrier is still in
+            // effect; these frames were built many collections ago, so each
+            // store needs its own remembered-set entry.
+            if pyre_object::gc_hook::try_gc_owns_object(callee as *mut u8) {
+                pyre_object::gc_hook::try_gc_write_barrier(callee as *mut u8);
+            }
+        }
+    }
+    let ec = unsafe {
+        (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
+            as *mut pyre_interpreter::PyExecutionContext
+    };
+    let saved_topframeref = unsafe { (*ec).topframeref };
+    // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
+    let set_topframeref = |frame_ptr: i64| unsafe {
+        (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
+    };
     // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
     // full-coverage dispatch table, not the inline-call-only builder.
     let (mut mf_builder, _unwired) =
         crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
     mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
-    let outcome = majit_metainterp::drive_multi_frame_blackhole(
+    let majit_metainterp::MultiFrameBlackholeResult {
+        outcome,
+        terminal: mut mf_terminal,
+    } = majit_metainterp::drive_multi_frame_blackhole(
         &mut mf_builder,
         &mut latched.framestack,
         majit_metainterp::blackhole::StateFieldLayout::default(),
@@ -1661,8 +1761,13 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
+        Some(per_frame.as_slice()),
+        Some(&set_topframeref as &dyn Fn(i64)),
     );
-
+    // `leave`: restore `ec.topframeref` to the portal after the inline chain.
+    unsafe {
+        (*ec).topframeref = saved_topframeref;
+    }
     let adopted = match outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
@@ -1674,12 +1779,28 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
             if cf_addr == 0 || resume_py_pc == 0 {
                 return false;
             }
-            // Every frame in the chain uses the live portal virtualizable.
-            // Its setfield_vable operations have already committed the outer
-            // frame state; only the interpreter restart coordinate remains.
-            unsafe {
-                (*(cf_addr as *mut pyre_interpreter::PyFrame)).last_instr =
-                    resume_py_pc as isize - 1;
+            // The terminal frame's own `setfield_vable` operations committed
+            // the frame fields they wrote, but the aborted mid-expression
+            // operand stack is still in place, so the resume coordinate needs
+            // the same live-slot materialization the single-frame path
+            // performs.
+            let Some(terminal) = mf_terminal.as_mut() else {
+                return false;
+            };
+            let Ok(terminal_jitcode_index) = i32::try_from(terminal.jitcode_index) else {
+                return false;
+            };
+            if !apply_blackhole_crn(
+                cf_addr,
+                terminal_jitcode_index,
+                terminal.position,
+                terminal.last_opcode_position,
+                &terminal.registers_i,
+                terminal.registers_r.as_mut_slice(),
+                &terminal.registers_f,
+                resume_py_pc,
+            ) {
+                return false;
             }
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
             true

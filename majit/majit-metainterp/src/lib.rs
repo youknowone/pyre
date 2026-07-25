@@ -127,9 +127,9 @@ pub use jitcode::{
     live_slots_for_state_field_jit, set_global_build_descr_pool,
 };
 pub use jitdriver::{
-    DeclarativeJitDriver, JitDriver, JitDriverStaticData, SingleFrameBlackholeResult,
-    TraceContinuationSuspendGuard, drive_multi_frame_blackhole, drive_single_frame_blackhole,
-    trace_continuation_suspended,
+    DeclarativeJitDriver, JitDriver, JitDriverStaticData, MultiFrameBlackholeResult,
+    SingleFrameBlackholeResult, TraceContinuationSuspendGuard, drive_multi_frame_blackhole,
+    drive_single_frame_blackhole, trace_continuation_suspended,
 };
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};

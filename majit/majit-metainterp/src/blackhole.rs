@@ -2251,6 +2251,37 @@ fn handle_jitexception_in_portal(
     }
 }
 
+/// Register-bank image of the blackhole frame whose `JitException` propagated
+/// out of `_run_forever`.
+///
+/// `_run_forever` releases that frame back to the pool before the exception
+/// leaves, so a `ContinueRunningNormally` handoff that has to materialize the
+/// resumed frame's live operand-stack slots cannot read the banks afterwards.
+/// The three banks are moved out (not copied) before the release, matching
+/// [`crate::jitdriver::SingleFrameBlackholeResult`], which keeps the terminal
+/// interpreter of the single-frame path logically alive the same way.
+pub struct BlackholeTerminalImage {
+    pub jitcode_index: usize,
+    pub registers_i: Vec<i64>,
+    pub registers_r: Vec<i64>,
+    pub registers_f: Vec<i64>,
+    pub position: usize,
+    pub last_opcode_position: usize,
+}
+
+impl BlackholeTerminalImage {
+    fn take_from(bh: &mut BlackholeInterpreter) -> Self {
+        Self {
+            jitcode_index: bh.jitcode.index(),
+            registers_i: std::mem::take(&mut bh.registers_i),
+            registers_r: std::mem::take(&mut bh.registers_r),
+            registers_f: std::mem::take(&mut bh.registers_f),
+            position: bh.position,
+            last_opcode_position: bh.last_opcode_position,
+        }
+    }
+}
+
 /// blackhole.py:1762 _handle_jitexception
 ///
 /// Route a JitException through the blackhole frame chain.
@@ -2262,6 +2293,7 @@ fn handle_jitexception(
     mut bh: BlackholeInterpreter,
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+    terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
@@ -2276,6 +2308,9 @@ fn handle_jitexception(
     // blackhole.py:1767-1769
     if bh.nextblackholeinterp.is_none() {
         // Bottommost entry: exception goes through
+        if let Some(terminal_out) = terminal_out {
+            *terminal_out = Some(BlackholeTerminalImage::take_from(&mut bh));
+        }
         builder.release_interp(bh);
         return Err(exc);
     }
@@ -2312,7 +2347,7 @@ pub fn run_forever(
     bh: BlackholeInterpreter,
     current_exc: i64,
 ) -> JitException {
-    run_forever_with_portal(builder, bh, current_exc, None)
+    run_forever_with_portal(builder, bh, current_exc, None, None, None)
 }
 
 /// blackhole.py:1752 _run_forever with optional portal runner callback.
@@ -2321,13 +2356,26 @@ pub fn run_forever(
 /// when ContinueRunningNormally is raised at a recursive portal level,
 /// this callback re-enters the portal function with the exception's
 /// green/red args and returns the result.
+///
+/// `terminal_out` receives the [`BlackholeTerminalImage`] of the bottommost
+/// frame when its exception propagates out, so the caller can read the banks
+/// the release would otherwise recycle.
 pub fn run_forever_with_portal(
     builder: &mut BlackholeInterpBuilder,
     mut bh: BlackholeInterpreter,
     mut current_exc: i64,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+    on_enter_level: Option<&dyn Fn(i64)>,
+    mut terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     loop {
+        // executioncontext.py enter: publish this level's frame as
+        // `ec.topframeref` before its residuals run (pyjitpl multi-frame
+        // resume only; None on the guard-failure path where the chain is
+        // already correct via the compiled trace's real stores).
+        if let Some(on_enter_level) = on_enter_level {
+            on_enter_level(bh.virtualizable_ptr);
+        }
         // blackhole.py:1754-1755
         match bh.resume_mainloop(current_exc) {
             Ok(exc) => {
@@ -2335,7 +2383,13 @@ pub fn run_forever_with_portal(
             }
             Err(jit_exc) => {
                 // blackhole.py:1756-1758
-                match handle_jitexception(builder, bh, jit_exc, portal_runner) {
+                match handle_jitexception(
+                    builder,
+                    bh,
+                    jit_exc,
+                    portal_runner,
+                    terminal_out.as_deref_mut(),
+                ) {
                     Ok((new_bh, exc)) => {
                         // Handled at recursive portal level — continue
                         bh = new_bh;
@@ -2373,6 +2427,16 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     pub virtualizable_ptr: i64,
     pub virtualizable_stack_base: usize,
     pub jitdrivers_sd: &'a [BhJitDriverSd],
+    /// Per-frame concrete frame ptr + its own stack_base, aligned to
+    /// `framestack.frames` (outermost-first).  When present, each blackhole
+    /// level uses ITS OWN frame as the virtualizable instead of sharing the
+    /// portal's, and `on_enter_level` publishes it as `ec.topframeref`.
+    pub per_frame: Option<&'a [(i64, usize)]>,
+    /// `executioncontext.py enter`: publish `ec.topframeref = <this level's
+    /// frame>` before each frame runs so a re-executed `sys._getframe` observes
+    /// the resumed frame chain.  Threaded from the interpreter side because
+    /// majit-metainterp cannot reference `ExecutionContext`.
+    pub on_enter_level: Option<&'a dyn Fn(i64)>,
 }
 
 pub fn convert_and_run_from_pyjitpl(
@@ -2381,12 +2445,14 @@ pub fn convert_and_run_from_pyjitpl(
     last_exc_value: i64,
     raising_exception: bool,
     config: Option<PyjitplBlackholeFrameConfig<'_>>,
+    terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     // blackhole.py:1803-1810
     let mut next_bh: Option<Box<BlackholeInterpreter>> = None;
     let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    let on_enter_level = config.as_ref().and_then(|config| config.on_enter_level);
 
-    for frame in &framestack.frames {
+    for (frame_index, frame) in framestack.frames.iter().enumerate() {
         let mut cur_bh = builder.acquire_interp();
         cur_bh.copy_data_from_miframe(frame);
         if let Some(config) = config.as_ref() {
@@ -2394,6 +2460,11 @@ pub fn convert_and_run_from_pyjitpl(
             cur_bh.virtualizable_info = config.virtualizable_info;
             cur_bh.virtualizable_ptr = config.virtualizable_ptr;
             cur_bh.virtualizable_stack_base = config.virtualizable_stack_base;
+            if let Some(per_frame) = config.per_frame {
+                let (frame_ptr, frame_stack_base) = per_frame[frame_index];
+                cur_bh.virtualizable_ptr = frame_ptr;
+                cur_bh.virtualizable_stack_base = frame_stack_base;
+            }
             cur_bh.jitdrivers_sd = config.jitdrivers_sd.to_vec();
         }
         // Keep every completed interpreter bank rooted while later frames are
@@ -2421,7 +2492,14 @@ pub fn convert_and_run_from_pyjitpl(
         0
     };
 
-    let outcome = run_forever(builder, first_bh, current_exc);
+    let outcome = run_forever_with_portal(
+        builder,
+        first_bh,
+        current_exc,
+        None,
+        on_enter_level,
+        terminal_out,
+    );
     majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
     outcome
 }
