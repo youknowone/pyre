@@ -2070,6 +2070,32 @@ impl PyFrame {
         PY_NULL
     }
 
+    /// pyframe.py:213-218 — bind the locals namespace of code that is not
+    /// `OPTIMIZED`.  A class body gets a fresh namespace mapping; anything
+    /// else (module-level code, and the same code reached through
+    /// `FunctionType(co, globals)`) aliases its globals, so `STORE_NAME` /
+    /// `LOAD_NAME` / `DELETE_NAME` and `locals()` land there.  Optimized code
+    /// keeps its fast-locals array and binds nothing.
+    ///
+    /// The binding is the canonical `W_DictObject`, not the raw `DictStorage`
+    /// proxy, so those opcodes route through the object.
+    fn bind_unoptimized_locals_scope(&mut self) {
+        let flags = unsafe { (*pyframe_get_pycode(self)).flags };
+        if flags.contains(CodeFlags::OPTIMIZED) {
+            return;
+        }
+        if flags.contains(CodeFlags::NEWLOCALS) {
+            // `build_class` replaces this with the `__prepare__` namespace via
+            // `setdictscope`; an orphan NEWLOCALS frame still has a usable
+            // mapping.
+            let w_locals = unsafe { pyre_object::w_dict_new() };
+            self.getorcreate_debug_data(-1).w_locals = w_locals;
+        } else {
+            let w_globals = self.get_w_globals();
+            self.getorcreate_debug_data(-1).w_locals = w_globals;
+        }
+    }
+
     /// pyframe.py:223-261 initialize_frame_scopes.
     ///
     /// Errors mirror pyframe.py:242-246 (TypeError "directly executed code
@@ -2083,27 +2109,9 @@ impl PyFrame {
         outer_func: PyObjectRef,
         _code: *const (),
     ) -> Result<(), crate::PyError> {
-        let code = unsafe { &*pyframe_get_pycode(self) };
-        let flags = code.flags;
-        if !flags.contains(CodeFlags::OPTIMIZED) {
-            if flags.contains(CodeFlags::NEWLOCALS) {
-                // pyframe.py:213 — class body binds a fresh locals namespace
-                // dict object (`space.newdict(module=True)`).  `build_class`
-                // replaces it with the `__prepare__` namespace via
-                // `setdictscope`; an orphan NEWLOCALS frame still has a
-                // usable mapping.
-                let w_locals = unsafe { pyre_object::w_dict_new() };
-                self.getorcreate_debug_data(-1).w_locals = w_locals;
-            } else {
-                // pyframe.py:216-218 — module scope binds `w_locals = w_globals`.
-                // Bind the canonical W_DictObject so STORE_NAME / LOAD_NAME /
-                // DELETE_NAME and `locals()` route through the object instead of
-                // the raw DictStorage proxy.
-                let w_globals = self.get_w_globals();
-                self.getorcreate_debug_data(-1).w_locals = w_globals;
-            }
-        }
+        self.bind_unoptimized_locals_scope();
 
+        let code = unsafe { &*pyframe_get_pycode(self) };
         let npure = npure_cellvars(code);
         let nfreevars = code.freevars.len();
         if npure == 0 && nfreevars == 0 {
@@ -3795,6 +3803,11 @@ impl PyFrame {
             w_builtin: pyre_object::gc_roots::shadow_stack_get(root_base + 3),
             w_globals: pyre_object::gc_roots::shadow_stack_get(root_base + 1),
         };
+        // This constructor bypasses `initialize_frame_scopes`, so apply the
+        // scope binding it would have done.  `FunctionType(co, globals)` over
+        // a module-level code object arrives here, and without the binding its
+        // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
+        frame.bind_unoptimized_locals_scope();
         frame.init_cells();
         frame
     }
