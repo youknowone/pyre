@@ -972,6 +972,61 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Code keys of the callees a FOR_ITER body admitted under
+    /// [`CalleeReplaySafety::DeferredCall`], outermost first.  Non-empty for
+    /// the lifetime of such a sub-walk ([`ForiterDeferredInlineGuard`]), which
+    /// is what arms the deferred-call arm of
+    /// [`fbw_abort_nested_unjournaled_residual`].
+    static FBW_FORITER_DEFERRED_INLINE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Callee code keys whose deferred body reached a CALL residual the lever
+    /// could not inline.  The gate declines them up front from then on, so the
+    /// backstop abort costs one attempt per callee instead of storming.
+    static FBW_FORITER_DEFERRED_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Marks the sub-walk of a callee admitted into a FOR_ITER body under
+/// [`CalleeReplaySafety::DeferredCall`] for its whole lifetime, so a nested
+/// residual the lever could not inline can recognise the admission it breaks
+/// (and the callee to deny) rather than executing.
+pub(crate) struct ForiterDeferredInlineGuard(bool);
+
+impl ForiterDeferredInlineGuard {
+    pub(crate) fn enter(callee_code_key: usize, deferred: bool) -> Self {
+        if deferred {
+            FBW_FORITER_DEFERRED_INLINE.with(|c| c.borrow_mut().push(callee_code_key));
+        }
+        ForiterDeferredInlineGuard(deferred)
+    }
+}
+
+impl Drop for ForiterDeferredInlineGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            FBW_FORITER_DEFERRED_INLINE.with(|c| {
+                c.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// The outermost callee the active sub-walk was admitted for under
+/// [`CalleeReplaySafety::DeferredCall`], or `None` outside such a sub-walk.
+/// Declining that callee suppresses the whole nest: a body that calls another
+/// is itself `DeferredCall`, so no admitted caller sits above it.
+fn fbw_foriter_deferred_inline_outermost() -> Option<usize> {
+    FBW_FORITER_DEFERRED_INLINE.with(|c| c.borrow().first().copied())
+}
+
+pub(crate) fn fbw_foriter_deferred_call_denied(callee_code_key: usize) -> bool {
+    FBW_FORITER_DEFERRED_DENY.with(|c| c.borrow().contains(&callee_code_key))
+}
+
+fn fbw_foriter_deny_deferred_call(callee_code_key: usize) {
+    FBW_FORITER_DEFERRED_DENY.with(|c| {
+        c.borrow_mut().insert(callee_code_key);
+    });
 }
 
 /// Whether the active inline sub-walk is one of the hazard classes the blanket
@@ -1032,6 +1087,15 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
     let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
     let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
+    // A FOR_ITER-body inline admitted under `CalleeReplaySafety::DeferredCall`
+    // stands on the promise that the sub-walk commits nothing: the static scan
+    // cleared every direct heap write, leaving only Python-level CALL residuals
+    // whose callee the lever resolves here.  One that did not inline breaks the
+    // promise, so abort BEFORE it executes — every op the sub-walk has run so
+    // far is write-free, so the resume re-runs the body benignly.  Denying the
+    // admitted callee makes the next attempt decline it statically, so this
+    // costs one abort per callee rather than an abort per trace attempt.
+    let foriter_deferred_inline = fbw_foriter_deferred_inline_outermost();
     // Narrowed decline: the general depth-≥2 nested
     // residual inline is sound now that the portal-runner ABI is correct — a
     // straight-line mutating callee inlines bit-exact.  Only two callee shapes
@@ -1048,8 +1112,11 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     if !in_selfrec_fold
         && !in_exception_string_inline
         && !ctx.session.borrow().framestack.is_empty()
-        && fbw_inline_callee_hazardous(ctx)
+        && (foriter_deferred_inline.is_some() || fbw_inline_callee_hazardous(ctx))
     {
+        if let Some(callee_code_key) = foriter_deferred_inline {
+            fbw_foriter_deny_deferred_call(callee_code_key);
+        }
         let (outer_resume, stack_overrides) = {
             let session = ctx.session.borrow();
             match session.framestack.first().and_then(|f| f.parent.as_ref()) {
@@ -1276,11 +1343,31 @@ pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
     Some(python_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc) as usize)
 }
 
+/// Replay safety of one inline candidate's body inside a FOR_ITER body, as
+/// judged by [`fbw_callee_body_replay_safety`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CalleeReplaySafety {
+    /// No op in the body can commit a live-heap effect.
+    Clean,
+    /// Clean apart from Python-level CALL residuals, whose callee is resolved
+    /// only at walk time.
+    DeferredCall,
+    /// Carries a live-heap effect a replay would double.
+    Dirty,
+}
+
 /// Whether an inline callee can be replayed from its caller's CALL boundary
 /// without duplicating a live-heap effect.  The inline sub-walk's deopt
 /// snapshot does not yet carry its own callee frame, so this is deliberately
-/// stricter than ordinary inlining: unknown calls and every live-heap write
-/// decline up front.
+/// stricter than ordinary inlining: every live-heap write declines up front.
+///
+/// A Python-level CALL residual is the one shape this static scan cannot
+/// settle: its callee is a runtime value, so whether the sub-walk inlines it
+/// (leaving nothing to replay) or executes it (which may write) is known only
+/// at the call.  Those bodies report [`CalleeReplaySafety::DeferredCall`] and
+/// the lever decides at the call — see
+/// [`fbw_abort_nested_unjournaled_residual`], which aborts before executing a
+/// residual that did not inline.  Every other unproven residual is `Dirty`.
 ///
 /// A `new_with_vtable/d>r` result is fresh within this body.  Its
 /// initialization write is benign only when the target field is immutable;
@@ -1288,29 +1375,30 @@ pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
 /// pass through `ref_copy`, but every other Ref-producing instruction clears
 /// it, so a later `setfield_gc` cannot accidentally be classified as an
 /// initialization of an earlier allocation.
-pub(crate) fn fbw_callee_body_side_effect_free(
+pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
     args_all_numeric: bool,
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
-) -> bool {
+) -> CalleeReplaySafety {
     let mut fresh_ref_regs = [false; u8::MAX as usize + 1];
+    let mut deferred_call = false;
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
+            return CalleeReplaySafety::Dirty;
         };
 
         if d.opname.starts_with("residual_call") {
             let Some(descr_index) = residual_call_descr_index_in_body(body_code, &d) else {
-                return false;
+                return CalleeReplaySafety::Dirty;
             };
             let Some(call_descr) = callee_descr_refs
                 .get(descr_index)
                 .and_then(|descr| descr.as_call_descr())
             else {
-                return false;
+                return CalleeReplaySafety::Dirty;
             };
             let ei = call_descr.get_extra_info();
             // `ForIterNext` is deliberately not accepted here: it advances the
@@ -1319,8 +1407,19 @@ pub(crate) fn fbw_callee_body_side_effect_free(
             // double-consume.  A FOR_ITER-bearing body is declined anyway — its
             // mandatory `GET_ITER` (`MayForce`) predecessor fails this scan
             // first — so this only removes a latent landmine, not live inlines.
-            let provably_side_effect_free =
-                ei.check_is_elidable() || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
+            // `load_const` / `load_global` / `box_int` are tagged `CanRaise`
+            // only to keep the `_OS_CANRAISE` invariant (effectinfo.rs); each
+            // is a read or a fresh allocation, so re-running one commits
+            // nothing to the live heap.
+            let replay_safe_read = matches!(
+                ei.pyre_helper,
+                majit_ir::PyreHelperKind::LoadConst
+                    | majit_ir::PyreHelperKind::LoadGlobal
+                    | majit_ir::PyreHelperKind::BoxInt
+            );
+            let provably_side_effect_free = replay_safe_read
+                || ei.check_is_elidable()
+                || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
             if !provably_side_effect_free
                 && !residual_call_is_specialized_plain_int_add(
                     body_code,
@@ -1331,13 +1430,26 @@ pub(crate) fn fbw_callee_body_side_effect_free(
                     callee_descr_refs,
                 )
             {
-                return false;
+                // A Python-level CALL is the one shape this scan cannot
+                // settle: the inline lever binds its callee only at the call,
+                // so whether it leaves a residual behind — and what that
+                // residual writes — is not a property of this body.  Defer it;
+                // the backstop aborts before executing one that did not
+                // inline.
+                if matches!(
+                    ei.pyre_helper,
+                    majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
+                ) {
+                    deferred_call = true;
+                } else {
+                    return CalleeReplaySafety::Dirty;
+                }
             }
         } else if d.opname.starts_with("setfield_gc") {
             // Canonical setfield shapes are `r<value>d`: the target ref is
             // operand 0 and the field descr is operand 2.
             let Some(&target_reg) = body_code.get(d.pc + 1) else {
-                return false;
+                return CalleeReplaySafety::Dirty;
             };
             let descr_index = decode_descr_index(body_code, &d, 2);
             let immutable_field = callee_descr_refs
@@ -1345,7 +1457,7 @@ pub(crate) fn fbw_callee_body_side_effect_free(
                 .and_then(|descr| descr.as_field_descr())
                 .is_some_and(|field| field.is_immutable());
             if !fresh_ref_regs[target_reg as usize] || !immutable_field {
-                return false;
+                return CalleeReplaySafety::Dirty;
             }
         } else if d.opname.starts_with("setarrayitem_gc")
             || d.opname.starts_with("setinteriorfield_gc")
@@ -1356,13 +1468,13 @@ pub(crate) fn fbw_callee_body_side_effect_free(
         {
             // Array/interior/raw stores and non-residual call forms cannot be
             // proven replay-safe from this single callee body.
-            return false;
+            return CalleeReplaySafety::Dirty;
         }
 
         // The result byte is always the final operand for `>r` forms.
         if d.argcodes.ends_with(">r") {
             let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1)) else {
-                return false;
+                return CalleeReplaySafety::Dirty;
             };
             fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
                 || (d.key == "ref_copy/r>r"
@@ -1372,7 +1484,11 @@ pub(crate) fn fbw_callee_body_side_effect_free(
         }
         pc = d.next_pc;
     }
-    true
+    if deferred_call {
+        CalleeReplaySafety::DeferredCall
+    } else {
+        CalleeReplaySafety::Clean
+    }
 }
 
 pub(crate) fn fbw_callee_body_has_binary_op_residual(

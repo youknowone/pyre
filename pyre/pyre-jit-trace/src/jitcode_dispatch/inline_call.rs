@@ -1594,18 +1594,35 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
     // a live-heap mutation would double it; the nested-residual decline catches
-    // that only after an abort storm.  A side-effect-free callee replays
-    // benignly, so admit it.
-    if fbw_foriter_inflight_active()
-        && !fbw_callee_body_side_effect_free(
+    // that only after an abort storm.  A callee whose body commits nothing
+    // replays benignly, so admit it.
+    //
+    // A body whose only unproven ops are Python-level CALL residuals is
+    // admitted too: this same gate re-runs for each callee the lever resolves
+    // below it, and one it cannot inline aborts before executing
+    // (`fbw_abort_nested_unjournaled_residual`) and denies this callee, so a
+    // deferred body commits nothing either.  Without that the whole nest
+    // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
+    // per iteration, though each body on its own is pure arithmetic.
+    let mut foriter_deferred_admit = false;
+    if fbw_foriter_inflight_active() {
+        let admit = match fbw_callee_body_replay_safety(
             body.code,
             args_all_numeric,
             body.num_regs_i,
             body.constants_i,
             callee_descr_refs,
-        )
-    {
-        return Ok(None);
+        ) {
+            CalleeReplaySafety::Clean => true,
+            CalleeReplaySafety::DeferredCall => {
+                foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
+                foriter_deferred_admit
+            }
+            CalleeReplaySafety::Dirty => false,
+        };
+        if !admit {
+            return Ok(None);
+        }
     }
     if method_form
         && !allow_method_load_attr
@@ -2346,6 +2363,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
+        let _foriter_deferred =
+            ForiterDeferredInlineGuard::enter(callee_code_key, foriter_deferred_admit);
         if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
             if frame.body_matches(&body) {
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
