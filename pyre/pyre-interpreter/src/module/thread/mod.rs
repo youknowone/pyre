@@ -980,6 +980,10 @@ mod local_class {
         initkwargs: PyObjectRef,
         last_dict: PyObjectRef,
         last_ident: i64,
+        /// Guards `dicts` and the `last_dict`/`last_ident` pair.  Upstream
+        /// keeps both unsynchronized — `os_local.py:36` "cache the last seen
+        /// dict, works because we are protected by the GIL" — which
+        /// free-threaded pyre cannot rely on.
         state_lock: Mutex<()>,
     }
 
