@@ -109,7 +109,8 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Some(a) => {
             let callable = unsafe { crate::function::is_function(a) }
                 || crate::typedef::r#type(a).is_some_and(|ty| {
-                    unsafe { crate::baseobjspace::lookup_in_type(ty, "__call__") }.is_some()
+                    unsafe { crate::baseobjspace::lookup_in_type(ty.as_ptr(), "__call__") }
+                        .is_some()
                 });
             if !callable {
                 return Err(crate::PyError::type_error(

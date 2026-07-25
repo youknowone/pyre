@@ -1281,7 +1281,7 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
     let Some(w_exc_class) = crate::typedef::r#type(exc_value) else {
         return false;
     };
-    crate::baseobjspace::exception_match(w_exc_class, exc_type)
+    crate::baseobjspace::exception_match(w_exc_class.as_ptr(), exc_type)
 }
 
 /// Try to dispatch an exception using the exception table or block stack.
@@ -2446,7 +2446,7 @@ impl IterOpcodeHandler for PyFrame {
             // this only sees non-iterator containers.
             if pyre_object::is_instance(iter)
                 || crate::typedef::r#type(iter).is_some_and(|t| {
-                    crate::baseobjspace::lookup_in_type_where(t, "__iter__").is_some()
+                    crate::baseobjspace::lookup_in_type_where(t.as_ptr(), "__iter__").is_some()
                 })
             {
                 let result = crate::baseobjspace::iter(iter)?;
@@ -2792,7 +2792,7 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
                     // metaclass MRO; bind the type for a method-descriptor
                     // function getattr surfaced unchanged.
                     match crate::typedef::r#type(obj)
-                        .and_then(|meta| crate::baseobjspace::lookup_in_type(meta, name))
+                        .and_then(|meta| crate::baseobjspace::lookup_in_type(meta.as_ptr(), name))
                     {
                         Some(d) => method_descriptor_bound(d, attr, obj),
                         None => PY_NULL,
@@ -2808,9 +2808,9 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // FunctionWithFixedCode (interp2app) attrs that getattr
             // returns unchanged, while staticmethods (str.maketrans) and
             // classmethods (dict.fromkeys) were already unwrapped.
-            match crate::baseobjspace::lookup_in_type(w_type, name) {
+            match crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
-                Some(d) if pyre_object::is_classmethod(d) => w_type,
+                Some(d) if pyre_object::is_classmethod(d) => w_type.as_ptr(),
                 Some(d) => method_descriptor_bound(d, attr, obj),
                 None => PY_NULL,
             }
@@ -2879,7 +2879,7 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.locals_w()[depth - 1];
         let exit_self = self.locals_w()[depth - 4];
         let exit_func = self.locals_w()[depth - 5];
-        let exc_type = crate::typedef::r#type(val).unwrap_or(pyre_object::w_none());
+        let exc_type = crate::typedef::r#type(val).map_or(pyre_object::w_none(), |p| p.as_ptr());
         let exc_tb =
             crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
         let res = if exit_self.is_null() {
@@ -3600,7 +3600,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn match_mapping(&mut self) -> Result<(), PyError> {
         let subject = PyFrame::peek_at(self, 0);
         let is_mapping = unsafe {
-            let ty = crate::typedef::r#type(subject).unwrap_or(std::ptr::null_mut());
+            let ty = crate::typedef::r#type(subject).map_or(std::ptr::null_mut(), |p| p.as_ptr());
             pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'M'
         };
         self.push(pyre_object::boolobject::w_bool_from(is_mapping));
@@ -3610,7 +3610,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn match_sequence(&mut self) -> Result<(), PyError> {
         let subject = PyFrame::peek_at(self, 0);
         let is_sequence = unsafe {
-            let ty = crate::typedef::r#type(subject).unwrap_or(std::ptr::null_mut());
+            let ty = crate::typedef::r#type(subject).map_or(std::ptr::null_mut(), |p| p.as_ptr());
             pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'S'
         };
         self.push(pyre_object::boolobject::w_bool_from(is_sequence));
@@ -3701,7 +3701,8 @@ impl OpcodeStepExecutor for PyFrame {
                 if unsafe { !pyre_object::is_tuple(match_args) } {
                     let got = unsafe {
                         pyre_object::w_type_get_name(
-                            crate::typedef::r#type(match_args).unwrap_or(std::ptr::null_mut()),
+                            crate::typedef::r#type(match_args)
+                                .map_or(std::ptr::null_mut(), |p| p.as_ptr()),
                         )
                     };
                     return Err(crate::PyError::type_error(format!(
@@ -3723,7 +3724,7 @@ impl OpcodeStepExecutor for PyFrame {
                             let got = unsafe {
                                 pyre_object::w_type_get_name(
                                     crate::typedef::r#type(attr_obj)
-                                        .unwrap_or(std::ptr::null_mut()),
+                                        .map_or(std::ptr::null_mut(), |p| p.as_ptr()),
                                 )
                             };
                             return Err(crate::PyError::type_error(format!(

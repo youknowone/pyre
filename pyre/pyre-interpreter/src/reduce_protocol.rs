@@ -92,7 +92,7 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// `%T`-style class name of `w_obj` for error messages.
 fn typename(w_obj: PyObjectRef) -> String {
     match crate::typedef::r#type(w_obj) {
-        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
         None => "object".to_string(),
     }
 }
@@ -226,7 +226,7 @@ pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
 
     let w_type = crate::typedef::r#type(w_obj)
         .ok_or_else(|| PyError::type_error("cannot determine type for __reduce__"))?;
-    pyre_object::gc_roots::pin_root(w_type);
+    pyre_object::gc_roots::pin_root(w_type.as_ptr());
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     // PySequence_List(self): no GC between reading the items and `w_list_new`
@@ -277,7 +277,7 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
     if let Some(w_reduce) = w_reduce {
         let w_type = crate::typedef::r#type(w_obj)
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
-        let w_cls_reduce = crate::baseobjspace::getattr_str(w_type, "__reduce__")?;
+        let w_cls_reduce = crate::baseobjspace::getattr_str(w_type.as_ptr(), "__reduce__")?;
         let w_obj_reduce =
             crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
         let mut override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);

@@ -40,7 +40,7 @@ pub(crate) unsafe fn try_call_dunder_obj(
         }
         // A raising `__repr__`/`__str__` propagates; a non-string return is a
         // TypeError (`object.c slot_tp_repr` / `slot_tp_str`).
-        let w_type = crate::typedef::r#type(obj).unwrap_or(pyre_object::PY_NULL);
+        let w_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
         let result = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
         if pyre_object::is_str(result) {
             return Ok(Some(result));
@@ -60,13 +60,14 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         let Some(w_type) = crate::typedef::r#type(obj) else {
             return Ok(None);
         };
-        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_type, name) else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_type.as_ptr(), name)
+        else {
             return Ok(None);
         };
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
             return Ok(None);
         }
-        let result = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
+        let result = crate::baseobjspace::get_and_call_function(method, obj, w_type.as_ptr(), &[])?;
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }
@@ -91,7 +92,7 @@ unsafe fn try_call_dunder_wtf8(
 /// override returned a non-`str` (`descroperation.py:918-920`).
 unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::PyError {
     let type_name = match unsafe { crate::typedef::r#type(result) } {
-        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
         None => "object".to_string(),
     };
     crate::PyError::type_error(format!("{name} returned non-string (type '{type_name}')"))
@@ -391,10 +392,11 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         let Some(metaclass) = crate::typedef::r#type(obj) else {
             return Ok(None);
         };
-        if !pyre_object::is_type(metaclass) {
+        if !pyre_object::is_type(metaclass.as_ptr()) {
             return Ok(None);
         }
-        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(metaclass, name) else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(metaclass.as_ptr(), name)
+        else {
             return Ok(None);
         };
         if std::ptr::eq(src, crate::typedef::w_type())
@@ -671,7 +673,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let is_frozen = pyre_object::is_frozenset(obj);
             let is_exact_set = pyre_object::is_exact_type(obj, &pyre_object::setobject::SET_TYPE);
             let class_name = crate::typedef::r#type(obj)
-                .map(|w_type| pyre_object::w_type_get_name(w_type))
+                .map(|w_type| pyre_object::w_type_get_name(w_type.as_ptr()))
                 .unwrap_or(if is_frozen { "frozenset" } else { "set" });
             let Some(_guard) = ReprGuard::enter(obj) else {
                 return Ok(format!("{class_name}(...)"));
@@ -742,7 +744,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // produced outside the constructor path (`gateway.rs` raise
             // sites that bypass `exc_constructor!`).
             let class_name = if let Some(cls) = crate::typedef::r#type(obj) {
-                pyre_object::w_type_get_name(cls).to_string()
+                pyre_object::w_type_get_name(cls.as_ptr()).to_string()
             } else {
                 pyre_object::interp_exceptions::exc_kind_name(pyre_object::w_exception_get_kind(
                     obj,

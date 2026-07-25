@@ -1138,7 +1138,7 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__reduce_ex__")?;
     let obj = args[0];
     let protocol = crate::baseobjspace::int_w(args[1])?;
-    let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+    let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
     let typecode = unsafe { arr::w_array_typecode(obj) };
     let tc = typecode as char;
     let w_typecode = pyre_object::w_str_new(&tc.to_string());

@@ -906,7 +906,7 @@ fn parse_split_sep(value: PyObjectRef) -> Result<Option<Wtf8Buf>, crate::PyError
     }
     let tp_name = unsafe {
         match crate::typedef::r#type(value) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
             None => "object".to_string(),
         }
     };
@@ -2291,7 +2291,7 @@ pub(crate) fn call_format_dispatch(
     spec_obj: PyObjectRef,
 ) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
-        let w_type = crate::typedef::r#type(val).unwrap_or(pyre_object::PY_NULL);
+        let w_type = crate::typedef::r#type(val).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
         let result = crate::baseobjspace::get_and_call_function(meth, val, w_type, &[spec_obj])?;
         if !pyre_object::is_str(result) {
             return Err(crate::PyError::type_error(format!(
@@ -2343,7 +2343,7 @@ pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
     }
     unsafe {
         match crate::typedef::r#type(obj) {
-            Some(tp) => w_type_get_name(tp).to_string(),
+            Some(tp) => w_type_get_name(tp.as_ptr()).to_string(),
             None => (*(*obj).ob_type).name.to_string(),
         }
     }
@@ -5369,7 +5369,7 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             // Read that reserved layout slot directly: going through
             // `getattr_str` would incorrectly expose internal dict operations
             // to a subclass's Python-level `__getattribute__` hook.
-            let w_type = crate::typedef::r#type(obj).unwrap_or(PY_NULL);
+            let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
             if !w_type.is_null() {
                 let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
                 while !layout.is_null() {
@@ -5892,10 +5892,11 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     }
     // Real `dict` type — no subclass at all, so __iter__ is by
     // definition unshadowed.
-    if std::ptr::eq(other_type as *const _, dict_type as *const _) {
+    if std::ptr::eq(other_type.as_ptr() as *const _, dict_type as *const _) {
         return true;
     }
-    let other_iter = unsafe { crate::baseobjspace::lookup_in_type(other_type, "__iter__") };
+    let other_iter =
+        unsafe { crate::baseobjspace::lookup_in_type(other_type.as_ptr(), "__iter__") };
     let dict_iter = unsafe { crate::baseobjspace::lookup_in_type(dict_type, "__iter__") };
     match (other_iter, dict_iter) {
         (Some(a), Some(b)) => std::ptr::eq(a, b),

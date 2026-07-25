@@ -1113,7 +1113,7 @@ unsafe fn classify_attr(
 /// `w_descr` must be a live object.
 unsafe fn descr_type_is_heaptype(w_descr: PyObjectRef) -> bool {
     match crate::typedef::r#type(w_descr) {
-        Some(t) => unsafe { pyre_object::typeobject::w_type_is_heaptype(t) },
+        Some(t) => unsafe { pyre_object::typeobject::w_type_is_heaptype(t.as_ptr()) },
         None => true,
     }
 }
@@ -2041,7 +2041,7 @@ unsafe fn is_unboxable_int(w_value: PyObjectRef) -> bool {
     let Some(actual) = crate::typedef::r#type(w_value) else {
         return false;
     };
-    std::ptr::eq(actual, exact)
+    std::ptr::eq(actual.as_ptr(), exact)
 }
 
 /// Float half of `_pick_unbox_type`: PyPy uses
@@ -2058,7 +2058,7 @@ unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
     let Some(actual) = crate::typedef::r#type(w_value) else {
         return false;
     };
-    std::ptr::eq(actual, exact)
+    std::ptr::eq(actual.as_ptr(), exact)
 }
 
 /// mapdict.py:586-590 `UnboxedPlainAttribute._convert_to_boxed` — rebuild the

@@ -2789,8 +2789,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
         return Ok(None);
     };
-    if !std::ptr::eq(w_class, w_typ_r)
-        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r, w_class) }
+    if !std::ptr::eq(w_class, w_typ_r.as_ptr())
+        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r.as_ptr(), w_class) }
     {
         return Ok(None);
     }
@@ -2836,7 +2836,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, concrete_rhs, w_typ_r)),
+        Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
         false,
     )?
@@ -2933,8 +2933,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
         return Ok(None);
     };
-    if !std::ptr::eq(w_class, w_typ_r)
-        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r, w_class) }
+    if !std::ptr::eq(w_class, w_typ_r.as_ptr())
+        && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r.as_ptr(), w_class) }
     {
         return Ok(None);
     }
@@ -2980,7 +2980,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         nparams,
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, concrete_rhs, w_typ_r)),
+        Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
         false,
     )?

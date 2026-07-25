@@ -202,7 +202,7 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // carry the generic layout marker in `ob_type` and the real class in
     // `w_class`, so reading `ob_type` directly would resolve to `object`;
     // `r#type` returns the class for both builtin and user instances.
-    let subclass = crate::typedef::r#type(instance).unwrap_or(std::ptr::null_mut());
+    let subclass = crate::typedef::r#type(instance).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if subclass.is_null() {
         return Ok(w_bool_from(false));
     }

@@ -29,7 +29,7 @@ fn type_name_of(w_obj: PyObjectRef) -> String {
     }
     unsafe {
         match crate::typedef::r#type(w_obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
             None => (*(*w_obj).ob_type).name.to_string(),
         }
     }
@@ -465,7 +465,8 @@ pub fn combine_starstarargs_wrapped(
             // Pyre's `findattr` matches the same shape (Option<W>),
             // modulo async-propagation (still a known gap covered by
             // the `findattr` TODO).
-            let w_obj_type = crate::typedef::r#type(w_starstararg).unwrap_or(pyre_object::PY_NULL);
+            let w_obj_type =
+                crate::typedef::r#type(w_starstararg).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
             let lhs = if w_obj_type.is_null() {
                 None
             } else {

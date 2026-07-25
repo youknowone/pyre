@@ -681,10 +681,10 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj = dereference(w_self);
     let type_name = unsafe {
         match crate::typedef::r#type(w_self) {
-            Some(tp) if std::ptr::eq(tp, weakref_type()) => "weakref",
-            Some(tp) if std::ptr::eq(tp, proxy_type()) => "weakproxy",
-            Some(tp) if std::ptr::eq(tp, callable_proxy_type()) => "weakcallableproxy",
-            Some(tp) => pyre_object::w_type_get_name(tp),
+            Some(tp) if std::ptr::eq(tp.as_ptr(), weakref_type()) => "weakref",
+            Some(tp) if std::ptr::eq(tp.as_ptr(), proxy_type()) => "weakproxy",
+            Some(tp) if std::ptr::eq(tp.as_ptr(), callable_proxy_type()) => "weakcallableproxy",
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()),
             None => "weakref",
         }
     };
@@ -693,7 +693,7 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         let objtype_name = unsafe {
             match crate::typedef::r#type(w_obj) {
-                Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                 None => "object".to_string(),
             }
         };
@@ -1217,7 +1217,10 @@ pub fn is_w_abstract_proxy(obj: PyObjectRef) -> bool {
         return false;
     }
     match crate::typedef::r#type(obj) {
-        Some(tp) => std::ptr::eq(tp, proxy_type()) || std::ptr::eq(tp, callable_proxy_type()),
+        Some(tp) => {
+            std::ptr::eq(tp.as_ptr(), proxy_type())
+                || std::ptr::eq(tp.as_ptr(), callable_proxy_type())
+        }
         None => false,
     }
 }
@@ -2262,7 +2265,9 @@ mod tests {
     fn test_isinstance_through_proxy() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
-        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
+        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0))
+            .unwrap()
+            .as_ptr();
         let proxy = W_Proxy_new(int_type, PY_NULL);
         // 7 is an int — through the proxy it must still resolve.
         let yes = crate::baseobjspace::isinstance(pyre_object::w_int_new(7), proxy).unwrap();
@@ -2278,8 +2283,12 @@ mod tests {
     fn test_issubclass_through_proxy() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
-        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
-        let str_type = crate::typedef::r#type(pyre_object::w_str_new("")).unwrap();
+        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0))
+            .unwrap()
+            .as_ptr();
+        let str_type = crate::typedef::r#type(pyre_object::w_str_new(""))
+            .unwrap()
+            .as_ptr();
         let proxy = W_Proxy_new(int_type, PY_NULL);
         let yes = crate::baseobjspace::issubclass(int_type, proxy).unwrap();
         assert!(yes);
@@ -2326,7 +2335,9 @@ mod tests {
             };
         });
         let checker = pyre_object::objectobject::w_instance_new(user_type);
-        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
+        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0))
+            .unwrap()
+            .as_ptr();
         let yes = crate::baseobjspace::issubclass(int_type, checker).unwrap();
         assert!(yes);
     }

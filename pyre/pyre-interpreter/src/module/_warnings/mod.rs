@@ -100,6 +100,7 @@ fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectR
     let warning = warning_class("Warning");
     if crate::baseobjspace::isinstance(message, warning)? {
         return crate::typedef::r#type(message)
+            .map(|p| p.as_ptr())
             .ok_or_else(|| PyError::type_error("warning instance has no type"));
     }
     let category = if category.is_null() || unsafe { is_none(category) } {
@@ -585,6 +586,7 @@ fn do_warn_explicit(
             )])?,
             pyre_object::gc_roots::shadow_stack_get(input_message_slot),
             crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(input_message_slot))
+                .map(|p| p.as_ptr())
                 .unwrap_or(category),
         )
     } else {

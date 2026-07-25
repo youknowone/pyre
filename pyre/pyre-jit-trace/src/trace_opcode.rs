@@ -3518,7 +3518,7 @@ unsafe fn trace_check_exc_match_against(
     let Some(w_exc_class) = pyre_interpreter::typedef::r#type(exc_value) else {
         return false;
     };
-    pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
+    pyre_interpreter::baseobjspace::exception_match(w_exc_class.as_ptr(), exc_type)
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {

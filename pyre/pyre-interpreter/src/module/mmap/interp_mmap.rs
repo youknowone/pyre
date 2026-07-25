@@ -138,7 +138,7 @@ fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), crate::Py
 /// True when `obj` is an `mmap` instance.
 #[cfg(unix)]
 pub(crate) fn is_mmap(obj: pyre_object::PyObjectRef) -> bool {
-    crate::typedef::r#type(obj).is_some_and(|tp| std::ptr::eq(tp, mmap_type()))
+    crate::typedef::r#type(obj).is_some_and(|tp| std::ptr::eq(tp.as_ptr(), mmap_type()))
 }
 
 /// `_exports` — how many buffers are currently exported from the mapping.
@@ -179,7 +179,7 @@ pub(crate) fn mmap_buffer_view(
     obj: pyre_object::PyObjectRef,
 ) -> Option<Result<(usize, usize, bool), crate::PyError>> {
     let w_type = crate::typedef::r#type(obj)?;
-    if !std::ptr::eq(w_type, mmap_type()) {
+    if !std::ptr::eq(w_type.as_ptr(), mmap_type()) {
         return None;
     }
     Some(mmap_ptr(obj).map(|(ptr, len)| {

@@ -1289,8 +1289,8 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
 fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
     match crate::typedef::r#type(w) {
         Some(t) => unsafe {
-            std::ptr::eq(t, pyre_object::get_instantiate(&pyre_object::STR_TYPE))
-                || std::ptr::eq(t, pyre_object::get_instantiate(&pyre_object::BYTES_TYPE))
+            std::ptr::eq(t.as_ptr(), pyre_object::get_instantiate(&pyre_object::STR_TYPE))
+                || std::ptr::eq(t.as_ptr(), pyre_object::get_instantiate(&pyre_object::BYTES_TYPE))
         },
         None => false,
     }

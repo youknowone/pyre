@@ -953,7 +953,7 @@ pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyErro
     // `type(path).__fspath__(path)` — the descriptor read off the type is
     // unbound, so `path` is supplied as the sole argument.
     if let Some(fspath_fn) = crate::typedef::r#type(obj)
-        .and_then(|pt| unsafe { crate::baseobjspace::lookup_in_type(pt, "__fspath__") })
+        .and_then(|pt| unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") })
     {
         let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
         unsafe {

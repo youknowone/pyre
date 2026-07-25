@@ -161,7 +161,7 @@ fn missing_frozen_error(name: &str) -> crate::PyError {
 /// The receiver's type name, for argument-type error messages.
 fn type_name(obj: pyre_object::PyObjectRef) -> String {
     match crate::typedef::r#type(obj) {
-        Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
         None => "object".to_string(),
     }
 }

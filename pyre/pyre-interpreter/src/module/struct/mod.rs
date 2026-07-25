@@ -335,7 +335,7 @@ unsafe fn accept_int(arg: PyObjectRef) -> Result<BigInt, crate::PyError> {
             return Ok(BigInt::from(if w_bool_get_value(arg) { 1 } else { 0 }));
         }
         if let Some(tp) = crate::typedef::r#type(arg) {
-            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp, "__index__") {
+            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__") {
                 let r = crate::call::call_function_impl_result(index_fn, &[arg])?;
                 if is_int(r) || is_long(r) {
                     return Ok(crate::builtins::obj_to_bigint(r));
@@ -373,7 +373,7 @@ unsafe fn accept_float(arg: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(if w_bool_get_value(arg) { 1.0 } else { 0.0 });
         }
         if let Some(tp) = crate::typedef::r#type(arg) {
-            if let Some(float_fn) = crate::baseobjspace::lookup_in_type(tp, "__float__") {
+            if let Some(float_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__") {
                 let r = crate::call::call_function_impl_result(float_fn, &[arg])?;
                 if is_float(r) {
                     return Ok(w_float_get_value(r));

@@ -121,7 +121,7 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
     let Some(w_type) = crate::typedef::r#type(obj) else {
         return;
     };
-    if unsafe { pyre_object::w_type_get_hasuserdel(w_type) } {
+    if unsafe { pyre_object::w_type_get_hasuserdel(w_type.as_ptr()) } {
         pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
     }
 }
@@ -152,7 +152,7 @@ pub fn register_native_buffer_finalizer(obj: PyObjectRef) {
 /// registered twice.
 pub fn register_weakref_finalizer(obj: PyObjectRef) {
     let already_registered = crate::typedef::r#type(obj)
-        .map(|w_type| unsafe { pyre_object::w_type_get_hasuserdel(w_type) })
+        .map(|w_type| unsafe { pyre_object::w_type_get_hasuserdel(w_type.as_ptr()) })
         .unwrap_or(false);
     let native_buffer_finalizer = crate::module::__pypy__::W_PickleBuffer::from_obj(obj).is_some()
         || crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(obj).is_some();
@@ -448,8 +448,8 @@ impl ExecutionContext {
                 if crate::is_function_with_fixed_code(w_func) {
                     if let Some(w_firstarg) = args.firstarg() {
                         if !w_firstarg.is_null() {
-                            let w_type =
-                                crate::typedef::r#type(w_firstarg).unwrap_or(pyre_object::PY_NULL);
+                            let w_type = crate::typedef::r#type(w_firstarg)
+                                .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
                             w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
                         }
                     }
@@ -920,7 +920,7 @@ impl ExecutionContext {
             let w_arg = if let Some(operr) = operr {
                 let w_value = operr.normalize_exception(space)?;
                 let w_type = if operr.w_type.is_null() {
-                    crate::typedef::r#type(w_value).unwrap_or_else(pyre_object::w_none)
+                    crate::typedef::r#type(w_value).map_or_else(pyre_object::w_none, |p| p.as_ptr())
                 } else {
                     operr.w_type
                 };
@@ -2039,7 +2039,8 @@ impl UserDelAction {
         let Some(w_type) = crate::typedef::r#type(w_obj) else {
             return;
         };
-        let Some(w_del) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__del__") })
+        let Some(w_del) =
+            (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__") })
         else {
             return;
         };
@@ -2048,9 +2049,9 @@ impl UserDelAction {
         }
         // pyre's combined helper cannot distinguish get-vs-call errors;
         // report through the call arm (executioncontext.py:680-690).
-        if let Err(error) =
-            unsafe { crate::baseobjspace::get_and_call_function(w_del, w_obj, w_type, &[]) }
-        {
+        if let Err(error) = unsafe {
+            crate::baseobjspace::get_and_call_function(w_del, w_obj, w_type.as_ptr(), &[])
+        } {
             report_error(self.base.space, &error, "", w_del);
         }
     }

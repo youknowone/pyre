@@ -3392,7 +3392,7 @@ pub fn import_from(
 fn type_name_for_err(w_obj: PyObjectRef) -> String {
     unsafe {
         match crate::typedef::r#type(w_obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
             None => (*(*w_obj).ob_type).name.to_string(),
         }
     }

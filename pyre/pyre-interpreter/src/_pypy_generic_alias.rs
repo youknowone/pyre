@@ -328,11 +328,11 @@ fn is_typevartuple(param: PyObjectRef) -> bool {
     let Some(t) = crate::typedef::r#type(param) else {
         return false;
     };
-    if unsafe { pyre_object::w_type_get_name(t) } != "TypeVarTuple" {
+    if unsafe { pyre_object::w_type_get_name(t.as_ptr()) } != "TypeVarTuple" {
         return false;
     }
     matches!(
-        crate::baseobjspace::getattr_str(t, "__module__")
+        crate::baseobjspace::getattr_str(t.as_ptr(), "__module__")
             .ok()
             .and_then(|m| crate::baseobjspace::text_w(m).ok()),
         Some("typing")

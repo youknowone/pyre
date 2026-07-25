@@ -129,7 +129,7 @@ impl W_PickleBuffer {
             let callback_result = if let Some(w_release) =
                 unsafe { crate::baseobjspace::lookup(w_exporter, "__release_buffer__") }
             {
-                let w_type = crate::typedef::r#type(w_exporter).unwrap_or(w_exporter);
+                let w_type = crate::typedef::r#type(w_exporter).map_or(w_exporter, |p| p.as_ptr());
                 unsafe {
                     crate::baseobjspace::get_and_call_function(
                         w_release,
@@ -195,7 +195,7 @@ fn released_error() -> PyError {
 
 fn type_name(obj: PyObjectRef) -> String {
     match crate::typedef::r#type(obj) {
-        Some(t) => unsafe { pyre_object::w_type_get_name(t) }.to_string(),
+        Some(t) => unsafe { pyre_object::w_type_get_name(t.as_ptr()) }.to_string(),
         None => "object".to_string(),
     }
 }
@@ -228,7 +228,7 @@ fn acquire_pickle_buffer(obj: PyObjectRef) -> Result<(PyObjectRef, bool, PyObjec
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         if let Some(w_impl) = crate::baseobjspace::lookup(r_obj, "__buffer__") {
             pyre_object::gc_roots::pin_root(w_impl);
-            let w_type = crate::typedef::r#type(r_obj).unwrap_or(r_obj);
+            let w_type = crate::typedef::r#type(r_obj).map_or(r_obj, |p| p.as_ptr());
             let w_result = crate::baseobjspace::get_and_call_function(
                 pyre_object::gc_roots::shadow_stack_get(sp + 2),
                 r_obj,

@@ -142,7 +142,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     || crate::baseobjspace::lookup(args[0], "__index__").is_some();
                 if !has_int {
                     let name = crate::typedef::r#type(args[0])
-                        .map(|tp| w_type_get_name(tp).to_string())
+                        .map(|tp| w_type_get_name(tp.as_ptr()).to_string())
                         .unwrap_or_else(|| "object".to_string());
                     return Err(crate::PyError::type_error(format!(
                         "'{name}' object cannot be interpreted as an integer"

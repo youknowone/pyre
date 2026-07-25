@@ -988,7 +988,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Some(v) if !unsafe { pyre_object::is_none(v) } => {
                     if !unsafe { pyre_object::is_int(v) } {
                         let type_name = crate::typedef::r#type(v)
-                            .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t) })
+                            .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t.as_ptr()) })
                             .unwrap_or("object");
                         return Err(crate::PyError::type_error(format!(
                             "argument should be integer or None, not {type_name}"
@@ -1211,13 +1211,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let path_type = crate::typedef::r#type(arg);
                 if let Some(pt) = path_type {
                     if let Some(fspath_fn) =
-                        unsafe { crate::baseobjspace::lookup_in_type(pt, "__fspath__") }
+                        unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
                     {
                         return crate::call::call_function_impl_result(fspath_fn, &[arg]);
                     }
                 }
                 let type_name = match path_type {
-                    Some(pt) => unsafe { pyre_object::typeobject::w_type_get_name(pt) },
+                    Some(pt) => unsafe { pyre_object::typeobject::w_type_get_name(pt.as_ptr()) },
                     None => "object",
                 };
                 Err(crate::PyError::type_error(format!(

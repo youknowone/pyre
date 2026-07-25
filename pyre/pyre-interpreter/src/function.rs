@@ -2171,7 +2171,7 @@ pub unsafe fn descr_method__new__(
     if w_instance.is_null() || unsafe { pyre_object::is_none(w_instance) } {
         return Err(crate::PyError::type_error("instance must not be None"));
     }
-    let w_class = crate::typedef::r#type(w_instance).unwrap_or(pyre_object::PY_NULL);
+    let w_class = crate::typedef::r#type(w_instance).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     Ok(pyre_object::w_method_new(w_function, w_instance, w_class))
 }
 
@@ -2182,7 +2182,7 @@ pub unsafe fn descr_method__new__(
 pub fn require_method(method: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     if method.is_null() || !unsafe { pyre_object::function::is_method(method) } {
         let received = crate::typedef::r#type(method)
-            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
             .unwrap_or("object");
         return Err(crate::PyError::type_error(format!(
             "descriptor '{name}' requires a 'method' object but received a '{received}'"

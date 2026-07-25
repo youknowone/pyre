@@ -1430,7 +1430,8 @@ fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return None;
     }
-    crate::typedef::r#type(exc).map(|tp| unsafe { pyre_object::w_type_get_name(tp).to_string() })
+    crate::typedef::r#type(exc)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()).to_string() })
 }
 
 impl std::fmt::Display for PyError {

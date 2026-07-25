@@ -1074,7 +1074,7 @@ pub fn call_kw(
 /// the default class-instantiation path should run.
 fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     let metaclass = crate::typedef::r#type(callable)?;
-    if std::ptr::eq(metaclass, crate::typedef::w_type()) {
+    if std::ptr::eq(metaclass.as_ptr(), crate::typedef::w_type()) {
         return None;
     }
     // Resolve WHERE `__call__` is defined first; the default `type.__call__`
@@ -1082,14 +1082,16 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     // that merely inherits it — e.g. ABCMeta — keeps the fast path.  The
     // defining-class half is the cheap guard, so it runs before the value
     // half's second residual walk (avoided on the common fast path).
-    let where_defined =
-        unsafe { crate::baseobjspace::lookup_where_class_uncached(metaclass, "__call__") }?;
+    let where_defined = unsafe {
+        crate::baseobjspace::lookup_where_class_uncached(metaclass.as_ptr(), "__call__")
+    }?;
     if std::ptr::eq(where_defined, crate::typedef::w_type()) {
         return None;
     }
-    let call_descr =
-        unsafe { crate::baseobjspace::lookup_in_type_where_uncached(metaclass, "__call__") }?;
-    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass) }
+    let call_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where_uncached(metaclass.as_ptr(), "__call__")
+    }?;
+    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr()) }
         .ok()
         .flatten()
         .unwrap_or(call_descr);
@@ -1107,12 +1109,13 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(call_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    let Some(call_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
     else {
         return Ok(None);
     };
-    let bound =
-        unsafe { crate::baseobjspace::get(call_descr, callable, w_type) }?.unwrap_or(call_descr);
+    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, w_type.as_ptr()) }?
+        .unwrap_or(call_descr);
     Ok(Some(bound))
 }
 
@@ -1129,12 +1132,13 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(call_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    let Some(call_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
     else {
         return Ok(None);
     };
-    let bound =
-        unsafe { crate::baseobjspace::get(call_descr, callable, w_type) }?.unwrap_or(call_descr);
+    let bound = unsafe { crate::baseobjspace::get(call_descr, callable, w_type.as_ptr()) }?
+        .unwrap_or(call_descr);
     Ok(Some(bound))
 }
 
@@ -1846,7 +1850,7 @@ pub fn call_with_kwargs(
             return call_with_kwargs(frame, bound, pos_args, kwargs);
         }
         let type_name = crate::typedef::r#type(callable)
-            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
             .unwrap_or("classmethod");
         return Err(PyError::type_error(format!(
             "'{type_name}' object is not callable"
@@ -2548,7 +2552,7 @@ pub fn call_function_impl_result(
         }
     }
     let type_name = crate::typedef::r#type(callable)
-        .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
         .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
     Err(PyError::type_error(format!(
         "'{type_name}' object is not callable"
@@ -2574,11 +2578,13 @@ pub(crate) fn calculate_metaclass(
         let Some(w_base_type) = crate::typedef::r#type(base) else {
             continue;
         };
-        if std::ptr::eq(w_winner, w_base_type) || issubtype_ptr(w_winner, w_base_type) {
+        if std::ptr::eq(w_winner, w_base_type.as_ptr())
+            || issubtype_ptr(w_winner, w_base_type.as_ptr())
+        {
             continue;
         }
-        if issubtype_ptr(w_base_type, w_winner) {
-            w_winner = w_base_type;
+        if issubtype_ptr(w_base_type.as_ptr(), w_winner) {
+            w_winner = w_base_type.as_ptr();
             continue;
         }
         return Err(PyError::type_error(
@@ -2706,7 +2712,7 @@ fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
         return Ok(());
     }
     let tname = crate::typedef::r#type(result)
-        .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+        .map(|t| unsafe { pyre_object::w_type_get_name(t.as_ptr()) })
         .unwrap_or("object");
     Err(PyError::type_error(format!(
         "__init__() should return None, not '{tname}'"
@@ -2715,8 +2721,8 @@ fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
 
 fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
     let w_insttype = crate::typedef::r#type(instance)?;
-    if std::ptr::eq(w_insttype, w_type) || issubtype_ptr(w_insttype, w_type) {
-        Some(w_insttype)
+    if std::ptr::eq(w_insttype.as_ptr(), w_type) || issubtype_ptr(w_insttype.as_ptr(), w_type) {
+        Some(w_insttype.as_ptr())
     } else {
         None
     }
@@ -3288,7 +3294,7 @@ fn build_class_inner(
                     };
                     let result_type = unsafe {
                         match crate::typedef::r#type(ns_obj) {
-                            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                             None => (*(*ns_obj).ob_type).name.to_string(),
                         }
                     };
