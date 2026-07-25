@@ -1464,6 +1464,12 @@ fn body_branch_targets(body_code: &[u8]) -> Option<std::collections::HashSet<usi
     let mut pc = 0usize;
     while pc < body_code.len() {
         let d = crate::jitcode_runtime::decode_op_at(body_code, pc)?;
+        // `switch/id` carries its case targets in the descr, not in an operand,
+        // so this decode cannot name the joins it creates.  Give up on the
+        // whole body rather than return a target set that is missing them.
+        if d.opname.starts_with("switch") {
+            return None;
+        }
         if d.argcodes.contains('L') {
             // Operand widths follow `decode_op_at`; only the fixed-width forms
             // can precede the label, so anything else gives up.
@@ -1733,8 +1739,16 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 }
             }
         } else if d.opname.starts_with("setfield_gc") {
-            // Canonical setfield shapes are `r<value>d`: the target ref is
-            // operand 0 and the field descr is operand 2.
+            // Only the `r<value>d` shapes name their target in a ref register
+            // (operand 0), with the field descr at operand 2.  The `i…` forms
+            // (`setfield_gc_i/iid`, `setfield_gc_r/ird`, `setfield_gc_v/iid`,
+            // `setfield_gc_v/ird`) address the target by raw int instead, so
+            // there is no ref register whose freshness could be proven — and
+            // reading operand 0 as one would index the freshness set with an
+            // int register number.
+            if !d.argcodes.starts_with('r') {
+                return CalleeReplaySafety::Dirty;
+            }
             let Some(&target_reg) = body_code.get(d.pc + 1) else {
                 return CalleeReplaySafety::Dirty;
             };

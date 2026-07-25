@@ -1243,6 +1243,26 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
 ///
 /// # Safety
 /// `w_code` must be the live code object pointer for the resolved callable.
+/// Whether every local of `w_code` that a call must bind lives in
+/// `registers_r[0..co_argcount]`, which is all the inline seeding fills.
+///
+/// `*args` and `**kwargs` own locals the seeding never packs, and a
+/// keyword-only parameter owns one it never reaches — and none of the three is
+/// counted by `co_argcount`, so an arity check alone lets them through.
+fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return false;
+    }
+    let flags = unsafe { (*raw).flags };
+    !flags.contains(pyre_interpreter::CodeFlags::VARARGS)
+        && !flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
+        && unsafe { (*raw).kwonlyarg_count } == 0
+}
+
 unsafe fn fbw_reorder_call_kw_args(
     r_args: &[OpRef],
     arg_concretes: &[ConcreteValue],
@@ -1278,11 +1298,7 @@ unsafe fn fbw_reorder_call_kw_args(
     if raw.is_null() {
         return None;
     }
-    let flags = unsafe { (*raw).flags };
-    if flags.contains(pyre_interpreter::CodeFlags::VARARGS)
-        || flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
-        || unsafe { (*raw).kwonlyarg_count } != 0
-    {
+    if !fbw_callee_scope_is_positional_only(w_code) {
         return None;
     }
     let varnames = unsafe { &(*raw).varnames };
@@ -1309,8 +1325,11 @@ unsafe fn fbw_reorder_call_kw_args(
             .position(|v| v.as_str() == name)?;
         // A keyword may only bind a parameter past the positional fill, and each
         // parameter at most once (else Python raises "multiple values for
-        // argument").
-        if pi < n_pos || slot_args[pi].is_some() {
+        // argument").  A name in the positional-only range is not bindable by
+        // keyword at all — `def f(x, /)` called as `f(x=1)` is a TypeError, so
+        // binding slot 0 here would inline a call the interpreter rejects.
+        if pi < n_pos || pi < unsafe { (*raw).posonlyarg_count } as usize || slot_args[pi].is_some()
+        {
             return None;
         }
         slot_args[pi] = Some(args[n_pos + j]);
@@ -1351,6 +1370,17 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     match arg_concretes[3] {
         ConcreteValue::Null => {}
         ConcreteValue::Ref(kwargs) if kwargs.is_null() || kwargs == pyre_object::PY_NULL => {}
+        _ => return None,
+    }
+    // `wrappeditems` resolves to a structural field index (offset / size /
+    // type), so an object whose slot 0 happens to match — a list's backing
+    // store, say — would hit the same cache entry and be unpacked as if its
+    // slots were tuple element refs.  `f(*some_list)` is ordinary Python, so
+    // pin the concrete to a real tuple the way the `kwnames` path does before
+    // reading the field.
+    match arg_concretes[2] {
+        ConcreteValue::Ref(starargs)
+            if !starargs.is_null() && unsafe { pyre_object::is_tuple(starargs) } => {}
         _ => return None,
     }
     let starargs = r_args[2];
@@ -1489,7 +1519,13 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         // a trace-time reorder whenever the tuple is the one this trace just
         // built: its element boxes are still in the heap cache, so the callee
         // seeds from them and the tuple keeps no consumer.
-        if method_form {
+        //
+        // The seeding fills `registers_r[0..nparams]` and nothing else, so a
+        // callee owning a local the arity check cannot see must stay residual:
+        // `co_argcount` counts neither `*args` nor `**kwargs` nor keyword-only
+        // params, so `def f(a, *, b=5)` accepts a 1-tuple here while `b` is
+        // never bound.  Same decline the keyword fold applies.
+        if method_form || !fbw_callee_scope_is_positional_only(w_code) {
             return Ok(None);
         }
         let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
