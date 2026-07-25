@@ -1146,9 +1146,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let pre_pos = ctx.get_trace_position();
     // `setup_reconstructed_callee_frame` emits the callee frame vable into the
     // trace and returns `argboxes_r` seeding the portal reds + in-flight
-    // operand-stack temps; the `_pending` callee sym/concrete frame is unused on
-    // the sub-walk path (the sub-walk drives the callee body off `argboxes_r` +
-    // the emitted frame vable, not a callee MIFrame).
+    // operand-stack temps; the `_pending` callee sym is unused on the sub-walk
+    // path (the sub-walk drives the callee body off `argboxes_r` + the emitted
+    // frame vable, not a callee MIFrame).
     let Some((_pending, argboxes_r)) =
         crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())
     else {

@@ -11962,7 +11962,6 @@ mod tests {
 /// `MetaInterpFrame`.  No upstream counterpart.
 pub struct PendingInlineFrame {
     pub sym: PyreSym,
-    pub concrete_frame: pyre_interpreter::pyframe::PyFrame,
     pub green_key: u64,
     /// Raw `(code_ptr, target_pc)` greenkey components for element-
     /// wise recursion-depth comparison. `green_key` above is the u64
@@ -12050,8 +12049,6 @@ pub(crate) fn assemble_bridge_inline_pending(
     execution_context: *const pyre_interpreter::PyExecutionContext,
     parent_frames: Vec<ResumeFrameState>,
 ) -> PendingInlineFrame {
-    use pyre_interpreter::pyframe::PyFrame;
-
     let nlocals = recipe.nlocals;
     let valuestackdepth = recipe.valuestackdepth;
 
@@ -12072,35 +12069,12 @@ pub(crate) fn assemble_bridge_inline_pending(
     // object, so this is non-null here.
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
 
-    // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
-    // the callee's own pycode wrapper and seed
-    // `locals_cells_stack_w[0..valuestackdepth]` from the decoded boxes. The
-    // callee has no cells/freevars (gated in `reconstruct_inline_recipe`), so
-    // `closure = PY_NULL` and the array layout is `[locals | stack]` with
-    // `stack_base() == nlocals`.
-    let mut concrete_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
-        w_code,
-        &[],
-        w_globals,
-        execution_context,
-        pyre_object::PY_NULL,
-        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::StdAlloc,
-    );
-    {
-        let arr = concrete_frame.locals_w_mut();
-        for k in 0..nlocals {
-            arr[k] = recipe_slot_to_pyobj(recipe.concrete_r[k]);
-        }
-    }
-    for k in nlocals..valuestackdepth {
-        concrete_frame.push(recipe_slot_to_pyobj(recipe.concrete_r[k]));
-    }
-    // last_instr is one before the recipe's Python pc so next_instr() resumes there.
-    concrete_frame.set_last_instr_from_next_instr(forward_py_pc_or_backxlat(
-        recipe.jitcode_index,
-        recipe.jitcode_pc,
-    ) as usize);
-
+    // resume.py:1042-1057 newframe + reload: the decoded boxes are reloaded
+    // into the symbolic frame below. The callee's concrete state lives in
+    // `sym.concrete_locals` / `sym.concrete_stack` and in the emitted frame
+    // vable that `setup_reconstructed_callee_frame` binds to `sym.frame`;
+    // no separate interpreter-side `PyFrame` is materialized here.
+    //
     // Symbolic side: mirror the FAST branch field-for-field.
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
     sym.nlocals = nlocals;
@@ -12152,7 +12126,6 @@ pub(crate) fn assemble_bridge_inline_pending(
 
     PendingInlineFrame {
         sym,
-        concrete_frame,
         // The reconstructed frame represents the same inlined call the
         // forward trace pushed at function entry; match its (code, 0)
         // greenkey identity for recursion-depth + inline-position tracking.
@@ -12162,9 +12135,8 @@ pub(crate) fn assemble_bridge_inline_pending(
         nargs: recipe.nargs,
         caller_result_stack_idx: None,
         caller_result_type: Some(Type::Ref),
-        // Reconstructed frames carry no CALL-site OpRefs; the inline
-        // back-edge CALL_ASSEMBLER path requires drop_frame_opref and
-        // is gated out for them anyway.
+        // Reconstructed frames carry no CALL-site OpRefs, and the inline
+        // back-edge CALL_ASSEMBLER path is gated out for them anyway.
         replay_callable: OpRef::NONE,
         replay_args: Vec::new(),
     }
