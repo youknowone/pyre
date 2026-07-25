@@ -417,17 +417,36 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
             seed.catch_target
         } else {
-            // `_prepare_exception_resumption` null-exception arm
-            // (pyjitpl.py:3152-3154) + `prepare_resume_from_failure`
-            // (pyjitpl.py:3156-3171): every exception-guard bridge re-checks
-            // its entry flavor.  With no pending exception at walk time,
-            // `clear_exception()` + `handle_possible_exception()` record
-            // GUARD_NO_EXCEPTION at the bridge start, so the OTHER failure
-            // flavor — a pending exception whose class the source guard's
-            // expected class does not match — deopts to the blackhole at
-            // bridge entry instead of running the recorded no-exception
+            // `_prepare_exception_resumption` null-exception arm +
+            // `prepare_resume_from_failure` (pyjitpl.py): every exception-guard
+            // bridge re-checks its entry flavor.  With no pending exception at
+            // walk time, `clear_exception()` + `handle_possible_exception()`
+            // record GUARD_NO_EXCEPTION at the bridge start, so the OTHER
+            // failure flavor — a pending exception whose class the source
+            // guard's expected class does not match — deopts to the blackhole
+            // at bridge entry instead of running the recorded no-exception
             // continuation on a NULL raised-call result.
             if wc.trace_ctx.is_bridge_trace && wc.trace_ctx.bridge_source_is_exception_guard() {
+                // `_prepare_exception_resumption` records SAVE_EXC_CLASS +
+                // SAVE_EXCEPTION for the exception-guard descr flavor whether or
+                // not the deadframe carried an exception — `exc_class = 0` and a
+                // null value on this arm — and `prepare_resume_from_failure`
+                // records RESTORE_EXCEPTION just before the guard.  That pair is
+                // what keeps the optimizer from deleting the guard: resume data
+                // can put a removable op ahead of it (here
+                // `seed_execution_context_for_walk`'s GetfieldGcR, a heap-CSE
+                // candidate), and both `optimize_GUARD_NO_EXCEPTION` ports
+                // (rewrite.rs, pure.rs) drop a GUARD_NO_EXCEPTION whose
+                // predecessor was removed.  RESTORE_EXCEPTION is never folded, so
+                // it holds that flag clear.  `remove_bridge_exception` strips the
+                // trio again once it is consecutive and unused, so keeping the
+                // guard costs nothing at runtime.  Without it the bridge is
+                // entered with a pending exception at the same source guard and
+                // runs the no-exception continuation on a NULL raised-call
+                // result — the shape upstream issue #2132 describes.
+                let class_op = wc.trace_ctx.save_exc_class();
+                let value_op = wc.trace_ctx.save_exception();
+                wc.trace_ctx.restore_exception(class_op, value_op);
                 wc.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 // `position` is already the post-call resume coordinate —
                 // capture without the after-residual advance and carry it
