@@ -1905,9 +1905,10 @@ pub(crate) fn create_sys_path_list() -> PyObjectRef {
 
 /// Extract a package module's `__path__` as filesystem directories.
 ///
-/// Returns `None` when the module is not a package (no `__path__` list), so
-/// the caller can fall back to the top-level (sys.path) search for the rare
-/// builtin packages that carry no on-disk `__path__`.
+/// Returns `None` when `__path__` is absent or is not a plain list of `str`.
+/// `absolute_import` rejects the absent case up front ("'<parent>' is not a
+/// package"), so a `None` reaching the caller means a package whose `__path__`
+/// yielded no usable directories.
 fn parent_package_path(parent: PyObjectRef) -> Option<Vec<PathBuf>> {
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(parent) };
     if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
@@ -2590,7 +2591,33 @@ fn absolute_import(
         let full_name = prefix.join(".");
         // A submodule is resolved against its parent package's `__path__`;
         // top-level names (level 0, no parent) search sys.path.
-        let parent_dirs = parent.and_then(parent_package_path);
+        //
+        // `_bootstrap._find_and_load_unlocked` fixes the order: a sys.modules
+        // hit for the full name wins first (`load_part` answers both the cached
+        // entry and the blocked-name sentinel), and only then must the parent be
+        // a package. Presence of `__path__` is the whole test — a PEP 420
+        // `_NamespacePath` (or any other non-list value) still marks a package
+        // even though `parent_package_path` cannot turn it into directories.
+        // Without the check a dotted name whose parent is a plain module falls
+        // back to the top-level search and can resolve to a same-leaf builtin.
+        let parent_dirs = match parent {
+            None => None,
+            Some(_)
+                if check_sys_modules(&full_name).is_some() || sys_modules_blocks(&full_name) =>
+            {
+                None
+            }
+            Some(parent_mod) => {
+                if crate::baseobjspace::findattr_result(parent_mod, "__path__")?.is_none() {
+                    let parent_name = parts[..level].join(".");
+                    return Err(crate::PyError::module_not_found_with_name(
+                        format!("No module named '{full_name}'; '{parent_name}' is not a package"),
+                        &full_name,
+                    ));
+                }
+                parent_package_path(parent_mod)
+            }
+        };
         let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
         let Some(module) = w_mod else {
             // _bootstrap.py:1335 raises for the prefix that actually failed
