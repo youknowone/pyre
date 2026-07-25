@@ -3247,11 +3247,22 @@ fn update_bases(
 pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
-            "__build_class__ requires at least 2 arguments",
+            "__build_class__: not enough arguments",
         ));
     }
     let body_fn = args[0];
     let name_obj = args[1];
+
+    // compiling.py:163-167 — the body must be a Python function carrying a
+    // `PyCode`.  Its code object is read directly below, so anything else is
+    // rejected here rather than reaching that read.
+    if !unsafe { crate::is_function(body_fn) }
+        || unsafe { crate::function_has_builtin_code(body_fn) }
+    {
+        return Err(crate::PyError::type_error(
+            "__build_class__: func must be a function",
+        ));
+    }
 
     // Check if last arg is a kwargs dict (from CALL_KW)
     // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
