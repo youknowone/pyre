@@ -774,17 +774,9 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
     let _ = majit_backend_cranelift::take_pending_frame_restore();
-    #[cfg(feature = "cranelift")]
-    let pending = majit_backend_cranelift::take_pending_force_local0();
-    #[cfg(not(feature = "cranelift"))]
-    let pending: Option<i64> = None;
 
-    // Lazy frame (RPython parity): when CallR(create_frame) is elided,
-    // frame_ptr is the CALLER frame. pending_force_local0 contains the
-    // raw int arg. Create callee frame lazily and execute it.
-    if let Some(raw_local0) = pending {
-        return jit_force_self_recursive_call_raw_1(frame_ptr, raw_local0);
-    }
+    // `assembler_call_helper` (warmspot.py:1021-1028) resumes the callee
+    // frame the rewritten CALL_ASSEMBLER passed as arg 0.
     portal_runner_from_raw_frame_ptr(frame_ptr)
 }
 
@@ -877,16 +869,9 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     // This is the "blackhole" path — RPython resume.py parity.
     //
     // Step 1: read the raw int arg from jf_frame[0]
-    let raw_arg = unsafe { majit_backend::llmodel::get_int_value_direct(jf, 0) };
+    let raw_local0 = unsafe { majit_backend::llmodel::get_int_value_direct(jf, 0) } as i64;
 
-    // Step 2: get caller frame from the force context
-    #[cfg(feature = "cranelift")]
-    let pending = majit_backend_cranelift::take_pending_force_local0();
-    #[cfg(not(feature = "cranelift"))]
-    let pending: Option<i64> = None;
-    let raw_local0 = pending.unwrap_or(raw_arg as i64);
-
-    // Step 3: create a PyFrame and run it
+    // Step 2: create a PyFrame and run it
     // The caller_frame is in inputs[0] which was the JitFrame's first
     // virtualizable input. For now, fall back to the existing force path.
     jit_force_self_recursive_call_raw_1(jitframe_ptr, raw_local0)

@@ -607,9 +607,6 @@ struct RegisteredLoopTarget {
     num_ref_roots: usize,
     max_output_slots: usize,
     inputarg_types: Vec<Type>,
-    /// virtualizable.py:86 read_boxes: number of scalar inputargs
-    /// (frame + static fields). First local is at this index.
-    num_scalar_inputargs: usize,
     /// pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable.
     /// Read from JitCellToken at registration time; -1 when the driver
     /// has no virtualizable.
@@ -2010,18 +2007,6 @@ fn rebuild_state_after_failure_dispatch(
     }
 }
 
-// Thread-local raw local0 value from CallAssemblerI inputs,
-// for force_fn to re-box before interpreter execution.
-thread_local! {
-    static PENDING_FORCE_LOCAL0: std::cell::Cell<Option<i64>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Take the pending raw local0 value (if any).
-pub fn take_pending_force_local0() -> Option<i64> {
-    PENDING_FORCE_LOCAL0.with(|c| c.take())
-}
-
 /// resume.py:763-779 VStrPlainInfo.allocate / resume.py:817-829
 /// VUniPlainInfo.allocate parity — materialize a Plain string/unicode
 /// virtual from per-character fieldnums. Frontend implements via
@@ -2296,49 +2281,6 @@ pub fn prologue_probe_addr() -> Option<usize> {
     PROLOGUE_PROBE_ADDR.get().copied()
 }
 
-/// Execute compiled code for a token directly, bypassing the JitDriver chain.
-///
-/// PyPy assembler_call_helper equivalent: dispatches through compiled code
-/// for the given token_number. Returns Some(raw_result) on finish,
-/// None if no compiled code or guard failure (caller should use interpreter).
-///
-/// This is used by jit_force_callee_frame to avoid the eval_with_jit →
-/// try_function_entry_jit → run_compiled → execute_token indirection chain.
-pub fn execute_call_assembler_direct(
-    token_number: u64,
-    inputs: &[i64],
-    force_fn: extern "C" fn(i64) -> i64,
-) -> Option<i64> {
-    let target_ptr = unsafe { fast_lookup_ca_target(token_number) };
-    if target_ptr.is_null() {
-        return None;
-    }
-    let target = unsafe { &*target_ptr };
-    if target.code_ptr.is_null() {
-        return None;
-    }
-
-    let mut outcome = [0i64; 2];
-    let result = call_assembler_fast_path(target, inputs, outcome.as_mut_ptr(), force_fn);
-
-    if outcome[0] == CALL_ASSEMBLER_OUTCOME_FINISH {
-        Some(result as i64)
-    } else {
-        if outcome[0] == CALL_ASSEMBLER_OUTCOME_DEADFRAME {
-            // RPython assembler_call_helper consumes the guard-failure
-            // deadframe immediately. This direct helper cannot propagate a
-            // deadframe through its Option<i64> API, so drop the stored
-            // JitFrameDeadFrame before falling back to the interpreter;
-            // otherwise its registered GC root keeps stale fail-args alive.
-            let handle = outcome[1] as u64;
-            if handle != 0 {
-                let _ = take_call_assembler_deadframe(handle);
-            }
-        }
-        None // guard failure — caller should fallback
-    }
-}
-
 pub fn register_call_assembler_bridge(f: fn(*const i64, usize, usize) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
@@ -2597,12 +2539,6 @@ fn register_call_assembler_target(
     token.set_ll_function_addr(compiled.code_ptr as usize);
     let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
-    let num_scalar_inputargs = if token.num_scalar_inputargs() > 0 {
-        token.num_scalar_inputargs()
-    } else {
-        // Derive from types: first N header entries.
-        token.inputarg_types().len().min(compiled.num_inputs)
-    };
     // Preserve an existing registered CLT Arc when this token number is
     // re-registered, so metadata pointers already baked into callers remain
     // stable. `CompiledLoopToken::new` zero-initialises the fields we're about
@@ -2635,8 +2571,6 @@ fn register_call_assembler_target(
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
         inputarg_types: token.inputarg_types().to_vec(),
-        // virtualizable.py:86 read_boxes: header = frame + static fields.
-        num_scalar_inputargs,
         index_of_virtualizable: token
             .virtualizable_arg_index()
             .map(|i| i as i32)
@@ -3482,183 +3416,6 @@ fn call_assembler_guard_failure_inner(
     0
 }
 
-/// Fast path for call_assembler when a force callback is available.
-/// Runs compiled code with stack-allocated buffers, avoiding all heap
-/// allocation per call (no Vec, no DeadFrame, no Box).
-fn call_assembler_fast_path(
-    target: &RegisteredLoopTarget,
-    inputs: &[i64],
-    outcome: *mut i64,
-    force_fn: extern "C" fn(i64) -> i64,
-) -> u64 {
-    // RPython parity: compile_tmp_callback. Production CALL_ASSEMBLER descrs
-    // should carry compiled or tmp-callback bodies; keep the null-code fallback
-    // for helper and compatibility paths that still reach the shim.
-    if target.code_ptr.is_null() {
-        let frame_ptr = inputs.get(0).copied().unwrap_or(0);
-        // Set pending_force_local0 for lazy frame creation.
-        // When create_frame is elided, frame_ptr is the caller frame.
-        // force_fn uses pending_force_local0 to create a callee frame.
-        let fli = target.num_scalar_inputargs;
-        if inputs.len() > fli {
-            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(inputs[fli])));
-        }
-        let result = force_fn(frame_ptr);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-            *outcome.add(1) = 0;
-        }
-        return result as u64;
-    }
-
-    call_assembler_fast_path_heap(target, inputs, outcome, force_fn)
-}
-
-/// Heap path for call_assembler — uses heap-allocated JitFrame
-/// via run_compiled_code.
-fn call_assembler_fast_path_heap(
-    target: &RegisteredLoopTarget,
-    inputs: &[i64],
-    outcome: *mut i64,
-    force_fn: extern "C" fn(i64) -> i64,
-) -> u64 {
-    let actual_outputs = target.max_output_slots.max(1);
-    let attachments_guard = target.cpu_attachments.read().unwrap();
-    let attachments: &CpuDescrAttachments = &*attachments_guard;
-    let exec = run_compiled_code(
-        target.code_ptr,
-        &target.fail_descrs,
-        target.num_ref_roots,
-        target.max_output_slots,
-        inputs,
-        attachments,
-        0, // preamble entry
-    );
-    let fail_index = exec.fail_index;
-    let direct_descr = exec.direct_descr.clone();
-    let outputs = exec.extract_outputs(actual_outputs);
-
-    if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
-        let frame = take_call_assembler_deadframe_from_outputs(&outputs);
-
-        let handle = store_call_assembler_deadframe(frame);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-            *outcome.add(1) = handle as i64;
-        }
-        return 0;
-    }
-
-    let fail_descr_arc =
-        direct_descr.unwrap_or_else(|| target.fail_descrs[fail_index as usize].clone());
-    let fail_descr = &fail_descr_arc;
-    let fail_descr_fd = as_fd(fail_descr);
-
-    if fail_descr_fd.is_finish() {
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-            *outcome.add(1) = 0;
-        }
-        return match fail_descr_fd.fail_arg_types() {
-            [] | [Type::Void] => 0,
-            // compile.py:649 DoneWithThisFrameDescr*.get_result:
-            // cpu.get_{int,ref,float}_value(deadframe, 0)
-            [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
-            other => unreachable!("call_assembler finish with unsupported layout: {other:?}"),
-        };
-    }
-
-    // Guard failure — check for bridge, then fall back to force
-    maybe_increment_fail_count(fail_descr_fd);
-
-    if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
-        // Dispatch routes on-demand ResumeDataDirectReader
-        // callback first; falls back to recovery_layout walker.
-        let mut bridge_outputs = outputs;
-        let fail_arg_types = fail_descr_fd.fail_arg_types();
-        rebuild_state_after_failure_dispatch(
-            fail_descr,
-            &mut bridge_outputs,
-            fail_arg_types,
-            bridge.num_inputs,
-        );
-        let mut frame = CraneliftBackend::execute_bridge(
-            &bridge,
-            &bridge_outputs,
-            fail_arg_types,
-            &attachments,
-        );
-        let bridge_descr = get_latest_descr_from_deadframe(&frame)
-            .expect("bridge deadframe must have a descriptor");
-        if bridge_descr.is_finish() {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            return finish_result_from_deadframe(&mut frame)
-                .expect("finish_result_from_deadframe failed") as u64;
-        }
-        let df_handle = store_call_assembler_deadframe(frame);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-            *outcome.add(1) = df_handle as i64;
-        }
-        return 0;
-    }
-    // resume.py:1312 blackhole_from_resumedata parity.
-    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        // BH expects a `FailDescrCell` thin pointer (see
-        // `Backend::fail_descr_arc_from_addr`).  Wrap in a fresh cell
-        // and bake its address; the local cell stays alive across the
-        // BH call, and the recovery inside BH bumps the strong refcount
-        // so the descr survives independently afterward.
-        let bh_cell = majit_ir::FailDescrCell::wrap(fail_descr.clone());
-        let descr_addr = Arc::as_ptr(&bh_cell) as *const () as usize;
-        let raw_num = fail_descr_fd.fail_arg_types().len();
-        let raw_outputs = outputs.to_vec();
-        let mut bh_outputs = outputs.to_vec();
-        // Same on-demand dispatch as the bridge path above.
-        let fail_arg_types_for_dispatch = fail_descr_fd.fail_arg_types();
-        rebuild_state_after_failure_dispatch(
-            fail_descr,
-            &mut bh_outputs,
-            fail_arg_types_for_dispatch,
-            raw_num,
-        );
-        let num_outputs = bh_outputs.len();
-        let guard_exc = grab_exc_value_from_jf_ptr(exec.jf_gcref.0);
-        let bh_result = bh_fn(
-            descr_addr,
-            bh_outputs.as_ptr(),
-            num_outputs,
-            raw_outputs.as_ptr(),
-            raw_num,
-            guard_exc,
-        );
-        drop(bh_cell);
-        if let Some(result) = bh_result {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            // warmspot.py:988-996: DoneWithThisFrame* returns typed result as-is.
-            // warmspot.py:998: exception already raised via jit_exc_raise.
-            return result as u64;
-        }
-    }
-
-    // RPython assembler_call_helper: force_fn receives the callee frame.
-    // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
-    // but force_fn needs the callee frame which is inputs[0].
-    let callee_frame_ptr = inputs[0];
-    let result = force_fn(callee_frame_ptr);
-    unsafe {
-        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-        *outcome.add(1) = 0;
-    }
-    result as u64
-}
-
 extern "C" fn call_assembler_shim(
     target_token: u64,
     args_ptr: u64,
@@ -3813,11 +3570,10 @@ fn call_assembler_shim_inner(
     }
     // Fallback: force_fn re-executes from scratch.
     if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
+        // `assembler_call_helper(deadframe, virtualizable)`
+        // (warmspot.py:1021-1028) resumes from the callee frame, which the
+        // rewritten CALL_ASSEMBLER passes as arg 0.
         let callee_frame_ptr = input_slice[0];
-        let fli = target.num_scalar_inputargs;
-        if input_slice.len() > fli {
-            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(input_slice[fli])));
-        }
         let result = force_fn(callee_frame_ptr);
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -4734,33 +4490,16 @@ fn resolve_call_assembler_target(
     }
 
     // The CALL_ASSEMBLER descriptor's arg_types are the caller-side red-arg
-    // list and must match the callee's compiled inputarg list directly.
+    // list and must match the callee's compiled inputarg list directly:
+    // `direct_assembler_call` records exactly `num_red_args` args
+    // (pyjitpl.py:3596) and `send_loop_to_backend` truncates the callee's
+    // compiled `inputargs` to the same count via
+    // `patch_new_loop_to_load_virtualizable_fields` (compile.py:432), which
+    // prepends a GETFIELD_GC / GETARRAYITEM_GC per dropped vable field. A
+    // mismatch here is a layout bug, so decline the compilation rather than
+    // emit a call with the wrong frame geometry.
     let expected_arity = call_descr.arg_types().len();
     if target.inputarg_types.len() != expected_arity {
-        // TODO: pyre's `direct_assembler_call`
-        // emits CALL_ASSEMBLER with `arg_types = [frame]` (or
-        // `[frame, ec]` once `extra_reds` flips) while the callee's
-        // compiled trace still exposes the full vable-expanded
-        // inputarg list (`frame + scalars + items`, e.g. 8 for fib).
-        // The shrink-to-reds happens in
-        // `patch_new_loop_to_load_virtualizable_fields`
-        // (compile.py:425-461), which only fires when
-        // `state.rs:4058 driver_descriptor()` returns `Some(...)`.
-        // Pyre holds it disabled pending vable
-        // heap-writeback (see state.rs comment for the full
-        // prerequisite chain). Until then, when the target exposes
-        // scalar header slots (`num_scalar_inputargs >` caller's red
-        // count), the mismatch IS the vable-expansion case; treat it
-        // as unresolved so the runtime falls through to the helper
-        // (force_fn) path, matching how the pending-token path
-        // already handles `code_ptr = null`. The `Err` branch is
-        // reserved for cases that look like a real layout bug —
-        // typically when the target's scalar header is SMALLER than
-        // the caller's red count, which would not be explained by
-        // vable expansion.
-        if target.num_scalar_inputargs > call_descr.arg_types().len() {
-            return Ok(None);
-        }
         return Err(unsupported_semantics(
             opcode,
             &format!(
