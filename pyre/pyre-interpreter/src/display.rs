@@ -353,6 +353,24 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
         }
+        // Only a subclass can redirect the dunder: it keeps the builtin
+        // `ob_type` and retags `w_class` (`typedef::subclass_to_tag`), which
+        // is exactly what `is_exact_builtin_instance` tests. An exact
+        // instance resolves the dunder to the builtin the caller is about to
+        // run natively, and the builtin types are immutable, so the two MRO
+        // walks and the descriptor call below can only reproduce it.
+        //
+        // `long` is the one leaf where the descriptor does more than the leaf
+        // formatter: `longobject.py descr_repr` also enforces
+        // `sys.set_int_max_str_digits`, and that check sits in the descriptor
+        // rather than in the conversion, so an exact `long` keeps going
+        // through it. A machine `int` cannot reach any settable limit — 19
+        // digits against a floor of 640.
+        if !std::ptr::eq(tp, &LONG_TYPE as *const PyType)
+            && pyre_object::is_exact_builtin_instance(obj)
+        {
+            return Ok(None);
+        }
         let Some((src, found)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
             return Ok(None);
         };
