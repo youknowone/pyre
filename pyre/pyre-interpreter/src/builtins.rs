@@ -4410,9 +4410,36 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             )));
         }
     }
-    let args_list = pyre_object::w_list_new(positional.to_vec());
-    unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
+    // `interp_exceptions.py:123-124 descr_init` and `:277-282
+    // descr_new_base_exception` both store the `args_w` list their own
+    // signature was bound to, so `type.__call__` reaches here holding a list
+    // that already contains exactly these objects.  Keep it rather than build
+    // a second one over the same elements: `args` is read out as a fresh
+    // tuple and the storage is never handed out, so its identity is not
+    // observable.
+    if !exception_args_already(w_self, positional) {
+        let args_list = pyre_object::w_list_new(positional.to_vec());
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
+    }
     Ok(pyre_object::w_none())
+}
+
+/// Whether `w_self`'s `args_w` storage already holds exactly `positional`,
+/// element for element by identity.
+fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bool {
+    unsafe {
+        let stored = pyre_object::interp_exceptions::w_exception_get_args_storage(w_self);
+        if stored.is_null() || !pyre_object::is_list(stored) {
+            return false;
+        }
+        if pyre_object::w_list_len(stored) != positional.len() {
+            return false;
+        }
+        positional.iter().enumerate().all(|(i, &item)| {
+            pyre_object::w_list_getitem(stored, i as i64)
+                .is_some_and(|held| std::ptr::eq(held, item))
+        })
+    }
 }
 
 /// `interp_exceptions.py:551-652 W_OSError._parse_init_args` + `_init_error`.

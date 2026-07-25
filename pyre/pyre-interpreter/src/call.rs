@@ -2752,10 +2752,13 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         pyre_object::gc_roots::pin_root(arg);
     }
     let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    let current_args = || {
-        (0..args.len())
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
-            .collect::<Vec<_>>()
+    // `Arguments.prepend` builds one list per call, so both call sites below
+    // fill their argument vector straight from the pinned slots — reloading
+    // into a throwaway `Vec` first would allocate a second one per call.
+    let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
+        for i in 0..args.len() {
+            dst.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+        }
     };
 
     if let Err(e) = check_type_instantiable(current_type()) {
@@ -2768,7 +2771,7 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
     {
         let mut new_args = Vec::with_capacity(1 + args.len());
         new_args.push(current_type());
-        new_args.extend(current_args());
+        extend_current_args(&mut new_args);
         call_function_impl(new_fn, &new_args)
     } else {
         pyre_object::w_instance_new(current_type())
@@ -2789,7 +2792,7 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         {
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
-            init_args.extend(current_args());
+            extend_current_args(&mut init_args);
             let res = call_function_impl(init_fn, &init_args);
             if res.is_null() {
                 // `__init__` raised — error already stashed; propagate it.

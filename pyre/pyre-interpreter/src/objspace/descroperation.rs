@@ -4379,6 +4379,17 @@ pub fn neg(a: PyObjectRef) -> PyResult {
     }
 }
 
+const BOOL_INVERT_DEPRECATION_TEXT: &str = "Bitwise inversion '~' on bool is deprecated and will be removed in \
+Python 3.16. This returns the bitwise inversion of the underlying int \
+object and is usually not what you expect from negating a bool. \
+Use the 'not' operator for boolean negation or ~int(x) if you really want \
+the bitwise inversion of the underlying int.";
+
+/// The wrapped form of [`BOOL_INVERT_DEPRECATION_TEXT`]: `~True` in a loop
+/// issues the same message on every iteration, and the registry lookup that
+/// deduplicates it hashes and compares the message each time.
+static BOOL_INVERT_DEPRECATION: crate::warn::PrebuiltText = crate::warn::PrebuiltText::new();
+
 /// Unary bitwise inversion.
 
 pub fn invert(a: PyObjectRef) -> PyResult {
@@ -4390,12 +4401,10 @@ pub fn invert(a: PyObjectRef) -> PyResult {
             // CPython 3.14 `Objects/boolobject.c:bool_invert`.  The bundled
             // PyPy source inherits `W_IntObject.descr_invert`; 3.14 inserts
             // this warning-bearing bool slot before the integer inversion.
-            crate::warn::warn_deprecation(
-                "Bitwise inversion '~' on bool is deprecated and will be removed in \
-Python 3.16. This returns the bitwise inversion of the underlying int \
-object and is usually not what you expect from negating a bool. \
-Use the 'not' operator for boolean negation or ~int(x) if you really want \
-the bitwise inversion of the underlying int.",
+            crate::warn::warn_category_w(
+                BOOL_INVERT_DEPRECATION.get(BOOL_INVERT_DEPRECATION_TEXT),
+                "DeprecationWarning",
+                2,
             )?;
             return Ok(w_int_new(!int_value(a)));
         }
