@@ -3731,16 +3731,16 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 driver.meta_interp_mut().force_virtualizable_token(token);
             });
         };
-        // Force the traced frame only when the frame handed to Python IS the
-        // traced virtualizable (it was the one recorded as escaping). Clearing
-        // TOKEN_TRACING_RESCALL is what `tracing_after_residual_call` reads as
-        // "the callee forced the virtualizable", raising
-        // `VableEscapedDuringResidualCall` so the walk resumes forward.  A
-        // residual callee inspecting its own frame escapes a DIFFERENT frame;
-        // clearing the token there raises a spurious escape with no committed
-        // resume pc, so the walk replays from entry — double-applying the
-        // residual's non-journaled body effects.  Skipping the force there
-        // leaves the callee frame (which is not the traced shadow) untouched.
+        // Force the traced frame only when the frame handed to Python belongs
+        // to the traced virtualizable — either it IS the virtualizable, or it
+        // is the concrete frame an inline sub-walk published and therefore
+        // runs under it. Clearing TOKEN_TRACING_RESCALL is what
+        // `tracing_after_residual_call` reads as "the callee forced the
+        // virtualizable", raising `VableEscapedDuringResidualCall` so the walk
+        // resumes forward.  Any other frame a residual callee inspects is not
+        // the traced shadow; clearing the token there raises a spurious escape
+        // with no committed resume pc, so the walk replays from entry —
+        // double-applying the residual's non-journaled body effects.
         if traced_frame_escaped && let Some(ptr) = tracing_frame {
             force(ptr);
         }

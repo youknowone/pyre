@@ -2069,6 +2069,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // below met).  For a strict callee this gates routing its guards through the
     // multi-frame snapshot vs. falling back to collapse.
     let mut callee_frame_seeded = false;
+    // The concrete callee frame the seed block materializes, retained so the
+    // sub-walk can put it on the interpreter frame chain: the walk executes
+    // the callee's residuals for real, and a residual that reads the chain
+    // (`sys._getframe`, a traceback) must see the callee it is running in.
+    let mut concrete_callee_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
     if try_multiframe || strict_seed {
         'seed: {
             // Branch-A frame shape only (mirror REC_CA): no cells.
@@ -2208,6 +2213,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             );
             drop(arg_roots);
             let concrete_frame_ptr = frame.as_mut_ptr();
+            concrete_callee_frame = concrete_frame_ptr;
             callee_concrete_r[frame_reg as usize] =
                 ConcreteValue::Ref(concrete_frame_ptr as pyre_object::PyObjectRef);
             ctx.trace_ctx.set_opref_concrete(
@@ -2494,6 +2500,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
         let _foriter_deferred =
             ForiterDeferredInlineGuard::enter(callee_code_key, foriter_deferred_admit);
+        // Name the frame this sub-walk executes concretely, so each residual
+        // it runs can `enter`/`leave` it on the interpreter frame chain.
+        let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
         if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
             if frame.body_matches(&body) {
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);

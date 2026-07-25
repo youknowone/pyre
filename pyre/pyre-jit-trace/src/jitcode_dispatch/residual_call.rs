@@ -297,6 +297,107 @@ pub(crate) fn escape_flush_undo_cell_ptr() -> *const std::cell::RefCell<Option<E
     ESCAPE_FLUSH_UNDO.with(|cell| cell as *const _)
 }
 
+thread_local! {
+    /// The concrete `PyFrame` the innermost inline sub-walk is executing, or
+    /// null outside one.  Set by [`InlineConcreteFrameGuard`].
+    static INLINE_CONCRETE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+
+    /// The concrete frame currently published on the interpreter chain by a
+    /// live [`ResidualFrameChainGuard`], or null.  Distinct from
+    /// [`INLINE_CONCRETE_FRAME`], which stays set across the whole sub-walk.
+    static PUBLISHED_INLINE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Names the frame an inline sub-walk executes concretely for the duration of
+/// that sub-walk.  Publishing it on the interpreter chain is left to
+/// [`ResidualFrameChainGuard`], which brackets only the residual calls.
+pub(crate) struct InlineConcreteFrameGuard(*mut pyre_interpreter::PyFrame);
+
+impl InlineConcreteFrameGuard {
+    pub(crate) fn enter(frame: *mut pyre_interpreter::PyFrame) -> Self {
+        let previous = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        if !frame.is_null() {
+            INLINE_CONCRETE_FRAME.with(|slot| slot.set(frame));
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for InlineConcreteFrameGuard {
+    fn drop(&mut self) {
+        INLINE_CONCRETE_FRAME.with(|slot| slot.set(self.0));
+    }
+}
+
+/// `executioncontext.py:85 enter` / `:91 leave` around one concretely executed
+/// residual call of an inline sub-walk.
+///
+/// Inlining a call elides the callee's real call sequence, so nothing
+/// publishes the callee frame.  PyPy can leave the chain alone — its
+/// metainterp never runs the callee for real while tracing — but the walker
+/// does, and a residual that reads the chain (`sys._getframe`, a traceback)
+/// would otherwise observe the caller as the running frame and resolve one
+/// level too shallow.  Scoped to the call itself so the walk's own frame
+/// bookkeeping outside it is untouched.
+struct ResidualFrameChainGuard {
+    ec: *mut pyre_interpreter::PyExecutionContext,
+    frame: *mut pyre_interpreter::PyFrame,
+    saved_topframeref: *mut pyre_interpreter::PyFrame,
+    previous_published: *mut pyre_interpreter::PyFrame,
+}
+
+impl ResidualFrameChainGuard {
+    fn enter() -> Option<Self> {
+        let frame = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        if frame.is_null() {
+            return None;
+        }
+        let ec = unsafe { (*frame).execution_context } as *mut pyre_interpreter::PyExecutionContext;
+        if ec.is_null() {
+            return None;
+        }
+        let saved_topframeref = unsafe { (*ec).topframeref };
+        // Re-entering the same frame would make it its own caller.
+        if std::ptr::eq(saved_topframeref, frame) {
+            return None;
+        }
+        unsafe {
+            (*frame).f_backref = saved_topframeref;
+            (*ec).topframeref = frame;
+        }
+        let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
+        Some(Self {
+            ec,
+            frame,
+            saved_topframeref,
+            previous_published,
+        })
+    }
+}
+
+impl Drop for ResidualFrameChainGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // `executioncontext.py:91-109 leave`: move the raw caller vref
+            // back without forcing it, then, when the frame escaped, force
+            // the caller and mark it escaped too.  A frame handed to
+            // application code keeps a reference to its caller, so the caller
+            // must stay materialised; dropping that propagation would leave
+            // the escape recorded only on a frame the walk owns privately.
+            PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
+            (*self.ec).topframeref = self.saved_topframeref;
+            if (*self.frame).escaped() {
+                let f_back = (*self.frame).get_f_back();
+                if !f_back.is_null() {
+                    (*f_back).mark_as_escaped();
+                }
+            }
+        }
+    }
+}
+
 struct ActiveFrameEscapeGuard {
     prev: Option<(usize, usize)>,
     prev_stack: Option<Vec<OpRef>>,
@@ -325,15 +426,34 @@ impl Drop for ActiveFrameEscapeGuard {
 
 /// Returns whether `frame` is the one recorded as escaping this residual call
 /// (`expected == frame`) — i.e. the traced virtualizable itself was handed to
-/// Python, so its tracing token must be forced. A residual callee inspecting
-/// its own frame passes a different `frame` and returns false. Independently,
-/// the walk-end resume pc is committed only when the state flush succeeds (a
-/// merge point with cached depth); a matched frame that cannot flush still
-/// escaped and must be forced, so the two signals are decoupled.
+/// Python, so its tracing token must be forced.  The concrete frame an inline
+/// sub-walk published counts as well: it runs under that virtualizable, so
+/// handing it out escapes the virtualizable too. Any other frame a residual
+/// callee inspects returns false. Independently, the walk-end resume pc is
+/// committed only when the state flush succeeds (a merge point with cached
+/// depth); a directly matched frame that cannot flush still escaped and must
+/// be forced, so for it the two signals are decoupled.
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
+    // `executioncontext.py:104-106 leave` — a frame handed to application code
+    // keeps a reference to its caller, so escaping the concrete frame an inline
+    // sub-walk published escapes the traced virtualizable it runs under.  The
+    // flush stays keyed on that virtualizable, whose resume pc this residual
+    // already latched, so the walk resumes forward rather than replaying from
+    // entry.
+    let escaped_published = PUBLISHED_INLINE_FRAME.with(|slot| {
+        let published = slot.get();
+        let matched = !published.is_null() && std::ptr::eq(published, frame);
+        if matched {
+            let f_back = unsafe { (*published).get_f_back() };
+            if !f_back.is_null() {
+                unsafe { (*f_back).mark_as_escaped() };
+            }
+        }
+        matched
+    });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
         if let Some((expected, py_pc)) = slot.get()
-            && expected == frame as usize
+            && (expected == frame as usize || escaped_published)
         {
             // Force #2+ within this residual (`enter` resets the committed pc
             // per residual): the live frame is already heap-authoritative
@@ -357,7 +477,12 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
             }
-            return true;
+            // A directly matched frame escaped whether or not the flush
+            // committed, so the two signals stay decoupled.  A redirected one
+            // is reported only once the resume pc is committed: forcing
+            // without it would raise an escape the walk can only answer by
+            // replaying from entry, double-applying this residual's body.
+            return flushed || expected == frame as usize;
         }
         false
     })
@@ -1616,6 +1741,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         .then(|| ctx.vstack_boxes.clone());
         let _frame_escape =
             ActiveFrameEscapeGuard::enter(escape_frame, ctx.vstack_cur_pypc as usize, escape_stack);
+        // `executioncontext.py:85 enter` for the inlined callee this residual
+        // runs inside of.
+        let _frame_chain = ResidualFrameChainGuard::enter();
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
