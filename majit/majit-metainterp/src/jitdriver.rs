@@ -781,6 +781,30 @@ pub struct JitDriverStaticData {
     /// populated alongside `virtualizable_info` once the host runtime
     /// supplies the field descriptor.
     pub vable_token_descr: Option<majit_ir::DescrRef>,
+    /// Per-driver override for the `jitcode.py:147 enumerate_vars` frame box
+    /// count (`length_i + length_r + length_f`) that `rebuild_from_numbering`
+    /// asks for while building guard metadata.
+    ///
+    /// Upstream needs no such thing: one codewriter run numbers every jitcode
+    /// and interns every `-live-` triple into the single
+    /// `metainterp_sd.liveness_info` pool (`pyjitpl.py:2264`), so the global
+    /// decode is unambiguous. pyre has **two** numbering spaces — the runtime
+    /// CodeObject-keyed store jd0 grows via `intern_liveness`, and the
+    /// build-time `jitcode_runtime` artifacts a driver over an extracted
+    /// interpreter body (jd1 `unpackiterable_driver`) numbers against. A frame
+    /// numbered in one space and decoded against the other reads an unrelated
+    /// frame's liveness triple.
+    ///
+    /// Selecting the store therefore has to be keyed on the driver, which is
+    /// what this field does: `None` keeps the process-global callback
+    /// (`majit_ir::resumedata::set_frame_value_count_fn`), and a driver whose
+    /// frames are numbered elsewhere installs its own decoder here.
+    ///
+    /// ⚠️ A "try the global store, fall back on failure" scheme cannot replace
+    /// this. The wrong store frequently *succeeds*: its low indices hold
+    /// unrelated jitcodes that decode at the same pc and silently return a
+    /// mistyped count. A successful decode is not evidence of the right store.
+    pub frame_value_count_fn: Option<fn(i32, i32) -> usize>,
 }
 
 impl JitDriverStaticData {
@@ -860,6 +884,7 @@ impl JitDriverStaticData {
             no_loop_header: false,
             assembler_helper_adr: 0,
             vable_token_descr: None,
+            frame_value_count_fn: None,
         };
         // warmspot.py:529/538 — keep `index_of_virtualizable` in sync
         // with the `virtualizable_arg_index()` derived from `reds`.

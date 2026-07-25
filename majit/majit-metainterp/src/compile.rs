@@ -370,10 +370,16 @@ impl<'a> UnrolledLoopData<'a> {
 /// The backend numbers every guard and finish in a single exit table, so this
 /// helper mirrors that numbering and records only the guard entries that need
 /// resume data plus the corresponding op index for blackhole fallback.
+///
+/// `frame_value_count_fn` is the compiling driver's
+/// [`crate::jitdriver::JitDriverStaticData::frame_value_count_fn`] override for
+/// the `jitcode.py:147 enumerate_vars` frame box count; `None` falls back to the
+/// process-global callback the host registered.
 pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
     ops: &[T],
     pc: u64,
+    frame_value_count_fn: Option<fn(i32, i32) -> usize>,
 ) -> (
     indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
     indexmap::IndexMap<u32, StoredExitLayout>,
@@ -383,6 +389,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
+    // The driver-scoped override wins: a driver whose frames are numbered
+    // outside the process-global liveness pool must not decode against it (see
+    // `JitDriverStaticData::frame_value_count_fn`).
+    let fvc = frame_value_count_fn.or_else(majit_ir::resumedata::get_frame_value_count_fn);
+    let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
+        fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
     // history.py:220/261/307 — each fail-arg's type is intrinsic on the Box
     // (the OpRef variant tag, `ty()`); a fail_arg carries its own type
     // regardless of trace position, so no position-keyed side table is needed.
@@ -540,9 +552,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 (op.resolved_rd_numb(), op.resolved_rd_consts())
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let fvc = majit_ir::resumedata::get_frame_value_count_fn();
-                let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                 let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
                     &rd_numb_bytes,
@@ -657,9 +666,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     (op.resolved_rd_numb(), op.resolved_rd_consts())
                 {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                    let fvc = majit_ir::resumedata::get_frame_value_count_fn();
-                    let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-                        fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                     let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                     let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
                         &rd_numb_bytes,
@@ -2648,7 +2654,7 @@ mod tests {
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 8);
+        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 8, None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2698,7 +2704,7 @@ mod tests {
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 0);
+        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 0, None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(

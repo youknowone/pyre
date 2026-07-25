@@ -1154,6 +1154,66 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     })
 }
 
+/// [`frame_value_count_at`] for a driver whose frames are numbered in the
+/// build-time `jitcode_runtime` tables instead of the runtime
+/// `MetaInterpStaticData` store.
+///
+/// pyre has two jitcode numbering spaces. jd0 (`pyframe_driver`) numbers
+/// Python-bytecode jitcodes into `MetaInterpStaticData.jitcodes`, keyed by
+/// CodeObject, and interns their `-live-` triples into
+/// `metainterp_sd.liveness_info` (`pyjitpl.py:2264`) as tracing discovers them.
+/// A novable driver over an extracted interpreter body — jd1
+/// `unpackiterable_driver`, whose jitcode is the
+/// `_unpackiterable_unknown_length` graph plus its inlined build-time callees —
+/// numbers against `jitcode_runtime::all_jitcodes()`, with `-live-` offsets
+/// baked at extraction into `jitcode_runtime::all_liveness()`.
+///
+/// Decoding one space's coordinate against the other's tables does not fail
+/// loudly, which is why the store has to be picked per driver rather than tried
+/// and retried: the runtime store's low indices hold unrelated PyCode jitcodes
+/// that decode at the same pc and hand back a mistyped count (the drain's 2 refs
+/// read as ints → `Const::getint on Ref`). Same split, and same reasoning, as
+/// the `novable` arms of `call_jit.rs`'s `blackhole_resume_via_rd_numb`.
+///
+/// Installed on jd1's `JitDriverStaticData::frame_value_count_fn`, so only that
+/// driver's guard metadata decodes here.
+pub fn build_time_frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
+    // `pyjitpl.py:2236` `self.op_live = self.opcode_implementations...` — the
+    // `live/` byte of the table the jitcode's bytes were assembled with. Read it
+    // off the build-time table rather than `blackhole_control_opcodes()`, whose
+    // value comes from the runtime assembler's `insns`; the two agree
+    // (`jitcode_runtime.rs` `build_default_bh_builder_matches_insns_table`), but
+    // the build-time decode should not depend on the runtime store being set up.
+    let Some(op_live) = crate::jitcode_runtime::insns_opname_to_byte()
+        .get("live/")
+        .copied()
+    else {
+        return 0;
+    };
+    let jitcode = match crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize) {
+        Some(jc) => jc,
+        None => return 0,
+    };
+    let all_liveness = crate::jitcode_runtime::all_liveness();
+    if pc >= 0 && jitcode.can_decode_live_vars(pc as usize, op_live) {
+        let off = jitcode.get_live_vars_info(pc as usize, op_live);
+        if off + 2 < all_liveness.len() {
+            let length_i = all_liveness[off] as usize;
+            let length_r = all_liveness[off + 1] as usize;
+            let length_f = all_liveness[off + 2] as usize;
+            return length_i + length_r + length_f;
+        }
+    }
+    // Same fail-loud contract as `frame_value_count_at`: a published resume
+    // coordinate that does not decode violates the capture contract.
+    panic!(
+        "build_time_frame_value_count_at: no decodable `-live-` for \
+         jitcode_index={jitcode_index} pc={pc} (code_len={}, all_liveness.len={})",
+        jitcode.code.len(),
+        all_liveness.len(),
+    );
+}
+
 /// Resolve the JitCode byte offset the full-body walk should RESUME at for a
 /// bridge whose guard carried `carried_jitcode_pc`. Agrees with where the
 /// blackhole resumes (`call_jit.rs` `resolve_jitcode`): a kept-stack branch

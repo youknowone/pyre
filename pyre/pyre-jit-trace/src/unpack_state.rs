@@ -97,6 +97,10 @@ impl UnpackJitState {
         // first trace closes the loop on the `goto` back-edge instead of
         // unrolling the whole drain to the StopIteration finish.
         sd.no_loop_header = true;
+        // The drain's frames are numbered in the build-time `jitcode_runtime`
+        // tables, not the CodeObject-keyed runtime store jd0 grows, so guard
+        // metadata must decode `-live-` there.
+        sd.frame_value_count_fn = Some(crate::state::build_time_frame_value_count_at);
         sd
     }
 }

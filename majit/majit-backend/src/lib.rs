@@ -1766,6 +1766,18 @@ pub trait Backend: Send {
     /// this header PC to synthesised exit recovery layouts.
     fn set_next_header_pc(&mut self, _header_pc: u64) {}
 
+    /// The compiling driver's override for the `jitcode.py:147 enumerate_vars`
+    /// frame box count, when a backend decodes the guards' `rd_numb` itself to
+    /// build exit layouts.
+    ///
+    /// Carried on `JitDriverStaticData::frame_value_count_fn`: a driver whose
+    /// frames are numbered outside the process-global liveness pool must not
+    /// decode against it, and the wrong pool decodes *successfully* with a
+    /// mistyped count rather than failing. `None` (the default) leaves the
+    /// backend on the global callback
+    /// (`majit_ir::resumedata::set_frame_value_count_fn`).
+    fn set_next_frame_value_count_fn(&mut self, _fvc: Option<fn(i32, i32) -> usize>) {}
+
     /// `compile.py:665-674` `make_and_attach_done_descrs([self, cpu])` —
     /// per-result-type `DoneWithThisFrame*` singleton shared with
     /// `MetaInterpStaticData`.  Attached once per CPU instance, matching

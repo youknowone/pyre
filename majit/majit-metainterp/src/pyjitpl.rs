@@ -3504,6 +3504,22 @@ impl<M: Clone> MetaInterp<M> {
             .position(|jd| jd.virtualizable_info.is_some())
     }
 
+    /// The active driver's
+    /// [`crate::jitdriver::JitDriverStaticData::frame_value_count_fn`] override,
+    /// for `build_guard_metadata`'s `-live-` decode.
+    ///
+    /// Read STRICTLY off `active_jitdriver_sd` — the driver whose trace is being
+    /// compiled. There is deliberately no fallback scan over the other slots:
+    /// the override names the jitcode/liveness store the frames were numbered
+    /// against, and borrowing a sibling driver's store decodes *successfully*
+    /// against unrelated frames rather than failing (see the field's doc).
+    fn active_frame_value_count_fn(&self) -> Option<fn(i32, i32) -> usize> {
+        self.staticdata
+            .jitdrivers_sd
+            .get(self.active_jitdriver_sd?)?
+            .frame_value_count_fn
+    }
+
     /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(cpu, jd)`.
     ///
     /// Hosts that declare green fields (greens containing `.`) call
@@ -6076,6 +6092,8 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let front_target_tokens = if retried_without_unroll {
             let target_token = crate::history::TargetToken::new_loop(token_num);
@@ -6259,8 +6277,12 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
-                let (mut resume_data, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &compiled_ops, green_key);
+                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                    &inputargs,
+                    &compiled_ops,
+                    green_key,
+                    self.active_frame_value_count_fn(),
+                );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
@@ -7123,6 +7145,8 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
@@ -7186,8 +7210,12 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
-                let (mut resume_data, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &combined_ops, green_key);
+                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                    &inputargs,
+                    &combined_ops,
+                    green_key,
+                    self.active_frame_value_count_fn(),
+                );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) =
@@ -7645,6 +7673,8 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
         let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
@@ -7723,8 +7753,12 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
+                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                    &inputargs,
+                    &optimized_ops,
+                    green_key,
+                    self.active_frame_value_count_fn(),
+                );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
@@ -8009,6 +8043,8 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
         let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
@@ -8083,8 +8119,12 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &compiled_ops, green_key);
+                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                    &inputargs,
+                    &compiled_ops,
+                    green_key,
+                    self.active_frame_value_count_fn(),
+                );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
@@ -10312,6 +10352,8 @@ impl<M: Clone> MetaInterp<M> {
             .set_callinfocollection(self.callinfocollection.clone());
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(original_green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let token = make_jitcell_token(self.warm_state.alloc_token_number(), None);
         // `green_key` is interior-mutable, so it is written through the
@@ -10346,6 +10388,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_inputargs,
                     &optimized_ops,
                     original_green_key,
+                    self.active_frame_value_count_fn(),
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
@@ -10958,6 +11001,8 @@ impl<M: Clone> MetaInterp<M> {
             .set_callinfocollection(self.callinfocollection.clone());
         self.backend.set_next_trace_id(bridge_trace_id);
         self.backend.set_next_header_pc(green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let result = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -11070,6 +11115,8 @@ impl<M: Clone> MetaInterp<M> {
                 self.last_quasi_immutable_deps =
                     std::mem::take(&mut optimizer.quasi_immutable_deps);
                 self.record_loop_or_bridge(&source_jct, &mut optimized_ops, bridge_trace_id);
+                // Read before the `compiled_loops` mutable borrow below.
+                let fvc = self.active_frame_value_count_fn();
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     // pyjitpl.py:1049 — `fail_descr.trace_id()` is the
@@ -11077,8 +11124,12 @@ impl<M: Clone> MetaInterp<M> {
                     // starts at 1).  No `0 → root_trace_id` sentinel;
                     // RPython resolves the source via descr identity.
                     let source_trace_id = fail_descr.trace_id();
-                    let (mut resume_data, mut exit_layouts) =
-                        compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
+                    let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                        bridge_inputargs,
+                        &optimized_ops,
+                        green_key,
+                        fvc,
+                    );
                     let mut terminal_exit_layouts =
                         compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
@@ -16636,6 +16687,7 @@ mod metainterp_static_data_tests {
             no_loop_header: false,
             assembler_helper_adr: 0,
             vable_token_descr: None,
+            frame_value_count_fn: None,
         };
         {
             let MetaInterp {
@@ -20170,12 +20222,18 @@ mod tests {
         let mut token = JitCellToken::new(green_key + 1000);
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
+        meta.backend
+            .set_next_frame_value_count_fn(meta.active_frame_value_count_fn());
         let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(std::rc::Rc::new).collect();
         meta.backend
             .compile_loop(inputargs, &ops_rc, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key);
+        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+            inputargs,
+            &ops,
+            green_key,
+            meta.active_frame_value_count_fn(),
+        );
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts, &ops);

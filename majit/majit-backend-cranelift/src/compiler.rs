@@ -7690,6 +7690,9 @@ pub struct CraneliftBackend {
     trace_counter: u64,
     next_trace_id: Option<u64>,
     next_header_pc: Option<u64>,
+    /// `Backend::set_next_frame_value_count_fn` — the compiling driver's
+    /// `-live-` decoder for the `rd_numb` reads below.
+    next_frame_value_count_fn: Option<fn(i32, i32) -> usize>,
     registered_call_assembler_tokens: IndexSet<u64>,
     registered_call_assembler_bridge_traces: IndexSet<u64>,
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
@@ -7917,6 +7920,7 @@ impl CraneliftBackend {
             trace_counter: 1,
             next_trace_id: None,
             next_header_pc: None,
+            next_frame_value_count_fn: None,
             registered_call_assembler_tokens: IndexSet::new(),
             registered_call_assembler_bridge_traces: IndexSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
@@ -8487,6 +8491,7 @@ impl CraneliftBackend {
             caller_layout,
             &constants_i64,
             attached_descrs,
+            self.next_frame_value_count_fn,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
@@ -14404,6 +14409,10 @@ fn collect_guards(
     caller_layout: Option<&ExitRecoveryLayout>,
     _constants: &indexmap::IndexMap<u32, i64>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
+    // `Backend::set_next_frame_value_count_fn` — the compiling driver's
+    // `-live-` decoder for the `rd_numb` reads below.  `None` falls back to the
+    // process-global callback.
+    frame_value_count_fn: Option<fn(i32, i32) -> usize>,
 ) -> Result<(), BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, op_def_positions) = build_type_overrides(ops, &type_index);
@@ -14541,7 +14550,7 @@ fn collect_guards(
                 (op.resolved_rd_numb(), op.resolved_rd_consts())
             {
                 use majit_ir::resumedata::{get_frame_value_count_fn, rebuild_from_numbering};
-                let fvc = get_frame_value_count_fn();
+                let fvc = frame_value_count_fn.or_else(get_frame_value_count_fn);
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
@@ -14588,7 +14597,7 @@ fn collect_guards(
             let rd_vi = op.resolved_rd_virtuals();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
             let rd_consts_ref: &[majit_ir::Const] = &rd_consts_data;
-            let fvc = majit_ir::resumedata::get_frame_value_count_fn();
+            let fvc = frame_value_count_fn.or_else(majit_ir::resumedata::get_frame_value_count_fn);
             let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                 fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
             let num_virtuals = rd_vi.as_ref().map_or(0, |v| v.len());
@@ -15384,6 +15393,10 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn set_next_header_pc(&mut self, header_pc: u64) {
         self.next_header_pc = Some(header_pc);
+    }
+
+    fn set_next_frame_value_count_fn(&mut self, fvc: Option<fn(i32, i32) -> usize>) {
+        self.next_frame_value_count_fn = fvc;
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
