@@ -3464,22 +3464,39 @@ impl<M: Clone> MetaInterp<M> {
     /// `virtualizable_info` and the related metadata together.
     ///
     /// pyjitpl.py:3291 `vinfo = self.jitdriver_sd.virtualizable_info` — the
-    /// vinfo is STRICTLY that of the elected active driver. When a driver is
-    /// elected, use its own vinfo: `Some(idx)` if it carries one, else `None`
-    /// so `initialize_virtualizable` bails (RPython's `vinfo is None` early
-    /// return). A novable active driver (jd1 `unpackiterable_driver`,
-    /// `virtualizable_info=None`) must NOT borrow another driver's vinfo — that
-    /// would capture a phantom jd0-shaped vable section in its novable trace's
-    /// resume data. Only when no driver is elected yet (init-time / test
-    /// caller) fall back to scanning for the first vinfo-bearing slot.
+    /// vinfo is STRICTLY that of the elected active driver, so a novable
+    /// active driver (jd1 `unpackiterable_driver`, `virtualizable_info=None`)
+    /// never borrows a sibling driver's vinfo; borrowing would capture a
+    /// phantom jd0-shaped vable section in the novable trace's resume data.
+    /// Returning `None` makes `initialize_virtualizable` bail, matching
+    /// RPython's `vinfo is None` early return.
+    ///
+    /// One adaptation preserves the documented [`Self::ensure_default_driver_sd`]
+    /// contract: a host that calls `set_virtualizable_info` BEFORE
+    /// `register_jitdriver_sd` lands its vinfo on the empty placeholder slot
+    /// (`index == None`), so its real driver is elected without one. That vinfo
+    /// still belongs to the host's single logical driver, so it is adopted via
+    /// the linear scan — but only while no *registered* driver owns a vinfo.
+    /// Once one does (pyre: jd0 at slot 1), a later registered driver that
+    /// carries none is genuinely novable (pyre: jd1 at slot 2) and gets `None`.
     fn resolve_active_jitdriver_sd_with_vinfo(&self) -> Option<usize> {
         if let Some(idx) = self.active_jitdriver_sd {
-            return self
+            if let Some(jd) = self.staticdata.jitdrivers_sd.get(idx) {
+                if jd.virtualizable_info.is_some() {
+                    return Some(idx);
+                }
+            }
+            // `jd.index` is stamped only by `register_jitdriver_sd`
+            // (call.py:46-47), so `index.is_some()` marks a host-registered
+            // driver as opposed to the pre-registration placeholder.
+            if self
                 .staticdata
                 .jitdrivers_sd
-                .get(idx)
-                .filter(|jd| jd.virtualizable_info.is_some())
-                .map(|_| idx);
+                .iter()
+                .any(|jd| jd.index.is_some() && jd.virtualizable_info.is_some())
+            {
+                return None;
+            }
         }
         self.staticdata
             .jitdrivers_sd
