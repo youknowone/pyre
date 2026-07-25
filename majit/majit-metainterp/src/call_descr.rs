@@ -187,6 +187,27 @@ pub fn default_effect_info() -> EffectInfo {
     EffectInfo::MOST_GENERAL
 }
 
+/// `call.py:300-301 elif self._canraise(op):` — `EF_CAN_RAISE` built
+/// through `effectinfo_from_writeanalyze` with an empty analyzer result.
+///
+/// Shape: `extraeffect=CanRaise`, every `_*_descrs_*` raw set =
+/// `Some(Vec::new())`, every `*_descrs_*` bitstring = `Some(Vec::new())`,
+/// `can_collect=true` (`effectinfo.py:283` default).
+/// `effectinfo.py:293-299`'s else-branch starts the raw sets at `[]` and
+/// grows them with the analyzer's actual effects, so an analyzer that
+/// reported nothing leaves them `[]` — distinct from `MOST_GENERAL`,
+/// which the `effectinfo.py:149-162` invariant ties to raw = `None`.
+///
+/// This is the row for a callee the producer classified by hand: an
+/// opaque leaf helper the author marked `#[dont_look_inside]`
+/// (`rlib/jit.py:132`), whose upstream counterpart still has a graph for
+/// the write analyzer to walk. It asserts "writes no field of any object
+/// the trace already cached", which
+/// [`default_effect_info`] deliberately does not.
+pub fn can_raise_effect_info() -> EffectInfo {
+    EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None)
+}
+
 /// aheui nursery-alloc residual: `EF_CAN_RAISE` with empty write sets —
 /// an allocation publishes a fresh object and writes no field of any
 /// object the trace already cached, so `graphanalyze.py:60
@@ -405,21 +426,31 @@ pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
 /// which is out of scope for the slot enum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EffectInfoSlot {
-    /// Default slot for producers without per-callee heap analysis.
-    /// Maps to [`default_effect_info()`] = `EffectInfo::MOST_GENERAL`
-    /// (`EF_RANDOM_EFFECTS`, all raw sets and bitstrings `None`), the
-    /// `graphanalyze.py:109-112` "callee has no analyzable graph" →
-    /// `top_result()` outcome promoted by `effectinfo.py:285-292`.
+    /// `EF_CAN_RAISE` — `call.py:300-301 elif self._canraise(op):`
+    /// branch of `getcalldescr`, resolved through
+    /// [`can_raise_effect_info()`]: `CanRaise` + `Some(empty)` raw sets
+    /// and bitstrings.
     ///
-    /// The name records the `call.py:300-301 elif self._canraise(op):`
-    /// row it stands in for; the `EF_CAN_RAISE` + empty-write-set shape
-    /// that row produces requires analyzer output pyre does not have at
-    /// these sites, so it is not what this slot resolves to. A producer
-    /// that HAS proved the callee cannot raise picks
-    /// [`EffectInfoSlot::CannotRaise`] or
-    /// [`EffectInfoSlot::CannotRaiseNoHeap`] instead.
+    /// Picked by producers that classified the callee by hand — the
+    /// `#[dont_look_inside]` policy bytes, whose upstream counterpart is
+    /// a `@dont_look_inside` function the write analyzer still walks. It
+    /// is not the "nothing was analyzed" answer: that one is
+    /// [`EffectInfoSlot::Unanalyzed`].
     #[default]
     CanRaise,
+    /// `EF_RANDOM_EFFECTS` / [`EffectInfo::MOST_GENERAL`] — the
+    /// `graphanalyze.py:109-112` "callee has no analyzable graph" →
+    /// `top_result()` outcome, promoted by `effectinfo.py:285-292`.
+    /// Resolved through [`default_effect_info()`].
+    ///
+    /// Picked by producers that classified nothing: a helper binding
+    /// arbitrary interpreter execution, with no graph for a write
+    /// analyzer to walk. `check_forces_virtual_or_virtualizable()` holds
+    /// for this row (`effectinfo.py:249-250`, `7 >= 6`), so a callee
+    /// registered with it must not be dispatched through `cond_call` /
+    /// `record_known_result` (`jtransform.py:1677`,
+    /// `pyjitpl.py:2128-2132` assert the opposite).
+    Unanalyzed,
     /// `EF_CANNOT_RAISE` — `call.py:303` `else` branch.
     CannotRaise,
     /// `EF_CANNOT_RAISE` + analyzer-confirmed empty heap. Maps to
@@ -443,7 +474,8 @@ pub enum EffectInfoSlot {
 /// const captures the analyzer-absent fallback for that `extraeffect`.
 pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
     match slot {
-        EffectInfoSlot::CanRaise => default_effect_info(),
+        EffectInfoSlot::CanRaise => can_raise_effect_info(),
+        EffectInfoSlot::Unanalyzed => default_effect_info(),
         EffectInfoSlot::CannotRaise => cannot_raise_effect_info(),
         EffectInfoSlot::CannotRaiseNoHeap => CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
         EffectInfoSlot::ElidableCanRaise => ELIDABLE_EFFECT_INFO,
@@ -984,5 +1016,28 @@ mod set_effect_bitstrings_tests {
         assert!(!ei.has_random_effects());
         assert!(!ei.has_oopspec());
         assert!(!ei.check_can_invalidate());
+    }
+
+    /// `effectinfo.py:149-162` ties `EF_RANDOM_EFFECTS` to raw sets =
+    /// `None`, so the hand-classified `call.py:300-301` row and the
+    /// `graphanalyze.py:109-112` no-graph row are not interchangeable.
+    /// A slot resolving `CanRaise` to `MOST_GENERAL` would make every
+    /// `cond_call` / `record_known_result` target force the
+    /// virtualizable, which `jtransform.py:1677` and
+    /// `pyjitpl.py:2128-2132` assert can never happen.
+    #[test]
+    fn can_raise_slot_is_the_analyzed_row_and_unanalyzed_is_most_general() {
+        let can_raise = effect_info_for_slot(EffectInfoSlot::CanRaise);
+        assert_eq!(can_raise.extraeffect, ExtraEffect::CanRaise);
+        assert!(!can_raise.has_random_effects());
+        assert!(!can_raise.check_forces_virtual_or_virtualizable());
+        assert!(can_raise._write_descrs_fields.is_some());
+
+        let unanalyzed = effect_info_for_slot(EffectInfoSlot::Unanalyzed);
+        assert_eq!(unanalyzed.extraeffect, ExtraEffect::RandomEffects);
+        assert!(unanalyzed.has_random_effects());
+        assert!(unanalyzed._write_descrs_fields.is_none());
+        assert_eq!(unanalyzed, default_effect_info());
+        assert_ne!(can_raise, unanalyzed);
     }
 }

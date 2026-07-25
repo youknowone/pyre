@@ -623,8 +623,12 @@ pub fn intern_call_descr_stub(
 pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoSlot {
     use majit_metainterp::EffectInfoSlot;
     match flavor {
-        // `call.py:301 getcalldescr` — `EF_CAN_RAISE`.
-        CallFlavor::Plain => EffectInfoSlot::CanRaise,
+        // `graphanalyze.py:109-112` — every `Plain` helper binds an
+        // interpreter entry point with no graph for a write analyzer to
+        // walk, so its row is `top_result()` → `MOST_GENERAL`, not the
+        // `call.py:301` analyzed `EF_CAN_RAISE`. Matches the EI
+        // `effect_info_for_call_flavor` hands the same flavor.
+        CallFlavor::Plain => EffectInfoSlot::Unanalyzed,
         // `call.py:303 getcalldescr` — `EF_CANNOT_RAISE` (`else` branch).
         // RPython has a single `EF_CANNOT_RAISE` constant; the "no heap
         // touched" property of `PlainCannotRaiseNoHeap` is captured in
@@ -7051,6 +7055,23 @@ mod tests {
         // both resolve to `MOST_GENERAL`.
         let ei = effect_info_for_call_flavor(CallFlavor::Plain);
         assert_eq!(dispatch_kind_for_effect_info(&ei), CallFlavor::MayForce);
+    }
+
+    /// The two producer-side classifiers for one flavor must agree: the
+    /// slot a helper is registered with (`add_fn_ptr_with_slot`, read back
+    /// by the residual-call adapters) and the EI the walker records must
+    /// name the same `call.py:282-303` row. A `Plain` helper registered as
+    /// the analyzed `EF_CAN_RAISE` row while its recorded EI says
+    /// `MOST_GENERAL` would let one path assert an empty write set the
+    /// other refuses to.
+    #[test]
+    fn plain_flavor_slot_and_effect_info_name_the_same_row() {
+        let slot = slot_for_call_flavor(CallFlavor::Plain);
+        assert_eq!(slot, majit_metainterp::EffectInfoSlot::Unanalyzed);
+        assert_eq!(
+            majit_metainterp::effect_info_for_slot(slot),
+            effect_info_for_call_flavor(CallFlavor::Plain)
+        );
     }
 
     #[test]

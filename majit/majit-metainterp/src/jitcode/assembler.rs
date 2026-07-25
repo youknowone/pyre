@@ -2937,21 +2937,43 @@ impl JitCodeBuilder {
     /// ()
     /// route through this adapter so callers do not have to thread
     /// `concrete_ptr` and `BhCallDescr` separately.
+    /// `call.py:282-303 getcalldescr`'s per-callee `extraeffect` for the
+    /// target at `fn_ptr_idx`.
+    ///
+    /// The producer already stamped its classification onto the
+    /// `JitCallTarget` (`add_call_target_with_save_err` /
+    /// `add_fn_ptr_with_slot`), so the residual descr reads that slot
+    /// instead of inventing a row here: a hand-classified
+    /// `#[dont_look_inside]` helper keeps `EF_CAN_RAISE`, while a helper
+    /// registered as [`crate::call_descr::EffectInfoSlot::Unanalyzed`]
+    /// keeps `MOST_GENERAL`. A `fn_ptr_idx` that is not a call target is
+    /// left to the `_with_effect_info` sibling's own panic.
+    fn effect_info_for_target(&self, fn_ptr_idx: u16) -> majit_ir::descr::EffectInfo {
+        match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => {
+                crate::call_descr::effect_info_for_slot(target.effect_info_slot)
+            }
+            _ => crate::call_descr::default_effect_info(),
+        }
+    }
+
     pub fn residual_call_void_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
         arg_regs: &[JitCallArg],
     ) {
         // pyjitpl.py:2655 do_residual_call invalidates the heapcache from
-        // descriptor effects before recording the call. `default_effect_info()`
-        // returns `EffectInfo::MOST_GENERAL`, the `graphanalyze.py:109-112`
-        // no-analyzed-graph outcome; `check_can_raise()`
-        // (`effectinfo.py:236 extraeffect > EF_CANNOT_RAISE`) stays true so
-        // the walker keeps emitting `GUARD_NO_EXCEPTION`.
+        // descriptor effects before recording the call, so the descr must
+        // carry the callee's own classification —
+        // `effect_info_for_target`. `check_can_raise()`
+        // (`effectinfo.py:236 extraeffect > EF_CANNOT_RAISE`) holds for
+        // every row it can return, so the walker keeps emitting
+        // `GUARD_NO_EXCEPTION`.
+        let effect_info = self.effect_info_for_target(fn_ptr_idx);
         self.residual_call_void_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
-            crate::call_descr::default_effect_info(),
+            effect_info,
         );
     }
 
@@ -3359,11 +3381,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
+        let effect_info = self.effect_info_for_target(fn_ptr_idx);
         self.residual_call_int_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
             dst,
-            crate::call_descr::default_effect_info(),
+            effect_info,
         );
     }
 
@@ -3400,11 +3423,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
+        let effect_info = self.effect_info_for_target(fn_ptr_idx);
         self.residual_call_ref_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
             dst,
-            crate::call_descr::default_effect_info(),
+            effect_info,
         );
     }
 
@@ -3511,11 +3535,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
+        let effect_info = self.effect_info_for_target(fn_ptr_idx);
         self.residual_call_float_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
             dst,
-            crate::call_descr::default_effect_info(),
+            effect_info,
         );
     }
 
