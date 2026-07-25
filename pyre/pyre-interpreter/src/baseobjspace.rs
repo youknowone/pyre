@@ -7848,6 +7848,79 @@ pub unsafe fn load_method_fast_path(
     Some((w_type, version_tag, w_descr))
 }
 
+/// The `getattr(w_obj, name)` shape that reduces, purely, to
+/// `w_method_new(w_descr, w_obj, w_type)` — the bound method
+/// `object.__getattribute__` builds when the name resolves to a plain
+/// builtin-code function on the type and nothing shadows it.
+///
+/// This is the case [`load_method_fast_path`] deliberately does NOT take:
+/// upstream restricts the `[w_descr, w_obj]` push to `flag_method_descriptor`
+/// types (only `Function.typedef`, typedef.py:807), so `lst.append` falls
+/// through to `space.getattr` and materialises a `Method` in both engines.
+/// PyPy's tracer then sees through that `getattr` — it is ordinary RPython —
+/// and the resulting `Method` virtualizes away, leaving LOAD_METHOD with zero
+/// ops in a steady-state loop. pyre's `getattr` is an opaque residual instead,
+/// so the tracer needs this predicate to reproduce the same fold.
+///
+/// Returns `(w_type, version_tag, w_descr)` when the reduction holds, `None`
+/// otherwise. Every ingredient is a pure read: the caller pins `w_type` on
+/// the receiver and `version_tag` on the type, which together make the
+/// `lookup_in_type` result a constant. The receiver must have no instance
+/// dict at all (not merely no entry for `name`) — a dict the guards do not
+/// cover could grow a shadowing entry between trace and execution.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn bound_method_attr_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() {
+        return None;
+    }
+    let w_type = crate::typedef::r#type(w_obj)?;
+    if w_type.is_null() {
+        return None;
+    }
+    // The tracer pins the class by guarding the receiver's `w_class` slot, so
+    // only a receiver whose class IS that slot can be reproduced.  Exception
+    // instances carrying the generic stub resolve their class through the
+    // kind registry instead and are declined here.
+    if !std::ptr::eq(w_type, (*w_obj).w_class) {
+        return None;
+    }
+    // typeobject.py:56-58: an uncacheable type cannot pin the lookup.
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    // Only the default `__getattribute__` is sound to reproduce.
+    if !has_object_getattribute(w_type) {
+        return None;
+    }
+    // No instance dict => the type lookup cannot be shadowed, so the
+    // non-data-descriptor branch of `object.__getattribute__` is the only
+    // reachable one.
+    if !getdict_backing(w_obj).is_null() {
+        return None;
+    }
+    let w_descr = lookup_in_type(w_type, name)?;
+    // `get()` binds exactly this shape: a `function` whose code is builtin
+    // (a `BuiltinFunction` returns itself unbound; every other descriptor
+    // kind takes a different arm).  A function is never a data descriptor,
+    // so the data-descriptor arm above it cannot fire either.
+    if !crate::is_function(w_descr) {
+        return None;
+    }
+    if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
+        return None;
+    }
+    if !crate::is_builtin_code(crate::function_get_code(w_descr) as PyObjectRef) {
+        return None;
+    }
+    Some((w_type, version_tag, w_descr))
+}
+
 /// descroperation.py:12-15 `object_getattribute(space)` — the canonical
 /// `object.__getattribute__` descriptor used as the identity anchor for
 /// the `uses_object_getattribute` fast path.  Returns true iff `w_descr`

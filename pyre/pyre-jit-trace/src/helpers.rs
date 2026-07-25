@@ -523,6 +523,43 @@ pub fn emit_exception_new_inline(
     new_op
 }
 
+/// Emit inline `Method` creation (NewWithVtable + SetfieldGc for
+/// `w_function` / `w_self` / `w_class` and the inherited header
+/// `PyObject.w_class`), mirroring `function.rs w_method_new`.
+///
+/// This is the traced form of the bound method `getattr(obj, name)` builds
+/// for a `LOAD_ATTR`-method whose descriptor lives on the type. Emitting it
+/// as New+SetField instead of the opaque `bh_load_attr_fn` residual lets the
+/// optimizer virtualize the method away when it is immediately consumed by
+/// the following `CALL` — the shape PyPy gets for free by tracing through
+/// `space.getattr` (its LOAD_METHOD emits no ops at all in a steady-state
+/// loop; `pypy/objspace/std/callmethod.py:25-80`).
+pub fn emit_bound_method_inline(
+    ctx: &mut TraceCtx,
+    w_function: OpRef,
+    w_self: OpRef,
+    w_class: OpRef,
+    header_w_class: OpRef,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_method_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+    for (descr, value) in [
+        (crate::descr::method_w_function_descr(), w_function),
+        (crate::descr::method_w_self_descr(), w_self),
+        (crate::descr::method_w_class_descr(), w_class),
+        (crate::descr::method_header_w_class_descr(), header_w_class),
+    ] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+        ctx.heapcache_setfield_cached(new_op, index, value);
+    }
+    new_op
+}
+
 /// Emit inline Object-strategy `W_ListObject` creation as traced
 /// `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` + `SetfieldGc`
 /// ops the optimizer can virtualize when the list never escapes — instead

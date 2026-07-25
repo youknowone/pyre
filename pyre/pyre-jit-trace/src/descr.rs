@@ -988,6 +988,19 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // The inline bound-method emit (`emit_bound_method_inline`) can
+            // escape a guard and be materialized, so the inherited Python
+            // class needs to be a proper virtual field of this group — same
+            // reasoning as the `PyObject.w_class` entry on W_ListObject.
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "Method",
         "function::Method",
@@ -1833,6 +1846,28 @@ pub fn method_w_function_descr() -> DescrRef {
 /// `_Method._immutable_fields_`.
 pub fn method_w_self_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 1)
+}
+
+/// `Method.w_class` — the class the bound function was found on
+/// (`function.py` `Method.w_class`), distinct from the inherited
+/// `PyObject.w_class` naming the Method's own type.
+pub fn method_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 2)
+}
+
+/// Inherited `PyObject.w_class` on a `Method` — the Python-level `method`
+/// class stamped by `w_method_new`'s header. Kept in the Method group (not
+/// the standalone `w_class_descr`) so an inline emit's store is a virtual
+/// field of the same size descr and materialization reproduces the header.
+pub fn method_header_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 3)
+}
+
+/// Size descriptor for `Method` allocation via `NewWithVtable`
+/// (vtable = `&METHOD_TYPE`); `w_function` / `w_self` / `w_class` and the
+/// inherited header `w_class` are `SetfieldGc`'d after.
+pub fn w_method_size_descr() -> DescrRef {
+    W_METHOD_DESCR_GROUP.size_descr.clone()
 }
 
 /// `typeobject.py:26-34 ObjectMutableCell.w_value` — the boxed payload of

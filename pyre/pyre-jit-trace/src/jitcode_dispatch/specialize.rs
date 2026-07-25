@@ -1666,6 +1666,133 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Fold the `LOAD_ATTR`-method `getattr` residual for a receiver whose name
+/// resolves to a plain builtin-code function on its type — the `lst.append`
+/// shape [`try_walker_specialize_load_method_attr`] declines because upstream
+/// restricts its `[w_descr, w_obj]` push to `flag_method_descriptor` types.
+///
+/// Both engines materialise a `Method` here (`space.getattr`), but PyPy traces
+/// *through* that `getattr` — it is ordinary RPython — so the type lookup folds
+/// to a constant under `guard_class` + the version pin and the `Method` itself
+/// virtualizes away: its optimized LOAD_METHOD emits no ops at all in a
+/// steady-state loop (`pypy/objspace/std/callmethod.py:25-80`). pyre's `getattr`
+/// is an opaque `CALL_MAY_FORCE` residual, which additionally drags a
+/// `GUARD_NOT_FORCED` (forcing the virtualizable frame) and a `GUARD_NO_EXCEPTION`
+/// through every iteration. This fold reproduces PyPy's shape directly:
+///
+///   guard_class(obj, ob_type)
+///   guard_value(getfield(obj, w_class), the type)
+///   guard_value(getfield(the type, version_tag), the tag)
+///   new_with_vtable(Method) + setfield(w_function/w_self/w_class/header)
+///
+/// The guards make `lookup_in_type` constant exactly as the version-tag promote
+/// does upstream, and the emitted `Method` is dead once the following `CALL`
+/// folds — the append fold reads `w_function` / `w_self` straight back off it.
+///
+/// Returns `None` (fall through to the residual, SAFE) for every shape
+/// [`pyre_interpreter::baseobjspace::bound_method_attr_fast_path`] declines.
+///
+/// Restricted to the top full-body frame for the reason
+/// [`try_walker_orthodox_list_append`] documents: inside an inlined callee
+/// sub-walk a fold's guards collapse their resume to the caller's CALL
+/// boundary, so a guard failure re-runs the callee from its entry and doubles
+/// any side effect it sequenced before this `LOAD_ATTR`. The residual resumes
+/// past the call instead, so declining here re-runs nothing extra.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    // `__`-names reach `getattr` through slots the fold does not model, the
+    // same carve-out `try_walker_specialize_load_method_attr` applies.
+    if name.contains("__") {
+        return Ok(None);
+    }
+    let Some((w_type, version_tag, w_descr)) = (unsafe {
+        pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+
+    // guard_class(obj, ob_type): the physical layout the `w_class` read below
+    // needs, and what pins the receiver's builtin kind.
+    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(phys_type);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, phys_type);
+    }
+
+    // Pin the Python-level class exactly: a subclass reaching the same
+    // physical layout can define its own `name` and must side-exit.
+    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[w_class_op, w_type_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(w_class_op, w_type_const);
+
+    // typeobject.py `promote(self.version_tag())`: reassigning the method on
+    // the type bumps the tag, so the constant `w_descr` side-exits.
+    let vt_op = walker_record_getfield_gc_i_uncached(
+        ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let vt_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+
+    // `w_method_new(w_descr, obj, w_type)` + the header stamp its allocation
+    // performs (`ob_type` comes from the NewWithVtable's size descr).
+    let func_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    let header_w_class = ctx
+        .trace_ctx
+        .const_ref(pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE) as i64);
+    let method_op = crate::helpers::emit_bound_method_inline(
+        ctx.trace_ctx,
+        func_const,
+        obj,
+        w_type_const,
+        header_w_class,
+    );
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(method_op, method_type_addr);
+    // The concrete bound method the walker's own execution must observe; a
+    // fresh `Method` per evaluation is what `getattr` produces anyway, so the
+    // trace allocating its own is not an identity divergence.
+    let bound = pyre_object::w_method_new(w_descr, concrete_obj, w_type);
+    ctx.trace_ctx.set_opref_concrete(
+        method_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(bound as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)?;
+    Ok(Some(()))
+}
+
 /// Fold `bh_load_method_self_fn(obj, attr, code, name_idx)` once both the
 /// receiver and the attribute are concrete.  The method-attribute fold above
 /// already guards class, type version, and instance map; this second residual
@@ -1693,9 +1820,35 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     let Some(concrete_attr) = walker_concrete_ref_object(ctx, attr) else {
         return Ok(None);
     };
+    // `compute_load_method_bound` answers PY_NULL for an already-bound method
+    // without inspecting anything else, so pinning the attribute's class is
+    // the whole precondition.  Left as a residual this is a second per-iteration
+    // call on top of the `getattr` one (`lst.append(x)` pays both).
     if unsafe { pyre_object::is_method(concrete_attr) } {
-        return Ok(None);
-    };
+        let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+        let class_pinned = attr.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(attr);
+        if !class_pinned {
+            // A guard here would resume at the caller's CALL inside an inlined
+            // callee sub-walk, re-running whatever that callee already did;
+            // leave those to the residual (which resumes past the call).
+            if ctx.fbw_mode.inline_subwalk {
+                return Ok(None);
+            }
+            let type_const = ctx.trace_ctx.const_int(method_type_addr);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardClass,
+                &[attr, type_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(attr, method_type_addr);
+        }
+        let null_const = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, null_const)?;
+        return Ok(Some(()));
+    }
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };

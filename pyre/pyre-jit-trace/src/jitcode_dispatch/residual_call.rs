@@ -3395,6 +3395,24 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // The `[w_descr, w_obj]` push above is restricted to
+                // `flag_method_descriptor` types, so a builtin method on a
+                // builtin receiver (`lst.append`) leaves `getattr` to build a
+                // `Method`.  Emit that construction instead of the opaque
+                // residual so it virtualizes into the following CALL.
+                if try_walker_specialize_load_bound_method_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
             }
         }
     }
