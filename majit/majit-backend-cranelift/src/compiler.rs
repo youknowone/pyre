@@ -8413,6 +8413,12 @@ impl CraneliftBackend {
             trace_id
         });
         let header_pc = self.next_header_pc.take().unwrap_or(0);
+        // One-shot like `next_trace_id` / `next_header_pc`: a compile entry that
+        // installs no override (`compile_tmp_callback`) must fall back to the
+        // process-global callback rather than inherit the previous driver's
+        // build-time store, which decodes the same `-live-` marker to a
+        // different — and silently plausible — count.
+        let frame_value_count_fn = self.next_frame_value_count_fn.take();
         let ptr_type = self.module.target_config().pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
         // The body uses CallConv::Tail so it can `return_call_indirect` to
@@ -8491,7 +8497,7 @@ impl CraneliftBackend {
             caller_layout,
             &constants_i64,
             attached_descrs,
-            self.next_frame_value_count_fn,
+            frame_value_count_fn,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
