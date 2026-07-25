@@ -10468,21 +10468,11 @@ impl CodeWriter {
                         // `setarrayitem_gc_r` array build (`pyframe.py:408-419`),
                         // then a single `build_map_from_array` residual consuming
                         // the forced `[k0, v0, k1, v1, ...]` array. No arity cap:
-                        // the length travels in the array.
+                        // the length travels in the array.  count 0 (`{}`) takes
+                        // the same path as every other count, exactly like
+                        // BuildSet: an empty array yields an empty dict.
                         Instruction::BuildMap { count } => {
                             let nitems = count.get(op_arg) as usize * 2;
-                            // Empty `{}` (count 0) declines: the only corpus
-                            // site is `type(name, (), {})`, whose raise
-                            // (UnicodeEncodeError) exercises the unsupported
-                            // exception-resume-through-call path (#68/#51c).
-                            // Non-empty dict literals lower to the array
-                            // residual below.
-                            if nitems == 0 {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
-                                emit_abort_permanent!(py_pc);
-                                continue;
-                            }
                             let mut item_values_rev = Vec::with_capacity(nitems);
                             for _ in 0..nitems {
                                 let _item_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -10620,9 +10610,7 @@ impl CodeWriter {
                         // `setarrayitem_gc_r` array build, then a single
                         // `build_set_from_array` residual consuming the forced
                         // element array.  No arity cap: the length travels in
-                        // the array.  Unlike BuildMap, no count==0 decline —
-                        // BuildSet has no raising corpus site (`{}` is a dict),
-                        // and an empty array yields an empty set.
+                        // the array.
                         Instruction::BuildSet { count } => {
                             let n = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(n);
