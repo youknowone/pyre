@@ -51,6 +51,12 @@ type ListGuard = parking_lot::lock_api::ReentrantMutexGuard<
     (),
 >;
 
+/// Only the acquire itself is opaque to the tracer; the guard-holding bodies
+/// stay look-inside, the same split `w_dict_lock` uses. A `dont_look_inside`
+/// data function is excluded from the jitcode pipeline entirely — the
+/// codewriter roots jitdriver portals and reaches everything else through
+/// look-inside calls — so the tracer emits a residual call for the whole
+/// operation instead of specializing the strategy dispatch.
 #[majit_macros::dont_look_inside]
 unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
     let lock = LIST_LOCKS[(obj as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
@@ -798,7 +804,6 @@ pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObje
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let _list_guard = w_list_lock(obj);
     let list = &*(obj as *const W_ListObject);
@@ -840,7 +845,6 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -> bool {
     let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
@@ -1026,7 +1030,6 @@ pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     let _list_guard = w_list_lock(obj);
     let list = &*(obj as *const W_ListObject);
