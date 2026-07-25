@@ -103,9 +103,10 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             forward(&mut ec.compiler);
             forward(&mut ec.w_profilefuncarg);
             forward(&mut ec.w_async_exception_type);
-            for wref in &mut ec.thread_local_refs {
-                forward(wref);
-            }
+            forward(&mut ec.sys_exc_value);
+            forward(&mut ec.current_gen_or_coroutine);
+            forward(&mut ec.w_asyncgen_firstiter_fn);
+            forward(&mut ec.w_asyncgen_finalizer_fn);
             if !ec.topframeref.is_null() {
                 let mut frame = ec.topframeref as PyObjectRef;
                 forward(&mut frame);
@@ -120,6 +121,12 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     }
                 }
             }
+            // `builtins_module` / `builtin_dict_cache` / `thread_local_refs`.
+            // `clone_for_thread` copies the builtins reference into the child
+            // EC, so each copy is its own slot: forwarding only the parent's
+            // leaves the child pointing at the pre-move address once a thread
+            // is registered but has not yet armed its own root area.
+            ec.walk_builtin_roots(visitor);
         }
     }
     let mut forwarded = Vec::new();
