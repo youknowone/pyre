@@ -3106,12 +3106,50 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
     next(zip_receiver(args, "__next__")?)
 }
 
+/// `objspace.py:752-753` / `:763-764` — the receiver gate both
+/// `StdObjSpace.finditem_str` and `StdObjSpace.finditem` apply before
+/// taking their shortcut: `isinstance(w_obj, W_DictMultiObject) and not
+/// w_obj.user_overridden_class`.  `is_dict` is the `isinstance` half (it
+/// answers the user-visible question, so a module dict passes); the exact
+/// class comparison is the `user_overridden_class` half, keeping a dict
+/// subclass — whose `__getitem__` or `__missing__` may override the probe
+/// — on the generic path.
+fn is_shortcut_dict(obj: PyObjectRef) -> bool {
+    unsafe {
+        if !pyre_object::is_dict(obj) {
+            return false;
+        }
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return false;
+        };
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+        !dict_type.is_null() && std::ptr::eq(w_type.as_ptr(), dict_type)
+    }
+}
+
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
 /// for `key` in `obj`, or `None` if absent.  PyPy catches only the
 /// `KeyError` arm and re-raises any other `OperationError`; in Rust
 /// the re-raise surfaces as `Result::Err`, the absent case as
 /// `Ok(None)`, and a hit as `Ok(Some(value))`.
+///
+/// `objspace.py:757-766 StdObjSpace.finditem` overrides that generic form
+/// with a "performance shortcut to avoid creating the
+/// OperationError(KeyError)": a plain dict answers the probe through its
+/// own strategy slot, so a miss allocates nothing.  The generic body below
+/// pays a full exception object — key `repr` included — for every miss,
+/// which is the common outcome on attribute-lookup paths.  A raising
+/// `__hash__`/`__eq__` reaches the shortcut as `DictKeyError`; recover the
+/// concrete exception through the same `take_pending_dict_key_error` the
+/// dict arm of `getitem_slot` uses, so the 3.14 dict-key hash-error wrapping
+/// is identical on both routes.  The shortcut is that arm minus its
+/// `dict_missing_or_key_error` miss branch, which only a dict subclass — one
+/// the receiver gate already excluded — can reach through `__missing__`.
 pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_shortcut_dict(obj) {
+        return unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) }
+            .map_err(|_| take_pending_dict_key_error(index));
+    }
     match getitem(obj, index) {
         Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
@@ -3600,7 +3638,18 @@ unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 }
 
 /// String-keyed `finditem` shorthand: `space.finditem_str(w_obj, key)`.
+///
+/// `objspace.py:745-755 StdObjSpace.finditem_str` shortcuts a plain dict to
+/// `w_obj.getitem_str(key)` — "performance shortcut to avoid creating the
+/// OperationError(KeyError) and allocating W_BytesObject".  Both halves
+/// apply here: `w_dict_getitem_str` probes the strategy with the borrowed
+/// `&str`, so a miss allocates neither the wrapped key nor the exception.
+/// Every other receiver falls through to `baseobjspace.py:868-871`, which
+/// wraps the key and defers to the generic `finditem`.
 pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, PyError> {
+    if is_shortcut_dict(obj) {
+        return Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(obj, key) });
+    }
     finditem(obj, w_str_new(key))
 }
 
