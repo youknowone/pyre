@@ -7,8 +7,8 @@ use crate::{make_builtin_function, make_builtin_function_with_arity, module_ns_s
 use pyre_object::*;
 use std::sync::OnceLock;
 
-/// Shared stub type for `sys._getframe`, `sys.flags`, `sys.stdout` and other
-/// module-level sys attributes that expose CPython-looking attribute bags.
+/// Shared stub type for `sys._getframe`, `sys.stdout` and other module-level
+/// sys attributes that expose attribute bags.
 ///
 /// `typedef::w_object()` (plain `object`) cannot store instance attributes —
 /// its type flag `hasdict` is false, matching CPython where `object()`
@@ -787,167 +787,67 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     let exc_info_code = unsafe { crate::getcode(exc_info_fn) };
     crate::function::register_sys_exc_info_path(exc_info_code, exc_info_direct);
     // sys.flags — pypy/module/sys/app.py:99-119 `class sysflags` with
-    // `__metaclass__ = structseqtype`. PyPy exposes it as a structseq
-    // (immutable tuple subclass with named fields). pyre does not have
-    // structseq yet, so we approximate the orthodox behavior with a
-    // dedicated type whose attributes live in the TYPE's class
-    // namespace rather than the instance dict. Read access via the
-    // descriptor protocol still works (`sys.flags.optimize`); writes
-    // fall through to `setdictvalue → raiseattrerror` because the type
-    // has no `__dict__` slot, matching the read-only contract:
-    //
-    //     >>> sys.flags.optimize = 3
-    //     AttributeError: 'sys.flags' object has no attribute 'optimize'
-    //
-    // The exact exception type differs from PyPy
-    // (`pypy/module/sys/test/test_sysmodule.py:148` expects TypeError)
-    // because pyre lacks the structseq tp_setattro slot. The full
-    // structseq port is tracked separately.
+    // `__metaclass__ = structseqtype`: an immutable tuple subclass whose
+    // first `n_sequence_fields` entries are also indexable, so
+    // `sys.flags[3] is sys.flags.optimize` and `isinstance(sys.flags,
+    // tuple)` both hold.  `gil`, `thread_inherit_context` and
+    // `context_aware_warnings` sit past the sequence as named-only extras,
+    // which is what makes `n_fields` (21) exceed `len()` (18).
     {
-        let flags_type = crate::typedef::make_builtin_type("sys.flags", |fns| {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "debug",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "inspect",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "interactive",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "optimize",
-                    w_int_new(crate::importing::optimize_level()),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "dont_write_bytecode",
-                    w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "no_user_site",
-                    w_int_new(i64::from(crate::importing::no_user_site_flag())),
-                )
-            };
-            // `-S` (skip `import site`) is recorded by the launcher.
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "no_site",
-                    w_int_new(i64::from(crate::importing::no_site_flag())),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "ignore_environment",
-                    w_int_new(i64::from(crate::importing::ignore_environment_flag())),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "verbose",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "bytes_warning",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "quiet",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "hash_randomization",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "isolated",
-                    w_int_new(i64::from(crate::importing::isolated_flag())),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "dev_mode",
-                    w_bool_from(crate::importing::dev_mode_flag()),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "utf8_mode",
-                    w_int_new(crate::importing::utf8_mode_flag()),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "warn_default_encoding",
-                    w_int_new(0),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "safe_path",
-                    w_bool_from(crate::importing::safe_path_flag()),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "int_max_str_digits",
-                    w_int_new(4300),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "context_aware_warnings",
-                    w_bool_from(false),
-                )
-            };
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    fns,
-                    "thread_inherit_context",
-                    w_int_new(0),
-                )
-            };
-        });
-        let flags = w_instance_new(flags_type);
+        let flags_type = crate::_structseq::make_struct_seq_with_extra(
+            "sys.flags",
+            &[
+                "debug",
+                "inspect",
+                "interactive",
+                "optimize",
+                "dont_write_bytecode",
+                "no_user_site",
+                "no_site",
+                "ignore_environment",
+                "verbose",
+                "bytes_warning",
+                "quiet",
+                "hash_randomization",
+                "isolated",
+                "dev_mode",
+                "utf8_mode",
+                "warn_default_encoding",
+                "safe_path",
+                "int_max_str_digits",
+            ],
+            &["gil", "thread_inherit_context", "context_aware_warnings"],
+        );
+        let flags = crate::_structseq::new_instance_with_extra(
+            flags_type,
+            vec![
+                w_int_new(0), // debug
+                w_int_new(0), // inspect
+                w_int_new(0), // interactive
+                w_int_new(crate::importing::optimize_level()),
+                w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
+                w_int_new(i64::from(crate::importing::no_user_site_flag())),
+                // `-S` (skip `import site`) is recorded by the launcher.
+                w_int_new(i64::from(crate::importing::no_site_flag())),
+                w_int_new(i64::from(crate::importing::ignore_environment_flag())),
+                w_int_new(0), // verbose
+                w_int_new(0), // bytes_warning
+                w_int_new(0), // quiet
+                w_int_new(0), // hash_randomization
+                w_int_new(i64::from(crate::importing::isolated_flag())),
+                w_bool_from(crate::importing::dev_mode_flag()),
+                w_int_new(crate::importing::utf8_mode_flag()),
+                w_int_new(0), // warn_default_encoding
+                w_bool_from(crate::importing::safe_path_flag()),
+                w_int_new(4300), // int_max_str_digits
+            ],
+            vec![
+                // The interpreter holds a GIL, so `-X gil=0` is not available.
+                ("gil", w_int_new(1)),
+                ("thread_inherit_context", w_int_new(0)),
+                ("context_aware_warnings", w_int_new(0)),
+            ],
+        );
         module_ns_store(ns, "flags", flags);
     }
     // sys.getdefaultencoding
