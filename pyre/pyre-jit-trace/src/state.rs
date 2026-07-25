@@ -9,7 +9,7 @@ use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
     BridgeInlineCarrier, BridgeVirtualCache, JitDriverStaticData, JitState, ReconstructRecipe,
-    ResidualVirtualizableSync, TraceAction, TraceCtx, decode_fieldnum, materialize_bridge_virtual,
+    TraceAction, TraceCtx, decode_fieldnum, materialize_bridge_virtual,
 };
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
@@ -9592,17 +9592,6 @@ impl JitState for PyreJitState {
         unsafe {
             info.reset_vable_token(frame_ptr);
         }
-    }
-
-    fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
-        crate::virtualizable_gen::virt_sync_before_residual(self, ctx)
-    }
-
-    fn sync_virtualizable_after_residual_call(
-        &self,
-        _ctx: &mut TraceCtx,
-    ) -> ResidualVirtualizableSync {
-        crate::virtualizable_gen::virt_sync_after_residual(self, _ctx)
     }
 
     fn import_virtualizable_boxes(

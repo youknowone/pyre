@@ -120,8 +120,8 @@ pub use io_buffer::{
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,
 };
 pub use jit_state::{
-    DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResidualVirtualizableSync,
-    ResumeDataResult, bridge_decode_red,
+    DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResumeDataResult,
+    bridge_decode_red,
 };
 pub use jitcode::{
     BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, RuntimeBhDescr, insns,

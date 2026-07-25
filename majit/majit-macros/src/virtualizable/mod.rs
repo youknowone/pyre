@@ -693,39 +693,6 @@ fn generate_standalone_hooks(
             Some(unsafe { info.read_all_boxes(obj_ptr, &lengths) })
         }
 
-        pub fn virt_sync_before_residual(
-            state: &#state_type,
-            ctx: &mut majit_metainterp::TraceCtx,
-        ) {
-            let info = build_virtualizable_info();
-            let Some(vable_ref) = ctx.standard_virtualizable_box() else {
-                return;
-            };
-            ctx.gen_store_back_in_vable(vable_ref);
-            let Some(obj_ptr) = __heap_ptr(state) else {
-                return;
-            };
-            unsafe {
-                info.tracing_before_residual_call(obj_ptr);
-            }
-            let force_token = ctx.force_token();
-            ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
-        }
-
-        pub fn virt_sync_after_residual(
-            state: &#state_type,
-            _ctx: &mut majit_metainterp::TraceCtx,
-        ) -> majit_metainterp::ResidualVirtualizableSync {
-            let info = build_virtualizable_info();
-            let Some(obj_ptr) = __heap_ptr(state) else {
-                return majit_metainterp::ResidualVirtualizableSync::default();
-            };
-            let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
-            majit_metainterp::ResidualVirtualizableSync {
-                updated_fields: Vec::new(),
-                forced,
-            }
-        }
     }
 }
 

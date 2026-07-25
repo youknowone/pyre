@@ -591,31 +591,6 @@ pub trait JitState: Sized {
         None
     }
 
-    /// Called before a residual call (CALL_MAY_FORCE) during tracing.
-    ///
-    /// Writes virtualizable state to heap via SETFIELD_GC ops so the callee
-    /// can observe up-to-date virtualizable fields. Interpreters that use
-    /// virtualizable objects should override this to emit the necessary
-    /// SETFIELD_GC operations for each tracked field.
-    ///
-    /// Default: no-op (interpreters without virtualizable fields).
-    fn sync_virtualizable_before_residual_call(&self, _ctx: &mut crate::trace_ctx::TraceCtx) {}
-
-    /// Called after a residual call (CALL_MAY_FORCE) during tracing.
-    ///
-    /// Re-reads virtualizable state from heap via GETFIELD_GC ops because
-    /// the callee may have modified virtualizable fields. Also reports whether
-    /// the standard virtualizable token protocol observed a force, in which
-    /// case the caller should abort tracing instead of emitting GUARD_NOT_FORCED.
-    ///
-    /// Default: no-op (interpreters without virtualizable fields).
-    fn sync_virtualizable_after_residual_call(
-        &self,
-        _ctx: &mut crate::trace_ctx::TraceCtx,
-    ) -> ResidualVirtualizableSync {
-        ResidualVirtualizableSync::default()
-    }
-
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef>;
 
     /// Loop-close jump-arg collection with access to the live
@@ -1362,17 +1337,6 @@ pub trait JitState: Sized {
             };
         }
     }
-}
-
-/// Outcome of virtualizable synchronization around a residual call.
-///
-/// `updated_fields` covers nonstandard/heap-based re-reads.
-/// `forced` mirrors the standard virtualizable token protocol: when true,
-/// tracing should abort instead of recording `GUARD_NOT_FORCED`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResidualVirtualizableSync {
-    pub updated_fields: Vec<(u32, OpRef)>,
-    pub forced: bool,
 }
 
 fn frame_values_from_reconstructed(
