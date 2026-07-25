@@ -2641,35 +2641,56 @@ pub fn w_exception_slot_descr(
 /// dead-store-eliminates a balanced save/restore (and the stored
 /// exception, if it never otherwise escapes, stays virtual and DCEs).
 pub fn ec_sys_exc_value_descr() -> DescrRef {
-    static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
-        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
-        // type_id 0 + vtable 0 → SimpleSizeDescr::is_object() == false, so
-        // the optimizer builds a StructPtrInfo for the (non-GC) EC pointer.
-        // The single field is Ref-typed (ref value tracking) but
-        // Unsigned-flagged (is_pointer_field() == false → no write barrier;
-        // the slot is a forwarded GC root, see eval::walk_pyframe_roots).
-        majit_ir::descr::make_simple_descr_group(
-            u32::MAX,
-            pyre_interpreter::EC_SIZE,
-            0,
-            0,
-            &[SimpleFieldDescrSpec {
-                index: 0,
-                field_key: "sys_exc_value".to_string(),
-                name: "ExecutionContext.sys_exc_value".to_string(),
-                offset: pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
-                field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
-                field_type: Type::Ref,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                flag: ArrayFlag::Unsigned,
-                virtualizable: false,
-                index_in_parent: 0,
-            }],
-        )
-    });
     EC_DESCR_GROUP.field_descrs[0].clone() as DescrRef
 }
+
+/// Field descr for `ExecutionContext::topframeref`, used by the JIT lowering
+/// of `executioncontext.py:88-89 enter` / `:96-97 leave` at an inlined call:
+/// `frame.f_backref = self.topframeref` reads it and
+/// `self.topframeref = jit.virtual_ref(frame)` writes it back.
+///
+/// Same group as [`ec_sys_exc_value_descr`] — one struct, one identity, so the
+/// heap optimizer can forward an `enter` store to the matching `leave` read
+/// and dead-store-eliminate a balanced pair whose frame never escaped.
+pub fn ec_topframeref_descr() -> DescrRef {
+    EC_DESCR_GROUP.field_descrs[1].clone() as DescrRef
+}
+
+/// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
+/// `SimpleSizeDescr::is_object() == false`, so the optimizer builds a
+/// StructPtrInfo for the (non-GC) EC pointer.  Both fields are Ref-typed
+/// (ref value tracking) but Unsigned-flagged (`is_pointer_field()` is false →
+/// no write barrier), which is correct because each slot is forwarded
+/// directly as a GC root every collection (`eval::walk_pyframe_roots`), so the
+/// generational remembered-set barrier is unnecessary.
+static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
+    use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+    let field = |index: u32, field_key: &str, offset: usize| SimpleFieldDescrSpec {
+        index,
+        // descr.py:220-233 cache key is the bare fieldname; `name` is the
+        // qualified display form.
+        field_key: field_key.to_string(),
+        name: format!("ExecutionContext.{field_key}"),
+        offset,
+        field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
+        field_type: Type::Ref,
+        is_immutable: false,
+        is_quasi_immutable: false,
+        flag: ArrayFlag::Unsigned,
+        virtualizable: false,
+        index_in_parent: 0,
+    };
+    majit_ir::descr::make_simple_descr_group(
+        u32::MAX,
+        pyre_interpreter::EC_SIZE,
+        0,
+        0,
+        &[
+            field(0, "sys_exc_value", pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET),
+            field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
+        ],
+    )
+});
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
 /// vtable = &SLICE_TYPE (ob_type for virtual materialization).

@@ -2586,16 +2586,15 @@ impl MIFrame {
             self.orgpc = pc;
         }
         self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
-        // pyjitpl.py:2971 assert len(self.virtualref_boxes) == 0,
+        // pyjitpl.py:2995 assert len(self.virtualref_boxes) == 0,
         //     "missing virtual_ref_finish()?"
-        // Reached loop header must not have dangling virtualrefs — they
-        // should have been finished by prior vrefs_after_residual_call /
-        // stop_tracking_virtualref. pyre's equivalent is sym.virtualref_boxes.
-        debug_assert!(
-            self.sym().virtualref_boxes.is_empty(),
-            "missing virtual_ref_finish()? close_loop_args_at reached with \
-             virtualref_boxes={:?}",
-            self.sym().virtualref_boxes.len()
+        // Reached loop header must not have dangling virtualrefs — every
+        // `enter` must have been matched by a `leave`, or one closed by
+        // vrefs_after_residual_call / stop_tracking_virtualref.
+        debug_assert_eq!(
+            ctx.virtualref_boxes_len(),
+            0,
+            "missing virtual_ref_finish()? close_loop_args_at reached with open virtualrefs"
         );
         // Verify `live_args_shape_at` formula matches actual output.
         // If this fires, the helper's shape derivation is stale relative
@@ -2982,7 +2981,10 @@ impl MIFrame {
         // multi-frame parent chain was the retired trait-interpret leg.
         let frames = vec![top_frame];
         let vable_boxes = self.list_of_boxes_virtualizable(ctx);
-        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
+        // `pyjitpl.py:2623` passes `self.virtualref_boxes` to the snapshot
+        // alongside the virtualizable boxes; the vable half here comes from
+        // the trait leg's own mirror, so take only the vref half.
+        let (_, vref_boxes) = ctx.build_snapshot_vable_vref_boxes();
         // PHASE 1.4 candidate D probe: detect snapshot-time divergence
         // between vable_boxes (heap mirror) and registers_r (machine
         // register source). Both should be populated by store_local_value's
@@ -3346,19 +3348,6 @@ impl MIFrame {
             }
         }
         boxes
-    }
-
-    /// pyjitpl.py:2597 virtualref_boxes parity.
-    /// pyjitpl.py:2597 virtualref_boxes parity.
-    /// Returns pairs of (jit_virtual, real_vref) as SnapshotTagged.
-    fn build_virtualref_boxes(
-        sym: &PyreSym,
-        ctx: &majit_metainterp::TraceCtx,
-    ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
-        sym.virtualref_boxes
-            .iter()
-            .map(|&(opref, _concrete)| Self::opref_to_snapshot_tagged(opref, ctx))
-            .collect()
     }
 
     /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:

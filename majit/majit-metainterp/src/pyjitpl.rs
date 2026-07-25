@@ -4923,25 +4923,9 @@ impl<M: Clone> MetaInterp<M> {
         let Some(ctx) = self.tracing.as_mut() else {
             return OpRef::NONE;
         };
-        // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
-        // `vrefinfo = self.staticdata.virtualref_info` (pyjitpl.py:1314).
-        let vref_ptr = self
-            .staticdata
-            .virtualref_info
-            .virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
-        // pyjitpl.py:1805: cindex = ConstInt(len(virtualref_boxes) // 2)
-        let cindex = ctx.const_int((ctx.virtualref_boxes.len() / 2) as i64);
-        // pyjitpl.py:1806-1807:
-        //   resbox = metainterp.history.record2(rop.VIRTUAL_REF, box, cindex, vref)
-        //   self.metainterp.heapcache.new(resbox)
-        // `TraceCtx::virtual_ref` bundles both so the heapcache `new`
-        // is not skipped (the inline `ctx.record_op(VirtualRefR, ...)`
-        // form bypassed `heap_cache.new_object` — pyjitpl.py:1807 parity).
-        let vref = ctx.virtual_ref(virtual_obj, cindex);
-        // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
-        ctx.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
-        ctx.virtualref_boxes.push((vref, vref_ptr as usize));
-        vref
+        // `@arguments("box", returns="box")` — the jitcode opimpl yields only
+        // the box; the concrete vref has no register to land in.
+        ctx.opimpl_virtual_ref(virtual_obj, virtual_obj_ptr).0
     }
 
     /// pyjitpl.py:1819-1832 `opimpl_virtual_ref_finish(box)` parity —
@@ -4952,54 +4936,10 @@ impl<M: Clone> MetaInterp<M> {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
-        // `pyjitpl.py:1820-1822`:
-        //     vrefbox = metainterp.virtualref_boxes.pop()
-        //     lastbox = metainterp.virtualref_boxes.pop()
-        let (vrefbox, vref_ptr) = ctx
-            .virtualref_boxes
-            .pop()
-            .expect("opimpl_virtual_ref_finish: missing vrefbox");
-        let (lastbox, lastbox_ptr) = ctx
-            .virtualref_boxes
-            .pop()
-            .expect("opimpl_virtual_ref_finish: missing virtualbox");
-        // `pyjitpl.py:1823 assert box.getref_base() == lastbox.getref_base()`
-        // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
-        // alias boxes that share `getref_base()` but differ in box identity;
-        // an `OpRef`-identity assert would reject those.  Read
-        // `virtual_obj`'s ref value off its variant tag when it is a
-        // ConstPtr, falling back to the pre-pop side-table pointer that the
-        // matching `opimpl_virtual_ref(virtual_obj, virtual_obj_ptr)`
-        // recorded as `lastbox_ptr`.
-        let virtual_obj_ptr = match virtual_obj.inline_const_to_value() {
-            Some(Value::Ref(r)) => r.as_usize(),
-            _ => lastbox_ptr,
-        };
-        // pyjitpl.py:1825 `assert box.getref_base() == lastbox.getref_base()`
-        // — RPython's plain `assert` fires in both untranslated and
-        // translated builds (the latter via the same fail-fast on
-        // invariant break); the Rust port mirrors that with `assert_eq!`
-        // so release builds also fail at the divergence point rather
-        // than silently corrupting the vref stack.
-        assert_eq!(
-            virtual_obj_ptr, lastbox_ptr,
-            "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
-             (virtual_obj={:?}, lastbox={:?})",
-            virtual_obj, lastbox
+        assert!(
+            ctx.opimpl_virtual_ref_finish(virtual_obj),
+            "opimpl_virtual_ref_finish: missing vrefbox"
         );
-        // pyjitpl.py:1826-1832 `vrefinfo = ...; vref = vrefbox.getref_base();
-        //   if vrefinfo.is_virtual_ref(vref): record VIRTUAL_REF_FINISH`.
-        let is_vref = vref_ptr != 0
-            && unsafe {
-                self.staticdata
-                    .virtualref_info
-                    .is_virtual_ref(vref_ptr as *const u8)
-            };
-        if is_vref {
-            // pyjitpl.py:1831-1832 `VIRTUAL_REF_FINISH(vrefbox, nullbox)`.
-            let null = ctx.const_ref(0);
-            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, null]);
-        }
     }
 
     /// Whether the engine is currently tracing.

@@ -1045,6 +1045,113 @@ impl TraceCtx {
         result
     }
 
+    /// Live `[virtualbox, vrefbox]` entry count — twice the number of open
+    /// `virtual_ref` scopes.  `pyjitpl.py:2995` asserts this is zero when a
+    /// loop header is reached ("missing virtual_ref_finish()?").
+    pub fn virtualref_boxes_len(&self) -> usize {
+        self.virtualref_boxes.len()
+    }
+
+    /// `pyjitpl.py:3433 rebuild_state_after_failure`'s
+    /// `self.virtualref_boxes = virtualref_boxes`.  A bridge resumes into its
+    /// parent's still-open `virtual_ref` scopes, so the pairs the parent guard
+    /// encoded are re-tracked before the bridge trace records anything —
+    /// otherwise its own `virtual_ref_finish` would pop an empty stack.
+    pub fn restore_virtualref_boxes(&mut self, boxes: Vec<(OpRef, usize)>) {
+        self.virtualref_boxes = boxes;
+    }
+
+    /// `pyjitpl.py:1789-1814 opimpl_virtual_ref` — `ExecutionContext.enter`'s
+    /// `jit.virtual_ref(frame)` (`executioncontext.py:89`) as the tracer sees
+    /// it.  Creates the concrete vref, records `VIRTUAL_REF(box, cindex)`, and
+    /// pushes the `[virtualbox, vrefbox]` pair.
+    ///
+    /// Lives here rather than on `MetaInterp` because `virtualref_boxes` does:
+    /// upstream has exactly one `MetaInterp.virtualref_boxes`, and both the
+    /// MIFrame leg and the full-body walker record into this one trace.
+    ///
+    /// Returns the recorded box and the concrete vref.  Upstream returns only
+    /// the box because the `jit.virtual_ref` call it lowers hands its runtime
+    /// result straight back to the interpreter's `enter`; pyre's walker has to
+    /// perform that store itself, so it needs both.
+    pub fn opimpl_virtual_ref(
+        &mut self,
+        virtual_obj: OpRef,
+        virtual_obj_ptr: usize,
+    ) -> (OpRef, *mut u8) {
+        // pyjitpl.py:1804 `vref = vrefinfo.virtual_ref_during_tracing(box)`.
+        let vref_ptr = self
+            .metainterp_sd
+            .virtualref_info
+            .virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
+        // pyjitpl.py:1805 `cindex = ConstInt(len(virtualref_boxes) // 2)`.
+        let cindex = self.const_int((self.virtualref_boxes.len() / 2) as i64);
+        // pyjitpl.py:1806-1807 `record2(VIRTUAL_REF, box, cindex)` +
+        // `heapcache.new(resbox)`, bundled by `virtual_ref`.
+        let vref = self.virtual_ref(virtual_obj, cindex);
+        // pyjitpl.py:1814 `virtualref_boxes += [virtualbox, vrefbox]`.
+        self.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
+        self.virtualref_boxes.push((vref, vref_ptr as usize));
+        (vref, vref_ptr)
+    }
+
+    /// `pyjitpl.py:1819-1832 opimpl_virtual_ref_finish(box)` —
+    /// `ExecutionContext.leave`'s `jit.virtual_ref_finish`
+    /// (`executioncontext.py:107`).  The vrefbox is reconstituted by popping,
+    /// not passed in, so the stack discipline is checked rather than assumed.
+    ///
+    /// Returns whether a pair was popped: the walker brackets a callee level
+    /// whose `enter` may have been skipped, and an unbalanced pop would eat
+    /// an enclosing level's pair.
+    pub fn opimpl_virtual_ref_finish(&mut self, virtual_obj: OpRef) -> bool {
+        // pyjitpl.py:1820-1822 `vrefbox = pop(); lastbox = pop()`.
+        let Some((vrefbox, vref_ptr)) = self.virtualref_boxes.pop() else {
+            return false;
+        };
+        let (lastbox, lastbox_ptr) = self
+            .virtualref_boxes
+            .pop()
+            .expect("opimpl_virtual_ref_finish: vrefbox without its virtualbox");
+        // pyjitpl.py:1823 `assert box.getref_base() == lastbox.getref_base()`
+        // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
+        // alias boxes that share `getref_base()` but differ in box identity;
+        // an `OpRef`-identity assert would reject those.  Read `virtual_obj`'s
+        // ref value off its variant tag when it is a ConstPtr, falling back to
+        // the pre-pop side-table pointer the matching `opimpl_virtual_ref`
+        // recorded as `lastbox_ptr`.
+        let virtual_obj_ptr = match virtual_obj.inline_const_to_value() {
+            Some(Value::Ref(r)) => r.as_usize(),
+            _ => lastbox_ptr,
+        };
+        // RPython's plain `assert` fires in both untranslated and translated
+        // builds, so this is an `assert_eq!`: a release build must fail at the
+        // divergence rather than silently corrupt the vref stack.
+        assert_eq!(
+            virtual_obj_ptr, lastbox_ptr,
+            "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
+             (virtual_obj={virtual_obj:?}, lastbox={lastbox:?})"
+        );
+        // pyjitpl.py:1826-1832 `if vrefinfo.is_virtual_ref(vref): record
+        // VIRTUAL_REF_FINISH`.  False once `stop_tracking_virtualref` has
+        // replaced the box with ConstPtr(NULL) — the finish already ran.
+        let is_vref = vref_ptr != 0
+            && unsafe {
+                self.metainterp_sd
+                    .virtualref_info
+                    .is_virtual_ref(vref_ptr as *const u8)
+            };
+        if is_vref {
+            // pyjitpl.py:1831-1832 `VIRTUAL_REF_FINISH(vrefbox, nullbox)`.
+            let null = self.const_ref(0);
+            let _ = Self::do_record_op(
+                &mut self.recorder,
+                OpCode::VirtualRefFinish,
+                &[vrefbox, null],
+            );
+        }
+        true
+    }
+
     /// `pyjitpl.py:3317-3324 MetaInterp.vable_and_vrefs_before_residual_call`
     /// — the vrefs half (the virtualizable-info half lives on
     /// `JitCodeMachine::prepare_standard_virtualizable_before_residual_call`).

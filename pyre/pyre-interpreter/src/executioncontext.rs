@@ -78,7 +78,7 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
 /// jit_virtual_ref_vtable: return inst` (the pointer already *is* the frame)
 /// else materialize via `force_virtual`.
 #[inline]
-pub(crate) fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
+pub fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
         // Only the tracer stores a `JitVirtualRef` here, and it registers the
         // hook when the driver comes up, so an unset hook means the slot was
@@ -305,6 +305,13 @@ pub fn execution_context_builtin_cache_get(ec: &ExecutionContext) -> PyObjectRef
 /// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
+
+/// Byte offset of `topframeref` within `ExecutionContext`, for the JIT's
+/// GETFIELD_GC/SETFIELD_GC lowering of [`ExecutionContext::enter`] /
+/// [`ExecutionContext::leave`] at an inlined call.  The traced sequence is
+/// `executioncontext.py:88-89` — read the slot into the callee's `f_backref`,
+/// then store the callee's `jit.virtual_ref` back into it.
+pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, topframeref);
 
 /// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr
 /// describing the (non-GC) EC struct.  The EC is never JIT-allocated;

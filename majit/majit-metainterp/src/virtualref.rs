@@ -150,6 +150,23 @@ pub use crate::jit::InvalidVirtualRef;
 /// `virtualref.py:85-91 virtual_ref_during_tracing(real_object)`.
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
+///
+/// The allocation is a leaked `Box`, not a GC object as
+/// `lltype.malloc(self.JIT_VIRTUAL_REF)` is: the vref outlives every scope
+/// that could free it — the trace stores its address in `virtualref_boxes`
+/// and in resume data, the interpreter stores it in `ec.topframeref` /
+/// `f_backref`, and after `virtual_ref_finish` a forced frame may still be
+/// reached through it — so ownership genuinely belongs to the collector.  Two
+/// consequences follow, and both are why this is safe rather than merely
+/// tolerated: the address never moves, which is what lets `virtualref_boxes`
+/// hold it as a raw pointer across a collection, and the GC skips it as
+/// unowned when it visits the root slot it sits in
+/// (`majit-gc gc_current_object_address` early-out).  What is lost is
+/// reclamation: one 24-byte vref per inlined call, per trace recording, is
+/// never freed.  That is bounded by compilation events rather than by
+/// iterations, and converges the same way the sibling divergence noted on
+/// `set_vref_gc_type_id`'s registration does — by moving this allocation, the
+/// `_dummy`, and the JITFRAME under the GC together.
 fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
     let vref = Box::new(JitVirtualRef {
         super_: ObjectHeader {

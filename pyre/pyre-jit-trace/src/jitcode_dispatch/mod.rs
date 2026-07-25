@@ -101,18 +101,14 @@
 //!       token before the call and probe-and-clears it after, surfacing
 //!       [`DispatchError::VableEscapedDuringResidualCall`] on a force
 //!       (`pyjitpl.py` ABORT_ESCAPE parity).  The vref halves
-//!       (`vrefs_before_residual_call` / `vrefs_after_residual_call` /
-//!       `stop_tracking_virtualref`) ARE ported — on `TraceCtx`, and
-//!       wired on the metainterp leg — but the walker never calls
-//!       them, so the gap is the call, not the port.  Two
-//!       `virtualref_boxes` also exist: `TraceCtx`'s, which the
-//!       bracket and the guard snapshots read, and `PyreSym`'s, which
-//!       only the caller-less `opimpl_virtual_ref` /
-//!       `opimpl_virtual_ref_finish` and the resume-side decode
-//!       touch.  A producer must push into `TraceCtx`'s or nothing
-//!       downstream sees it.  Unreachable today — the codewriter
-//!       emits no `jit.virtual_ref` producers (`jit/call.rs`),
-//!       leaving both empty so every loop iterates zero times.
+//!       (`vrefs_before_residual_call` / `vrefs_after_residual_call` →
+//!       `stop_tracking_virtualref`) are bracketed at the same two
+//!       points, over the vrefs an inlined call's `enter` pushed
+//!       (`inline_call.rs::walker_ec_enter`).  They still iterate zero
+//!       times for a callee the walker inlines without seeding a frame:
+//!       such a level has no frame object to take a `jit.virtual_ref`
+//!       of, where upstream's `perform_call` builds one for every
+//!       inlined call (`pyjitpl.py:2445-2476, 1862-1874`).
 //!    b. **Codewriter-side**: `direct_assembler_call` + KEEPALIVE on
 //!       vablebox (`pyjitpl.py:3589-3609 + 2080-2081`). Walker's
 //!       residual_call dispatchers never receive `assembler_call=True`

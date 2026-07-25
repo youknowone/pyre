@@ -1607,6 +1607,142 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     )
 }
 
+/// `executioncontext.py:85-89 ExecutionContext.enter`, at an inlined call.
+///
+/// ```python
+/// def enter(self, frame):
+///     frame.f_backref = self.topframeref
+///     self.topframeref = jit.virtual_ref(frame)
+/// ```
+///
+/// Both halves run.  The recorded ops are what a guard resumes into; the
+/// concrete stores are what the callee body observes while this walk records
+/// it, because the walk IS the interpreter running — a `sys._getframe()` in
+/// the body executes as a residual against the live `ec`, and without the
+/// concrete store it would read the CALLER and commit the wrong frame.
+///
+/// The concrete slot holds the `JitVirtualRef`, not the frame:
+/// `executioncontext::force_vref` resolves it for every reader, and a vref
+/// built by `virtual_ref_during_tracing` already carries `forced = frame` with
+/// `virtual_token = TOKEN_NONE` (`virtualref.py:85-92`), so the resolution is
+/// exact and cannot fail.  Storing the vref rather than the frame is what lets
+/// the optimizer keep the frame virtual: nothing reads the frame itself unless
+/// something forces it.
+///
+/// Returns the vref's OpRef for the matching [`walker_ec_leave`].
+fn walker_ec_enter(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+) -> OpRef {
+    // `frame.f_backref = self.topframeref` — the caller's vref moves into the
+    // callee, unforced.  `emit_new_pyframe_inline_with_params` leaves the slot
+    // at its constructor default, so this is the store that links the chain.
+    let concrete_caller_topframeref = unsafe { (*concrete_ec).topframeref };
+    let caller_topframeref = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[callee_ec],
+        crate::descr::ec_topframeref_descr(),
+    );
+    ctx.set_opref_concrete(
+        caller_topframeref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, caller_topframeref],
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    // `self.topframeref = jit.virtual_ref(frame)`.
+    let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame as usize);
+    ctx.set_opref_concrete(
+        vref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_ec, vref],
+        crate::descr::ec_topframeref_descr(),
+    );
+    unsafe {
+        (*concrete_frame).f_backref = concrete_caller_topframeref;
+        (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;
+    }
+    vref
+}
+
+/// `executioncontext.py:91-107 ExecutionContext.leave`'s frame-chain half, at
+/// the return from an inlined call.
+///
+/// ```python
+/// frame_vref = self.topframeref
+/// self.topframeref = frame.f_backref
+/// if frame.escaped or got_exception:
+///     f_back = frame.f_backref()
+///     if f_back:
+///         f_back.mark_as_escaped()
+///     frame_vref()
+/// jit.virtual_ref_finish(frame_vref, frame)
+/// ```
+///
+/// The profile-hook half stays with the interpreter's own
+/// [`pyre_interpreter::PyExecutionContext::leave`]; a traced call never runs a
+/// profile hook, which is why upstream can inline this frame at all.
+///
+/// Upstream runs this from a `finally`, so the caller must too: every path out
+/// of the callee level — normal return, raised exception, or a declined
+/// sub-walk — has to reach it, or `virtualref_boxes` is left unbalanced and the
+/// loop header trips `assert len(self.virtualref_boxes) == 0`.
+fn walker_ec_leave(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+    got_exception: bool,
+) {
+    // `self.topframeref = frame.f_backref` — no parens: the caller's vref
+    // moves back unforced, so a caller frame that stayed virtual stays virtual.
+    let concrete_f_backref = unsafe { (*concrete_frame).f_backref };
+    let f_backref = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[callee_frame],
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    ctx.set_opref_concrete(
+        f_backref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_ec, f_backref],
+        crate::descr::ec_topframeref_descr(),
+    );
+    unsafe {
+        let frame_vref = (*concrete_ec).topframeref;
+        (*concrete_ec).topframeref = concrete_f_backref;
+        if (*concrete_frame).escaped() || got_exception {
+            // A frame that reached app level must keep its caller reachable
+            // too, or the next `_getframe().f_back` walks into a frame the JIT
+            // was still free to keep virtual.  `get_f_back` forces, which is
+            // `f_back = frame.f_backref()` with the parens.
+            let f_back = (*concrete_frame).get_f_back();
+            if !f_back.is_null() {
+                (*f_back).mark_as_escaped();
+            }
+            // `frame_vref()` — force the leaving frame's own vref so it
+            // outlives the JIT frame.  A no-op at recording time (the vref
+            // already carries `forced`), kept because it is the operation
+            // upstream performs and the optimizer reads the trace, not this.
+            let _ = pyre_interpreter::executioncontext::force_vref(frame_vref);
+        }
+    }
+    // `jit.virtual_ref_finish(frame_vref, frame)`.
+    ctx.opimpl_virtual_ref_finish(callee_frame);
+}
+
 /// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
 /// resolve their callee from the CALL operand; builtin-dispatch specializers
 /// resolve an app-level descriptor first and enter here with that function as
@@ -2172,6 +2308,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     let mut ca_callee_frame = OpRef::NONE;
     let mut ca_callee_ec = OpRef::NONE;
     let mut ca_nlocals = 0usize;
+    // The seeded callee frame's runtime object, for the `enter`/`leave`
+    // bracket below — the OpRef alone cannot carry it out of the seed block.
+    let mut ca_concrete_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
     // A strict straight-line callee at the top inline level is seeded the same
     // way, so its in-callee guards route through the multi-frame snapshot.  A
     // deeper strict callee (`inline_depth >= fbw_max_multiframe_depth()`) keeps the
@@ -2385,6 +2524,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ca_callee_frame = callee_frame;
             ca_callee_ec = callee_ec;
             ca_nlocals = nlocals;
+            ca_concrete_frame = concrete_frame_ptr;
             callee_frame_seeded = true;
         }
     }
@@ -2612,6 +2752,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ctx.outer_jitcode_index,
             ctx.outer_resume_marker_jit_pc,
         )
+    };
+    // `executioncontext.py:88 enter` — emitted here, past every decline gate,
+    // so a callee that never runs leaves no half-entered chain behind.  A
+    // seeded level is the only one with a frame object to enter with; an
+    // unseeded (register-resident) inline has none, which is the remaining gap
+    // between this chain and upstream's, where `perform_call` builds a frame
+    // for every inlined call (`pyjitpl.py:2445-2476, 1862-1874`).
+    let entered_ec = callee_frame_seeded && !ca_concrete_frame.is_null() && {
+        let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
+            as *mut pyre_interpreter::PyExecutionContext;
+        if concrete_ec.is_null() {
+            false
+        } else {
+            walker_ec_enter(
+                ctx.trace_ctx,
+                ca_callee_frame,
+                ca_callee_ec,
+                ca_concrete_frame,
+                concrete_ec,
+            );
+            true
+        }
     };
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
@@ -2937,6 +3099,23 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
         (result, class_of_last_exc_is_const)
     };
+    // `executioncontext.py:91-107 leave`, in the original's `finally`
+    // position: the sub-walk block above is an expression that always
+    // completes, so every callee exit — return, exception, or decline —
+    // arrives here before any of the early returns below.
+    if entered_ec {
+        let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
+            as *mut pyre_interpreter::PyExecutionContext;
+        let got_exception = !matches!(callee_outcome, Ok((DispatchOutcome::SubReturn { .. }, _)));
+        walker_ec_leave(
+            ctx.trace_ctx,
+            ca_callee_frame,
+            ca_callee_ec,
+            ca_concrete_frame,
+            concrete_ec,
+            got_exception,
+        );
+    }
     // RPython has one MetaInterp shared by every MIFrame.  The sub-walk uses
     // a copied FbwWalkMode only to satisfy Rust's nested borrow, so write the
     // MetaInterp-owned exception state back across the frame boundary.
