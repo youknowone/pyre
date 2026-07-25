@@ -95,11 +95,6 @@ struct ServentRaw {
 /// UnicodeEncodeError falls back to `.encode('idna')`.  Embedded null
 /// bytes raise TypeError (matching `:120-122`).  Other input types
 /// raise TypeError.
-///
-/// pyre's `idna` codec presently passes through as UTF-8 instead of
-/// emitting punycode, so non-ASCII hostnames still pass through this
-/// helper without raising but produce incorrect DNS queries — that is
-/// an `encodings/idna` gap, not a `_socket` parity issue.
 #[cfg(unix)]
 fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     if w_host.is_null() {
@@ -109,15 +104,23 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, cr
     }
     let bytes: Vec<u8> = unsafe {
         if pyre_object::is_str(w_host) {
-            let s = crate::baseobjspace::str_utf8_w(w_host)?;
-            if s.is_ascii() {
+            // The ASCII attempt reads the raw buffer, so a host that has no
+            // utf-8 view — one carrying a lone surrogate — reaches the `idna`
+            // fallback the same way any other non-ASCII host does.
+            let s = pyre_object::unicodeobject::w_str_get_wtf8(w_host);
+            if s.as_bytes().is_ascii() {
                 s.as_bytes().to_vec()
             } else {
                 let method = crate::baseobjspace::getattr_str(w_host, "encode")?;
                 let codec = pyre_object::w_str_new("idna");
                 let encoded = crate::call_function(method, &[codec]);
                 if encoded.is_null() {
-                    return Err(crate::PyError::type_error("idna encoding failed"));
+                    // The codec's own error is what the caller sees — a host
+                    // the `idna` codec rejects raises that rejection, not a
+                    // substituted one.
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::type_error("idna encoding failed")
+                    }));
                 }
                 if !pyre_object::bytesobject::is_bytes_like(encoded) {
                     return Err(crate::PyError::type_error(
