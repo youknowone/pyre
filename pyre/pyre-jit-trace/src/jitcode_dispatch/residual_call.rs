@@ -2219,23 +2219,64 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
     Some(decode_descr_index(body_code, d, descr_offset))
 }
 
-/// `BINARY_OP Add` has the generic residual shape in a per-function jitcode,
-/// but the walker replaces a statically tagged plain add with `IntAddOvf` or
-/// `FloatAdd` before the generic residual executor (and its nested-residual
-/// decline) is reached when every incoming callee argument is int or float.
+/// A `BINARY_OP` has the generic residual shape in a per-function jitcode, but
+/// the walker replaces a statically tagged plain arithmetic op with a native
+/// one before the generic residual executor (and its nested-residual decline)
+/// is reached, when every incoming callee argument is an exact int or float.
 /// Non-numeric operands stay an impure residual, so admitting them here would
-/// trigger the nested-residual 6421 abort storm.  Accept only the constant
-/// `Add` tag with numeric arguments; every in-place tag and every dynamic or
-/// different binary operation remains conservative.
-pub(crate) fn residual_call_is_specialized_plain_int_add(
+/// trigger the nested-residual 6421 abort storm.
+///
+/// The accepted set is every tag a specialization table lowers with no runtime
+/// decline path left, so nothing survives as a residual.  Both tables key the
+/// in-place tag to the SAME arm as its plain form, so the two forms are
+/// admitted together:
+///
+/// - `Add` / `Subtract` / `Multiply` (+ in-place) — `IntAddOvf` / `IntSubOvf` /
+///   `IntMulOvf` in `try_walker_specialize_binary_op_int`, `FloatAdd` /
+///   `FloatSub` / `FloatMul` in `try_walker_specialize_binary_op_float`.  In
+///   both tables `needs_concrete_check` is false, so either argument width
+///   lowers unconditionally.
+/// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`, also
+///   unconditional, but *int-only*: the float table falls through to
+///   `_ => return Ok(None)` for them.  Hence the separate
+///   `args_all_exact_plain_int`.
+///
+/// Every other tag is excluded because its lowering can still decline and
+/// leave the residual in place:
+///
+/// - `FloorDivide` / `Remainder` (+ in-place) — int-table `needs_concrete_check`
+///   declines a zero or `i64::MIN / -1` divisor; the float table has no
+///   `FLOAT_*` opcode for either.
+/// - `TrueDivide` (+ in-place) — float-table only, and it declines a zero
+///   divisor so the raising `descr_truediv` stays recorded.
+/// - `Lshift` (+ in-place) — the int table declines it outright (the reused
+///   trace would bake a count the x86 `SHL` masks mod 64, and the guarded form
+///   breaks the cranelift bridge).
+/// - `Rshift` (+ in-place) — declines a negative or `>= LONG_BIT` count rather
+///   than baking intobject.py's fold-to-`0`/`-1`.
+/// - `Power` (+ in-place) — the int table has no arm; the float table inlines
+///   `_pow` but keeps a cold-path residual for nan/inf/negative-base operands.
+/// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm in either table.
+///
+/// Known limitation: both flags describe the callee's INCOMING arguments, not
+/// the operands of the binop itself, which this straight-line scan cannot name.
+/// A body can reach a non-numeric operand through the two residuals the scan
+/// already treats as replay-safe reads (`LoadConst` / `LoadGlobal`), and a
+/// user `__add__` behind one of those would be a live-heap effect the claim
+/// misses.  The in-place tags do not widen that hole: an in-place result must
+/// be stored back, and every store target outside the callee's own registers
+/// (`STORE_GLOBAL` / `STORE_ATTR` / `STORE_SUBSCR`) is itself an unproven
+/// residual that fails this scan first.
+pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     body_code: &[u8],
-    args_all_numeric: bool,
+    args_all_exact_numeric: bool,
+    args_all_exact_plain_int: bool,
     d: &DecodedOp,
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
-    if !args_all_numeric
+    if !args_all_exact_numeric
         || !matches!(
             d.key,
             "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
@@ -2247,7 +2288,7 @@ pub(crate) fn residual_call_is_specialized_plain_int_add(
     }
     // `iIR`: funcptr i-reg, then the I-list.  The first I-list item is the
     // BINARY_OP tag.  It must be in the callee's immutable constants window;
-    // a runtime tag could select an in-place or user-defined operation.
+    // a runtime tag could select an operation outside the accepted set.
     let Some(&i_len) = body_code.get(d.pc + 2) else {
         return false;
     };
@@ -2263,10 +2304,26 @@ pub(crate) fn residual_call_is_specialized_plain_int_add(
     else {
         return false;
     };
-    matches!(
-        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
-        Some(pyre_interpreter::bytecode::BinaryOperator::Add)
-    )
+    use pyre_interpreter::bytecode::BinaryOperator;
+    match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
+        Some(
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::InplaceAdd
+            | BinaryOperator::InplaceSubtract
+            | BinaryOperator::InplaceMultiply,
+        ) => true,
+        Some(
+            BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Xor
+            | BinaryOperator::InplaceAnd
+            | BinaryOperator::InplaceOr
+            | BinaryOperator::InplaceXor,
+        ) => args_all_exact_plain_int,
+        _ => false,
+    }
 }
 
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(

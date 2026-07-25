@@ -1411,7 +1411,8 @@ pub(crate) enum CalleeReplaySafety {
 /// there, which this straight-line scan cannot name.
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
-    args_all_numeric: bool,
+    args_all_exact_numeric: bool,
+    args_all_exact_plain_int: bool,
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
@@ -1465,9 +1466,10 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
             if !provably_side_effect_free
-                && !residual_call_is_specialized_plain_int_add(
+                && !residual_call_is_specialized_plain_numeric_binop(
                     body_code,
-                    args_all_numeric,
+                    args_all_exact_numeric,
+                    args_all_exact_plain_int,
                     &d,
                     num_regs_i,
                     constants_i,

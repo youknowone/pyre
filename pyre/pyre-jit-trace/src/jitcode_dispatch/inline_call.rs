@@ -1417,6 +1417,15 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw && !is_call_function_ex {
         return Ok(None);
     }
+    if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        eprintln!(
+            "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={}",
+            op.pc,
+            pyre_helper,
+            r_args.len(),
+            ctx.fbw_mode.inline_subwalk,
+        );
+    }
     if r_args.is_empty() {
         return Ok(None);
     }
@@ -1450,8 +1459,17 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
     else {
+        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            eprintln!("[inline-decline] pc={} callee not inlinable", op.pc);
+        }
         return Ok(None);
     };
+    if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        eprintln!(
+            "[inline-resolved] pc={} nparams={nparams} has_closure={has_closure} method_form={method_form}",
+            op.pc,
+        );
+    }
     let (callee_args, callee_arg_concretes) = if is_call_kw {
         // A keyword call folds its `kwnames`->parameter permutation at trace
         // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
@@ -1574,13 +1592,46 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    let args_all_numeric = callee_arg_concretes.iter().all(|concrete| match concrete {
-        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => true,
-        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
-            pyre_object::is_int(*obj) || pyre_object::is_float(*obj)
-        },
-        ConcreteValue::Ref(_) | ConcreteValue::Null => false,
-    });
+    // EXACT int/float only.  These feed `fbw_callee_body_replay_safety`, whose
+    // question is "will the walker specialize this body's BINARY_OP to a native
+    // op, leaving no residual to replay?".  The walker's specialization admits
+    // only exact builtin numbers (`walker_int_specialization_operands` /
+    // `walker_float_specialization_operands` both require
+    // `is_exact_builtin_instance`), because a numeric subclass keeps the
+    // builtin layout while its Python-visible class lives in `w_class` and may
+    // define its own `__add__`.  `is_int` / `is_float` are `ob_type` checks
+    // that a subclass passes, so using them here claims a specialization that
+    // will not happen and admits a body whose real residual a replay would
+    // double.
+    //
+    // The two widths are folded in one pass because the accepted tag set
+    // depends on which one holds: only the int table covers `And` / `Or` /
+    // `Xor`, so those need every argument to be an exact plain int, while
+    // `Add` / `Subtract` / `Multiply` are in both tables and take either.
+    // `bool` is excluded from both: `is_plain_int1` rejects it, so an
+    // argument list carrying one stays on the conservative side.
+    let (args_all_exact_plain_int, args_all_exact_numeric) =
+        callee_arg_concretes
+            .iter()
+            .fold((true, true), |(all_int, all_numeric), concrete| {
+                let (exact_int, exact_float) = match concrete {
+                    ConcreteValue::Int(_) => (true, false),
+                    ConcreteValue::Float(_) => (false, true),
+                    ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+                        (
+                            pyre_object::is_plain_int1(*obj),
+                            pyre_object::is_plain_float_strict(*obj),
+                        )
+                    },
+                    ConcreteValue::Bool(_) | ConcreteValue::Ref(_) | ConcreteValue::Null => {
+                        (false, false)
+                    }
+                };
+                (
+                    all_int && exact_int,
+                    all_numeric && (exact_int || exact_float),
+                )
+            });
     let args_all_builtin_integer = callee_arg_concretes.iter().all(|concrete| match concrete {
         ConcreteValue::Int(_) | ConcreteValue::Bool(_) => true,
         ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { pyre_object::is_int_or_long(*obj) },
@@ -1658,13 +1709,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // per iteration, though each body on its own is pure arithmetic.
     let mut foriter_deferred_admit = false;
     if fbw_foriter_inflight_active() {
-        let admit = match fbw_callee_body_replay_safety(
+        let safety = fbw_callee_body_replay_safety(
             body.code,
-            args_all_numeric,
+            args_all_exact_numeric,
+            args_all_exact_plain_int,
             body.num_regs_i,
             body.constants_i,
             callee_descr_refs,
-        ) {
+        );
+        let admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
                 foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
@@ -1672,6 +1725,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             }
             CalleeReplaySafety::Dirty => false,
         };
+        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            eprintln!(
+                "[inline-foriter-gate] pc={} admit={admit} exact_numeric={args_all_exact_numeric} \
+                 safety={safety:?} deferred_admit={foriter_deferred_admit}",
+                op.pc,
+            );
+        }
         if !admit {
             return Ok(None);
         }
