@@ -76,9 +76,12 @@ would only manufacture conflicts):
   carrier-boundary raise delivery, now unconditional with the
   `PYRE_FBW_TRYBLOCK_INLINE` / `PYRE_FBW_CARRIER_RAISE` gates retired.
 
-**Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam
-of the vable-owner rework toward `direct_assembler_call` scalar args);
-`PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
+**Judged KEEP** (genuine WIP parity port): `PYRE_FBW_VABLE_SCALAR_CA` was kept
+here as "S0 seam of the vable-owner rework toward `direct_assembler_call` scalar
+args" — **that judgement was wrong and is reversed in §1d**: the 2026-07-25
+parity pass read `direct_assembler_call` and found its ON design is what
+upstream's `num_red_args` assert forbids. Retired.
+Still kept: `PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
 into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
 inert until validated; the seed's `bridge_guard_exc` GC-rooting and the
 unconditional `execute_ll_raised` exception assign are parity gaps to close
