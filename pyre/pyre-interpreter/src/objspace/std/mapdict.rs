@@ -10,11 +10,55 @@
 
 use crate::PyError;
 use pyre_object::PyObjectRef;
+use parking_lot::ReentrantMutex;
 
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+
+// PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
+// free-threaded, so use narrow address-striped reentrant locks around the same
+// transition boundaries.  This is synchronization only; attribute state
+// remains on `W_ObjectObject.map/storage`, exactly as upstream.
+struct ForkReentrantLock(UnsafeCell<ReentrantMutex<()>>);
+unsafe impl Sync for ForkReentrantLock {}
+
+impl ForkReentrantLock {
+    fn new() -> Self {
+        Self(UnsafeCell::new(ReentrantMutex::new(())))
+    }
+
+    fn get(&self) -> &ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(ReentrantMutex::new(())) };
+    }
+}
+
+static INSTANCE_LOCKS: LazyLock<Vec<ForkReentrantLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkReentrantLock::new()).collect());
+static CODE_CACHE_LOCKS: LazyLock<Vec<ForkReentrantLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkReentrantLock::new()).collect());
+
+fn instance_lock_for(obj: PyObjectRef) -> &'static ReentrantMutex<()> {
+    INSTANCE_LOCKS[(obj as usize >> 4) & (INSTANCE_LOCKS.len() - 1)].get()
+}
+
+fn code_cache_lock_for(code: PyObjectRef) -> &'static ReentrantMutex<()> {
+    CODE_CACHE_LOCKS[(code as usize >> 4) & (CODE_CACHE_LOCKS.len() - 1)].get()
+}
+
+pub fn after_fork_child() {
+    for lock in INSTANCE_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+    for lock in CODE_CACHE_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
 
 // ── attribute shapes (mapdict.py:32-42, 720-732) ──────────────────────
 
@@ -340,6 +384,7 @@ pub unsafe fn instance_node_setdictvalue(
     name: &Wtf8,
     value: PyObjectRef,
 ) -> bool {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -364,6 +409,7 @@ pub unsafe fn instance_node_setdictvalue(
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -388,6 +434,7 @@ pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Optio
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -413,6 +460,7 @@ pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool 
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -432,6 +480,7 @@ pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> bool {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -445,6 +494,7 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
 /// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &*(obj as *const pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -461,6 +511,7 @@ pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef>
 /// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef) -> bool {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -474,6 +525,7 @@ pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef)
 /// `obj` must be a live `W_ObjectObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
+    let _instance_guard = instance_lock_for(obj).lock();
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
@@ -761,6 +813,10 @@ pub struct MapAttrCache {
     cached_attrs: Vec<MapRef>,
 }
 
+// MapRef targets are process-lifetime immutable/interned nodes; the only
+// mutable cache slots are protected by MAP_ATTR_CACHE's mutex.
+unsafe impl Send for MapAttrCache {}
+
 impl MapAttrCache {
     fn new() -> Self {
         let size = 1usize << METHODCACHESIZEEXP;
@@ -789,17 +845,18 @@ impl MapAttrCache {
     }
 }
 
-thread_local! {
-    /// `space.fromcache(MapAttrCache)` (mapdict.py:80) — one cache per space;
-    /// pyre runs one space per thread.
-    static MAP_ATTR_CACHE: RefCell<MapAttrCache> = RefCell::new(MapAttrCache::new());
-}
+/// `space.fromcache(MapAttrCache)` (mapdict.py:80) — one cache on the shared
+/// object space.  Pyre's free-threaded execution contexts share that space, so
+/// the cache remains process/interpreter-owned and is synchronized rather than
+/// duplicated through TLS.
+static MAP_ATTR_CACHE: LazyLock<Mutex<MapAttrCache>> =
+    LazyLock::new(|| Mutex::new(MapAttrCache::new()));
 
 /// interp_gc.py:14-17 — clear `space.fromcache(MapAttrCache)` before an
 /// explicit full collection so cached map nodes do not retain stale entries.
 #[majit_macros::dont_look_inside]
 pub fn clear_map_attr_cache() {
-    MAP_ATTR_CACHE.with(|cache| cache.borrow_mut().clear());
+    MAP_ATTR_CACHE.lock().unwrap().clear();
 }
 
 /// `objectmodel.compute_hash(name)` for a (utf8-encoded) str (mapdict.py:94).
@@ -849,32 +906,27 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
     let product = attrs_as_int.wrapping_mul(hash_selector) as u64;
     let attr_hash = ((product ^ (product << SHIFT1)) >> SHIFT2) as usize;
 
-    MAP_ATTR_CACHE.with(|cache| {
-        {
-            let cache = cache.borrow();
-            if cache.attrs[attr_hash] == self_node
-                && cache.names[attr_hash].as_deref() == Some(name)
-                && cache.indexes[attr_hash] == attrkind
-            {
-                let cached = cache.cached_attrs[attr_hash];
-                return if cached.is_null() { None } else { Some(cached) };
-            }
-        }
-        let attr = unsafe { find_map_attr_chain(self_node, name, attrkind) };
-        // Populate the cache, gated on `space._side_effects_ok()`
-        // (mapdict.py:110). `_side_effects_ok` returns True except under reverse
-        // debugging (not ported); the JIT does not trace this write because the
-        // cache path is `@jit.dont_look_inside` and the JIT calls
-        // `find_map_attr_chain` directly.
-        if crate::baseobjspace::side_effects_ok() {
-            let mut cache = cache.borrow_mut();
-            cache.attrs[attr_hash] = self_node;
-            cache.names[attr_hash] = Some(name.to_owned());
-            cache.indexes[attr_hash] = attrkind;
-            cache.cached_attrs[attr_hash] = attr.unwrap_or(std::ptr::null());
-        }
-        attr
-    })
+    let mut cache = MAP_ATTR_CACHE.lock().unwrap();
+    if cache.attrs[attr_hash] == self_node
+        && cache.names[attr_hash].as_deref() == Some(name)
+        && cache.indexes[attr_hash] == attrkind
+    {
+        let cached = cache.cached_attrs[attr_hash];
+        return if cached.is_null() { None } else { Some(cached) };
+    }
+    let attr = unsafe { find_map_attr_chain(self_node, name, attrkind) };
+    // Populate the cache, gated on `space._side_effects_ok()`
+    // (mapdict.py:110). `_side_effects_ok` returns True except under reverse
+    // debugging (not ported); the JIT does not trace this write because the
+    // cache path is `@jit.dont_look_inside` and the JIT calls
+    // `find_map_attr_chain` directly.
+    if crate::baseobjspace::side_effects_ok() {
+        cache.attrs[attr_hash] = self_node;
+        cache.names[attr_hash] = Some(name.to_owned());
+        cache.indexes[attr_hash] = attrkind;
+        cache.cached_attrs[attr_hash] = attr.unwrap_or(std::ptr::null());
+    }
+    attr
 }
 
 // ── LOAD_ATTR / STORE_ATTR inline cache (mapdict.py:1416-1653) ─────────
@@ -1137,6 +1189,12 @@ pub unsafe fn load_attr_caching(
     nameindex: usize,
     name: &str,
 ) -> Result<PyObjectRef, PyError> {
+    // PyPy's GIL makes the per-instance map/storage pair and the per-code
+    // `_mapdict_caches` entry one atomic observation.  Preserve those exact
+    // owners under free threading with narrow synchronization around the
+    // upstream cache operation.
+    let _instance_guard = instance_lock_for(w_obj).lock();
+    let _code_cache_guard = code_cache_lock_for(pycode).lock();
     let entry = unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) };
     // mapdict.py:1482 `map = w_obj._get_mapdict_map()`.
     let map = unsafe { mapdict_map_or_null(w_obj) };
@@ -1539,6 +1597,8 @@ pub unsafe fn store_attr_caching(
     name: &str,
     w_value: PyObjectRef,
 ) -> Result<(), PyError> {
+    let _instance_guard = instance_lock_for(w_obj).lock();
+    let _code_cache_guard = code_cache_lock_for(pycode).lock();
     let entry = unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) };
     // mapdict.py:1577 `map = w_obj._get_mapdict_map()`.
     let map = unsafe { mapdict_map_or_null(w_obj) };
@@ -2859,33 +2919,17 @@ pub unsafe fn node_write<O: MapdictObject>(
     }
 }
 
-thread_local! {
-    /// objspace/std/mapdict.py:830 — MapdictDictSupport stores the
-    /// instance dict in the "dict" SPECIAL slot of the mapdict map.
-    /// pyre keeps a side table of address → W_DictObject because there
-    /// is no mapdict; semantically this is the same backing store.
-    pub static INSTANCE_DICT: RefCell<HashMap<usize, PyObjectRef>> =
-        RefCell::new(HashMap::new());
-}
+/// These tables are the temporary carrier for builtin-layout objects that do
+/// not yet have mapdict SPECIAL fields.  PyPy's SPECIAL fields are visible to
+/// every ExecutionContext, so the compatibility carrier must be
+/// interpreter/process-owned too, never TLS.
+pub static INSTANCE_DICT: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static WEAKREF_TABLE: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-thread_local! {
-    /// objspace/std/mapdict.py:780-797 MapdictWeakrefSupport stores the
-    /// lifeline in the "weakref" SPECIAL slot of the mapdict map. pyre
-    /// uses that slot for `W_ObjectObject`; this table remains only for
-    /// weakrefable non-instance wrappers that have no mapdict carrier.
-    pub static WEAKREF_TABLE: RefCell<HashMap<usize, PyObjectRef>> =
-        RefCell::new(HashMap::new());
-
-    static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea {
-        instance_dict: INSTANCE_DICT.with(|table| table as *const _),
-        weakref_table: WEAKREF_TABLE.with(|table| table as *const _),
-    };
-}
-
-struct MapdictRootArea {
-    instance_dict: *const RefCell<HashMap<usize, PyObjectRef>>,
-    weakref_table: *const RefCell<HashMap<usize, PyObjectRef>>,
-}
+struct MapdictRootArea;
+static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea;
 
 // ── MapdictDictSupport ────────────────────────────────────────────────
 
@@ -3288,15 +3332,20 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
         debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
         w_dict
     } else {
-        let existing =
-            INSTANCE_DICT.with(|table| table.borrow().get(&(self_ref as usize)).copied());
+        let existing = INSTANCE_DICT
+            .lock()
+            .unwrap()
+            .get(&(self_ref as usize))
+            .copied()
+            .map(|dict| dict as PyObjectRef);
         if let Some(w_dict) = existing {
             return w_dict;
         }
         let w_dict = pyre_object::w_dict_new();
-        INSTANCE_DICT.with(|table| {
-            table.borrow_mut().insert(self_ref as usize, w_dict);
-        });
+        INSTANCE_DICT
+            .lock()
+            .unwrap()
+            .insert(self_ref as usize, w_dict as usize);
         w_dict
     }
 }
@@ -3389,22 +3438,19 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
 }
 
 pub fn capture_mapdict_root_area() -> *const () {
-    MAPDICT_ROOT_AREA.with(|area| area as *const _ as *const ())
+    &MAPDICT_ROOT_AREA as *const _ as *const ()
 }
 
 /// # Safety
 /// `data` must come from [`capture_mapdict_root_area`], and the owning thread
 /// must be quiesced.
-pub unsafe fn walk_mapdict_roots_area(data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let area = unsafe { &*(data as *const MapdictRootArea) };
-    let instance_dict = unsafe { &*area.instance_dict };
-    let weakref_table = unsafe { &*area.weakref_table };
+pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
     let dict_values = {
-        let table = instance_dict;
-        table
-            .borrow()
+        INSTANCE_DICT
+            .lock()
+            .unwrap()
             .iter()
-            .map(|(&key, &dict)| (key, dict))
+            .map(|(&key, &dict)| (key, dict as PyObjectRef))
             .collect::<Vec<_>>()
     };
     // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
@@ -3413,14 +3459,13 @@ pub unsafe fn walk_mapdict_roots_area(data: *const (), mut visitor: impl FnMut(&
         visitor(&mut dict);
         let new_key = current_owner_key(key);
         {
-            let table = instance_dict;
-            let mut table = table.borrow_mut();
+            let mut table = INSTANCE_DICT.lock().unwrap();
             if new_key == key {
                 if let Some(slot) = table.get_mut(&key) {
-                    *slot = dict;
+                    *slot = dict as usize;
                 }
             } else if table.remove(&key).is_some() {
-                table.insert(new_key, dict);
+                table.insert(new_key, dict as usize);
             }
         }
         // Trace the dict's own r_dict entries. INSTANCE_DICT now holds only
@@ -3453,25 +3498,24 @@ pub unsafe fn walk_mapdict_roots_area(data: *const (), mut visitor: impl FnMut(&
         // So no instance is walked here.
     }
     let weakref_values = {
-        let table = weakref_table;
-        table
-            .borrow()
+        WEAKREF_TABLE
+            .lock()
+            .unwrap()
             .iter()
-            .map(|(&key, &value)| (key, value))
+            .map(|(&key, &value)| (key, value as PyObjectRef))
             .collect::<Vec<_>>()
     };
     for (key, mut value) in weakref_values {
         visitor(&mut value);
         let new_key = current_owner_key(key);
         {
-            let table = weakref_table;
-            let mut table = table.borrow_mut();
+            let mut table = WEAKREF_TABLE.lock().unwrap();
             if new_key == key {
                 if let Some(slot) = table.get_mut(&key) {
-                    *slot = value;
+                    *slot = value as usize;
                 }
             } else if table.remove(&key).is_some() {
-                table.insert(new_key, value);
+                table.insert(new_key, value as usize);
             }
         }
     }
@@ -3534,9 +3578,10 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         // Non-instance hasdict objects (property/member, baseobjspace
         // 1850/3786) keep a plain own-storage dict in the address-keyed side
         // table; it never delegates to a backing object, so no force step.
-        INSTANCE_DICT.with(|table| {
-            table.borrow_mut().insert(self_ref as usize, w_dict);
-        });
+        INSTANCE_DICT
+            .lock()
+            .unwrap()
+            .insert(self_ref as usize, w_dict as usize);
     }
     Ok(())
 }
@@ -3558,7 +3603,12 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
     if unsafe { pyre_object::is_instance(self_ref) } {
         unsafe { instance_get_weakref_slot(self_ref) }
     } else {
-        WEAKREF_TABLE.with(|table| table.borrow().get(&(self_ref as usize)).copied())
+        WEAKREF_TABLE
+            .lock()
+            .unwrap()
+            .get(&(self_ref as usize))
+            .copied()
+            .map(|value| value as PyObjectRef)
     }
 }
 
@@ -3575,11 +3625,10 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
         let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
         debug_assert!(flag, "write to the weakref SPECIAL slot failed");
     } else {
-        WEAKREF_TABLE.with(|table| {
-            table
-                .borrow_mut()
-                .insert(self_ref as usize, weakreflifeline);
-        });
+        WEAKREF_TABLE
+            .lock()
+            .unwrap()
+            .insert(self_ref as usize, weakreflifeline as usize);
     }
 }
 
@@ -3593,9 +3642,10 @@ pub fn delweakref(self_ref: PyObjectRef) {
     if unsafe { pyre_object::is_instance(self_ref) } {
         unsafe { instance_del_weakref_slot(self_ref) };
     } else {
-        WEAKREF_TABLE.with(|table| {
-            table.borrow_mut().remove(&(self_ref as usize));
-        });
+        WEAKREF_TABLE
+            .lock()
+            .unwrap()
+            .remove(&(self_ref as usize));
     }
 }
 
@@ -3712,7 +3762,7 @@ mod tests {
     #[test]
     fn find_map_attr_cached_matches_uncached_on_hit_and_miss() {
         unsafe {
-            MAP_ATTR_CACHE.with(|c| c.borrow_mut().clear());
+            MAP_ATTR_CACHE.lock().unwrap().clear();
             let (_term, a, b) = build_chain();
             // first call populates the cache, second hits it
             assert_eq!(find_map_attr(b, wn("a"), DICT), Some(a));
@@ -4237,7 +4287,7 @@ mod tests {
             let addr = obj_ref as usize;
             // Never entered INSTANCE_DICT (no getdict call), proving storage
             // forwarding is decoupled from wrapper materialisation.
-            let in_instance_dict = INSTANCE_DICT.with(|t| t.borrow().contains_key(&addr));
+            let in_instance_dict = INSTANCE_DICT.lock().unwrap().contains_key(&addr);
             assert_eq!(in_instance_dict, false);
 
             let mut seen: Vec<PyObjectRef> = Vec::new();
@@ -4265,7 +4315,7 @@ mod tests {
             // stored in the SPECIAL slot, not INSTANCE_DICT.
             assert_eq!(instance_get_dict_slot(obj_ref), Some(w1));
             let addr = obj_ref as usize;
-            let in_instance_dict = INSTANCE_DICT.with(|t| t.borrow().contains_key(&addr));
+            let in_instance_dict = INSTANCE_DICT.lock().unwrap().contains_key(&addr);
             assert_eq!(in_instance_dict, false);
             // identity stable across repeated access.
             let w2 = _obj_getdict(obj_ref);

@@ -169,6 +169,9 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(w_none());
     }
     let dur = std::time::Duration::from_nanos(timeout_ns as u64);
+    // interp_time.py's `time_sleep` is an `@rffi` external call.  In pyre the
+    // blocking mutator leaves the free-threaded GC's STW RUNNING census.
+    let _blocking = crate::module::thread::before_external_block();
     #[cfg(feature = "sandbox")]
     {
         // The controller services the sleep; signal handling is its concern.

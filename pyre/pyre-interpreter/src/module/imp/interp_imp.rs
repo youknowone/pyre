@@ -460,7 +460,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // not yet imported, -1 = a builtin already in sys.modules and
                 // thus not re-initializable (sys/builtins and any other
                 // already-imported builtin).
-                let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(name));
+                let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(name);
                 let result = if !is_builtin {
                     0
                 } else if crate::importing::check_sys_modules(name).is_some() {

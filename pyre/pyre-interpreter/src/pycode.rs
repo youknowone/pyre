@@ -194,7 +194,9 @@ pub struct PyCode {
     /// to `code.names.len()`, never resized.  `null` when `code_ptr`
     /// is null or unaligned (test fixtures, gateway builtins).
     pub globals_caches:
-        *mut Vec<Option<std::rc::Weak<std::cell::RefCell<pyre_object::celldict::GlobalCache>>>>,
+        *mut std::sync::Mutex<
+            Vec<Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>>,
+        >,
     /// `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     /// len(co_names_w)`.
     ///
@@ -348,10 +350,10 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         let names_len = code_ref.names.len();
         let mut v: Vec<
-            Option<std::rc::Weak<std::cell::RefCell<pyre_object::celldict::GlobalCache>>>,
+            Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>,
         > = Vec::with_capacity(names_len);
         v.resize_with(names_len, || None);
-        Box::into_raw(Box::new(v))
+        Box::into_raw(Box::new(std::sync::Mutex::new(v)))
     };
     // `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     // len(co_names_w)` — `None` is `INVALID_CACHE_ENTRY`.
@@ -1676,7 +1678,7 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
 
 /// `celldict.py:292 cache_wref = pycode._globals_caches[nameindex]` —
 /// read slot `nameindex` and upgrade the weakref to a strong
-/// `Rc<RefCell<GlobalCache>>` (returning `None` when the slot is
+/// `Arc<Mutex<GlobalCache>>` (returning `None` when the slot is
 /// unset, the weak target is gone, or `code_ptr` is invalid).
 ///
 /// # Safety
@@ -1685,7 +1687,7 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
 pub unsafe fn w_code_globals_caches_get(
     obj: PyObjectRef,
     nameindex: usize,
-) -> Option<std::rc::Rc<std::cell::RefCell<pyre_object::celldict::GlobalCache>>> {
+) -> Option<std::sync::Arc<std::sync::Mutex<pyre_object::celldict::GlobalCache>>> {
     if obj.is_null() {
         return None;
     }
@@ -1693,14 +1695,14 @@ pub unsafe fn w_code_globals_caches_get(
     if code.globals_caches.is_null() {
         return None;
     }
-    let vec = unsafe { &*code.globals_caches };
+    let vec = unsafe { &*code.globals_caches }.lock().unwrap();
     vec.get(nameindex)
         .and_then(|slot| slot.as_ref())
         .and_then(|w| w.upgrade())
 }
 
 /// `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`
-/// — store `Rc::downgrade(cache)` in slot `nameindex`.  No-op when
+/// — store `Arc::downgrade(cache)` in slot `nameindex`.  No-op when
 /// `code_ptr` is invalid or `nameindex` is out of range.
 ///
 /// # Safety
@@ -1709,7 +1711,7 @@ pub unsafe fn w_code_globals_caches_get(
 pub unsafe fn w_code_globals_caches_set(
     obj: PyObjectRef,
     nameindex: usize,
-    cache: &std::rc::Rc<std::cell::RefCell<pyre_object::celldict::GlobalCache>>,
+    cache: &std::sync::Arc<std::sync::Mutex<pyre_object::celldict::GlobalCache>>,
 ) {
     if obj.is_null() {
         return;
@@ -1718,9 +1720,9 @@ pub unsafe fn w_code_globals_caches_set(
     if code.globals_caches.is_null() {
         return;
     }
-    let vec = unsafe { &mut *code.globals_caches };
+    let mut vec = unsafe { &*code.globals_caches }.lock().unwrap();
     if let Some(slot) = vec.get_mut(nameindex) {
-        *slot = Some(std::rc::Rc::downgrade(cache));
+        *slot = Some(std::sync::Arc::downgrade(cache));
     }
 }
 
@@ -1739,7 +1741,7 @@ pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
     if code.globals_caches.is_null() {
         return 0;
     }
-    unsafe { (*code.globals_caches).len() }
+    unsafe { (*code.globals_caches).lock().unwrap().len() }
 }
 
 /// `mapdict.py:1483/1546/1575 entry = pycode._mapdict_caches[nameindex]` — read

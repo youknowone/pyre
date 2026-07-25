@@ -366,6 +366,17 @@ pub fn unregister_mutator() {
     registry.swap_remove(index);
 }
 
+/// Discard root areas owned by threads which disappeared across `fork()`.
+///
+/// PyPy's `reinit_threads()` retains only the child thread's execution
+/// context.  The shadow-stack registry is the translated equivalent of that
+/// per-thread root ownership.
+pub fn after_fork_child() {
+    let thread_id = std::thread::current().id();
+    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    registry.retain(|entry| entry.thread_id == thread_id);
+}
+
 /// The shadow stack itself.
 struct ShadowStack {
     entries: Vec<GcRef>,

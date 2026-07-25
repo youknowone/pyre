@@ -244,6 +244,13 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                     _ => {}
                 }
             }
+            // Accepted for CPython/PyPy command-line compatibility.  Warning
+            // filter installation is handled by the warnings module; keeping
+            // the option/value in launcher parsing lets stdlib subprocesses
+            // reach their command or module.
+            Short('W') => {
+                let _filter = parser.value()?.string()?;
+            }
             // `-O` / `-OO` raise the optimization level; each occurrence counts
             // (app_main.py `optimize`). PYTHONOPTIMIZE folds in during finalize.
             Short('O') => flags.optimize = flags.optimize.saturating_add(1),
@@ -853,6 +860,83 @@ pub(crate) fn init_importlib_bootstrap(
     Ok(())
 }
 
+/// PyPy object-space finalization / `threading._shutdown`: run the app-level
+/// callbacks before module teardown, then join native non-daemon handles.
+fn run_threading_shutdown() {
+    if let Some(threading) = importing::get_sys_module("threading")
+        && let Ok(shutdown) =
+            pyre_interpreter::getattr(threading, pyre_object::w_str_new("_shutdown"))
+    {
+        let result = pyre_interpreter::call_function(shutdown, &[]);
+        if result.is_null()
+            && let Some(err) = pyre_interpreter::call::take_call_error()
+        {
+            pyre_interpreter::eprint_exception(&err, true);
+        }
+    }
+    // PyPy's `threading._shutdown` first waits for non-daemon threads. Those
+    // threads may legally start further non-daemon threads while the shutdown
+    // drain is in progress. Only reject new thread creation once that app-level
+    // drain has returned and module/finalizer teardown is about to begin.
+    pyre_interpreter::module::thread::set_finalizing();
+}
+
+fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
+    pyre_object::gc_hook::try_gc_collect();
+    if !ec_ptr.is_null() {
+        unsafe { (&mut *(ec_ptr as *mut PyExecutionContext))._run_finalizers_now() };
+    }
+}
+
+/// PyPy `ObjSpace.finish()` / module teardown ordering: join non-daemon
+/// threads, collect already-unreachable cycles, then release `__main__`
+/// globals from newest to oldest while the older globals their `__del__`
+/// methods may reference are still present.
+fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
+    run_threading_shutdown();
+    collect_and_run_finalizers(ec_ptr);
+    let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
+    entries.reverse();
+    for (name, _) in entries {
+        if name == "__builtins__" {
+            continue;
+        }
+        unsafe {
+            pyre_object::w_dict_delitem_str(canonical, &name);
+        }
+        collect_and_run_finalizers(ec_ptr);
+    }
+}
+
+/// Keep the object references carried by a pending SystemExit live and
+/// relocatable while interpreter finalization performs collections.  PyPy's
+/// OperationError is GC-visible RPython state; pyre's Rust `PyError` is not, so
+/// its three raw PyObjectRef fields need the same explicit shadow-root
+/// treatment as other host-stack temporaries.
+fn finalize_system_exit(
+    mut error: pyre_interpreter::PyError,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> ! {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for value in [
+        error.exc_object,
+        error.w_name_context,
+        error.w_obj_context,
+    ] {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    finalize_runtime(canonical, ec_ptr);
+    error.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
+    error.w_name_context = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    error.w_obj_context = pyre_object::gc_roots::shadow_stack_get(base + 2);
+    let code = system_exit_code(&error);
+    drop(roots);
+    maybe_print_jit_stats();
+    std::process::exit(code);
+}
+
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
 fn run_module(module: &str, no_site: bool) {
@@ -895,13 +979,13 @@ fn run_module(module: &str, no_site: bool) {
 
     if let Err(e) = result {
         if e.kind == PyErrorKind::SystemExit {
-            maybe_print_jit_stats();
-            std::process::exit(system_exit_code(&e));
+            finalize_system_exit(e, canonical, ec_ptr);
         }
         maybe_print_jit_stats();
         pyre_interpreter::eprint_exception(&e, true);
         std::process::exit(1);
     }
+    finalize_runtime(canonical, ec_ptr);
     maybe_print_jit_stats();
 }
 
@@ -1021,14 +1105,14 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
         }
         Err(e) => {
             if e.kind == PyErrorKind::SystemExit {
-                maybe_print_jit_stats();
-                std::process::exit(system_exit_code(&e));
+                finalize_system_exit(e, canonical, ec_ptr);
             }
             maybe_print_jit_stats();
             pyre_interpreter::eprint_exception(&e, true);
             std::process::exit(1);
         }
     }
+    finalize_runtime(canonical, ec_ptr);
     maybe_print_jit_stats();
 }
 

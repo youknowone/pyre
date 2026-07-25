@@ -21,7 +21,6 @@ use pyre_object::*;
 // across `str` and `unicodedata` here.
 use rustpython_unicode::{case, classify, identifier};
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
-
 // ── Arity checks for builtin methods ─────────────────────────────────
 // A builtin method registered with `make_builtin_function_with_arity`
 // records an arity only as a fast-path dispatch hint — some stubs register

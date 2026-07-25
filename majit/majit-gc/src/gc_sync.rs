@@ -321,10 +321,81 @@ pub fn unregister_thread() {
     GC_SYNC.quiesced.notify_all();
 }
 
+/// Temporarily remove the current mutator from the RUNNING census while it
+/// blocks in an external operation.
+///
+/// This is the free-threaded counterpart of RPython's
+/// `rffi.aroundstate.before()` / `gil.before_external_call()`: a thread which
+/// is asleep in `pthread_cond_wait`, `join`, or `nanosleep` cannot poll the
+/// eval breaker, so it must not remain in the set that a collector waits to
+/// drain.  Dropping the guard waits for an in-flight STW request to finish and
+/// then makes the mutator RUNNING again.
+pub struct BlockingGuard {
+    registered: bool,
+}
+
+impl Drop for BlockingGuard {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        state = GC_SYNC
+            .resumed
+            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+            .unwrap();
+        state.running += 1;
+        assert!(
+            !GC_THREAD.with(|t| t.running.replace(true)),
+            "GC mutator resumed from an external block twice"
+        );
+    }
+}
+
+#[inline]
+pub fn before_external_block() -> BlockingGuard {
+    let registered = GC_THREAD.with(|t| t.registered.get());
+    if registered {
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        assert!(
+            GC_THREAD.with(|t| t.running.replace(false)),
+            "GC mutator entered an external block twice"
+        );
+        state.running = state
+            .running
+            .checked_sub(1)
+            .expect("RUNNING underflow entering external block");
+        GC_SYNC.quiesced.notify_all();
+    }
+    BlockingGuard { registered }
+}
+
 /// Number of registered GC mutators.
 #[inline]
 pub fn registered_threads() -> usize {
     REGISTERED_THREADS.load(Ordering::Acquire)
+}
+
+/// RPython `rthread.thread_after_fork()` parity for the child process.
+///
+/// Only the thread which called `fork()` survives.  Rebuild the mutator
+/// census around that thread so a later collection never waits for vanished
+/// parent threads.
+pub fn after_fork_child() {
+    let registered = GC_THREAD.with(|t| t.registered.get());
+    let running = GC_THREAD.with(|t| t.running.get());
+    REGISTERED_THREADS.store(usize::from(registered), Ordering::SeqCst);
+    IN_FAST_PATH.store(0, Ordering::Release);
+    GC_OP_OWNER.store(0, Ordering::SeqCst);
+    STW_OWNER.store(0, Ordering::SeqCst);
+    STW_DEPTH.store(0, Ordering::SeqCst);
+    GC_SYNC.stw_requested.store(false, Ordering::Release);
+    majit_ir::eval_breaker_word::clear_stw();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    state.running = usize::from(registered && running);
+    GC_SYNC.stw_generation.fetch_add(1, Ordering::SeqCst);
+    GC_SYNC.resumed.notify_all();
+    GC_SYNC.quiesced.notify_all();
 }
 
 /// Whether a stop-the-world pause is required for a collection driven by the

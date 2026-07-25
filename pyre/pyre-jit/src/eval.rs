@@ -644,7 +644,7 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///   * `dstorage` → `ModuleDictStorage.entries` (Vec<(String,
 ///     PyObjectRef)>) — every entry's value
 ///   * `mstrategy` → `ModuleDictStrategy.caches` (Option<HashMap<...,
-///     Rc<RefCell<GlobalCache>>>>) — every live cache's `cell`
+///     Arc<Mutex<GlobalCache>>>>) — every live cache's `cell`
 ///   * `object_storage` → post-`switch_to_object_strategy`
 ///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
 ///
@@ -2973,6 +2973,12 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_interpreter::module::_io::W_TextIOWrapper
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::thread::W_Local
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical
@@ -3467,6 +3473,10 @@ pub fn init_gc_subsystem() {
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker.
     pyre_object::rbigint::initialize_rbigint_parts_cache();
+    pyre_interpreter::call::register_thread_entry_hook(|| {
+        init_jit_hooks();
+        init_gc_root_walkers();
+    });
     if !GC_TLS_INSTALLED.with(|c| c.get()) {
         majit_gc::gc_sync::register_thread();
         majit_gc::shadow_stack::register_mutator();
@@ -6240,6 +6250,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
+        pyre_interpreter::module::thread::park_if_finalizing();
         // Interpreter-path GC safepoint (PYRE_GC_INTERP). Between opcodes the
         // only live refs are in the frame, reachable through the registered
         // pyframe root walker; no bytecode handler holds a Rust-stack temporary
@@ -6318,11 +6329,36 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
-            if needs_trace {
-                if let Err(err) = unsafe {
+            // A compiled back-edge deopts when the process breaker is armed.
+            // On resume, run the live frame's ordinary bytecode_trace so its
+            // EC-owned `w_async_exception_type` is consumed.  This is the
+            // source-level equivalent of PyPy resuming into
+            // CheckSignalAction.perform; testing only `needs_trace` here used
+            // to bypass the interpreter semantic path and immediately re-enter
+            // the compiled loop with the exception still pending.
+            let async_pending = majit_ir::eval_breaker_word::load()
+                & majit_ir::eval_breaker_word::EB_ASYNC
+                != 0;
+            if needs_trace || async_pending {
+                if let Err(mut err) = unsafe {
                     (*ec_ptr)
                         .bytecode_trace(f, pyre_interpreter::executioncontext::TICK_COUNTER_STEP)
                 } {
+                    // `handle_bytecode` catches exceptions raised by
+                    // bytecode_trace at this opcode.  In particular, an
+                    // asynchronously injected exception must be catchable by
+                    // the target frame's surrounding try/except.
+                    let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                    let mut next_instr = unsafe { &*f }.next_instr();
+                    if pyre_interpreter::eval::handle_exception(
+                        unsafe { &mut *f },
+                        &mut err,
+                        &mut next_instr,
+                    ) {
+                        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                        unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                        continue;
+                    }
                     return LoopResult::Done(Err(err));
                 }
                 // bytecode_trace may allocate (tracer callback) → the frame may

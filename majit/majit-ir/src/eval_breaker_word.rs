@@ -53,6 +53,11 @@ pub fn eval_breaker_word_addr() -> usize {
     EVAL_BREAKER_WORD_ADDR.load(Ordering::Relaxed)
 }
 
+#[inline]
+pub fn load() -> usize {
+    EVAL_BREAKER_WORD.load(Ordering::Relaxed)
+}
+
 // --- async (bit0): armed by the OS signal handler / action dispatcher ---
 // `fetch_or` is a single lock-free atomic RMW → async-signal-safe.
 pub fn set_async() {

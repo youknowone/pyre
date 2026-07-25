@@ -106,14 +106,30 @@ pub fn clear_call_error() {
 /// these three fields are the complete set of GC refs a `PyError` holds.
 pub fn walk_pending_call_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     PENDING_CALL_ERROR.with(|slot| {
-        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
-        // holds the only reference for its duration and does not re-borrow the
-        // cell, so no borrow-flag conflict with a walker-triggered path.
-        let opt = unsafe { &mut *slot.as_ptr() };
-        if let Some(err) = opt.as_mut() {
-            err.walk_gc_refs(visitor);
-        }
+        unsafe { walk_pending_call_error_area(slot as *const _ as *const (), visitor) };
     });
+}
+
+pub(crate) fn capture_pending_call_error_area() -> *const () {
+    PENDING_CALL_ERROR.with(|slot| slot as *const _ as *const ())
+}
+
+/// Walk the deferred call error belonging to one stopped mutator.
+///
+/// # Safety
+/// `data` must come from [`capture_pending_call_error_area`], and the owning
+/// mutator must be quiesced.
+pub(crate) unsafe fn walk_pending_call_error_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let slot = unsafe { &*(data as *const RefCell<Option<PyError>>) };
+    // SAFETY: the owning mutator is stopped, so nothing can borrow or mutate
+    // the RefCell while the collector forwards the PyError's object slots.
+    let opt = unsafe { &mut *slot.as_ptr() };
+    if let Some(err) = opt.as_mut() {
+        err.walk_gc_refs(visitor);
+    }
 }
 
 /// Cold debug flag probe for `call_function_impl_raw`. This is a
@@ -141,6 +157,8 @@ use crate::pyframe::PyFrame;
 // ── Eval function injection ──────────────────────────────────────
 type EvalFn = fn(&mut PyFrame) -> PyResult;
 static EVAL_OVERRIDE: OnceLock<EvalFn> = OnceLock::new();
+type ThreadEntryFn = fn();
+static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn> = OnceLock::new();
 
 type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
 static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn> = OnceLock::new();
@@ -214,6 +232,21 @@ impl Drop for CallDepthGuardPublic {
 /// Register the JIT-aware eval function. Called by pyre-jit at startup.
 pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
+}
+
+/// Install the runtime hook for entering a new Python mutator thread.
+///
+/// `pyre-interpreter` cannot depend on `pyre-jit`, so the JIT registers this
+/// reverse hook after it has installed the process-global collector.  Every
+/// newly-created Python OS thread invokes it before allocating or evaluating.
+pub fn register_thread_entry_hook(f: ThreadEntryFn) {
+    let _ = THREAD_ENTRY_HOOK.set(f);
+}
+
+pub fn enter_runtime_thread() {
+    if let Some(f) = THREAD_ENTRY_HOOK.get() {
+        f();
+    }
 }
 
 /// Get the current eval function (JIT-aware if registered, plain otherwise).
@@ -309,7 +342,14 @@ thread_local! {
 
 /// Set the last known execution context (called at eval loop entry).
 pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
-    LAST_EXEC_CTX.with(|c| c.set(ctx));
+    LAST_EXEC_CTX.with(|c| {
+        let previous = c.replace(ctx);
+        if previous.is_null() && !ctx.is_null() {
+            crate::module::thread::register_execution_context(ctx);
+        } else if !previous.is_null() && ctx.is_null() {
+            crate::module::thread::unregister_execution_context();
+        }
+    });
 }
 
 /// Snapshot the current thread-local execution context. Residual callers

@@ -6,10 +6,129 @@
 
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
+use std::sync::{LazyLock, Mutex};
 // Under sandbox, name libc through the seam facade so any direct syscall call
 // in this module is a compile error (only types/constants/pure fns resolve).
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
+
+/// PyPy `ApplevelForkCallbacks`, cached on the object space.
+///
+/// The callback collections are RPython lists, so use insertion-ordered Vecs;
+/// this is process/interpreter state, never TLS.
+#[derive(Default)]
+struct ApplevelForkCallbacks {
+    before_w: Vec<usize>,
+    parent_w: Vec<usize>,
+    child_w: Vec<usize>,
+}
+
+static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
+    LazyLock::new(|| Mutex::new(ApplevelForkCallbacks::default()));
+// PyPy's GIL serializes concurrent fork entry.  Pyre is free-threaded, so the
+// corresponding process operation has its own narrow serializer.
+static FORK_SERIALIZER: Mutex<()> = Mutex::new(());
+
+pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+    let ApplevelForkCallbacks {
+        before_w,
+        parent_w,
+        child_w,
+    } = &mut *callbacks;
+    for callbacks in [
+        before_w,
+        parent_w,
+        child_w,
+    ] {
+        for callback in callbacks {
+            visitor(unsafe { &mut *(callback as *mut usize as *mut PyObjectRef) });
+        }
+    }
+}
+
+fn run_fork_callbacks(kind: &str) {
+    let reverse = kind == "before";
+    let initial_len = {
+        let callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+        match kind {
+            "before" => callbacks.before_w.len(),
+            "parent" => callbacks.parent_w.len(),
+            "child" => callbacks.child_w.len(),
+            _ => unreachable!(),
+        }
+    };
+    let indices: Box<dyn Iterator<Item = usize>> = if reverse {
+        Box::new((0..initial_len).rev())
+    } else {
+        Box::new(0..initial_len)
+    };
+    for index in indices {
+        let callback = {
+            let callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+            match kind {
+                "before" => callbacks.before_w.get(index),
+                "parent" => callbacks.parent_w.get(index),
+                "child" => callbacks.child_w.get(index),
+                _ => unreachable!(),
+            }
+            .copied()
+        };
+        let Some(callback) = callback else { continue };
+        if let Err(mut error) =
+            crate::call::call_function_impl_result(callback as PyObjectRef, &[])
+        {
+            error.write_unraisable(pyre_object::w_none(), "fork hook", callback as PyObjectRef);
+        }
+    }
+}
+
+fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if !pos.is_empty() {
+        return Err(crate::PyError::type_error(
+            "register_at_fork() takes no positional arguments",
+        ));
+    }
+    crate::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["before", "after_in_parent", "after_in_child"],
+        "register_at_fork",
+    )?;
+    let before = crate::builtins::kwarg_get(kwargs, "before");
+    let parent = crate::builtins::kwarg_get(kwargs, "after_in_parent");
+    let child = crate::builtins::kwarg_get(kwargs, "after_in_child");
+    if before.is_none() && parent.is_none() && child.is_none() {
+        return Err(crate::PyError::type_error(
+            "At least one argument is required.",
+        ));
+    }
+    for (name, callback) in [
+        ("before", before),
+        ("after_in_parent", parent),
+        ("after_in_child", child),
+    ] {
+        if callback.is_some_and(|callback| !crate::baseobjspace::callable_w(callback)) {
+            return Err(crate::PyError::type_error(format!(
+                "'{name}' must be callable",
+            )));
+        }
+    }
+    {
+        let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+        if let Some(callback) = before {
+            callbacks.before_w.push(callback as usize);
+        }
+        if let Some(callback) = parent {
+            callbacks.parent_w.push(callback as usize);
+        }
+        if let Some(callback) = child {
+            callbacks.child_w.push(callback as usize);
+        }
+    }
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    Ok(pyre_object::w_none())
+}
 
 /// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
 /// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
@@ -695,7 +814,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "waitstatus_to_exitcode",
         "_exit",
         "_cpu_count",
-        "register_at_fork",
         "abort",
         "spawnv",
         "spawnve",
@@ -710,6 +828,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
         );
     }
+    crate::module_ns_store(
+        ns,
+        "register_at_fork",
+        crate::make_builtin_function("register_at_fork", register_at_fork),
+    );
 
     // PyPy `interp_posix.get_blocking/set_blocking` → rposix
     // `get_blocking/set_blocking`: inspect or update O_NONBLOCK with fcntl.
@@ -917,8 +1040,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(not(feature = "sandbox"))]
                 let buf = {
                     let mut buf = vec![0u8; n];
-                    let ret =
-                        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) };
+                    let ret = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) }
+                    };
                     if ret < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
                     }
@@ -950,23 +1075,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
                 let target = unsafe { buffer.as_mut_slice() };
                 #[cfg(not(feature = "sandbox"))]
-                let result = loop {
-                    let result = unsafe {
-                        libc::read(
-                            fd,
-                            target.as_mut_ptr() as *mut libc::c_void,
-                            target.len() as _,
-                        )
-                    };
-                    if result >= 0 {
-                        break result as i64;
+                let result = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    loop {
+                        let result = unsafe {
+                            libc::read(
+                                fd,
+                                target.as_mut_ptr() as *mut libc::c_void,
+                                target.len() as _,
+                            )
+                        };
+                        if result >= 0 {
+                            break Ok(result as i64);
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::EINTR) {
+                            break Err(error);
+                        }
                     }
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    return Err(io_err(error, ""));
                 };
+                #[cfg(not(feature = "sandbox"))]
+                let result = result.map_err(|error| io_err(error, ""))?;
                 #[cfg(feature = "sandbox")]
                 let result = {
                     let data = crate::host_seam::ops::read(fd, target.len() as i64)
@@ -998,8 +1127,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
-                    let ret = unsafe {
-                        libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
+                    let ret = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        unsafe {
+                            libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
+                        }
                     };
                     if ret < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -2511,8 +2643,54 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "fork",
                 |_| {
-                    let pid = host_posix::fork().map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_int_new(pid as i64))
+                    if majit_gc::gc_sync::registered_threads() > 1 {
+                        crate::warn::warn_deprecation(
+                            "This process is multi-threaded, use of fork() may lead to deadlocks",
+                        )?;
+                    }
+                    let blocked = crate::module::thread::before_external_block();
+                    let fork_serial = FORK_SERIALIZER
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    drop(blocked);
+                    run_fork_callbacks("before");
+                    // A free-threaded fork must snapshot native/Python lock
+                    // state while every other mutator is parked.  Enter
+                    // through the collector's full request path so no GC
+                    // operation can overlap the STW window.
+                    let mut fork_result = None;
+                    majit_gc::gc_sync::request_stw(|_| {
+                        fork_result = Some(host_posix::fork());
+                    });
+                    match fork_result.expect("fork STW closure must run") {
+                        Ok(0) => {
+                            crate::module::thread::after_fork_child();
+                            run_fork_callbacks("child");
+                            // PyPy's child is now the sole mutator.  Reclaim
+                            // vanished-thread-only objects immediately so
+                            // weak containers such as threading._dangling
+                            // reflect the one surviving MainThread before
+                            // user code resumes.
+                            pyre_object::gc_hook::try_gc_collect();
+                            let ec = crate::call::getexecutioncontext()
+                                as *mut crate::PyExecutionContext;
+                            if !ec.is_null() {
+                                unsafe { (*ec)._run_finalizers_now() };
+                            }
+                            drop(fork_serial);
+                            Ok(pyre_object::w_int_new(0))
+                        }
+                        Ok(pid) => {
+                            run_fork_callbacks("parent");
+                            drop(fork_serial);
+                            Ok(pyre_object::w_int_new(pid as i64))
+                        }
+                        Err(error) => {
+                            run_fork_callbacks("parent");
+                            drop(fork_serial);
+                            Err(io_err(error, ""))
+                        }
+                    }
                 },
                 0,
             ),
@@ -2543,8 +2721,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let pid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
                     let options = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                     let mut status: i32 = 0;
-                    let res = host_posix::waitpid(pid, &mut status, options)
-                        .map_err(|e| io_err(e, ""))?;
+                    let res = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_posix::waitpid(pid, &mut status, options)
+                    }
+                    .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_int_new(res as i64),
                         pyre_object::w_int_new(status as i64),
@@ -2562,7 +2743,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "wait",
                 |_| {
                     let mut status: i32 = 0;
-                    let res = host_posix::waitpid(-1, &mut status, 0).map_err(|e| io_err(e, ""))?;
+                    let res = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_posix::waitpid(-1, &mut status, 0)
+                    }
+                    .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_int_new(res as i64),
                         pyre_object::w_int_new(status as i64),

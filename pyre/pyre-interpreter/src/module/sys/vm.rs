@@ -3,6 +3,7 @@
 //! PyPy equivalent: `pypy/module/sys/vm.py`.
 
 use crate::{make_builtin_function_with_arity, module_ns_store};
+use crate::executioncontext::ActionFlagOps;
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -329,6 +330,26 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
         // with real None") propagates via setprofile -> setllprofile.
         unsafe { (*ec).setprofile(w_func)? };
     }
+    Ok(w_none())
+}
+
+fn sys_settraceallthreads_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_func = *args.first().ok_or_else(|| {
+        crate::PyError::type_error(
+            "_settraceallthreads() missing 1 required positional argument: 'function'",
+        )
+    })?;
+    crate::module::thread::set_trace_all_execution_contexts(w_func);
+    Ok(w_none())
+}
+
+fn sys_setprofileallthreads_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_func = *args.first().ok_or_else(|| {
+        crate::PyError::type_error(
+            "_setprofileallthreads() missing 1 required positional argument: 'function'",
+        )
+    })?;
+    crate::module::thread::set_profile_all_execution_contexts(w_func)?;
     Ok(w_none())
 }
 
@@ -922,6 +943,74 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    module_ns_store(
+        ns,
+        "getswitchinterval",
+        make_builtin_function_with_arity(
+            "getswitchinterval",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "getswitchinterval() takes no arguments",
+                    ));
+                }
+                let ec = current_execution_context();
+                let interval = if ec.is_null() {
+                    0.005
+                } else {
+                    unsafe { (*ec).actionflag.getcheckinterval() as f64 / 2_000_000.0 }
+                };
+                Ok(w_float_new(interval))
+            },
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "setswitchinterval",
+        make_builtin_function_with_arity(
+            "setswitchinterval",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(
+                        "setswitchinterval() takes exactly one argument",
+                    ));
+                }
+                let interval = crate::baseobjspace::float_w(args[0])?;
+                if interval <= 0.0 {
+                    return Err(crate::PyError::value_error(
+                        "switch interval must be strictly positive",
+                    ));
+                }
+                let ec = current_execution_context();
+                if !ec.is_null() {
+                    unsafe {
+                        (*(ec as *mut crate::PyExecutionContext))
+                            .actionflag
+                            .setcheckinterval((interval * 2_000_000.0) as usize)
+                    };
+                }
+                Ok(w_none())
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_current_frames",
+        make_builtin_function_with_arity(
+            "_current_frames",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "_current_frames() takes no arguments",
+                    ));
+                }
+                Ok(crate::module::thread::current_frames())
+            },
+            0,
+        ),
+    );
     // PyPy: pypy/module/sys/state.py:get_int_max_str_digits and
     // set_int_max_str_digits. The limit is object-space state, shared by
     // every caller rather than thread-local state.
@@ -1424,6 +1513,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     module_ns_store(
         ns,
+        "_settraceallthreads",
+        make_builtin_function_with_arity(
+            "_settraceallthreads",
+            sys_settraceallthreads_impl,
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_setprofileallthreads",
+        make_builtin_function_with_arity(
+            "_setprofileallthreads",
+            sys_setprofileallthreads_impl,
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
         "get_coroutine_origin_tracking_depth",
         make_builtin_function_with_arity(
             "get_coroutine_origin_tracking_depth",
@@ -1483,7 +1590,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "is_finalizing",
-        make_builtin_function_with_arity("is_finalizing", |_| Ok(w_bool_from(false)), 0),
+        make_builtin_function_with_arity(
+            "is_finalizing",
+            |_| Ok(w_bool_from(crate::module::thread::is_finalizing())),
+            0,
+        ),
     );
     // sys.displayhook / excepthook. `__displayhook__` keeps the original so
     // code (e.g. doctest) can save and restore the hook.

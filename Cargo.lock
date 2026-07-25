@@ -2195,6 +2195,7 @@ dependencies = [
  "num-complex",
  "num-integer",
  "num-traits",
+ "parking_lot",
  "paste",
  "pymath",
  "pyre-macros",
@@ -2304,6 +2305,7 @@ dependencies = [
  "majit-macros",
  "malachite-bigint",
  "num-traits",
+ "parking_lot",
  "pyre-macros",
  "rustpython-wtf8",
 ]

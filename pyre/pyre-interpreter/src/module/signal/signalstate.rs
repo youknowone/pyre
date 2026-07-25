@@ -67,7 +67,7 @@ pub fn registered_ticker_ptr() -> *mut isize {
 
 /// Store -1 into the ticker cell so the next `decrement_ticker` runs
 /// `action_dispatcher`.  Async-signal-safe: a single aligned word store.
-fn rearm_ticker() {
+pub(crate) fn rearm_ticker() {
     let p = TICKER_PTR.load(Ordering::SeqCst);
     if !p.is_null() {
         unsafe { std::ptr::write_volatile(p, -1) };

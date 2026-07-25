@@ -9,6 +9,7 @@ description = "Python object model for pyre interpreter"
 [dependencies]
 num-traits = { workspace = true }
 majit-gc = { workspace = true }
+parking_lot = { workspace = true }
 majit-macros = { workspace = true }
 pyre-macros = { workspace = true }
 indexmap = { workspace = true }

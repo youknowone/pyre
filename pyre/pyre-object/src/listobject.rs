@@ -18,6 +18,60 @@ use crate::{
     intobject::w_int_get_value, intobject::w_int_new, longobject::jit_bigint_to_i64_value,
     longobject::w_long_fits_int, longobject::w_long_get_value, tupleobject::is_plain_float_strict,
 };
+use std::cell::UnsafeCell;
+use std::sync::LazyLock;
+
+// PyPy's list strategy/storage transitions are indivisible under its GIL.
+// Pyre keeps the list itself as the sole semantic owner and uses only narrow
+// address-striped reentrant synchronization around those transitions.
+struct ForkListLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkListLock {}
+
+impl ForkListLock {
+    fn new() -> Self {
+        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe {
+            self.0
+                .get()
+                .write(parking_lot::ReentrantMutex::new(()))
+        };
+    }
+}
+
+static LIST_LOCKS: LazyLock<Vec<ForkListLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkListLock::new()).collect());
+
+type ListGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+#[majit_macros::dont_look_inside]
+unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
+    let lock = LIST_LOCKS[(obj as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+pub fn list_locks_after_fork_child() {
+    for lock in LIST_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -748,7 +802,9 @@ pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObje
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    let _list_guard = w_list_lock(obj);
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // listobject.py:1134 EmptyListStrategy.getitem raises IndexError.
@@ -788,7 +844,9 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -> bool {
+    let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py:1185 EmptyListStrategy.setitem raises IndexError.
@@ -840,7 +898,9 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
+    let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py:1170 EmptyListStrategy.append: pick the matching
@@ -945,7 +1005,9 @@ pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
+    let _list_guard = w_list_lock(obj);
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // listobject.py:1131 EmptyListStrategy.length returns 0.

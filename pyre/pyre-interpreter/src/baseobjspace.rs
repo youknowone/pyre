@@ -82,28 +82,42 @@ pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyEr
 /// lazy-null `exc_object`.
 pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     PENDING_HASH_ERROR.with(|cell| {
-        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
-        // holds the only reference for its duration and does not re-borrow the
-        // cell, so no borrow-flag conflict with a walker-triggered path.
-        let opt = unsafe { &mut *cell.as_ptr() };
-        if let Some(err) = opt.as_mut() {
-            err.walk_gc_refs(visitor);
-        }
+        unsafe { walk_pending_hash_error_area(cell as *const _ as *const (), visitor) };
     });
+}
+
+pub(crate) fn capture_pending_hash_error_area() -> *const () {
+    PENDING_HASH_ERROR.with(|cell| cell as *const _ as *const ())
+}
+
+/// Walk the deferred dict callback error belonging to one stopped mutator.
+///
+/// # Safety
+/// `data` must come from [`capture_pending_hash_error_area`], and the owning
+/// mutator must be quiesced.
+pub(crate) unsafe fn walk_pending_hash_error_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = unsafe { &*(data as *const Cell<Option<PyError>>) };
+    // SAFETY: the owning mutator is stopped, so the collector has exclusive
+    // access to the Cell interior while forwarding the PyError's object slots.
+    let opt = unsafe { &mut *cell.as_ptr() };
+    if let Some(err) = opt.as_mut() {
+        err.walk_gc_refs(visitor);
+    }
 }
 
 /// interp_gc.py:12-15 — clear `space.fromcache(MethodCache)` before an
 /// explicit full collection.
 #[majit_macros::dont_look_inside]
 pub fn clear_method_cache() {
-    METHOD_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache.versions.fill(0);
-        cache.names.fill(None);
-        cache
-            .lookup_where
-            .fill((std::ptr::null_mut(), std::ptr::null_mut()));
-    });
+    let mut cache = METHOD_CACHE.lock();
+    cache.versions.fill(0);
+    cache.names.fill(None);
+    cache
+        .lookup_where
+        .fill((std::ptr::null_mut(), std::ptr::null_mut()));
 }
 
 /// CPython 3.14 `dict_unhashable_type` (`Objects/dictobject.c`) parity.
@@ -3969,6 +3983,12 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
 pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
+    // pypy/module/thread/os_local.py Local.getdict selects the dictionary
+    // belonging to the current ExecutionContext before ordinary mapdict
+    // dispatch.  The Local object itself owns the mapping and cache.
+    if let Some(w_dict) = crate::module::thread::local_getdict(obj) {
+        return w_dict;
+    }
     // function.py:231-234 Function.getdict — typed `w_func_dict` field.
     if unsafe { crate::is_function(obj) }
         && unsafe { std::ptr::eq((*obj).ob_type, &crate::function::FUNCTION_TYPE) }
@@ -7527,10 +7547,9 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
 }
 
 /// `typeobject.py:76-101 MethodCache` — the per-space method-lookup
-/// cache.  `space.fromcache(MethodCache)` returns one instance per
-/// space; pyre is single-space, so a thread-local singleton stands in
-/// (the role the dict-strategy `space.fromcache` singletons already
-/// play).  `versions[h]` is the `version_tag()` the slot was filled
+/// cache. `space.fromcache(MethodCache)` returns one instance per object
+/// space; pyre's single space therefore owns one process-shared instance.
+/// `versions[h]` is the `version_tag()` the slot was filled
 /// under (`0` = empty), `names[h]` the looked-up name, `lookup_where[h]`
 /// the cached `(w_class, w_value)` pair from the MRO walk — a
 /// `(null, null)` pair on a valid `(version, name)` entry is the cached
@@ -7542,17 +7561,23 @@ struct MethodCache {
     lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
 }
 
+// PyPy stores this cache on the shared object space. The mutex below protects
+// every probe, fill, clear, and GC-forwarding walk, so its raw object-pointer
+// slots are never accessed concurrently while the collector rewrites them.
+unsafe impl Send for MethodCache {}
+
 /// `space.config.objspace.std.methodcachesizeexp` default.
 const METHOD_CACHE_SIZE_EXP: u32 = 11;
 const METHOD_CACHE_SIZE: usize = 1 << METHOD_CACHE_SIZE_EXP;
 
-thread_local! {
-    static METHOD_CACHE: std::cell::RefCell<MethodCache> = std::cell::RefCell::new(MethodCache {
+static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(MethodCache {
         versions: vec![0u64; METHOD_CACHE_SIZE],
         names: vec![None; METHOD_CACHE_SIZE],
         lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
+        })
     });
-}
 
 /// `typeobject.py:520-535` method-hash.  `version_tag` is pyre's u64
 /// version token directly (PyPy hashes `current_object_addr_as_int(
@@ -7678,15 +7703,15 @@ unsafe fn _cached_lookup_where(
 ) -> (PyObjectRef, PyObjectRef) {
     let h = method_hash(version_tag, name);
     // Probe without holding the borrow across the MRO walk below.
-    let hit = METHOD_CACHE.with(|c| {
-        let cache = c.borrow();
+    let hit = {
+        let cache = METHOD_CACHE.lock();
         if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
             // A valid entry with null pointers is the cached negative result.
             Some(cache.lookup_where[h])
         } else {
             None
         }
-    });
+    };
     if let Some(tup) = hit {
         return tup;
     }
@@ -7695,12 +7720,10 @@ unsafe fn _cached_lookup_where(
     // Prebuilt-family store: the cache slot is reached only by
     // `walk_method_cache_gc`, skipped on clean minor collections.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    METHOD_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        cache.versions[h] = version_tag;
-        cache.names[h] = Some(name.to_string());
-        cache.lookup_where[h] = tup;
-    });
+    let mut cache = METHOD_CACHE.lock();
+    cache.versions[h] = version_tag;
+    cache.names[h] = Some(name.to_string());
+    cache.lookup_where[h] = tup;
     tup
 }
 
@@ -7719,33 +7742,9 @@ unsafe fn _cached_lookup_where(
 /// never by a relocating move, so the cache's *own* copy of each pointer
 /// must be forwarded here or a later hit would read a stale address.
 pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    METHOD_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        for (w_class, w_value) in cache.lookup_where.iter_mut() {
-            // Empty / negative-cache slots hold nulls: nothing to forward.
-            if !w_class.is_null() {
-                forward(w_class);
-            }
-            if !w_value.is_null() {
-                forward(w_value);
-            }
-        }
-    });
-}
-
-pub(crate) fn capture_method_cache_root_area() -> *const () {
-    METHOD_CACHE.with(|cache| cache as *const _ as *const ())
-}
-
-/// # Safety
-/// `data` must come from [`capture_method_cache_root_area`], and the owning
-/// thread must be quiesced.
-pub(crate) unsafe fn walk_method_cache_root_area(
-    data: *const (),
-    forward: &mut dyn FnMut(&mut PyObjectRef),
-) {
-    let cache = unsafe { &mut *(*(data as *const std::cell::RefCell<MethodCache>)).as_ptr() };
+    let mut cache = METHOD_CACHE.lock();
     for (w_class, w_value) in cache.lookup_where.iter_mut() {
+        // Empty / negative-cache slots hold nulls: nothing to forward.
         if !w_class.is_null() {
             forward(w_class);
         }

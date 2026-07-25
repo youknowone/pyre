@@ -215,6 +215,13 @@ pub struct ExecutionContext {
     pub w_profilefuncarg: PyObjectRef,
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
+    /// Last process-wide all-threads hook generations applied by this EC.
+    /// Only the owning OS thread writes these fields.
+    pub trace_all_generation: usize,
+    pub profile_all_generation: usize,
+    /// `os_local.py:ExecutionContext._thread_local_objs`: weak references to
+    /// `_thread._local` objects which own a dictionary for this EC.
+    pub thread_local_refs: Vec<PyObjectRef>,
     pub actionflag: ActionFlag,
     /// `space.user_del_action`, allocated after the ExecutionContext reaches
     /// its stable process-lifetime address.
@@ -304,6 +311,9 @@ impl ExecutionContext {
             w_profilefuncarg: pyre_object::PY_NULL,
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
+            trace_all_generation: 0,
+            profile_all_generation: 0,
+            thread_local_refs: Vec::new(),
             actionflag: ActionFlag::new(),
             user_del_action: std::ptr::null_mut(),
             builtins_module,
@@ -314,6 +324,54 @@ impl ExecutionContext {
             current_gen_or_coroutine: pyre_object::PY_NULL,
             w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
+        }
+    }
+
+    /// `OSThreadLocals.enter_thread()` / `ExecutionContext(space)` parity.
+    ///
+    /// Interpreter-wide objects (the object space and builtins module) remain
+    /// shared, while frame, exception, tracing, profiling, generator, and
+    /// action state starts fresh for each OS thread.
+    pub fn clone_for_thread(&self) -> Self {
+        let mut ec = self.clone();
+        ec.topframeref = std::ptr::null_mut();
+        ec.w_tracefunc = pyre_object::PY_NULL;
+        ec.is_tracing = 0;
+        ec.profilefunc = None;
+        ec.w_profilefuncarg = pyre_object::PY_NULL;
+        ec.thread_disappeared = false;
+        ec.w_async_exception_type = pyre_object::PY_NULL;
+        ec.trace_all_generation = 0;
+        ec.profile_all_generation = 0;
+        ec.thread_local_refs.clear();
+        ec.actionflag = ActionFlag::new();
+        ec.user_del_action = std::ptr::null_mut();
+        // The cached Module wrapper is execution-context-owned and movable.
+        // A new thread lazily builds its own wrapper over the shared
+        // builtins_module, matching a fresh PyPy ExecutionContext.
+        ec.builtin_dict_cache = std::cell::Cell::new(pyre_object::PY_NULL);
+        ec.sys_exc_value = pyre_object::PY_NULL;
+        ec.current_gen_or_coroutine = pyre_object::PY_NULL;
+        ec.w_asyncgen_firstiter_fn = pyre_object::PY_NULL;
+        ec.w_asyncgen_finalizer_fn = pyre_object::PY_NULL;
+        ec
+    }
+
+    /// Expose the two builtin-owner slots to the translated shadow-stack root
+    /// walker.  PyPy reaches both through the process-owned object space;
+    /// pyre stores movable GC refs directly on the EC and must forward those
+    /// fields in place.
+    pub(crate) fn walk_builtin_roots(
+        &mut self,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        visitor(unsafe {
+            &mut *(&mut self.builtins_module as *mut PyObjectRef as *mut majit_ir::GcRef)
+        });
+        let cache = self.builtin_dict_cache.as_ptr();
+        visitor(unsafe { &mut *(cache as *mut majit_ir::GcRef) });
+        for wref in &mut self.thread_local_refs {
+            visitor(unsafe { &mut *(wref as *mut PyObjectRef as *mut majit_ir::GcRef) });
         }
     }
 
@@ -554,6 +612,16 @@ impl ExecutionContext {
         frame: *mut PyFrame,
         decr_by: usize,
     ) -> Result<(), crate::PyError> {
+        crate::module::thread::apply_all_thread_hooks(self)?;
+        if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
+            let w_async_exception_type =
+                crate::module::thread::take_async_exception(self as *mut ExecutionContext);
+            if !w_async_exception_type.is_null() {
+                let w_exc =
+                    crate::builtins::exc_exception_new(&[w_async_exception_type])?;
+                return Err(unsafe { crate::PyError::from_exc_object(w_exc) });
+            }
+        }
         // executioncontext.py:158-165 bytecode_trace:
         //   def bytecode_trace(self, frame, decr_by=TICK_COUNTER_STEP):
         //       self.bytecode_only_trace(frame)
@@ -1626,7 +1694,9 @@ impl ActionFlagOps for ActionFlag {
             if value < 0 {
                 majit_ir::eval_breaker_word::set_async();
             } else {
-                majit_ir::eval_breaker_word::clear_async();
+                if !crate::module::thread::has_pending_async_exception() {
+                    majit_ir::eval_breaker_word::clear_async();
+                }
                 // A signal delivered between the ticker store and this clear
                 // rearms the ticker to -1 and re-sets the async bit; the clear
                 // would then drop it, leaving a negative ticker with the bit

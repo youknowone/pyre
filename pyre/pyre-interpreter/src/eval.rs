@@ -47,8 +47,12 @@ thread_local! {
         current_frame: CURRENT_FRAME.with(|frame| frame as *const _),
         last_exec_ctx: crate::call::capture_last_exec_ctx_cell(),
         import_roots: crate::importing::capture_import_root_area(),
-        method_cache: crate::baseobjspace::capture_method_cache_root_area(),
         mapdict_method_cache: crate::pycode::capture_mapdict_method_cache_root_area(),
+        in_flight_exception: IN_FLIGHT_EXCEPTION.with(|cell| cell as *const _),
+        bh_last_exception: majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+            .with(|cell| cell as *const _),
+        pending_call_error: crate::call::capture_pending_call_error_area(),
+        pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
     };
 }
 
@@ -56,8 +60,11 @@ struct PyFrameRootArea {
     current_frame: *const Cell<*mut PyFrame>,
     last_exec_ctx: *const (),
     import_roots: *const (),
-    method_cache: *const (),
     mapdict_method_cache: *const (),
+    in_flight_exception: *const Cell<PyObjectRef>,
+    bh_last_exception: *const Cell<i64>,
+    pending_call_error: *const (),
+    pending_hash_error: *const (),
 }
 use crate::pyframe::PyFrame;
 
@@ -471,9 +478,17 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                 forward(&mut t.w_qualname);
                 // Heap and builtin types both hold a managed W_DictObject.
                 // Forward the field itself; the dict's custom trace walks its
-                // keys and values.
+                // keys and values during a major collection. During a minor,
+                // an already-old dict is not recursively rescanned merely
+                // because this root slot is visited, so explicitly descend
+                // through the strategy storage as the translated prebuilt
+                // object's trace function does.
                 let dict_slot = &mut t.dict as *mut *mut u8 as *mut PyObjectRef;
                 forward(&mut *dict_slot);
+                pyre_object::dictmultiobject::w_dict_walk_gc_refs(
+                    *dict_slot,
+                    &mut |slot| forward(slot),
+                );
                 // `weak_subclasses` holds `w_weakref_new` (`try_gc_alloc`)
                 // young WEAKREF GcStructs whose only strong root is this
                 // off-GC list; forward each slot in place so the WEAKREF
@@ -567,6 +582,18 @@ pub unsafe fn walk_pyframe_roots_area(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     let area = unsafe { &*(data as *const PyFrameRootArea) };
+    // These are genuinely thread-local exception carriers, but every stopped
+    // mutator's carrier must be visited during free-threaded collection.
+    // PyPy reaches the equivalent values through each ExecutionContext /
+    // thread state; keeping them in this registered per-mutator root area
+    // preserves that ownership instead of resolving TLS on only the thread
+    // which happened to initiate collection.
+    unsafe {
+        walk_in_flight_exception_area(area.in_flight_exception, visitor);
+        walk_bh_last_exception_area(area.bh_last_exception, visitor);
+        crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
+        crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
+    }
     // incminimark.py:339-355 prebuilt-object scanning parity: a minor
     // collection scans an old/prebuilt object only when the write barrier
     // recorded a store into it since the previous minor collection
@@ -628,12 +655,16 @@ pub unsafe fn walk_pyframe_roots_area(
             }
             let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
             visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
+            unsafe { (*ec).walk_builtin_roots(visitor) };
             // `sys_exc_value` holds the active handler exception, which
             // is nursery-allocated and may move; forward it so the EC
             // slot is updated on a minor collection (the value-stack
             // copy alone is not authoritative for later EC reads).
             let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
             visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
+            let async_exc_slot =
+                unsafe { &mut (*ec).w_async_exception_type as *mut PyObjectRef };
+            visitor(unsafe { &mut *(async_exc_slot as *mut majit_ir::GcRef) });
             // Exceptions may use the off-GC malloc_typed fallback.  In that
             // case forwarding the carrier above is a no-op, so trace its raw
             // GC-managed children just as `walk_in_flight_exception` does.
@@ -856,11 +887,6 @@ pub unsafe fn walk_pyframe_roots_area(
                     walk_raw_getset_roots(*slot, visitor);
                 };
                 crate::importing::walk_import_roots_area(area.import_roots, &mut forward);
-                // The interpreter method cache (`baseobjspace::MethodCache`)
-                // keeps a second pointer to each looked-up method that the
-                // namespace-dict walk above does not reach; forward those so
-                // a cache hit after a moving collection is not stale.
-                crate::baseobjspace::walk_method_cache_root_area(area.method_cache, &mut forward);
                 // The per-pycode `_mapdict_caches` LOAD_METHOD slots hold a
                 // `w_method` pointer (mapdict.py:1418) that no custom trace
                 // reaches — code objects are Box-immortal — so forward those
@@ -869,10 +895,6 @@ pub unsafe fn walk_pyframe_roots_area(
                     area.mapdict_method_cache,
                     &mut forward,
                 );
-                // _codecs.CodecState is a space-cache object in PyPy; pyre
-                // keeps the same list/dict state in an interpreter-global
-                // slot, so its Python objects must be forwarded explicitly.
-                crate::module::_codecs::walk_codec_state_gc(&mut forward);
             }
         }
     }
@@ -885,6 +907,7 @@ pub unsafe fn walk_pyframe_roots_area(
 /// the same fn pointer is idempotent.
 pub fn register_pyframe_root_walker() {
     majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
+    majit_gc::shadow_stack::register_extra_root_walker(crate::module::thread::walk_thread_roots);
 }
 
 thread_local! {
@@ -911,33 +934,28 @@ pub fn set_in_flight_exception(exc: PyObjectRef) {
 
 fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     IN_FLIGHT_EXCEPTION.with(|c| {
-        let exc = c.get();
-        if exc.is_null() {
-            return;
-        }
-        // Forward the exception OBJECT slot itself. A GC-managed exception
-        // (oldgen-stable `w_exception_new_empty`) is marked here and the
-        // collector then recurses into its `W_BASE_EXCEPTION_GC_PTR_OFFSETS`
-        // slots via offset tracing, keeping the whole graph alive. The
-        // exception is oldgen-stable (non-moving), so the slot is not rewritten,
-        // but marking is what matters. Mirrors the value-stack walker, which
-        // forwards the on-stack exception slot then walks its raw children.
-        let slot = c.as_ptr();
-        // SAFETY: `slot` points at the `Cell<PyObjectRef>`'s interior, which is
-        // valid for the duration of this closure. `PyObjectRef` and `GcRef`
-        // share layout (`*mut PyObject`).
-        unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
-        // Off-GC fallback: when the GC is not installed the exception is
-        // `malloc_typed`-immortal, so the visitor above is a no-op and the
-        // collector never traces its slots. Forward ALL its GC-managed children
-        // in place — the whole `W_BASE_EXCEPTION_GC_PTR_OFFSETS` set (args_w,
-        // w_cause, w_context, the w_traceback chain, w_dict, and the per-subclass
-        // slots). Read the object AFTER the visitor so a (hypothetically) moved
-        // exception is the live one. The slots are forwarded by address (not the
-        // barriered setter), so a moving child is relocated with no re-entry.
-        let exc = unsafe { *(slot as *const PyObjectRef) };
-        unsafe { walk_raw_exception_roots(exc, visitor) };
+        unsafe { walk_in_flight_exception_area(c as *const _, visitor) };
     });
+}
+
+unsafe fn walk_in_flight_exception_area(
+    c: *const Cell<PyObjectRef>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let c = unsafe { &*c };
+    let exc = c.get();
+    if exc.is_null() {
+        return;
+    }
+    // Forward the exception OBJECT slot itself. A GC-managed exception
+    // (oldgen-stable `w_exception_new_empty`) is marked here and the collector
+    // then recurses into its slots via offset tracing.
+    let slot = c.as_ptr();
+    unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
+    // Off-GC fallback exceptions are malloc_typed, so explicitly trace their
+    // raw GC-managed children after forwarding the carrier itself.
+    let exc = unsafe { *(slot as *const PyObjectRef) };
+    unsafe { walk_raw_exception_roots(exc, visitor) };
 }
 
 /// Root the residual-call raise carried in the blackhole `BH_LAST_EXC_VALUE`
@@ -951,35 +969,25 @@ fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// `0xDEAD` sentinel exists solely in a blackhole unit-test helper).
 fn walk_bh_last_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
-        if c.get() == 0 {
-            return;
-        }
-        // SAFETY: `slot` is the `Cell<i64>` interior, valid for this closure;
-        // the stored `i64` is a `PyObjectRef` bit-pattern, layout-compatible
-        // with `GcRef`. Forwarding through the slot relocates a (hypothetically)
-        // moving exception in place; the object is oldgen-stable today so only
-        // the mark takes effect.
-        let slot = c.as_ptr();
-        unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
-        let exc = c.get() as PyObjectRef;
-        unsafe { walk_raw_exception_roots(exc, visitor) };
+        unsafe { walk_bh_last_exception_area(c as *const _, visitor) };
     });
 }
 
+unsafe fn walk_bh_last_exception_area(
+    c: *const Cell<i64>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let c = unsafe { &*c };
+    if c.get() == 0 {
+        return;
+    }
+    let slot = c.as_ptr();
+    unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
+    let exc = c.get() as PyObjectRef;
+    unsafe { walk_raw_exception_roots(exc, visitor) };
+}
+
 fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    // The in-flight exception is a live stack root, not a prebuilt object;
-    // walk it on every collection, ahead of the prebuilt-dirty gate below.
-    walk_in_flight_exception(visitor);
-    // These exception-carrier walkers resolve their thread-local on the
-    // collecting thread, matching `walk_in_flight_exception`. Under the
-    // single-threaded (GIL) execution model the collecting thread is the only
-    // mutator, so that covers every live carrier. A pending carrier on another
-    // stopped mutator would need the per-mutator root-area mechanism
-    // (`register_mutator_extra_area`); migrating all exception carriers to it is
-    // the free-threading root-area work, deferred with the rest of the EXC set.
-    walk_bh_last_exception(visitor);
-    crate::call::walk_pending_call_error(visitor);
-    crate::baseobjspace::walk_pending_hash_error(visitor);
     // `reduce_protocol`'s app-level interphook handles are process-global
     // off-GC slots.  RPython stores them in the space's ordinary object graph;
     // expose the equivalent slots on every collection so both minor moves and
@@ -1002,6 +1010,16 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_getset_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
+        // `space.fromcache(MethodCache)` is owned by the shared object space,
+        // not by an execution context. Trace its cached `(w_class, w_value)`
+        // slots once through the interpreter-global root walker.
+        crate::baseobjspace::walk_method_cache_gc(&mut forward);
+        // interp_codecs.CodecState is `space.fromcache(CodecState)` in PyPy:
+        // one process/interpreter-owned registry, not one copy per mutator.
+        crate::module::_codecs::walk_codec_state_gc(&mut forward);
+        // interp_posix.ApplevelForkCallbacks is another object-space cache.
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);
     }
     if is_minor {
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
@@ -1599,7 +1617,12 @@ pub(crate) fn eval_frame_plain_with_resume(
     }
     let execution_context =
         unsafe { &mut *(frame.execution_context as *mut crate::PyExecutionContext) };
-    crate::call::set_last_exec_ctx(frame.execution_context);
+    // executioncontext.py / threadlocals.py parity: the current
+    // ExecutionContext is owned by the OS-thread locals and is installed by
+    // thread bootstrap.  Entering an (including inlined) frame must not
+    // replace that thread-owned slot from a frame field; doing so lets a
+    // collapsed/stale translated frame identity poison every subsequent
+    // `space.getexecutioncontext()` lookup.
     execution_context.enter(frame as *mut PyFrame);
     let mut got_exception = true;
     let mut w_exitvalue = pyre_object::w_none();
@@ -1686,6 +1709,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let mut next_instr = frame.next_instr();
 
     loop {
+        crate::module::thread::park_if_finalizing();
         // Interpreter-path GC safepoint (PYRE_GC_INTERP), mirroring the JIT
         // eval loop. Between opcodes the only live refs are in the frame,
         // reachable through the installed `current_frame` root walker; no
@@ -1694,6 +1718,12 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // Without it, a JIT-off run reclaims interpreter-routed old-gen
         // allocations only at explicit `gc.collect`, so RSS grows unbounded.
         pyre_object::gc_interp::safepoint();
+        // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
+        // execute this plain evaluator (their JitDriver state is thread-owned),
+        // so they must poll the same process breaker as compiled/JIT-warm
+        // loops; otherwise a non-allocating Python loop can prevent collection
+        // and fork/finalization STW forever.
+        majit_gc::gc_sync::safepoint_poll();
 
         if next_instr >= code.instructions.len() {
             return Ok(w_none());
@@ -2067,7 +2097,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // only the builtin `finditem_str` fallback below runs.  Positive
         // form (`load_attr_cached` eval.rs:3586) keeps the annotator off
         // the bare-`!` hazard; `we_are_jitted()` folds to `ConstBool(true)`
-        // so the cache arm and its `Rc<RefCell<GlobalCache>>` chase are
+        // so the cache arm and its `Arc<Mutex<GlobalCache>>` chase are
         // dead-code-eliminated on the lifted graph.
         let use_cache = if majit_metainterp::jit::we_are_jitted() {
             false
@@ -2167,7 +2197,7 @@ pub unsafe fn load_global_via_cache_extern(
 /// during the builtins fallback (`baseobjspace.py:45-49
 /// W_Root.getdictvalue` → `space.finditem_str`).
 ///
-/// The `GlobalCache` chase walks an `Rc<RefCell<GlobalCache>>` cache
+/// The `GlobalCache` chase walks an `Arc<Mutex<GlobalCache>>` cache
 /// structure the tracer cannot model (its `deref` reads past the
 /// refcount / borrow-flag header, not a value-model identity).
 /// `celldict.py:287-291 _LOAD_GLOBAL_cached` bypasses the whole cache
@@ -2184,7 +2214,8 @@ unsafe fn load_global_via_cache(
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
     use pyre_object::celldict::unwrap_cell;
-    use pyre_object::dictmultiobject::W_ModuleDictObject;
+    use pyre_object::dictmultiobject::{W_ModuleDictObject, w_dict_lock};
+    let _module_guard = w_dict_lock(w_module_dict);
     // Body is a chain of unsafe-fn / raw-ptr ops on caller-supplied
     // PyObjectRefs; SAFETY contract is on the `unsafe fn` signature
     // (caller upholds w_module_dict / pycode / w_builtin validity).
@@ -2215,14 +2246,14 @@ unsafe fn load_global_via_cache(
                 // which calls `_load_global` whose own fallback chain reads
                 // the frame's picked builtin via `space.finditem_str`.
                 let (cell_opt, valid, bc_opt) = {
-                    let c = cache.borrow();
+                    let c = cache.lock().unwrap();
                     (c.cell, c.valid, c.builtincache.clone())
                 };
                 if let Some(v) = cell_opt {
                     return Ok(Some(unwrap_cell(v)));
                 }
                 if valid && let Some(bc) = bc_opt {
-                    let bcell = bc.borrow().cell;
+                    let bcell = bc.lock().unwrap().cell;
                     if let Some(v) = bcell {
                         return Ok(Some(unwrap_cell(v)));
                     }
@@ -2262,7 +2293,7 @@ unsafe fn load_global_via_cache(
             crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);
         }
         // `_LOAD_GLOBAL_cached` lines 296-298: cache.getvalue hit.
-        let cell_opt = cache.borrow().cell;
+        let cell_opt = cache.lock().unwrap().cell;
         if let Some(v) = cell_opt {
             return Ok(Some(unwrap_cell(v)));
         }

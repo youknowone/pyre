@@ -62,6 +62,7 @@ base64 = { workspace = true }
 crc32fast = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }
+parking_lot = { workspace = true }
 # Decompresses the embedded stdlib VFS blob at runtime (wasm_vfs). Decode-only,
 # no_std-compatible safe path; the encode side is unused here.
 lz4_flex = { version = "0.13", default-features = false, features = [

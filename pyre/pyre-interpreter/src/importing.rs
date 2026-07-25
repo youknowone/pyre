@@ -10,7 +10,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{
+    LazyLock, Mutex,
+    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+};
 // `Path` is used only by the host_env source/package loaders; keep it gated
 // so an host_env-off build does not warn on an unused import. `PathBuf`
 // appears in the host_env-independent module-search surface
@@ -351,27 +354,36 @@ pub fn mount_embedded_stdlib(mount: &Path) {
 }
 
 // ── sys.modules cache ────────────────────────────────────────────────
-// PyPy equivalent: space.sys.get('modules') — a dict mapping module names
-// to module objects. We use a thread-local HashMap<String, PyObjectRef>.
+// PyPy equivalent: `space.sys.get('modules')`, `space.sys.path`, and
+// `space.builtin_modules` are object-space/process state, shared by every
+// ExecutionContext.  Raw GC references use the established process-global
+// `usize` representation; the GIL serializes semantic access while the mutex
+// also makes foreign STW root walks well-defined.
+static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "host_env")]
+static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// The directory prepended to `sys.path` at startup (`config->sys_path_0`):
+/// the script's directory, or the cwd for `-c` / `-m`.  Captured once by
+/// `init_sys_path`; read by the shadowing check, which must not see later
+/// `sys.path` mutations.  PyPy records this on interpreter/import state, not
+/// on an OS thread: import shadowing decisions made by free-threaded workers
+/// must observe the startup path captured by the launcher.
+static SYS_PATH_0: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+/// The literal `sys.path[0]` entry staged by `init_sys_path` and prepended
+/// by `add_sys_path_0` once `site` has run (`pymain_sys_path_add_path0`):
+/// `""` for `-c` / stdin / the REPL, the cwd for `-m`, the script's
+/// directory for a script.  `None` under `-P`, and taken on first insert so
+/// the `-i` REPL-after-script path does not prepend it twice.  Process-global
+/// for the same reason as `SYS_PATH_0`: the launcher stages it and whichever
+/// thread runs the insert must observe that staging.
+static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
-    static SYS_MODULES: RefCell<HashMap<String, PyObjectRef>> = RefCell::new(HashMap::new());
-    /// The Python-visible `sys.modules` dict. Kept in sync with SYS_MODULES
-    /// so that `sys.modules['name']` lookups work from Python code.
-    static SYS_MODULES_DICT: std::cell::Cell<PyObjectRef> = const { std::cell::Cell::new(pyre_object::PY_NULL) };
-    /// sys.path equivalent — list of directories to search for modules.
-    #[cfg(feature = "host_env")]
-    static SYS_PATH: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-    /// Builtin modules registry — PyPy equivalent: space.builtin_modules
-    ///
-    /// Maps module name → initializer function that populates a GC module dict.
-    /// Each builtin module is lazily created on first import.
-    pub(crate) static BUILTIN_MODULES: RefCell<HashMap<&'static str, BuiltinModuleDef>> =
-        RefCell::new(HashMap::new());
-
     static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
-        modules: SYS_MODULES.with(|modules| modules as *const _),
-        modules_dict: SYS_MODULES_DICT.with(|dict| dict as *const _),
         argv_pending: SYS_ARGV_PENDING.with(|p| p as *const _),
     };
 }
@@ -383,8 +395,6 @@ pub(crate) struct BuiltinModuleDef {
 }
 
 struct ImportRootArea {
-    modules: *const RefCell<HashMap<String, PyObjectRef>>,
-    modules_dict: *const std::cell::Cell<PyObjectRef>,
     /// The pending `sys.argv` list is reachable only from this cell between
     /// `set_sys_argv` and `take_pending_sys_argv`.
     argv_pending: *const std::cell::Cell<PyObjectRef>,
@@ -410,15 +420,13 @@ struct ImportRootArea {
 ///
 /// PyPy equivalent: Module.install() → space.builtin_modules[name] = mod
 pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
-    BUILTIN_MODULES.with(|m| {
-        m.borrow_mut().insert(
-            name,
-            BuiltinModuleDef {
-                init,
-                startup: None,
-            },
-        );
-    });
+    BUILTIN_MODULES.lock().unwrap().insert(
+        name,
+        BuiltinModuleDef {
+            init,
+            startup: None,
+        },
+    );
 }
 
 /// Register a MixedModule initializer plus its `Module.startup` hook.
@@ -429,15 +437,13 @@ pub fn register_builtin_module_with_startup(
     init: fn(PyObjectRef),
     startup: fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>,
 ) {
-    BUILTIN_MODULES.with(|m| {
-        m.borrow_mut().insert(
-            name,
-            BuiltinModuleDef {
-                init,
-                startup: Some(startup),
-            },
-        );
-    });
+    BUILTIN_MODULES.lock().unwrap().insert(
+        name,
+        BuiltinModuleDef {
+            init,
+            startup: Some(startup),
+        },
+    );
 }
 
 /// The registered builtin module names, for `sys.builtin_module_names`.
@@ -450,16 +456,15 @@ pub fn register_builtin_module_with_startup(
 /// Dotted keys (`importlib.machinery`, `__pypy__.builders`) are registry
 /// entries for submodules, not top-level modules, so they are left out.
 pub fn builtin_module_names() -> Vec<&'static str> {
-    BUILTIN_MODULES.with(|m| {
-        let mut names: Vec<&'static str> = m
-            .borrow()
-            .keys()
-            .copied()
-            .filter(|name| !name.contains('.'))
-            .collect();
-        names.sort_unstable();
-        names
-    })
+    let mut names: Vec<&'static str> = BUILTIN_MODULES
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .filter(|name| !name.contains('.'))
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 /// Install all standard builtin modules.
@@ -887,7 +892,7 @@ fn init_sysconfigdata_empty(ns: PyObjectRef) {
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
 pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
-    let module_def = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
+    let module_def = BUILTIN_MODULES.lock().unwrap().get(name).copied()?;
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
@@ -1137,7 +1142,11 @@ fn startup_builtin_module(
     let mod_slot = shadow_stack_len();
     pin_root(module);
 
-    let startup = BUILTIN_MODULES.with(|m| m.borrow().get(name).and_then(|d| d.startup));
+    let startup = BUILTIN_MODULES
+        .lock()
+        .unwrap()
+        .get(name)
+        .and_then(|d| d.startup);
     if let Some(startup) = startup {
         startup(shadow_stack_get(mod_slot), execution_context)?;
     }
@@ -1178,20 +1187,16 @@ pub fn init_sys_path(script_dir: &Path, path0: &str) {
     // code can mutate `sys.path`.  Module origins are absolute canonical paths,
     // so store the canonical absolute form here for the directory comparison to
     // hold for a relative script argument or a symlinked working directory.
-    SYS_PATH_0.with(|p| {
-        *p.borrow_mut() = Some(canonical_startup_dir(script_dir));
-    });
+    *SYS_PATH_0.lock().unwrap() = Some(canonical_startup_dir(script_dir));
 
     // `pymain_run_python` prepends `sys.path[0]` only after `site` has run, so
     // `site.removeduppaths()` never absolutizes the `-c` / REPL empty entry into
     // the cwd.  Stage the entry here; `add_sys_path_0` performs the insert.
     // `-P` (safe_path) suppresses it entirely.
-    SYS_PATH_0_PENDING.with(|p| {
-        *p.borrow_mut() = (!safe_path_flag()).then(|| path0.to_string());
-    });
+    *SYS_PATH_0_PENDING.lock().unwrap() = (!safe_path_flag()).then(|| path0.to_string());
 
-    SYS_PATH.with(|p| {
-        let mut path = p.borrow_mut();
+    {
+        let mut path = SYS_PATH.lock().unwrap();
         path.clear();
         // PYTHONPATH entries head the seed and precede the stdlib
         // (pathconfig.c), split on the platform path-list separator.  Honoured
@@ -1213,7 +1218,7 @@ pub fn init_sys_path(script_dir: &Path, path0: &str) {
         // The stdlib entry is appended when the `sys` module is created —
         // `create_sys_path_list` forces `ensure_stdlib_path` before flushing
         // this seed into `sys.path`.
-    });
+    }
 }
 
 /// Locate the vendored stdlib (`lib-python/3`) by walking up the running
@@ -1303,13 +1308,13 @@ pub fn add_sys_path(dir: &Path) {
 
     let entry = dir.to_string_lossy();
     if get_sys_module("sys").is_none() {
-        SYS_PATH.with(|p| {
-            let mut path = p.borrow_mut();
+        {
+            let mut path = SYS_PATH.lock().unwrap();
             let pb = dir.to_path_buf();
             if !path.contains(&pb) {
                 path.push(pb);
             }
-        });
+        }
         return;
     }
     // Pin the new entry before any further allocation (`get_sys_module` and the
@@ -1352,13 +1357,13 @@ pub fn add_sys_path(dir: &Path) {
 pub fn add_sys_path_0() {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(entry) = SYS_PATH_0_PENDING.with(|p| p.borrow_mut().take()) else {
+    let Some(entry) = SYS_PATH_0_PENDING.lock().unwrap().take() else {
         return;
     };
     // No `sys` yet (an embedder that never imports `site`): stage at the front
     // of the seed instead, which `create_sys_path_list` flushes in order.
     if get_sys_module("sys").is_none() {
-        SYS_PATH.with(|p| p.borrow_mut().insert(0, PathBuf::from(&entry)));
+        SYS_PATH.lock().unwrap().insert(0, PathBuf::from(&entry));
         return;
     }
     // Pin the new entry before any further allocation (`get_sys_module` and the
@@ -1390,7 +1395,7 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // writing `sys.modules['foo'] = mod` is immediately visible to imports.
     // PyPy: importing.py check_sys_modules reads space.sys.get('modules').
     let key = pyre_object::w_str_new(name);
-    let dict = SYS_MODULES_DICT.with(|d| d.get());
+    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         if let Some(m) = unsafe { pyre_object::w_dict_lookup(dict, key) } {
             if !m.is_null() && !unsafe { pyre_object::is_none(m) } {
@@ -1398,7 +1403,12 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
             }
         }
     }
-    SYS_MODULES.with(|m| m.borrow().get(name).copied())
+    SYS_MODULES
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .map(|module| module as PyObjectRef)
 }
 
 /// Whether `sys.modules[name]` is bound to `None`, the sentinel that marks
@@ -1414,7 +1424,7 @@ fn sys_modules_blocks(name: &str) -> bool {
     // uses: reading the thread-local last keeps the borrow off the stack
     // across the allocation.
     let key = pyre_object::w_str_new(name);
-    let dict = SYS_MODULES_DICT.with(|d| d.get());
+    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if dict.is_null() {
         return false;
     }
@@ -1434,25 +1444,24 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
 /// installed. Used by callers that need to iterate every loaded module
 /// (e.g. pickle's `whichmodule` scan).
 pub fn sys_modules_dict() -> PyObjectRef {
-    SYS_MODULES_DICT.with(|d| d.get())
+    SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef
 }
 
 pub fn set_sys_module(name: &str, module: PyObjectRef) {
     // A new module joins the `walk_module_dicts_gc` root set; its dict
     // may hold young values — rescan on the next minor collection.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    SYS_MODULES.with(|m| {
-        m.borrow_mut().insert(name.to_string(), module);
-    });
+    SYS_MODULES
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), module as usize);
     // Keep the Python-visible sys.modules dict in sync.
-    SYS_MODULES_DICT.with(|d| {
-        let dict = d.get();
-        if !dict.is_null() {
-            unsafe {
-                pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
-            }
+    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    if !dict.is_null() {
+        unsafe {
+            pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
         }
-    });
+    }
 }
 
 /// Remove a (partially initialised) module from `sys.modules`.
@@ -1463,17 +1472,13 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
 /// `import ssl` (missing `_ssl`) leaves a broken `ssl` shell behind, and
 /// the next `import ssl` succeeds with no `SSLWantReadError`, etc.
 pub fn remove_sys_module(name: &str) {
-    SYS_MODULES.with(|m| {
-        m.borrow_mut().remove(name);
-    });
-    SYS_MODULES_DICT.with(|d| {
-        let dict = d.get();
-        if !dict.is_null() {
-            unsafe {
-                pyre_object::w_dict_delitem_str(dict, name);
-            }
+    SYS_MODULES.lock().unwrap().remove(name);
+    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    if !dict.is_null() {
+        unsafe {
+            pyre_object::w_dict_delitem_str(dict, name);
         }
-    });
+    }
 }
 
 /// GC root walk over every loaded module's dict storage.
@@ -1495,8 +1500,9 @@ pub fn remove_sys_module(name: &str) {
 /// `visitor` must tolerate being called on every movable module-dict
 /// value slot reachable here.
 pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    SYS_MODULES.with(|m| {
-        for &module in m.borrow().values() {
+    {
+        for &module in SYS_MODULES.lock().unwrap().values() {
+            let module = module as PyObjectRef;
             if module.is_null() || !unsafe { pyre_object::is_module(module) } {
                 continue;
             }
@@ -1507,7 +1513,7 @@ pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
                 pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
             }
         }
-    });
+    }
 }
 
 /// Forward the `sys.modules` dict pointer cached in `SYS_MODULES_DICT`.
@@ -1524,14 +1530,12 @@ pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 /// # Safety
 /// `visitor` must tolerate a non-nursery or already-forwarded pointer.
 pub unsafe fn walk_sys_modules_dict_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    SYS_MODULES_DICT.with(|d| {
-        let mut dict = d.get();
-        if dict.is_null() {
-            return;
-        }
-        visitor(&mut dict);
-        d.set(dict);
-    });
+    let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    if dict.is_null() {
+        return;
+    }
+    visitor(&mut dict);
+    SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
 }
 
 pub(crate) fn capture_import_root_area() -> *const () {
@@ -1546,10 +1550,11 @@ pub(crate) unsafe fn walk_import_roots_area(
     visitor: &mut dyn FnMut(&mut PyObjectRef),
 ) {
     let area = unsafe { &*(data as *const ImportRootArea) };
-    // SAFETY: the owning thread is quiesced for this foreign root walk, so the
-    // modules map is stable even if it parked with the RefCell borrow flag set.
-    let modules = unsafe { &*(*area.modules).as_ptr() };
-    for &module in modules.values() {
+    // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
+    // mutator, so the process-global cache cannot be semantically mutated
+    // while this walk holds its native lock.
+    for &module in SYS_MODULES.lock().unwrap().values() {
+        let module = module as PyObjectRef;
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
         }
@@ -1560,11 +1565,10 @@ pub(crate) unsafe fn walk_import_roots_area(
             pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
         }
     }
-    let modules_dict = unsafe { &*area.modules_dict };
-    let mut dict = modules_dict.get();
+    let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         visitor(&mut dict);
-        modules_dict.set(dict);
+        SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
     }
     let argv_pending = unsafe { &*area.argv_pending };
     let mut argv = argv_pending.get();
@@ -1590,17 +1594,6 @@ pub fn set_sys_argv(args: &[String]) {
 thread_local! {
     static SYS_ARGV_PENDING: std::cell::Cell<pyre_object::PyObjectRef> =
         const { std::cell::Cell::new(pyre_object::PY_NULL) };
-    /// The directory prepended to `sys.path` at startup (`config->sys_path_0`):
-    /// the script's directory, or the cwd for `-c` / `-m`.  Captured once by
-    /// `init_sys_path`; read by the shadowing check, which must not see later
-    /// `sys.path` mutations.
-    static SYS_PATH_0: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// The literal `sys.path[0]` entry staged by `init_sys_path` and prepended
-    /// by `add_sys_path_0` once `site` has run (`pymain_sys_path_add_path0`):
-    /// `""` for `-c` / stdin / the REPL, the cwd for `-m`, the script's
-    /// directory for a script.  `None` under `-P`, and taken on first insert so
-    /// the `-i` REPL-after-script path does not prepend it twice.
-    static SYS_PATH_0_PENDING: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 // The launcher flags belong to the interpreter, not to whichever thread
@@ -1714,15 +1707,17 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
     // The fast-path cell walked by `walk_sys_modules_dict_gc` now holds
     // a possibly-young dict; rescan on the next minor collection.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    SYS_MODULES_DICT.with(|d| d.set(dict));
+    SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
     // Populate with all modules already in the cache.
-    SYS_MODULES.with(|m| {
-        for (name, &module) in m.borrow().iter() {
-            unsafe {
-                pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
-            }
+    for (name, &module) in SYS_MODULES.lock().unwrap().iter() {
+        unsafe {
+            pyre_object::w_dict_store(
+                dict,
+                pyre_object::w_str_new(name),
+                module as PyObjectRef,
+            );
         }
-    });
+    }
 }
 
 // ── find_module ──────────────────────────────────────────────────────
@@ -1758,7 +1753,7 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
     }
 
     // Check builtin modules first (PyPy: space.builtin_modules check in find_module)
-    let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
+    let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
     if is_builtin {
         return Some(FindInfo::Builtin);
     }
@@ -1786,7 +1781,7 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
     if let Some(dirs) = parent_dirs {
         return find_in_dirs(partname, dirs);
     }
-    let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
+    let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
     if is_builtin {
         return Some(FindInfo::Builtin);
     }
@@ -1795,7 +1790,7 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
 
 #[cfg(not(feature = "host_env"))]
 fn find_module(partname: &str, _parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
-    let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
+    let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
     if is_builtin {
         return Some(FindInfo::Builtin);
     }
@@ -1912,10 +1907,16 @@ fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
             // at startup. Until the `nt` registration lands, a live-list miss
             // falls back to the native seed so the stdlib stays importable.
             #[cfg(windows)]
-            let found = found.or_else(|| SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())));
+            let found = found.or_else(|| {
+                let path = SYS_PATH.lock().unwrap();
+                find_in_dirs(partname, &path)
+            });
             found
         }
-        None => SYS_PATH.with(|p| find_in_dirs(partname, &p.borrow())),
+        None => {
+            let path = SYS_PATH.lock().unwrap();
+            find_in_dirs(partname, &path)
+        }
     }
 }
 
@@ -1934,12 +1935,12 @@ fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
 pub(crate) fn create_sys_path_list() -> PyObjectRef {
     #[cfg(not(target_arch = "wasm32"))]
     ensure_stdlib_path();
-    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
-        p.borrow()
-            .iter()
-            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
-            .collect()
-    });
+    let items: Vec<PyObjectRef> = SYS_PATH
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+        .collect();
     pyre_object::w_list_new(items)
 }
 
@@ -2520,7 +2521,10 @@ fn load_part(
     // `importlib.machinery` can override the filesystem search.
     // PyPy: interp_import.importhook consults sys.builtin_module_names by
     // the fully-qualified name.
-    let full_is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(modulename));
+    let full_is_builtin = BUILTIN_MODULES
+        .lock()
+        .unwrap()
+        .contains_key(modulename);
     if full_is_builtin {
         // `pypy/interpreter/module.py:18 Module.__init__` keeps a single
         // `Module` per imported module name; `space.builtin` IS the
@@ -3366,7 +3370,7 @@ pub(crate) fn is_possibly_shadowing(origin: &str) -> bool {
     if safe_path_flag() {
         return false;
     }
-    let Some(sys_path_0) = SYS_PATH_0.with(|p| p.borrow().clone()) else {
+    let Some(sys_path_0) = SYS_PATH_0.lock().unwrap().clone() else {
         return false;
     };
     let sep = std::path::MAIN_SEPARATOR;
