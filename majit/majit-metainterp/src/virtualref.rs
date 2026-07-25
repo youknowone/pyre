@@ -343,7 +343,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
-    pub(crate) unsafe fn force_virtual(
+    pub unsafe fn force_virtual(
         &self,
         vref_ptr: *mut u8,
         force_now: impl FnOnce(*mut JitVirtualRef),

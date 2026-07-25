@@ -3645,7 +3645,37 @@ fn build_jit_driver_pair() -> JitDriverPair {
         crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
     );
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
+    pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
     (d, info)
+}
+
+/// The materializing arm of `virtualref.py:134 force_virtual_if_necessary`.
+///
+/// The interpreter's `force_vref` runs the typeptr check — upstream's "common,
+/// fast case" — and calls this only for a slot that really holds a
+/// `JitVirtualRef`.  `force_virtual` needs `ResumeGuardForcedDescr.force_now`
+/// (`compile.py:966`), which lives behind the backend `Runner`, so it takes it
+/// as a closure and this is where both halves are in scope.
+unsafe extern "C" fn force_pyframe_vref(
+    vref: *mut pyre_interpreter::PyFrame,
+) -> *mut pyre_interpreter::PyFrame {
+    let (driver, _info) = driver_pair();
+    let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
+    let forced = unsafe {
+        vrefinfo.force_virtual(vref as *mut u8, |v| {
+            // `compile.py:967-971 force_now(cpu, token)` — force the JIT frame
+            // the vref names, then run the guard's async forcing, which is
+            // what writes `virtual_token = TOKEN_NONE` and `forced` back.
+            let token = (*v).virtual_token as usize as u64;
+            driver.meta_interp_mut().force_virtualizable_token(token);
+        })
+    };
+    // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means
+    // the vref outlived the frame it stood for, which upstream reports as
+    // `jit.py:487 InvalidVirtualRef`.  Nothing in the frame chain may reach
+    // that state: `virtual_ref_finish` runs before the frame is dropped.
+    forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
+        as *mut pyre_interpreter::PyFrame
 }
 
 unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {

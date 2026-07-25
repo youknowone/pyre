@@ -41,10 +41,13 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
 #[inline]
 pub(crate) fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
-        match FORCE_VREF_HOOK.get() {
-            Some(f) => unsafe { f(ptr) },
-            None => ptr,
-        }
+        // Only the tracer stores a `JitVirtualRef` here, and it registers the
+        // hook when the driver comes up, so an unset hook means the slot was
+        // misidentified.  Returning `ptr` would hand a vref out as a frame.
+        let f = FORCE_VREF_HOOK
+            .get()
+            .expect("frame-chain vref with no force hook: the JIT never came up");
+        unsafe { f(ptr) }
     } else {
         ptr
     }
