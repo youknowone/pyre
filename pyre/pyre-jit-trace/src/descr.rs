@@ -704,7 +704,7 @@ fn build_object_descr_group_with_def_path(
             .iter()
             .any(|fd| fd.offset() == pyre_object::pyobject::W_CLASS_OFFSET)
         {
-            gc_fielddescrs.push(new_w_class_field_descr());
+            gc_fielddescrs.push(W_CLASS_FIELD_DESCR.clone());
         }
         // `descr.py:108-118 get_size_descr` cache key — `path_hash`로
         // 만들어진 lltype-object identity.  Prefer the canonical
@@ -1774,8 +1774,19 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
     })
 }
 
+/// The single `w_class` field descriptor for the shared `PyObject` header.
+///
+/// `descr.py:218-239 get_field_descr` caches on `(STRUCT, fieldname)`, so a
+/// given field is one object for the whole run and every consumer compares it
+/// by identity: `heap.py` keys `cached_fields` by the descriptor itself
+/// (`heap.rs:860 cached_field_pos_for_descr` matches on `descr_identity`), and
+/// so do the short-preamble export and `force_from_effectinfo`. Minting a
+/// fresh `Arc` per call gave each `w_class` read in a trace its own identity,
+/// so two reads of the same header could never share a cache entry.
+static W_CLASS_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(new_w_class_field_descr);
+
 pub fn w_class_descr() -> DescrRef {
-    new_w_class_field_descr()
+    W_CLASS_FIELD_DESCR.clone() as DescrRef
 }
 
 /// Alias for backward compatibility — same as w_class_descr().
@@ -2160,7 +2171,16 @@ pub fn str_len_descr() -> DescrRef {
 
 /// Field descriptor for ob_type (PyObject.ob_type pointer) — immutable.
 /// heaptracker.py:66: `if name == 'typeptr': continue`
+///
+/// One object per run, for the identity reason documented on
+/// [`W_CLASS_FIELD_DESCR`].
+static OB_TYPE_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(new_ob_type_field_descr);
+
 pub fn ob_type_descr() -> DescrRef {
+    OB_TYPE_FIELD_DESCR.clone() as DescrRef
+}
+
+fn new_ob_type_field_descr() -> Arc<dyn FieldDescr> {
     Arc::new(PyreFieldDescr {
         offset: OB_TYPE_OFFSET,
         field_size: 8,
