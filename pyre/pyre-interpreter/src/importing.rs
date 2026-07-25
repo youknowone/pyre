@@ -3096,13 +3096,13 @@ pub fn dunder_import_name_obj(
     let fromlist_slot = shadow_stack_len();
     pin_root(w_fromlist);
 
-    let bootstrap = get_sys_module("importlib._bootstrap").and_then(|w_bootstrap| {
+    let bootstrap = if let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") {
         let bootstrap_slot = shadow_stack_len();
         pin_root(w_bootstrap);
-        crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")
-            .ok()
-            .flatten()
-    });
+        crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")?
+    } else {
+        None
+    };
     let Some(w_import) = bootstrap else {
         // The bootstrap is not importable yet, and no native lookup can serve
         // this name, so it is reported missing.
