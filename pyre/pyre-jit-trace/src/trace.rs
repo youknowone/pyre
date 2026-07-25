@@ -2937,14 +2937,17 @@ fn run_perfn_walk<Sym: WalkSym>(
     // rather than rewinding the live frame to the guard pc and re-running the
     // region through the `ContinueRunningNormally` re-entry — which would
     // execute every residual a second time and double-apply any
-    // callee-internal side effect (#177).  The tracer arms it for any
-    // single-frame resume: the general guard path consumes the kept stash as
-    // a terminal `BridgeResolution`, and the CALL_ASSEMBLER callback hands it
-    // to its back-to-back blackhole hook, so a committed journal never
-    // strands into a guard-state re-run; the three decisions (this
-    // predicate, the journal commit below, and the caller's
-    // consume-vs-rewind) stay in agreement.  A multiframe resume is never
-    // armed, so it stays on the legacy rewind-and-replay path.
+    // callee-internal side effect (#177).  The general guard path consumes
+    // the kept stash as a terminal `BridgeResolution` and so arms any resume,
+    // single- or multi-frame — `Terminate` is always the LIVE frame's return
+    // (an inlined callee's return is a `SubReturn` inside the walk), so its
+    // concrete result is what that frame hands its caller either way.  The
+    // CALL_ASSEMBLER callback routes the stash through a back-to-back
+    // blackhole hook that reconstructs a single live frame, so it arms only
+    // single-frame resumes and leaves multiframe ones on the rewind-and-replay
+    // path.  Either way a committed journal never strands into a guard-state
+    // re-run: the three decisions (this predicate, the journal commit below,
+    // and the caller's consume-vs-rewind) stay in agreement.
     let terminate_no_replay = (!is_bridge_trace
         || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(

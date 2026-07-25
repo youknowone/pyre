@@ -3097,17 +3097,30 @@ pub fn trace_and_compile_from_bridge(
     let trace_frame = frame.snapshot_for_tracing();
     let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
-    // Arm the bridge `Terminate` no-replay shortcut for this walk whenever
-    // the resume is single-frame.  The walk epilogue (`run_perfn_walk` in
-    // trace.rs) reads this flag: only when armed does a bridge `Terminate`
-    // walk keep its finish-concrete stash + commit the store journal, so the
-    // three decisions (epilogue predicate, journal commit, the
-    // consume-vs-rewind below) stay in agreement and a committed journal
-    // never strands into a blackhole re-run.  Both callers can consume the
-    // kept stash: the general guard path returns it as a terminal
-    // `BridgeResolution`, and the CALL_ASSEMBLER callback hands it to the
-    // back-to-back blackhole hook via `CA_WALK_FINISHED_FRAME`.
-    let bridge_noreplay_armed = !is_multiframe_resume;
+    // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
+    // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
+    // does a bridge `Terminate` walk keep its finish-concrete stash + commit
+    // the store journal, so the three decisions (epilogue predicate, journal
+    // commit, the consume-vs-rewind below) stay in agreement and a committed
+    // journal never strands into a blackhole re-run.
+    //
+    // `pyjitpl.py:2947` `interpret()` "should always raise": a resumed trace
+    // that runs its frames forward to a return raises `DoneWithThisFrame`
+    // from the POST-walk state, whatever the resume's frame count — there is
+    // no rewind-to-the-deadframe re-run upstream.  A multi-frame resume walks
+    // the inlined callees to `SubReturn` and only the LIVE frame's return
+    // raises `Terminate`, so its finish-concrete is that frame's result, the
+    // same value the blackhole rebuild would produce.  Replaying instead
+    // re-executes every residual the walk already ran concretely and
+    // double-applies its callee-internal side effects (`Counter.bump()`'s
+    // `self.pos += 1` counted twice in
+    // `bench/synth/nested_callee_chain_mutation_abort.py`).
+    //
+    // The CALL_ASSEMBLER callback (`allow_finish_direct_return == false`)
+    // hands a kept stash to its back-to-back blackhole hook through
+    // `CA_WALK_FINISHED_FRAME`, which reconstructs one live frame; keep that
+    // caller on the single-frame arming it already had.
+    let bridge_noreplay_armed = allow_finish_direct_return || !is_multiframe_resume;
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(bridge_noreplay_armed);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -3200,15 +3213,10 @@ pub fn trace_and_compile_from_bridge(
     }
     match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
         Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
-            // `bridge_noreplay_armed` folds in `!is_multiframe_resume`, so a kept
-            // stash implies a single real live PyFrame: the `Terminate` is the
-            // live frame's function return, about to be popped by its caller with
-            // `cv`.  No rewind, no blackhole.
-            debug_assert!(
-                !is_multiframe_resume,
-                "bridge Terminate no-replay stash kept for a multiframe resume \
-                 (frames={num_resume_frames})"
-            );
+            // `Terminate` is the LIVE frame's function return, about to be
+            // popped by its caller with `cv`; any inlined callee the resume
+            // reconstructed already returned inside the walk.  No rewind, no
+            // blackhole.
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] finish-noreplay at resume_pc={} key={}",
@@ -3218,11 +3226,6 @@ pub fn trace_and_compile_from_bridge(
             return BridgeResolution::Finished(cv);
         }
         Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-            debug_assert!(
-                !is_multiframe_resume,
-                "bridge Terminate no-replay raise kept for a multiframe resume \
-                 (frames={num_resume_frames})"
-            );
             // jitexc.py:44: hand the walk's uncaught exception to the
             // guard's portal as ExitFrameWithExceptionRef.
             return BridgeResolution::FinishedException(cv);
@@ -3244,9 +3247,11 @@ pub fn trace_and_compile_from_bridge(
     // THIS iteration through the blackhole, which rebuilds the full inlined
     // framestack and runs it — exactly as a cold multi-frame guard does.
     // Signalled by returning `false` (→ `handle_fail` ResumeInBlackhole) even
-    // though the bridge compiled. The walk took the non-flush path, so it
-    // committed no side effects; the blackhole re-running the resumed region
-    // applies them exactly once.
+    // though the bridge compiled. The walk took the non-flush path, so its
+    // store journal was rolled back; a residual it executed concretely is not
+    // in that journal, so the blackhole re-run applies such an effect twice —
+    // the `Terminate` no-replay shortcut above is what keeps a returning walk
+    // off this path.
     // The non-flush path applies to single-frame guards too: without the
     // committed walk-end state the live frame's last_instr / operand stack
     // were never advanced through the guard's resume region (only the
