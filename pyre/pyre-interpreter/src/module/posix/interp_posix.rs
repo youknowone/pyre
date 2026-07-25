@@ -1733,10 +1733,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "urandom",
             |args| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error("urandom() requires 1 argument"));
+                crate::gateway::check_declared_arity("urandom", 1, args.len())?;
+                // `__index__` conversion, so a non-integer is a TypeError
+                // instead of a raw field read that asks for an arbitrary
+                // number of bytes.
+                let n = crate::baseobjspace::int_w(args[0])?;
+                if n < 0 {
+                    return Err(crate::PyError::value_error("negative argument not allowed"));
                 }
-                let n = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                let n = n as usize;
                 #[cfg(not(feature = "sandbox"))]
                 let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
                 // Route host entropy through the trusted controller instead of
