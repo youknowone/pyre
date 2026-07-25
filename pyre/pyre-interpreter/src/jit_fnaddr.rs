@@ -1098,6 +1098,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
         crate::objspace::descroperation::jit_bigint_mod_floor as *const (),
     );
+    // Machine-int-divisor legs of the same seams (`_int_floordiv` / `_int_mod`).
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_div_floor",
+        crate::objspace::descroperation::jit_bigint_int_div_floor as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_mod_int_result",
+        crate::objspace::descroperation::jit_bigint_int_mod_int_result as *const (),
+    );
     // `jit_bigint_{and,or,xor,sub,mul}` residualize the Rust RBigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
     // (`front::bigint_binop`) redirects when both operands are the opaque
@@ -1197,6 +1208,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_pow_nomod",
         crate::objspace::descroperation::jit_bigint_pow_nomod as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_pow_nomod",
+        crate::objspace::descroperation::jit_bigint_int_pow_nomod as *const (),
     );
     // `bigint_lshift_count(...)?` carries the same implicit MemoryError shape
     // for RPython's lshift allocation.

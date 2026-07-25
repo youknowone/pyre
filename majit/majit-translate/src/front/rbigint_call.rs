@@ -180,23 +180,27 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
 /// rule in `result_exc` removes the `Result` diamond; this target swap supplies
 /// the matching one-GC-reference result ABI.
 pub(crate) fn pow_nomod_residual_path(segments: &[String]) -> Option<Vec<String>> {
-    if !segments.ends_with(&[
-        "objspace".to_string(),
-        "descroperation".to_string(),
-        "bigint_pow_nomod".to_string(),
-    ]) {
+    // `bigint_int_pow_nomod` is the machine-int-exponent leg `descr_pow` takes
+    // for a `W_IntObject` exponent; its carrier and pointer result ABI match.
+    let residual = match segments.last().map(String::as_str) {
+        Some("bigint_pow_nomod") => "jit_bigint_pow_nomod",
+        Some("bigint_int_pow_nomod") => "jit_bigint_int_pow_nomod",
+        _ => return None,
+    };
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
         return None;
     }
     Some(
-        [
-            "pyre_interpreter",
-            "objspace",
-            "descroperation",
-            "jit_bigint_pow_nomod",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
+        ["pyre_interpreter", "objspace", "descroperation", residual]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     )
 }
 
@@ -250,6 +254,11 @@ pub(crate) fn divmod_projection_residual_path(segments: &[String]) -> Option<Vec
     let residual = match segments.last().map(String::as_str) {
         Some("bigint_floordiv_nonzero") => "jit_bigint_div_floor",
         Some("bigint_modulo_nonzero") => "jit_bigint_mod_floor",
+        // Machine-int-divisor quotient leg (`_int_floordiv`): the divisor is
+        // already a bare word, so this swap stays ABI-identical. The `_int_mod`
+        // leg has no entry — `int_mod_int_result` yields a machine int, while
+        // every result in this map is modeled as a GC reference.
+        Some("bigint_int_floordiv_nonzero") => "jit_bigint_int_div_floor",
         _ => return None,
     };
     if !segments

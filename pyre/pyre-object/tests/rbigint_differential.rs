@@ -69,6 +69,24 @@ fn oracle_floor_divmod(a: &Oracle, b: &Oracle) -> (Oracle, Oracle) {
     (q, r)
 }
 
+/// Machine-word operand stream for the `int_*` legs: mostly random words, but
+/// weighted towards the boundaries those legs special-case — zero, ±1, powers
+/// of two, and the ends of the signed range where the single-digit fast path
+/// gives way to a `fromint` fallback.
+fn machine_word(state: &mut u64) -> i64 {
+    let raw = next_u64(state);
+    match raw % 8 {
+        0 => 0,
+        1 => 1,
+        2 => -1,
+        3 => 1_i64 << (raw >> 32) % 62,
+        4 => -(1_i64 << (raw >> 32) % 62),
+        5 => i64::MAX,
+        6 => i64::MIN,
+        _ => raw as i64,
+    }
+}
+
 fn oracle_abs(value: &Oracle) -> Oracle {
     if value.sign() == OracleSign::Minus {
         -value
@@ -228,6 +246,72 @@ fn deterministic_arbitrary_size_arithmetic_matches_independent_oracle() {
             let (oq, or) = oracle_floor_divmod(&oa, &ob);
             assert_eq!(to_oracle(&q), oq, "floordiv, iteration {iteration}");
             assert_eq!(to_oracle(&r), or, "mod, iteration {iteration}");
+        }
+
+        // Machine-word legs (`rbigint.int_*`), the ones `W_LongObject`'s
+        // descriptors take for a `W_IntObject` operand. The divisor stream
+        // deliberately spans ±1, powers of two, and magnitudes outside the
+        // single-digit range so `int_floordiv`/`int_mod_int_result` exercise
+        // their `fromint` fallbacks too.
+        let word = machine_word(&mut state);
+        let oword = Oracle::from(word);
+        assert_eq!(
+            to_oracle(&a.int_add(word)),
+            &oa + &oword,
+            "int_add, iteration {iteration}"
+        );
+        assert_eq!(
+            to_oracle(&a.int_sub(word)),
+            &oa - &oword,
+            "int_sub, iteration {iteration}"
+        );
+        assert_eq!(
+            to_oracle(&a.int_mul(word)),
+            &oa * &oword,
+            "int_mul, iteration {iteration}"
+        );
+        assert_eq!(
+            to_oracle(&a.int_and_(word)),
+            &oa & &oword,
+            "int_and_, iteration {iteration}"
+        );
+        assert_eq!(
+            to_oracle(&a.int_or_(word)),
+            &oa | &oword,
+            "int_or_, iteration {iteration}"
+        );
+        assert_eq!(
+            to_oracle(&a.int_xor(word)),
+            &oa ^ &oword,
+            "int_xor, iteration {iteration}"
+        );
+        if word != 0 {
+            let (oq, or) = oracle_floor_divmod(&oa, &oword);
+            assert_eq!(
+                to_oracle(&a.int_floordiv(word).unwrap()),
+                oq,
+                "int_floordiv, iteration {iteration}"
+            );
+            assert_eq!(
+                to_oracle(&a.int_mod(word).unwrap()),
+                or,
+                "int_mod, iteration {iteration}"
+            );
+            // The remainder of a long by a machine int always fits a machine
+            // int — that invariant is what lets `_int_mod` return `newint`.
+            assert_eq!(
+                Oracle::from(a.int_mod_int_result(word).unwrap()),
+                or,
+                "int_mod_int_result, iteration {iteration}"
+            );
+            let (iq, ir) = a.int_divmod(word).unwrap();
+            assert_eq!(to_oracle(&iq), oq, "int_divmod q, iteration {iteration}");
+            assert_eq!(to_oracle(&ir), or, "int_divmod r, iteration {iteration}");
+        } else {
+            assert!(a.int_floordiv(word).is_err());
+            assert!(a.int_mod(word).is_err());
+            assert!(a.int_mod_int_result(word).is_err());
+            assert!(a.int_divmod(word).is_err());
         }
 
         let exponent = (next_u64(&mut state) % 13) as i64;

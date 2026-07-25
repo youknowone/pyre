@@ -108,6 +108,25 @@ fn bigint_modulo_nonzero(a: BigInt, b: BigInt) -> BigInt {
     a.divmod(&b).expect("divisor was checked nonzero").1
 }
 
+/// Machine-int-divisor form of [`bigint_floordiv_nonzero`]
+/// (`longobject.py:418 _int_floordiv` → `rbigint.int_floordiv`). The dedicated
+/// leg divides by a single digit instead of first materializing an rbigint for
+/// the `W_IntObject`.
+#[majit_macros::jit_elidable]
+fn bigint_int_floordiv_nonzero(a: BigInt, b: i64) -> BigInt {
+    a.int_floordiv(b).expect("divisor was checked nonzero")
+}
+
+/// Machine-int-divisor form of [`bigint_modulo_nonzero`]
+/// (`longobject.py:435 _int_mod` → `rbigint.int_mod_int_result`). The remainder
+/// of a long by a machine int always fits a machine int, so the descriptor
+/// returns `space.newint` and this leg allocates no result bigint.
+#[majit_macros::jit_elidable]
+fn bigint_int_modulo_int_result_nonzero(a: BigInt, b: i64) -> i64 {
+    a.int_mod_int_result(b)
+        .expect("divisor was checked nonzero")
+}
+
 #[majit_macros::elidable]
 fn bigint_and(a: BigInt, b: BigInt) -> BigInt {
     a & b
@@ -146,6 +165,15 @@ fn bigint_rshift(a: BigInt, shift: usize) -> BigInt {
 #[majit_macros::dont_look_inside]
 fn bigint_pow_nomod(a: &BigInt, b: &BigInt) -> Result<BigInt, PyError> {
     a.pow(b, None)
+        .map_err(|_| PyError::memory_error("exponent too large"))
+}
+
+/// Machine-int-exponent form of [`bigint_pow_nomod`]. `descr_pow` keeps a
+/// `W_IntObject` exponent unwrapped and calls `rbigint.int_pow`
+/// (`longobject.py:230`); only a long exponent reaches `rbigint.pow`.
+#[majit_macros::dont_look_inside]
+fn bigint_int_pow_nomod(a: &BigInt, b: i64) -> Result<BigInt, PyError> {
+    a.int_pow(b, None)
         .map_err(|_| PyError::memory_error("exponent too large"))
 }
 
@@ -254,6 +282,33 @@ pub extern "C" fn jit_bigint_div_floor(a: i64, b: i64) -> pyre_object::longobjec
             ),
         )
     }
+}
+
+/// Machine-int-divisor quotient (`longobject.py:418 _int_floordiv` →
+/// `rbigint.int_floordiv`). `b` is a bare machine word, not a payload pointer.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_int_div_floor(
+    a: i64,
+    b: i64,
+) -> pyre_object::longobject::JitBigIntResult {
+    let a = a as *const BigInt;
+    unsafe {
+        pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                (&*a).int_floordiv(b).expect("division by zero"),
+            ),
+        )
+    }
+}
+
+/// Machine-int-divisor remainder (`longobject.py:435 _int_mod` →
+/// `rbigint.int_mod_int_result`). The remainder of a long by a machine int
+/// always fits a machine int, so this residual returns the value itself and
+/// allocates nothing.
+#[majit_macros::elidable]
+pub extern "C" fn jit_bigint_int_mod_int_result(a: i64, b: i64) -> i64 {
+    let a = a as *const BigInt;
+    unsafe { (&*a).int_mod_int_result(b).expect("division by zero") }
 }
 
 /// `rbigint.divmod`'s floored modulus projection.
@@ -410,6 +465,27 @@ bigint_int_comparison_residual!(jit_bigint_int_ge, int_ge);
 pub extern "C" fn jit_bigint_pow_nomod(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     match unsafe { (&*a).pow(&*b, None) } {
+        Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
+            pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+        ),
+        Err(_) => {
+            crate::runtime_ops::jit_publish_exception(
+                pyre_object::interp_exceptions::memory_error_singleton(),
+            );
+            pyre_object::longobject::encode_jit_bigint_result(std::ptr::null_mut())
+        }
+    }
+}
+
+/// Machine-int-exponent form of [`jit_bigint_pow_nomod`]
+/// (`longobject.py:230` → `rbigint.int_pow`). `b` is a bare machine word.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_int_pow_nomod(
+    a: i64,
+    b: i64,
+) -> pyre_object::longobject::JitBigIntResult {
+    let a = a as *const BigInt;
+    match unsafe { (&*a).int_pow(b, None) } {
         Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
             pyre_object::longobject::alloc_bigint_nursery_collecting(value),
         ),
@@ -777,11 +853,20 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    // longobject.py:424 `_make_descr_binop(_floordiv, _int_floordiv)`: a
+    // machine-int divisor takes the dedicated `rbigint.int_floordiv` leg.
+    // 3.x reports "integer division or modulo by zero" for every int; the
+    // int path raises the same. PyPy's `_floordiv` still carries the 2.x
+    // "long ..." wording (longobject.py:409), which a 3.x runtime does not.
+    if is_int_like(b) {
+        let vb = int_value(b);
+        if vb == 0 {
+            return Err(PyError::zero_division("integer division or modulo by zero"));
+        }
+        return Ok(w_long_new(bigint_int_floordiv_nonzero(as_bigint(a), vb)));
+    }
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        // 3.x reports "integer division or modulo by zero" for every int; the
-        // int path raises the same. PyPy's `_floordiv` still carries the 2.x
-        // "long ..." wording (longobject.py:409), which a 3.x runtime does not.
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
@@ -790,22 +875,28 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    // longobject.py:441 `_make_descr_binop(_mod, _int_mod)`. `_int_mod`
+    // (machine-int RHS) computes through `rbigint.int_mod_int_result` and
+    // returns `space.newint` — the remainder of a long by a machine int always
+    // fits — while `_mod` (long RHS) returns `newlong`.
+    // `%` alone reports "integer modulo by zero" (not the floordiv/divmod
+    // "division or modulo" wording).
+    if is_int_like(b) {
+        let vb = int_value(b);
+        if vb == 0 {
+            return Err(PyError::zero_division("integer modulo by zero"));
+        }
+        return Ok(w_int_new(bigint_int_modulo_int_result_nonzero(
+            as_bigint(a),
+            vb,
+        )));
+    }
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        // `%` alone reports "integer modulo by zero" (not the floordiv/divmod
-        // "division or modulo" wording).
         return Err(PyError::zero_division("integer modulo by zero"));
     }
     // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
-    // `_int_mod` (machine-int RHS) returns `space.newint` — the remainder of a
-    // long by a machine int always fits — while `_mod` (long RHS) returns
-    // `newlong`. `a` is a long here, so the RHS kind decides.
-    let r = bigint_modulo_nonzero(as_bigint(a), vb);
-    if is_int_like(b) {
-        Ok(w_int_new(jit_bigint_to_i64_value(&r)))
-    } else {
-        Ok(w_long_new(r))
-    }
+    Ok(w_long_new(bigint_modulo_nonzero(as_bigint(a), vb)))
 }
 
 /// PyPy longobject.py `_divmod` / `_int_divmod`: compute both halves with one
@@ -1302,6 +1393,12 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if va == BigInt::from(-1) {
         let even = vb.clone() % BigInt::from(2) == BigInt::from(0);
         return Ok(w_long_new(BigInt::from(if even { 1 } else { -1 })));
+    }
+    // longobject.py:229-231: `descr_pow` keeps a `W_IntObject` exponent
+    // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
+    // long exponent reaches `rbigint.pow`.
+    if is_int_like(b) {
+        return Ok(w_long_new(bigint_int_pow_nomod(&va, int_value(b))?));
     }
     Ok(w_long_new(bigint_pow_nomod(&va, &vb)?))
 }
