@@ -233,19 +233,25 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let w_typecode = args[1];
     // typecode must be a 1-character str.
     if !unsafe { pyre_object::is_str(w_typecode) } {
-        return Err(PyError::type_error(
-            "array() argument 1 must be a unicode character, not a different type",
-        ));
+        return Err(PyError::type_error(format!(
+            "array() argument 1 must be a unicode character, not {}",
+            crate::baseobjspace::object_functionstr_type_name(w_typecode)
+        )));
     }
-    // Read as the raw buffer: a typecode is a single ASCII character, so a
-    // lone surrogate simply fails the length and membership checks below.
-    let tc_bytes = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_typecode) }.as_bytes();
-    if tc_bytes.len() != 1 {
-        return Err(PyError::type_error(
-            "array() argument 1 must be a unicode character, not str",
-        ));
-    }
-    let typecode = tc_bytes[0];
+    // Measured in code points on the raw buffer: a lone surrogate is one
+    // character with no `&str` spelling, so it reaches the typecode check
+    // below rather than counting as three.
+    let tc = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_typecode) };
+    let mut points = tc.code_points();
+    let Some(first) = points.next().filter(|_| points.next().is_none()) else {
+        return Err(PyError::type_error(format!(
+            "array() argument 1 must be a unicode character, not a string of length {}",
+            tc.code_points().count()
+        )));
+    };
+    // Every typecode is ASCII, so a wider code point takes the same
+    // "bad typecode" rejection as an unrecognised ASCII one.
+    let typecode = u8::try_from(first.to_u32()).unwrap_or(0xff);
     let itemsize = arr::typecode_itemsize(typecode).ok_or_else(|| {
         PyError::value_error("bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)")
     })?;
