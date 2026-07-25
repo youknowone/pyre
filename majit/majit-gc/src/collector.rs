@@ -3763,6 +3763,15 @@ impl GcAllocator for MiniMarkGC {
         self.is_nursery_object_start(addr)
     }
 
+    fn nursery_bounds(&self) -> Option<(usize, usize)> {
+        let start = self.nursery.start_ptr() as usize;
+        Some((start, start + self.nursery.size()))
+    }
+
+    fn taggedpointers(&self) -> bool {
+        self.config.taggedpointers
+    }
+
     fn write_barrier(&mut self, obj: GcRef) {
         self.do_write_barrier(obj);
     }

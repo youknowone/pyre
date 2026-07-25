@@ -93,6 +93,7 @@ pub fn store_singleton(gc: Box<dyn GcAllocator>) {
     // SAFETY: gc_mutex held, no concurrent access.
     unsafe {
         *GC_STORE.0.get() = Some(gc);
+        crate::publish_singleton_nursery(&**(*GC_STORE.0.get()).as_ref().unwrap());
     }
     GC_INITIALIZED.store(true, Ordering::Release);
 }
@@ -115,6 +116,7 @@ pub fn replace_singleton_leaking_old(gc: Box<dyn GcAllocator>) {
             std::mem::forget(old);
         }
         *GC_STORE.0.get() = Some(gc);
+        crate::publish_singleton_nursery(&**(*GC_STORE.0.get()).as_ref().unwrap());
     }
     GC_INITIALIZED.store(true, Ordering::Release);
 }

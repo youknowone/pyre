@@ -211,6 +211,10 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// [`install_gc_standalone`], which registers the same hooks WITHOUT a
 /// box so the trampolines fall through to `gc_sync`.
 fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
+    // This thread now answers heap queries from its own allocator, whose
+    // nursery is not the singleton's, so the process-wide published range can
+    // no longer stand in for `is_nursery_object`.
+    majit_gc::disarm_published_nursery();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     DYNASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();

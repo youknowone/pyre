@@ -352,6 +352,9 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
 /// Install a GC box into TLS and register all `set_active_*` hooks.
 /// Shared by `install_gc_standalone` (production) and `set_gc_allocator` (tests).
 fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
+    // Per-thread allocator: its nursery is not the singleton's, so the
+    // process-wide published range can no longer answer `is_nursery_object`.
+    majit_gc::disarm_published_nursery();
     let jitframe_type_id = ensure_jitframe_type_registered(gc.as_mut());
     gc.freeze_types();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
