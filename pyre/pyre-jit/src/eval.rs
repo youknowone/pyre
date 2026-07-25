@@ -3834,10 +3834,18 @@ unsafe extern "C" fn force_pyframe_vref(
     // returns into RPython; this hook is a `extern "C"` pointer read from the
     // frame chain with no exception channel, so the unreachable state is
     // asserted instead.  Unreachable holds because a vref reaches the chain
-    // only between `virtual_ref` and `virtual_ref_finish`, and `finish` writes
-    // `forced` before the frame is dropped.  Whoever teaches the tracer to
-    // emit `VIRTUAL_REF` owns re-checking that: a trace aborted between the
-    // two leaves a vref naming a JIT frame that is already gone.
+    // only between `virtual_ref` and `virtual_ref_finish`, and every path that
+    // can outlive the finish writes `forced` first.
+    //
+    // Re-checked now that the walker emits `VIRTUAL_REF` at the inlined-call
+    // push (`inline_call.rs::walker_ec_enter`).  A leaving frame that escaped
+    // takes `ExecutionContext.leave`'s escape branch, which records
+    // `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` — the form that stores the
+    // virtual into `forced` — and marks the caller escaped so its own leave
+    // does the same.  A frame that did not escape has no reader left once
+    // `leave` restores `topframeref`.  The state that would reach here is a
+    // vref finished with the NULL form and still read afterwards, which
+    // requires that propagation to have been skipped.
     forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
         as *mut pyre_interpreter::PyFrame
 }

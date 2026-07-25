@@ -1893,7 +1893,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // this callee" from "untouched".  Armed here, past every decline gate, for
     // the same reason the vable half is: a declined residual must not strand a
     // token.
-    ctx.trace_ctx.vrefs_before_residual_call();
+    //
+    // Gated on `is_may_force` — the walker's `check_forces_virtual_or_
+    // virtualizable()` — because `do_residual_call` runs the whole preparation
+    // block only for `assembler_call or effectinfo.check_forces_...`
+    // (`pyjitpl.py:2007`).  A call that cannot force needs no stamp, and
+    // stamping one would leave `tracing_after_residual_call` reading a token
+    // nobody will clear.
+    if is_may_force {
+        ctx.trace_ctx.vrefs_before_residual_call();
+    }
     let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {
         0
     } else {
@@ -2103,8 +2112,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // virtualizable check below, matching the upstream order, and before the
     // CALL op is recorded further down.  A vref the callee handed to Python
     // stops being tracked and its box becomes ConstPtr(NULL), so the resume
-    // snapshot no longer claims the frame is still virtual.
-    ctx.trace_ctx.vrefs_after_residual_call();
+    // snapshot no longer claims the frame is still virtual.  Paired with the
+    // pre-call stamp, so it carries the same `is_may_force` gate.
+    if is_may_force {
+        ctx.trace_ctx.vrefs_after_residual_call();
+    }
     // `vinfo.tracing_after_residual_call(virtualizable)`
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py

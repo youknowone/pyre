@@ -1691,6 +1691,14 @@ fn walker_ec_enter(
 /// [`pyre_interpreter::PyExecutionContext::leave`]; a traced call never runs a
 /// profile hook, which is why upstream can inline this frame at all.
 ///
+/// The escape branch runs in both worlds.  Concretely it marks the caller and
+/// forces the leaving vref; in the trace it records the force as
+/// `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` — upstream's "already forced
+/// during tracing" form — rather than the NULL form, so `vref.forced` ends up
+/// pointing at the virtual instead of staying NULL.  That is what keeps a
+/// later read through a deeper escaped frame's `f_backref` from hitting
+/// `InvalidVirtualRef`.
+///
 /// Upstream runs this from a `finally`, so the caller must too: every path out
 /// of the callee level — normal return, raised exception, or a declined
 /// sub-walk — has to reach it, or `virtualref_boxes` is left unbalanced and the
@@ -1720,10 +1728,11 @@ fn walker_ec_leave(
         &[callee_ec, f_backref],
         crate::descr::ec_topframeref_descr(),
     );
-    unsafe {
+    let escaped = unsafe {
         let frame_vref = (*concrete_ec).topframeref;
         (*concrete_ec).topframeref = concrete_f_backref;
-        if (*concrete_frame).escaped() || got_exception {
+        let escaped = (*concrete_frame).escaped() || got_exception;
+        if escaped {
             // A frame that reached app level must keep its caller reachable
             // too, or the next `_getframe().f_back` walks into a frame the JIT
             // was still free to keep virtual.  `get_f_back` forces, which is
@@ -1733,10 +1742,39 @@ fn walker_ec_leave(
                 (*f_back).mark_as_escaped();
             }
             // `frame_vref()` — force the leaving frame's own vref so it
-            // outlives the JIT frame.  A no-op at recording time (the vref
-            // already carries `forced`), kept because it is the operation
-            // upstream performs and the optimizer reads the trace, not this.
+            // outlives the JIT frame.
             let _ = pyre_interpreter::executioncontext::force_vref(frame_vref);
+        }
+        escaped
+    };
+    if escaped {
+        // The concrete force above is only half of `frame_vref()`: the
+        // optimizer reads the trace, not the heap.  Record the force as
+        // `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` — the non-null second
+        // operand is upstream's "this vref was forced during tracing already"
+        // encoding, which `optimize_VIRTUAL_REF_FINISH` lowers to storing the
+        // virtual into `vref.forced` (`virtualize.py:141-151`).
+        //
+        // Without it the finish below would emit the NULL form, leaving
+        // `forced` NULL and `virtual_token` cleared, and a later read through
+        // a deeper escaped frame's `f_backref` would hit `InvalidVirtualRef`.
+        // `stop_tracking_virtualref` also replaces the vrefbox with
+        // ConstPtr(NULL), so the finish that follows sees a non-vref and
+        // records nothing — one finish, not two.
+        //
+        // Upstream reaches the same end state by a different route: it records
+        // `frame_vref()` as a force and then the ordinary NULL finish, so
+        // `forced` is written at runtime by `force_now` rather than by the
+        // optimizer.  That route needs the `jit_force_virtual` lowering, which
+        // is the one piece of this protocol pyre has not wired
+        // (`jitcode_dispatch/mod.rs` item c — `_do_jit_force_virtual` is
+        // tests-only, production reach 0).  Both forms are already understood
+        // by `optimize_VIRTUAL_REF_FINISH`, so this uses the one that is
+        // reachable; converge on the upstream spelling when the force lowering
+        // lands.
+        let live = ctx.virtualref_boxes_len();
+        if live >= 2 {
+            ctx.stop_tracking_virtualref(live - 2);
         }
     }
     // `jit.virtual_ref_finish(frame_vref, frame)`.
@@ -3106,7 +3144,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if entered_ec {
         let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
             as *mut pyre_interpreter::PyExecutionContext;
-        let got_exception = !matches!(callee_outcome, Ok((DispatchOutcome::SubReturn { .. }, _)));
+        // `leave(frame, w_exitvalue, got_exception)` — the caller passes true
+        // only when the frame is unwinding an exception, which for an inlined
+        // callee is `SubRaise` and nothing else.  A tracing decline (`Err`) or
+        // a loop transition is not an exception exit: treating it as one would
+        // permanently `mark_as_escaped` the caller and force a vref that never
+        // needed forcing.
+        let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
         walker_ec_leave(
             ctx.trace_ctx,
             ca_callee_frame,
