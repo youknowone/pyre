@@ -1190,23 +1190,11 @@ pub struct JitDriver<S: JitState> {
                 + Send,
         >,
     >,
-    /// Dispatch JitCode singleton, registered at install time by
-    /// `__JitMeta::install_canonical_liveness`.  `__trace_<fn>` invokes
-    /// this singleton; the resume-side `resolve_jitcode` closures
-    /// (`back_edge_internal`, `back_edge_or_run_compiled_internal`)
-    /// also clone it for the root frame of the multi-frame chain.
-    ///
-    /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
-    /// registry slot, scoped to the per-`#[jit_interp]` driver.
-    dispatch_jitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
-    /// Flat global jitcode registry, indexed by each jitcode's absolute
-    /// index (`JitCode::index`). Slot 0 = the dispatch JitCode; slots
-    /// 1..N = every sub-JitCode reachable through the descr pools. Built
-    /// at `register_dispatch_jitcode`. resume.py:1050/1338 `jitcode =
-    /// jitcodes[jitcode_pos]` — every resume frame resolves its jitcode
-    /// from this table by the self-describing index the snapshot stamped,
-    /// with no parent-relative walk or root/sub bookkeeping.
-    jitcode_registry: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// jtransform.py:1704 `portal_jd.index` — the `jitdrivers_sd` slot this
+    /// driver's portal occupies. `call.py:147 jd.mainjitcode` holds the portal
+    /// JitCode itself, so this driver stores only the slot; `None` until
+    /// `register_dispatch_jitcode` runs.
+    portal_jd_index: Option<usize>,
 }
 
 thread_local! {
@@ -1336,8 +1324,7 @@ impl<S: JitState> JitDriver<S> {
             _invalidation_thread: None,
             blackhole_allocator: None,
             portal_runner: None,
-            dispatch_jitcode: None,
-            jitcode_registry: Vec::new(),
+            portal_jd_index: None,
             shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
                 majit_translate::codewriter::assembler::Assembler::new(),
             )),
@@ -1448,8 +1435,28 @@ impl<S: JitState> JitDriver<S> {
                 }
             }
         }
-        self.dispatch_jitcode = Some(dispatch_arc);
-        self.jitcode_registry = registry.clone();
+        // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)` — the
+        // portal JitCode belongs to the driver's static data, not to the runtime
+        // driver. The back-pointer of call.py:148 has no counterpart here: the
+        // metainterp-side `JitCode` carries no `jitdriver_sd` slot (only the
+        // translate-side one does, via `set_jitdriver_sd`), so the slot index
+        // below is the link in that direction.
+        // `call.py:46-47 jd.index = idx` is this driver's own slot — the macro's
+        // install pipeline runs `ensure_descriptor_registered` before reaching
+        // here, so it is assigned. Fall back to the single-portal slot 0 only
+        // when a consumer skipped that step.
+        self.ensure_descriptor_registered();
+        let portal_jd_index = self.index().unwrap_or(0);
+        self.meta
+            .jitdriver_sd_mut(portal_jd_index)
+            .expect("register_dispatch_jitcode: this driver's jitdrivers_sd slot is vacant")
+            .mainjitcode = Some(dispatch_arc);
+        self.portal_jd_index = Some(portal_jd_index);
+        // warmspot.py:281-282 `metainterp_sd.jitcodes = make_jitcodes()` — the
+        // drained list is owned by the staticdata, which is what `resume.py:1051`
+        // indexes. `Arc` identity carries over from the worklist above, so the
+        // `Arc::ptr_eq` dedup and the `set_index` stamps stay valid.
+        self.meta.install_jitcodes(registry.clone());
         // Publish the registry + packed liveness for the stateless global
         // `frame_value_count` decode. `install_canonical_liveness` ran just
         // before this call, so staticdata carries the final liveness buffer.
@@ -1458,10 +1465,12 @@ impl<S: JitState> JitDriver<S> {
         install_state_field_fvc(registry, all_liveness, op_live);
     }
 
-    /// Access the registered dispatch JitCode. Returns `None` until
-    /// `register_dispatch_jitcode` has been called.
+    /// pyjitpl.py:3294 `self.jitdriver_sd.mainjitcode` — this driver's portal
+    /// JitCode. Returns `None` until `register_dispatch_jitcode` has been
+    /// called; upstream has no such window, since `call.py:145-148` assigns
+    /// every driver's `mainjitcode` before the metainterp ever runs.
     pub fn dispatch_jitcode(&self) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
-        self.dispatch_jitcode.as_ref()
+        self.meta.mainjitcode_of(self.portal_jd_index?)
     }
 
     /// Register a BlackholeAllocator for virtual materialization during
@@ -3587,7 +3596,7 @@ impl<S: JitState> JitDriver<S> {
                 // resolve every frame statelessly from the flat global
                 // registry by its self-describing absolute index (no root/sub
                 // branch, no parent-relative descrs walk, no last-frame state).
-                let jitcode_registry = self.jitcode_registry.clone();
+                let jitcode_registry = self.meta.jitcodes().to_vec();
                 let resolve_jitcode = |jitcode_index: i32,
                                        pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
@@ -5445,7 +5454,7 @@ impl<S: JitState> JitDriver<S> {
         // Scoped to state-field drivers by the `dispatch_jitcode` probe — a
         // JitState that overrides `setup_bridge_sym` with real multi-frame
         // support (pyre) registers no dispatch JitCode and is unaffected.
-        if self.dispatch_jitcode.is_some()
+        if self.dispatch_jitcode().is_some()
             && resume_data_result
                 .as_ref()
                 .is_some_and(|r| r.frames.len() > 1)
@@ -5967,7 +5976,7 @@ impl<S: JitState> JitDriver<S> {
                 // resolve every frame statelessly from the flat global
                 // registry by its self-describing absolute index (no root/sub
                 // branch, no parent-relative descrs walk, no last-frame state).
-                let jitcode_registry = self.jitcode_registry.clone();
+                let jitcode_registry = self.meta.jitcodes().to_vec();
                 let resolve_jitcode = |jitcode_index: i32,
                                        pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {

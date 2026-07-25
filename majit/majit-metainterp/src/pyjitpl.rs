@@ -2633,6 +2633,47 @@ impl<M: Clone> MetaInterp<M> {
         staticdata.install_canonical_liveness(asm);
     }
 
+    /// warmspot.py:281-282 `self.metainterp_sd.jitcodes = jitcodes` — hand the
+    /// codewriter's drained jitcode list to the staticdata, the single table
+    /// `resume.py:1051` indexes.
+    ///
+    /// Same single-owner window as [`Self::install_canonical_liveness`], which
+    /// the install pipeline runs immediately before this.
+    pub fn install_jitcodes(&mut self, jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::install_jitcodes called after `staticdata` was cloned; \
+             RPython warmspot.py:281-282 installs the table while the \
+             MetaInterpStaticData still has a single owner",
+        );
+        staticdata.install_jitcodes(jitcodes);
+    }
+
+    /// resume.py:1051 `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
+    pub fn jitcodes(&self) -> &[std::sync::Arc<crate::jitcode::JitCode>] {
+        &self.staticdata.jitcodes
+    }
+
+    /// Mutable borrow of one `jitdrivers_sd` slot, for the install-time wiring
+    /// `warmspot.py` performs on `jd` before the staticdata is shared.
+    pub fn jitdriver_sd_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut crate::jitdriver::JitDriverStaticData> {
+        std::sync::Arc::get_mut(&mut self.staticdata)
+            .expect("jitdriver_sd_mut: staticdata has other owners")
+            .jitdrivers_sd
+            .get_mut(index)
+    }
+
+    /// call.py:147 `jd.mainjitcode` for a `jitdrivers_sd` slot.
+    pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        self.staticdata
+            .jitdrivers_sd
+            .get(index)?
+            .mainjitcode
+            .as_ref()
+    }
+
     /// Copy a freshly-snapshotted `all_liveness`
     /// byte stream into `staticdata.liveness_info` without re-running
     /// the full `install_canonical_liveness` insn-id seeding.
@@ -15285,6 +15326,20 @@ pub struct MetaInterpStaticData {
     /// `pyjitpl.py:2334-2342`), but pyre has not yet switched this
     /// storage edge over to the canonical codewriter `JitCode`.
     pub indirectcalltargets: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// warmspot.py:281-282 `metainterp_sd.jitcodes = codewriter.make_jitcodes()`.
+    ///
+    /// The one flat jitcode table. `codewriter.py:68` stamps each entry with
+    /// its position (`jitcode.index = len(all_jitcodes)` at the drain in
+    /// `codewriter.py:80`), and every resume frame carries that absolute index,
+    /// so `resume.py:1051 jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
+    /// resolves a frame with no per-driver or parent-relative bookkeeping.
+    ///
+    /// Upstream fills this once at translation, but the structure itself is a
+    /// growable memoized worklist — `call.py:155-172 get_jitcode` appends on a
+    /// miss and `codewriter.py:79-81` numbers each entry as it drains. Indices
+    /// are therefore append-only: published resume data bakes them
+    /// (`resume.py:250-252`), so an entry's index must never be reassigned.
+    pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
     /// Pair-list of (fnaddr, name) for debug introspection.
     pub _addr2name_keys: Vec<usize>,
@@ -16048,6 +16103,18 @@ impl MetaInterpStaticData {
         self.indirectcalltargets = targets;
         // Force a rebuild of the lazy lookup on next access.
         self.globaldata.lock().unwrap().indirectcall_dict = None;
+    }
+
+    /// warmspot.py:281-282 `self.metainterp_sd.jitcodes = jitcodes` — install
+    /// a codewriter's drained jitcode list. Each entry must already carry its
+    /// absolute index (`codewriter.py:68`).
+    pub fn install_jitcodes(&mut self, jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>) {
+        self.jitcodes = jitcodes;
+    }
+
+    /// resume.py:1051 `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
+    pub fn jitcode_at(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        self.jitcodes.get(index)
     }
 
     /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
