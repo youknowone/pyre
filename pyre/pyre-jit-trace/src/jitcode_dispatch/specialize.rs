@@ -4406,6 +4406,11 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     let value_concrete = ConcreteValue::Ref(value);
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
+    // Read the arm AFTER any empty-strategy promotion above, so the predicate
+    // sees the storage the sub-walk will actually append into.
+    ctx.fbw_mode.append_inplace_wb_covered_receiver =
+        unsafe { pyre_object::w_list_append_stores_into_gc_block_in_place(inner_self) }
+            .then_some(inner_self as usize);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
