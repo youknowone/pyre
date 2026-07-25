@@ -801,6 +801,15 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // fabricates one from the promoted callee metadata
         // (`record_inline_traceback_for_recording`), so `tb_frame` keeps
         // answering a real frame there; a null here would lose it.
+        //
+        // Top level has no such hook fallback: `record_top_level_application_
+        // traceback` resolves its frame operand from the same unseeded color
+        // and declines too, so that level contributes no node at all.  A
+        // shorter traceback than `record_application_traceback` would build is
+        // the deliberate trade — the frame box a node needs is exactly what
+        // this walk lacks, and the vable box is not a substitute (a traceback
+        // outlives the frame, so storing it demands the escape marking this
+        // path does not perform).
         return false;
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
@@ -836,12 +845,10 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
         return false;
     };
     if site.frame.is_none() {
-        // No materialized frame for this level.  The opaque inline hook
-        // fabricates one from the promoted callee metadata
-        // (`record_inline_traceback_for_recording`), so `tb_frame` keeps
-        // answering a real frame; a null one answers None and breaks every
-        // consumer that follows `tb_frame.f_code` — `traceback.print_exc`
-        // among them.
+        // Same disposition as the prepend sibling, for the same reason: the
+        // opaque inline hook fabricates a frame from the promoted callee
+        // metadata, while a null one answers None and breaks every consumer
+        // that follows `tb_frame.f_code` — `traceback.print_exc` among them.
         return false;
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
@@ -9326,7 +9333,11 @@ fn handle<Sym: WalkSym>(
                     // carry callee nodes, so the general case prepends onto
                     // its chain rather than starting a fresh one.  Either
                     // recorder declining leaves the node to the opaque hook,
-                    // which fabricates the frame the walk has no box for.
+                    // which builds a frame from the callee's code + globals
+                    // for the level the walk has no box for.  That frame
+                    // carries no locals and its own identity, so it is a
+                    // weaker node than the live one — still a node whose
+                    // `tb_frame.f_code` answers the right code object.
                     let emit_runtime = if freshly_normalized {
                         !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)
                     } else {
