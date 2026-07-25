@@ -10,10 +10,13 @@ pyre's plain-Python runner convention (no pytest / RPython dependency).
 - **Per-module subprocess.** Each test module runs in its own subprocess of
   the built interpreter, exactly like PyPy launches `pypy3-c -m test <module>`.
   Test pollution can't leak between modules.
-- **Pristine vendored tests.** `lib-python/3/test/` stays an unmodified copy
-  of CPython's `Lib/test`. Every skip / expected-status decision lives in the
-  external `baseline.json` — we never edit test files (so stdlib upgrades stay
-  a clean drop-in; see `lib-python/stdlib-upgrade.txt`).
+- **Vendored tests carry PyPy's edits and nothing else.** `lib-python/3/test/`
+  is CPython's `Lib/test` plus the modifications PyPy makes to it in its own
+  `lib-python` — those are ported and kept (a re-vendor from CPython drops
+  them, so they are restored after one). A pyre-specific skip / expected-status
+  decision never becomes a test-file edit: it lives in the external
+  `baseline.json`, so stdlib upgrades stay a clean drop-in (see
+  `lib-python/stdlib-upgrade.txt`).
 - **External baseline.** `baseline.json` records the expected status of every
   module per backend. A module recorded `PASS` that stops passing is a
   regression and fails CI. The default gate runs only the `PASS` subset (for CI

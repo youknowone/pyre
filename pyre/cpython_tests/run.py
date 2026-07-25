@@ -3,8 +3,9 @@
 
 This mirrors PyPy's `lib-python/conftest.py` mechanism: each CPython test
 module is run in its OWN subprocess of the built interpreter, the vendored
-test files stay pristine, and every expected-status / skip decision lives in
-an EXTERNAL baseline (`baseline.json`) — never as edits to the test files.
+test files carry PyPy's own modifications and nothing else, and every
+pyre-specific expected-status / skip decision lives in an EXTERNAL baseline
+(`baseline.json`) — never as an edit to the test files.
 
 Each module is launched one of three ways, selectable with `--mode`:
 
