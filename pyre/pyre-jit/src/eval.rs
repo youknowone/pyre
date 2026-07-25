@@ -6160,32 +6160,23 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
     // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
-thread_local! {
-    /// Memoizes `find_loop_header_pcs` per code object.  The loop-header set
-    /// depends only on `code.instructions` (immutable) and the `CodeObject`
-    /// behind `code_ptr` is `Box`-immortal — a stable, never-freed address —
-    /// so the raw pointer is a sound stable key.  Recomputing it on every
-    /// `eval_loop_jit` entry re-scans the whole bytecode and rebuilds the
-    /// successor map for each called function / module-body frame; the loop
-    /// headers are code-invariant (fixed once the codewriter has seen the
-    /// code), so that per-frame O(code) work is pure waste on cold, run-once
-    /// startup code where no frame is entered twice through this loop.
-    static LOOP_HEADER_MEMO: RefCell<HashMap<usize, Rc<VecSet<usize>>>> =
-        RefCell::new(HashMap::new());
-}
-
-/// Cached form of [`crate::jit::codewriter::find_loop_header_pcs`], keyed by
-/// the immortal `CodeObject` address.
-fn cached_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> Rc<VecSet<usize>> {
-    let key = code as *const pyre_interpreter::CodeObject as usize;
-    LOOP_HEADER_MEMO.with(|memo| {
-        if let Some(hit) = memo.borrow().get(&key) {
-            return hit.clone();
-        }
-        let computed = Rc::new(crate::jit::codewriter::find_loop_header_pcs(code));
-        memo.borrow_mut().insert(key, computed.clone());
-        computed
-    })
+/// Loop-header PC set for `code`, from the `CallControl` that owns the
+/// per-graph codewriter caches (call.py:29 `self.jitcodes = {}`).
+///
+/// The set is scanned once per graph and kept there, matching the point in
+/// upstream where loop headers are fixed: `jtransform.py:1714-1723`
+/// rewrites `can_enter_jit` into a `loop_header` operation while the
+/// codewriter builds that graph's `JitCode`, so the running interpreter
+/// only ever reads an already-derived answer. Recomputing the scan per
+/// back-edge would re-walk the whole bytecode and rebuild the successor
+/// map on every loop iteration of every interpreted frame.
+fn cached_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> std::sync::Arc<VecSet<usize>> {
+    // The `&mut CallControl` borrow ends with this statement — the set is
+    // handed back as a shared `Arc`, so no caller holds it across a
+    // re-entry into `callcontrol()`.
+    crate::jit::codewriter::CodeWriter::instance()
+        .callcontrol()
+        .get_loop_header_pcs(code)
 }
 
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
@@ -6214,7 +6205,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // runs once and never takes a back-edge — never reach it, so computing it
     // eagerly here scanned the whole bytecode and built a successor map for
     // every frame entry to produce a set no one read.  Compute it lazily at
-    // the first back-edge instead (memoized per code object).
+    // the first back-edge instead (kept per graph on `CallControl`).
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).

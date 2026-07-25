@@ -22,6 +22,8 @@
 //! | `grab_initial_jitcodes()`   | `grab_initial_jitcodes()`   |
 //! | `enum_pending_graphs()`     | `enum_pending_graphs()`     |
 //! | (n/a — pure-lookup helper)  | `find_jitcode()`            |
+//! | (baked into `JitCode` at    | `loop_header_pcs` +         |
+//! |  translation time)          | `get_loop_header_pcs()`     |
 //!
 //! Note: RPython's CallControl is owned by a single
 //! `CodeWriter` instance (`warmspot.py:245`) for the lifetime of the JIT.
@@ -34,6 +36,7 @@ use std::collections::HashMap;
 use majit_translate::jitcode::BhCallDescr;
 use pyre_interpreter::CodeObject;
 use pyre_jit_trace::PyJitCode;
+use vecset::VecSet;
 
 use super::cpu::Cpu;
 
@@ -182,6 +185,29 @@ pub struct CallControl {
     /// `CodeWriter::make_jitcodes` (codewriter.py:85). See
     /// [`CallInfoCollection`] for the pyre-side shell rationale.
     pub callinfocollection: CallInfoCollection,
+
+    /// Per-graph loop-header PC set — the scan result of
+    /// [`super::codewriter::find_loop_header_pcs`].
+    ///
+    /// Loop headers are translation-time information upstream. A
+    /// `can_enter_jit` marker in the source graph becomes a `loop_header`
+    /// operation while the graph is transformed
+    /// (`jtransform.py:1714-1723 handle_jit_marker__loop_header`), and
+    /// the marker scan over all graphs — `warmspot.py:143-156
+    /// _find_jit_marker` / `:172-173 find_loop_headers` — likewise runs
+    /// once, inside `WarmRunnerDesc.__init__`. The running interpreter
+    /// only ever reads an already-derived answer.
+    ///
+    /// pyre's graph is raw 3.14 bytecode, which carries no markers, so
+    /// the equivalent set has to be scanned from `code.instructions`
+    /// (`find_loop_header_pcs`); it also has to exclude the backward
+    /// jumps 3.14 emits for a `break` inside an `except` handler, which
+    /// are a layout artifact rather than a loop back-edge. Keeping the
+    /// result here gives that scan upstream's computed-once, per-graph
+    /// lifetime, under the same owner and key as the jitcodes it belongs
+    /// with (call.py:29 `self.jitcodes = {}` is a plain instance dict on
+    /// `CallControl`, filled on miss by call.py:155-172 `get_jitcode`).
+    pub loop_header_pcs: HashMap<usize, std::sync::Arc<VecSet<usize>>>,
 }
 
 impl CallControl {
@@ -198,7 +224,28 @@ impl CallControl {
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: CallInfoCollection::new(),
+            loop_header_pcs: HashMap::new(),
         }
+    }
+
+    /// Loop-header PC set for `code`, computed on first request and kept
+    /// on this `CallControl` afterwards.
+    ///
+    /// Same memoize-on-miss shape as `get_jitcode` (call.py:155-172:
+    /// `try: return self.jitcodes[graph] / except KeyError: ... ;
+    /// self.jitcodes[graph] = jitcode; return jitcode`) and keyed by the
+    /// same canonical `CodeObject*` graph identity. The scan reads only
+    /// `code.instructions`, which is fixed for a given graph, so the
+    /// cached set never goes stale.
+    pub fn get_loop_header_pcs(&mut self, code: &CodeObject) -> std::sync::Arc<VecSet<usize>> {
+        let key = code as *const CodeObject as usize;
+        if let Some(hit) = self.loop_header_pcs.get(&key) {
+            return std::sync::Arc::clone(hit);
+        }
+        let computed = std::sync::Arc::new(super::codewriter::find_loop_header_pcs(code));
+        self.loop_header_pcs
+            .insert(key, std::sync::Arc::clone(&computed));
+        computed
     }
 
     /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).
