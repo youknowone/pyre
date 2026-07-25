@@ -2128,13 +2128,24 @@ pub fn walk<Sym: WalkSym>(
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
                     if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                        // Emit the node at runtime as well as applying it for
+                        // the recording pass.  The top-level arm above can
+                        // leave this to the interpreter: its frame is a real
+                        // `PyFrame`, so the `exit_frame_with_exception` the
+                        // trace finishes with surfaces as an error on that
+                        // frame and `handle_operation_error` records the node.
+                        // An inlined callee has no frame to return to — the
+                        // walk pops it symbolically — so unless the trace
+                        // carries the record itself, the callee contributes no
+                        // node once the trace runs compiled and the exception
+                        // reaches its handler one frame short.
                         record_inline_application_traceback(
                             ctx,
                             exc,
                             exc_concrete,
                             opcode_position,
                             true,
-                            false,
+                            true,
                         );
                     }
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
