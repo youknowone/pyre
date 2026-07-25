@@ -775,6 +775,7 @@ pub use gateway::{
     make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
     make_builtin_function_with_signature, make_module_builtin_function,
     make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
+    make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use opcode_ops::*;
@@ -933,6 +934,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(13, &crate::gateway::BUILTIN_CODE_TYPE),
         subclass_range_alias(14, &crate::function::FUNCTION_TYPE),
         subclass_range_alias(14, &crate::function::BUILTIN_FUNCTION_TYPE),
+        subclass_range_alias(14, &crate::function::SLOT_WRAPPER_TYPE),
         subclass_range_alias(43, &crate::pycode::CODE_TYPE),
         subclass_range_alias(44, &crate::pytraceback::PYTRACEBACK_TYPE),
         subclass_range_alias(56, typed::<crate::module::_random::W_Random>()),

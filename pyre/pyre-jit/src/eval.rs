@@ -1559,6 +1559,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
         function_tid,
     );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_interpreter::function::SLOT_WRAPPER_TYPE as *const _ as usize,
+        function_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_interpreter::function::SLOT_WRAPPER_TYPE as *const _ as usize,
+        function_tid,
+    );
     // Cell / Method / W_SliceObject — typed payload
     // via `#[pyre_class]`.  Pre-registered ahead of the foreign-
     // pytype loop because that loop's `size_of::<PyObject>()`

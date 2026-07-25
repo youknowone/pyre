@@ -2708,7 +2708,7 @@ unsafe fn method_descriptor_bound(
     obj: PyObjectRef,
 ) -> PyObjectRef {
     unsafe {
-        if d != attr || !crate::is_function(d) {
+        if d != attr || !crate::is_function_carrier(d) {
             return PY_NULL;
         }
         // BuiltinFunction has no `__get__` (its typedef carries no

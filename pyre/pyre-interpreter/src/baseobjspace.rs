@@ -8460,6 +8460,13 @@ pub(crate) unsafe fn get(
     // PyPy splits BuiltinFunction from FunctionWithFixedCode at the typedef
     // layer: BuiltinFunction omits __get__, while FunctionWithFixedCode keeps
     // Function.__get__ and binds like a normal method descriptor.
+    if crate::is_slot_wrapper(descr) {
+        if obj.is_null() {
+            return Ok(Some(descr));
+        }
+        return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
+    }
+
     if crate::is_function(descr) {
         let ob_type = unsafe { (*descr).ob_type };
         if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
@@ -9931,6 +9938,7 @@ pub fn callable_w(obj: PyObjectRef) -> bool {
     // `__call__`.  Mirrors `builtins::builtin_callable`.
     unsafe {
         is_function(obj)
+            || crate::is_slot_wrapper(obj)
             || is_type(obj)
             || pyre_object::is_method(obj)
             || pyre_object::function::is_staticmethod(obj)
