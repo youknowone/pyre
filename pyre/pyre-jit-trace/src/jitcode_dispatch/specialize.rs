@@ -1717,11 +1717,6 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    // `__`-names reach `getattr` through slots the fold does not model, the
-    // same carve-out `try_walker_specialize_load_method_attr` applies.
-    if name.contains("__") {
-        return Ok(None);
-    }
     let Some((w_type, version_tag, w_descr)) = (unsafe {
         pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, &name)
     }) else {

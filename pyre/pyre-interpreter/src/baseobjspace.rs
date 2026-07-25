@@ -7900,7 +7900,11 @@ pub unsafe fn bound_method_attr_fast_path(
     }
     // No instance dict => the type lookup cannot be shadowed, so the
     // non-data-descriptor branch of `object.__getattribute__` is the only
-    // reachable one.
+    // reachable one.  This is stricter than `callmethod.py:60-64`, which
+    // admits a dict-bearing receiver and merely checks that `name` is absent
+    // from it: the emitted fold carries no dict-shape guard, so a later store
+    // of `name` into the dict would not side-exit.  Admitting those receivers
+    // means emitting that guard first.
     if !getdict_backing(w_obj).is_null() {
         return None;
     }

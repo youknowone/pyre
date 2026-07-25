@@ -8,8 +8,9 @@
 # that fold depends on: a __slots__ subclass whose method is replaced mid-loop
 # (version tag), an instance-dict entry shadowing the method name (the fold
 # must decline for a dict-bearing receiver), alternating receiver types at one
-# call site (class guard), and a bound method that outlives its CALL (the
-# virtual must materialize). Output verified against CPython/PyPy.
+# call site (class guard), `__`-names that bind through the same shape, and a
+# bound method that outlives its CALL (the virtual must materialize). Output
+# verified against CPython/PyPy.
 N = 20000
 
 
@@ -67,6 +68,17 @@ def polymorphic(n):
     return len(a), len(b)
 
 
+def dunder_names(n):
+    # `__`-names bind through the same `function` + builtin-code shape as
+    # `append`, so the fold applies to them too.
+    lst = [0] * 8
+    total = 0
+    for i in range(n):
+        total += lst.__len__() + (i,).__len__()
+        lst.__setitem__(i & 7, i)
+    return total, lst[3]
+
+
 def escaping_bound_method(n):
     r = []
     keep = []
@@ -83,4 +95,5 @@ print(dict_and_set(N))
 print(slots_subclass_override(N))
 print(shadowed(N))
 print(polymorphic(N))
+print(dunder_names(N))
 print(escaping_bound_method(N))
