@@ -5338,6 +5338,17 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// PyPy: W_DictMultiObject subclass instances ARE dicts, so no indirection
 /// is needed. In pyre, dict subclass instances are W_ObjectObject with a
 /// backing dict stored as an attribute.
+/// True when `obj` can be read as a dict — an exact dict, a dict subclass
+/// carrying a `__dict_data__` backing, or a mapping proxy wrapping one.  This
+/// is the receiver test a `dict` method descriptor applies, so an object that
+/// merely claims `__class__ is dict` never reaches the backing lookup.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+pub unsafe fn has_dict_backing(obj: PyObjectRef) -> bool {
+    !resolve_dict_backing(obj).is_null()
+}
+
 pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         if is_dict(obj) {

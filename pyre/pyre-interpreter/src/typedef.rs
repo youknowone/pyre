@@ -1399,6 +1399,114 @@ pub fn w_object() -> PyObjectRef {
         .unwrap_or(PY_NULL)
 }
 
+/// The receiver type of every method descriptor a builtin type defines.
+///
+/// Python 3.14 gives each entry of a type's `tp_methods` / slot table a
+/// descriptor that remembers its `d_type` and refuses a receiver that is not
+/// an instance of it.  Pyre's builtin methods reach the receiver's payload
+/// through layout-typed accessors (`w_str_get_wtf8`, `w_dict_getitem`, …), so
+/// without the same check an object that merely claims `__class__ is str`
+/// gets its memory read at the wrong layout.
+///
+/// The predicates test the *layout*, which is what those accessors require;
+/// an instance of a Python-level subclass keeps its base's layout, so
+/// `str.upper(MyStr('a'))` still passes.
+///
+/// `object`'s predicate accepts everything, since every receiver really is an
+/// `object`; listing it still rejects a *missing* receiver, which its methods
+/// would otherwise index straight off an empty argument slice.
+fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner> {
+    macro_rules! owners {
+        ($($name:literal => $pred:path),+ $(,)?) => {
+            match type_name {
+                $($name => {
+                    static OWNER: crate::gateway::MethodOwner = crate::gateway::MethodOwner {
+                        type_name: $name,
+                        is_instance: |obj| unsafe { $pred(obj) },
+                    };
+                    Some(&OWNER)
+                })+
+                _ => None,
+            }
+        };
+    }
+    owners! {
+        "str" => pyre_object::is_str,
+        "bytes" => pyre_object::is_bytes,
+        "bytearray" => pyre_object::is_bytearray,
+        // `int` covers `bool` and the arbitrary-precision layout: all three
+        // are `int` instances at Python level.
+        "int" => pyre_object::is_int_or_long,
+        "bool" => pyre_object::is_bool,
+        "float" => pyre_object::is_float,
+        "complex" => pyre_object::is_complex,
+        // A dict subclass keeps its entries in a `__dict_data__` backing
+        // rather than the dict layout, and the dict methods already read
+        // through to it, so "has a dict backing" is the receiver test.
+        "dict" => crate::type_methods::has_dict_backing,
+        "list" => pyre_object::is_list,
+        "tuple" => pyre_object::is_tuple,
+        "set" => pyre_object::is_set,
+        "frozenset" => pyre_object::is_frozenset,
+        "range" => pyre_object::functional::is_w_range,
+        "slice" => pyre_object::is_slice,
+        "memoryview" => pyre_object::memoryview::is_w_memoryview,
+        "type" => pyre_object::is_type,
+        "object" => is_any_object,
+        "BaseException" => pyre_object::interp_exceptions::is_exception,
+    }
+}
+
+/// The receiver test for `object`'s own methods: they accept any instance, so
+/// only a missing receiver is rejected.
+///
+/// # Safety
+/// Trivially safe; the signature matches the other receiver predicates.
+unsafe fn is_any_object(_obj: PyObjectRef) -> bool {
+    true
+}
+
+/// Bind every method descriptor in a freshly built namespace to the type that
+/// defines it, so its receiver is checked before the implementation runs —
+/// `PyType_Ready` handing each `PyMethodDef` to `PyDescr_NewMethod`.
+///
+/// Only bare functions are descriptors of the type: `maketrans` and the class
+/// methods are already wrapped in static/class-method objects by the time the
+/// namespace is complete, and they take a type or no receiver at all.
+/// `__new__` is skipped explicitly because it receives the type being
+/// instantiated rather than an instance, whether or not this namespace
+/// happens to wrap it.
+///
+/// # Safety
+/// `ns` must be a valid, live `W_DictObject`.
+unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::MethodOwner) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(ns);
+
+    let keys: Vec<String> = pyre_object::w_dict_items(ns)
+        .into_iter()
+        .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
+        .collect();
+    for key in keys {
+        if key == "__new__" {
+            continue;
+        }
+        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
+            continue;
+        };
+        if descr.is_null() || !crate::function::is_function(descr) {
+            continue;
+        }
+        let code = crate::function::getcode(descr) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            continue;
+        }
+        crate::gateway::builtin_code_set_owner(code, owner);
+    }
+}
+
 /// Stamp the builtin `__new__` carrier in `ns` with `__self__ =
 /// type_obj` (the type that defines `tp_new`), mirroring
 /// `typeobject.c add_tp_new_wrapper`.  `copyreg._reduce_ex` walks the
@@ -1524,6 +1632,12 @@ fn new_typeobject_with_base_and_layout(
     let ns = pyre_object::w_dict_new();
     pyre_object::gc_roots::pin_root(ns);
     init(ns);
+    // The namespace is complete, so every method descriptor in it can be
+    // bound to the type that defines it before the type goes live.
+    if let Some(owner) = method_owner(name) {
+        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        unsafe { stamp_method_owners(ns, owner) };
+    }
     let bases = w_tuple_new(vec![base]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let type_obj = w_type_new_builtin(name, bases, ns as *mut u8, layout_pytype);
@@ -14218,31 +14332,29 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getformat__",
-            make_builtin_function("__getformat__", |args| {
-                // Python classmethod signature: float.__getformat__(kind).
-                // pyre may pass either (kind,) or (self, kind); accept both by
-                // scanning for the first str argument.
-                let kind = args
-                    .iter()
-                    .find_map(|&a| unsafe {
-                        if pyre_object::is_str(a) {
-                            Some(pyre_object::w_str_get_value(a).to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| {
-                        crate::PyError::type_error(
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__getformat__",
+                |args| {
+                    // A class method, so `args[0]` is the class and the kind
+                    // follows it.
+                    let kind = args
+                        .get(1)
+                        .copied()
+                        .filter(|&a| unsafe { pyre_object::is_str(a) })
+                        .map(|a| unsafe { pyre_object::w_str_get_value(a).to_string() })
+                        .ok_or_else(|| {
+                            crate::PyError::type_error(
+                                "__getformat__() argument must be 'double' or 'float'",
+                            )
+                        })?;
+                    match kind.as_str() {
+                        "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
+                        _ => Err(crate::PyError::value_error(
                             "__getformat__() argument must be 'double' or 'float'",
-                        )
-                    })?;
-                match kind.as_str() {
-                    "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
-                    _ => Err(crate::PyError::value_error(
-                        "__getformat__() argument must be 'double' or 'float'",
-                    )),
-                }
-            }),
+                        )),
+                    }
+                },
+            )),
         )
     };
     unsafe {

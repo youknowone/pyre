@@ -498,6 +498,22 @@ pub const BUILTIN_CODE_GC_TYPE_ID: u32 = 13;
 /// pyre equivalent: returns Result so errors propagate through the call stack.
 pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
+/// The type a method descriptor belongs to, and the layout test its receiver
+/// must satisfy — `PyDescrObject.d_type`, and the `self` entry of PyPy's
+/// `interp2app` unwrap_spec.
+///
+/// An unbound descriptor validates its receiver against this before the
+/// implementation runs, so a foreign object can never reach an accessor that
+/// reads the receiver's payload at the owning type's layout.  Without it,
+/// `str.split(x)` on an `x` whose `__class__` merely claims to be `str`
+/// reaches `w_str_get_wtf8` and dereferences arbitrary memory.
+pub struct MethodOwner {
+    /// The owning type's name as it appears in the mismatch message.
+    pub type_name: &'static str,
+    /// Layout membership, true for instances of subclasses as well.
+    pub is_instance: fn(PyObjectRef) -> bool,
+}
+
 /// A built-in function object.
 ///
 /// `docstring` mirrors PyPy `BuiltinCode.docstring` (gateway.py:673
@@ -522,6 +538,14 @@ pub struct BuiltinCode {
     /// raw pointer carries no Drop obligation and is not a GC pointer,
     /// matching the `func` function-pointer convention.
     pub sig: *const Signature,
+    /// The type this code object is a descriptor of, or null for a builtin
+    /// with no receiver to check (a module-level function, a `__new__`
+    /// carrier, a class or static method).  `stamp_method_owners` fills it
+    /// in once a type's namespace is fully populated, mirroring
+    /// `PyType_Ready` handing each `PyMethodDef` to `PyDescr_NewMethod`.
+    /// The pointee is `'static`, so it carries no Drop obligation and is not
+    /// a GC pointer.
+    pub owner: *const MethodOwner,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -611,6 +635,7 @@ fn builtin_code_new_full(
         docstring,
         fast_natural_arity,
         sig,
+        owner: std::ptr::null(),
     }) as PyObjectRef
 }
 
@@ -647,6 +672,142 @@ pub unsafe fn is_builtin_code(obj: PyObjectRef) -> bool {
 pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
     let func_obj = obj as *const BuiltinCode;
     unsafe { (*func_obj).func }
+}
+
+/// Record the type whose namespace this code object was installed in, so its
+/// receiver is checked before the implementation runs.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+pub unsafe fn builtin_code_set_owner(obj: PyObjectRef, owner: &'static MethodOwner) {
+    unsafe { (*(obj as *mut BuiltinCode)).owner = owner };
+}
+
+/// Invoke a `BuiltinCode` after applying the receiver check its owning type
+/// requires.  Every dispatch path — the interpreter's call paths, the JIT's
+/// residual call, and the bound-method fast paths — goes through here, so a
+/// call can never reach the implementation with an unchecked receiver.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_call(
+    obj: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let code = obj as *const BuiltinCode;
+    let owner = unsafe { (*code).owner };
+    if !owner.is_null() {
+        let owner = unsafe { &*owner };
+        let accepted = matches!(args.first(), Some(&receiver) if (owner.is_instance)(receiver));
+        if !accepted {
+            return Err(receiver_mismatch(owner, unsafe { (*code).name }, args));
+        }
+    }
+    unsafe { ((*code).func)(args) }
+}
+
+/// Python 3.14 fills a type's slots with `wrapper_descriptor`s and its
+/// `tp_methods` with `method_descriptor`s, and the two kinds word their
+/// receiver errors differently, so only the slot names need listing — every
+/// other name is an ordinary method.  `__contains__` and `__getitem__` are
+/// slots everywhere except on the types that expose them through `tp_methods`.
+fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
+    match name {
+        "__contains__" => !matches!(type_name, "dict" | "set" | "frozenset"),
+        "__getitem__" => !matches!(type_name, "dict" | "list"),
+        _ => matches!(
+            name,
+            "__abs__"
+                | "__add__"
+                | "__and__"
+                | "__bool__"
+                | "__buffer__"
+                | "__call__"
+                | "__delattr__"
+                | "__delete__"
+                | "__delitem__"
+                | "__divmod__"
+                | "__eq__"
+                | "__float__"
+                | "__floordiv__"
+                | "__ge__"
+                | "__get__"
+                | "__getattribute__"
+                | "__gt__"
+                | "__hash__"
+                | "__iadd__"
+                | "__iand__"
+                | "__imul__"
+                | "__index__"
+                | "__init__"
+                | "__int__"
+                | "__invert__"
+                | "__ior__"
+                | "__isub__"
+                | "__iter__"
+                | "__ixor__"
+                | "__le__"
+                | "__len__"
+                | "__lshift__"
+                | "__lt__"
+                | "__mod__"
+                | "__mul__"
+                | "__ne__"
+                | "__neg__"
+                | "__next__"
+                | "__or__"
+                | "__pos__"
+                | "__pow__"
+                | "__radd__"
+                | "__rand__"
+                | "__rdivmod__"
+                | "__release_buffer__"
+                | "__repr__"
+                | "__rfloordiv__"
+                | "__rlshift__"
+                | "__rmod__"
+                | "__rmul__"
+                | "__ror__"
+                | "__rpow__"
+                | "__rrshift__"
+                | "__rshift__"
+                | "__rsub__"
+                | "__rtruediv__"
+                | "__rxor__"
+                | "__set__"
+                | "__setattr__"
+                | "__setitem__"
+                | "__str__"
+                | "__sub__"
+                | "__truediv__"
+                | "__xor__"
+        ),
+    }
+}
+
+/// Build the TypeError an unbound descriptor raises for a missing or
+/// foreign receiver.  Cold: it runs only on the failing call.
+#[cold]
+#[inline(never)]
+fn receiver_mismatch(owner: &MethodOwner, name: &str, args: &[PyObjectRef]) -> crate::PyError {
+    let ty = owner.type_name;
+    let slot_wrapper = is_slot_wrapper(ty, name);
+    let message = match args.first() {
+        None if slot_wrapper => format!("descriptor '{name}' of '{ty}' object needs an argument"),
+        None => format!("unbound method {ty}.{name}() needs an argument"),
+        Some(&receiver) => {
+            let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+            if slot_wrapper {
+                format!("descriptor '{name}' requires a '{ty}' object but received a '{received}'")
+            } else {
+                format!(
+                    "descriptor '{name}' for '{ty}' objects doesn't apply to a '{received}' object"
+                )
+            }
+        }
+    };
+    crate::PyError::type_error(message)
 }
 
 /// eval.py:16-23 — read `fast_natural_arity` from a BuiltinCode.

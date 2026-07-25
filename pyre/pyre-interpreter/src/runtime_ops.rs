@@ -241,9 +241,8 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     let callable = callable as PyObjectRef;
     unsafe {
         let code = crate::getcode(callable);
-        let func = builtin_code_get(code as PyObjectRef);
         let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
-        match func(arg_slice) {
+        match crate::builtin_code_call(code as PyObjectRef, arg_slice) {
             Ok(result) => result as i64,
             Err(mut e) => {
                 jit_publish_exception(e.to_exc_object());

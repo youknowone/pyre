@@ -772,17 +772,16 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
             .collect::<Vec<_>>()
     };
 
-    let func = unsafe { builtin_code_get(current_code()) };
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code()) } {
         if sig.has_vararg() || sig.has_kwarg() || sig.num_kwonlyargnames() > 0 {
             let fname = unsafe { crate::builtin_code_name(current_code()) };
             let args = current_args();
             let bound = bind_kwargs_to_signature(sig, fname, &args, &[])?;
-            return func(&bound);
+            return unsafe { crate::builtin_code_call(current_code(), &bound) };
         }
     }
     let args = current_args();
-    func(&args)
+    unsafe { crate::builtin_code_call(current_code(), &args) }
 }
 
 /// Leaf execution mode for a user-function call reached through
@@ -1982,8 +1981,9 @@ pub fn call_with_kwargs(
                 // builtin directly — routing back through `call_callable`
                 // would re-enter `call_builtin_code_positional` and pack the
                 // tail a second time.
-                let func = unsafe { crate::builtin_code_get(code as pyre_object::PyObjectRef) };
-                return func(&bound);
+                return unsafe {
+                    crate::builtin_code_call(code as pyre_object::PyObjectRef, &bound)
+                };
             }
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {

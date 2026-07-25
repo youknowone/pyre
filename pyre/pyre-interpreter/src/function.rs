@@ -2540,7 +2540,8 @@ pub fn funccall_valuestack(
             (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
             "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
         );
-        let builtin_fn = unsafe { crate::builtin_code_get(code as PyObjectRef) };
+        let builtin_fn =
+            |args: &[PyObjectRef]| unsafe { crate::builtin_code_call(code as PyObjectRef, args) };
         // function.py:154-184 — BuiltinCodeN.fastcall_N dispatch.
         // Pyre builtins share a single fn(&[PyObjectRef]) signature, so we
         // build a fixed-size stack array instead of heap-allocating a Vec.
@@ -2625,14 +2626,13 @@ pub fn funccall_valuestack(
     // peek/Arguments split is structural — the final closure invocation
     // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
     if fast_natural_arity == crate::PASSTHROUGHARGS1 as usize && nargs >= 1 {
-        let builtin_fn = unsafe { crate::builtin_code_get(code as PyObjectRef) };
         let w_obj = frame.peekvalue(nargs - 1);
         let rest = frame.make_arguments(nargs - 1, false, func);
         let mut args_w = Vec::with_capacity(nargs);
         args_w.push(w_obj);
         args_w.extend_from_slice(&rest);
         frame.dropvalues(dropvalues);
-        return match builtin_fn(&args_w) {
+        return match unsafe { crate::builtin_code_call(code as PyObjectRef, &args_w) } {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

@@ -4712,10 +4712,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     if unsafe { is_function(callable) } {
         let code = unsafe { pyre_interpreter::getcode(callable) };
         if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
-            let func =
-                unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
             let call_args = reload_args();
-            return match func(&call_args) {
+            return match unsafe {
+                pyre_interpreter::builtin_code_call(code as pyre_object::PyObjectRef, &call_args)
+            } {
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
                 Err(mut err) => {
