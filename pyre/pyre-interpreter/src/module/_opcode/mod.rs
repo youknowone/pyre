@@ -55,6 +55,7 @@ fn has_exc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["jump"], "stack_effect")?;
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "stack_effect() takes at most 2 positional arguments ({} given)",
@@ -136,7 +137,7 @@ crate::py_module! {
         // tail and the keyword-only `jump` leave no single natural arity, so
         // the body enforces the count itself.
         "stack_effect"             / * = stack_effect,
-        "get_executor"             / 0 = |_| Ok(w_none()),
+        "get_executor"             / 2 = |_| Ok(w_none()),
         "get_specialization_stats" / 0 = |_| Ok(w_none()),
         "get_intrinsic1_descs"     / 0 = get_intrinsic1_descs,
         "get_intrinsic2_descs"     / 0 = get_intrinsic2_descs,

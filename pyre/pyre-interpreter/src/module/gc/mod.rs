@@ -217,22 +217,31 @@ crate::py_module! {
                 .collect();
             Ok(w_list_new_object(result))
         },
+        // `set_threshold(threshold0, threshold1=None, threshold2=None)` — the
+        // optional tail leaves no single natural arity, so the body enforces
+        // the count itself.
         "set_threshold" / * = |args| {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if crate::builtins::has_real_kwargs(kwargs) {
+                return Err(crate::PyError::type_error(
+                    "set_threshold() takes no keyword arguments",
+                ));
+            }
             // CPython 3.14 `gc.set_threshold(threshold0[, threshold1[,
             // threshold2]])` writes only the positions it was given, and
             // parses every argument before writing any of them.
-            if args.is_empty() || args.len() > 3 {
+            if positional.is_empty() || positional.len() > 3 {
                 return Err(crate::PyError::type_error(
                     "gc.set_threshold requires 1 to 3 arguments",
                 ));
             }
             let mut parsed = [0i64; 3];
-            for (i, &arg) in args.iter().enumerate() {
+            for (i, &arg) in positional.iter().enumerate() {
                 parsed[i] = crate::baseobjspace::int_w(
                     crate::baseobjspace::space_index(arg)?,
                 )?;
             }
-            for (i, &value) in parsed[..args.len()].iter().enumerate() {
+            for (i, &value) in parsed[..positional.len()].iter().enumerate() {
                 GC_THRESHOLD[i].store(value, Ordering::Relaxed);
             }
             Ok(w_none())
