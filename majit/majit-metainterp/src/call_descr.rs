@@ -462,8 +462,11 @@ pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
 /// opcode at codewriter time, so reverse the mapping here so the descr
 /// the optimizer reads carries the matching effect class.
 ///
-/// `CALL_MAY_FORCE` maps to [`forces_virtual_or_virtualizable_effect_info`]
-/// (`effectinfo.py:23 EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).
+/// `CALL_MAY_FORCE` maps to [`default_effect_info()`]: the opcode alone
+/// only proves `check_forces_virtual_or_virtualizable()` held
+/// (`pyjitpl.py:2007-2008`), which `EF_RANDOM_EFFECTS` satisfies via the
+/// `>=` at `effectinfo.py:249-250`. It does NOT prove the write analyzer
+/// ran, so the reconstruction cannot invent an empty write set.
 /// `CALL_RELEASE_GIL` cannot be reconstructed from the opcode alone —
 /// upstream `effectinfo.py:271-273 MOST_GENERAL` pairs `EF_RANDOM_EFFECTS`
 /// with a `call_release_gil_target` funcptr that this helper does not
@@ -476,7 +479,7 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
     } else if opcode.is_call_loopinvariant() {
         LOOPINVARIANT_EFFECT_INFO
     } else if opcode.is_call_may_force() {
-        forces_virtual_or_virtualizable_effect_info()
+        default_effect_info()
     } else if opcode.is_call_release_gil() {
         unreachable!(
             "default_effect_for_opcode: CALL_RELEASE_GIL (`{opcode:?}`) requires \

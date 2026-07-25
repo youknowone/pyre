@@ -1940,8 +1940,21 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         };
         let helper = ctx.trace_ctx.const_int(helper_fn as usize as i64);
 
-        let mut effect = original_effect.clone();
-        effect.extraeffect = majit_ir::ExtraEffect::CannotRaise;
+        // `original_effect` is the generic setattr residual's
+        // `EF_RANDOM_EFFECTS`, whose six raw sets and six bitstrings are
+        // all `None` (`effectinfo.py:149-155`). Cloning it and lowering
+        // only `extraeffect` would build the "non-random + raw=None"
+        // shape `effectinfo.py:149-162` asserts against, and
+        // `check_write_descr_field` would then unwrap a `None`
+        // bitstring. Build the downgraded effect from scratch so the
+        // sets match the extraeffect: the raw slot write cannot raise,
+        // and it touches no field or array descr the heap cache holds
+        // (the storage is reached only through this helper pair, never
+        // through `getfield_gc` / `getarrayitem_gc`).
+        let mut effect = majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        );
         effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
         let descr = majit_metainterp::make_call_descr_with_effect(
             &[

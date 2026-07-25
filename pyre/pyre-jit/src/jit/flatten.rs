@@ -724,21 +724,26 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // clean_caches), and `force_from_effectinfo` finds no descr
         // bits set so no per-cached-descr flush either.
         CallFlavor::PlainCannotRaiseNoHeap => majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` —
-        // `call.py:288-289 if self.virtualizable_analyzer.analyze(op):`
-        // row of `getcalldescr`, fed through
-        // `effectinfo_from_writeanalyze` with the
-        // `graphanalyze.py:60` analyzer default (empty set). Distinct
-        // from `EF_RANDOM_EFFECTS` (`call.py:282-283
-        // randomeffects_analyzer` branch): both pass
-        // `check_forces_virtual_or_virtualizable()` via `>=` ordering at
-        // `effectinfo.py:249-250`, but only RandomEffects trips
-        // `has_random_effects()` (`effectinfo.py:252`) → routes
-        // OptHeap through `clean_caches`. Collapsing MayForce onto
-        // `MOST_GENERAL` would over-invalidate heap state PyPy keeps
-        // live for virtualizable-forcing callees with an empty heap
-        // effects analysis.
-        CallFlavor::MayForce => majit_metainterp::forces_virtual_or_virtualizable_effect_info(),
+        // Also `EffectInfo::MOST_GENERAL`. Upstream reaches
+        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` at
+        // `call.py:287-289 if extraeffect is None: if
+        // self.virtualizable_analyzer.analyze(op):`, i.e. only after
+        // `call.py:282-284 randomeffects_analyzer` declined AND the write
+        // analyzer produced a concrete set for the callee's graph. Every
+        // pyre producer of this flavor binds an interpreter entry point
+        // that runs arbitrary Python code (`cpu.call_fn`, `compare_fn`,
+        // `truth_fn`, `call_fn_0..8`, `setattr_fn`, …), so no write set
+        // was ever computed and an empty one asserts something false.
+        //
+        // Nothing is lost by the promotion: `EF_RANDOM_EFFECTS` (7) is
+        // `>=` `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (6) at
+        // `effectinfo.py:249-250`, so `check_forces_virtual_or_
+        // virtualizable()` still holds and `pyjitpl.py:2007-2008` still
+        // selects the `CALL_MAY_FORCE_*` opcode with its vable/vref
+        // preparation. The added effect is `heap.py:460`'s
+        // `has_random_effects()` route into `clean_caches`, which is what
+        // an unknown write set means.
+        CallFlavor::MayForce => majit_metainterp::default_effect_info(),
         // EF_LOOPINVARIANT — `effectinfo.py:18`.
         // `optimize_CALL_LOOPINVARIANT_*` branch.
         CallFlavor::LoopInvariant => EffectInfo {
@@ -6997,13 +7002,10 @@ mod tests {
         // ReleaseGil is excluded because it needs the real
         // `(target_fn_addr, save_err)` seed.
         //
-        // `Plain` → `EF_CAN_RAISE` (`call.py:300-301`, fed through
-        // `effectinfo_from_writeanalyze` with the
-        // `graphanalyze.py:60 analyze_external_call` default
-        // `bottom_result()` = empty set; the `effectinfo.py:285`
-        // top_set force-promotion only fires when `effects is top_set`,
-        // not when the producer simply omits an analyzer). dispatch
-        // reverses via the `_ => Plain` arm.
+        // `Plain` is excluded — with no analyzer output it resolves to
+        // `EffectInfo::MOST_GENERAL`, sharing `ExtraEffect::RandomEffects`
+        // with `MayForce`, so the reverse mapping collapses to `MayForce`
+        // (asserted separately below).
         //
         // `PlainCannotRaise` → `EF_CANNOT_RAISE` (`call.py:303`),
         // dispatch reverses via the `ExtraEffect::CannotRaise =>
@@ -7017,7 +7019,6 @@ mod tests {
         // not the extraeffect discriminant, so the round-trip correctly
         // collapses to PlainCannotRaise.
         for flavor in [
-            CallFlavor::Plain,
             CallFlavor::PlainCannotRaise,
             CallFlavor::MayForce,
             CallFlavor::LoopInvariant,
@@ -7045,6 +7046,11 @@ mod tests {
             "PlainCannotRaiseNoHeap shares extraeffect=CannotRaise with \
              PlainCannotRaise; dispatch reverse-maps both to PlainCannotRaise"
         );
+
+        // Same collapse on the RandomEffects side: `Plain` and `MayForce`
+        // both resolve to `MOST_GENERAL`.
+        let ei = effect_info_for_call_flavor(CallFlavor::Plain);
+        assert_eq!(dispatch_kind_for_effect_info(&ei), CallFlavor::MayForce);
     }
 
     #[test]
@@ -7055,28 +7061,33 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_absent_plain_and_may_force_carry_distinct_extra_effects() {
-        // `call.py:288-303 getcalldescr` keeps `EF_CAN_RAISE`
-        // (plain raising callees) and `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
-        // (virtualizable forcing callees) as distinct extraeffect
-        // values.  Collapsing them both onto `EF_RANDOM_EFFECTS = 7`
-        // (`MOST_GENERAL`) would over-claim random-effects semantics on
-        // plain calls, routing them through
-        // `check_forces_virtual_or_virtualizable()` (`pyjitpl.py:2007`,
-        // `effectinfo.py:250`) and tripping `has_random_effects()`
-        // cache invalidation that `EF_CAN_RAISE` / `EF_FORCES` leave
-        // intact.
+    fn analyzer_absent_plain_and_may_force_both_resolve_to_most_general() {
+        // `call.py:282-303 getcalldescr` reaches `EF_CAN_RAISE` and
+        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` only with write-analyzer
+        // output in hand; both rows carry the callee's concrete write set.
+        // Neither pyre flavor has one — `Plain` means "nothing is known
+        // about the callee" and every `MayForce` producer binds an
+        // interpreter entry point that runs arbitrary Python code — so
+        // both take `graphanalyze.py:109-112`'s `top_result()` and land on
+        // `EF_RANDOM_EFFECTS` (`effectinfo.py:285-292`).
+        //
+        // The `MayForce` semantics survive the merge: `EF_RANDOM_EFFECTS`
+        // (7) `>=` `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (6) at
+        // `effectinfo.py:249-250`, so `pyjitpl.py:2007-2008` still selects
+        // `CALL_MAY_FORCE_*` with its vable/vref preparation.
         let plain_ei = effect_info_for_call_flavor(CallFlavor::Plain);
         let may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
-        assert_ne!(plain_ei, may_force_ei);
-        assert_eq!(plain_ei.extraeffect, majit_ir::ExtraEffect::CanRaise);
+        assert_eq!(plain_ei, may_force_ei);
+        assert_eq!(plain_ei.extraeffect, majit_ir::ExtraEffect::RandomEffects);
+        assert!(plain_ei.has_random_effects());
+        assert!(plain_ei.check_forces_virtual_or_virtualizable());
+        // `effectinfo.py:149-155`: `EF_RANDOM_EFFECTS` keeps every raw set
+        // and every bitstring at `None`, so no `check_*_descr_*` query can
+        // read an invented empty set.
+        assert!(plain_ei._write_descrs_fields.is_none());
+        assert!(plain_ei.write_descrs_fields.is_none());
         assert_eq!(
-            may_force_ei.extraeffect,
-            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable
-        );
-        assert_eq!(dispatch_kind_for_effect_info(&plain_ei), CallFlavor::Plain);
-        assert_eq!(
-            dispatch_kind_for_effect_info(&may_force_ei),
+            dispatch_kind_for_effect_info(&plain_ei),
             CallFlavor::MayForce
         );
     }
@@ -10069,19 +10080,12 @@ mod tests {
 
     #[test]
     fn build_load_global_helper_carries_distinct_effect_info_from_binary_op_helper() {
-        // BINARY_OP records `MayForce` → ForcesVirtualOrVirtualizable;
-        // LoadGlobal records `Plain` → CanRaise. PyPy `call.py:288-303
-        // getcalldescr` keeps these as distinct `extraeffect` values:
-        // the `virtualizable_analyzer` branch (`:288-289`) routes to
-        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, the `_canraise`
-        // raising-callee branch (`:300-301`) routes to `EF_CAN_RAISE`.
-        // `effectinfo.py:285` force-promotion to `EF_RANDOM_EFFECTS`
-        // only fires when the analyzer literally returns `top_set`; the
-        // analyzer-absent external-call default is `bottom_result()` =
-        // empty set per `graphanalyze.py:60`, so the supplied
-        // `extraeffect` survives the empty-effects else-branch
-        // (`:293-299`). Both EIs therefore carry distinct shapes and
-        // round-trip through `dispatch_kind_for_effect_info`.
+        // BINARY_OP records `MayForce`, LoadGlobal records `Plain`.
+        // Neither callee was write-analyzed, so both resolve to
+        // `EffectInfo::MOST_GENERAL` (`graphanalyze.py:109-112`
+        // `top_result()` → `effectinfo.py:285-292`) and share
+        // `ExtraEffect::RandomEffects`. What still separates the two
+        // descrs is the `pyre_helper` tag the walker dispatches on.
         let bin = build_binary_op_residual_call_ir_r_insn(7, 0, 1, 2, 3);
         let glob = build_load_global_fn_residual_call_ir_r_insn(7, 0, 1, 2, 4, 3);
         let bin_descr = match &bin {
@@ -10104,25 +10108,28 @@ mod tests {
             },
             _ => panic!("LoadGlobal Insn is not Op"),
         };
-        assert_eq!(
-            bin_descr.extraeffect,
-            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
-            "MayForce flavor produces EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE \
-             per `call.py:288-289 virtualizable_analyzer` branch"
-        );
-        assert_eq!(
-            glob_descr.extraeffect,
-            majit_ir::ExtraEffect::CanRaise,
-            "Plain flavor produces EF_CAN_RAISE per `call.py:300-301 \
-             _canraise` branch"
-        );
+        for (name, ei) in [("BINARY_OP", &bin_descr), ("LoadGlobal", &glob_descr)] {
+            assert_eq!(
+                ei.extraeffect,
+                majit_ir::ExtraEffect::RandomEffects,
+                "{name}: an un-analyzed callee is `graphanalyze.py:109-112` \
+                 `top_result()`, promoted to EF_RANDOM_EFFECTS at \
+                 `effectinfo.py:285-292`"
+            );
+            assert!(
+                ei.check_forces_virtual_or_virtualizable(),
+                "{name}: EF_RANDOM_EFFECTS (7) >= \
+                 EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE (6) at \
+                 `effectinfo.py:249-250`, so `pyjitpl.py:2007-2008` still \
+                 selects CALL_MAY_FORCE"
+            );
+        }
         assert_ne!(
             bin_descr, glob_descr,
-            "MayForce and Plain carry distinct EffectInfo shapes; \
-             collapsing them onto MOST_GENERAL would over-claim \
-             random-effects semantics and trip `has_random_effects` \
-             cache invalidation (`effectinfo.py:252`)"
+            "the two descrs stay distinguishable through `pyre_helper`, \
+             which is what the walker's fold recognisers dispatch on"
         );
+        assert_ne!(bin_descr.pyre_helper, glob_descr.pyre_helper);
     }
 
     #[test]

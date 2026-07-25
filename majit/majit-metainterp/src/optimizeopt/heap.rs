@@ -1939,26 +1939,23 @@ impl OptHeap {
             // `!compute_bitstrings_has_run()` so the translated interpreter's
             // bitstring path is unchanged.
             //
-            // STRUCTURAL ADAPTATION (no heap.py analog): upstream every
-            // cached descr is inside the `compute_bitstrings` universe, so
-            // the bitcheck is total.  Pyre also caches RUNTIME-minted
-            // descrs (`ei_index` unset even after bitstrings ran — e.g.
-            // the module-global cell fold's mutable
-            // `ObjectMutableCell.w_value`).  No call's write bitstring can
-            // ever name such a descr, so a bitcheck miss proves nothing;
-            // treating it as "not written" let a namespace-store residual
-            // (analyzed write set, which cannot include the runtime descr)
-            // keep the getfield cache and re-read a stale global
-            // (`acc = acc + a; acc = acc + b` at module level dropped the
-            // first term).  A mutable out-of-universe descr is therefore
-            // conservatively invalidated by every non-elidable call — but
-            // only once bitstrings have run: before that, a u32::MAX
-            // `effect_idx` just means the fixture never stamped the slot, so
-            // the identity fallback below is the correct arbiter.
+            // A descr whose `ei_index` is still the sentinel is NOT special-
+            // cased here, matching `heap.py:537-553`. Upstream leaves the
+            // sentinel on any descr that no EffectInfo's raw set names —
+            // `effectinfo.py:495-496` stamps `sys.maxint` on every descr in
+            // `all_descrs` and only `:524-526` renumbers the ones that appear
+            // in some `_readonly_descrs_*` / `_write_descrs_*`, which
+            // `test_effectinfo.py:172,176` pins with `f3descr`. A sentinel
+            // descr therefore bitchecks false upstream too. That is sound
+            // because of the OTHER half of the contract: a call whose write
+            // set was never computed is `EF_RANDOM_EFFECTS`
+            // (`graphanalyze.py:109-112 top_result()` →
+            // `effectinfo.py:285-292`) and never reaches this function at all
+            // — `heap.py:460` routes it to `clean_caches`. pyre upholds the
+            // same contract at `call_descr.rs default_effect_info()`; keeping
+            // a descr-side guard here instead would be papering over any call
+            // that still asserts an empty write set it did not earn.
             let writes_field = ei.check_write_descr_field(effect_idx)
-                || (majit_ir::effectinfo::compute_bitstrings_has_run()
-                    && effect_idx == u32::MAX
-                    && !descr.is_always_pure())
                 || (!majit_ir::effectinfo::compute_bitstrings_has_run()
                     && ei.writes_field_descr_by_identity(&descr));
             if writes_field {
@@ -1986,14 +1983,9 @@ impl OptHeap {
             .collect();
         for (descr_idx, descr, effect_idx) in array_descrs {
             let read = ei.check_readonly_descr_array(effect_idx);
-            // See the field loop above: a RUNTIME-minted array descr
-            // (`ei_index` unset) is outside the bitstring universe, so no
-            // call's write bitstring can name it — conservatively treat
-            // every non-elidable call as writing it.
-            let write = ei.check_write_descr_array(effect_idx)
-                || (majit_ir::effectinfo::compute_bitstrings_has_run()
-                    && effect_idx == u32::MAX
-                    && !descr.is_always_pure());
+            // heap.py:556 — no sentinel special case, for the reason given
+            // in the field loop above.
+            let write = ei.check_write_descr_array(effect_idx);
             if !read && !write {
                 continue;
             }
@@ -3502,14 +3494,27 @@ impl Optimization for OptHeap {
             .collect();
         sort_descr_item_refs_untranslated(&mut field_entries);
         for (descr, (field_idx, cf)) in field_entries {
+            // NOT heap.py:370-372, which has no filter here.
+            //
+            // Hoisting a cached MUTABLE field into the peeled loop's label is
+            // only sound if the back-edge re-supplies it. `shortpreamble.py:465-476
+            // ExtendedShortPreambleBuilder.add_preamble_op` appends
+            // `preamble_op.op` to the label args and `preamble_op.preamble_op` —
+            // the RE-EXECUTED operation — to the jump args, so upstream re-reads
+            // the field each iteration. pyre's peeled body currently passes the
+            // ENTRY value straight back: with this filter removed,
+            // `pyre/bench/synth/callee_store_global_read_after_call.py` emits
+            // `v245 = SameAsI(<preamble getfield IntMutableCell.intvalue>)` and
+            // `Jump(..., v245)`, so a global a residual call mutates every
+            // iteration is treated as loop-invariant (316836 vs 240008).
+            // `is_always_pure()` descrs are exempt because re-reading them cannot
+            // observe a change. Remove this once the back-edge supplies the
+            // re-executed op.
             let effect_idx = Self::field_effect_index(descr);
             if majit_ir::effectinfo::compute_bitstrings_has_run()
                 && effect_idx == u32::MAX
                 && !descr.is_always_pure()
             {
-                // Match force_from_effectinfo's conservatism for mutable
-                // descrs outside the bitstring universe: a residual call may
-                // write them, so they must be read live in each peeled body.
                 continue;
             }
             cf.produce_potential_short_preamble_ops(sb, descr, field_idx, ctx);
@@ -3519,12 +3524,12 @@ impl Optimization for OptHeap {
         //         for index, d in submap.const_indexes.items():
         //             d.produce_potential_short_preamble_ops(self.optimizer, sb, descr, index)
         for (_, descr, submap) in &self.cached_arrayitems {
+            // Same back-edge gap as the field loop above, for array items.
             let effect_idx = Self::array_effect_index(descr);
             if majit_ir::effectinfo::compute_bitstrings_has_run()
                 && effect_idx == u32::MAX
                 && !descr.is_always_pure()
             {
-                // Same rule for runtime-minted mutable array descrs.
                 continue;
             }
             for (_, cai) in &submap.const_indexes {
