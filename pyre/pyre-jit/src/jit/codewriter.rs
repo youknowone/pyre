@@ -9052,7 +9052,23 @@ impl CodeWriter {
                                 items,
                                 py_pc as i64,
                             );
-                            push_and_bump!(result_value.into(), py_pc);
+                            // Physically write the list into its value-stack slot
+                            // (`pyframe.py:389 pushvalue` → `setarrayitem_vable_r`
+                            // via `jtransform.py:1898 do_fixed_list_setitem`), not
+                            // just bump the symbolic depth.  `LIST_APPEND` reads
+                            // its accumulator back through `getarrayitem_vable_r`
+                            // (see below), and the blackhole runs
+                            // BUILD_LIST→LIST_APPEND from the jitcode on a
+                            // mid-frame resume, so the slot must be populated by
+                            // the emitted op rather than relying on a prior
+                            // interpreter write — the same pairing GET_ITER makes
+                            // for FOR_ITER's iterator reload.  A list display
+                            // longer than 30 elements compiles to `BUILD_LIST 0` +
+                            // repeated `LIST_APPEND`, so without this the append
+                            // receiver is whatever the slot last held.
+                            let pushed: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(pushed.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
                         // pyopcode.py:1463 BUILD_SLICE:
