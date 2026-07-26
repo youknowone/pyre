@@ -5504,6 +5504,17 @@ impl<S: JitState> JitDriver<S> {
         // at this header pc; the bridge closes by JUMPing into it there, not at
         // its own `resume_pc`. Resolve before the `ctx` mutable borrow below.
         let parent_header_pc = self.meta.loop_header_pc_for(green_key);
+        // pyjitpl.py:3446-3450 `rebuild_state_after_failure` ends with
+        // `synchronize_virtualizable()` / `check_synchronized_virtualizable()`,
+        // both of which read the LIVE virtualizable.  Resolve it here (the same
+        // `virtualizable_heap_ptr` hook the trace-entry `sync_before` uses) so
+        // the bridge's vable seeding has an authority to check the guard's
+        // decoded identity against.
+        let live_vable_ptr = self.meta.virtualizable_info().cloned().and_then(|info| {
+            state
+                .virtualizable_heap_ptr(&trace_meta, &info.name.clone(), &info)
+                .map(|ptr| ptr.cast_const())
+        });
         // `start_retrace_from_guard` above sets `self.meta.tracing = Some(..)`
         // on success (pyjitpl.py:9415). Fail loud rather than skipping bridge
         // header_pc / is_bridge_trace / has_compiled_targets_fn wiring
@@ -5522,6 +5533,9 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
+        if let Some(ptr) = live_vable_ptr {
+            ctx.set_virtualizable_heap_ptr(ptr);
+        }
         ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
         // pyjitpl.py:3125 `_prepare_exception_resumption` grabs the exception
         // BEFORE frame reconstruction; thread it onto the ctx so the pyre

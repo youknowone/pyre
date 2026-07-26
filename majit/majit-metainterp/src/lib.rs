@@ -163,6 +163,7 @@ pub use quasiimmut::QuasiImmut;
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
     materialize_bridge_virtual, rebuilt_value_to_opref, replay_pending_fields,
+    seed_bridge_virtualizable_boxes,
 };
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::GreenBox;

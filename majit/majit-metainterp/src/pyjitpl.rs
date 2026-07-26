@@ -3218,7 +3218,30 @@ impl<M: Clone> MetaInterp<M> {
         let box_ref_index = info
             .identity_ref_bank_index
             .unwrap_or(index_of_virtualizable);
-        let virtualizable_box = OpRef::input_arg_ref(box_ref_index as u32);
+        // `identity_ref_bank_index` names a JitCode ref REGISTER, while trace
+        // inputargs are numbered flat across banks — `OpRef::input_arg_ref(1)`
+        // is inputarg #1, which for the state-field front-end is an int, not
+        // the `&state` identity.  The alias is invisible while the identity is
+        // only read through `virtualizable_values[-1]`, but it is what
+        // `capture_resumedata` writes into every guard's vable section, so a
+        // bridge decoding that section resolves the identity to the wrong
+        // deadframe slot.  `pyjitpl.py:3295 virtualizable_box =
+        // original_boxes[index]` is a lookup of the red that HOLDS the
+        // virtualizable; recover the same box by matching the live pointer
+        // against `live_values`, which is `original_boxes` here.
+        let identity_index = if info.identity_ref_bank_index.is_some() && !self.vable_ptr.is_null()
+        {
+            let vable_bits = self.vable_ptr as usize;
+            original_boxes
+                .iter()
+                .position(|value| matches!(value, Value::Ref(r) if r.as_usize() == vable_bits))
+        } else {
+            None
+        };
+        let virtualizable_box = match identity_index {
+            Some(idx) => OpRef::input_arg_typed(idx as u32, Type::Ref),
+            None => OpRef::input_arg_ref(box_ref_index as u32),
+        };
         // The identity's concrete VALUE is the live virtualizable pointer.
         // For PyFrame `original_boxes[index]` already IS the frame pointer
         // (== `vable_ptr`), so this is a no-op there. For the state-field

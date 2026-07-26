@@ -1806,6 +1806,40 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
     };
 
+    // pyjitpl.py:3449 `rebuild_state_after_failure`:
+    //     if vinfo is not None:
+    //         self.virtualizable_boxes = virtualizable_boxes
+    // The guard's vable section is decoded by `rebuild_from_resumedata` above;
+    // rebuild the shadow from it so the bridge traces with the same
+    // virtualizable the parent loop had.  Without it `virtualizable_boxes`
+    // stays None for the whole bridge and `__trace_*` aborts at its first
+    // statement (`standard_virtualizable_jitcode_argbox` has nothing to
+    // resolve), so a state with `[.. ; virt]` arrays never forms a bridge at
+    // all — every guard exit deopts through the blackhole instead.
+    let seed_bridge_vable: TokenStream = if num_virt_arrays > 0 {
+        quote! {
+            if let Some(__vinfo) = Self::__build_virtualizable_info() {
+                let __seeded = majit_metainterp::seed_bridge_virtualizable_boxes(
+                    ctx,
+                    &__vinfo,
+                    rd_virtuals,
+                    resume_data,
+                    &mut __bridge_cache,
+                    fail_values,
+                );
+                if std::env::var("MAJIT_BRIDGE_DEBUG").is_ok() {
+                    eprintln!(
+                        "[bridgeB] vable seed={} stream={}",
+                        __seeded,
+                        resume_data.virtualizable_values.len(),
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // ── VirtualizableInfo / heap-ptr overrides for `[int; virt]` arrays ──
     // Each virt array becomes a standard-virtualizable RustVec array field on
     // a zero-static-field vinfo, so `state.<arr>[i]` lowers through the
@@ -2568,6 +2602,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     rd_virtuals,
                     &mut __bridge_cache,
                 );
+                #seed_bridge_vable
                 let frame = match resume_data.frames.first() {
                     Some(f) => f,
                     None => return,
