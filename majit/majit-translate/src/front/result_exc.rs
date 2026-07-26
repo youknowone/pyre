@@ -237,26 +237,37 @@ pub(crate) fn tyref_result_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> Opti
 /// widened to a genuine void return rather than forwarding the unit
 /// `()` value as a `Ref`-typed shell — see [`widen_unit_return_to_void`].
 pub(crate) fn tyref_result_ok_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
+    result_ok_slot(ty, llbc).is_some_and(|slot| {
+        crate::front::mir::charon_type_value_to_ast_string(slot, llbc, 0) == "()"
+    })
+}
+
+/// The `Ok` payload slot of a `Result<T, E>` type value, or `None` when
+/// `ty` is not a `Result`.
+fn result_ok_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return false,
-        },
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     if adt_path_of(body, llbc).as_deref() != Some("core::result::Result") {
-        return false;
+        return None;
     }
-    let Some(ok_slot) = body
-        .get("Adt")
+    body.get("Adt")
         .and_then(|a| a.get("generics"))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
-    else {
-        return false;
-    };
-    crate::front::mir::charon_type_value_to_ast_string(ok_slot, llbc, 0) == "()"
+}
+
+/// The `Ok` payload of a `Result<T, PyError>` as its own [`TyRef`], or
+/// `None` when `ty` is not a `Result`.
+///
+/// A scoped callee's `Result` never survives the exception-link lowering:
+/// the graph returns `T` and the residual-call ABI returns `T` with the
+/// error routed through `BH_LAST_EXC_VALUE`.  Consumers that describe the
+/// callee's result therefore have to read `T`, not the `Result` ADT.
+pub(crate) fn tyref_result_ok(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    result_ok_slot(ty, llbc).and_then(|slot| serde_json::from_value(slot.clone()).ok())
 }
 
 /// Collapse a scoped callee's returnblock to a genuine void return.
@@ -1178,7 +1189,9 @@ fn rewire_one_call_site(
     // value itself.
     let continue_target = continue_link.target;
     for pos in payload_positions {
-        collapse_pos0_read(graph, continue_target, pos, &name)?;
+        if let Some(payload_ty) = collapse_pos0_read(graph, continue_target, pos, &name)? {
+            narrow_call_result_ty(graph, a, r, payload_ty);
+        }
     }
 
     // Rewire A: LastException exits — normal → continue arm,
@@ -2166,9 +2179,11 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     );
 
     // The Ok arm reads the payload via `r.__pos_0[Result::Ok]`; with the native
-    // call result flowing directly, that read collapses to `r`.
+    // call result flowing directly, that read collapses to `r`.  The fused
+    // native call is stamped from the guest value it returns, not from the
+    // `Result` shell, so its declared type already is the payload's.
     for pos in payload_positions {
-        collapse_pos0_read(graph, ok_link.target, pos, &name)?;
+        let _ = collapse_pos0_read(graph, ok_link.target, pos, &name)?;
     }
 
     Ok(())
@@ -2564,15 +2579,57 @@ fn verify_break_arm_is_reraise(
     verify_forwards_to_returnblock_general(graph, e_block, &residual_result)
 }
 
+/// Narrow the declared result type of the operation producing `r` in
+/// `block` to `payload_ty`.
+///
+/// The call was stamped from its Rust `dest.ty` — `Result<T, PyError>`,
+/// an ADT, hence `Ref` (`front::mir` `Rvalue::Call`).  Once the diamond
+/// rewrite lets the call result flow into the continue arm's payload slot
+/// and [`collapse_pos0_read`] folds the `__pos_0` read away, `r` IS the
+/// `T` the arm reads, so the stale `Ref` stamp contradicts the value's
+/// kind.  A `Ref` payload hides that — `Result<PyObjectRef, PyError>`
+/// projects to the same `Ref` — but a scalar `T` leaves the carrier
+/// column unioning `Bool`/`Int` against `Ref` at every merge that also
+/// receives the value from a non-`?` path.  The union has no answer
+/// (`legacy_annotator::union_type`), the empty binding is defaulted to
+/// `GcRef`, and the register banks only disagree at the assembler.
+///
+/// `checked_arith` keeps the same invariant by replacing its residual
+/// `checked_*()` call outright with an `Int`-stamped `BinOp`, and
+/// [`widen_unit_return_to_void`] is the `T = ()` case of the same rule.
+fn narrow_call_result_ty(
+    graph: &mut FunctionGraph,
+    block: usize,
+    r: &Variable,
+    payload_ty: ValueType,
+) {
+    let Some(op) = graph.blocks[block]
+        .operations
+        .iter_mut()
+        .find(|op| op.result.as_ref() == Some(r))
+    else {
+        return;
+    };
+    if let OpKind::Call { result_ty, .. } = &mut op.kind {
+        *result_ty = payload_ty;
+    }
+}
+
 /// In the continue-arm target, the `__pos_0` read off the inputarg at
 /// `pos` collapses: the inherited value already *is* the payload.
 /// Deletes the read and renames its result to the inputarg.
+///
+/// Returns the collapsed read's type, or `None` when the arm discarded
+/// the payload and there was no read to collapse.  The carrier inputarg
+/// carries the payload from here on, so a caller whose substituted value
+/// still declares the enclosing `Result` / `Option` type must narrow that
+/// declaration to the returned type — see [`narrow_call_result_ty`].
 pub(crate) fn collapse_pos0_read(
     graph: &mut FunctionGraph,
     target: crate::model::BlockId,
     pos: usize,
     name: &str,
-) -> Result<(), String> {
+) -> Result<Option<ValueType>, String> {
     let ti = target.0;
     let carrier = graph.blocks[ti]
         .inputargs
@@ -2602,12 +2659,16 @@ pub(crate) fn collapse_pos0_read(
                  carrier outside a __pos_0 read — unsupported shape"
             ));
         }
-        return Ok(());
+        return Ok(None);
     };
     let read_result = graph.blocks[ti].operations[read_idx]
         .result
         .clone()
         .ok_or_else(|| format!("{name}: __pos_0 read without result"))?;
+    let payload_ty = match &graph.blocks[ti].operations[read_idx].kind {
+        OpKind::FieldRead { ty, .. } => ty.clone(),
+        _ => unreachable!("read_idx was selected by matching FieldRead"),
+    };
     graph.blocks[ti].operations.remove(read_idx);
     // Rename the read's result to the carrier across the block's
     // remaining ops, exitswitch, and exits.
@@ -2630,5 +2691,5 @@ pub(crate) fn collapse_pos0_read(
     );
     block.exitswitch = sw;
     block.exits = exits;
-    Ok(())
+    Ok(Some(payload_ty))
 }

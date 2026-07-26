@@ -12783,10 +12783,24 @@ fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// `Unknown` results (whose legacy concrete is also Unknown — the
 /// dead-var backfill family, not a genuine kind mismatch).
 fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> {
-    if is_unit_type(output, llbc) {
+    // A `Result<T, PyError>` callee is reached through the residual-call
+    // ABI, which hands back the `Ok` payload and routes the error through
+    // `BH_LAST_EXC_VALUE`, so `FUNC.RESULT` is `T`.  Reading the kind off
+    // the `Result` ADT instead reports `ref` whatever `T` is, and the
+    // caller — whose call result is the unwrapped payload — then disagrees
+    // with the token for every non-reference `T` (`getcalldescr`'s
+    // `RESULT == FUNC.RESULT` check).  `Result<(), PyError>` reaches the
+    // unit arm the same way its callee reaches `widen_unit_return_to_void`.
+    //
+    // The `OBJECTPTR` carve-out below deliberately keeps reading the
+    // declared `output`: it decides the pointer's lowering, not its bank,
+    // and a `Result`-typed output has never taken it.
+    let payload = crate::front::result_exc::tyref_result_ok(output, llbc);
+    let kind_src = payload.as_ref().unwrap_or(output);
+    if is_unit_type(kind_src, llbc) {
         return None;
     }
-    let token = match tyref_to_value_type(output, llbc) {
+    let token = match tyref_to_value_type(kind_src, llbc) {
         ValueType::Bool => "bool",
         ValueType::Int => "i64",
         ValueType::Unsigned => "u64",

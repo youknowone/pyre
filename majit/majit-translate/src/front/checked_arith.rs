@@ -341,8 +341,11 @@ fn rewire_one_checked_arith_site(graph: &mut FunctionGraph, opt: &Variable) -> R
 
     // The Some target reads the payload via `opt.__pos_0`; with the `_ovf`
     // result flowing directly, that read collapses to the carried value.
+    // The `checked_*()` residual is replaced below by an `Int`-stamped
+    // `_ovf` BinOp, so the value flowing into the collapsed payload slot
+    // already declares the payload's type.
     for pos in payload_positions {
-        collapse_pos0_read(graph, some_target, pos, &name)?;
+        let _ = collapse_pos0_read(graph, some_target, pos, &name)?;
     }
 
     // Replace A's residual `checked_*()` call with the native `_ovf`
