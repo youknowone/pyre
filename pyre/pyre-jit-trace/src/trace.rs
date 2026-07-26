@@ -1682,6 +1682,17 @@ fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool 
 }
 
 fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
+    // Every arm below returns to the legacy escape/replay path.  Name each one
+    // under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_miframe`'s
+    // `s2dbg!` names its own: a silent decline is indistinguishable from the
+    // adopt never being reached, and the two want different fixes.
+    macro_rules! mfdbg {
+        ($($a:tt)*) => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!("[s2-adopt-decline] {}", format!($($a)*));
+            }
+        };
+    }
     let Some(mut latched) = crate::jitcode_dispatch::take_multi_frame_blackhole() else {
         return false;
     };
@@ -1691,9 +1702,11 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
         .map(std::sync::Arc::as_ptr)
         .unwrap_or(std::ptr::null());
     if virtualizable_info.is_null() {
+        mfdbg!("no virtualizable_info");
         return false;
     }
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
+        mfdbg!("cf_addr {cf_addr:#x} has no concrete nlocals");
         return false;
     };
     // Recover each level's concrete PyFrame ptr and its own fastlocals base.
@@ -1704,21 +1717,29 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     // into — that intermediate frame.  Any level whose frame register is not
     // a concrete PyFrame declines the adopt (legacy replay handles it).
     let mut per_frame: Vec<(i64, usize)> = Vec::with_capacity(latched.framestack.frames.len());
-    for frame in &latched.framestack.frames {
+    for (index, frame) in latched.framestack.frames.iter().enumerate() {
         let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+            mfdbg!(
+                "frame {index}: jitcode index {} out of range",
+                frame.jitcode.index()
+            );
             return false;
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
         if frame_reg == u16::MAX {
+            mfdbg!("frame {index}: jitcode {jitcode_index} has no portal frame reg");
             return false;
         }
         let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
+            mfdbg!("frame {index}: reg {frame_reg} unstamped");
             return false;
         };
         if frame_ptr == 0 {
+            mfdbg!("frame {index}: reg {frame_reg} is null");
             return false;
         }
         let Some(frame_stack_base) = crate::state::concrete_nlocals(frame_ptr as usize) else {
+            mfdbg!("frame {index}: {frame_ptr:#x} has no concrete nlocals");
             return false;
         };
         per_frame.push((frame_ptr, frame_stack_base));
@@ -1737,6 +1758,11 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     // the `jit.virtual_ref` emit at the inline push, so decline to legacy
     // replay until then.
     if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(cf_addr as i64) {
+        mfdbg!(
+            "chain rooted at {:#x}, not the walked frame {cf_addr:#x} (needs the \
+             virtual_ref emit at the inline push)",
+            per_frame.first().map(|&(p, _)| p).unwrap_or(0),
+        );
         return false;
     }
     // `ExecutionContext::enter` parity for the resumed chain:
@@ -1806,10 +1832,12 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
             ref green_int, ..
         } => {
             let Some(&resume_py_pc) = green_int.first() else {
+                mfdbg!("ContinueRunningNormally with no green int");
                 return false;
             };
             let resume_py_pc = resume_py_pc as usize;
             if cf_addr == 0 || resume_py_pc == 0 {
+                mfdbg!("cf_addr {cf_addr:#x} / resume_py_pc {resume_py_pc} is zero");
                 return false;
             }
             // The terminal frame's own `setfield_vable` operations committed
@@ -1818,9 +1846,14 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
             // the same live-slot materialization the single-frame path
             // performs.
             let Some(terminal) = mf_terminal.as_mut() else {
+                mfdbg!("no terminal image for the ContinueRunningNormally handoff");
                 return false;
             };
             let Ok(terminal_jitcode_index) = i32::try_from(terminal.jitcode_index) else {
+                mfdbg!(
+                    "terminal jitcode index {} out of range",
+                    terminal.jitcode_index
+                );
                 return false;
             };
             if !apply_blackhole_crn(
@@ -1833,6 +1866,7 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
                 &terminal.registers_f,
                 resume_py_pc,
             ) {
+                mfdbg!("apply_blackhole_crn rejected the terminal image");
                 return false;
             }
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
