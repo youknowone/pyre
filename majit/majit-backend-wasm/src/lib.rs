@@ -2889,10 +2889,15 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn invalidate_loop(&self, token: &JitCellToken) {
-        // x86/assembler.py:641-648 invalidate_loop parity. The wasm module is
-        // immutable, so GUARD_NOT_INVALIDATED loads this live flag instead of
-        // having its instruction bytes patched in place.
-        token.invalidated.store(true, Ordering::Release);
+        // A validated wasm module's code is immutable, so
+        // GUARD_NOT_INVALIDATED loads a live flag instead of having its
+        // instruction bytes patched in place — the same shape the llgraph
+        // backend uses (`llgraph/runner.py:375` sets `trace.invalid` across
+        // `_llgraph_alltraces`). `model.py:145` covers the loop AND its
+        // attached bridges, each of which reads its own generation flag, so
+        // this must go through `invalidate` rather than store to the root
+        // flag alone.
+        token.invalidate();
     }
 
     fn redirect_call_assembler(

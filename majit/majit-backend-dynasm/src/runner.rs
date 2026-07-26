@@ -2838,7 +2838,11 @@ impl Backend for DynasmBackend {
     }
 
     fn invalidate_loop(&self, token: &JitCellToken) {
-        token.invalidated.store(true, Ordering::Release);
+        // `model.py:145` activates the guards in the loop AND in its attached
+        // bridges. Each bridge's GUARD_NOT_INVALIDATED reads its own
+        // generation flag, so storing to the root flag alone would leave every
+        // bridge guard a no-op; `invalidate` walks both.
+        token.invalidate();
     }
 
     // assembler.py:1138 redirect_call_assembler
