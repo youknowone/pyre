@@ -1471,6 +1471,85 @@ pub fn install_jit_call_bridge() {
 ///
 /// When rd_numb is available, uses ResumeDataDirectReader for exact
 /// frame decoding (resume.py:1312 parity).
+/// Complete a CALL_ASSEMBLER callee whose bridge walk already carried it past
+/// the guard, so the guard-state resume must not re-run the region.
+///
+/// `callee_frame` is the callee `PyFrame*` the guard failed in — pyre's CA
+/// virtualizable layout puts it at `fail_values[0]` (call_jit.rs:2471-2472).
+/// Returns `Some(result)` once the walk completed the callee, i.e. the
+/// `DoneWithThisFrame` / `ExitFrameWithExceptionRef` the assembler caller
+/// catches (pyjitpl.py:1688-1698, jitexc.py), and `None` when the caller still
+/// has to resume the guard state.
+///
+/// Shared by both CALL_ASSEMBLER completions — the native back-to-back
+/// blackhole hook below and the wasm in-guest deopt helper
+/// (`wasm_ca_resume_deopt`) — so the two cannot drift apart on which walk
+/// outcomes are replay-safe.
+fn ca_complete_after_bridge_walk(
+    ca_finished_frame: usize,
+    ca_adopted_frame: usize,
+    callee_frame: usize,
+) -> Option<i64> {
+    // The CA bridge walk ran the callee to its finishframe concretely and
+    // kept the finish-concrete stash (`CA_WALK_FINISHED_FRAME` handshake set
+    // by `trace_and_compile_from_bridge`); a guard-state resume would re-run
+    // the resumed region over the already-applied effects.  Complete the
+    // callee with the stashed concrete instead.
+    if ca_finished_frame != 0 && ca_finished_frame == callee_frame {
+        match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                let result = match cv {
+                    // A void return stashes `Null`, i.e. Python `None`.
+                    pyre_jit_trace::state::ConcreteValue::Null => pyre_object::w_none(),
+                    other => other.to_pyobj(),
+                };
+                return Some(result as i64);
+            }
+            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
+                let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = cv else {
+                    unreachable!("FinishConcrete::Raise must hold a concrete Ref")
+                };
+                debug_assert!(!exc_ref.is_null());
+                publish_residual_call_exception(exc_ref as i64);
+                return Some(0);
+            }
+            // The epilogue reset the stash between the hook calls; fall
+            // through to the guard-state resume.
+            None => {}
+        }
+    } else {
+        // A kept stash without a matching frame must not leak into a later
+        // top-level portal `fbw_finish_concrete_take`.
+        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
+    }
+
+    // raise_continue_running_normally parity (pyjitpl.py:3048-3091 +
+    // warmspot.py:970-983): the CA bridge walk committed its end-of-walk
+    // state into the live callee frame and the frame adopted it. The walk
+    // already executed the resumed region's effects concretely, so a
+    // guard-state resume would re-apply them over the advanced heap
+    // (double-execution / stale-value return). Complete the callee from its
+    // adopted state via the portal runner instead — the same
+    // portal_ptr(*args) completion the ContinueRunningNormally arm of
+    // handle_blackhole_result performs.
+    if ca_adopted_frame != 0 && ca_adopted_frame == callee_frame {
+        let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
+        return match crate::eval::portal_runner_result(frame) {
+            Ok(result) => Some(result as i64),
+            Err(mut err) => {
+                let exc_obj = err.to_exc_object();
+                if exc_obj != pyre_object::PY_NULL {
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                    store_jit_exception(exc_obj as i64);
+                }
+                Some(0)
+            }
+        };
+    }
+
+    None
+}
+
 fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
     fail_values_ptr: *const i64,
@@ -1516,64 +1595,10 @@ fn jit_blackhole_resume_from_guard(
         fail_values_raw
     };
 
-    // The CA bridge walk ran the callee to its finishframe concretely and
-    // kept the finish-concrete stash (`CA_WALK_FINISHED_FRAME` handshake set
-    // by `trace_and_compile_from_bridge`); the guard-state blackhole below
-    // would re-run the resumed region over the already-applied effects.
-    // Complete the callee with the stashed concrete instead — the
-    // `DoneWithThisFrame` / `ExitFrameWithExceptionRef` the assembler caller
-    // catches when a retrace reaches finishframe (pyjitpl.py:1688-1698,
-    // jitexc.py).
-    if ca_finished_frame != 0 && ca_finished_frame == fail_values[0] as usize {
-        match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
-                let result = match cv {
-                    // A void return stashes `Null`, i.e. Python `None`.
-                    pyre_jit_trace::state::ConcreteValue::Null => pyre_object::w_none(),
-                    other => other.to_pyobj(),
-                };
-                return Some(result as i64);
-            }
-            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-                let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = cv else {
-                    unreachable!("FinishConcrete::Raise must hold a concrete Ref")
-                };
-                debug_assert!(!exc_ref.is_null());
-                publish_residual_call_exception(exc_ref as i64);
-                return Some(0);
-            }
-            // The epilogue reset the stash between the hook calls; fall
-            // through to the guard-state blackhole.
-            None => {}
-        }
-    } else {
-        // A kept stash without a matching frame must not leak into a later
-        // top-level portal `fbw_finish_concrete_take`.
-        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
-    }
-
-    // raise_continue_running_normally parity (pyjitpl.py:3048-3091 +
-    // warmspot.py:970-983): the CA bridge walk committed its end-of-walk
-    // state into the live callee frame and the frame adopted it. The walk
-    // already executed the resumed region's effects concretely, so the
-    // guard-state blackhole below would re-apply them over the advanced
-    // heap (double-execution / stale-value return). Complete the callee
-    // from its adopted state via the portal runner instead — the same
-    // portal_ptr(*args) completion the ContinueRunningNormally arm of
-    // handle_blackhole_result performs.
-    if ca_adopted_frame != 0 && ca_adopted_frame == fail_values[0] as usize {
-        let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
-        return match crate::eval::portal_runner_result(frame) {
-            Ok(result) => Some(result as i64),
-            Err(mut err) => {
-                let exc_obj = err.to_exc_object();
-                if exc_obj != pyre_object::PY_NULL {
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-                    store_jit_exception(exc_obj as i64);
-                }
-                Some(0)
-            }
-        };
+    if let Some(result) =
+        ca_complete_after_bridge_walk(ca_finished_frame, ca_adopted_frame, fail_values[0] as usize)
+    {
+        return Some(result);
     }
 
     let raw_deadframe_raw = if let Some(values) = ca_resume_deadframe.as_deref() {
@@ -3625,6 +3650,23 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 // invocation would blackhole.  Invalidate callers so the next
                 // trace refuses this target and returns to the baseline path.
                 majit_backend_wasm::mark_call_assembler_terminal_decline(compiled_ptr as usize);
+            }
+            // The walk above may have carried the callee past the guard —
+            // running the resumed region to the callee's return, or committing
+            // its end-of-walk state into the live frame — executing every
+            // residual in it concretely.  Take the same completion the native
+            // CA hook takes; the guard-state resume below would re-run that
+            // region and apply its side effects a second time (#177).  This is
+            // the wasm side of the `CA_WALK_*` handshake: nothing else on this
+            // target reads those cells, so an unconsumed completion is silently
+            // dropped into a replay.
+            let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
+            let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
+            let callee_frame = raw_values.first().copied().unwrap_or(0) as usize;
+            if let Some(result) =
+                ca_complete_after_bridge_walk(ca_finished_frame, ca_adopted_frame, callee_frame)
+            {
+                return result;
             }
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
                 &raw_values,
