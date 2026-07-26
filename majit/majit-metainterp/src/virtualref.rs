@@ -15,10 +15,15 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// The value [`VREF_GC_TYPE_ID`] holds before `set_vref_gc_type_id` runs.  Zero
+/// is a legitimate id, so the sentinel has to be a value the registry never
+/// hands out.
+const VREF_GC_TYPE_ID_UNSET: u32 = u32::MAX;
+
 /// GC type id for JitVirtualRef, set by `set_vref_gc_type_id()` at startup.
 /// RPython registers JIT_VIRTUAL_REF as a real GC type; pyre does the same
 /// via `gc.register_type(TypeInfo::with_gc_ptrs(...))` in eval.rs.
-static VREF_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+static VREF_GC_TYPE_ID: AtomicU32 = AtomicU32::new(VREF_GC_TYPE_ID_UNSET);
 
 /// Set the GC type id for JitVirtualRef. Called once at startup after
 /// `gc.register_type()` returns the assigned id.
@@ -166,8 +171,8 @@ pub use crate::jit::InvalidVirtualRef;
 /// so the address is stable across a minor collection.  The `forced` frame may
 /// be young, hence the creation write barrier.
 ///
-/// The `Box` fallback covers the window before a backend has installed its
-/// allocator hook (`vref_gc_type_id() == 0`, or an old-gen allocation failure);
+/// The `Box` fallback covers the window before `set_vref_gc_type_id` has run
+/// (the id still reads its unset sentinel) and an old-gen allocation failure;
 /// it is leaked, and reclamation is what it gives up.
 fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
     let vref = JitVirtualRef {
@@ -178,7 +183,7 @@ fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
         forced: real_object,
     };
     let type_id = vref_gc_type_id();
-    if type_id != 0 {
+    if type_id != VREF_GC_TYPE_ID_UNSET {
         let gcref = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<JitVirtualRef>());
         if gcref.0 != 0 {
             unsafe { std::ptr::write(gcref.0 as *mut JitVirtualRef, vref) };
