@@ -4016,8 +4016,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     // Mirror the commit's own promotion predicate exactly: a rollback must
     // undo a promotion only when one was performed, or it would pop another
     // list's journal entry.
-    let promoted_empty = empty_append_virt_enabled()
-        && unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
+    let promoted_empty = unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
 
     // ── tentative commit ──
     let callable_op = r_args[0];
@@ -4104,15 +4103,11 @@ unsafe fn orthodox_list_append_recognize(
     if !pyre_object::pyobject::is_list(inner_self) {
         return None;
     }
-    // Empty-strategy first-append promotion (gated). `w_list_can_append_without_realloc`
+    // Empty-strategy first-append promotion. `w_list_can_append_without_realloc`
     // is false for Empty (no backing block yet), so classify by the value's
     // type using switch_to_correct_strategy's int -> float -> object order
     // (listobject.py) and let the commit path install the typed storage.
     if pyre_object::w_list_uses_empty_storage(inner_self) {
-        if !empty_append_virt_enabled() {
-            // Gate off: preserve the prior behavior (Empty always declined).
-            return None;
-        }
         let int_ok = pyre_object::is_plain_int1(value)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(value));
@@ -4241,8 +4236,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // transition IR mutating the existing wrapper, promote the concrete list,
     // and journal the rewind to Empty.
     use pyre_object::listobject::ListStrategy;
-    let promote_empty = empty_append_virt_enabled()
-        && unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
+    let promote_empty = unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
     if promote_empty {
         let target = unsafe {
             let int_ok = pyre_object::is_plain_int1(value)
@@ -4546,8 +4540,7 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     // Mirror the commit's own promotion predicate exactly: a rollback must
     // undo a promotion only when one was performed, or it would pop another
     // list's journal entry.
-    let promoted_empty =
-        empty_append_virt_enabled() && unsafe { pyre_object::w_list_uses_empty_storage(list) };
+    let promoted_empty = unsafe { pyre_object::w_list_uses_empty_storage(list) };
 
     // ── tentative commit ──
     // The receiver list OpRef + value OpRef are the residual's Ref operands.

@@ -2052,12 +2052,11 @@ thread_local! {
 }
 
 /// Record — once per distinct code object — the frame-shape decline of a frame
-/// that `unsupported_jit_shape` keeps out of the tracer entirely.  Two shapes
-/// reach here: a `CurrentFrameOnly` FOR_ITER frame (a body with a
-/// non-journalable mutator — the #57 gate — or a `finally`-duplicated loop),
-/// and a `StructuralRegion` frame (a `with` block whose `WITH_EXCEPT_START`
-/// exception-link lowering the codewriter still residualizes, which also keeps
-/// its nested callees interpreted).  The tracer never runs for such a frame, so
+/// that `unsupported_jit_shape` keeps out of the tracer entirely: a
+/// `CurrentFrameOnly` FOR_ITER frame (a body with a non-journalable mutator —
+/// the #57 gate — or a `finally`-duplicated loop), a `NestedBreakBridgeResume`
+/// frame, or a frame whose constant pool overruns the single-byte index
+/// encoding.  The tracer never runs for such a frame, so
 /// its decline would otherwise leave no census entry and read as a silent
 /// no-token gap; recording it here lets the `PYRE_FBW_DEBUG_ABORT` corpus
 /// attribute the pre-trace frame-shape decline alongside the traced declines.
@@ -7052,49 +7051,6 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
     let eq = ctx.trace_ctx.record_op(OpCode::PtrEq, &[actual, expected]);
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])
-}
-
-/// `PYRE_NEWLIST_VIRT` gate (read once) — routes the `newlist_from_array`
-/// residual through the virtualizable [`try_walker_specialize_newlist`]
-/// instead of recording the opaque CallR.  Default-on (the orthodox
-/// `opimpl_newlist` shape); set `PYRE_NEWLIST_VIRT=0` to fall back to the
-/// residual.
-fn newlist_virt_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("PYRE_NEWLIST_VIRT").map_or(true, |v| v != "0"));
-    *ENABLED
-}
-
-/// `PYRE_EMPTY_APPEND_VIRT` gate (read once) — admits the empty-list first
-/// append into the orthodox `w_list_append` fold by promoting the receiver
-/// Empty→typed (recording the strategy switch as inline IR) before the
-/// spare-capacity fold runs, instead of aborting with
-/// `UnfoldableListAppendResidualUnsupported`.  Default-on (the orthodox
-/// `EmptyListStrategy.append` → `switch_to_correct_strategy` shape); set
-/// `PYRE_EMPTY_APPEND_VIRT=0` to fall back to the residual abort.
-fn empty_append_virt_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("PYRE_EMPTY_APPEND_VIRT").map_or(true, |v| v != "0")
-    });
-    *ENABLED
-}
-
-/// `PYRE_NESTED_LIST_FOLD_VIRT` gate (read once) — admits a non-empty nested
-/// `BUILD_LIST` element (`[[i] for i in range(n)]`) into the orthodox
-/// `w_list_append` fold. The appended value is a virtualized inner list whose
-/// separately allocated backing block (`NewArray` / `NewArrayClear`) carries no
-/// jitcode-liveness slot; once the trace-time single-executor forks were retired
-/// the append body no longer runs under a speculative-replay sub-walk, so the
-/// backing block is bound at every guard-exit deopt and the shape compiles
-/// bit-exact on dynasm / cranelift / wasm (comprehension-hot acceptance repro
-/// `bench/synth/nested_list_comprehension_hot.py`). Default-on; set
-/// `PYRE_NESTED_LIST_FOLD_VIRT=0` to fall back to the `for_iter_bodies_all_jit_safe`
-/// decline (native only — the wasm guest cannot read the env var).
-pub fn nested_list_fold_virt_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("PYRE_NESTED_LIST_FOLD_VIRT").map_or(true, |v| v != "0")
-    });
-    *ENABLED
 }
 
 /// #62 dead-`box_bool` proof for [`try_walker_specialize_compare_op_int`] /

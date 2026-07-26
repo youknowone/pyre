@@ -4528,8 +4528,8 @@ where
             // shape (`pyjitpl.py:779 opimpl_newlist`) instead of recording the
             // opaque CallR.  Inert on the assembler/baseline path (it reads
             // fn_idx + args, not `pyre_helper`) and on the legacy trait path
-            // (which never emitted this residual); only the FBW intercept, gated
-            // on `PYRE_NEWLIST_VIRT`, keys on it.
+            // (which never emitted this residual); only the FBW intercept keys
+            // on it.
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.newlist_from_array_fn_idx,
                 vec![array_operand],

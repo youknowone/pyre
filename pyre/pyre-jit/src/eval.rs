@@ -5440,36 +5440,10 @@ pub fn init_jit_hooks() {
     );
 }
 
-thread_local! {
-    static JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME: Cell<usize> = const { Cell::new(0) };
-}
-
-struct JitSuppressionGuard;
-
-impl JitSuppressionGuard {
-    fn new() -> Self {
-        JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.set(depth.get() + 1));
-        Self
-    }
-}
-
-impl Drop for JitSuppressionGuard {
-    fn drop(&mut self) {
-        JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
-}
-
-// dont_look_inside: reads JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME TLS.
-#[majit_macros::dont_look_inside]
-fn jit_suppressed_by_unsupported_frame() -> bool {
-    JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.get() != 0)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnsupportedJitShape {
     None,
     CurrentFrameOnly,
-    StructuralRegion,
     NestedBreakBridgeResume,
     /// The frame's constant pool plus register file would exceed the
     /// single-byte (`< 256`) register-or-constant index encoding
@@ -5648,41 +5622,33 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
             // effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl never
             // executes and the optimizer never treats as a side effect).
             //
-            // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is the one
-            // value-producing shape: the fold virtualizes the inner list, whose
-            // separately allocated backing block (`NewArray` / `NewArrayClear`)
-            // carries no jitcode-liveness slot. With the trace-time single-executor
-            // forks retired the append body no longer runs under a speculative-replay
-            // sub-walk, so the backing block is bound at every guard-exit deopt and
-            // the shape compiles bit-exact on all backends; admitted by default
-            // (`PYRE_NESTED_LIST_FOLD_VIRT`). An empty `[]` element is Empty-strategy
-            // (no backing block) and unaffected; tuple / set / dict elements take
-            // non-list allocation paths.
-            let nested_list_fold_ok =
-                pyre_jit_trace::jitcode_dispatch::nested_list_fold_virt_enabled();
-            let (body_has_call, body_has_nonempty_list_build) = {
+            // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
+            // too: the fold virtualizes the inner list, whose separately
+            // allocated backing block (`NewArray` / `NewArrayClear`) carries no
+            // jitcode-liveness slot, and with the trace-time single-executor
+            // forks retired the append body no longer runs under a
+            // speculative-replay sub-walk, so the block is bound at every
+            // guard-exit deopt and the shape compiles bit-exact on all backends
+            // (`bench/synth/nested_list_comprehension_hot.py`).
+            let body_has_call = {
                 let mut scan_state = pyre_interpreter::OpArgState::default();
                 let mut scan_pc = pc + 1;
                 let mut has_call = false;
-                let mut has_nonempty_list_build = false;
                 while scan_pc < exit && scan_pc < instructions.len() {
-                    let (scan_instr, scan_op_arg) = scan_state.get(instructions[scan_pc]);
-                    match scan_instr {
+                    let (scan_instr, _) = scan_state.get(instructions[scan_pc]);
+                    if matches!(
+                        scan_instr,
                         I::Call { .. }
-                        | I::CallKw { .. }
-                        | I::CallFunctionEx
-                        | I::CallIntrinsic1 { .. } => has_call = true,
-                        I::BuildList { count } if count.get(scan_op_arg) > 0 => {
-                            has_nonempty_list_build = true
-                        }
-                        _ => {}
-                    }
-                    if has_call && has_nonempty_list_build {
+                            | I::CallKw { .. }
+                            | I::CallFunctionEx
+                            | I::CallIntrinsic1 { .. }
+                    ) {
+                        has_call = true;
                         break;
                     }
                     scan_pc += 1;
                 }
-                (has_call, has_nonempty_list_build)
+                has_call
             };
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
@@ -5700,9 +5666,7 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
                     )
-                    || (!body_has_call
-                        && (!body_has_nonempty_list_build || nested_list_fold_ok)
-                        && matches!(body_instr, I::ListAppend { .. }));
+                    || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
                     return false;
                 }
@@ -5993,23 +5957,16 @@ fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
 }
 
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
-    // Structural adaptation: RPython/PyPy traces these bytecodes with
-    // fully translated support. Pyre's codewriter still lowers
-    // `WITH_EXCEPT_START` through a pyre-local `abort_permanent`
-    // path. A frame containing this unsupported shape must run in the
-    // interpreter. While that frame is active, nested helper calls are
-    // also kept out of the JIT by `JitSuppressionGuard`; this mirrors
-    // the structural unsupported region instead of keying on a
-    // benchmark filename.
+    // RPython/PyPy has no counterpart to this function at all: `jit_merge_point`
+    // and `can_enter_jit` are unconditional (`pypy/module/pypyjit/interp_jit.py`),
+    // and `JitPolicy.look_inside_graph` (`rpython/jit/codewriter/policy.py:48`)
+    // decides inline-vs-residual for *interpreter helper graphs* at translation
+    // time, never whether a user frame may be traced. Every arm below is a pyre
+    // deviation kept only until the defect it names is closed; each records a
+    // census entry so the interpreted frame is visible rather than a silent
+    // no-token gap.
     //
-    // The gate cannot be dropped yet: removing it lets a `with` frame trace,
-    // which miscompiles (a raw SIGSEGV in the exception-link path plus
-    // guard-failure storms — test_strftime/test_shlex/test_textwrap, #389).
-    // The eventual fix is a real `WITH_EXCEPT_START` lowering; until then the
-    // decline is recorded in the census (see the `StructuralRegion` arm) so it
-    // is not a silent no-token gap.
-    //
-    // `FOR_ITER` is narrower: a FOR_ITER frame may enter the JIT only when
+    // `FOR_ITER`: a FOR_ITER frame may enter the JIT only when
     // every loop body contains exclusively allow-listed opcodes
     // (`for_iter_bodies_all_jit_safe`). The exclusion exists because a FBW walk
     // that aborts mid-loop while an inlined sub-walk has performed a direct
@@ -6103,9 +6060,6 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame(None, None);
     }
-    if jit_suppressed_by_unsupported_frame() {
-        return frame.execute_frame(None, None);
-    }
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     pyre_interpreter::call::register_eval_override(eval_with_jit);
@@ -6137,21 +6091,6 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
             );
             return frame_root.frame().execute_frame(None, None);
         }
-        UnsupportedJitShape::StructuralRegion => {
-            // A `with` frame whose `WITH_EXCEPT_START` exception-link lowering
-            // the codewriter still residualizes: tracing it (or its callees)
-            // miscompiles — a raw SIGSEGV in the exception path and guard-failure
-            // storms (#389 gate-regression evidence).  Keep the frame AND its
-            // nested helper frames interpreted via `JitSuppressionGuard`, and
-            // record the census entry so the decline is visible, not a silent
-            // no-token gap.
-            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
-                code as *const _ as usize,
-                "FrameShape::StructuralRegion",
-            );
-            let _guard = JitSuppressionGuard::new();
-            return frame_root.frame().execute_frame(None, None);
-        }
         UnsupportedJitShape::NestedBreakBridgeResume => {
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
@@ -6164,9 +6103,8 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
             // single-byte register-or-constant index encoding, so no jitcode
             // can be assembled for it (`unsupported_jit_shape`).  Run this frame
             // in the plain interpreter; nested callees stay JIT-eligible (the
-            // overflow is per-frame), so no `JitSuppressionGuard`.  Record the
-            // decline in the census so the interpreted frame is visible, not a
-            // silent no-token gap.
+            // overflow is per-frame).  Record the decline in the census so the
+            // interpreted frame is visible, not a silent no-token gap.
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
                 "FrameShape::ConstEncodingOverflow",
@@ -6409,19 +6347,6 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-    // Mirror `eval_with_jit_inner`'s structural-region suppression so a
-    // recursive portal entry whose code contains `WITH_EXCEPT_START`
-    // keeps nested helper Python frames out of the JIT too. The current
-    // frame is already kept out of trace by `try_function_entry_jit`; the
-    // guard extends that to callees.
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    let _suppression = match unsupported_jit_shape(code) {
-        UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
-        UnsupportedJitShape::None
-        | UnsupportedJitShape::CurrentFrameOnly
-        | UnsupportedJitShape::NestedBreakBridgeResume
-        | UnsupportedJitShape::ConstEncodingOverflow => None,
-    };
     portal_runner_dispatch(frame_root.frame())
 }
 
@@ -6897,9 +6822,7 @@ fn maybe_compile_and_run(
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if jit_suppressed_by_unsupported_frame()
-        || unsupported_jit_shape(code) != UnsupportedJitShape::None
-    {
+    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
         return None;
     }
     if let Some(expected_vsd) =
@@ -7949,9 +7872,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    if jit_suppressed_by_unsupported_frame()
-        || unsupported_jit_shape(code) != UnsupportedJitShape::None
-    {
+    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
         return None;
     }
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
@@ -10860,7 +10781,7 @@ mod tests {
         // only residual is the idempotent `list_write_barrier`, exempt from the
         // FBW body-effect gate. An empty `[]` element is Empty-strategy (no
         // backing block). A non-empty nested `BUILD_LIST` element (`[[i] …]`) is
-        // also admitted (`nested_list_fold_virt_enabled`, default-on): with the
+        // also admitted: with the
         // trace-time single-executor forks retired the inner list's separately
         // allocated backing block is bound at every guard-exit deopt without an
         // extra resume-data root.

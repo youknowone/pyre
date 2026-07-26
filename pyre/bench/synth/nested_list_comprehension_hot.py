@@ -4,12 +4,10 @@
 # jitcode-liveness color. Once the trace-time single-executor forks were retired
 # the append body no longer runs under a speculative-replay sub-walk, so the
 # backing block is bound at every guard-exit deopt without an extra resume-data
-# root; the shape is admitted by default (PYRE_NESTED_LIST_FOLD_VIRT, default-on).
+# root.
 #
 # Acceptance repro for that fold: it must print the same total on all three
-# backends (dynasm / cranelift / wasm). Set PYRE_NESTED_LIST_FOLD_VIRT=0 to fall
-# back to the `for_iter_bodies_all_jit_safe` interpreter decline (native only —
-# the wasm guest cannot read the env var).
+# backends (dynasm / cranelift / wasm).
 
 
 def single_comp(n):

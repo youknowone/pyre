@@ -2779,10 +2779,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // same-length, step-1, Integer↔Integer slice — fold the assignment
         // into per-element getarrayitem/setarrayitem on the int_items blocks so
         // a virtualizable BUILD_LIST source temp is consumed without forcing.
-        // Gated on `PYRE_NEWLIST_VIRT`; declines to the opaque residual
-        // otherwise (SAFE — always byte-correct).
-        if newlist_virt_enabled() && try_walker_specialize_setslice(ctx, op.pc, &r_args)?.is_some()
-        {
+        // Declines to the opaque residual for any shape it cannot reproduce
+        // faithfully (SAFE — always byte-correct).
+        if try_walker_specialize_setslice(ctx, op.pc, &r_args)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
@@ -2850,14 +2849,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `new_with_vtable` + `new_array` + `setarrayitem_gc` + `setfield_gc` —
     // choosing the storage strategy from the concrete element shadows exactly
     // like `w_list_new` / `list_strategy_for`, so the traced object matches what
-    // the blackhole rebuilds on deopt.  Gated on `PYRE_NEWLIST_VIRT`
-    // (default-on).  Falls through to the opaque residual for any shape it
-    // cannot reproduce faithfully (empty list, non-const array length, an
-    // element without a concrete Ref shadow) — SAFE, never declined.
+    // the blackhole rebuilds on deopt.  Falls through to the opaque residual
+    // for any shape it cannot reproduce faithfully (empty list, non-const
+    // array length, an element without a concrete Ref shadow) — SAFE, never
+    // declined.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::NewlistFromArray
-        && newlist_virt_enabled()
         && try_walker_specialize_newlist(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
