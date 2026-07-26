@@ -1506,6 +1506,10 @@ pub(crate) fn resolve_kwargs(
     // varnames[skip_cls..total_params] are the effective param names
     let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
+    // argument.py:469,481-484 — `wrong_posonly` accumulator: every
+    // posonly-as-keyword violation is collected across the whole loop and
+    // reported together, instead of raising on the first one found.
+    let mut posonly_kwds: Vec<String> = Vec::new();
     for ki in 0..nkw {
         let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
         let Some(kw_name_obj) = kw_name else { continue };
@@ -1532,10 +1536,11 @@ pub(crate) fn resolve_kwargs(
                     if has_varkw {
                         break; // fall through to !matched → extra_kwargs
                     }
-                    return Err(crate::PyError::type_error(format!(
-                        "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-                        fname, param_name
-                    )));
+                    // argument.py:481-484 — collect and keep scanning
+                    // remaining keywords instead of raising immediately.
+                    posonly_kwds.push(param_name.to_string());
+                    matched = true;
+                    break;
                 }
                 // argument.py:410 — duplicate keyword argument
                 if !result[pi].is_null() {
@@ -1557,6 +1562,17 @@ pub(crate) fn resolve_kwargs(
                     .push(unsafe { pyre_object::w_str_get_wtf8(kw_name_obj).to_owned() });
             }
         }
+    }
+
+    // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
+    // keyword scan (and before ArgErrUnknownKwds, since `_match_keywords`
+    // raises this before its caller ever checks unmatched kwds).
+    if !posonly_kwds.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+            fname,
+            posonly_kwds.join(", ")
+        )));
     }
 
     // `argument.py:270-271` ArgErrUnknownKwds — unmatched kwargs and no
@@ -1775,6 +1791,9 @@ pub(crate) fn bind_kwargs_to_signature(
     // _match_keywords — match each keyword to a param name by index.
     let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
+    // argument.py:469,481-484 — collected across the whole loop, reported
+    // together instead of raising on the first violation found.
+    let mut posonly_kwds: Vec<String> = Vec::new();
     for (key, value) in kwargs {
         // A lone-surrogate keyword name (not valid UTF-8) never equals a
         // source-level parameter name, so it falls straight to **kwargs or
@@ -1789,10 +1808,10 @@ pub(crate) fn bind_kwargs_to_signature(
                     if has_varkw {
                         break;
                     }
-                    return Err(crate::PyError::type_error(format!(
-                        "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-                        fname, key
-                    )));
+                    // argument.py:481-484 — collect and keep scanning.
+                    posonly_kwds.push(key.to_string());
+                    matched = true;
+                    break;
                 }
                 if !result[pi].is_null() {
                     return Err(crate::PyError::type_error(format!(
@@ -1812,6 +1831,16 @@ pub(crate) fn bind_kwargs_to_signature(
                 unmatched_kw_names.push(key.clone());
             }
         }
+    }
+
+    // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
+    // keyword scan and before ArgErrUnknownKwds.
+    if !posonly_kwds.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+            fname,
+            posonly_kwds.join(", ")
+        )));
     }
 
     if !unmatched_kw_names.is_empty() {
@@ -2080,6 +2109,9 @@ pub fn call_with_kwargs(
             let posonly = code.posonlyarg_count as usize;
             let mut extra_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = Vec::new();
             let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
+            // argument.py:469,481-484 — collected across the whole loop,
+            // reported together instead of raising on the first violation.
+            let mut posonly_kwds: Vec<String> = Vec::new();
             for (key, value) in kwargs {
                 // A lone-surrogate keyword name never equals a source-level
                 // parameter name; it falls to **kwargs or the error below.
@@ -2093,10 +2125,10 @@ pub fn call_with_kwargs(
                             if has_varkw {
                                 break;
                             }
-                            return Err(crate::PyError::type_error(format!(
-                                "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-                                fname, key
-                            )));
+                            // argument.py:481-484 — collect and keep scanning.
+                            posonly_kwds.push(key.to_string());
+                            matched = true;
+                            break;
                         }
                         // argument.py:495 — ArgErrMultipleValues: keyword
                         // duplicates an already-bound positional argument.
@@ -2118,6 +2150,16 @@ pub fn call_with_kwargs(
                         unmatched_kw_names.push(key.clone());
                     }
                 }
+            }
+
+            // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the
+            // full keyword scan and before ArgErrUnknownKwds.
+            if !posonly_kwds.is_empty() {
+                return Err(crate::PyError::type_error(format!(
+                    "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                    fname,
+                    posonly_kwds.join(", ")
+                )));
             }
 
             // `argument.py:270-271` ArgErrUnknownKwds.
