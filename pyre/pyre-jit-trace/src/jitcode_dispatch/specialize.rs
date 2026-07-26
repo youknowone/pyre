@@ -1019,6 +1019,166 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Walker-native `W_LongObject ** W_IntObject` specialization for the
+/// `BINARY_OP` helper residual_call.
+///
+/// `longobject.py:206-231 descr_pow` keeps a `W_IntObject` exponent unwrapped
+/// (`exp_bigint` stays `None`) and calls `rbigint.int_pow`; only a long
+/// exponent reaches `rbigint.pow`. `long_pow` (`descroperation.rs`) reaches
+/// that call past four short-circuits — a negative exponent goes to the float
+/// path, a zero exponent returns 1, and a base of 0 / 1 / -1 returns a
+/// constant. The exponent tests unbox to a machine word, so they record as a
+/// single `GUARD_TRUE(int_gt(exp, 0))`.
+///
+/// The three base tests collapse into one guard: a base whose payload does not
+/// fit a machine word has magnitude at least `2**63`, so it can be none of
+/// 0 / 1 / -1. That is strictly stronger than the interpreter's three
+/// comparisons — it can only bail more often, never take a different path —
+/// and it costs one `jit_bigint_fits_int` call instead of three bigint
+/// comparisons against baked constants. It also makes the usual trailing
+/// result-fits guard redundant: `|base| >= 2**63` with `exp >= 1` cannot
+/// produce a result that fits a machine word, so unlike the floordiv and shift
+/// legs this one emits no guard on the result payload.
+///
+/// `descr_pow` wraps every branch as `W_LongObject` (no `newlong` demotion),
+/// so the result boxes inline exactly like the other long legs.
+/// The three-argument `pow(a, b, m)` is not a `BINARY_OP` and never reaches
+/// here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_binary_op_long_int_pow<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    if !matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+        Some(BinaryOperator::Power | BinaryOperator::InplacePower)
+    ) {
+        return Ok(None);
+    }
+    let long = r_args[0];
+    let int = r_args[1];
+    let (Some(long_obj), Some(int_obj)) = (
+        walker_concrete_ref_object(ctx, long),
+        walker_concrete_ref_object(ctx, int),
+    ) else {
+        return Ok(None);
+    };
+    let exp_value = unsafe {
+        if !pyre_object::is_long(long_obj)
+            || !pyre_object::is_int(int_obj)
+            || !pyre_object::is_exact_builtin_instance(long_obj)
+            || !pyre_object::is_exact_builtin_instance(int_obj)
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(int_obj)
+    };
+    // A non-positive exponent leaves through one of the short-circuits above
+    // the `rbigint.int_pow` call; record those through the generic helper.
+    if exp_value <= 0 {
+        return Ok(None);
+    }
+    let off = pyre_object::longobject::LONG_VALUE_OFFSET;
+    let base_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
+    if pyre_object::longobject::jit_bigint_fits_int(base_payload) != 0 {
+        return Ok(None);
+    }
+
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+    if boxed_result_obj == pyre_object::PY_NULL
+        || unsafe {
+            pyre_object::is_int(boxed_result_obj) || !pyre_object::is_long(boxed_result_obj)
+        }
+    {
+        return Ok(None);
+    }
+    let raw_concrete = unsafe {
+        *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+            as *const i64)
+    };
+
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
+    let exp_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let positive = ctx.trace_ctx.record_op(OpCode::IntGt, &[exp_raw, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(positive, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[positive])?;
+
+    let base_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[long],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        base_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(base_payload as usize)),
+    );
+    let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+    let base_fits = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        fits_fn,
+        &[base_pl],
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::cannot_raise_effect_info(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(base_fits, majit_ir::Value::Int(0));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[base_fits])?;
+
+    let helper = pyre_interpreter::objspace::descroperation::jit_bigint_int_pow_nomod as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+        OpCode::CallR,
+        helper,
+        &[base_pl, exp_raw],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(base_payload as usize)),
+            majit_ir::Value::Int(exp_value),
+        ],
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
+
+    let result = crate::helpers::emit_box_long_inline(
+        ctx.trace_ctx,
+        raw,
+        crate::descr::w_long_size_descr(),
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
 /// Walker-native `W_LongObject << W_IntObject` / `>>` specialization for the
 /// `BINARY_OP` helper residual_call.
 ///

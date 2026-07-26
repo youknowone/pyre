@@ -4151,6 +4151,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )?;
                         }
                         if specialized.is_none() {
+                            // `descr_pow` keeps a `W_IntObject` exponent
+                            // unwrapped and calls `rbigint.int_pow`; only a
+                            // long exponent reaches `rbigint.pow`.
+                            specialized = try_walker_specialize_binary_op_long_int_pow(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
                             // W_LongObject operands take the long fast path
                             // before float so bigint arithmetic retains its
                             // payload representation.
