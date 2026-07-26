@@ -450,6 +450,12 @@ pub struct InlineFrame {
     /// Paused caller snapshot for the multi-frame path. `None` preserves the
     /// straight-line single-frame collapse while retaining the callee level.
     pub parent: Option<InlineParentFrame>,
+    /// [`FBW_EXECUTED_EFFECT_COUNT`] when this level was entered, i.e. at the
+    /// CALL its `parent` pauses on.  An abort-point flush that resumes the
+    /// caller AT that CALL re-executes the call, discarding everything this
+    /// level and its descendants did, so it is only sound while the odometer
+    /// has not moved since.
+    pub entry_executed_effects: usize,
 }
 
 /// Per-trace-attempt walk session, owned by the walk driver and threaded
@@ -4670,10 +4676,11 @@ impl<'a> InlineFrameGuard<'a> {
         w_code: usize,
         parent: Option<InlineParentFrame>,
     ) -> Self {
-        session
-            .borrow_mut()
-            .framestack
-            .push(InlineFrame { w_code, parent });
+        session.borrow_mut().framestack.push(InlineFrame {
+            w_code,
+            parent,
+            entry_executed_effects: fbw_executed_effect_count(),
+        });
         ACTIVE_WALK_SESSION.with(|c| c.set(session as *const _));
         InlineFrameGuard(session)
     }

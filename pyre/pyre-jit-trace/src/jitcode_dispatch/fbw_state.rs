@@ -1108,9 +1108,23 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         if let Some(callee_code_key) = foriter_deferred_inline {
             fbw_foriter_deny_deferred_call(callee_code_key);
         }
+        // The flush this latch feeds resumes the OUTERMOST caller at the CALL
+        // that entered the inline region, re-executing that call from scratch,
+        // while the walk's store journal is committed.  So it is sound only
+        // while the inline region has executed nothing irreversible: an
+        // executed-effect delta means the call would apply its effects a
+        // second time on top of the committed ones.  Same zero-delta gate the
+        // entry carrier applies at its own CALL (`try_walker_inline_user_call`)
+        // and the contract `FBW_EXECUTED_EFFECT_COUNT` documents; declining
+        // here leaves the legacy path, whose journal rollback makes the replay
+        // exactly-once.
         let (outer_resume, stack_overrides) = {
             let session = ctx.session.borrow();
-            match session.framestack.first().and_then(|f| f.parent.as_ref()) {
+            let outermost = session
+                .framestack
+                .first()
+                .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
+            match outermost.and_then(|f| f.parent.as_ref()) {
                 Some(frame) => (
                     frame
                         .call_jitcode_pc
