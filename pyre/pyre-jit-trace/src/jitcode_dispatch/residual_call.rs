@@ -4142,6 +4142,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )?;
                         }
                         if specialized.is_none() {
+                            // `_int_floordiv` / `_int_mod` are the same family:
+                            // an Int divisor keeps its machine word instead of
+                            // being widened to a bigint, and `_int_mod`'s
+                            // result is a machine int rather than a long.
+                            specialized = try_walker_specialize_binary_op_long_int_div(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?;
+                        }
+                        if specialized.is_none() {
                             // W_LongObject operands take the long fast path
                             // before float so bigint arithmetic retains its
                             // payload representation.

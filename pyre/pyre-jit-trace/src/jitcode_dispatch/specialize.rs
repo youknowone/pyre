@@ -808,6 +808,217 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Walker-native `W_LongObject // W_IntObject` / `%` specialization for the
+/// `BINARY_OP` helper residual_call.
+///
+/// `pypy/objspace/std/longobject.py:424,441 _make_descr_binop` selects
+/// `_int_floordiv` / `_int_mod` when the right operand is a `W_IntObject`.
+/// The two legs differ in their *result* representation, and that difference
+/// is the whole point of specialising them apart:
+///   * `_int_floordiv` (`longobject.py:417-423`) → `rbigint.int_floordiv` →
+///     a bigint quotient, boxed as a `W_LongObject` — the same shape
+///     [`try_walker_specialize_binary_op_long_int_shift`] emits.
+///   * `_int_mod` (`longobject.py:434-440`) → `rbigint.int_mod_int_result` →
+///     `space.newint`: the remainder of a long by a machine int always fits a
+///     machine int, so this leg allocates **no** result bigint and boxes a
+///     plain `W_IntObject`.
+///
+/// `long_floordiv` / `long_mod` (`descroperation.rs`) raise
+/// `ZeroDivisionError` before reaching the `_nonzero` rbigint seam, so the
+/// divisor test is traced as a `GUARD_TRUE(int_ne(divisor, 0))` — the guard a
+/// meta-tracer records for that interpreter branch. A replay with a zero
+/// divisor therefore bails to the interpreter, which raises the authentic
+/// error rather than re-deriving its wording here.
+///
+/// `int // long` and `int % long` are `descr_rfloordiv` / `descr_rmod`, which
+/// coerce the left operand to a long and take the bigint/bigint path; they are
+/// deliberately left to [`try_walker_specialize_binary_op_long`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    let is_floordiv = match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
+        Some(BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide) => true,
+        Some(BinaryOperator::Remainder | BinaryOperator::InplaceRemainder) => false,
+        _ => return Ok(None),
+    };
+    let long = r_args[0];
+    let int = r_args[1];
+    let (Some(long_obj), Some(int_obj)) = (
+        walker_concrete_ref_object(ctx, long),
+        walker_concrete_ref_object(ctx, int),
+    ) else {
+        return Ok(None);
+    };
+    let int_value = unsafe {
+        if !pyre_object::is_long(long_obj)
+            || !pyre_object::is_int(int_obj)
+            || !pyre_object::is_exact_builtin_instance(long_obj)
+            || !pyre_object::is_exact_builtin_instance(int_obj)
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(int_obj)
+    };
+    // The zero-divisor arm raises before calling rbigint. Record it through the
+    // generic helper so no partial specialization is emitted.
+    if int_value == 0 {
+        return Ok(None);
+    }
+
+    // Execute the authentic Python operation first: it supplies both the
+    // observable result and the concrete payload for the pure call, without
+    // running an allocating rbigint helper twice at record time.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+    if boxed_result_obj == pyre_object::PY_NULL {
+        return Ok(None);
+    }
+    // Everything that can decline must do so before the first guard is
+    // recorded — a later bail-out would leave the operand's class pinned in
+    // the heap cache with no matching guard in the trace.
+    let quotient_concrete = if is_floordiv {
+        if unsafe {
+            pyre_object::is_int(boxed_result_obj) || !pyre_object::is_long(boxed_result_obj)
+        } {
+            return Ok(None);
+        }
+        let raw_concrete = unsafe {
+            *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+                as *const i64)
+        };
+        if pyre_object::longobject::jit_bigint_fits_int(raw_concrete) != 0 {
+            return Ok(None);
+        }
+        Some(raw_concrete)
+    } else {
+        if unsafe { !pyre_object::is_int(boxed_result_obj) } {
+            return Ok(None);
+        }
+        None
+    };
+
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
+    let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonzero = ctx.trace_ctx.record_op(OpCode::IntNe, &[int_raw, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonzero, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonzero])?;
+
+    let off = pyre_object::longobject::LONG_VALUE_OFFSET;
+    let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
+    let long_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[long],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        long_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+    );
+
+    let result = match quotient_concrete {
+        Some(raw_concrete) => {
+            let helper =
+                pyre_interpreter::objspace::descroperation::jit_bigint_int_div_floor as *const ();
+            let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+                OpCode::CallR,
+                helper,
+                &[long_pl, int_raw],
+                &[majit_ir::Type::Ref, majit_ir::Type::Int],
+                majit_ir::Type::Ref,
+                majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(helper as usize as i64),
+                    majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+                    majit_ir::Value::Int(int_value),
+                ],
+                majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                raw,
+                majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+            );
+            if raw.inline_const_to_value().is_none() {
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+            }
+            // `w_long_new` keeps the quotient a `W_LongObject`, so this guard is
+            // not a demotion test: it pins the trace to the payload shape the
+            // inline box was recorded for, exactly as the shift leg does.
+            let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
+            let fits = ctx.trace_ctx.call_typed_with_effect(
+                OpCode::CallI,
+                fits_fn,
+                &[raw],
+                &[majit_ir::Type::Ref],
+                majit_ir::Type::Int,
+                majit_metainterp::cannot_raise_effect_info(),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(fits, majit_ir::Value::Int(0));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
+
+            let boxed = crate::helpers::emit_box_long_inline(
+                ctx.trace_ctx,
+                raw,
+                crate::descr::w_long_size_descr(),
+                crate::descr::long_value_descr(),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+            );
+            boxed
+        }
+        None => {
+            let mod_concrete = unsafe { pyre_object::w_int_get_value(boxed_result_obj) };
+            let helper = pyre_interpreter::objspace::descroperation::jit_bigint_int_mod_int_result
+                as *const ();
+            let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+                OpCode::CallI,
+                helper,
+                &[long_pl, int_raw],
+                &[majit_ir::Type::Ref, majit_ir::Type::Int],
+                majit_ir::Type::Int,
+                majit_metainterp::ELIDABLE_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(helper as usize as i64),
+                    majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+                    majit_ir::Value::Int(int_value),
+                ],
+                majit_ir::Value::Int(mod_concrete),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(mod_concrete));
+            if raw.inline_const_to_value().is_none() {
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+            }
+            let boxed = walker_box_int(ctx, op_pc, raw, mod_concrete)?;
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(mod_concrete, boxed_result_i64));
+            boxed
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
 /// Walker-native `W_LongObject << W_IntObject` / `>>` specialization for the
 /// `BINARY_OP` helper residual_call.
 ///
