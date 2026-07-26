@@ -8066,30 +8066,6 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// Devirtualize a callsite of the blanket
-    /// `impl<T, U: From<T>> Into<U> for T` (`core::convert::<Impl>::into`).
-    ///
-    /// The callsite's `generics.trait_refs` carries the resolved
-    /// `U: From<T>` obligation as a trait ref whose `trait_decl_ref`
-    /// names `core::convert::From` and whose `kind` is
-    /// `TraitImpl { id }` — the def_id of the selected `impl From<T>
-    /// for U`.  Two outcomes:
-    ///
-    /// - The obligation's decl-ref type args are equal (`T == U`):
-    ///   the reflexive `impl<T> From<T> for T` was selected and the
-    ///   whole conversion is a `T -> T` identity —
-    ///   [`IntoDevirt::Identity`].
-    /// - Otherwise the impl's `methods` table binds the single `From`
-    ///   method to the concrete `from` FunDecl, whose path is the
-    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
-    ///   is an associated function (no `self` receiver), so the
-    ///   caller must keep the `FunctionPath` shape (a
-    ///   `CallTarget::Method` hint would bind the *argument* as a
-    ///   receiver).
-    ///
-    /// Returns `None` (caller keeps the blanket-into path) when the
-    /// obligation is unresolved (`kind` is a clause/builtin rather
-    /// than `TraitImpl`) or any table lookup misses.
     /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
     /// change only const/mut, never the pointee type.  The JIT does not
     /// model the mut/const distinction (`Ref` / `RawPtr` lower to a
@@ -8539,6 +8515,30 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Devirtualize a callsite of the blanket
+    /// `impl<T, U: From<T>> Into<U> for T` (`core::convert::<Impl>::into`).
+    ///
+    /// The callsite's `generics.trait_refs` carries the resolved
+    /// `U: From<T>` obligation as a trait ref whose `trait_decl_ref`
+    /// names `core::convert::From` and whose `kind` is
+    /// `TraitImpl { id }` — the def_id of the selected `impl From<T>
+    /// for U`.  Two outcomes:
+    ///
+    /// - The obligation's decl-ref type args are equal (`T == U`):
+    ///   the reflexive `impl<T> From<T> for T` was selected and the
+    ///   whole conversion is a `T -> T` identity —
+    ///   [`IntoDevirt::Identity`].
+    /// - Otherwise the impl's `methods` table binds the single `From`
+    ///   method to the concrete `from` FunDecl, whose path is the
+    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
+    ///   is an associated function (no `self` receiver), so the
+    ///   caller must keep the `FunctionPath` shape (a
+    ///   `CallTarget::Method` hint would bind the *argument* as a
+    ///   receiver).
+    ///
+    /// Returns `None` (caller keeps the blanket-into path) when the
+    /// obligation is unresolved (`kind` is a clause/builtin rather
+    /// than `TraitImpl`) or any table lookup misses.
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
