@@ -5533,6 +5533,12 @@ impl<S: JitState> JitDriver<S> {
             let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
             meta.has_compiled_targets(gk)
         }));
+        ctx.compiled_key_for_greens_fn = Some(Box::new(
+            move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
+                let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
+                meta.compiled_key_for_greens(greens)
+            },
+        ));
         // pyjitpl.py:1551 first-iteration auto loop-header
         // `if self.metainterp.portal_call_depth: return` parity —
         // sample the live counter through the same self.meta

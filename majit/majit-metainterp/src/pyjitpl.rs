@@ -3944,6 +3944,12 @@ impl<M: Clone> MetaInterp<M> {
                         let meta = unsafe { &*(self_ptr as *const Self) };
                         meta.has_compiled_targets(gk)
                     }));
+                    ctx.compiled_key_for_greens_fn = Some(Box::new(
+                        move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
+                            let meta = unsafe { &*(self_ptr as *const Self) };
+                            meta.compiled_key_for_greens(greens)
+                        },
+                    ));
                     ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                         let meta = unsafe { &*(self_ptr as *const Self) };
                         meta.portal_call_depth
@@ -4224,6 +4230,12 @@ impl<M: Clone> MetaInterp<M> {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.has_compiled_targets(gk)
             }));
+            ctx.compiled_key_for_greens_fn = Some(Box::new(
+                move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
+                    let meta = unsafe { &*(self_ptr as *const Self) };
+                    meta.compiled_key_for_greens(greens)
+                },
+            ));
             ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.portal_call_depth

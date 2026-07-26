@@ -306,6 +306,20 @@ pub struct TraceCtx {
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
     /// matches RPython's get_procedure_token(greenboxes) + has_compiled_targets.
     pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
+    /// pyjitpl.py:3005 `ptoken = self.get_procedure_token(greenboxes)` for the
+    /// greens of the merge point just reached, in the same `(ints, refs,
+    /// floats)` slot grouping as [`Self::close_greens`]. `Some(key)` iff a
+    /// compiled loop with jumpable targets already lives at those greens
+    /// (`MetaInterp::compiled_key_for_greens`, which folds in
+    /// `has_compiled_targets`).
+    ///
+    /// [`Self::has_compiled_targets_fn`] cannot answer this: it is keyed on the
+    /// u64 green key, and the dispatch loop cannot derive a foreign merge
+    /// point's key. `green_key_from_code_ptr(green_key_raw.0, pc)` is not it —
+    /// `JitState::code_ptr()` defaults to 0, and the driver's key is
+    /// `GreenKey::hash_u64` over the declared green tuple.
+    pub compiled_key_for_greens_fn:
+        Option<Box<dyn Fn(&(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64>>>,
     /// pyjitpl.py:2978 `if not self.partial_trace:` parity at
     /// `reached_loop_header` — explicit "this trace started from a
     /// guard failure" flag.  RPython distinguishes via
@@ -1228,6 +1242,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
             bridge_target_header_pc: None,
@@ -1306,6 +1321,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
             bridge_target_header_pc: None,
