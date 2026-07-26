@@ -272,7 +272,10 @@ impl LowererConfig {
     /// `[int_identity_base, int_end)` / `[ref_identity_base, ref_end)`.
     ///
     /// Mirrors the dispatch JitCode's identity reservation: int identity =
-    /// the scalar slots plus two words (ptr+len) per virtualizable array;
+    /// the scalar slots plus the ONE virtualizable identity word (present
+    /// whenever the state declares any `[.. ; virt]` array — the
+    /// virtualizable is one red, `warmspot.py:538`, and array lengths are
+    /// read off the live object, `virtualizable.py:150-153`);
     /// ref identity = the ref scalars. A split sub-JitCode must reserve the
     /// SAME prefix so its register file spans the identity slots that the
     /// arm body's `load/store_state_field` ops address and that the resume
@@ -281,7 +284,7 @@ impl LowererConfig {
     pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
         let int_end = self.int_identity_base()
             + self.state_scalars.len() as u16
-            + 2 * self.state_virt_arrays.len() as u16;
+            + u16::from(!self.state_virt_arrays.is_empty());
         let ref_end = if self.state_ref_scalars.is_empty() {
             0
         } else {

@@ -3227,12 +3227,17 @@ impl<M: Clone> MetaInterp<M> {
         // bridge decoding that section resolves the identity to the wrong
         // deadframe slot.  `pyjitpl.py:3295 virtualizable_box =
         // original_boxes[index]` is a lookup of the red that HOLDS the
-        // virtualizable; recover the same box by matching the live pointer
-        // against `live_values`, which is `original_boxes` here.
+        // virtualizable; recover the same box by matching the live pointer.
+        //
+        // The scan runs over `live_values`, NOT `original_boxes`: the latter is
+        // `[Void; num_green_args] ++ live_values` (the greens are positional
+        // placeholders so the `num_green_args + index_of_virtualizable` read
+        // above lands), while trace inputargs are reds-only.  A position taken
+        // in the `original_boxes` space would be `num_green_args` too high.
         let identity_index = if info.identity_ref_bank_index.is_some() && !self.vable_ptr.is_null()
         {
             let vable_bits = self.vable_ptr as usize;
-            original_boxes
+            live_values
                 .iter()
                 .position(|value| matches!(value, Value::Ref(r) if r.as_usize() == vable_bits))
         } else {

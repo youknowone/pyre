@@ -3807,7 +3807,7 @@ impl<S: JitState> JitDriver<S> {
                                     eprintln!("[callee-rca][crn-state-before]\n{dump}");
                                 }
                             }
-                            if layout.num_virt_arrays == 0 {
+                            if layout.num_vable_identity_slots == 0 {
                                 let float_base = layout.float_scalar_base.min(bh.registers_f.len());
                                 state.restore_banked3(
                                     &compiled_meta,

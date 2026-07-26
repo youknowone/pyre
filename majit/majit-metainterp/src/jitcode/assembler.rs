@@ -5570,7 +5570,11 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 /// state-field JIT enforces `Type::Int` on every slot at macro
 /// expansion (`codegen_state.rs:30-43`), so `live_r` and `live_f` are
 /// empty.  `total_slots` matches `JitCodeSym::total_slots`:
-/// `num_scalars + sum(array_lens) + 2 * num_virt_arrays`.
+/// `num_scalars + sum(array_lens) + num_vable_identity_slots`, where the last
+/// term is 1 when the state has a virtualizable and 0 otherwise —
+/// `pyjitpl.py:2984-2989` carries the virtualizable once regardless of how
+/// many `[.. ; virt]` arrays it holds, and `virtualizable.py:150-153` reads
+/// every array length off the live object rather than boxing it.
 ///
 /// The returned `Vec<u8>`s are caller-owned and can be passed directly
 /// into `JitCodeBuilder::live` / `Assembler::_encode_liveness`.
@@ -5585,14 +5589,15 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 pub fn live_slots_for_state_field_jit(
     num_scalars: usize,
     array_lens: &[usize],
-    num_virt_arrays: usize,
+    num_vable_identity_slots: usize,
     num_ref_scalars: usize,
     ref_scalar_base: usize,
     num_float_scalars: usize,
     float_scalar_base: usize,
     int_scalar_base: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let total_slots: usize = num_scalars + array_lens.iter().sum::<usize>() + 2 * num_virt_arrays;
+    let total_slots: usize =
+        num_scalars + array_lens.iter().sum::<usize>() + num_vable_identity_slots;
     // Int identity slots start past the dispatch JitCode's int-bank
     // argument registers (`pc` at i0), mirroring the ref-bank base
     // below: the guard-time canonical materialization writes the
@@ -6241,13 +6246,15 @@ mod tests {
 
     #[test]
     fn state_field_canonical_slots_mixed_layout() {
-        // Mirrors the `tlc` example shape: 1 scalar (`stackpos`) + 1
-        // virt array (`stack`, ptr+len) plus a synthetic 3-element
-        // flattened array.  total_slots = 1 + 3 + 2 = 6, so
-        // live_i = [0, 1, 2, 3, 4, 5] and ref/float banks are empty.
+        // Mirrors the `tlc` example shape: 1 scalar (`stackpos`) + a
+        // virtualizable (`stack`) plus a synthetic 3-element flattened
+        // array.  The virtualizable contributes ONE slot — its identity —
+        // however many `[.. ; virt]` arrays it declares, so
+        // total_slots = 1 + 3 + 1 = 5 and live_i = [0, 1, 2, 3, 4] with
+        // the ref/float banks empty.
         let (live_i, live_r, live_f) =
             super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0, 0, 0);
-        assert_eq!(live_i, vec![0u8, 1, 2, 3, 4, 5]);
+        assert_eq!(live_i, vec![0u8, 1, 2, 3, 4]);
         assert!(live_r.is_empty());
         assert!(live_f.is_empty());
     }

@@ -4694,7 +4694,7 @@ fn handler_abort_result_marker_i(
 /// Mirrors `live_slots_for_state_field_jit` (`jitcode/assembler.rs:4476`): the
 /// blackhole int register file holds, in flat order,
 /// `[scalars 0..num_scalars | flattened fixed-array elements |
-/// virt-array (ptr,len) pairs]`, seeded by the resume reader via `setarg_i`
+/// the virtualizable identity]`, seeded by the resume reader via `setarg_i`
 /// (`resume.rs _prepare_next_section` → `blackhole.py:339 setarg_i`).
 ///
 /// majit's `state_field` opcodes carry a section-relative logical index
@@ -4702,15 +4702,21 @@ fn handler_abort_result_marker_i(
 /// slot. RPython's codewriter assigns register indices directly, so this
 /// mapping is the majit-port adaptation recovering the flat slot a handler
 /// must read/write. `array_lens` are per-instance (a fixed `[int]` array's
-/// length comes from the live state, e.g. tlr's `regs`); virt arrays
-/// contribute exactly two slots each (data pointer + length) regardless of
-/// element count — those slots are threaded as loop inputargs / live values
-/// alongside the element boxes the virtualizable machinery carries.
+/// length comes from the live state, e.g. tlr's `regs`); the virtualizable,
+/// when the state has one, contributes exactly ONE slot — its identity —
+/// however many `[.. ; virt]` arrays it declares. `virtualizable.py:150-153`
+/// reads each array's length off the live object, so a length is never a box,
+/// and `virtualizable.py:139-144` names the virtualizable once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateFieldLayout {
     pub num_scalars: usize,
     pub array_lens: Vec<usize>,
-    pub num_virt_arrays: usize,
+    /// `1` when the state declares any `[.. ; virt]` array (or an explicit
+    /// virtualizable), else `0`. `pyjitpl.py:2984-2989` carries the
+    /// virtualizable exactly once — it is one red, `warmspot.py:538
+    /// jd.index_of_virtualizable = jitdriver.reds.index(vname)` — so this is
+    /// a presence flag, not a per-array count.
+    pub num_vable_identity_slots: usize,
     /// Ref-typed scalar state fields. They live in the SEPARATE ref
     /// register bank at `registers_r[ref_scalar_base ..
     /// ref_scalar_base + num_ref_scalars]`, seeded by the resume reader
@@ -4743,13 +4749,13 @@ impl StateFieldLayout {
     pub fn new(
         num_scalars: usize,
         array_lens: Vec<usize>,
-        num_virt_arrays: usize,
+        num_vable_identity_slots: usize,
         int_scalar_base: usize,
     ) -> Self {
         Self {
             num_scalars,
             array_lens,
-            num_virt_arrays,
+            num_vable_identity_slots,
             num_ref_scalars: 0,
             ref_scalar_base: 0,
             num_float_scalars: 0,
@@ -4763,7 +4769,7 @@ impl StateFieldLayout {
     pub fn with_ref_scalars(
         num_scalars: usize,
         array_lens: Vec<usize>,
-        num_virt_arrays: usize,
+        num_vable_identity_slots: usize,
         num_ref_scalars: usize,
         ref_scalar_base: usize,
         int_scalar_base: usize,
@@ -4771,7 +4777,7 @@ impl StateFieldLayout {
         Self {
             num_scalars,
             array_lens,
-            num_virt_arrays,
+            num_vable_identity_slots,
             num_ref_scalars,
             ref_scalar_base,
             num_float_scalars: 0,
@@ -4794,9 +4800,9 @@ impl StateFieldLayout {
     }
 
     /// Total int register slots — equals the `live_slots_for_state_field_jit`
-    /// slot count `num_scalars + Σ array_lens + 2·num_virt_arrays`.
+    /// slot count `num_scalars + Σ array_lens + num_vable_identity_slots`.
     pub fn total_slots(&self) -> usize {
-        self.num_scalars + self.array_lens.iter().sum::<usize>() + 2 * self.num_virt_arrays
+        self.num_scalars + self.array_lens.iter().sum::<usize>() + self.num_vable_identity_slots
     }
 
     /// Total live values `extract_live_values` produces: the int register
