@@ -1017,17 +1017,33 @@ mod local_class {
                     call_args.extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
                     self.call_init(w_init, &call_args)
                 });
-            let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
-            drop(roots);
             if let Err(err) = result {
                 // failed, forget w_dict and propagate the exception
                 let key = w_int_new(ident);
                 let _guard = self.state_lock.lock();
                 unsafe { pyre_object::w_dict_delitem(self.dicts, key) };
+                // The initializer reached `current_dict` before it raised —
+                // assigning an instance attribute is what publishes the dict —
+                // so this thread's cache now names the entry just removed.
+                // Leaving it makes the next access return a half-initialized
+                // dict instead of rerunning `__init__`; `thread_is_stopping`
+                // drops the same pair alongside the same removal.
+                unsafe {
+                    if (*this).last_ident == ident {
+                        (*this).last_ident = 0;
+                        (*this).last_dict = PY_NULL;
+                    }
+                }
                 return Err(err);
             }
-            // ready
+            // ready.  `register_local_in_current_ec` allocates a weakref, so
+            // the dict stays rooted across it and is reloaded afterwards: it is
+            // still reachable through `self.dicts`, and a moving collection
+            // would relocate it there while this frame's copy kept the pre-move
+            // address for `current_dict` to cache and return.
             register_local_in_current_ec(obj);
+            let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            drop(roots);
             Ok(w_dict)
         }
 
@@ -1137,12 +1153,9 @@ mod local_class {
             // os_local.py:23-38 `Local.__init__` installs the first dictionary
             // before app-level __init__ is entered, preventing recursive
             // initialization.
-            let initargs = w_tuple_new(positional.get(1..).unwrap_or(&[]).to_vec());
             let roots = pyre_object::gc_roots::push_roots();
             let cls_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(cls);
-            let initargs_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(initargs);
             // A plain `_local()` has no keyword mapping, and a null takes no
             // shadow-stack slot.
             let initkwargs_slot = kwargs.map(|w_kwargs| {
@@ -1150,6 +1163,14 @@ mod local_class {
                 pyre_object::gc_roots::pin_root(w_kwargs);
                 slot
             });
+            // Pinned BEFORE the tuple is built: `w_tuple_new` allocates, and
+            // while it roots the elements it is given, `cls` and the keyword
+            // mapping are raw locals of this frame that a moving collection
+            // cannot update.  Pinning them afterwards would record evacuated
+            // addresses, so both are read back from their slots below.
+            let initargs = w_tuple_new(positional.get(1..).unwrap_or(&[]).to_vec());
+            let initargs_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(initargs);
             let dicts_slot = pyre_object::gc_roots::shadow_stack_len();
             let dicts = pyre_object::w_dict_new();
             pyre_object::gc_roots::pin_root(dicts);
