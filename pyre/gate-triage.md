@@ -255,11 +255,33 @@ path.  With the comparison fixed, that fixture under `PYRE_FBW_MULTIFRAME=1`
 reports **5 `BUILT multi-frame depth=2` and 5 `adopted multi-frame terminal`,
 zero declines** (the other 5 escapes in the run have `inline_subwalk=false` and
 take the single-frame arm, as before), and prints the same result as CPython and
-PyPy.  A depth-3 variant (two nested inlined levels) still reports
-`frame 1: parent.blackhole None (capture missing)` — a separate, deeper gap in
-the nested-parent capture, since the two bridge parent-frame constructors latch
-`blackhole: None` while only `capture_inline_parent_blackhole` fills it.  Note
-the multi-frame latch is
+PyPy.
+
+**What the build still declines, and why the decline is right.**  Two shapes
+reach the latch and are then refused by `capture_inline_parent_blackhole`
+(`resume_snapshot.rs`): a caller with an exception handler around the inlined
+call, and two nested inlined levels (depth 3).  Instrumented 2026-07-26, both
+report the same cause — a ref color that is **live at the caller's post-call
+coordinate holds `ConcreteValue::Null`**:
+
+```
+try/except caller: ref color=11 not concrete: Null  result_color=Some(5) nlocals=3 depth=3 live_ref=[0,1,2,5,11]
+depth 3:           ref color=2  not concrete: Null  result_color=Some(0) nlocals=1 depth=1 live_ref=[0,1,2]
+```
+
+Neither is the not-yet-produced result slot, and neither involves the bridge
+parent-frame constructors — every `[s2-gate]` event in both runs prints
+`not_bridge=true`, and the latch requires `!is_bridge_trace`, so those
+constructors are unreachable from here.  `ConcreteValue::Null` is the
+**untracked** sentinel, deliberately distinct from `Ref(PY_NULL)` = "uninitialised
+local" (`state.rs`, `trace_opcode.rs`), so accepting it would fabricate a parent
+frame rather than reproduce one.  Declining is correct; closing these two shapes
+is the outer-locals materialization named above — completing the caller's
+concrete banks at an inline escape — not a change to the capture itself.  Both
+are pinned by `synth/getframe_while_subwalk_decline_shapes` so a decline cannot
+silently become a wrong answer.
+
+Note the multi-frame latch is
 nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
 `_BLACKHOLE_RESUME` to stay ON.  The pre-existing `[s2-gate]` eprintln (under
 `PYRE_FBW_DEBUG_ABORT`) already reports `inline_subwalk` at that site.
