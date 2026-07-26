@@ -1273,51 +1273,119 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    let collect_float_scalar_parts_for_jump: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(sym.#fname); }
-        })
-        .collect();
-    // Override `JitState::collect_jump_args_with_boxes` when the state has any
-    // `[int; virt]` array (tl/tlc/tla/braininterp + multi-array interps). With
-    // 0 virt arrays (tlr/tinyframe) the defaulted trait method (scalars + fixed
-    // arrays) is already correct, so the `else` is the 0-array case.
+    // pyjitpl.py:2981-2989 `live_arg_boxes` — THE loop-carried box list, built
+    // in exactly one place because it has two consumers that must agree:
+    // `JitState::collect_jump_args_with_boxes` (the closing JUMP) and
+    // `JitCodeSym::loop_carried_boxes` (the merge-point registration, i.e. a
+    // later cross-loop cut's LABEL). RPython gets that agreement for free —
+    // `reached_loop_header` builds one list and passes it to both — and
+    // asserts it at pyjitpl.py:3020. Two independent constructions here is
+    // what made every purely-virt-array interpreter's nested loop decline on
+    // `jump.numargs() != label.numargs()` (compile.py:334).
     //
-    // The JUMP must be slot-for-slot identical to the trace-entry Label, whose
-    // virt-array inputargs are all the `<arr>_ptr`/`<arr>_len` headers (minted
-    // by `create_sym` advancing `__offset`, declaration order) followed by the
-    // element boxes (minted by `initialize_virtualizable` at
-    // `num_reds..num_reds+total`). `__boxes` =
-    // `TraceCtx::collect_virtualizable_boxes()` =
+    // The list must be slot-for-slot identical to the trace-entry Label, whose
+    // inputargs are minted by `create_sym` advancing `__offset` in declaration
+    // order — int scalars (Int), each fixed `[int]` array's cells (Int), then
+    // per virt array the `<arr>_ptr` (Ref, `input_arg_ref`) + `<arr>_len`
+    // (Int) header, then ref scalars (Ref), then float scalars (Float) — with
+    // the element boxes minted by `initialize_virtualizable` at
+    // `num_reds..num_reds+total`. `__boxes` =
+    // `TraceCtx::collect_virtualizable_typed_boxes()` =
     // `[arr0_elem0.., arr1_elem0.., .., identity]` (`num_static_extra_boxes==0`
     // for state-field; `initialize_virtualizable` concatenates the arrays in
     // declaration order; identity LAST). So push every header first (loop-
     // invariant identity bases + lengths), then the whole element shadow once,
-    // dropping the trailing identity (pyjitpl.py:2982-2989 `live_arg_boxes +=
+    // dropping the trailing identity (pyjitpl.py:2988-2989 `live_arg_boxes +=
     // virtualizable_boxes; live_arg_boxes.pop()`). The element block is already
     // in per-array order, so a single contiguous splice reproduces the Label
     // for any number of arrays; pushing it once-per-array (or putting elements
     // before a later array's header) would shift every later slot and break the
     // unroll's Label↔Jump virtual-state match.
+    //
+    // With 0 virt arrays (tlr/tinyframe) there is no element shadow to splice,
+    // so the body degenerates to `collect_jump_args` and `__boxes` is unused —
+    // which is why the `collect_jump_args_with_boxes` override below stays
+    // gated on `num_virt_arrays >= 1` (the trait default already delegates to
+    // `collect_jump_args` there).
+    let typed_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push((sym.#fname, majit_ir::Type::Int)); }
+        })
+        .collect();
+    let typed_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for &__cell in sym.#fname.iter() {
+                    args.push((__cell, majit_ir::Type::Int));
+                }
+            }
+        })
+        .collect();
+    let typed_virt_array_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let ptr_name = quote::format_ident!("{}_ptr", f.name);
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! {
+                args.push((sym.#ptr_name, majit_ir::Type::Ref));
+                args.push((sym.#len_name, majit_ir::Type::Int));
+            }
+        })
+        .collect();
+    let typed_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push((sym.#fname, majit_ir::Type::Ref)); }
+        })
+        .collect();
+    let typed_float_scalar_parts: Vec<TokenStream> = float_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { args.push((sym.#fname, majit_ir::Type::Float)); }
+        })
+        .collect();
+    let typed_element_splice: TokenStream = if num_virt_arrays >= 1 {
+        quote! {
+            let __elem_count = __boxes.len().saturating_sub(1);
+            args.extend_from_slice(&__boxes[..__elem_count]);
+        }
+    } else {
+        quote! {}
+    };
+    let loop_carried_boxes_fn: TokenStream = quote! {
+        /// pyjitpl.py:2981-2989 `live_arg_boxes`, typed. See the emit-site
+        /// comment in `majit-macros/src/jit_interp/codegen_state.rs`.
+        #[allow(unused_variables)]
+        fn __jit_loop_carried_boxes(
+            sym: &__JitSym,
+            __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
+        ) -> Vec<(majit_ir::OpRef, majit_ir::Type)> {
+            let mut args: Vec<(majit_ir::OpRef, majit_ir::Type)> = Vec::new();
+            #(#typed_scalar_parts)*
+            #(#typed_array_parts)*
+            #(#typed_virt_array_parts)*
+            #typed_element_splice
+            #(#typed_ref_scalar_parts)*
+            #(#typed_float_scalar_parts)*
+            args
+        }
+    };
     let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays >= 1 {
         quote! {
             fn collect_jump_args_with_boxes(
                 sym: &__JitSym,
-                __boxes: &[majit_ir::OpRef],
+                __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
             ) -> Vec<majit_ir::OpRef> {
-                let mut args = Vec::new();
-                #(#collect_scalar_parts)*
-                #(#collect_array_parts)*
-                #(#collect_virt_array_parts)*
-                let __elem_count = __boxes.len().saturating_sub(1);
-                for __i in 0..__elem_count {
-                    args.push(__boxes[__i]);
-                }
-                #(#collect_ref_scalar_parts)*
-                #(#collect_float_scalar_parts_for_jump)*
-                args
+                __jit_loop_carried_boxes(sym, __boxes)
+                    .into_iter()
+                    .map(|(__opref, _)| __opref)
+                    .collect()
             }
         }
     } else {
@@ -2129,9 +2197,18 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             trace_started: bool,
         }
 
+        #loop_carried_boxes_fn
+
         impl majit_metainterp::JitCodeSym for __JitSym {
             fn total_slots(&self) -> usize {
                 #num_scalars #(#total_slots_array_parts)* + #num_virt_arrays * 2
+            }
+
+            fn loop_carried_boxes(
+                &self,
+                __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
+            ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
+                Some(__jit_loop_carried_boxes(self, __boxes))
             }
 
             fn int_identity_slots_end(&self) -> usize {

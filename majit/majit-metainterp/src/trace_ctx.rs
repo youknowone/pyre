@@ -1859,6 +1859,26 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
+    /// [`collect_virtualizable_boxes`] with each slot paired with its declared
+    /// [`Type`] (`virtualizable_slot_type`); identity LAST, as always.
+    ///
+    /// pyjitpl.py:2981-2989 builds ONE `live_arg_boxes` and hands it to both
+    /// the merge-point registration and the closing JUMP. The registration
+    /// side becomes a cut trace's LABEL inputargs, and those are *typed*
+    /// (`TreeLoop::cut_trace_from_with_consts` → `OpRef::input_arg_typed`), so
+    /// the type tag has to travel with the box for a registration to be able
+    /// to reproduce the close's shape.
+    pub fn collect_virtualizable_typed_boxes(&self) -> Option<Vec<(OpRef, Type)>> {
+        let boxes = self.virtualizable_boxes.as_ref()?;
+        Some(
+            boxes
+                .iter()
+                .enumerate()
+                .map(|(i, &opref)| (opref, self.virtualizable_slot_type(i).unwrap_or(Type::Int)))
+                .collect(),
+        )
+    }
+
     /// The walk-final concrete values of the virtualizable's array elements, in
     /// the flat `[arr0_elem0.., arr1_elem0.., ..]` layout — the array portion of
     /// `virtualizable_values`, excluding the `num_static_extra_boxes` leading

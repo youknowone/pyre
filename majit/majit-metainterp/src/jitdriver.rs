@@ -2513,7 +2513,7 @@ impl<S: JitState> JitDriver<S> {
                             let vable_boxes = self
                                 .meta
                                 .trace_ctx()
-                                .and_then(|ctx| ctx.collect_virtualizable_boxes());
+                                .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
                             let finish_args = match vable_boxes {
                                 Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
                                 None => S::collect_jump_args(sym),
@@ -2598,7 +2598,7 @@ impl<S: JitState> JitDriver<S> {
                     let vable_boxes = self
                         .meta
                         .trace_ctx()
-                        .and_then(|ctx| ctx.collect_virtualizable_boxes());
+                        .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
                     let jump_args = match vable_boxes {
                         Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
                         None => S::collect_jump_args(sym),

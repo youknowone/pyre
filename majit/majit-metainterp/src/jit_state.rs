@@ -607,12 +607,18 @@ pub trait JitState: Sized {
     /// JUMP in place of the `<arr>_ptr`/`<arr>_len` placeholders that the
     /// no-ctx `collect_jump_args` emits.
     ///
-    /// `boxes` is `TraceCtx::collect_virtualizable_boxes()` extracted by the
-    /// caller (owned clone, so the trace-ctx borrow is released before the
+    /// `boxes` is `TraceCtx::collect_virtualizable_typed_boxes()` extracted by
+    /// the caller (owned clone, so the trace-ctx borrow is released before the
     /// subsequent `compile_loop`). Default delegates to `collect_jump_args`,
     /// so PyFrame (which closes via `CloseLoopWithArgs`, never this path) and
     /// non-virtualizable state-field JITs (e.g. `regs: [int]`) are unaffected.
-    fn collect_jump_args_with_boxes(sym: &Self::Sym, _boxes: &[OpRef]) -> Vec<OpRef> {
+    ///
+    /// The boxes are typed because the same construction also builds the
+    /// merge-point registration's `original_boxes`
+    /// (`JitCodeSym::loop_carried_boxes`), and those become a cut trace's
+    /// typed LABEL inputargs. RPython gets that for free — one
+    /// `live_arg_boxes` list of `Box`es, each already carrying its type.
+    fn collect_jump_args_with_boxes(sym: &Self::Sym, _boxes: &[(OpRef, Type)]) -> Vec<OpRef> {
         Self::collect_jump_args(sym)
     }
 

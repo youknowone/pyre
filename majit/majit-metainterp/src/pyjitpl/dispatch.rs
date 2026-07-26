@@ -335,6 +335,31 @@ pub trait JitCodeSym {
         None
     }
 
+    /// pyjitpl.py:2981-2989 `live_arg_boxes` — this merge point's
+    /// loop-carried boxes, in the exact order the closing JUMP emits them.
+    ///
+    /// RPython builds `live_arg_boxes` ONCE per `reached_loop_header` and
+    /// hands the same list to `current_merge_points.append` (the
+    /// registration), to `compile_loop`'s LABEL and to `compile_trace`'s
+    /// JUMP; `assert len(original_boxes) == len(live_arg_boxes)`
+    /// (pyjitpl.py:3020) is free there because there is only one list. The
+    /// dispatch loop reaches a merge point with only `JitCodeSym` in scope,
+    /// so this hook is how it gets at the construction that
+    /// `JitState::collect_jump_args_with_boxes` uses for the close — the two
+    /// MUST agree or the cut label's arity will not match the JUMP's
+    /// (`compile.py:334 jump.numargs() == label.numargs()`).
+    ///
+    /// `vable_boxes` is `TraceCtx::collect_virtualizable_typed_boxes()`,
+    /// identity last (this hook drops it, mirroring the `.pop()`).
+    /// `None` = "no state-field construction" — the caller keeps its own
+    /// fallback.
+    fn loop_carried_boxes(
+        &self,
+        _vable_boxes: &[(OpRef, majit_ir::Type)],
+    ) -> Option<Vec<(OpRef, majit_ir::Type)>> {
+        None
+    }
+
     // -- State field support (register/tape machines) -----
     //
     // When state_fields is configured, scalar and array fields on the
@@ -5011,30 +5036,31 @@ where
                             // RED state fields (the closing JUMP = collect_jump_args),
                             // NOT the green operands captured in `live_arg_boxes`
                             // (those are promoted constants folded inline in the cut
-                            // body). Use the red state-field oprefs in
-                            // collect_jump_args order (int scalars then ref scalars)
-                            // as the cut's `original_boxes` so the inner loop's LABEL
-                            // inputarg arity matches the JUMP (compile.py:334
-                            // jump.numargs()==label.numargs()). Falls back to the
-                            // operand-captured boxes for interpreters with no
-                            // int/ref state fields.
-                            let mut red_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
-                            let mut sfi = 0;
-                            while let Some(o) = sym.state_field_ref(sfi) {
-                                red_boxes
-                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Int));
-                                sfi += 1;
-                            }
-                            let mut sfr = 0;
-                            while let Some(o) = sym.state_ref_field_ref(sfr) {
-                                red_boxes
-                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Ref));
-                                sfr += 1;
-                            }
-                            let original_boxes = if red_boxes.is_empty() {
-                                live_arg_boxes
-                            } else {
-                                red_boxes
+                            // body). Register the SAME construction the close uses
+                            // — `JitState::collect_jump_args_with_boxes` reached
+                            // through `JitCodeSym::loop_carried_boxes` — so the cut
+                            // label's inputarg arity matches the JUMP's
+                            // (compile.py:334 jump.numargs()==label.numargs()), the
+                            // way RPython's single `live_arg_boxes` list does by
+                            // construction (pyjitpl.py:2981-2989). Falls back to the
+                            // operand-captured boxes for interpreters with no state
+                            // fields at all.
+                            //
+                            // Building this from the scalar state fields alone (as
+                            // this site used to) silently omits the virtualizable's
+                            // element boxes, so an interpreter whose state is purely
+                            // `[int; virt]` / `[float; virt]` arrays registered just
+                            // the greens plus one unexpanded vable ref while its
+                            // close expanded to one box per element — the arity
+                            // mismatch that made every nested loop decline.
+                            let vable_boxes =
+                                ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+                            let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                                Some(boxes) => boxes
+                                    .into_iter()
+                                    .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
+                                    .collect(),
+                                None => live_arg_boxes,
                             };
                             if crate::mptrace_enabled() {
                                 eprintln!(
