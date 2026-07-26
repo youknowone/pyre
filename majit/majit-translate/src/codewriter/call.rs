@@ -3188,6 +3188,13 @@ impl CallControl {
         self.candidate_graphs.contains(path)
     }
 
+    /// Size of the post-`find_all_graphs` candidate set — the graphs the
+    /// portal closure actually reaches, against which the registered graph
+    /// count is the eagerly-lowered universe.
+    pub fn candidate_graph_count(&self) -> usize {
+        self.candidate_graphs.len()
+    }
+
     /// RPython: `CallControl.get_jitcode(graph, called_from)`.
     ///
     /// Retrieve or create the `Arc<JitCode>` shell for the given graph.

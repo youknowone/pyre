@@ -121,6 +121,7 @@ fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
     explicit_llbc_paths: Option<&[&str]>,
+    prof: &mut PhaseProfiler,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
@@ -155,8 +156,10 @@ fn build_semantic_program_via_active_frontend(
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
                 .iter()
                 .map(|p| {
-                    majit_charon_reader::Llbc::load(p)
-                        .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"))
+                    let llbc = majit_charon_reader::Llbc::load(p)
+                        .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                    prof.mark(&format!("    load {p}"));
+                    llbc
                 })
                 .collect();
             // Seed the local-crate alias roots from the loaded set so
@@ -174,6 +177,7 @@ fn build_semantic_program_via_active_frontend(
                     module_paths,
                 )
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
+            prof.mark("    build_semantic_program_from_llbcs");
             // JIT-hint pass.  pyre's proc-macro attributes
             // (`#[majit_macros::elidable*]` / `dont_look_inside` /
             // `loop_invariant` / `unroll_safe`) are consumed by the
@@ -517,12 +521,20 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
 /// the parity guard against silent cross-crate name-tail collisions.
 /// Same-name re-registration (e.g. a function reachable through more
 /// than one well-known crate alias) is treated as idempotent.
+/// `graph` is shared, not copied, across the ~`4 + 2 * local_crate_roots`
+/// spellings [`free_function_alias_paths`] produces for one funcobj —
+/// `bookkeeper.getdesc` binds every alias to the same graph object, and a
+/// per-alias deep copy of `FunctionGraph.blocks` multiplied the whole
+/// free-function graph set by the alias count.
 fn register_function_graph_alias(
-    graphs: &mut std::collections::HashMap<crate::parse::CallPath, crate::model::FunctionGraph>,
+    graphs: &mut std::collections::HashMap<
+        crate::parse::CallPath,
+        std::sync::Arc<crate::model::FunctionGraph>,
+    >,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
     path: crate::parse::CallPath,
     source_name: &str,
-    graph: &crate::model::FunctionGraph,
+    graph: &std::sync::Arc<crate::model::FunctionGraph>,
 ) {
     if let Some(prev) = sources.get(&path) {
         assert!(
@@ -534,7 +546,7 @@ fn register_function_graph_alias(
         return;
     }
     sources.insert(path.clone(), source_name.to_string());
-    graphs.insert(path, graph.clone());
+    graphs.insert(path, std::sync::Arc::clone(graph));
 }
 
 /// Compute the full alias spelling set for a free function lifted
@@ -606,6 +618,103 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     paths
 }
 
+/// `PYRE_PROFILE_PIPELINE=1` phase profiler: elapsed wall time plus the
+/// process high-water RSS at each mark, so a phase's contribution to the
+/// translation prepass's peak footprint is visible next to its cost in time.
+pub struct PhaseProfiler {
+    enabled: bool,
+    start: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl PhaseProfiler {
+    pub fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            enabled: std::env::var_os("PYRE_PROFILE_PIPELINE").is_some(),
+            start: now,
+            last: now,
+        }
+    }
+
+    pub fn mark(&mut self, name: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        const GB: f64 = (1u64 << 30) as f64;
+        eprintln!(
+            "[PYRE_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  live {:>6.2}GB  peak {:>6.2}GB  {name}",
+            (now - self.start).as_secs_f64(),
+            (now - self.last).as_secs_f64(),
+            live_rss_bytes() as f64 / GB,
+            peak_rss_bytes() as f64 / GB,
+        );
+        self.last = now;
+    }
+
+    /// Emit a free-form line under the same gate as [`Self::mark`], for
+    /// per-phase input sizes that explain a phase's cost. Takes a closure so
+    /// counting the sizes costs nothing when the profiler is off.
+    pub fn note(&self, message: impl FnOnce() -> String) {
+        if self.enabled {
+            eprintln!("[PYRE_PROFILE_PIPELINE] {}", message());
+        }
+    }
+}
+
+impl Default for PhaseProfiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `getrusage(RUSAGE_SELF).ru_maxrss` — the process high-water RSS. Monotonic,
+/// so the difference between two marks is what the span between them added to
+/// the peak. macOS reports bytes, Linux kilobytes.
+#[cfg(unix)]
+fn peak_rss_bytes() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0;
+    }
+    let raw = usage.ru_maxrss as u64;
+    if cfg!(target_os = "macos") {
+        raw
+    } else {
+        raw * 1024
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
+}
+
+/// Current resident set size. Unlike [`peak_rss_bytes`] this falls back when a
+/// phase releases memory, so the pair separates "this phase allocated N" from
+/// "this phase retains N". Shells out to `ps` because the in-process query is
+/// per-platform (`proc_pidinfo` on macOS, `/proc/self/statm` on Linux) and the
+/// profiler samples fewer than a dozen times per run.
+#[cfg(unix)]
+fn live_rss_bytes() -> u64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p"])
+        .arg(std::process::id().to_string())
+        .output();
+    let Ok(output) = output else { return 0 };
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn live_rss_bytes() -> u64 {
+    0
+}
+
 fn analyze_pipeline_from_module_paths(
     module_paths: &[&str],
     explicit_llbc_paths: Option<&[&str]>,
@@ -616,23 +725,11 @@ fn analyze_pipeline_from_module_paths(
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    let profile = std::env::var_os("PYRE_PROFILE_PIPELINE").is_some();
-    let phase_start = std::time::Instant::now();
-    let mut last = phase_start;
+    let mut prof = PhaseProfiler::new();
     macro_rules! mark_phase {
-        ($name:literal) => {{
-            #[allow(unused_assignments)]
-            if profile {
-                let now = std::time::Instant::now();
-                eprintln!(
-                    "[PYRE_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  {}",
-                    (now - phase_start).as_secs_f64(),
-                    (now - last).as_secs_f64(),
-                    $name,
-                );
-                last = now;
-            }
-        }};
+        ($name:literal) => {
+            prof.mark($name)
+        };
     }
     mark_phase!("entry");
     // `FORCE_ATTRIBUTES_INTO_CLASSES` is seeded from the LLBC-sourced
@@ -652,8 +749,12 @@ fn analyze_pipeline_from_module_paths(
     // `scripts/extract-llbc.py`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
-    let program =
-        build_semantic_program_via_active_frontend(module_paths, static_addrs, explicit_llbc_paths);
+    let program = build_semantic_program_via_active_frontend(
+        module_paths,
+        static_addrs,
+        explicit_llbc_paths,
+        &mut prof,
+    );
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
     // later `codewriter` `canonical_struct_name` `path_hash` sites
@@ -691,6 +792,25 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     mark_phase!("build_semantic_program_from_parsed_files");
+    prof.note(|| {
+        format!(
+            "  program: {} functions, {} blocks, {} ops, {} struct_fields, {} type layouts",
+            program.functions.len(),
+            program
+                .functions
+                .iter()
+                .map(|f| f.graph.blocks.len())
+                .sum::<usize>(),
+            program
+                .functions
+                .iter()
+                .flat_map(|f| f.graph.blocks.iter())
+                .map(|b| b.operations.len())
+                .sum::<usize>(),
+            program.struct_fields.fields.len(),
+            program.exact_layouts.len(),
+        )
+    });
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     // `(trait_leaf, trait_qualified, method_name, owner, return_type,
@@ -849,6 +969,7 @@ fn analyze_pipeline_from_module_paths(
             (None, None) => {}
         }
     }
+    prof.mark("  classify methods into side tables");
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
@@ -858,10 +979,10 @@ fn analyze_pipeline_from_module_paths(
             // codewriter signature validator reads `FUNC.RESULT`
             // directly off the callee graph (RPython
             // `funcptr._obj.TO.RESULT`).
-            let graph = match &func.return_type {
+            let graph = std::sync::Arc::new(match &func.return_type {
                 Some(rt) => func.graph.clone().with_return_type(rt),
                 None => func.graph.clone(),
-            };
+            });
             // Free function: register under every canonical alias
             // spelling computed by `free_function_alias_paths` — bare
             // segments, `crate::` prefix, three pyre-crate prefixes,
@@ -881,6 +1002,7 @@ fn analyze_pipeline_from_module_paths(
             }
         }
     }
+    prof.mark("  free-fn graph aliases");
 
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
@@ -941,6 +1063,7 @@ fn analyze_pipeline_from_module_paths(
     // so the variant payload resolves at its real position. Per-field type
     // classification, immutability rank, and size stay as the provider
     // computed them; only the byte offsets and the struct size are corrected.
+    prof.mark("  call_control setup");
     for struct_name in program.struct_fields.fields.keys() {
         // Resolve the (possibly multi-spelled) field-registry key to its
         // identity token; an unresolved / ambiguous bare leaf has no
@@ -960,9 +1083,15 @@ fn analyze_pipeline_from_module_paths(
     }
     // Register graphs collected above (free functions only — trait
     // methods are handled separately via register_trait_method).
+    prof.mark("  struct layouts");
     for (path, graph) in &canonical_function_graphs {
-        call_control.register_function_graph(path.clone(), graph.clone());
+        // Each alias re-presents the shared graph so
+        // `insert_function_graph_indexed` can fold that spelling's pending
+        // external-funcobj effects onto the one stored graph; `GraphStore`
+        // keys on the funcobj, so the copy is transient.
+        call_control.register_function_graph(path.clone(), graph.as_ref().clone());
     }
+    prof.mark("  register_function_graph (free fns)");
     // Re-register free functions with their RPython-equivalent hints
     // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
     // so `JitPolicy::look_inside_graph` sees the same metadata RPython
@@ -1186,6 +1315,7 @@ fn analyze_pipeline_from_module_paths(
             }
         }
     }
+    prof.mark("  trait-impl registration");
     // Single-impl devirtualization for REQUIRED trait methods.  A call
     // site `<Trait>::<method>(receiver, …)` lowers to
     // `CallTarget::FunctionPath { segments: [<Trait>, <method>] }`
@@ -1478,6 +1608,7 @@ fn analyze_pipeline_from_module_paths(
             }
         }
     }
+    prof.mark("  concrete-trait + inherent method registration");
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }
@@ -1600,6 +1731,14 @@ fn analyze_pipeline_from_module_paths(
     }
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
+    prof.mark("  find_all_graphs");
+    prof.note(|| {
+        format!(
+            "  portal closure: {} candidate graphs out of {} lowered functions",
+            call_control.candidate_graph_count(),
+            program.functions.len(),
+        )
+    });
 
     // The canonical jitcode emitter below is the production analysis
     // path; `ProgramPipelineResult.functions` / `total_*` remain diagnostic fields.
@@ -1618,7 +1757,7 @@ fn analyze_pipeline_from_module_paths(
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
     let (jitcodes, insns, descrs, all_liveness) =
-        make_jitcodes(&config.pipeline, &mut call_control);
+        make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
     mark_phase!("make_jitcodes");
     pipeline.jit_drivers = call_control
         .jitdrivers_sd()
@@ -1717,6 +1856,7 @@ fn register_configured_jitdrivers(
 fn make_jitcodes(
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
+    prof: &mut PhaseProfiler,
 ) -> (
     Vec<std::sync::Arc<jitcode::JitCode>>,
     indexmap::IndexMap<String, u8>,
@@ -1751,17 +1891,21 @@ fn make_jitcodes(
     // RPython grab_initial_jitcodes + drain portals and their callees.
     // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
+    prof.mark("  grab_initial_jitcodes");
     // Two-phase rtyper prepass (production default; `PYRE_TWO_PHASE_RTYPE=0`
     // opts out): annotate-all → rtype-all over the portal closure before the
     // drain publishes any covered graph, so a shared callee (e.g. `type_error`)
     // is unioned across all its callers before being rtyped.
     codewriter.run_two_phase_prepass_if_enabled(call_control);
+    prof.mark("  run_two_phase_prepass");
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
+    prof.mark("  drain_pending_graphs");
 
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler
         .finished(&call_control.callinfocollection);
+    prof.mark("  assembler.finished");
 
     // Materialise `all_jitcodes[]` from the completed jitcodes. Each
     // jitcode receives its dense index when appended, matching RPython
@@ -1870,7 +2014,8 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _) = make_jitcodes(&config, &mut call_control);
+        let (jitcodes, _, _, _) =
+            make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
         assert!(call_control.jitcodes().contains_key(&portal));
@@ -1938,7 +2083,8 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _) = make_jitcodes(&config, &mut call_control);
+        let (jitcodes, _, _, _) =
+            make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
         let merge = jitcodes[0]
             .body()
             ._ssarepr
