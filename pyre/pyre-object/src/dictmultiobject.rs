@@ -2739,6 +2739,29 @@ pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObject
     w_dict_get_strategy(obj).getitem_str(obj, key)
 }
 
+/// Error-propagating sibling of [`w_dict_getitem_str`], the str-keyed
+/// counterpart of [`w_dict_lookup_checked`].
+///
+/// A borrowed-`&str` probe still runs `dict_keys_equal` against whatever the
+/// bucket holds, so a stored non-string key whose hash collides can reach a
+/// user `__eq__`.  When that raises, the callback pair records the error and
+/// reports "not equal", which `Option` alone renders as an ordinary miss —
+/// a name lookup would then continue as though the name were absent.  Drain
+/// the flag so the caller can surface the exception instead.
+///
+/// # Safety
+/// `obj` must point to a valid dict.
+pub unsafe fn w_dict_getitem_str_checked(
+    obj: PyObjectRef,
+    key: &str,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    let hit = w_dict_getitem_str(obj, key);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    Ok(hit)
+}
+
 /// Internal helper for `ObjectDictStrategy::getitem_str`. Kept as a free
 /// function so the strategy trait impl can share the borrowed-str lookup.
 ///

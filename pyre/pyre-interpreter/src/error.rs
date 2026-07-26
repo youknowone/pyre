@@ -1110,11 +1110,14 @@ impl PyError {
         if w_type.is_null() {
             w_type = pyre_object::w_none();
         }
+        // `error.py:271` — `w_tb = self.get_w_traceback(space)`, the slot
+        // read with its escape mark.
         let mut w_tb = if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
             unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) }
         } else {
             pyre_object::PY_NULL
         };
+        unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
         if w_tb.is_null() {
             w_tb = pyre_object::w_none();
         }
@@ -1162,6 +1165,8 @@ impl PyError {
                             if w_type.is_null() {
                                 w_type = pyre_object::w_none();
                             }
+                            // `error.py:312` — same `get_w_traceback` read
+                            // for the exception the hook itself raised.
                             w_tb = if !hook_value.is_null()
                                 && unsafe { pyre_object::is_exception(hook_value) }
                             {
@@ -1173,6 +1178,7 @@ impl PyError {
                             } else {
                                 pyre_object::PY_NULL
                             };
+                            unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
                             if w_tb.is_null() {
                                 w_tb = pyre_object::w_none();
                             }

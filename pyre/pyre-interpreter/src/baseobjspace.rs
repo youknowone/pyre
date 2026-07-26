@@ -3662,9 +3662,15 @@ unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 /// `&str`, so a miss allocates neither the wrapped key nor the exception.
 /// Every other receiver falls through to `baseobjspace.py:868-871`, which
 /// wraps the key and defers to the generic `finditem`.
+///
+/// The probe still compares against whatever the bucket holds, so a stored
+/// non-string key whose hash collides can reach a user `__eq__` that raises.
+/// Take the `_checked` variant so that surfaces as an error rather than a
+/// miss; only that path wraps the key, to name it in a 3.14 hash-error.
 pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
-        return Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(obj, key) });
+        return unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked(obj, key) }
+            .map_err(|_| take_pending_dict_key_error(w_str_new(key)));
     }
     finditem(obj, w_str_new(key))
 }
@@ -4123,12 +4129,11 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
 /// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// A subclass of a builtin type with a fixed Rust payload (e.g. a subclass
-/// of `array.array`) keeps that native layout and has no mapdict, so the
-/// slot is instead backed by the instance `__dict__` — the same side table
-/// (`mapdict::INSTANCE_DICT`) that already holds the subclass's regular
-/// attributes. `None`/`false` means the receiver has no writable dict.
-pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// Native `str` subclasses carry their PyPy-shaped indexed storage on the
+/// `W_UnicodeObject` itself. Other fixed Rust payloads still fall back to an
+/// exposed instance `__dict__` when their type has one. `None`/`false` means
+/// the receiver has no writable storage.
+pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str, index: u32) -> Option<PyObjectRef> {
     // Python 3.14 permits a native-layout `property` subclass to declare an
     // explicit `__doc__` slot.  PyPy's extended instance layout stores that
     // slot on the object; pyre's equivalent object-resident location is the
@@ -4138,6 +4143,9 @@ pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         return (!value.is_null()).then_some(value);
     }
+    if unsafe { pyre_object::is_str(obj) } {
+        return unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) };
+    }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
         return None;
@@ -4145,9 +4153,18 @@ pub(crate) fn native_slot_get(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
     unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) }
 }
 
-pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+pub(crate) fn native_slot_set(
+    obj: PyObjectRef,
+    name: &str,
+    index: u32,
+    value: PyObjectRef,
+) -> bool {
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
+        return true;
+    }
+    if unsafe { pyre_object::is_str(obj) } {
+        unsafe { pyre_object::unicodeobject::w_str_slot_set(obj, index as usize, value) };
         return true;
     }
     let w_dict = getdict(obj);
@@ -4158,7 +4175,7 @@ pub(crate) fn native_slot_set(obj: PyObjectRef, name: &str, value: PyObjectRef) 
     true
 }
 
-pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
+pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> bool {
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         if value.is_null() {
@@ -4166,6 +4183,9 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
         }
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
         return true;
+    }
+    if unsafe { pyre_object::is_str(obj) } {
+        return unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) };
     }
     let w_dict = getdict(obj);
     if w_dict.is_null() {
@@ -4285,6 +4305,29 @@ fn getdict_backing(obj: PyObjectRef) -> PyObjectRef {
         return w_dict;
     }
     crate::type_methods::resolve_dict_backing(w_dict)
+}
+
+/// `baseobjspace.py:46-50 W_Root.getdictvalue`.
+///
+/// ```python
+/// def getdictvalue(self, space, attr):
+///     w_dict = self.getdict(space)
+///     if w_dict is not None:
+///         return space.finditem_str(w_dict, attr)
+///     return None
+/// ```
+///
+/// Going through `finditem_str` rather than the raw layout accessor is what
+/// makes a dict probe that raises reach the caller: a borrowed-`&str` key is
+/// still compared against whatever the bucket holds, so a stored non-string
+/// key whose hash collides can run a user `__eq__`, and the raw accessor
+/// reports that as an ordinary miss — the attribute would look absent.
+fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    let w_dict = getdict_backing(obj);
+    if w_dict.is_null() {
+        return Ok(None);
+    }
+    finditem_str(w_dict, name)
 }
 
 /// interpreter/baseobjspace.py:142-143 W_Root.getweakref().
@@ -6205,11 +6248,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                         }
                     }
                 }
-                let w_dict = getdict_backing(obj);
-                if !w_dict.is_null() {
-                    if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
-                        return Ok(value);
-                    }
+                if let Some(value) = getdictvalue(obj, name)? {
+                    return Ok(value);
                 }
                 if let Some(descr) = w_descr {
                     if crate::is_function(descr) {
@@ -6258,11 +6298,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     }
                 }
             }
-            let w_dict = getdict_backing(obj);
-            if !w_dict.is_null() {
-                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                    return Ok(value);
-                }
+            if let Some(value) = getdictvalue(obj, name)? {
+                return Ok(value);
             }
             if let Some(method) = w_descr {
                 match unsafe { get(method, obj, w_type.as_ptr()) } {
@@ -6307,13 +6344,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // Function object attributes — PyPy: function.py Function
     // Check the live W_DictObject (functions are hasdict per typedef.py:735
     // __dict__ = getset_func_dict).
-    if unsafe { crate::is_function(obj) } {
-        let w_dict = getdict_backing(obj);
-        if !w_dict.is_null() {
-            if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                return Ok(v);
-            }
-        }
+    if unsafe { crate::is_function(obj) }
+        && let Some(v) = getdictvalue(obj, name)?
+    {
+        return Ok(v);
     }
     unsafe {
         if crate::is_function(obj) {
@@ -6472,11 +6506,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     if name == "__doc__" || name == "__module__" || name == "__annotations__" {
         // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
         // instance dict (exception `w_dict` slot, hasdict objects).
-        let w_dict = getdict_backing(obj);
-        if !w_dict.is_null() {
-            if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                return Ok(value);
-            }
+        if let Some(value) = getdictvalue(obj, name)? {
+            return Ok(value);
         }
         // `__module__` is not a universal attribute: an object whose
         // type-MRO carries no `__module__` (e.g. a builtin instance like
@@ -6494,9 +6525,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // returns the `w_traceback` slot stamped by
                 // `descr_settraceback` and the `raise` machinery's
                 // `record_application_traceback`; `None` when none has
-                // been set.
+                // been set.  The traceback reaches app level here, so its
+                // frame is marked escaped.
                 let stored =
                     unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
+                unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__cause__" => {
@@ -7837,10 +7870,16 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // self._pure_lookup_where_with_method_cache(name, version_tag)`.  The
     // tuple is split across two single-register elidable residuals over the
     // same cache entry (see `_pure_lookup_class_with_method_cache`), so the
-    // thread-local `MethodCache` read stays off the trace surface and the
-    // lookup folds to a `CALL_PURE_R` instead of aborting the trace.  The
-    // interned, immortal `w_name` (`box_str_constant`) is the green token the
-    // trace folds on; both residuals share it.
+    // `MethodCache` read stays off the trace surface and the lookup folds to
+    // a `CALL_PURE_R` instead of aborting the trace.  The interned, immortal
+    // `w_name` (`box_str_constant`) is the green token the trace folds on;
+    // both residuals share it.  Upstream reads the pair atomically because it
+    // returns one tuple, whereas each residual here takes the cache mutex
+    // separately, so a concurrent `mutated()` can land between them.  That is
+    // no weaker than the `version_tag` promotion above, which is likewise
+    // only stable while no other thread invalidates the type: both halves are
+    // then read under a tag that is no longer current, exactly as a lookup
+    // that had completed one instruction earlier would have been.
     let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
     let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {
@@ -8682,6 +8721,13 @@ pub(crate) unsafe fn get(
     // PyPy splits BuiltinFunction from FunctionWithFixedCode at the typedef
     // layer: BuiltinFunction omits __get__, while FunctionWithFixedCode keeps
     // Function.__get__ and binds like a normal method descriptor.
+    if crate::is_slot_wrapper(descr) {
+        if obj.is_null() {
+            return Ok(Some(descr));
+        }
+        return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
+    }
+
     if crate::is_function(descr) {
         let ob_type = unsafe { (*descr).ob_type };
         if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
@@ -8751,7 +8797,11 @@ pub(crate) unsafe fn get(
             crate::objspace::std::mapdict::getslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
-            native_slot_get(obj, pyre_object::w_member_get_name(descr))
+            native_slot_get(
+                obj,
+                pyre_object::w_member_get_name(descr),
+                pyre_object::w_member_get_index(descr),
+            )
         };
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
@@ -8841,7 +8891,7 @@ unsafe fn set(
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
             let slot_name = pyre_object::w_member_get_name(descr);
-            if !native_slot_set(obj, slot_name, value) {
+            if !native_slot_set(obj, slot_name, index, value) {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::AttributeError,
                     format!(
@@ -8913,7 +8963,11 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
             crate::objspace::std::mapdict::delslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
-            native_slot_del(obj, pyre_object::w_member_get_name(descr))
+            native_slot_del(
+                obj,
+                pyre_object::w_member_get_name(descr),
+                pyre_object::w_member_get_index(descr),
+            )
         };
         if !removed {
             let slot_name = pyre_object::w_member_get_name(descr);
@@ -9610,10 +9664,9 @@ pub unsafe fn exception_attr_slot_fold(
             ExceptionAttrSlot::Filename2
         }
         // `__traceback__` is a `W_BaseException` slot on every exception kind.
-        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`, which
-        // `w_exception_get_traceback` omits while the `ExecutionContext::leave`
-        // vref force it feeds is unported; the fold tracks that getter, so both
-        // sides gain the mark together.
+        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`; the
+        // fold folds only the slot read, so the specializer pairs it with a
+        // residual call that issues the mark.
         "__traceback__" => ExceptionAttrSlot::Traceback,
         // `name` shares the `w_exc_name` slot across the kinds whose getattr
         // arm reads it; other kinds keep the regular attribute fall-through.
@@ -10281,6 +10334,7 @@ pub fn callable_w(obj: PyObjectRef) -> bool {
     // `__call__`.  Mirrors `builtins::builtin_callable`.
     unsafe {
         is_function(obj)
+            || crate::is_slot_wrapper(obj)
             || is_type(obj)
             || pyre_object::is_method(obj)
             || pyre_object::function::is_staticmethod(obj)
@@ -10608,19 +10662,29 @@ fn _unpackiterable_unknown_length(
 /// jitcode. `#[dont_look_inside]` keeps the host plumbing opaque should a
 /// caller ever be traced.
 ///
-/// Pins `items` across the readback: an Integer/Float-strategy `getitem`
-/// boxes each element through the moving collector (`w_int_new` /
-/// `w_float_new`), which can relocate `items`.
+/// Pins `items` and every element read back. This is a liveness bracket, not
+/// a relocation read-back: the `W_ListObject` header is old-gen and non-moving.
+/// The caller's `RootScope` is already gone, so the drained list lives only on
+/// the Rust stack, and an Integer/Float-strategy `getitem` boxes through
+/// `w_int_new` / `w_float_new`, whose allocator slow path parks this mutator at
+/// a `gc_op` — a foreign thread's stop-the-world collection can mark and sweep
+/// while it is parked. The boxes read back so far are reachable from no root at
+/// that moment, so they get the same per-element pins
+/// `alloc_list_items_block_gc` uses.
 #[majit_macros::dont_look_inside]
 pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(items);
     let n = unsafe { pyre_object::listobject::w_list_len(items) };
-    let mut out: Vec<PyObjectRef> = Vec::with_capacity(n);
+    let save = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n as i64 {
-        out.push(unsafe { pyre_object::listobject::w_list_getitem(items, i).unwrap() });
+        pyre_object::gc_roots::pin_root(unsafe {
+            pyre_object::listobject::w_list_getitem(items, i).unwrap()
+        });
     }
-    out
+    (0..n)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(save + i))
+        .collect()
 }
 
 /// pypy/interpreter/baseobjspace.py:1080-1108 `length_hint`.

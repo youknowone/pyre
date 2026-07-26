@@ -1419,6 +1419,19 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             raw_value,
             majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
         );
+        if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback {
+            // The fold replaces `descr_gettraceback`, whose read marks the
+            // traceback's frame escaped so `ExecutionContext::leave` forces
+            // its vref.  The walk is the authoritative execution path, so
+            // mark now as well as on every compiled re-execution.
+            unsafe { pyre_interpreter::pytraceback::mark_traceback_escaped(stored) };
+            ctx.trace_ctx.call_void_typed_with_effect(
+                pyre_interpreter::pytraceback::jit_mark_traceback_escaped as *const (),
+                &[raw_value],
+                &[majit_ir::Type::Ref],
+                majit_metainterp::cannot_raise_effect_info(),
+            );
+        }
         let value = if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
             let list = unsafe { &*(stored as *const pyre_object::listobject::W_ListObject) };
             if list.strategy != pyre_object::listobject::ListStrategy::Object {

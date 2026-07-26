@@ -1,4 +1,5 @@
 import _warnings
+import os
 import sys
 import warnings
 
@@ -55,6 +56,33 @@ except TypeError:
     pass
 else:
     raise AssertionError("non-Warning category accepted")
+
+try:
+    _warnings.warn("bad prefixes", skip_file_prefixes=[])
+except TypeError:
+    pass
+else:
+    raise AssertionError("non-tuple skip_file_prefixes accepted")
+
+try:
+    _warnings.warn("bad prefix item", skip_file_prefixes=(1,))
+except TypeError:
+    pass
+else:
+    raise AssertionError("non-str skip_file_prefixes item accepted")
+
+
+def warning_from_skipped_helper():
+    _warnings.warn(
+        "skip helper",
+        skip_file_prefixes=(os.path.dirname(__file__),),
+    )
+
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    warning_from_skipped_helper()
+    assert caught[-1].filename != __file__
 
 for kwargs in ({"module_globals": True}, {"registry": 42}):
     try:

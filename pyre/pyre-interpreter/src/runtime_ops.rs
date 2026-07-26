@@ -428,7 +428,7 @@ where
     // instead of letting the OS abort on a guard-page hit.
     crate::stack_check::stack_check()?;
     unsafe {
-        if is_function(callable) {
+        if crate::is_function_carrier(callable) {
             // All callables are Function objects. Check code type to distinguish
             // builtins (BuiltinCode) from user functions (PyCode).
             let code = crate::getcode(callable);

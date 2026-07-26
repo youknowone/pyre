@@ -1874,7 +1874,23 @@ fn run_perfn_walk<Sym: WalkSym>(
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
     } else if uses_entry_sidecar {
-        sidecar_entry
+        // The resume-marker table forward-carries a py_pc that emitted no op of
+        // its own to the next py that did.  When lowering stopped early — an
+        // unported opcode ends the body with `abort_permanent` — every later py
+        // is unlowered, so that carry crosses the truncation and hands back the
+        // abort block.  The block's own coordinate is the unported instruction,
+        // far BEFORE `start_pc`: walking from it reaches the marker at once and
+        // `fbw_abort_resume_py_pc` back-translates to that earlier py, rewinding
+        // the live frame so every instruction between it and `start_pc` runs a
+        // second time.  Require the coordinate to round-trip forward instead —
+        // a trace-entry green heads its own block, so its marker back-translates
+        // to itself, and a genuine trivia carry lands on a LATER py.  Anything
+        // else is a body that does not encode `start_pc`, which is exactly the
+        // decline below.
+        sidecar_entry.filter(|&off| {
+            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, off) as usize
+                >= start_pc
+        })
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without
         // one the site-specific decline below rejects the walk.
@@ -3733,6 +3749,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                         finish_args: vec![],
                         finish_arg_types: vec![],
                         exit_with_exception: false,
+                        exc_value: 0,
                     },
                     // A top-level uncaught raise stashes the exception box as an
                     // `is_exception` payload (`fbw_terminate_with_raise`): build
@@ -3745,11 +3762,17 @@ fn full_body_walk_trace<Sym: WalkSym>(
                         finish_args: vec![exc],
                         finish_arg_types: vec![majit_ir::Type::Ref],
                         exit_with_exception: true,
+                        // The full-body walk delivers its own uncaught raise
+                        // through `WALK_END_PROPAGATED_EXCEPTION` (:557), so the
+                        // `raise` half of `finishframe_exception` is already
+                        // covered and no value needs to ride the action.
+                        exc_value: 0,
                     },
                     Some((finish_value, finish_type)) => TraceAction::Finish {
                         finish_args: vec![finish_value],
                         finish_arg_types: vec![finish_type],
                         exit_with_exception: false,
+                        exc_value: 0,
                     },
                     None => {
                         crate::jitcode_dispatch::census_record("Terminate::NoFinishPayload");

@@ -1,0 +1,66 @@
+# A trace that outgrows `trace_limit` must not re-apply effects the walk has
+# already executed. The walker's length check fires at an arbitrary opcode,
+# unlike every other abort, which declines before executing an effect it
+# cannot roll back; an abort resumes by re-interpreting the iteration from the
+# trace entry, so an executed-but-unrollbackable effect would land twice.
+#
+# `pypyjit.set_param` lowers `trace_limit` far enough that the check binds on
+# every backend (the param hook reaches the wasm guest, which sees no
+# environment). CPython, the oracle, has no `pypyjit`; guarding the import
+# keeps the output identical across all three while the limit only binds where
+# a JIT exists.
+try:
+    import pypyjit
+except ImportError:
+    pypyjit = None
+
+
+def set_trace_limit(n):
+    if pypyjit is not None:
+        pypyjit.set_param("trace_limit=%d,threshold=1,function_threshold=1" % n)
+
+
+N = 200
+
+# Phase A — an effect-free body under a limit small enough to trip it. The
+# committed `.jitstats` baseline records the resulting abort, so the length
+# check itself cannot silently stop firing.
+set_trace_limit(8)
+
+i = 0
+free_total = 0
+while i < N:
+    x = i
+    x = x + 1
+    x = x + 2
+    x = x + 3
+    x = x + 4
+    x = x + 5
+    free_total = free_total + x
+    i = i + 1
+
+# Phase B — the same shape with the limit raised past the body's own length,
+# so the check lands mid-body, and with one effect per rollback class: a list
+# slot store is journaled, a dict store and a list append historically were
+# not. Each counter must read exactly N; a replayed iteration shows up as
+# N + 1.
+set_trace_limit(100)
+
+box = [0]
+d = {"k": 0}
+obj = []
+
+i = 0
+total = 0
+while i < N:
+    x = i
+    x = x + 1
+    x = x + 2
+    x = x + 3
+    box[0] += 1
+    d["k"] = d["k"] + 1
+    obj.append(x)
+    total = total + x
+    i = i + 1
+
+print(free_total, total, box[0], d["k"], len(obj), sum(obj) % 1000003)

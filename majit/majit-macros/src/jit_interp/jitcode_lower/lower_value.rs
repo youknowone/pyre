@@ -215,10 +215,18 @@ impl<'c> Lowerer<'c> {
             }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
                 let binding = self.lower_value_expr(expr)?;
-                if !matches!(binding.kind, BindingKind::Int) {
-                    return None;
+                match binding.kind {
+                    BindingKind::Int => self.lower_int_cast(binding, ty),
+                    // A FLOAT operand is the `cast_int_to_float` arm above run
+                    // backwards. Only a word-width target lowers: Rust saturates
+                    // an `as` cast at the TARGET type's bounds, so `300.0 as i8`
+                    // is `127`, which a float->i64 followed by an int narrowing
+                    // (`44`) would not reproduce.
+                    BindingKind::Float if is_word_width_int(ty) => {
+                        self.lower_float_to_int_cast(binding)
+                    }
+                    _ => None,
                 }
-                self.lower_int_cast(binding, ty)
             }
             Expr::Paren(ExprParen { expr, .. }) => self.lower_value_expr(expr),
             Expr::If(expr_if) => self.lower_if_value(expr_if),
@@ -267,7 +275,7 @@ impl<'c> Lowerer<'c> {
                 // Unsigned compare intrinsics `majit_uint_lt(a, b)` /
                 // `majit_uint_le(a, b)` → uint_lt / uint_le (the signed opcode
                 // the generic binop path emits is wrong for uint).
-                if let Some(binding) = self.lower_uint_compare_call(call) {
+                if let Some(binding) = self.lower_uint_intrinsic_call(call) {
                     return Some(binding);
                 }
                 self.lower_call_value(call)
@@ -345,16 +353,40 @@ impl<'c> Lowerer<'c> {
         }
     }
 
-    /// Lower the unsigned integer comparison intrinsics `majit_uint_lt(a, b)` /
-    /// `majit_uint_le(a, b)` to `uint_lt` / `uint_le` (`bhimpl_uint_lt` /
-    /// `bhimpl_uint_le`). Both operands are read from the int bank as unsigned
-    /// 64-bit values; the op writes a `0`/`1` int result. `opcode_for_binop`
-    /// maps `<`/`<=` to the signed `IntLt`/`IntLe`, so an explicit intrinsic is
-    /// the only way to select the unsigned opcode from the tracing frontend.
-    fn lower_uint_compare_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
-        let opcode_name = match canonical_expr_segments(&call.func)?.last()?.as_str() {
-            "majit_uint_lt" => "UintLt",
-            "majit_uint_le" => "UintLe",
+    /// Lower the unsigned integer intrinsics. Both operands are read from the
+    /// int bank as unsigned 64-bit values. `opcode_for_binop` collapses every
+    /// Rust binary operator to its SIGNED opcode (`<` to `IntLt`, `/` to
+    /// `IntFloorDiv`) and `BindingKind` has no signedness at all, so an
+    /// explicit intrinsic is the only way to select an unsigned operation from
+    /// the tracing frontend.
+    ///
+    /// The two families lower differently, mirroring RPython:
+    ///   * `majit_uint_lt`/`majit_uint_le` become the `uint_lt`/`uint_le`
+    ///     primitives (`bhimpl_uint_lt`/`bhimpl_uint_le`), because
+    ///     `resoperation.py:1017-1018` keeps `UINT_LT`/`UINT_LE` as real
+    ///     resops.
+    ///   * `majit_uint_div`/`majit_uint_mod` become the `int.udiv`/`int.umod`
+    ///     oopspec residual calls, because `UINT_FLOORDIV` was REMOVED from the
+    ///     resop set in 2016 and `rint.py:434,525` route unsigned `/` and `%`
+    ///     through `ll_uint_py_div`/`ll_uint_py_mod` instead. This is the same
+    ///     redirect `binop_i_emit_tokens` already performs for the signed
+    ///     `IntFloorDiv`/`IntMod`.
+    ///
+    /// The division intrinsics carry `ll_uint_py_div`'s `rhs != 0`
+    /// precondition: the caller must guard the zero divisor, exactly as
+    /// RPython's inlined `ll_uint_py_div_zer` wrapper does.
+    fn lower_uint_intrinsic_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        enum UintEmit {
+            /// A real unsigned resop recorded through `record_binop_i`.
+            Opcode(&'static str),
+            /// An oopspec residual call recorded through its own `record_*`.
+            OopspecCall(&'static str),
+        }
+        let emit = match canonical_expr_segments(&call.func)?.last()?.as_str() {
+            "majit_uint_lt" => UintEmit::Opcode("UintLt"),
+            "majit_uint_le" => UintEmit::Opcode("UintLe"),
+            "majit_uint_div" => UintEmit::OopspecCall("record_uint_py_div"),
+            "majit_uint_mod" => UintEmit::OopspecCall("record_uint_py_mod"),
             _ => return None,
         };
         if call.args.len() != 2 {
@@ -367,14 +399,23 @@ impl<'c> Lowerer<'c> {
         }
         let (lhs_reg, rhs_reg) = (lhs.reg, rhs.reg);
         let dst = self.alloc_reg();
-        let opcode = format_ident!("{opcode_name}");
+        let tokens = match emit {
+            UintEmit::Opcode(opcode_name) => {
+                let opcode = format_ident!("{opcode_name}");
+                binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg)
+            }
+            UintEmit::OopspecCall(method_name) => {
+                let method = format_ident!("{method_name}");
+                quote! { __builder.#method(#dst, #lhs_reg, #rhs_reg); }
+            }
+        };
         self.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
                 Register::ints(&[lhs_reg, rhs_reg]),
                 vec![Register::int(dst)],
             ),
-            binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+            tokens,
         );
         Some(Binding {
             reg: dst,
@@ -2055,6 +2096,33 @@ impl<'c> Lowerer<'c> {
         Some(Binding {
             reg,
             kind: BindingKind::Float,
+            depends_on_stack: binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Lower a `<float> as i64` cast to RPython's `cast_float_to_int`
+    /// (`bhimpl_cast_float_to_int`), the inverse of
+    /// [`Self::lower_int_to_float_cast`]. The operand is read from the float
+    /// bank and truncated toward zero into the int bank; the result is an int
+    /// binding. `UnaryI` is the op-kind label, as for the neighbouring
+    /// `convert_float_bytes_to_longlong`; the float bank of the SOURCE and the
+    /// int bank of the result are carried by the `Register`s, which is what
+    /// liveness/regalloc read.
+    fn lower_float_to_int_cast(&mut self, binding: Binding) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                vec![Register::float(src_reg)],
+                vec![Register::int(reg)],
+            ),
+            quote! { __builder.record_cast_float_to_int(#reg, #src_reg); },
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
             depends_on_stack: binding.depends_on_stack,
             struct_type: None,
         })

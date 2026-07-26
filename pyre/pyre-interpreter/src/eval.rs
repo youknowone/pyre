@@ -51,6 +51,7 @@ thread_local! {
         in_flight_exception: IN_FLIGHT_EXCEPTION.with(|cell| cell as *const _),
         bh_last_exception: majit_metainterp::blackhole::BH_LAST_EXC_VALUE
             .with(|cell| cell as *const _),
+        jit_pending_exception: crate::stack_check::capture_jit_pending_exception_area(),
         pending_call_error: crate::call::capture_pending_call_error_area(),
         pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
     };
@@ -63,6 +64,7 @@ struct PyFrameRootArea {
     mapdict_method_cache: *const (),
     in_flight_exception: *const Cell<PyObjectRef>,
     bh_last_exception: *const Cell<i64>,
+    jit_pending_exception: *const Cell<i64>,
     pending_call_error: *const (),
     pending_hash_error: *const (),
 }
@@ -589,7 +591,8 @@ pub unsafe fn walk_pyframe_roots_area(
     // which happened to initiate collection.
     unsafe {
         walk_in_flight_exception_area(area.in_flight_exception, visitor);
-        walk_bh_last_exception_area(area.bh_last_exception, visitor);
+        walk_raw_exception_cell_area(area.bh_last_exception, visitor);
+        walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
         crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
     }
@@ -967,11 +970,14 @@ unsafe fn walk_in_flight_exception_area(
 /// `0xDEAD` sentinel exists solely in a blackhole unit-test helper).
 fn walk_bh_last_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
-        unsafe { walk_bh_last_exception_area(c as *const _, visitor) };
+        unsafe { walk_raw_exception_cell_area(c as *const _, visitor) };
     });
 }
 
-unsafe fn walk_bh_last_exception_area(
+/// Forward one raw `i64` exception carrier cell and trace the exception's
+/// GC-managed children. Shared by every such carrier
+/// (`BH_LAST_EXC_VALUE`, `TL_JIT_PENDING_EXCEPTION`) so they cannot drift.
+pub(crate) unsafe fn walk_raw_exception_cell_area(
     c: *const Cell<i64>,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
@@ -1432,7 +1438,10 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         // null `w_type` makes `normalize_exception` take `w_inst = w_type`
         // (null) and raise "exceptions must derive from BaseException".
         let operr_obj = err.to_exc_object();
+        // `executioncontext.py:362` hands the tracer
+        // `operr.get_w_traceback(space)` — the slot read with its mark.
         let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(operr_obj) };
+        unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
         if let Err(trace_err) = unsafe {
             (*ec).exception_trace(frame as *mut PyFrame, operr_obj, pyre_object::PY_NULL, w_tb)
         } {
@@ -2754,7 +2763,7 @@ unsafe fn method_descriptor_bound(
     obj: PyObjectRef,
 ) -> PyObjectRef {
     unsafe {
-        if d != attr || !crate::is_function(d) {
+        if d != attr || !crate::is_function_carrier(d) {
             return PY_NULL;
         }
         // BuiltinFunction has no `__get__` (its typedef carries no

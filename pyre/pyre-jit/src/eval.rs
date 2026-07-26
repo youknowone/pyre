@@ -1563,6 +1563,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
         function_tid,
     );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_interpreter::function::SLOT_WRAPPER_TYPE as *const _ as usize,
+        function_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_interpreter::function::SLOT_WRAPPER_TYPE as *const _ as usize,
+        function_tid,
+    );
     // Cell / Method / W_SliceObject — typed payload
     // via `#[pyre_class]`.  Pre-registered ahead of the foreign-
     // pytype loop because that loop's `size_of::<PyObject>()`
@@ -1869,15 +1878,20 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // value (an immortal holder cannot grey an old-gen box), which the
     // `is_managed_heap_object` guard on the edge skips. Managed subclass
     // instances also need the header's `w_class` traced, matching
-    // W_ObjectObject's instance-class edge. No `.with_destructor_fn`: the box
-    // tid's drop glue is the sole reclaimer (a holder destructor would
-    // double-free a box swept before its owner).
+    // W_ObjectObject's instance-class edge. A slots-bearing `str` subclass
+    // also owns a normal list in `w_slots`; tracing that list edge gives the
+    // list's custom tracer ownership of the individual slot values, matching
+    // PyPy's object-resident BaseUserClassMapdict storage. No
+    // `.with_destructor_fn`: the value-box tid's drop glue is the sole
+    // reclaimer (a holder destructor would double-free a box swept before its
+    // owner).
     let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
         object_tid,
         vec![
             pyre_object::pyobject::W_CLASS_OFFSET,
             pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
+            pyre_object::unicodeobject::UNICODE_W_SLOTS_OFFSET,
         ],
     ));
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
@@ -4963,6 +4977,24 @@ fn unpack_merge_point_jit(
     drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
 }
 
+/// The exception a jd1 drain exit escapes with, as a `PyError`, unless it is the
+/// drain's own loop-exit `StopIteration` (which the caller `ln` loop re-derives
+/// on its next `next()`) or the slot is empty.
+///
+/// `compile.py:658-662 ExitFrameWithExceptionDescrRef.handle_fail` reads the
+/// value out of the deadframe and raises `jitexc.ExitFrameWithExceptionRef`;
+/// every jd1 exit that carries one funnels through here so the three call sites
+/// cannot drift apart.
+fn drain_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyError> {
+    if exc == 0 {
+        return None;
+    }
+    let err = unsafe {
+        pyre_interpreter::error::PyError::from_exc_object(exc as pyre_object::PyObjectRef)
+    };
+    (err.kind != pyre_interpreter::PyErrorKind::StopIteration).then_some(err)
+}
+
 /// Drive one jd1 trace of `_unpackiterable_unknown_length`. The tracer executes
 /// each residual (`self.next`, `items.append`) concretely on the shared reds,
 /// so this advances the live iterator and grows the live list in place; the
@@ -5085,9 +5117,10 @@ fn drive_unpack_iterable_trace(
     // is novable with raw `(w_iterator, items)` reds, not a PyFrame the
     // frame-projecting `execute_assembler`/`handle_fail` path expects.
     if matches!(action, BackEdgeAction::RunCompiled) && jd1_enter_enabled() {
-        // Root the shared reds across the compiled run (it may collect).
-        // `items` is already pinned by `ln`; re-pinning is a harmless dup that
-        // pops with `ln`'s root scope. `w_iterator` is a bare `ln` local.
+        // Root the shared reds across the compiled run (it may collect). The
+        // scope guard truncates both entries on the way out; `pin_root` without
+        // one grows `ln`'s shadow stack by two per jd1 crossing.
+        let _enter_roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_iterator);
         pyre_object::gc_roots::pin_root(items);
         let before = unsafe { pyre_object::listobject::w_list_len(items) };
@@ -5123,6 +5156,14 @@ fn drive_unpack_iterable_trace(
                 break;
             };
             if is_finish {
+                // A finish exit can be the compiled drain's own
+                // `exit_frame_with_exception` (`finish_and_compile` publishes an
+                // `ExitFrameWithExceptionRef` trace as the loop for this green
+                // key, so the next crossing lands here). `compile.py:658-662`
+                // takes the value from result slot 0, not from `jf_guard_exc`.
+                if exit_layout.is_exception_exit {
+                    pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
+                }
                 break;
             }
             // A normal back-edge JUMP (`fail_index == u32::MAX`) or a guard exit
@@ -5135,16 +5176,9 @@ fn drive_unpack_iterable_trace(
             // the drain's `return Err(e)` arm. Resuming it would only walk the
             // drain's re-raise tail to re-derive the same error, so take it
             // here; the iteration is over either way.
-            if guard_exc != 0 {
-                let err = unsafe {
-                    pyre_interpreter::error::PyError::from_exc_object(
-                        guard_exc as pyre_object::PyObjectRef,
-                    )
-                };
-                if err.kind != pyre_interpreter::PyErrorKind::StopIteration {
-                    pending_err = Some(err);
-                    break;
-                }
+            if let Some(err) = drain_error_from_exc_ref(guard_exc) {
+                pending_err = Some(err);
+                break;
             }
             // compile.py:710-716 resume_in_blackhole: complete the in-flight
             // `next()`/`append` and run forward to the next merge point.
@@ -5177,10 +5211,21 @@ fn drive_unpack_iterable_trace(
                 after
             );
         }
-        // Discard any pending compiled-side StopIteration; `ln` re-derives its
-        // own loop exit.
-        let _ = pyre_interpreter::stack_check::drain_jit_pending_exception();
-        let _ = crate::call_jit::take_ca_exception();
+        // Clear the compiled-side slots so `ln` re-derives its own loop-exit
+        // StopIteration rather than seeing the drain's. Anything else left in
+        // them is a real error (a prologue-overflow `RecursionError` is the only
+        // producer today) and is promoted instead of discarded; an exit that
+        // already picked one keeps it, since that one is the earlier failure.
+        if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception()
+            && err.kind != pyre_interpreter::PyErrorKind::StopIteration
+        {
+            pending_err.get_or_insert(err);
+        }
+        if let Some(err) = crate::call_jit::take_ca_exception()
+            && err.kind != pyre_interpreter::PyErrorKind::StopIteration
+        {
+            pending_err.get_or_insert(err);
+        }
         // Parked last, so the clears above cannot swallow it.
         if let Some(err) = pending_err {
             pyre_interpreter::stack_check::park_jit_pending_error(err);
@@ -5291,12 +5336,28 @@ fn drive_unpack_iterable_trace(
         finish_args,
         finish_arg_types,
         exit_with_exception,
+        exc_value,
     }) = drove
     {
         // A straight-line trace that closes by finishing rather than
         // back-edging (the unpack loop's `StopIteration` exit reached before a
         // full body + back-edge): route through the same finish-compile path
         // jd0 uses so P1 still proves the recorded trace is assemblable.
+        //
+        // `pyjitpl.py:2558-2562 finishframe_exception` compiles the FINISH and
+        // then raises `ExitFrameWithExceptionRef(excvalue)`, which
+        // `warmspot.py:998-1005` propagates out of `ll_portal_runner`. The
+        // tracer ran the raising `next()` for real, so the error exists only
+        // here; without this the unpack silently returns a truncated list. jd1
+        // is entered from a merge-point hook with no return value, so the
+        // pending-exception slot carries it, exactly as the live-enter path
+        // above does. Parked *before* the compile — that is the one deliberate
+        // reordering against upstream — because the compile allocates and the
+        // slot is the only place the raw value is a GC root
+        // (`walk_jit_pending_exception`).
+        if exit_with_exception && let Some(err) = drain_error_from_exc_ref(exc_value) {
+            pyre_interpreter::stack_check::park_jit_pending_error(err);
+        }
         match meta.compile_finish_from_active_session(
             &finish_args,
             finish_arg_types,
@@ -7573,8 +7634,12 @@ fn compile_and_run_once(
     }
     let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
         .expect("registered portal must have a drained PyJitCode");
-    pjc.merge_entry_for(target_pc)
-        .expect("registered portal must have a static merge entry for the hot green");
+    // A body that stopped lowering at an `abort_permanent` carries no entry for
+    // the greens behind the abort, so the hot loop header has none.  There is
+    // no coordinate to start the walk from; interpret instead.
+    if pjc.merge_entry_for(target_pc).is_none() {
+        return None;
+    }
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     let had_compiled = driver.has_compiled_loop(green_key);

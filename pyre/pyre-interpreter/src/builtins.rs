@@ -9060,7 +9060,11 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             }
         }
         if pyre_object::is_none(obj) {
-            return 0;
+            // CPython 3.12+ `Objects/object.c:none_hash`; introduced by
+            // gh-99541 so singleton hashes are reproducible across processes.
+            // PyPy inherits identity hashing here, so this is an intentional
+            // CPython 3.14 surface delta rather than a PyPy semantic port.
+            return 0xFCA8_6420;
         }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);

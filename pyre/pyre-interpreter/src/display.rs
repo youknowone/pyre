@@ -262,9 +262,15 @@ pub unsafe fn tuple_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
 /// any other storage type.  Shared by `py_repr`'s leaf path and `py_str`'s
 /// fallback so a builtin leaf subclass that overrides only `__repr__`
 /// still `str()`s via the inherited builtin `tp_str`.
-unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Option<String> {
+unsafe fn builtin_leaf_repr_string(
+    obj: PyObjectRef,
+    tp: *const PyType,
+) -> Result<Option<String>, crate::PyError> {
     unsafe {
-        if std::ptr::eq(tp, &INT_TYPE as *const PyType) {
+        Ok(if std::ptr::eq(tp, &INT_TYPE as *const PyType) {
+            // A machine int is at most 19 digits, below the 640 floor
+            // `sys.set_int_max_str_digits` accepts, so it never trips the
+            // conversion-length limit the `long` arm has to check.
             Some(format!("{}", pyre_object::intobject::w_int_get_value(obj)))
         } else if std::ptr::eq(tp, &FLOAT_TYPE as *const PyType) {
             let float_obj = obj as *const pyre_object::floatobject::W_FloatObject;
@@ -275,8 +281,11 @@ unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Optio
                 pyre_object::w_complex_get_imag(obj),
             ))
         } else if std::ptr::eq(tp, &LONG_TYPE as *const PyType) {
-            let long_obj = obj as *const pyre_object::longobject::W_LongObject;
-            Some(format!("{}", &*(*long_obj).value))
+            // `long_to_decimal_string` enforces the
+            // `sys.set_int_max_str_digits` conversion-length limit, so the
+            // guard belongs to the conversion itself rather than to the
+            // `__repr__` descriptor that is only one of its callers.
+            Some(crate::builtins::int_to_decimal_string(obj)?)
         } else if std::ptr::eq(tp, &BOOL_TYPE as *const PyType) {
             let bool_obj = obj as *const pyre_object::boolobject::W_BoolObject;
             Some(
@@ -289,7 +298,7 @@ unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Optio
             )
         } else {
             None
-        }
+        })
     }
 }
 
@@ -591,7 +600,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         if let Some(result) = type_metaclass_dunder_obj(obj, "__repr__")? {
             return Ok(pyre_object::w_str_get_value(result).to_string());
         }
-        let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp) {
+        let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp)? {
             s
         } else if pyre_object::interp_array::is_array(obj) {
             crate::module::array::array_repr_string(obj)?

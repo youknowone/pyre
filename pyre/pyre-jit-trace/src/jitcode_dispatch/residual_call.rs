@@ -2389,19 +2389,20 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 ///   `_pow` but keeps a cold-path residual for nan/inf/negative-base operands.
 /// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm in either table.
 ///
-/// Known limitation: both flags describe the callee's INCOMING arguments, not
-/// the operands of the binop itself, which this straight-line scan cannot name.
-/// A body can reach a non-numeric operand through the two residuals the scan
-/// already treats as replay-safe reads (`LoadConst` / `LoadGlobal`), and a
-/// user `__add__` behind one of those would be a live-heap effect the claim
-/// misses.  The in-place tags do not widen that hole: an in-place result must
-/// be stored back, and every store target outside the callee's own registers
-/// (`STORE_GLOBAL` / `STORE_ATTR` / `STORE_SUBSCR`) is itself an unproven
-/// residual that fails this scan first.
+/// Both flags describe the callee's INCOMING arguments, so on their own they
+/// say nothing about the operands of any particular binop.  A body reaches an
+/// operand they do not cover through the residuals this scan treats as
+/// replay-safe reads: in `def f(x): return G - x` the left operand is whatever
+/// `G` names, and a numeric subclass there defines its own `__sub__`, declines
+/// the specialization, and leaves behind a live-heap effect a replay would
+/// double.  `binop_safe_ref_regs` carries the missing proof — the caller sets
+/// a register only while it provably holds an immutable builtin — and both
+/// operand registers must be in it.
 pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     body_code: &[u8],
     args_all_exact_numeric: bool,
     args_all_exact_plain_int: bool,
+    binop_safe_ref_regs: &[bool; u8::MAX as usize + 1],
     d: &DecodedOp,
     num_regs_i: usize,
     constants_i: &[i64],
@@ -2417,12 +2418,28 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     {
         return false;
     }
-    // `iIR`: funcptr i-reg, then the I-list.  The first I-list item is the
-    // BINARY_OP tag.  It must be in the callee's immutable constants window;
-    // a runtime tag could select an operation outside the accepted set.
+    // `iIR`: the R-list follows the I-list.  `walker_int_specialization_operands`
+    // / `walker_float_specialization_operands` read exactly `r_args[0]` (lhs)
+    // and `r_args[1]` (rhs) and decline any other arity, so demand the same
+    // shape here and require both operands to be proven.
     let Some(&i_len) = body_code.get(d.pc + 2) else {
         return false;
     };
+    let r_len_pc = d.pc + 1 + 1 + 1 + i_len as usize;
+    if body_code.get(r_len_pc) != Some(&2) {
+        return false;
+    }
+    let (Some(&lhs_reg), Some(&rhs_reg)) =
+        (body_code.get(r_len_pc + 1), body_code.get(r_len_pc + 2))
+    else {
+        return false;
+    };
+    if !binop_safe_ref_regs[lhs_reg as usize] || !binop_safe_ref_regs[rhs_reg as usize] {
+        return false;
+    }
+    // The first I-list item is the BINARY_OP tag.  It must be in the callee's
+    // immutable constants window; a runtime tag could select an operation
+    // outside the accepted set.
     if i_len == 0 {
         return false;
     }

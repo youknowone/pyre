@@ -2308,6 +2308,19 @@ pub(crate) fn call_format_dispatch(
 /// `str(value)`.  Shared by `format()`, the `FormatSimple`/`FormatWithSpec`
 /// f-string opcodes, and `str.format` field formatting.
 pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+    // Fast path for common types.  An exact `str` or `int` cannot carry a
+    // `__format__` override, and with an empty spec its builtin `__format__`
+    // is `str(value)` — so resolve and call nothing.  `bool` is excluded (it
+    // is a distinct type with its own `__format__`), as is any subclass.
+    if spec.is_empty()
+        && unsafe {
+            pyre_object::is_exact_type(val, &pyre_object::STR_TYPE)
+                || pyre_object::is_exact_type(val, &pyre_object::INT_TYPE)
+                || pyre_object::is_exact_type(val, &pyre_object::LONG_TYPE)
+        }
+    {
+        return Ok(unsafe { crate::py_str_wtf8(val)? });
+    }
     // A class instance always dispatches to its `__format__` (its own
     // override or the inherited `object.__format__`).  A builtin subclass
     // dispatches whenever it overrides `__format__` with anything other than

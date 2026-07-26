@@ -2958,6 +2958,37 @@ impl std::error::Error for AnnotatorError {}
 // union() dispatch (A4.6) — model.py:750-784 + binaryop.py pair().union().
 // ---------------------------------------------------------------------------
 
+/// Short identity of a `union` operand for the unhandled-pair error text.
+///
+/// The bare [`SomeValueTag`] is often not enough to act on: `Instance`
+/// covers every classdef, and the failing pair is usually diagnosed by
+/// *which* class collided, not by the variant. This renders the one
+/// discriminating field for the two payload-bearing variants that show up
+/// in unhandled pairs and falls back to the tag for the rest, so the error
+/// stays one short line. Same motivation as the `SomeInstance ∪
+/// SomeInstance` arm naming its two classdefs.
+fn union_operand_id(s: &SomeValue) -> String {
+    match s {
+        SomeValue::Instance(inst) => match &inst.classdef {
+            Some(cd) => format!("Instance({})", cd.borrow().name),
+            None => "Instance(classdef-less)".to_string(),
+        },
+        SomeValue::Ptr(ptr) => {
+            use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+            let target = match &ptr.ll_ptrtype.TO {
+                PtrTarget::Struct(st) => st._name.clone(),
+                PtrTarget::Opaque(op) => op.tag.clone(),
+                PtrTarget::Func(_) => "Func".to_string(),
+                PtrTarget::Array(_) => "Array".to_string(),
+                PtrTarget::FixedSizeArray(_) => "FixedSizeArray".to_string(),
+                PtrTarget::ForwardReference(_) => "ForwardReference".to_string(),
+            };
+            format!("Ptr({target})")
+        }
+        other => format!("{:?}", other.tag()),
+    }
+}
+
 /// RPython `union(s1, s2)` (model.py:750-769).
 ///
 /// The join operation in the lattice of annotations. Returns the most
@@ -3424,7 +3455,18 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         _ => Err(UnionError {
             lhs: s1.clone(),
             rhs: s2.clone(),
-            msg: "no upstream pair(s1, s2).union() handler in current subset".into(),
+            // Name the two colliding operands, for the same reason the
+            // `SomeInstance` arm above names its classdefs: both sides
+            // often render as the bare `<other>` `KnownType`, which makes
+            // the skip-classified panic undiagnosable.  The classifier
+            // phrase is kept verbatim and first — `cutover.rs:1291` /
+            // `:2718` match it with `contains`.
+            msg: format!(
+                "no upstream pair(s1, s2).union() handler in current subset: \
+                 {} ∪ {}",
+                union_operand_id(s1),
+                union_operand_id(s2)
+            ),
         }),
     }
 }

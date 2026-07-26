@@ -635,7 +635,8 @@ struct TracebackNodeSite {
     /// `PyTraceback.frame`.  `OpRef::NONE` when the walk has no materialized
     /// frame for this level — a branchless leaf inlined without one leaves
     /// the color unseeded.  Recording NONE as a `SetfieldGc` operand would
-    /// put a bogus box in the trace, so every caller has to resolve it.
+    /// put a bogus box in the trace, so every caller has to DECLINE on it and
+    /// leave the node to the frame-fabricating hook.
     frame: OpRef,
     w_code: usize,
     last_instruction: i32,
@@ -764,10 +765,11 @@ fn emit_traceback_node<Sym: WalkSym>(
 ///
 /// Every op is optimizer-visible, so escape analysis deletes the node when
 /// the exception never escapes.  The opaque
-/// `record_{,inline_,top_level_}application_traceback` hooks cannot be:
-/// they are `CanRaise` `call_void_typed_with_effect`s that force all lazy
-/// sets and materialize the exception, and the top-level one additionally
-/// passes the virtualizable frame box, forcing the vable.
+/// `record_{,inline_,top_level_}application_traceback` hooks cannot be: they
+/// carry `default_effect_info()` — `EffectInfo::MOST_GENERAL`, i.e. random
+/// effects — so the optimizer escapes every argument, forces all lazy sets
+/// and drops the whole heapcache, and the top-level one additionally passes
+/// the virtualizable frame box, forcing the vable.
 ///
 /// Returns `false` when nothing was emitted; the caller then keeps the
 /// opaque hook.
@@ -799,6 +801,15 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // fabricates one from the promoted callee metadata
         // (`record_inline_traceback_for_recording`), so `tb_frame` keeps
         // answering a real frame there; a null here would lose it.
+        //
+        // Top level has no such hook fallback: `record_top_level_application_
+        // traceback` resolves its frame operand from the same unseeded color
+        // and declines too, so that level contributes no node at all.  A
+        // shorter traceback than `record_application_traceback` would build is
+        // the deliberate trade — the frame box a node needs is exactly what
+        // this walk lacks, and the vable box is not a substitute (a traceback
+        // outlives the frame, so storing it demands the escape marking this
+        // path does not perform).
         return false;
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
@@ -815,30 +826,35 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
 /// exception's current traceback.  Sound only where the caller has proven
 /// the exception carries no prior node (`fbw_built_exc_take`); the general
 /// case is [`record_prepend_application_traceback`].
+///
+/// Returns `false` when nothing was emitted; the caller then keeps the
+/// opaque hook.
 fn record_fresh_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) {
+) -> bool {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return;
+        return false;
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return;
+        return false;
     }
-    let Some(mut site) = traceback_node_site(ctx, opcode_position) else {
-        return;
+    let Some(site) = traceback_node_site(ctx, opcode_position) else {
+        return false;
     };
     if site.frame.is_none() {
-        // No hook fallback on this route — the exception is one this walk
-        // built, so a frameless node still beats dropping it.  `tb_frame`
-        // answers None and the GC custom trace skips the null edge.
-        site.frame = ctx.trace_ctx.const_ref(0);
+        // Same disposition as the prepend sibling, for the same reason: the
+        // opaque inline hook fabricates a frame from the promoted callee
+        // metadata, while a null one answers None and breaks every consumer
+        // that follows `tb_frame.f_code` — `traceback.print_exc` among them.
+        return false;
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
     emit_traceback_node(ctx, exc, kind, &site, w_next);
+    true
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -2185,14 +2201,30 @@ pub fn walk<Sym: WalkSym>(
         //
         // The walker layer holds `&mut TraceCtx` and cannot reach
         // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
-        // `note_root_trace_too_long` is the warm-state half the retired loop
-        // called (`trace_next_iteration` + `mark_force_finish_tracing`, so the
-        // next attempt cuts the trace instead of growing it again). The
-        // `find_biggest_function` → `disable_noninlinable_function` half
-        // (pyjitpl.py:2793) still only runs on the per-opcode path.
-        if ctx.trace_ctx.is_too_long() {
+        // `note_root_trace_too_long` carries the warm-state half, split into
+        // the loop and bridge arms `prepare_trace_segmenting` (pyjitpl.py:2833)
+        // keeps apart. The `find_biggest_function` →
+        // `disable_noninlinable_function` half (pyjitpl.py:2817) still only
+        // runs on the per-opcode path.
+        //
+        // DEVIATION from `SwitchToBlackhole(ABORT_TOO_LONG)`, which resumes in
+        // the blackhole from the traced state: a `DispatchError` resumes by
+        // re-interpreting the iteration from the trace entry, so an effect the
+        // walk already executed and cannot roll back would be applied twice.
+        // Every other walker abort upholds that invariant by declining BEFORE
+        // it executes such an effect (see `InplaceContainerMutationUnsupported`
+        // and the `FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS` effect-free check); a
+        // length check fires at an arbitrary opcode instead, so it must consult
+        // the odometer itself. `fbw_executed_effect_count` is reset per walk, so
+        // zero means nothing the replay would redo has run yet. A walk that is
+        // already past that point keeps recording — the pre-existing unbounded
+        // behaviour — rather than corrupt the heap.
+        if ctx.trace_ctx.is_too_long() && fbw_executed_effect_count() == 0 {
             let ops = ctx.trace_ctx.num_recorded_ops();
-            crate::state::note_root_trace_too_long(ctx.trace_ctx.root_green_key());
+            crate::state::note_root_trace_too_long(
+                ctx.trace_ctx.current_merge_points_first_greenkey(),
+                ctx.trace_ctx.resumekey_original_loop_token().cloned(),
+            );
             return Err(DispatchError::TraceTooLong {
                 pc: opcode_position,
                 ops,
@@ -6106,6 +6138,20 @@ fn walker_float_specialization_operands<Sym: WalkSym>(
     };
     let (lhs_is_int, lhs_f64) = coerce(lhs_obj)?;
     let (rhs_is_int, rhs_f64) = coerce(rhs_obj)?;
+    // A numeric subclass keeps the builtin `ob_type` layout while its
+    // Python-visible class lives in `w_class`.  The raw float specialization
+    // bypasses special-method dispatch — and the `guard_class` it emits reads
+    // `ob_type`, so it would not catch the subclass at runtime either — so only
+    // exact builtin floats/ints/bools may enter it; subclasses continue through
+    // the residual BINARY_OP / COMPARE_OP.  Mirrors the same check in
+    // `walker_int_specialization_operands`.
+    unsafe {
+        if !pyre_object::is_exact_builtin_instance(lhs_obj)
+            || !pyre_object::is_exact_builtin_instance(rhs_obj)
+        {
+            return None;
+        }
+    }
     if lhs_is_int && rhs_is_int {
         return None;
     }
@@ -9313,31 +9359,36 @@ fn handle<Sym: WalkSym>(
             if !recording_instruction_is_bare_reraise(ctx, op.pc) {
                 let caught_in_frame = try_catch_exception_at(code, op.next_pc).is_some();
                 if caught_in_frame {
-                    if freshly_normalized {
-                        record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc);
+                    // Unless this walk built the exception it may already
+                    // carry callee nodes, so the general case prepends onto
+                    // its chain rather than starting a fresh one.  Either
+                    // recorder declining leaves the node to the opaque hook,
+                    // which builds a frame from the callee's code + globals
+                    // for the level the walk has no box for.  That frame
+                    // carries no locals and its own identity, so it is a
+                    // weaker node than the live one — still a node whose
+                    // `tb_frame.f_code` answers the right code object.
+                    let emit_runtime = if freshly_normalized {
+                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)
                     } else {
-                        // The exception may already carry callee nodes, so
-                        // the node prepends onto its chain rather than
-                        // starting a fresh one.
-                        let emit_runtime =
-                            !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc);
-                        record_inline_application_traceback(
-                            ctx,
-                            exc,
-                            concrete_exc,
-                            op.pc,
-                            false,
-                            emit_runtime,
-                        );
-                        record_top_level_application_traceback(
-                            ctx,
-                            exc,
-                            concrete_exc,
-                            op.pc,
-                            false,
-                            emit_runtime,
-                        );
-                    }
+                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)
+                    };
+                    record_inline_application_traceback(
+                        ctx,
+                        exc,
+                        concrete_exc,
+                        op.pc,
+                        false,
+                        emit_runtime,
+                    );
+                    record_top_level_application_traceback(
+                        ctx,
+                        exc,
+                        concrete_exc,
+                        op.pc,
+                        false,
+                        emit_runtime,
+                    );
                 }
             }
             // Route the top-level raise through `SubRaise` so walk()'s

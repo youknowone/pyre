@@ -339,13 +339,27 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     block
 }
 
-/// List-grow allocator on the Phase L2 nursery path. Pins the old block's
-/// `live_len` items across the new (collecting) allocation, copies from
-/// the relocated shadow-stack slots, NULL-fills the spare tail, then
-/// hands the old block to [`dealloc_list_items_block`] (which no-ops on a
-/// GC-managed block — the collector reclaims it). `old` may be null with
-/// `live_len == 0` (fresh allocation). Degrades to the `std::alloc`
-/// [`grow_list_items_block`] when the gate is off.
+/// List-grow allocator on the Phase L2 nursery path. Pins the OLD BLOCK across
+/// the new (collecting) allocation, copies its `live_len` items into the new
+/// one, NULL-fills the spare tail, then hands the old block to
+/// [`dealloc_list_items_block`] (which no-ops on a GC-managed block — the
+/// collector reclaims it). `old` may be null with `live_len == 0` (fresh
+/// allocation). Degrades to the `std::alloc` [`grow_list_items_block`] when the
+/// gate is off.
+///
+/// The block itself is the root, not its items. A block is a traced GC array of
+/// GC pointers (`PY_OBJECT_ARRAY_GC_TYPE_ID` is registered `TypeInfo::varsize`
+/// over `PyObjectRef` slots, `pyre-jit/src/eval.rs`), so a collection during the
+/// allocation below keeps every item reachable through it and relocates the
+/// slots in place — reading them back afterwards yields post-collection
+/// addresses without naming them one at a time. That is also the upstream
+/// shape: `_ll_list_resize_really` (rlist.py:262-267) mallocs the new array and
+/// `ll_arraycopy`s into it, with no per-item root bracket anywhere.
+///
+/// Pinning per item instead made a grow cost `2 * live_len` GC-ownership
+/// queries — each a TLS lookup, a `RefCell` borrow, an arena range test and a
+/// rawmalloced-set probe — so the 1% of appends that resize dominated the
+/// profile of every Object-strategy list build.
 pub unsafe fn grow_list_items_block_gc(
     old: *mut ItemsBlock,
     new_cap: usize,
@@ -356,14 +370,23 @@ pub unsafe fn grow_list_items_block_gc(
     }
     let _roots = crate::gc_roots::push_roots();
     let save = crate::gc_roots::shadow_stack_len();
-    let old_base = unsafe { items_block_items_base(old) };
-    for i in 0..live_len {
-        crate::gc_roots::pin_root(unsafe { *old_base.add(i) });
+    // Only a GC-owned block needs rooting: `alloc_items_block_gc` falls back to
+    // `std::alloc` when the nursery declines, and such a block never moves, so
+    // the incoming pointer stays valid on its own. A null `old` carries no items.
+    let root_old = !old.is_null() && crate::gc_hook::try_gc_owns_object(old as *mut u8);
+    if root_old {
+        crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
     }
     let new_block = unsafe { alloc_items_block_gc(new_cap) };
     let new_base = unsafe { items_block_items_base(new_block) };
-    for i in 0..live_len {
-        unsafe { *new_base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    let old = if root_old {
+        crate::gc_roots::shadow_stack_get(save) as *mut ItemsBlock
+    } else {
+        old
+    };
+    if live_len > 0 {
+        let old_base = unsafe { items_block_items_base(old) };
+        unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, live_len) };
     }
     for i in live_len..new_cap {
         unsafe { *new_base.add(i) = PY_NULL };

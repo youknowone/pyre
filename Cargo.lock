@@ -2213,6 +2213,7 @@ dependencies = [
  "rustpython-wtf8",
  "siphasher",
  "stacker",
+ "widestring",
  "windows-sys 0.61.2",
 ]
 

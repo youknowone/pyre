@@ -366,6 +366,68 @@ pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
 };
 
+/// `EF_ELIDABLE_CANNOT_RAISE` with `OS_INT_UDIV` oopspec — unsigned `/`.
+/// RPython parity: `rint.py:434 ll_uint_py_div` carries
+/// `@jit.oopspec("int.udiv(x, y)")`, and jtransform.py:2043-2047
+/// `_handle_int_special` classifies every `int.*div`/`int.*mod` oopspec as
+/// `EF_ELIDABLE_CANNOT_RAISE`.
+///
+/// Unsigned division deliberately has NO trace opcode. RPython removed
+/// `UINT_FLOORDIV` from the resop set (2016-05-10, "Remove divisions and
+/// modulos from regular JIT operations, uses oopspec calls") and routes it
+/// through this residual call instead, exactly as the signed
+/// [`INT_PY_DIV_EFFECT_INFO`] does — the oopspec index, not an opcode, is
+/// what the optimizer matches on (`rewrite.rs` `optimize_call_int_udiv`).
+/// Callee is pure: no heap touched, no GC trigger, no raise.
+pub const UINT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::ElidableCannotRaise,
+    oopspecindex: OopSpecIndex::IntUdiv,
+    pyre_helper: PyreHelperKind::None,
+    _readonly_descrs_fields: Some(Vec::new()),
+    _write_descrs_fields: Some(Vec::new()),
+    _readonly_descrs_arrays: Some(Vec::new()),
+    _write_descrs_arrays: Some(Vec::new()),
+    _readonly_descrs_interiorfields: Some(Vec::new()),
+    _write_descrs_interiorfields: Some(Vec::new()),
+    readonly_descrs_fields: Some(Vec::new()),
+    write_descrs_fields: Some(Vec::new()),
+    readonly_descrs_arrays: Some(Vec::new()),
+    write_descrs_arrays: Some(Vec::new()),
+    readonly_descrs_interiorfields: Some(Vec::new()),
+    write_descrs_interiorfields: Some(Vec::new()),
+    can_invalidate: false,
+    can_collect: false,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
+/// Counterpart of [`UINT_PY_DIV_EFFECT_INFO`] for unsigned `%`.
+/// RPython parity: `rint.py:525 ll_uint_py_mod` carries
+/// `@jit.oopspec("int.umod(x, y)")`.
+pub const UINT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::ElidableCannotRaise,
+    oopspecindex: OopSpecIndex::IntUmod,
+    pyre_helper: PyreHelperKind::None,
+    _readonly_descrs_fields: Some(Vec::new()),
+    _write_descrs_fields: Some(Vec::new()),
+    _readonly_descrs_arrays: Some(Vec::new()),
+    _write_descrs_arrays: Some(Vec::new()),
+    _readonly_descrs_interiorfields: Some(Vec::new()),
+    _write_descrs_interiorfields: Some(Vec::new()),
+    readonly_descrs_fields: Some(Vec::new()),
+    write_descrs_fields: Some(Vec::new()),
+    readonly_descrs_arrays: Some(Vec::new()),
+    write_descrs_arrays: Some(Vec::new()),
+    readonly_descrs_interiorfields: Some(Vec::new()),
+    write_descrs_interiorfields: Some(Vec::new()),
+    can_invalidate: false,
+    can_collect: false,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
 /// `EF_ELIDABLE_CANNOT_RAISE` (effectinfo.py:17). Selected by
 /// `call.py:299 getcalldescr` when `_canraise(op) == False` for an
 /// elidable callee — `pyjitpl.py:2126 do_residual_call` records

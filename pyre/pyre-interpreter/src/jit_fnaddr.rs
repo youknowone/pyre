@@ -2475,6 +2475,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             &crate::function::BUILTIN_FUNCTION_TYPE as *const _ as i64,
         ),
         (
+            "function::SLOT_WRAPPER_TYPE",
+            &crate::function::SLOT_WRAPPER_TYPE as *const _ as i64,
+        ),
+        (
             "gateway::BUILTIN_CODE_TYPE",
             &crate::gateway::BUILTIN_CODE_TYPE as *const _ as i64,
         ),

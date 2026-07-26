@@ -4244,6 +4244,31 @@ pub extern "C" fn ll_int_py_mod(a: i64, b: i64) -> i64 {
     }
 }
 
+/// RPython `rint.py:434-436 ll_uint_py_div` (oopspec `int.udiv`).  The
+/// `OS_INT_UDIV` residual call lands here at runtime.  Unsigned division
+/// has no sign correction to make — `llop.uint_floordiv` translates to
+/// the C macro `OP_UINT_FLOORDIV(x, y, r) r = (x) / (y)` — so the whole
+/// helper is the raw unsigned quotient of the two operands' bit patterns.
+///
+/// Unlike the signed [`ll_int_py_div`] there is no `INT_MIN / -1`
+/// corner: every pair of `u64` operands with a nonzero divisor has a
+/// representable quotient.  The zero divisor remains a precondition
+/// (`wrapping_div(0)` panics in every Rust build), spelled in RPython as
+/// the `rint.py:438 ll_uint_py_div_zer` wrapper whose check is inlined
+/// into the caller and becomes a runtime guard in the trace.
+///
+/// `extern "C"` for the same residual-call ABI reason as [`ll_int_py_div`].
+pub extern "C" fn ll_uint_py_div(a: i64, b: i64) -> i64 {
+    ((a as u64) / (b as u64)) as i64
+}
+
+/// RPython `rint.py:525-527 ll_uint_py_mod` (oopspec `int.umod`).  The
+/// unsigned remainder needs no sign correction either; see
+/// [`ll_uint_py_div`] for the zero-divisor precondition.
+pub extern "C" fn ll_uint_py_mod(a: i64, b: i64) -> i64 {
+    ((a as u64) % (b as u64)) as i64
+}
+
 /// RPython `support.py:255-264 _ll_2_int_floordiv`: C-truncating
 /// floor-division helper.  The upstream comment calls it "the reverse
 /// of `rpython.rtyper.rint.ll_int_py_div()`" — i.e. given an input

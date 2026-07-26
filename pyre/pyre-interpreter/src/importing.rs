@@ -525,6 +525,10 @@ pub fn install_builtin_modules() {
     // module must exist for the import machinery (and `import site`) to start.
     #[cfg(windows)]
     pyre_install_module!(winreg);
+    // `subprocess` picks its Windows implementation from the presence of
+    // `msvcrt`; `getpass` reads the console through it.
+    #[cfg(all(windows, feature = "host_env"))]
+    pyre_install_module!(msvcrt);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));

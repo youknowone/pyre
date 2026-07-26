@@ -13,6 +13,12 @@ pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function")
 /// Type descriptor for module-level builtins.
 pub static BUILTIN_FUNCTION_TYPE: PyType =
     pyre_object::pyobject::new_pytype("builtin_function_or_method");
+/// CPython-compatible slot wrapper descriptor.
+///
+/// The public type is distinct from PyPy's `FunctionWithFixedCode`, while the
+/// payload deliberately reuses [`Function`]: both are immutable BuiltinCode
+/// carriers and therefore have identical GC edges and call ABI.
+pub static SLOT_WRAPPER_TYPE: PyType = pyre_object::pyobject::new_pytype("wrapper_descriptor");
 
 /// User-defined function object.
 ///
@@ -518,6 +524,11 @@ pub fn function_new_builtin(
     )
 }
 
+/// Allocate an immutable slot-wrapper descriptor backed by `BuiltinCode`.
+pub fn function_new_slot_wrapper(code: *const (), name: String) -> PyObjectRef {
+    function_new_impl(&SLOT_WRAPPER_TYPE, code, name, PY_NULL, PY_NULL, false)
+}
+
 /// function.py:385-388 — `_check_code_mutable(attr)`:
 ///
 /// ```python
@@ -559,6 +570,21 @@ pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
 #[inline]
 pub unsafe fn is_function(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
+}
+
+/// Whether `obj` is a CPython-compatible slot-wrapper descriptor.
+#[inline]
+pub unsafe fn is_slot_wrapper(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &SLOT_WRAPPER_TYPE) }
+}
+
+/// Function-layout carriers accepted by the interpreter call machinery.
+///
+/// Keep this separate from [`is_function`]: wrapper descriptors must not
+/// expose Python-function metadata such as `__code__` or `__globals__`.
+#[inline]
+pub unsafe fn is_function_carrier(obj: PyObjectRef) -> bool {
+    unsafe { is_function(obj) || is_slot_wrapper(obj) }
 }
 
 /// Whether this Function carrier wraps an interp-level BuiltinCode rather

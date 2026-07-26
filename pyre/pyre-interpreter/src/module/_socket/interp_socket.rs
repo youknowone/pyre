@@ -1973,7 +1973,34 @@ fn socket_from_fd(
     ty: libc::c_int,
     proto: libc::c_int,
 ) -> pyre_object::PyObjectRef {
-    let obj = pyre_object::w_instance_new(socket_type());
+    socket_from_fd_with_class(fd, family, ty, proto, socket_type())
+}
+
+#[cfg(unix)]
+fn socket_from_fd_with_class(
+    fd: libc::c_int,
+    family: libc::c_int,
+    ty: libc::c_int,
+    proto: libc::c_int,
+    cls: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    // PyPy's typeobject.py allocate_instance preserves the requested
+    // W_TypeObject when W_Socket.descr_init initialises a user subclass.
+    // The stdlib relies on this for `class socket(_socket.socket)`: losing
+    // `cls` here also loses its Python-level makefile() and lifecycle state.
+    let obj = pyre_object::w_instance_new(cls);
+    socket_init_state(obj, fd, family, ty, proto);
+    obj
+}
+
+#[cfg(unix)]
+fn socket_init_state(
+    obj: pyre_object::PyObjectRef,
+    fd: libc::c_int,
+    family: libc::c_int,
+    ty: libc::c_int,
+    proto: libc::c_int,
+) {
     socket_set_attr(obj, "_fd", pyre_object::w_int_new(fd as i64));
     socket_set_attr(obj, "_family", pyre_object::w_int_new(family as i64));
     socket_set_attr(obj, "_type", pyre_object::w_int_new(ty as i64));
@@ -1983,7 +2010,6 @@ fn socket_from_fd(
     // `_drop` followed by no `_reuse` closes the underlying fd exactly
     // once.
     socket_set_attr(obj, "_usecount", pyre_object::w_int_new(1));
-    obj
 }
 
 /// `rsocket.py:1694 get_socket_family` — the family of an existing fd,
@@ -2133,18 +2159,40 @@ fn pack_inet_addr(
             )
         };
         if r != 1 {
-            // Fall back to gethostbyname for hostnames.
-            let he = unsafe { gethostbyname(c_host.as_ptr()) };
-            if he.is_null() {
+            // `rsocket.makeipaddr` resolves names through getaddrinfo and
+            // copies the resulting address into its INETAddress.  Do the
+            // same here: gethostbyname's process-global result buffer is not
+            // re-entrant and was corrupted by socketserver worker threads.
+            let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+            hints.ai_family = libc::AF_INET;
+            let mut result: *mut libc::addrinfo = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut result)
+            };
+            if rc != 0 || result.is_null() {
                 return Err(crate::PyError::os_error(format!(
                     "name or service not known: {host}"
                 )));
             }
-            unsafe {
-                let h = &*he;
-                let addr_ptr = *h.h_addr_list;
-                sin.sin_addr.s_addr = *(addr_ptr as *const u32);
+            let mut current = result;
+            let mut resolved = None;
+            while !current.is_null() {
+                let info = unsafe { &*current };
+                if info.ai_family == libc::AF_INET
+                    && !info.ai_addr.is_null()
+                    && info.ai_addrlen as usize >= core::mem::size_of::<libc::sockaddr_in>()
+                {
+                    let resolved_addr =
+                        unsafe { &*(info.ai_addr as *const libc::sockaddr_in) };
+                    resolved = Some(resolved_addr.sin_addr);
+                    break;
+                }
+                current = info.ai_next;
             }
+            unsafe { libc::freeaddrinfo(result) };
+            sin.sin_addr = resolved.ok_or_else(|| {
+                crate::PyError::os_error(format!("name or service not known: {host}"))
+            })?;
         }
         Ok((
             storage,
@@ -2252,22 +2300,31 @@ fn unpack_inet_addr(storage: &libc::sockaddr_storage) -> pyre_object::PyObjectRe
 
 #[cfg(unix)]
 fn init_socket_type(ns: pyre_object::PyObjectRef) {
-    // The `socket` callable: socket(family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None)
-    // CPython lets you pass a pre-existing fd via fileno=; we honor that
-    // by wrapping the fd directly instead of calling socket(2).
+    // `interp_socket.py:W_Socket.__init__` first creates an empty wrapper;
+    // `descr_init` below installs the RSocket state.  Keeping allocation and
+    // initialisation separate is required when socket.py's Python subclass
+    // explicitly calls `_socket.socket.__init__(self, ...)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
         crate::make_builtin_function("__new__", |args| {
-            // args = (cls, family, type, proto, fileno).  The cls slot is
-            // present when the type is invoked as `socket(...)`; keyword
-            // arguments arrive as a trailing `__pyre_kw__` dict.
-            let after_cls = if !args.is_empty() && !unsafe { pyre_object::is_int(args[0]) } {
-                &args[1..]
-            } else {
-                args
-            };
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(after_cls);
+            let cls = args
+                .first()
+                .copied()
+                .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
+                .unwrap_or_else(socket_type);
+            Ok(pyre_object::w_instance_new(cls))
+        }),
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        ns,
+        "__init__",
+        crate::make_builtin_function("__init__", |args| {
+            // `interp_socket.py:216 descr_init(family=-1, type=-1, proto=-1,
+            // w_fileno=None)`.
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            let after_self = if args.is_empty() { args } else { &args[1..] };
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(after_self);
             // `descr_init`'s `@unwrap_spec` signature rejects unknown
             // keywords and a parameter supplied both by position and name.
             crate::builtins::kwarg_reject_unknown(
@@ -2338,7 +2395,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 unsafe {
                     libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
-                return Ok(socket_from_fd(fd, family, ty, proto));
+                socket_init_state(obj, fd, family, ty, proto);
+                return Ok(pyre_object::w_none());
             }
             // `interp_socket.py:253-265` — wrap an existing fd.  A float
             // fileno is a TypeError, a negative fd a ValueError, and any
@@ -2365,7 +2423,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if proto == -1 {
                 proto = socket_get_so_protocol(fd)?;
             }
-            Ok(socket_from_fd(fd, family, ty, proto))
+            socket_init_state(obj, fd, family, ty, proto);
+            Ok(pyre_object::w_none())
         }),
     ) };
 

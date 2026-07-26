@@ -455,16 +455,25 @@ pub fn park_jit_pending_error(mut err: PyError) {
 /// `W_BaseException` is reachable from nothing else until the next call
 /// boundary drains it, and the drain crosses collecting code
 /// (`next()`/`__next__`). Registered once at JIT init next to the other
-/// `register_extra_root_walker` slots.
+/// `register_extra_root_walker` slots, which reach only the *collecting*
+/// thread's cell — every other mutator's cell is reached through the
+/// per-mutator root area built from
+/// [`capture_jit_pending_exception_area`].
 pub fn walk_jit_pending_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    TL_JIT_PENDING_EXCEPTION.with(|slot| {
-        let obj = slot.get();
-        if obj != 0 {
-            let mut r = majit_ir::GcRef(obj as usize);
-            visitor(&mut r);
-            slot.set(r.0 as i64);
-        }
+    TL_JIT_PENDING_EXCEPTION.with(|slot| unsafe {
+        crate::eval::walk_raw_exception_cell_area(slot as *const _, visitor)
     });
+}
+
+/// Address of this thread's pending-exception cell, for registration in the
+/// per-mutator `PyFrameRootArea` alongside the other thread-local exception
+/// carriers. `rthread.py:429-437 _trace_tlref` traces a GC-pointer thread
+/// local by enumerating *every* thread's block
+/// (`threadlocal.c:86-93 _RPython_ThreadLocals_Enum`); resolving the TLS on
+/// whichever thread happened to start the collection would miss a stopped
+/// mutator's parked exception.
+pub(crate) fn capture_jit_pending_exception_area() -> *const std::cell::Cell<i64> {
+    TL_JIT_PENDING_EXCEPTION.with(|slot| slot as *const _)
 }
 
 /// rpython/translator/c/src/stack.h:42 `LL_stack_criticalcode_start`.

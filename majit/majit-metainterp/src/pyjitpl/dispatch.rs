@@ -1783,10 +1783,24 @@ where
         // shortcuts to Abort for that case, so here the exception slot
         // is guaranteed non-zero).
         if let Some(exc_box) = self.last_exception_box {
+            // `pyjitpl.py:2531 excvalue = self.last_exc_value`, snapshotted
+            // next to `last_exc_box` so the consumer can raise it after the
+            // compile (`pyjitpl.py:2558-2562`).
+            let exc_value = self.last_exception_value;
+            // Upstream's `last_exc_value` dies with the MetaInterp the moment
+            // `finishframe_exception` raises out of it.  Pyre's half of that
+            // state is the `BH_LAST_EXC_VALUE` TLS shared with the blackhole,
+            // and every *other* way out of a frame clears it (`clear_exception`
+            // at each `BC_*_RETURN`).  This exit hands the value to the caller
+            // on the action instead, so the channel closes here too — leaving it
+            // set makes the interpreter re-surface the trace's exception at its
+            // next residual-call boundary.
+            self.clear_exception();
             TraceAction::Finish {
                 finish_args: vec![exc_box],
                 finish_arg_types: vec![majit_ir::Type::Ref],
                 exit_with_exception: true,
+                exc_value,
             }
         } else {
             TraceAction::Abort
@@ -3599,6 +3613,21 @@ where
                     _ => self.read_int_reg(value_reg),
                 };
                 let descr_index = descr.index();
+                // `execute_setarrayitem_gc` (pyjitpl.py:2742) records through
+                // `execute_and_record` → `_record_helper` (pyjitpl.py:2694),
+                // which runs `heapcache.invalidate_caches` → `mark_escaped` →
+                // `_escape_from_write` (heapcache.py:217-241) *before* the op is
+                // appended: a ref written into an already-escaped array escapes
+                // too, or `invalidate_unescaped` keeps its cached fields alive
+                // across the next residual call while the callee can reach and
+                // mutate it through the array.  `clear_caches_not_necessary`
+                // (heapcache.py:314) lists SETARRAYITEM_GC, so only the
+                // mark-escaped half runs.  Same shape as BC_RAW_STORE_I above.
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::SetarrayitemGc,
+                    None,
+                    &[array_opref, index_opref, value_opref],
+                );
                 ctx.record_op_with_descr(
                     OpCode::SetarrayitemGc,
                     &[array_opref, index_opref, value_opref],
@@ -5153,6 +5182,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Int],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5187,6 +5217,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Int],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5217,6 +5248,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Ref],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5247,6 +5279,7 @@ where
                         finish_args: vec![opref],
                         finish_arg_types: vec![majit_ir::Type::Float],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
             }
@@ -5264,6 +5297,7 @@ where
                         finish_args: vec![],
                         finish_arg_types: vec![],
                         exit_with_exception: false,
+                        exc_value: 0,
                     };
                 }
                 // Sub-frame void return: caller resumes; nothing to write.
@@ -6866,6 +6900,7 @@ where
             jitcode::insns::BC_FLOAT_GT => self.trace_compare_f(ctx, OpCode::FloatGt),
             jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
             jitcode::insns::BC_CAST_INT_TO_FLOAT => self.trace_cast_int_to_float(ctx),
+            jitcode::insns::BC_CAST_FLOAT_TO_INT => self.trace_cast_float_to_int(ctx),
             jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG => {
                 self.trace_convert_float_bytes_to_longlong(ctx)
             }
@@ -7562,6 +7597,28 @@ where
         let opref = ctx.record_op(OpCode::CastIntToFloat, &[src]);
         ctx.set_opref_concrete(opref, majit_ir::Value::Float(fvalue));
         self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
+    }
+
+    /// `cast_float_to_int/f>i`: truncate a float-bank value toward zero into the
+    /// int bank — the inverse of `trace_cast_int_to_float`, and a VALUE cast, not
+    /// the bitcast below. `[src][dst]`. The float travels as its `i64` bits, so
+    /// the concrete value is `f64::from_bits(bits) as i64`, matching
+    /// `bhimpl_cast_float_to_int` (`blackhole.py:801-810`) exactly — including
+    /// Rust's saturating behaviour on non-finite and out-of-range inputs, which
+    /// `execute_cast_const` deliberately refuses to constant-fold so the runtime
+    /// stays the single source of that policy.
+    fn trace_cast_float_to_int(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_float_reg(src_idx);
+        let ivalue = f64::from_bits(bits as u64) as i64;
+        let opref = ctx.record_op(OpCode::CastFloatToInt, &[src]);
+        ctx.set_opref_concrete(opref, majit_ir::Value::Int(ivalue));
+        self.set_int_reg(dst, Some(opref), Some(ivalue));
     }
 
     /// `convert_float_bytes_to_longlong/f>i`: reinterpret a float's 64-bit
@@ -8618,6 +8675,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => (finish_args, finish_arg_types),
             other => panic!("expected Finish[Int] from recursive-call portal, got {other:?}"),
         };
@@ -8832,6 +8890,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
                 finish_args
@@ -8916,6 +8975,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Ref]);
                 finish_args
@@ -8980,6 +9040,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Float]);
                 finish_args
@@ -9044,6 +9105,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert!(finish_args.is_empty(), "void return has no finish args");
                 assert!(
@@ -9191,6 +9253,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
+                ..
             } => {
                 assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
                 finish_args
@@ -10384,6 +10447,7 @@ mod tests {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception,
+                ..
             } => (finish_args, finish_arg_types, exit_with_exception),
             other => panic!(
                 "expected TraceAction::Finish for handler-less raise, got {:?}",

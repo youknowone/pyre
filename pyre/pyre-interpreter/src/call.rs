@@ -1917,7 +1917,7 @@ pub fn call_with_kwargs(
         }
     }
 
-    if unsafe { crate::is_function(callable) } {
+    if unsafe { crate::is_function_carrier(callable) } {
         let code = unsafe { crate::getcode(callable) };
         // For builtins: pack kwargs into a dict as last arg.
         //
@@ -2517,7 +2517,7 @@ pub fn call_function_impl_result(
             return call_function_impl_result(func, &call_args);
         }
         // All callables are Function objects.
-        if crate::is_function(callable) {
+        if crate::is_function_carrier(callable) {
             let code = crate::getcode(callable);
             if crate::is_builtin_code(code as pyre_object::PyObjectRef) {
                 // Builtin function: direct Rust call. Errors propagate
@@ -4303,12 +4303,14 @@ pub unsafe fn create_all_slots(
             // typeobject.py:1178: string_sort(newslotnames)
             newslotnames.sort();
 
-            // CPython 3.14 rejects additional instance slots on variable-size
-            // builtin layouts (the Py_TPFLAGS_ITEMS_AT_END families).
+            // CPython 3.14 rejects additional instance slots on the remaining
+            // variable-size builtin layouts. `str` is deliberately excluded:
+            // current CPython permits them (configparser._Line relies on it),
+            // and PyPy stores them in BaseUserClassMapdict like every other
+            // app-level subclass slot.
             if !newslotnames.is_empty() && !base_layout.is_null() {
                 let typedef = (*base_layout).typedef;
                 if std::ptr::eq(typedef, &pyre_object::INT_TYPE)
-                    || std::ptr::eq(typedef, &pyre_object::STR_TYPE)
                     || std::ptr::eq(typedef, &pyre_object::TUPLE_TYPE)
                     || std::ptr::eq(typedef, &pyre_object::bytesobject::BYTES_TYPE)
                 {

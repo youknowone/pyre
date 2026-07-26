@@ -395,6 +395,22 @@ pub(super) fn is_supported_ref_type(ty: &Type) -> bool {
     }
 }
 
+/// Whether an `as <ty>` target is a full machine word, i.e. a cast that neither
+/// truncates nor extends the 64-bit value. Only these are safe targets for a
+/// `<float> as <ty>` cast: Rust saturates at the TARGET type's bounds, which a
+/// float->i64 followed by an int narrowing would not reproduce.
+pub(super) fn is_word_width_int(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => {
+            type_path.path.is_ident("i64")
+                || type_path.path.is_ident("u64")
+                || type_path.path.is_ident("isize")
+                || type_path.path.is_ident("usize")
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn is_supported_float_type(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => type_path.path.is_ident("f64"),

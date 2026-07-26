@@ -550,6 +550,20 @@ pub fn init_typeobjects() {
             builtin_function_type as usize,
         );
 
+        // CPython `wrapper_descriptor`: slot wrappers bind their receiver and
+        // are callable, but are not Python functions. Their Rust payload is
+        // the immutable BuiltinCode-backed Function carrier.
+        let slot_wrapper_type = new_typeobject_with_base("wrapper_descriptor", |_| {}, object_type);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
+            pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
+            pyre_object::typeobject::w_type_set_flag_method_descriptor(slot_wrapper_type, true);
+        }
+        reg.insert(
+            &crate::SLOT_WRAPPER_TYPE as *const PyType as usize,
+            slot_wrapper_type as usize,
+        );
+
         // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
         reg.insert(
             &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
@@ -2485,7 +2499,7 @@ fn init_none_type(ns: PyObjectRef) {
         ),
         (
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::make_slot_wrapper_with_arity(
                 "__hash__",
                 |args| {
                     let self_ =
@@ -2497,7 +2511,7 @@ fn init_none_type(ns: PyObjectRef) {
         ),
         (
             "__eq__",
-            make_builtin_function_with_arity(
+            crate::make_slot_wrapper_with_arity(
                 "__eq__",
                 |args| {
                     singleton_receiver(args, "NoneType", "__eq__", pyre_object::is_none)?;
@@ -2512,7 +2526,7 @@ fn init_none_type(ns: PyObjectRef) {
         ),
         (
             "__ne__",
-            make_builtin_function_with_arity(
+            crate::make_slot_wrapper_with_arity(
                 "__ne__",
                 |args| {
                     singleton_receiver(args, "NoneType", "__ne__", pyre_object::is_none)?;
@@ -2539,7 +2553,7 @@ fn init_none_type(ns: PyObjectRef) {
             pyre_object::w_dict_setitem_str(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, 2),
+                crate::make_slot_wrapper_with_arity(name, function, 2),
             )
         };
     }
@@ -11335,7 +11349,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 let found = if unsafe { pyre_object::is_instance(obj) } {
                     unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) }
                 } else {
-                    crate::baseobjspace::native_slot_get(obj, slot_name)
+                    crate::baseobjspace::native_slot_get(obj, slot_name, index)
                 };
                 match found {
                     Some(v) => Ok(v),
@@ -11388,7 +11402,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
                 } else {
                     let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
-                    if !crate::baseobjspace::native_slot_set(obj, slot_name, value) {
+                    if !crate::baseobjspace::native_slot_set(obj, slot_name, index, value) {
                         return Err(crate::PyError::new(
                             crate::PyErrorKind::AttributeError,
                             format!(
@@ -11439,7 +11453,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 let removed = if unsafe { pyre_object::is_instance(obj) } {
                     unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) }
                 } else {
-                    crate::baseobjspace::native_slot_del(obj, slot_name)
+                    crate::baseobjspace::native_slot_del(obj, slot_name, index)
                 };
                 if !removed {
                     return Err(crate::PyError::new(

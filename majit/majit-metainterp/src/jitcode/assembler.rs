@@ -1822,6 +1822,36 @@ impl JitCodeBuilder {
         );
     }
 
+    /// Unsigned `/` — the `int.udiv` oopspec residual call
+    /// (`rint.py:434 ll_uint_py_div`).  RPython has no unsigned division
+    /// resop at all: `UINT_FLOORDIV` was deleted in 2016 in favour of this
+    /// oopspec call, so unlike the unsigned comparisons (which do have
+    /// `uint_lt`/`uint_le` primitives reachable through `record_binop_i`)
+    /// there is nothing here to record but the call.  Same
+    /// `rhs != 0` precondition as [`Self::record_int_py_div`]; unsigned has no
+    /// `INT_MIN / -1` corner.
+    pub fn record_uint_py_div(&mut self, dst: u16, lhs: u16, rhs: u16) {
+        self.record_int_py_helper(
+            dst,
+            lhs,
+            rhs,
+            crate::blackhole::ll_uint_py_div as *const (),
+            crate::call_descr::UINT_PY_DIV_EFFECT_INFO,
+        );
+    }
+
+    /// Unsigned `%` — the `int.umod` oopspec residual call
+    /// (`rint.py:525 ll_uint_py_mod`).  See [`Self::record_uint_py_div`].
+    pub fn record_uint_py_mod(&mut self, dst: u16, lhs: u16, rhs: u16) {
+        self.record_int_py_helper(
+            dst,
+            lhs,
+            rhs,
+            crate::blackhole::ll_uint_py_mod as *const (),
+            crate::call_descr::UINT_PY_MOD_EFFECT_INFO,
+        );
+    }
+
     fn record_int_py_helper(
         &mut self,
         dst: u16,
@@ -4446,6 +4476,19 @@ impl JitCodeBuilder {
         self.touch_float_reg(dst);
         self.touch_reg(src);
         self.write_insn("cast_int_to_float/i>f");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
+    /// Narrow a float-bank value to the int bank — RPython `cast_float_to_int`
+    /// (`blackhole.py:801-810 bhimpl_cast_float_to_int`). The inverse of
+    /// [`Self::record_cast_int_to_float`]: a VALUE cast that truncates toward
+    /// zero, NOT the `convert_float_bytes_to_longlong` bitcast below. Same
+    /// `f>i` operand crossing — float source, int result, `[src][dst]`.
+    pub fn record_cast_float_to_int(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_float_reg(src);
+        self.write_insn("cast_float_to_int/f>i");
         self.push_u8(src as u8);
         self.push_u8(dst as u8);
     }

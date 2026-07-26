@@ -128,7 +128,19 @@ fn is_internal_frame(frame: *mut crate::PyFrame) -> bool {
     filename.contains("importlib") && filename.contains("_bootstrap")
 }
 
-fn get_frame(mut stacklevel: i64) -> *mut crate::PyFrame {
+fn filename_has_prefix(frame: *mut crate::PyFrame, skip_file_prefixes: &[String]) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    let filename = unsafe { &*crate::pyframe::pyframe_get_pycode(&*frame) }
+        .source_path
+        .as_str();
+    skip_file_prefixes
+        .iter()
+        .any(|prefix| filename.starts_with(prefix))
+}
+
+fn get_frame(mut stacklevel: i64, skip_file_prefixes: &[String]) -> *mut crate::PyFrame {
     let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
         return std::ptr::null_mut();
@@ -143,7 +155,10 @@ fn get_frame(mut stacklevel: i64) -> *mut crate::PyFrame {
         while stacklevel > 1 && !frame.is_null() {
             loop {
                 frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(frame);
-                if frame.is_null() || !is_internal_frame(frame) {
+                if frame.is_null()
+                    || (!is_internal_frame(frame)
+                        && !filename_has_prefix(frame, skip_file_prefixes))
+                {
                     break;
                 }
             }
@@ -153,9 +168,12 @@ fn get_frame(mut stacklevel: i64) -> *mut crate::PyFrame {
     frame
 }
 
-fn setup_context(stacklevel: i64) -> (PyObjectRef, i64, PyObjectRef, PyObjectRef) {
+fn setup_context(
+    stacklevel: i64,
+    skip_file_prefixes: &[String],
+) -> (PyObjectRef, i64, PyObjectRef, PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
-    let frame = get_frame(stacklevel);
+    let frame = get_frame(stacklevel, skip_file_prefixes);
     let (filename, lineno, globals) = if frame.is_null() {
         let globals = crate::importing::get_sys_module("sys")
             .map(|module| unsafe { w_module_get_w_dict(module) })
@@ -712,9 +730,41 @@ crate::py_module! {
             #[default(pyre_object::PY_NULL)] category: PyObjectRef,
             #[default(1i64)] stacklevel: i64,
             #[kwonly] #[default(pyre_object::PY_NULL)] source: PyObjectRef,
+            #[kwonly] #[default(pyre_object::PY_NULL)] skip_file_prefixes: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
+            // CPython 3.14 `_warnings.warn`: `skip_file_prefixes` is a
+            // tuple-only fast-path argument.  Its frame walk is the current
+            // PyPy `get_frame` walk with matching filenames skipped alongside
+            // importlib-internal frames.
+            let skip_file_prefixes = if skip_file_prefixes.is_null() {
+                Vec::new()
+            } else {
+                if unsafe { !pyre_object::is_tuple(skip_file_prefixes) } {
+                    return Err(PyError::type_error(format!(
+                        "warn() argument 'skip_file_prefixes' must be tuple, not {}",
+                        crate::baseobjspace::object_functionstr_type_name(skip_file_prefixes),
+                    )));
+                }
+                let mut prefixes = Vec::new();
+                for prefix in crate::baseobjspace::fixedview(skip_file_prefixes, -1)? {
+                    if unsafe { !pyre_object::is_str(prefix) } {
+                        return Err(PyError::type_error(format!(
+                            "Found non-str '{}' in skip_file_prefixes.",
+                            crate::baseobjspace::object_functionstr_type_name(prefix),
+                        )));
+                    }
+                    prefixes.push(crate::baseobjspace::text_w(prefix)?.to_string());
+                }
+                prefixes
+            };
+            let stacklevel = if skip_file_prefixes.is_empty() {
+                stacklevel
+            } else {
+                stacklevel.max(2)
+            };
             let category = get_category(message, category)?;
-            let (filename, lineno, module, registry) = setup_context(stacklevel);
+            let (filename, lineno, module, registry) =
+                setup_context(stacklevel, &skip_file_prefixes);
             do_warn_explicit(
                 category, message, filename, lineno, module, registry,
                 pyre_object::PY_NULL, source,
