@@ -9,6 +9,56 @@
 
 use super::*;
 
+/// `executioncontext.py:91-107 leave` for a frame the bridge resumed into
+/// rather than entered.
+///
+/// A carrier frame's `enter` — and the `virtual_ref` scope it opened — belongs
+/// to the parent trace; `rebuild_state_after_failure` restores the still-open
+/// pairs (`pyjitpl.py:3433 self.virtualref_boxes = virtualref_boxes`).
+/// Upstream's resume continues inside that frame's `execute_frame`, so its
+/// `finally: ec.leave(...)` still runs and closes the scope.  Pyre's carrier
+/// sub-walk enters the callee body directly, with nothing standing in for that
+/// `finally`, so the close is emitted here as each carrier frame returns.
+///
+/// Without it the bridge finishes with `ec.topframeref` still naming the
+/// resumed frame's vref — one that, in compiled code, carries a live
+/// FORCE_TOKEN and a null `forced` (`virtualize.py optimize_VIRTUAL_REF`).  Any
+/// later `gettopframe` in the same trace then forces a vref whose scope no
+/// guard still encodes, and the force yields null.
+///
+/// The frame box comes from the restored pair rather than from anything this
+/// trace built: it is the box the parent's `enter` used, which is what
+/// `opimpl_virtual_ref_finish`'s identity assert compares against.
+pub(crate) fn carrier_ec_leave<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    root_sym: &Sym,
+    got_exception: bool,
+) {
+    let Some((callee_frame, concrete_frame)) = ctx.innermost_virtualref_virtual() else {
+        return;
+    };
+    let concrete_ec =
+        root_sym.concrete_execution_context() as *mut pyre_interpreter::PyExecutionContext;
+    if concrete_frame == 0 || concrete_ec.is_null() {
+        return;
+    }
+    // `frame.execution_context`, the same read `walker_ec_enter`'s counterpart
+    // performs at the inlined-call push.
+    let callee_ec = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[root_sym.frame()],
+        crate::descr::pyframe_execution_context_descr(),
+    );
+    super::inline_call::walker_ec_leave(
+        ctx,
+        callee_frame,
+        callee_ec,
+        concrete_frame as *mut pyre_interpreter::PyFrame,
+        concrete_ec,
+        got_exception,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_via_miframe<Sym: WalkSym>(
     trace_ctx: &mut TraceCtx,

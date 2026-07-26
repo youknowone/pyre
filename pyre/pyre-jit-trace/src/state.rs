@@ -9377,6 +9377,42 @@ impl JitState for PyreJitState {
                 vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
             }
         }
+        // `ExecutionContext.topframeref` is a live heap field, so unlike the
+        // RPython locals `rebuild_state_after_failure` reconstructs, whatever
+        // the dead trace last stored there is still in it.  A trace that
+        // abandoned an inlined callee level at this guard left that level's
+        // vref published — and a compiled-trace vref carries a live FORCE_TOKEN
+        // with a null `forced` (`virtualize.py optimize_VIRTUAL_REF`), naming a
+        // JIT frame that has now exited.  Forcing it reaches `cpu.force` with
+        // no armed `jf_force_descr`.
+        //
+        // The resume data says what the slot should hold: the innermost scope
+        // the guard still had open, whose vref the `continue_tracing` loop
+        // above has just repaired, or — with no scope open — the resumed frame
+        // itself.  Rewrite only when the slot holds some *other* vref; an
+        // already-correct slot (every non-abandoning exit) is left alone.
+        let restored_top = restored_virtualref_boxes
+            .last()
+            .map(|&(_, vref_ptr)| vref_ptr)
+            .unwrap_or(sym.concrete_vable_ptr as usize);
+        let live_ec = if sym.concrete_vable_ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let frame = sym.concrete_vable_ptr as *const pyre_interpreter::PyFrame;
+            unsafe { (*frame).execution_context as *mut pyre_interpreter::PyExecutionContext }
+        };
+        if !live_ec.is_null() && restored_top != 0 {
+            let published = unsafe { (*live_ec).topframeref };
+            if published as usize != restored_top
+                && unsafe {
+                    majit_metainterp::virtualref::ptr_is_virtual_ref(published as *const u8)
+                }
+            {
+                unsafe {
+                    (*live_ec).topframeref = restored_top as *mut pyre_interpreter::PyFrame;
+                }
+            }
+        }
         // `pyjitpl.py:3433 self.virtualref_boxes = virtualref_boxes`.
         ctx.restore_virtualref_boxes(restored_virtualref_boxes);
 

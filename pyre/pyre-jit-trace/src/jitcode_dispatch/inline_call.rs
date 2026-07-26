@@ -1708,7 +1708,7 @@ fn walker_ec_enter(
 /// of the callee level — normal return, raised exception, or a declined
 /// sub-walk — has to reach it, or `virtualref_boxes` is left unbalanced and the
 /// loop header trips `assert len(self.virtualref_boxes) == 0`.
-fn walker_ec_leave(
+pub(crate) fn walker_ec_leave(
     ctx: &mut TraceCtx,
     callee_frame: OpRef,
     callee_ec: OpRef,

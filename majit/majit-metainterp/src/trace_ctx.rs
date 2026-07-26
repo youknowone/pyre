@@ -1052,6 +1052,15 @@ impl TraceCtx {
         self.virtualref_boxes.len()
     }
 
+    /// The innermost still-open scope's `virtualbox` — `virtualref_boxes[-2]`,
+    /// the operand `opimpl_virtual_ref_finish` pops next.  A bridge resumes
+    /// into scopes its parent guard opened, so the frame box that closes one is
+    /// the one the parent encoded, not a box this trace built.
+    pub fn innermost_virtualref_virtual(&self) -> Option<(OpRef, usize)> {
+        let len = self.virtualref_boxes.len();
+        (len >= 2).then(|| self.virtualref_boxes[len - 2])
+    }
+
     /// `pyjitpl.py:3433 rebuild_state_after_failure`'s
     /// `self.virtualref_boxes = virtualref_boxes`.  A bridge resumes into its
     /// parent's still-open `virtual_ref` scopes, so the pairs the parent guard

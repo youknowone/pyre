@@ -1646,6 +1646,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let want_compile = n >= 1 && n <= crate::jitcode_dispatch::fbw_max_multiframe_depth();
         let mut middles_ok = true;
         if want_compile {
+            // The deepest carrier frame has returned; close the `virtual_ref`
+            // scope its `enter` opened in the parent trace.
+            crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
             for i in (0..n.saturating_sub(1)).rev() {
                 // recipes[i]'s paused parents are the shallower frames
                 // recipes[..i] (the root sits above them all).
@@ -1665,6 +1668,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                         break;
                     }
                 }
+                crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
             }
         }
         if want_compile && middles_ok {
@@ -1707,6 +1711,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     if let Some((exc, exc_concrete)) = subwalk_raise {
         if carrier.recipes.len() == 1 {
             if let Some(catch_target) = carrier_root_catch_target(sym, root_pc) {
+                // The carrier frame is unwinding, so this is `leave`'s
+                // `got_exception=True` arm: the caller is marked escaped and
+                // the leaving frame's own vref is forced.
+                crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, true);
                 crate::jitcode_dispatch::set_carrier_raise_seed(
                     crate::jitcode_dispatch::CarrierRaiseSeed {
                         exc,
