@@ -699,15 +699,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_set_new as *const (),
     );
     push_fnaddr(&mut entries, "w_set_new", w_set_new as *const ());
-    let w_frozenset_new: fn() -> pyre_object::PyObjectRef =
-        pyre_object::setobject::w_frozenset_new;
+    let w_frozenset_new: fn() -> pyre_object::PyObjectRef = pyre_object::setobject::w_frozenset_new;
     push_alias_pair(
         &mut entries,
         "pyre_object::setobject::w_frozenset_new",
         "pyre_object::w_frozenset_new",
         w_frozenset_new as *const (),
     );
-    push_fnaddr(&mut entries, "w_frozenset_new", w_frozenset_new as *const ());
+    push_fnaddr(
+        &mut entries,
+        "w_frozenset_new",
+        w_frozenset_new as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_len",

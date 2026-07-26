@@ -20027,9 +20027,9 @@ mod tests {
                 op.result.as_ref() == Some(sw)
                     && match &op.kind {
                         OpKind::BinOp { op: name, .. } => name == "ne",
-                        OpKind::UnaryOp { op: name, operand, .. } => {
-                            name == "bool" && ne_result_ids.contains(&operand.id())
-                        }
+                        OpKind::UnaryOp {
+                            op: name, operand, ..
+                        } => name == "bool" && ne_result_ids.contains(&operand.id()),
                         _ => false,
                     }
             });
