@@ -423,7 +423,12 @@ pub fn main_entry(binary_name: &'static str) {
         pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn(|| real_main(binary_name))
+            .spawn(|| {
+                real_main(binary_name);
+                if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
+                    pyre_jit::field_descr_identity_census_now();
+                }
+            })
             .expect("spawn main thread")
             .join()
             .unwrap();

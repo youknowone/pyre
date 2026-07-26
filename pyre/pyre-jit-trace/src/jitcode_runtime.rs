@@ -443,11 +443,72 @@ pub fn all_liveness() -> &'static [u8] {
 /// `Arc` instance still build their own at the call site
 /// until the by-index identity factories land.
 static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
-    all_descrs()
+    let refs: Vec<DescrRef> = all_descrs()
         .iter()
         .map(crate::descr::make_descr_from_bh)
-        .collect()
+        .collect();
+    if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
+        field_descr_identity_census(&refs);
+    }
+    refs
 });
+
+/// S4c prerequisite measurement — how many build-time `BhDescr::Field` slots
+/// resolve to the SAME `Arc` the runtime `descr.py:218-239 get_field_descr`
+/// cache holds for their `(STRUCT, fieldname)` key.
+///
+/// `effectinfo.py:465-547 compute_bitstrings` partitions descrs by object
+/// identity, so an `EffectInfo` raw set rehydrated from `descrs.bin` is only
+/// meaningful if each member lands on the descr the trace itself caches.  A
+/// slot that mints a fresh `Arc` instead is a silent mis-partition, which is
+/// strictly worse than the missing raw set it would replace — hence this runs
+/// before the format change, not after.
+pub fn field_descr_identity_census_now() {
+    field_descr_identity_census(all_descr_refs());
+}
+
+fn field_descr_identity_census(refs: &[DescrRef]) {
+    let (mut fields, mut keyed, mut converged, mut parentless) = (0usize, 0, 0, 0);
+    let mut misses: Vec<String> = Vec::new();
+    for (i, bh) in all_descrs().iter().enumerate() {
+        let BhDescr::Field { parent, name, .. } = bh else {
+            continue;
+        };
+        fields += 1;
+        let Some(parent) = parent.as_ref().filter(|p| p.type_id != 0) else {
+            parentless += 1;
+            continue;
+        };
+        keyed += 1;
+        let key = majit_ir::descr::LLType::Struct(parent.type_id);
+        let cached = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            ._cache_field
+            .get(&key)
+            .and_then(|m| m.get(name.as_str()))
+            .cloned();
+        let same = cached.as_ref().is_some_and(|fd| {
+            std::sync::Arc::as_ptr(&(fd.clone() as DescrRef)) == std::sync::Arc::as_ptr(&refs[i])
+        });
+        if same {
+            converged += 1;
+        } else if misses.len() < 40 {
+            misses.push(format!(
+                "{name} (T{:#x}) cached={}",
+                parent.type_id,
+                cached.is_some()
+            ));
+        }
+    }
+    eprintln!(
+        "[field-identity] {fields} Field slots: {keyed} keyed ({converged} converge with \
+         _cache_field), {parentless} parentless"
+    );
+    for m in &misses {
+        eprintln!("[field-identity]   MISS {m}");
+    }
+}
 
 /// `&'static [DescrRef]` view over [`ALL_DESCR_REFS`] for the walker's
 /// `WalkContext::descr_refs` parameter.

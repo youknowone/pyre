@@ -7306,4 +7306,3 @@ mod tests {
         assert_eq!(driver.index(), None);
     }
 }
-
