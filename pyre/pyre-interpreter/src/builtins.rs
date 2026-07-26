@@ -10679,96 +10679,108 @@ pub(crate) fn sort_rooted_items(
     }
 
     let mut order: Vec<usize> = (0..item_len).collect();
-    // `rpython/rlib/listsort.py listsort.lt` defers to
-    // `space.lt(a, b)` and propagates exceptions; if the user's
-    // `__lt__` raises, sort halts with that error.  Rust's
-    // `sort_by` closure cannot return Result, so capture the first
-    // error via a Cell and surface it after the sort completes.
-    // `pypy/objspace/std/listobject.py descr_sort` reverses before and after a stable
-    // ascending sort for `reverse=True`, so equal elements keep their
-    // original relative order (a stable descending sort). A single
-    // post-sort reverse would instead flip ties.
+    // `listobject.py descr_sort` reverses before and after a stable ascending
+    // sort for `reverse=True`, so equal elements keep their original relative
+    // order (a stable descending sort).  A single post-sort reverse would
+    // instead flip ties.
     if reverse {
         order.reverse();
     }
-    let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
-    let sort_lt = |left: usize, right: usize| -> bool {
-        if sort_error
-            .take()
-            .map(|e| {
-                sort_error.set(Some(e));
-                true
-            })
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-            key_base + left
-        } else {
-            item_base + left
-        });
-        let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-            key_base + right
-        } else {
-            item_base + right
-        });
-        match crate::baseobjspace::compare(left, right, crate::baseobjspace::CompareOp::Lt) {
-            Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
-                sort_error.set(Some(e));
-                false
-            }),
-            Err(e) => {
-                sort_error.set(Some(e));
-                false
-            }
-        }
+    let base = if key_fn_slot.is_some() {
+        key_base
+    } else {
+        item_base
     };
-    order.sort_by(|left, right| {
-        let ab = sort_lt(*left, *right);
-        if ab {
-            return std::cmp::Ordering::Less;
-        }
-        let ba = sort_lt(*right, *left);
-        if ba {
-            return std::cmp::Ordering::Greater;
-        }
-        // Fast-path tail kept for the cases where `compare` returns
-        // `False` for both directions (legacy unhashable / unorderable
-        // pairs that pyre still has) — preserves prior behaviour.
-        unsafe {
-            let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-                key_base + *left
-            } else {
-                item_base + *left
-            });
-            let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
-                key_base + *right
-            } else {
-                item_base + *right
-            });
-            if is_int(left) && is_int(right) {
-                return w_int_get_value(left).cmp(&w_int_get_value(right));
-            }
-            if is_str(left) && is_str(right) {
-                return w_str_get_value(left).cmp(w_str_get_value(right));
-            }
-            if is_float(left) && is_float(right) {
-                return pyre_object::w_float_get_value(left)
-                    .partial_cmp(&pyre_object::w_float_get_value(right))
-                    .unwrap_or(std::cmp::Ordering::Equal);
-            }
-            std::cmp::Ordering::Equal
-        }
-    });
-    if let Some(err) = sort_error.take() {
-        return Err(err);
-    }
+    let mut compare = sort_compare_for(base, item_len, key_fn_slot.is_some());
+    crate::listsort::sort_with(&mut order, &mut compare)?;
     // Second half of the `reverse=True` double-reverse (see above).
     if reverse {
         order.reverse();
     }
     Ok(order)
+}
+
+/// The comparison primitive `listsort.py`'s TimSort drives, holding the
+/// shadow-stack base of the values being compared (the keys under `key=`,
+/// otherwise the items themselves).
+///
+/// `descr_sort` (`listobject.py:809`) resolves the sorter class from the
+/// list's storage strategy, so an integer-strategy list sorts through
+/// `IntSort` (`listobject.py:2429`) and never dispatches a comparison dunder
+/// at all; `FloatSort` (`:2434`) is the same for floats, and `SimpleSort`
+/// (`:2423`) / `CustomKeySort` (`:2446`) are the generic `space.lt` path.
+enum SortCompare {
+    Int(usize),
+    Float(usize),
+    Str(usize),
+    Generic(usize),
+}
+
+impl crate::listsort::SortLt for SortCompare {
+    fn lt(&mut self, a: usize, b: usize) -> Result<bool, crate::PyError> {
+        let (Self::Int(base) | Self::Float(base) | Self::Str(base) | Self::Generic(base)) = *self;
+        let left = pyre_object::gc_roots::shadow_stack_get(base + a);
+        let right = pyre_object::gc_roots::shadow_stack_get(base + b);
+        // Each arm is what `compare_slot` reaches for that exact pair, taken
+        // directly: `int_lt`'s `int_value`, `float_lt`'s unwrapped `<`, and the
+        // WTF-8 byte order the str arm compares on.
+        unsafe {
+            match self {
+                Self::Int(_) => Ok(crate::objspace::descroperation::int_value(left)
+                    < crate::objspace::descroperation::int_value(right)),
+                Self::Float(_) => Ok(
+                    pyre_object::w_float_get_value(left) < pyre_object::w_float_get_value(right)
+                ),
+                Self::Str(_) => {
+                    Ok(w_str_get_wtf8(left).as_bytes() < w_str_get_wtf8(right).as_bytes())
+                }
+                Self::Generic(_) => {
+                    let result = crate::baseobjspace::compare(
+                        left,
+                        right,
+                        crate::baseobjspace::CompareOp::Lt,
+                    )?;
+                    crate::baseobjspace::is_true(result)
+                }
+            }
+        }
+    }
+}
+
+/// Pick the sorter the way `descr_sort` picks it from the list's strategy.
+///
+/// pyre's list stores plain object references with no strategy to read, so the
+/// same decision is one pass over the values.  The predicates are exact-type
+/// checks (`py_type_check` compares `ob_type` identity), which is what makes
+/// the specialization equivalent: a subclass carrying its own `__lt__` fails
+/// them and takes the generic path, exactly as it would keep an
+/// object-strategy list upstream.  A `key=` sort is `CustomKeySort`, generic
+/// upstream as well.
+fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
+    if keyed {
+        return SortCompare::Generic(base);
+    }
+    let (mut all_int, mut all_float, mut all_str) = (true, true, true);
+    for index in 0..len {
+        let item = pyre_object::gc_roots::shadow_stack_get(base + index);
+        unsafe {
+            all_int &= is_int(item);
+            all_float &= is_float(item);
+            all_str &= is_str(item);
+        }
+        if !(all_int || all_float || all_str) {
+            return SortCompare::Generic(base);
+        }
+    }
+    if all_int {
+        SortCompare::Int(base)
+    } else if all_float {
+        SortCompare::Float(base)
+    } else if all_str {
+        SortCompare::Str(base)
+    } else {
+        SortCompare::Generic(base)
+    }
 }
 
 /// `any(iterable)` — PyPy: operation.py any
