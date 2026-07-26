@@ -4192,12 +4192,20 @@ pub mod fbw_diag {
     /// says they executed a residual that wrote the live heap or entered a
     /// Python frame — their caller is about to replay an irreversible region.
     pub const ROLLED_BACK_WITH_EFFECTS: usize = 1;
+    /// Reachability of the two walk-end flush legs whose resume pc can precede
+    /// an effect the walk already recorded, and of the hazardous subset of
+    /// each.  The native corpus reaches neither leg, so these say whether the
+    /// wasm target does.
+    pub const MIDBODY_LATCH: usize = 2;
+    pub const MIDBODY_LATCH_NEW_UNJOURNALED: usize = 3;
+    pub const ESCAPE_PLAIN_FALLBACK: usize = 4;
+    pub const ESCAPE_PLAIN_FALLBACK_UNCLEAN: usize = 5;
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
-    pub const RING_BASE: usize = 2;
+    pub const RING_BASE: usize = 6;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;
@@ -4219,6 +4227,11 @@ pub mod fbw_diag {
         const Z: AtomicU64 = AtomicU64::new(0);
         [Z; LEN]
     };
+
+    /// Bump one of the reachability tallies.
+    pub(crate) fn bump(i: usize) {
+        FBW_DIAG[i].fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Read one slot (out-of-range reads as 0).  Surfaced to the wasm host
     /// through the `pyre_fbw_diag` export in the `pyre-wasm` crate.

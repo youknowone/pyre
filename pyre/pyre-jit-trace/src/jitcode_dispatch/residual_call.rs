@@ -472,8 +472,19 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 return true;
             }
             capture_escape_flush_undo(expected);
-            let flushed = flush_escape_state_with_latched_stack(ctx, expected, py_pc)
-                || crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc);
+            let latched = flush_escape_state_with_latched_stack(ctx, expected, py_pc);
+            let flushed =
+                latched || crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc);
+            // Reachability probe: the latched-stack path is gated on
+            // `escape_opcode_window_clean`, the plain fallback is not, and this
+            // resume pc re-runs the whole escaping opcode.
+            if !latched && flushed {
+                use crate::trace::fbw_diag;
+                fbw_diag::bump(fbw_diag::ESCAPE_PLAIN_FALLBACK);
+                if !escape_opcode_window_clean(py_pc) {
+                    fbw_diag::bump(fbw_diag::ESCAPE_PLAIN_FALLBACK_UNCLEAN);
+                }
+            }
             if flushed {
                 COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some(py_pc)));
             } else {

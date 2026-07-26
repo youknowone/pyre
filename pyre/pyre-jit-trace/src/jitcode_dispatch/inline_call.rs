@@ -2589,8 +2589,23 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             _ => None,
         };
         if let Some((abort_pc, abort_kind)) = midbody_abort {
+            if is_top_inline && !unjournaled_before_subwalk {
+                crate::trace::fbw_diag::bump(crate::trace::fbw_diag::MIDBODY_LATCH);
+                if fbw_has_unjournaled_effect() {
+                    crate::trace::fbw_diag::bump(
+                        crate::trace::fbw_diag::MIDBODY_LATCH_NEW_UNJOURNALED,
+                    );
+                }
+            }
+            // Unlike the entry carrier, this leg resumes INSIDE the rebuilt
+            // callee, so a residual the callee recorded only symbolically
+            // before the abort pc lies BEHIND the resume point and the
+            // discarded trace was its only carrier.  `unjournaled_before_subwalk`
+            // is sampled before the sub-walk and cannot see such a mark; read
+            // the flags again, as the loop-header, abort-pc and branch-guard
+            // legs do.
             if is_top_inline
-                && !unjournaled_before_subwalk
+                && !fbw_has_unjournaled_effect()
                 && fbw_executed_effect_count() != executed_effects_before
             {
                 let payload = (|| {

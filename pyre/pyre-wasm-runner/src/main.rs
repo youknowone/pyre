@@ -489,15 +489,20 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         // which the guest cannot read. Slot layout in
         // `pyre_jit_trace::trace::fbw_diag`.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 2;
+            const RING_BASE: u32 = 6;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
             let mut slot = |i: u32| fbw.call(&mut store, i).unwrap_or(0);
             let walks = slot(0);
             eprintln!(
-                "[jit-stats] fbw_diag walks={walks} ROLLED_BACK_WITH_EFFECTS={}",
+                "[jit-stats] fbw_diag walks={walks} ROLLED_BACK_WITH_EFFECTS={} \
+                 midbody_latch={}/{} escape_plain_fallback={}/{}",
                 slot(1),
+                slot(3),
+                slot(2),
+                slot(5),
+                slot(4),
             );
             for entry in 0..RING_ENTRIES.min(walks as u32) {
                 let base = RING_BASE + entry * RING_STRIDE;
