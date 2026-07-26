@@ -7,11 +7,10 @@ use crate::{PY_NULL, PyObjectRef};
 /// `W_ListObject.items` / `W_TupleObject.wrappeditems` /
 /// `DictStorage.values`. Shape matches RPython's
 /// `GcArray(OBJECTPTR)` from `rpython/rtyper/lltypesystem/rlist.py:84,116`
-/// — a `T_IS_VARSIZE` block with an 8-byte single-slot `capacity`
-/// header followed by inline `PyObjectRef` items. Registered with
-/// `TypeInfo::varsize(8, 8, 0, items_have_gc_ptrs=true, [])` so the
-/// GC walks each item slot as a Ref. Re-exported from
-/// `pyre_jit_trace::descr` for existing call sites.
+/// — a `T_IS_VARSIZE` block with a single-slot `capacity` header followed by
+/// inline `PyObjectRef` items. Registered from [`ITEMS_BLOCK_TOKEN`] with
+/// `items_have_gc_ptrs=true` so the GC walks each item slot as a Ref.
+/// Re-exported from `pyre_jit_trace::descr` for existing call sites.
 pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
 
 /// GC type id for `Ptr(GcArray(Signed))` blocks materialized by resume /
@@ -38,6 +37,36 @@ pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 /// unboxed slots (`instance_walk_boxed_storage`). Registered at the tail of the
 /// tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`) so no hardcoded constant shifts.
 pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
+
+/// The `(base_size, item_size, len_offset)` triple describing one varsize
+/// GcArray block, derived from the Rust struct that carries the block's GC type
+/// id — `symbolic.py:29 get_array_token`.
+///
+/// Upstream computes all three numbers from a single array lltype and hands
+/// that one triple to every consumer: the JIT's array descriptor
+/// (`descr.py:354 get_array_descr`), its length descriptor
+/// (`descr.py:262 get_field_arraylen_descr`) and the collector's varsize shape
+/// (`gctypelayout.py:273-291 encode_type_shape`, where `ofstovar`,
+/// `varitemsize` and `ofstolength` all read the same `ARRAY`). Picking the
+/// numbers apart per call site is what let the two scalar-array tids be
+/// registered with `GcTypedArray`'s bare length word while the blocks actually
+/// allocated under them were [`TypedItemsBlock`]s: the two structs agree on
+/// 64-bit and differ by four bytes on wasm32, where the `[u64; 0]` items pad a
+/// 4-byte length prefix out to 8. Every minor-collection copy of an
+/// `rbigint._digits` block was then sized four bytes short and dropped the high
+/// half of its last digit.
+///
+/// One token per (struct, element type) pair, so a consumer takes all three
+/// numbers from the struct it means, or none of them.
+pub struct ArrayToken {
+    /// Offset of items[0] — the collector's `ofstovar`, the array descriptor's
+    /// `base_size`.
+    pub base_size: usize,
+    /// `sizeof(ARRAY.OF)` — the element stride.
+    pub item_size: usize,
+    /// Offset of the length header — the collector's `ofstolength`.
+    pub len_offset: usize,
+}
 
 /// `#[repr(C)] { capacity, items: [PyObjectRef; 0] }` — the single-block
 /// inline-varsize GcArray body used by `W_ListObject.items` /
@@ -83,6 +112,17 @@ pub struct ItemsBlock {
 }
 
 pub const ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(ItemsBlock, items);
+
+/// Offset of the `capacity` header the collector reads as the GcArray length.
+pub const ITEMS_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(ItemsBlock, capacity);
+
+/// `get_array_token(GcArray(OBJECTPTR))` — the shape [`PY_OBJECT_ARRAY_GC_TYPE_ID`]
+/// is registered with and `pyobject_gcarray_descr` carries.
+pub const ITEMS_BLOCK_TOKEN: ArrayToken = ArrayToken {
+    base_size: ITEMS_BLOCK_ITEMS_OFFSET,
+    item_size: std::mem::size_of::<PyObjectRef>(),
+    len_offset: ITEMS_BLOCK_LEN_OFFSET,
+};
 
 /// Return the items base pointer (i.e. `&items[0]`) of an
 /// `ItemsBlock`. Null-safe: returns a null `*mut PyObjectRef` if the
@@ -587,6 +627,32 @@ pub struct TypedItemsBlock {
 
 pub const TYPED_ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, items);
 
+/// Offset of the `capacity` header the collector reads as the GcArray length.
+pub const TYPED_ITEMS_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, capacity);
+
+/// `get_array_token(GcArray(Signed))` — [`GC_INT_ARRAY_GC_TYPE_ID`].
+pub const TYPED_ITEMS_BLOCK_INT_TOKEN: ArrayToken = ArrayToken {
+    base_size: TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
+    item_size: std::mem::size_of::<i64>(),
+    len_offset: TYPED_ITEMS_BLOCK_LEN_OFFSET,
+};
+
+/// `get_array_token(GcArray(Float))` — [`GC_FLOAT_ARRAY_GC_TYPE_ID`]. A distinct
+/// ARRAY identity from the signed one, sharing this block's layout.
+pub const TYPED_ITEMS_BLOCK_FLOAT_TOKEN: ArrayToken = ArrayToken {
+    base_size: TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
+    item_size: std::mem::size_of::<f64>(),
+    len_offset: TYPED_ITEMS_BLOCK_LEN_OFFSET,
+};
+
+/// The items are `u64` words, so an element type wider or narrower than the
+/// storage word would stride past or short of them.
+const _: () = assert!(
+    TYPED_ITEMS_BLOCK_INT_TOKEN.item_size == std::mem::size_of::<u64>()
+        && TYPED_ITEMS_BLOCK_FLOAT_TOKEN.item_size == std::mem::size_of::<u64>(),
+    "TypedItemsBlock stores u64 words; another element width needs its own block",
+);
+
 /// Items base pointer (`&items[0]`) of a `TypedItemsBlock`. Null-safe.
 #[inline]
 pub unsafe fn typed_items_block_items_base(block: *mut TypedItemsBlock) -> *mut u8 {
@@ -804,13 +870,34 @@ pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
 // flexible-array tail). Allocation happens via a custom `Layout` at the
 // caller site (see `pyre_interpreter::pyframe::alloc_fixed_array_with_header`).
 
-/// Offset of the length prefix within `FixedObjectArray` (always 0).
-pub const FIXED_ARRAY_LEN_OFFSET: usize = 0;
+/// Offset of the length prefix within `FixedObjectArray`.
+pub const FIXED_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(FixedObjectArray, len);
 
 /// Offset of the first item within `FixedObjectArray` (immediately after
 /// the length prefix). The JIT-visible array descriptor uses this as
 /// `base_size` so `GETARRAYITEM_GC_*` reads items directly.
-pub const FIXED_ARRAY_ITEMS_OFFSET: usize = std::mem::size_of::<usize>();
+pub const FIXED_ARRAY_ITEMS_OFFSET: usize = std::mem::offset_of!(FixedObjectArray, _items);
+
+/// `get_array_token(GcArray(PyObjectRef))` for the frame-locals and mro blocks.
+pub const FIXED_OBJECT_ARRAY_TOKEN: ArrayToken = ArrayToken {
+    base_size: FIXED_ARRAY_ITEMS_OFFSET,
+    item_size: std::mem::size_of::<PyObjectRef>(),
+    len_offset: FIXED_ARRAY_LEN_OFFSET,
+};
+
+/// `FixedObjectArray` blocks are allocated under [`PY_OBJECT_ARRAY_GC_TYPE_ID`]
+/// as well (`pyframe::alloc_frame_locals_array`, [`alloc_mro_block_gc`]), and one
+/// tid carries one varsize shape — the one registered from [`ITEMS_BLOCK_TOKEN`].
+/// Both structs are a length word followed by `[PyObjectRef; 0]` today, so the
+/// two shapes coincide on every target. Diverge them and the collector would
+/// size one of the two wrong, which on a 32-bit target is a short copy rather
+/// than a build error. Keep it a build error.
+const _: () = assert!(
+    FIXED_OBJECT_ARRAY_TOKEN.base_size == ITEMS_BLOCK_TOKEN.base_size
+        && FIXED_OBJECT_ARRAY_TOKEN.item_size == ITEMS_BLOCK_TOKEN.item_size
+        && FIXED_OBJECT_ARRAY_TOKEN.len_offset == ITEMS_BLOCK_TOKEN.len_offset,
+    "FixedObjectArray and ItemsBlock share one GcArray tid; their shapes must match",
+);
 
 /// pyframe.py:110-112: fixed-length GcArray for `locals_cells_stack_w`.
 ///
@@ -951,11 +1038,19 @@ pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArra
 // `std::alloc::alloc_zeroed` rather than MiniMark's nursery, so GC
 // tracing/write barriers are not claimed here.
 
-/// Offset of the length prefix within `GcTypedArray` (always 0).
-pub const GC_TYPED_ARRAY_LEN_OFFSET: usize = 0;
+/// Offset of the length prefix within `GcTypedArray`.
+pub const GC_TYPED_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(GcTypedArray, len);
 
 /// Offset of the first item within `GcTypedArray`.
-pub const GC_TYPED_ARRAY_ITEMS_OFFSET: usize = std::mem::size_of::<usize>();
+///
+/// No [`ArrayToken`] companion, and deliberately so: the item size comes from
+/// the resume / blackhole array descriptor rather than from this block (one
+/// struct standing in for the Ref / Int / Float / Struct ARRAY lltypes), and no
+/// tid is registered for it — `allocate_flat_gc_typed_array` allocates through
+/// `std::alloc::alloc_zeroed`, so the collector never reads a shape here. These
+/// two offsets describe this struct's own pointer arithmetic only; they are not
+/// a GcArray shape any tid may be registered with.
+pub const GC_TYPED_ARRAY_ITEMS_OFFSET: usize = std::mem::offset_of!(GcTypedArray, items);
 
 /// Typed varsize array helper used by the resume / blackhole readers.
 /// The element type is carried by the array descriptor/API call, matching

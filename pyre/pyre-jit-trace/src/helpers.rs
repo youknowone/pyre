@@ -569,7 +569,7 @@ pub fn emit_bound_method_inline(
 /// Mirrors `listobject.rs::w_list_new` for the Object strategy:
 ///   - `items` points at an `ItemsBlock` GcArray (capacity == `len`);
 ///     `pyobject_gcarray_descr` is byte-compatible with the runtime
-///     `ItemsBlock` (`base_size = ITEMS_BLOCK_ITEMS_OFFSET = 8`).
+///     `ItemsBlock` (both read `ITEMS_BLOCK_TOKEN`).
 ///   - `length` = `items.len()`.
 ///   - `strategy` = `Object` (0). `NewWithVtable` already zero-fills the
 ///     payload (`int_items` / `float_items` stay empty, never read under

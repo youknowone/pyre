@@ -491,11 +491,11 @@ pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
 pub use pyre_object::listobject::W_LIST_GC_TYPE_ID;
 /// GC type id for the variable-length backing block of `PyObjectArray`
 /// (the list/tuple items storage). Shape matches `rlist.py:84,116`
-/// `GcArray(OBJECTPTR)` — a `T_IS_VARSIZE` block with an 8-byte
-/// single-slot `capacity` header (= upstream's GcArray length header,
+/// `GcArray(OBJECTPTR)` — a `T_IS_VARSIZE` block with a single-slot
+/// `capacity` header (= upstream's GcArray length header,
 /// rlist.py:251 `len(l.items)`) followed by inline `PyObjectRef`
-/// items. Registered via `TypeInfo::varsize(8, 8, 0,
-/// items_have_gc_ptrs=true, [])` so the GC walks each item slot as a
+/// items. Registered from `pyre_object::ITEMS_BLOCK_TOKEN` with
+/// `items_have_gc_ptrs=true` so the GC walks each item slot as a
 /// Ref (`gctypelayout.py:266-291 T_IS_VARSIZE / T_IS_GCARRAY_OF_GCPTR`);
 /// live list length is stored on the enclosing `W_ListObject` wrapper
 /// (`PyObjectArray.len`) to match rlist.py:116 `("length", Signed)`.

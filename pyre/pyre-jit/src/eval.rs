@@ -1336,10 +1336,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // See comments on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID`
     // and `pyre_object::object_array::ItemsBlock` for the companion
     // notices.
+    let items_token = &pyre_object::object_array::ITEMS_BLOCK_TOKEN;
     let py_object_array_tid = gc.register_type(TypeInfo::varsize(
-        pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
-        0,
+        items_token.base_size,
+        items_token.item_size,
+        items_token.len_offset,
         true,
         Vec::new(),
     ));
@@ -2060,25 +2061,25 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // distinct ARRAY identities, so register separate tids.
     //
     // The blocks carrying these two tids are `TypedItemsBlock`s
-    // (`rbigint._digits`, the Integer/Float list strategies), so the base size
-    // is that block's items offset, not `GcTypedArray`'s bare length word: the
-    // 8-byte items force 8-byte alignment, which pads a 4-byte length prefix on
-    // a 32-bit target. Sizing the instance from the length word would then
-    // compute four bytes too few and truncate the last item on every copy.
-    // `state.rs` builds the JIT array descrs for the same tids from the same
-    // offset.
+    // (`rbigint._digits`, the Integer/Float list strategies), so the shape comes
+    // from that block's `get_array_token` — all three numbers from the one
+    // struct, as `encode_type_shape` reads them from the one ARRAY
+    // (gctypelayout.py:273-291). `state.rs` builds the JIT array descrs for
+    // these tids from the same two tokens.
+    let int_token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
     let gc_int_array_tid = gc.register_type(TypeInfo::varsize(
-        pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
-        std::mem::size_of::<i64>(),
-        pyre_object::GC_TYPED_ARRAY_LEN_OFFSET,
+        int_token.base_size,
+        int_token.item_size,
+        int_token.len_offset,
         false,
         Vec::new(),
     ));
     debug_assert_eq!(gc_int_array_tid, GC_INT_ARRAY_GC_TYPE_ID);
+    let float_token = &pyre_object::TYPED_ITEMS_BLOCK_FLOAT_TOKEN;
     let gc_float_array_tid = gc.register_type(TypeInfo::varsize(
-        pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
-        std::mem::size_of::<f64>(),
-        pyre_object::GC_TYPED_ARRAY_LEN_OFFSET,
+        float_token.base_size,
+        float_token.item_size,
+        float_token.len_offset,
         false,
         Vec::new(),
     ));
@@ -2368,15 +2369,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // varsize leaf: the custom trace on the W_ObjectObject instance walks
     // each boxed storage slot by consulting the map to skip unboxed slots
     // (`instance_walk_boxed_storage`), and forwards this block pointer to
-    // keep the (non-moving, stable-allocated) block marked live.  Length at
-    // offset 0 (the `ItemsBlock.capacity` header), 8-byte ref items.
+    // keep the (non-moving, stable-allocated) block marked live.  The block is
+    // an `ItemsBlock` (`W_ObjectObject.storage`), so its shape is that block's
+    // token — the same one tid 9 registers, differing only in the leaf flag.
     // Registered here, immediately after `W_COMPLEX_GC_TYPE_ID = 54`, so it
     // takes tid 55 before the runtime-numbered `#[pyre_class]` / per-ExcKind
     // registrations below.
+    let storage_token = &pyre_object::object_array::ITEMS_BLOCK_TOKEN;
     let w_mapdict_storage_tid = gc.register_type(TypeInfo::varsize(
-        pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
-        0,
+        storage_token.base_size,
+        storage_token.item_size,
+        storage_token.len_offset,
         false,
         Vec::new(),
     ));
