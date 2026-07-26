@@ -12459,11 +12459,13 @@ pub(crate) fn call_forwarding_args(
     if !has_real_kwargs(kwargs) {
         return crate::call::call_function_impl_result(callable, positional);
     }
+    // The keyword ABI keeps names byte-ish, so the surrogate-preserving reader
+    // is the one to use here: `w_dict_str_entries` drops a `**{'\udc80': v}`
+    // key outright rather than forwarding it.
     let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
-        pyre_object::w_dict_str_entries(kwargs.unwrap())
+        pyre_object::w_dict_str_entries_wtf8(kwargs.unwrap())
             .into_iter()
-            .filter(|(name, _)| name != "__pyre_kw__")
-            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
+            .filter(|(name, _)| name.as_str() != Ok("__pyre_kw__"))
             .collect()
     };
     crate::eval::CURRENT_FRAME.with(|current| {

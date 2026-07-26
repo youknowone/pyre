@@ -4162,7 +4162,11 @@ pub(crate) fn native_slot_get(
     if w_dict.is_null() {
         return Ok(None);
     }
-    Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, name) })
+    // `finditem_str` rather than the raw layout accessor, for the reason
+    // [`getdictvalue`] documents: a stored non-string key whose hash collides
+    // runs a user `__eq__`, and the raw accessor reports a raising probe as an
+    // ordinary miss, so the slot would read as unset.
+    finditem_str(w_dict, name)
 }
 
 pub(crate) fn native_slot_set(
