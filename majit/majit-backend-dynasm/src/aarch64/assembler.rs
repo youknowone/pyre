@@ -3853,9 +3853,17 @@ impl<'a> AssemblerARM64<'a> {
         let fail_label = self.mc.new_dynamic_label();
         if self.invalidated_flag_addr != 0 {
             self.emit_mov_imm64(16, self.invalidated_flag_addr as i64);
+            // `CBNZ` reaches +-32KB, but this guard sits at the head of the
+            // peeled loop body while its recovery stub is emitted after the
+            // whole trace, so a long body puts the stub out of range and
+            // dynasm rejects the relocation at commit. Branch over an
+            // unconditional `B` (+-128MB) instead, the standard veneer.
+            let continue_label = self.mc.new_dynamic_label();
             dynasm!(self.mc ; .arch aarch64
                 ; ldrb w17, [x16]
-                ; cbnz w17, =>fail_label
+                ; cbz w17, =>continue_label
+                ; b =>fail_label
+                ; =>continue_label
             );
         }
         self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
