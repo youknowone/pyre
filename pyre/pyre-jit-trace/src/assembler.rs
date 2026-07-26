@@ -56,10 +56,18 @@ impl AssemblerState {
         // `pyre_jit::Assembler::resuming_build_time_liveness` seeds the
         // writer side the same way, so a `publish_state` wholesale replace
         // never rewinds past this prefix.
+        //
+        // `assembler.py:20 self.insns = {}` continues the same way. The
+        // build-time jitcodes' `-live-` markers carry the canonical opcode
+        // byte, and `blackhole.py:55-61` recovers it as `asm.insns['live/']`;
+        // starting empty leaves `MetaInterpStaticData.op_live` at its unset
+        // sentinel, and `can_decode_live_vars` then hunts for that sentinel as
+        // a marker byte and declines every build-time resume.
         let all_liveness = crate::jitcode_runtime::all_liveness().to_vec();
         let all_liveness_length = all_liveness.len();
+        let insns = crate::jitcode_runtime::insns_opname_to_byte().clone();
         Self {
-            insns: IndexMap::new(),
+            insns,
             all_liveness,
             all_liveness_length,
             all_liveness_positions: IndexMap::new(),

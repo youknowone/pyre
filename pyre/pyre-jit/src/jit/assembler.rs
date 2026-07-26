@@ -139,10 +139,30 @@ impl Assembler {
     /// The reader-side mirror seeds identically
     /// (`pyre_jit_trace::assembler::AssemblerState::new`), so the wholesale
     /// replace in `publish_state` never rewinds past this prefix.
+    /// `assembler.py:20 self.insns = {}` is the other half of the same
+    /// continuation, and it is load-bearing for the same reason. The build-time
+    /// jitcodes' `-live-` markers are written with the canonical opcode byte,
+    /// and `blackhole.py:55-61 BlackholeInterpBuilder.__init__` recovers it as
+    /// `asm.insns['live/']` — one dict, because upstream has one assembler.
+    /// A runtime `insns` that starts empty leaves
+    /// `MetaInterpStaticData.op_live` at its unset sentinel until some Python
+    /// bytecode graph happens to assemble a `-live-`, and until then
+    /// `JitCode::can_decode_live_vars` looks for the sentinel as a marker byte,
+    /// finds none, and declines every resume against a build-time jitcode.
+    /// That decline is silent and lossy: a jd1 drain guard that has already run
+    /// its `self.next(w_iterator)` cannot be re-executed, so the fetched item
+    /// is dropped instead of appended.
+    ///
+    /// Seeding is sound because the bytes are not allocated here — they come
+    /// from the fixed `wellknown_bh_insns` / `pyre_extension_insns` tables, so
+    /// the build-time and runtime spellings of an opname already agree on a
+    /// byte; the map only records which opnames exist.
     pub fn resuming_build_time_liveness() -> Self {
         let all_liveness = pyre_jit_trace::jitcode_runtime::all_liveness().to_vec();
         let all_liveness_length = all_liveness.len();
+        let insns = pyre_jit_trace::jitcode_runtime::insns_opname_to_byte().clone();
         Self {
+            insns,
             all_liveness,
             all_liveness_length,
             ..Self::default()
