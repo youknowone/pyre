@@ -5,6 +5,12 @@ mod virtualizable_spec;
 
 use walkdir::WalkDir;
 
+/// The translation prepass churns the whole graph universe through short-lived
+/// allocations; the system allocator keeps the freed spans and the process's
+/// peak RSS tracks the churn rather than the live set.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v2";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",

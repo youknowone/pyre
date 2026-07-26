@@ -41,6 +41,7 @@ majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2
 
 [build-dependencies]
 majit-translate = { workspace = true }
+mimalloc = { version = "0.1" }
 pyre-interpreter = { workspace = true, features = ["dynasm"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
