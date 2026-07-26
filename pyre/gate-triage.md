@@ -118,7 +118,7 @@ upstream lines:
 | gate | orthodox side | outcome |
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
-| PYRE_FBW_MULTIFRAME | **ON** | keep default-OFF; the ON path is the port and the adopt now works, but §1d measures one remaining wrong answer under it — an inner `sys._getframe(1)` read of a not-yet-materialized caller frame |
+| PYRE_FBW_MULTIFRAME | **ON** | keep default-OFF; the ON path is the port and the adopt now works, but §1d measures one remaining wrong answer under it — a `sys._getframe` that is itself the escaping residual reads the caller frame |
 | PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
 The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
@@ -282,27 +282,35 @@ are pinned by `synth/getframe_while_subwalk_decline_shapes` so a decline cannot
 silently become a wrong answer.
 
 **The flip is blocked, and the blocker is a wrong answer, not a decline.**
-Measured 2026-07-26.  With the adopt working, an inlined callee that reads its
-**caller's** frame through `sys._getframe(1)` is neither declined nor correct:
+Measured 2026-07-26.  The walker executes residuals **concretely** while an
+inline push never runs the interpreter's call sequence, so `ec.topframeref`
+still names the CALLER while an inlined callee body runs.  A `sys._getframe`
+that is *itself* the escaping residual therefore reads the wrong frame at walk
+time, and the adopt commits that answer where legacy escape/replay discards it:
 
 ```
-def leaf(x):
-    f = _gf(1)
-    return x + f.f_locals["bias"]        # KeyError: 'bias'
-    return x + (1 if f.f_code.co_name == "part_b" else 0)   # 29995, not 30000
+_gf().f_code.co_name   -> "main",     not "leaf"
+_gf(1).f_code.co_name  -> "<module>", not "main"     # one level too far up
+_gf(1).f_locals["k"]   -> KeyError                   # same cause, seen through the argument
 ```
 
-The chain runs innermost-first and each level runs against its own live frame,
-but an outer level's recovered locals are still only in its blackhole registers
-at that moment — nothing writes them back before the inner level re-executes.
-The count is exact: **one lost iteration per multi-frame adopt** (5 adopts, 5
-missing).  Both shapes are correct with the gate off.  So the outer-frame
-materialization named at the top of this entry is not a theoretical gap and not
-downstream of anything — it is the one thing standing between here and a
-default-ON flip, and the gate helper's own comment named it correctly all along.
-`synth/getframe_while_outer_frame_read_from_subwalk` is the acceptance test: it
-passes today (gate off, the default) and fails loudly if the gate is flipped
-first.
+**One wrong iteration per multi-frame adopt** — 5 adopts, 5 wrong, in each part
+of `synth/getframe_while_escaping_read_frame_identity`, which is the acceptance
+test: it passes today (gate off, the default) and fails loudly if the gate is
+flipped first.  This is *not* outer-locals staleness.  A `sys._getframe`
+executed **after** the escape, inside the blackhole, is correct — the chain
+publishes each level's frame as it runs — and an in-blackhole read of a caller
+local mutated earlier in the same iteration was measured correct against CPython
+and PyPy.  Closing it needs the inlined-call push to publish the callee frame on
+the execution context, which is what the open `walker_ec_enter` / `walker_ec_leave`
+work does; the `jit.virtual_ref` emit rides along with it.  So the original
+decline comment was right that an inline-push `enter` is the prerequisite, and
+wrong only about which check it gated.
+
+One thing the ON path already fixes: with a side-effecting inlined callee under
+a `while` loop that returns from inside the loop, the OFF path runs the callee's
+side effect ~5.2k extra times (the recorded trace-abort double-run class) while
+the adopt gives the exact count.
 
 Everything else that was thought to block the flip has been measured and does
 not: the full corpus is **326/326 on dynasm and cranelift with the gate both off

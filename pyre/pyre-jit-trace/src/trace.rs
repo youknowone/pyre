@@ -1760,6 +1760,25 @@ fn try_adopt_multi_frame_blackhole(
     } else {
         cf_addr
     };
+    // Frame-identity collapse guard.  Every level must be a distinct frame and
+    // only `frames[0]` may be the walked frame: a level whose frame register
+    // resolved to the root would make the relink below write a `f_backref`
+    // cycle and run an inner level against the root's own virtualizable.  No
+    // producer is known — an unseeded inline level has no frame object, so its
+    // register never resolves to a concrete `PyFrame` and the recovery loop
+    // above declines it — but the failure mode is silent, so decline rather
+    // than rely on the absence.  The chain is two or three levels, so the
+    // pairwise scan is free.
+    for i in 0..per_frame.len() {
+        if i > 0 && per_frame[i].0 == root_addr as i64 {
+            mfdbg!("frame {i}: is the walked frame {root_addr:#x}");
+            return false;
+        }
+        if per_frame[..i].iter().any(|&(ptr, _)| ptr == per_frame[i].0) {
+            mfdbg!("frame {i}: {:#x} repeats an earlier level", per_frame[i].0);
+            return false;
+        }
+    }
     // Identity gate: the recovered chain has to be rooted at the frame this
     // walk is stepping.  A chain rooted at an intermediate frame means the walk
     // descended into a residual call and inlined inside it, and then
@@ -1768,6 +1787,19 @@ fn try_adopt_multi_frame_blackhole(
     // `convert_and_run_from_pyjitpl` converts the whole framestack
     // unconditionally, and its `frames[0]` is always the portal frame, so this
     // shape cannot arise there.
+    //
+    // Passing this gate is NOT sufficient for the adopt to be right, and the
+    // remaining gap is why `PYRE_FBW_MULTIFRAME` is still opt-in.  The walker
+    // executes residuals CONCRETELY while an inline push never runs the
+    // interpreter's call sequence, so `ec.topframeref` still names the CALLER
+    // while an inlined callee body runs.  A `sys._getframe` that is itself the
+    // escaping residual therefore already read the wrong frame at walk time,
+    // and adopting commits that answer where the legacy escape/replay path
+    // discards it — measured as one wrong iteration per adopt
+    // (`synth/getframe_while_escaping_read_frame_identity`).  Closing it needs
+    // the inlined-call push to publish the callee frame on the execution
+    // context; a `sys._getframe` executed later, inside the blackhole, is
+    // already correct because each level is published as it runs.
     mfdbg!(
         "chain root={root_addr:#x} cf_addr={cf_addr:#x} levels=[{}]",
         per_frame
@@ -1853,6 +1885,26 @@ fn try_adopt_multi_frame_blackhole(
     unsafe {
         (*ec).topframeref = saved_topframeref;
     }
+    // Frame 0's blackhole level ran against `per_frame[0]`, the LIVE frame,
+    // because `convert_and_run_from_pyjitpl` overrides each level's
+    // `virtualizable_ptr` from `per_frame` — so its `setfield_vable` stores
+    // landed there, not in the snapshot.  EVERY adopted arm below sets
+    // `WALK_END_FLUSH_COMMITTED`, and the portal epilogue then copies the
+    // SNAPSHOT's whole locals array onto the live frame
+    // (`restore_resume_state_from`), which would revert every one of those
+    // stores.  Fold them into the snapshot before the arms so it is once again
+    // the committed image, which is the contract the epilogue and the
+    // single-frame arm both assume.  This has to sit outside the match: a
+    // `DoneWithThisFrame*` or `ExitFrameWithExceptionRef` terminal writes no
+    // resume state of its own, and for the exception terminal the traceback
+    // keeps the root frame reachable, so a stale copy is observable through
+    // `tb_frame.f_locals` long after the walk.
+    if root_addr != cf_addr {
+        unsafe {
+            (*(cf_addr as *mut pyre_interpreter::PyFrame))
+                .restore_resume_state_from(&*(root_addr as *const pyre_interpreter::PyFrame));
+        }
+    }
     let adopted = match outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
@@ -1889,26 +1941,9 @@ fn try_adopt_multi_frame_blackhole(
                 );
                 return false;
             };
-            // Frame 0's blackhole level ran against `per_frame[0]`, the LIVE
-            // frame, because `convert_and_run_from_pyjitpl` overrides each
-            // level's `virtualizable_ptr` from `per_frame` — so its
-            // `setfield_vable` stores landed there, not in the snapshot.  The
-            // portal epilogue copies the SNAPSHOT's whole locals array onto the
-            // live frame (`restore_resume_state_from`), which would revert
-            // every one of those stores that the CRN write below does not
-            // happen to cover.  Fold them into the snapshot first so it is
-            // once again the committed image, which is the contract the
-            // epilogue and the single-frame arm both assume.
-            if root_addr != cf_addr {
-                unsafe {
-                    (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
-                        &*(root_addr as *const pyre_interpreter::PyFrame),
-                    );
-                }
-            }
-            // Snapshot, not `root_addr`: with the fold above the snapshot is
-            // the committed image the epilogue propagates, matching the
-            // single-frame arm.
+            // Snapshot, not `root_addr`: with the fold above the match the
+            // snapshot is the committed image the epilogue propagates,
+            // matching the single-frame arm.
             if !apply_blackhole_crn(
                 cf_addr,
                 terminal_jitcode_index,
