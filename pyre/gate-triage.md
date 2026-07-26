@@ -118,7 +118,7 @@ upstream lines:
 | gate | orthodox side | outcome |
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
-| PYRE_FBW_MULTIFRAME | **ON** | keep; the ON path is the port, it is unfinished, §1 measures it as never reached by the corpus, and §1d locates the remaining blocker in the adopt's root-mismatch comparison |
+| PYRE_FBW_MULTIFRAME | **ON** | keep default-OFF; the ON path is the port and the adopt now works, but §1d measures one remaining wrong answer under it — an inner `sys._getframe(1)` read of a not-yet-materialized caller frame |
 | PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
 The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
@@ -280,6 +280,36 @@ is the outer-locals materialization named above — completing the caller's
 concrete banks at an inline escape — not a change to the capture itself.  Both
 are pinned by `synth/getframe_while_subwalk_decline_shapes` so a decline cannot
 silently become a wrong answer.
+
+**The flip is blocked, and the blocker is a wrong answer, not a decline.**
+Measured 2026-07-26.  With the adopt working, an inlined callee that reads its
+**caller's** frame through `sys._getframe(1)` is neither declined nor correct:
+
+```
+def leaf(x):
+    f = _gf(1)
+    return x + f.f_locals["bias"]        # KeyError: 'bias'
+    return x + (1 if f.f_code.co_name == "part_b" else 0)   # 29995, not 30000
+```
+
+The chain runs innermost-first and each level runs against its own live frame,
+but an outer level's recovered locals are still only in its blackhole registers
+at that moment — nothing writes them back before the inner level re-executes.
+The count is exact: **one lost iteration per multi-frame adopt** (5 adopts, 5
+missing).  Both shapes are correct with the gate off.  So the outer-frame
+materialization named at the top of this entry is not a theoretical gap and not
+downstream of anything — it is the one thing standing between here and a
+default-ON flip, and the gate helper's own comment named it correctly all along.
+`synth/getframe_while_outer_frame_read_from_subwalk` is the acceptance test: it
+passes today (gate off, the default) and fails loudly if the gate is flipped
+first.
+
+Everything else that was thought to block the flip has been measured and does
+not: the full corpus is **326/326 on dynasm and cranelift with the gate both off
+and on**, the blast radius is exactly `inline_subwalk = true` at a vable escape
+(the latch is an `if`/`else if` whose single-frame arm requires
+`!inline_subwalk`, so with the gate off that condition latches nothing and falls
+to legacy escape/replay), and the two build-side declines above are correct.
 
 Note the multi-frame latch is
 nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
