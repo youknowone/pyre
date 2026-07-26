@@ -395,7 +395,33 @@ fn real_main() {
     // build-script process the translator runs in, so the captured
     // addresses match a direct `&pyre_object::X` read at the codewriter
     // call site.
-    let static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
+    let mut static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
+    // This script is compiled for the host even when the crate it feeds is
+    // built for wasm, so the `#[pyre_class]` registry is populated here and
+    // empty there.  Binding a name the wasm runtime cannot re-pair would
+    // leave this process's address baked in the constant pool
+    // (`runtime_fnaddr_patch::patch_static_addr_constants` rewrites only
+    // names it finds in both pools), so drop the registry-derived rows when
+    // the target is wasm and let those statics stay unbound instead.
+    let registry_rows = pyre_interpreter::pyre_class_pytype_addrs();
+    let registry_keys: std::collections::HashSet<&str> =
+        registry_rows.iter().map(|&(key, _)| key).collect();
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        static_pytype_addrs.retain(|(key, _)| !registry_keys.contains(key));
+    }
+    // Counts the rows that survived, not the registry's size: the table
+    // drops every registry row whose static a hand-written row already
+    // names, and all of them when the target is wasm.
+    let kept_from_registry = static_pytype_addrs
+        .iter()
+        .filter(|(key, _)| registry_keys.contains(key))
+        .count();
+    eprintln!(
+        "[PREPASS statics] pytype rows = {} ({kept_from_registry} of {} \
+         #[pyre_class] registry rows kept)",
+        static_pytype_addrs.len(),
+        registry_rows.len(),
+    );
     let static_ref_addrs = pyre_interpreter::jit_static_ref_addrs();
     let static_int_values = pyre_interpreter::jit_static_int_values();
     let static_addrs = majit_translate::HostStaticAddrs {

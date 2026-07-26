@@ -14275,15 +14275,51 @@ fn graph_is_items_block_base_accessor(name: &str) -> bool {
         || name.ends_with("object_array::items_block_items_ptr")
 }
 
+/// One path segment, with a raw-identifier prefix removed.  `r#struct` and
+/// `struct` name the same module: rustc's canonical `DefPath` ident (what
+/// Charon records, and therefore what a `name_path()` carries) drops the
+/// `r#`, while a path spelled by `module_path!()` on the host side keeps it.
+fn path_segment_ident(seg: &str) -> &str {
+    seg.strip_prefix("r#").unwrap_or(seg)
+}
+
+/// Whole-path equality, segment by segment, ignoring raw-identifier
+/// prefixes on either side.
+fn path_eq_ignoring_raw(a: &str, b: &str) -> bool {
+    let mut a = a.split("::");
+    let mut b = b.split("::");
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if path_segment_ident(x) == path_segment_ident(y) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// `key` is a proper `::`-boundary suffix of `path`, compared the same way.
+fn path_has_suffix_ignoring_raw(path: &str, key: &str) -> bool {
+    let mut path = path.rsplit("::");
+    let mut key = key.rsplit("::");
+    loop {
+        let Some(k) = key.next() else {
+            // Key exhausted at a segment boundary; require at least one
+            // more segment so this stays a *proper* suffix (whole-path
+            // equality is the caller's other arm).
+            return path.next().is_some();
+        };
+        match path.next() {
+            Some(p) if path_segment_ident(p) == path_segment_ident(k) => {}
+            _ => return false,
+        }
+    }
+}
+
 fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
-    full == key
-        || stripped == key
-        || full
-            .strip_suffix(key)
-            .is_some_and(|prefix| prefix.ends_with("::"))
-        || stripped
-            .strip_suffix(key)
-            .is_some_and(|prefix| prefix.ends_with("::"))
+    path_eq_ignoring_raw(full, key)
+        || path_eq_ignoring_raw(stripped, key)
+        || path_has_suffix_ignoring_raw(full, key)
+        || path_has_suffix_ignoring_raw(stripped, key)
 }
 
 /// Supply the value of a primitive `f64` associated constant whose

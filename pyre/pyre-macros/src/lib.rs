@@ -1167,6 +1167,11 @@ fn expand_pyre_class(
                 object_size: #object_size_const,
                 ptr_offsets: &#ptr_offsets_const,
                 pyname: #name_lit,
+                pytype_path: ::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    ::core::stringify!(#pytype_static),
+                ),
             };
 
         /// Link-time registration of this class's descriptor into the

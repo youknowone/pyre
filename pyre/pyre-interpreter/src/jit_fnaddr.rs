@@ -863,11 +863,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::lookup_in_type_where_uncached",
         lookup_in_type_where_uncached as *const (),
     );
-    // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic and
-    // `longobject::bigint_gc_type_id` reads the init-assigned `BIGINT_GC_TYPE_ID`
-    // atomic — neither is a build-time constant, so both carry
+    // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
+    // `longobject::bigint_gc_type_id` /
+    // `dictmultiobject::dict_view_iterator_gc_type_id` read the
+    // init-assigned `BIGINT_GC_TYPE_ID` / `W_DICT_VIEW_ITERATOR_GC_TYPE_ID`
+    // cells — none is a build-time constant, so all three carry
     // `#[dont_look_inside]` and bind their `-> bool` / `-> u32` Rust `fn`
-    // directly by qualified path.
+    // directly by qualified path.  A type-id cell deliberately does NOT get
+    // a `jit_static_pytype_addrs` / `jit_static_ref_addrs` row: those carry
+    // the address of a value fixed at build time, and folding a
+    // runtime-stamped id that way would bake `TypeIdCell::UNASSIGNED`.
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_interp::enabled",
@@ -879,6 +884,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::longobject::bigint_gc_type_id",
         "pyre_object::bigint_gc_type_id",
         pyre_object::longobject::bigint_gc_type_id as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_view_iterator_gc_type_id",
+        "pyre_object::dict_view_iterator_gc_type_id",
+        pyre_object::dictmultiobject::dict_view_iterator_gc_type_id as *const (),
     );
     // The dispatch-loop safepoint's four toucher residuals plus the frame-entry
     // odometer bump and the items-block strategy gate: each reads a
@@ -2162,15 +2173,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 /// addresses are identical to a direct `&pyre_object::X` read at the
 /// codewriter call site.
 ///
-/// Keys are the in-source `module::NAME` spelling the front-end
-/// `Expr::Path` arm looks up in `KnownStaticsCatalogue`.
+/// Keys name the static's path.  The front-end reaches them through
+/// `HostStaticAddrs::pytypes` and matches with `front::mir`'s
+/// `static_key_matches`, which accepts the full path, the crate-stripped
+/// path, or either with the key as a `::`-boundary suffix — so both the
+/// `module::NAME` spelling the rows below use and the fully-qualified
+/// spelling [`pyre_class_pytype_addrs`] carries resolve the same static.
 pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
     macro_rules! pytype_addr {
         ($key:literal, $($path:tt)::+) => {
             ($key, &pyre_object::$($path)::+ as *const _ as i64)
         };
     }
-    vec![
+    let mut rows = vec![
         pytype_addr!(
             "bytearrayobject::BYTEARRAY_TYPE",
             bytearrayobject::BYTEARRAY_TYPE
@@ -2258,6 +2273,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             interp_exceptions::EXC_NAME_ERROR_TYPE
         ),
         pytype_addr!(
+            "interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE",
+            interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE
+        ),
+        pytype_addr!(
             "interp_exceptions::EXC_INDEX_ERROR_TYPE",
             interp_exceptions::EXC_INDEX_ERROR_TYPE
         ),
@@ -2332,6 +2351,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!(
             "interp_exceptions::EXC_SYSTEM_ERROR_TYPE",
             interp_exceptions::EXC_SYSTEM_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXC_BUFFER_ERROR_TYPE",
+            interp_exceptions::EXC_BUFFER_ERROR_TYPE
         ),
         pytype_addr!(
             "interp_exceptions::EXC_LOOKUP_ERROR_TYPE",
@@ -2528,7 +2551,49 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "interp_buffer::PICKLEBUFFER_TYPE",
             &crate::module::__pypy__::interp_buffer::PICKLEBUFFER_TYPE as *const _ as i64,
         ),
-    ]
+    ];
+    // Fold in the `#[pyre_class]` registry.  A row above names one static
+    // by hand, so a `#[pyre_class]` that lands without someone adding its
+    // row leaves that type's address unbound and every graph reaching it
+    // walled off at translation — a drift the rows cannot prevent because
+    // the macro derives the static's identifier from the struct name and
+    // no source search finds it.  Deduplicated on the address, not the
+    // key: the two spellings differ (`module::NAME` above, fully-qualified
+    // below) and both satisfy the front-end's `static_key_matches`, so the
+    // hand-written row wins for the types that already have one.
+    let hand_written: std::collections::HashSet<i64> = rows.iter().map(|&(_, addr)| addr).collect();
+    rows.extend(
+        pyre_class_pytype_addrs()
+            .into_iter()
+            .filter(|(_, addr)| !hand_written.contains(addr)),
+    );
+    rows
+}
+
+/// The `PyType` static of every `#[pyre_class]` type, keyed by the
+/// fully-qualified Rust path the flowgraph names the global read with
+/// (`PyreClassDescriptor::pytype_path`).
+///
+/// Empty on `wasm32`, where the `PYRE_CLASS_DESCRIPTORS` registry does not
+/// exist (`linkme::distributed_slice` rejects the target).  That makes the
+/// binding set target-dependent, so `pyre-jit-trace`'s build script drops
+/// these rows when it is generating jitcodes *for* wasm: a name bound at
+/// build time but missing from the runtime pool keeps the build-process
+/// address baked in the constant pool, because
+/// `runtime_fnaddr_patch::patch_static_addr_constants` only re-pairs names
+/// present in both.
+pub fn pyre_class_pytype_addrs() -> Vec<(&'static str, i64)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        pyre_object::lltype::PYRE_CLASS_DESCRIPTORS
+            .iter()
+            .map(|d| (d.pytype_path, d.pytype_ptr as usize as i64))
+            .collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Vec::new()
+    }
 }
 
 /// Build-time addresses of the prebuilt dict-strategy singletons pyre

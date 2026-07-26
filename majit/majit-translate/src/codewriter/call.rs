@@ -2344,6 +2344,7 @@ impl CallControl {
         let segments: Vec<&str> = full_path
             .split("::")
             .filter(|segment| !segment.is_empty())
+            .map(Self::strip_raw_ident_sigil)
             .collect();
         if segments.is_empty() {
             return;
@@ -2428,7 +2429,22 @@ impl CallControl {
         } else {
             format!("{module_prefix}::{impl_type_as_written}")
         };
+        let impl_type_joined = impl_type_joined
+            .split("::")
+            .map(Self::strip_raw_ident_sigil)
+            .collect::<Vec<_>>()
+            .join("::");
         self.register_function_fnaddr(CallPath::for_impl_method(&impl_type_joined, method), fnaddr);
+    }
+
+    /// Drop the `r#` sigil from one path segment.  A registry key spelled
+    /// by `module_path!()` keeps it (`module::r#struct`), while the
+    /// canonical [`CallPath`]s these registrations bind against are derived
+    /// from Charon, which records rustc's `DefPath` ident bare.  The sigil
+    /// is surface syntax, not identity, so a helper declared inside such a
+    /// module would otherwise register under a path nothing resolves to.
+    fn strip_raw_ident_sigil(segment: &str) -> &str {
+        segment.strip_prefix("r#").unwrap_or(segment)
     }
 
     /// Register a trait impl method graph.

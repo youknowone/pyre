@@ -290,11 +290,36 @@ pub fn path_hash_stripped_crate(module_path: &str, struct_name: &str) -> u64 {
         Some((_crate, rest)) => rest,
         None => "",
     };
+    // `module_path!()` and `stringify!` spell a raw identifier with its
+    // sigil (`module::r#struct`, `r#type`), while
+    // `module_path_from_source_file` and the Charon-side idents the analyzer
+    // hashes never carry one.  Strip it from every segment of both halves, so
+    // a type declared with — or inside — a keyword-named ident lands in one
+    // `path_hash` namespace instead of two.
+    let struct_name = strip_raw_ident_sigils(struct_name);
     if stripped_module.is_empty() {
-        path_hash(struct_name)
+        path_hash(&struct_name)
     } else {
-        path_hash(&format!("{}::{}", stripped_module, struct_name))
+        path_hash(&format!(
+            "{}::{struct_name}",
+            strip_raw_ident_sigils(stripped_module)
+        ))
     }
+}
+
+/// Every `::`-separated segment of `path` with its raw-identifier sigil
+/// removed, borrowing when there is none to remove.  `#` cannot occur inside
+/// an identifier, so an `r#` in the path is always the sigil.
+fn strip_raw_ident_sigils(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains("r#") {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(
+        path.split("::")
+            .map(|seg| seg.strip_prefix("r#").unwrap_or(seg))
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
 }
 
 /// Object-identity token for a STRUCT / enum-variant type definition —

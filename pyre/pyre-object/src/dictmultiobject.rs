@@ -3821,9 +3821,18 @@ pub const W_DICT_VIEW_ITERATOR_OBJECT_SIZE: usize =
 
 pub const W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS: [usize; 1] = [DICT_VIEW_ITER_W_DICT_OFFSET];
 
+/// Reads the runtime-assigned dict-view iterator type id (stamped once at
+/// init by the JIT driver's GC registration); the value is not a build-time
+/// constant, so the JIT residualises the read instead of tracing into it
+/// (`@dont_look_inside`).
+#[majit_macros::dont_look_inside]
+pub fn dict_view_iterator_gc_type_id() -> u32 {
+    W_DICT_VIEW_ITERATOR_GC_TYPE_ID.get()
+}
+
 impl crate::lltype::GcType for W_BaseDictMultiIterObject {
     fn type_id() -> u32 {
-        W_DICT_VIEW_ITERATOR_GC_TYPE_ID.get()
+        dict_view_iterator_gc_type_id()
     }
     const SIZE: usize = W_DICT_VIEW_ITERATOR_OBJECT_SIZE;
 }
@@ -3886,7 +3895,7 @@ fn w_dict_view_iterator_new_direction(
         start_strategy_id,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-        W_DICT_VIEW_ITERATOR_GC_TYPE_ID.get(),
+        dict_view_iterator_gc_type_id(),
         W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
     );
     if raw.is_null() {

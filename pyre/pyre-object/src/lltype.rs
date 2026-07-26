@@ -152,6 +152,23 @@ pub struct PyreClassDescriptor {
     /// diagnostics — the GC-root registration guard reports it by name
     /// when a type with managed children was left unregistered.
     pub pyname: &'static str,
+    /// Fully-qualified Rust path of the `PyType` static
+    /// [`Self::pytype_ptr`] points at (`"pyre_interpreter::module::thread\
+    /// ::local_class::LOCAL_TYPE"`), spelled the way the flowgraph names
+    /// the global read.  `#[pyre_class]` derives the static's identifier
+    /// from the struct name, so the path exists only after macro
+    /// expansion and no source search finds it; carrying it here is what
+    /// lets the JIT bind the address without a hand-written table row per
+    /// type (`pyre-interpreter/src/jit_fnaddr.rs`
+    /// `jit_static_pytype_addrs`).
+    ///
+    /// Declare the type at module scope.  The path comes from
+    /// `module_path!()`, which names the enclosing *module*, so a
+    /// `#[pyre_class]` written inside a function body would carry a path
+    /// missing that function's segment and bind nothing — unlike the raw
+    /// identifier difference (`mod r#struct`), which the consumer side
+    /// normalizes away.
+    pub pytype_path: &'static str,
 }
 
 // Safety: every field is either a static-`'static` reference (PyType,
