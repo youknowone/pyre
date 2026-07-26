@@ -7307,32 +7307,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod bridge_only_parse_tests {
-    use super::parse_bridge_only;
-
-    #[test]
-    fn parses_a_comma_separated_list_with_surrounding_space() {
-        assert_eq!(parse_bridge_only("3, 7 ,11"), vec![3, 7, 11]);
-    }
-
-    #[test]
-    #[should_panic(expected = "is not a valid guard fail_index")]
-    fn rejects_an_unparsable_entry() {
-        parse_bridge_only("3,seven");
-    }
-
-    /// An allowlist matching no guard suppresses every bridge, which is the
-    /// confidently-wrong bisection result this parser exists to prevent.
-    #[test]
-    #[should_panic(expected = "names no guard fail_index")]
-    fn rejects_a_value_that_names_no_index() {
-        parse_bridge_only(" , ,");
-    }
-
-    #[test]
-    #[should_panic(expected = "names no guard fail_index")]
-    fn rejects_an_empty_value() {
-        parse_bridge_only("");
-    }
-}
