@@ -6757,7 +6757,9 @@ fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> Di
     if crate::majit_log_enabled() {
         eprintln!(
             "[bh] residual_call declined: funcptr {func:#x} is a symbolic path hash, not a code \
-             address; register the callee's path in the host's fnaddr bindings"
+             address; register the callee's path in the host's fnaddr bindings (jitcode {:?} pos \
+             {} last {})",
+            bh.jitcode.name, bh.position, bh.last_opcode_position,
         );
     }
     bh.aborted = true;

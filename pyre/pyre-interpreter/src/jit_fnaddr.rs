@@ -1391,6 +1391,63 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::list_write_barrier",
         pyre_object::list_write_barrier as *const (),
     );
+    // The #171 fold descends `w_list_append` as a sub-jitcode walk, so a guard
+    // exit inside it is numbered against `w_list_append`'s own jitcode and is
+    // resumed there in the blackhole (`resume.py:1339 jitcodes[jitcode_pos]`).
+    // The resumed body then reaches the per-strategy store its arm selected —
+    // `W_ListObject::object_push` for the Object strategy, `IntArray::push` /
+    // `FloatArray::push` for the unwrapped ones — each a `residual_call`, and
+    // `blackhole.py:1230 bhimpl_residual_call_*` takes the funcptr straight to
+    // an indirect branch.  Upstream never has to bind these: `call.py:181-183
+    // getfunctionptr(graph)` resolves every callee in the same translation.
+    // pyre's codewriter runs in `build.rs`, so an unregistered callee keeps a
+    // `symbolic_fnaddr_for_path` hash, the blackhole aborts the frame, and the
+    // jd1 drain silently loses the in-flight `next()` item the resume was
+    // supposed to append.  `fnaddr_for_target`'s `CallTarget::Method` fallback
+    // looks the address up as `CallPath::for_impl_method(receiver, name)`, i.e.
+    // the 2-segment `[receiver, method]` key `register_macro_helper_trace_fnaddr`
+    // derives by stripping the leading crate segment — hence the
+    // `pyre_object::<Type>::<method>` spelling here.
+    let object_push: unsafe fn(&mut pyre_object::W_ListObject, pyre_object::PyObjectRef) =
+        pyre_object::W_ListObject::object_push;
+    push_fnaddr(
+        &mut entries,
+        "pyre_object::W_ListObject::object_push",
+        object_push as *const (),
+    );
+    let int_array_push: fn(&mut pyre_object::IntArray, i64) = pyre_object::IntArray::push;
+    push_fnaddr(
+        &mut entries,
+        "pyre_object::IntArray::push",
+        int_array_push as *const (),
+    );
+    let float_array_push: fn(&mut pyre_object::FloatArray, f64) = pyre_object::FloatArray::push;
+    push_fnaddr(
+        &mut entries,
+        "pyre_object::FloatArray::push",
+        float_array_push as *const (),
+    );
+    // The same resume needs the jitcode *shells* it inline-calls to carry a
+    // real address: `blackhole.py:1300-1317 bhimpl_inline_call_*` calls
+    // `cpu.bh_call_*(adr2int(jitcode.fnaddr), ...)`, so a shell minted with
+    // `symbolic_fnaddr_for_path` is uncallable the same way.  `w_list_append`
+    // is the fold's descended body and `w_list_len` its length probe.
+    let w_list_append: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
+        pyre_object::listobject::w_list_append;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_append",
+        "pyre_object::w_list_append",
+        w_list_append as *const (),
+    );
+    let w_list_len: unsafe fn(pyre_object::PyObjectRef) -> usize =
+        pyre_object::listobject::w_list_len;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_len",
+        "pyre_object::w_list_len",
+        w_list_len as *const (),
+    );
     // The cold list strategy dehomogenization `switch_to_object_strategy` bulk
     // re-boxes typed int/float storage into an Object items block via
     // Vec/collect allocation the tracer cannot model. Register it so the hot
