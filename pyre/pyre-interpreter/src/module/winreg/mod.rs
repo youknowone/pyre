@@ -139,7 +139,7 @@ mod imp {
     }
 
     fn store_handle(obj: PyObjectRef, raw: HKEY) {
-        let d = crate::baseobjspace::getdict(obj);
+        let d = crate::baseobjspace::getdict_native(obj);
         if !d.is_null() {
             unsafe { w_dict_setitem_str(d, "_handle", int_from_ptr(raw)) };
         }
@@ -165,7 +165,7 @@ mod imp {
     /// The stored `_handle` value, if `obj` is a `PyHKEY`.  `uint_w` reads both
     /// the small-int and long forms a handle pointer may take.
     fn stored_handle(obj: PyObjectRef) -> Option<HKEY> {
-        let d = crate::baseobjspace::getdict(obj);
+        let d = crate::baseobjspace::getdict_native(obj);
         if d.is_null() {
             return None;
         }
