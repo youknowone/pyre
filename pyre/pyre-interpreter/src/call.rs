@@ -1808,7 +1808,8 @@ pub(crate) fn bind_kwargs_to_signature(
                     if has_varkw {
                         break;
                     }
-                    // argument.py:481-484 — collect and keep scanning.
+                    // argument.py:481-484 — collect and keep scanning
+                    // remaining keywords instead of raising immediately.
                     posonly_kwds.push(key.to_string());
                     matched = true;
                     break;
@@ -2125,7 +2126,8 @@ pub fn call_with_kwargs(
                             if has_varkw {
                                 break;
                             }
-                            // argument.py:481-484 — collect and keep scanning.
+                            // argument.py:481-484 — collect and keep scanning
+                            // remaining keywords instead of raising immediately.
                             posonly_kwds.push(key.to_string());
                             matched = true;
                             break;
