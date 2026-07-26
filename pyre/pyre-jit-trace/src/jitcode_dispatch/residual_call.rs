@@ -2372,19 +2372,28 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // Latch the operand-stack mirror for the escape flush: at force time
         // the walk-end flush needs the caller's mid-expression stack, which
         // the vable shadow cannot provide (`reconstructed_all_ref_call_stack`
-        // resolves the same mirror for the inline-abort Entry carrier).  Only
-        // a non-writing residual is latched — a committed escape resumes AT
-        // this opcode and re-executes it in the interpreter, which must not
-        // re-apply a heap write.  The write gate is load-bearing beyond the
-        // obvious setters: forcing is NOT limited to frame-introspection
-        // reads (`hook_access_field`, rvirtualizable.py:49-53, forces on
-        // every redirected-field access, reads AND writes), and the mutating
-        // forcers — the `f_lineno`/`f_trace` setters, `sys.settrace`,
-        // `_warnings.warn` (forces the caller frame for `__name__`, then
-        // mutates `__warningregistry__` with no user frame entered) — are
-        // excluded here only because every Python-visible frame MUTATOR is a
-        // Void-returning store or a CALL-shaped helper.  What survives the
-        // gates is attribute/item READS of frame-family objects, which are
+        // resolves the same mirror for the inline-abort Entry carrier).
+        //
+        // A WRITING residual is latched too, but never to resume AT this
+        // opcode: the withdrawal below cancels its commit and restores the
+        // pre-flush frame unconditionally, so the interpreter never
+        // re-executes it and never re-applies the write.  What the commit
+        // leaves behind for it is a WITNESS — it proves every mirror slot
+        // resolved to a concrete non-null Ref, i.e. the walk holds a complete
+        // mid-expression stack image, which is exactly the precondition for
+        // building the blackhole resume PAST the residual.  Forcing is NOT
+        // limited to frame-introspection reads (`hook_access_field`,
+        // rvirtualizable.py:49-53, forces on every redirected-field access,
+        // reads AND writes), and every Python-visible frame MUTATOR (the
+        // `f_lineno`/`f_trace` setters, `sys.settrace`, `_warnings.warn`,
+        // which forces the caller frame for `__name__` and then mutates
+        // `__warningregistry__` with no user frame entered) is a
+        // Void-returning store or a CALL-shaped helper, so all of them land
+        // on the writing side and take that withdrawal.
+        //
+        // A non-writing residual that entered no user frame keeps its commit
+        // and the resume-AT-opcode semantics: what survives the gates there
+        // is attribute/item READS of frame-family objects, which are
         // idempotently re-executable (re-execution reads the same flushed
         // values the first execution saw; a token re-force is a no-op).
         //
@@ -2415,7 +2424,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // run_perfn_walk epilogue that adopts (or restores) a committed
         // escape flush, so a commit there would strand a moved frame.
         let escape_stack = (escape_frame != 0
-            && !writes_live_heap
             && !ctx.fbw_mode.inline_subwalk
             && !ctx.trace_ctx.is_bridge_trace
             && ctx.vstack_valid
@@ -2509,15 +2517,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // still holds trace-entry values, which a resume PAST the residual
             // would read back through the virtualizable and get a stale local.
             let escape_flush_committed = committed_frame_escape_pc().is_some();
-            // The escaping residual also entered a user Python frame whose
-            // body may have committed irreversible effects; a committed
-            // escape resume would re-execute this opcode and re-run that
-            // body.  Withdraw the commit AND restore the pre-flush frame so
-            // the legacy replay re-enters pristine pre-walk state (the flush
-            // moved the live frame mid-iteration; replaying on top of it
-            // loses journal-rolled-back effects and re-runs partial state).
-            if heap_write_odometer_before
-                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
+            // The escaping residual either wrote live heap outside the
+            // journals, or entered a user Python frame whose body may have
+            // committed irreversible effects.  Either way a committed escape
+            // resume would re-execute this opcode and so re-apply that write
+            // / re-run that body.  Withdraw the commit AND restore the
+            // pre-flush frame so the legacy replay re-enters pristine
+            // pre-walk state (the flush moved the live frame mid-iteration;
+            // replaying on top of it loses journal-rolled-back effects and
+            // re-runs partial state).  The sample above already read the
+            // commit, so the mirror-resolved witness survives the withdrawal
+            // for the blackhole gate below.
+            if writes_live_heap
+                || heap_write_odometer_before
+                    .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
             {
                 cancel_committed_frame_escape_pc();
                 restore_escape_flush_undo();
