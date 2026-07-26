@@ -33,7 +33,8 @@ Pinned contract:
      thread, with the arguments the object was constructed from —
      keywords included,
   2. an initializer that raises propagates out of the attribute access
-     and leaves no dictionary behind,
+     and leaves no dictionary behind — including in the per-thread cache,
+     so the next access from that same thread runs it again,
   3. construction arguments are accepted according to the initializer
      the subtype inherits, not the requested type,
   4. per-thread state is not shared,
@@ -87,6 +88,38 @@ class Failing(_thread._local):
 
 failing = Failing()
 assert run_in_thread(lambda: failing.__dict__) == ("err", "ValueError", "boom")
+
+
+# The discarded dict must be gone from the per-thread cache too.  This
+# initializer assigns an instance attribute before raising, and that assignment
+# is what publishes the dict, so the cache names the very entry the failure
+# path removes.  A cache left behind would answer the second access from the
+# same thread with the half-built dict instead of running `__init__` again.
+class FailingAfterStore(_thread._local):
+    count = 0
+
+    def __init__(self):
+        type(self).count += 1
+        if type(self).count > 1:
+            self.marker = type(self).count
+            raise ValueError("boom")
+
+
+failing_after_store = FailingAfterStore()
+
+
+def probe_twice():
+    seen = []
+    for _ in range(2):
+        try:
+            seen.append(("returned", failing_after_store.marker))
+        except ValueError as exc:
+            seen.append(("raised", str(exc)))
+    return seen
+
+
+assert run_in_thread(probe_twice) == ("ok", [("raised", "boom"), ("raised", "boom")])
+assert FailingAfterStore.count == 3, FailingAfterStore.count
 
 
 # 3. Argument acceptance follows the inherited initializer.

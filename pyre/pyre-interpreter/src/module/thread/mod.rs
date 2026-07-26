@@ -395,7 +395,12 @@ fn parse_acquire_args(
     } else if timeout == -1.0 {
         Ok(-1)
     } else {
-        Ok((timeout * 1e6) as i64)
+        // `_PyTime_ROUND_TIMEOUT` rounds away from zero, both in
+        // `lock_acquire_parse_args`' seconds→ns step and in
+        // `_PyTime_AsMicroseconds`.  Truncating instead would collapse any
+        // positive sub-microsecond timeout to 0, which `acquire_timed` reads
+        // as a non-blocking poll rather than a timed wait.
+        Ok((timeout * 1e6).ceil() as i64)
     }
 }
 
@@ -1090,9 +1095,16 @@ mod local_class {
                     return Ok(self.last_dict);
                 }
             }
-            // `create_new_dict` runs app-level `__init__`, which reenters this
-            // method, so the cache lock is not held across the lookup.
-            let w_dict = match unsafe { pyre_object::w_dict_getitem(self.dicts, ident) } {
+            // `dicts` is mutated under `state_lock` by `create_new_dict` and
+            // `thread_is_stopping`, so the probe takes it too rather than
+            // reading the native dict beside a concurrent write.  The lock is
+            // released before `create_new_dict`, which runs app-level
+            // `__init__` and reenters this method.
+            let existing = {
+                let _guard = self.state_lock.lock();
+                unsafe { pyre_object::w_dict_getitem(self.dicts, ident) }
+            };
+            let w_dict = match existing {
                 Some(w_dict) => w_dict,
                 None => self.create_new_dict(ident)?,
             };
