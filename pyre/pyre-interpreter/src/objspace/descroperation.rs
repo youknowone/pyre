@@ -3615,6 +3615,11 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
 /// standard NotImplemented fallback.
 pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
+        if needs_numeric_binop_dispatch(a, b, "__divmod__", "__rdivmod__") {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")? {
+                return Ok(result);
+            }
+        }
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
         if lhs_num && rhs_num {

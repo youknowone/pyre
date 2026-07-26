@@ -12223,6 +12223,26 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     )))
 }
 
+/// True iff `callable` is the canonical builtin `divmod` function object.
+/// The JIT walker uses the builtin-code identity to recognize a `divmod(a, b)`
+/// residual it can lower to the inline pair shape, and to distinguish it from
+/// an arbitrary replacement stored under the same global name.
+pub fn is_builtin_divmod_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        std::ptr::fn_addr_eq(
+            crate::gateway::builtin_code_get(code),
+            builtin_divmod as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py divmod row.
 fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);

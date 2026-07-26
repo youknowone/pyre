@@ -563,53 +563,15 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     }
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
-            // rint.py _ovf_zer guards: int_eq(rhs,0)→guard_false +
-            // (lhs==INT_MIN)&(rhs==-1)→guard_false ahead of the elidable
-            // helper call (so a re-used trace bails before the helper's
-            // wrapping_div / wrapping_rem returns a wrap value).
-            let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, (rb == 0) as i64);
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
-            let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
-            let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
-            let ovf_both = ctx
-                .trace_ctx
-                .record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
-            ctx.trace_ctx.set_opref_concrete(
-                ovf_both,
-                majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
-            );
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])?;
-            // jtransform.py OS_INT_PY_DIV / OS_INT_PY_MOD elidable
-            // residual call (call_typed_with_effect_pure → CallI patched via
-            // record_result_of_call_pure).
-            let (func_ptr, effect_info, concrete_result) = if op_code == OpCode::IntFloorDiv {
-                (
-                    majit_metainterp::blackhole::ll_int_py_div as *const (),
-                    majit_metainterp::INT_PY_DIV_EFFECT_INFO,
-                    majit_metainterp::blackhole::ll_int_py_div(la, rb),
-                )
-            } else {
-                (
-                    majit_metainterp::blackhole::ll_int_py_mod as *const (),
-                    majit_metainterp::INT_PY_MOD_EFFECT_INFO,
-                    majit_metainterp::blackhole::ll_int_py_mod(la, rb),
-                )
-            };
-            let r = ctx.trace_ctx.call_typed_with_effect_pure(
-                OpCode::CallI,
-                func_ptr,
-                &[lhs_raw, rhs_raw],
-                &[majit_ir::Type::Int, majit_ir::Type::Int],
-                majit_ir::Type::Int,
-                effect_info,
-                &[
-                    majit_ir::Value::Int(func_ptr as usize as i64),
-                    majit_ir::Value::Int(la),
-                    majit_ir::Value::Int(rb),
-                ],
-                majit_ir::Value::Int(concrete_result),
-            );
-            (r, concrete_result)
+            walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
+            walker_emit_int_py_div_or_mod(
+                ctx,
+                lhs_raw,
+                rhs_raw,
+                la,
+                rb,
+                op_code == OpCode::IntFloorDiv,
+            )
         }
         OpCode::IntRshift => {
             // The machine SAR masks the count mod 64, so guard the count into
@@ -650,6 +612,78 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
+}
+
+/// rint.py `_ovf_zer` guards for a machine-int division: `int_eq(rhs,0)` →
+/// `guard_false` plus `(lhs==INT_MIN)&(rhs==-1)` → `guard_false`.  Both must
+/// precede the elidable `ll_int_py_div` / `ll_int_py_mod` call so a re-used
+/// trace bails before the helper's `wrapping_div` / `wrapping_rem` returns a
+/// wrap value.  A `divmod` site shares one guard pair across both halves.
+fn walker_emit_int_div_domain_guards<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    lhs_raw: OpRef,
+    rhs_raw: OpRef,
+    la: i64,
+    rb: i64,
+) -> Result<(), DispatchError> {
+    let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, (rb == 0) as i64);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
+    let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
+    let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
+    let ovf_both = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+    ctx.trace_ctx.set_opref_concrete(
+        ovf_both,
+        majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])
+}
+
+/// jtransform.py `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable residual call
+/// (`call_typed_with_effect_pure` → `CallI` patched via
+/// `record_result_of_call_pure`), returning the result op and its recorded
+/// value.  The caller must have emitted
+/// [`walker_emit_int_div_domain_guards`] over the same operand pair first.
+fn walker_emit_int_py_div_or_mod<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    lhs_raw: OpRef,
+    rhs_raw: OpRef,
+    la: i64,
+    rb: i64,
+    is_div: bool,
+) -> (OpRef, i64) {
+    let (func_ptr, effect_info, concrete_result) = if is_div {
+        (
+            majit_metainterp::blackhole::ll_int_py_div as *const (),
+            majit_metainterp::INT_PY_DIV_EFFECT_INFO,
+            majit_metainterp::blackhole::ll_int_py_div(la, rb),
+        )
+    } else {
+        (
+            majit_metainterp::blackhole::ll_int_py_mod as *const (),
+            majit_metainterp::INT_PY_MOD_EFFECT_INFO,
+            majit_metainterp::blackhole::ll_int_py_mod(la, rb),
+        )
+    };
+    let r = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        func_ptr,
+        &[lhs_raw, rhs_raw],
+        &[majit_ir::Type::Int, majit_ir::Type::Int],
+        majit_ir::Type::Int,
+        effect_info,
+        &[
+            majit_ir::Value::Int(func_ptr as usize as i64),
+            majit_ir::Value::Int(la),
+            majit_ir::Value::Int(rb),
+        ],
+        majit_ir::Value::Int(concrete_result),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(r, majit_ir::Value::Int(concrete_result));
+    (r, concrete_result)
 }
 
 /// Walker-native mixed `W_LongObject` / `W_IntObject` arithmetic
@@ -3137,6 +3171,30 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         )?
     };
 
+    let Some(tuple) = walker_emit_specialised_tuple_ii(ctx, raw0, raw1, v0, v1) else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
+    Ok(Some(()))
+}
+
+/// Emit the virtual `Cls_ii` arity-2 int tuple (`makespecialisedtuple2`,
+/// specialisedtupleobject.py) walker-native: `new_with_vtable` + the `w_class`
+/// / `value0` / `value1` `setfield_gc`s over the two raw int payloads.
+///
+/// `v0` / `v1` are the recorded payloads; they build the concrete shadow the
+/// partner unpack fold reads back (`walker_concrete_ref_object` +
+/// `unpack_item_fn`).  The shadow is constructed LAST so the construct→root
+/// window holds no intervening runtime allocation: stamping `tuple`'s concrete
+/// roots the fresh spec_ii via the trace's concrete-shadow set.  Returns
+/// `None` only when that allocation fails.
+fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    raw0: OpRef,
+    raw1: OpRef,
+    v0: i64,
+    v1: i64,
+) -> Option<OpRef> {
     let tuple = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
         &[],
@@ -3160,43 +3218,25 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
             wc,
         );
     }
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[tuple, raw0],
-        crate::descr::specialised_tuple_ii_value0_descr(),
-    );
-    ctx.trace_ctx.heapcache_setfield_cached(
-        tuple,
-        crate::descr::specialised_tuple_ii_value0_descr().index(),
-        raw0,
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[tuple, raw1],
-        crate::descr::specialised_tuple_ii_value1_descr(),
-    );
-    ctx.trace_ctx.heapcache_setfield_cached(
-        tuple,
-        crate::descr::specialised_tuple_ii_value1_descr().index(),
-        raw1,
-    );
-    // Concrete spec_ii shadow for the dst (read by the partner unpack fold's
-    // `walker_concrete_ref_object` + `unpack_item_fn` execution).  Built
-    // directly from the element payloads — `newtuple_from_array(arr)` cannot
-    // be executed concretely (the virtual array `arr` has no concrete
-    // shadow).  Constructed last so the construct→root window holds no
-    // intervening runtime allocation: stamping `tuple`'s concrete roots the
-    // fresh spec_ii via the trace's concrete-shadow set.
+    for (raw, descr) in [
+        (raw0, crate::descr::specialised_tuple_ii_value0_descr()),
+        (raw1, crate::descr::specialised_tuple_ii_value1_descr()),
+    ] {
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[tuple, raw], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(tuple, descr_index, raw);
+    }
     let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
     if tuple_ptr.is_null() {
-        return Ok(None);
+        return None;
     }
     ctx.trace_ctx.set_opref_concrete(
         tuple,
         majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
     );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
-    Ok(Some(()))
+    Some(tuple)
 }
 
 /// #57 SLICE 3b: walker-native speculative int specialization for the
@@ -4664,6 +4704,142 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
         walker_guard_exact_w_class(ctx, op.pc, arg_op, float_type_obj)?;
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
     }
+    Ok(Some(()))
+}
+
+/// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
+/// shape the meta-tracer produces upstream (intobject.py `_divmod` →
+/// `space.newtuple2(space.newint(z), space.newint(m))`) instead of the opaque
+/// `bh_call_fn(divmod_builtin, NULL, a, b)` residual.
+///
+/// The divmod row rejects a zero divisor before dispatching, so the trace
+/// carries the same domain guards the `//` / `%` specialization emits, then
+/// runs the two `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable calls over one
+/// guarded operand pair.  The result is the virtual `Cls_ii` specialised
+/// tuple, so a `q, r = divmod(...)` site pairs with
+/// [`try_walker_specialize_unpack`] and the tuple never materializes.
+///
+/// The exact `w_class` guard is required because an `int` SUBCLASS shares
+/// `ob_type == &INT_TYPE` but may override `__divmod__`; it side-exits to the
+/// generic residual.
+///
+/// Returns `None` (fall through to the generic residual, SAFE) for any other
+/// shape: wrong arity, a bound receiver, a non-`divmod` callable, an operand
+/// that is not an exact `int` (long / float / bool / subclass), a tagged
+/// immediate, a zero divisor, or the `INT_MIN // -1` pair that escapes to a
+/// bigint result.
+pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, a, b)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(lhs_obj),
+        ConcreteValue::Ref(rhs_obj),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0 — not a plain `divmod(a, b)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || lhs_obj.is_null()
+        || rhs_obj.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_divmod_function(concrete_callable) {
+        return Ok(None);
+    }
+    // A tagged immediate has no real header for the `w_class` / unbox guards
+    // and this emit is not tag-aware, so decline it to the residual.
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let (la, rb) = unsafe {
+        let is_exact_int = |o: pyre_object::PyObjectRef| {
+            std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
+                && std::ptr::eq((*o).w_class, int_typeobj)
+        };
+        if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
+            return Ok(None);
+        }
+        (
+            pyre_object::w_int_get_value(lhs_obj),
+            pyre_object::w_int_get_value(rhs_obj),
+        )
+    };
+    // A zero divisor raises ZeroDivisionError and `INT_MIN // -1` escapes to
+    // the bigint pair; both are outside the guarded domain the emit below
+    // covers, so decline rather than record a guard the recorded operands
+    // already fail.
+    if rb == 0 || (la == i64::MIN && rb == -1) {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (LOAD_GLOBAL `divmod` is usually already a
+    // constant via the namespace cell fold).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let (lhs_op, rhs_op) = (r_args[2], r_args[3]);
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    // `GuardClass` before the `w_class` read: it is the guard that proves the
+    // operand is a real heap header rather than a tagged immediate, so it has
+    // to precede any `getfield` off that header.
+    walker_guard_class(ctx, op.pc, lhs_op, int_type_addr)?;
+    walker_guard_class(ctx, op.pc, rhs_op, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, lhs_op, int_typeobj)?;
+    walker_guard_exact_w_class(ctx, op.pc, rhs_op, int_typeobj)?;
+    let lhs_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        lhs_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    let rhs_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        rhs_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    walker_emit_int_div_domain_guards(ctx, op.pc, lhs_raw, rhs_raw, la, rb)?;
+    let (div_raw, div_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, true);
+    let (mod_raw, mod_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, false);
+    let Some(tuple) = walker_emit_specialised_tuple_ii(ctx, div_raw, mod_raw, div_value, mod_value)
+    else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
     Ok(Some(()))
 }
 

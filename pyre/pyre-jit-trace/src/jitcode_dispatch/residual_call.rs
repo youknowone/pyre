@@ -3221,6 +3221,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `divmod(a, b)` on two exact ints: inline the guarded
+    // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
+    // specialised tuple (intobject.py `_divmod` → `newtuple2`) instead of the
+    // opaque `bh_call_fn(divmod_builtin, NULL, a, b)` residual.  Pure like the
+    // `len` fold, so no sub-walk restriction; any non-matching shape falls
+    // through to the generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_divmod(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // B3: a `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
     // constructs the exception, and a `RaiseVarargs`
