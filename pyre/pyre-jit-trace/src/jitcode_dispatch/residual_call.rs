@@ -468,6 +468,20 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             *slot = Some(value as i64);
         }
     }
+    // `num_regs_f()` is the third bank `_copy_data_from_miframe` walks, so the
+    // rationale above covers floats too.  There is no float concrete shadow —
+    // resolve the recorded box, and leave the color unset when it has none.
+    for color in 0..miframe.float_values.len() {
+        if miframe.float_values[color].is_some() {
+            continue;
+        }
+        let Some(&opref) = ctx.registers_f.get(color) else {
+            continue;
+        };
+        if let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) {
+            miframe.float_values[color] = Some(value.to_bits() as i64);
+        }
+    }
 
     Some(miframe)
 }
@@ -2487,6 +2501,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     func_ptr as usize,
                 );
             }
+            // Sampled BEFORE the withdrawal below: a commit means the escape
+            // flush made the LIVE frame authoritative at this opcode — the
+            // latched operand-stack mirror resolved and
+            // `flush_walk_end_state_to_frame_with_full_stack` wrote every
+            // local and every mid-expression stack slot.  Without it the frame
+            // still holds trace-entry values, which a resume PAST the residual
+            // would read back through the virtualizable and get a stale local.
+            let escape_flush_committed = committed_frame_escape_pc().is_some();
             // The escaping residual also entered a user Python frame whose
             // body may have committed irreversible effects; a committed
             // escape resume would re-execute this opcode and re-run that
