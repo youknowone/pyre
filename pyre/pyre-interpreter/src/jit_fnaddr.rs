@@ -688,6 +688,26 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_dict_new as *const (),
     );
     push_fnaddr(&mut entries, "w_dict_new", w_dict_new as *const ());
+    // `w_set_new` / `w_frozenset_new` are `#[dont_look_inside]` for the same
+    // host `IndexMap::new` storage-box reason; bind their zero-arg
+    // `fn() -> PyObjectRef` so the residual calls resolve.
+    let w_set_new: fn() -> pyre_object::PyObjectRef = pyre_object::setobject::w_set_new;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::setobject::w_set_new",
+        "pyre_object::w_set_new",
+        w_set_new as *const (),
+    );
+    push_fnaddr(&mut entries, "w_set_new", w_set_new as *const ());
+    let w_frozenset_new: fn() -> pyre_object::PyObjectRef =
+        pyre_object::setobject::w_frozenset_new;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::setobject::w_frozenset_new",
+        "pyre_object::w_frozenset_new",
+        w_frozenset_new as *const (),
+    );
+    push_fnaddr(&mut entries, "w_frozenset_new", w_frozenset_new as *const ());
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_len",

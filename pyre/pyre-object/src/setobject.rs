@@ -154,6 +154,14 @@ fn set_write_barrier(obj: PyObjectRef) {
 }
 
 /// Allocate an empty `set`.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `w_dict_new` twin: the body builds the host `SetItemsStorage`
+/// (`IndexMap<ObjectKey, ()>`) box before the object is allocated, so the
+/// foreign `IndexMap::new` construction is an unported host container op.
+/// Tracing into it carries that op into the caller; residualising the whole
+/// constructor models it by signature — a plain `PyObjectRef` GCREF.
+#[majit_macros::dont_look_inside]
 pub fn w_set_new() -> PyObjectRef {
     let items =
         crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
@@ -197,6 +205,9 @@ pub fn w_set_new() -> PyObjectRef {
 ///
 /// Same body as [`w_set_new`] with the constant `&FROZENSET_TYPE` baked
 /// into `ob_type`; see that constructor for the GC old-gen rationale.
+/// `#[dont_look_inside]` for the same `IndexMap::new` storage-box reason as
+/// [`w_set_new`].
+#[majit_macros::dont_look_inside]
 pub fn w_frozenset_new() -> PyObjectRef {
     let items =
         crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());

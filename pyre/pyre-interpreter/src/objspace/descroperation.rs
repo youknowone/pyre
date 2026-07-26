@@ -2487,6 +2487,11 @@ unsafe fn needs_numeric_binop_dispatch(
 /// paths below are valid for exact builtins, but a heap subclass must enter
 /// `_call_binop_impl` so its forward/reflected override and the reflected-
 /// subclass priority are observed before inherited set semantics.
+///
+/// `dont_look_inside`: `is_exact_type` loads the builtin `SET_TYPE`/
+/// `FROZENSET_TYPE` statics here, so keep that load in this residual helper
+/// off the traced graph — mirrors `needs_seq`/`needs_bytes`/`needs_numeric`.
+#[majit_macros::dont_look_inside]
 unsafe fn needs_set_binop_dispatch(a: PyObjectRef, b: PyObjectRef) -> bool {
     let is_exact_setlike = |obj| {
         pyre_object::is_exact_type(obj, &pyre_object::setobject::SET_TYPE)
