@@ -11188,6 +11188,23 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 /// RPython delegates to self.cpu (metainterp_sd.cpu) for allocation.
 pub(crate) struct PyreBlackholeAllocator;
 
+/// The write barrier every blackhole ref store owes its container.
+///
+/// `llmodel.py:723 bh_setfield_gc_r` reaches `:495 write_ref_at_mem`, where the
+/// framework GC transformer supplies the barrier around the store. These
+/// blackhole setters are plain Rust writes with no transformer and no inline
+/// `TRACK_YOUNG_PTRS` test, and `allocate_with_vtable` materializes a resumed
+/// virtual into the non-moving old generation, so a young value stored into one
+/// creates an old→young edge that never enters `old_objects_pointing_to_young`
+/// — and the next minor collection reclaims the value while the container still
+/// points at it.
+fn write_barrier_after_ref_store(container: i64) {
+    let container = container as *mut u8;
+    if pyre_object::gc_hook::try_gc_owns_object(container) {
+        pyre_object::gc_hook::try_gc_write_barrier(container);
+    }
+}
+
 /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
 /// helper for integer and float fields. Ref fields use a pointer-width
 /// store in `bh_setfield_gc_r`, matching `llmodel.py:723`.
@@ -11421,9 +11438,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
         // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
         // ref store carries an implied write barrier on the destination struct.
-        if pyre_object::gc_hook::try_gc_owns_object(struct_ptr as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(struct_ptr as *mut u8);
-        }
+        write_barrier_after_ref_store(struct_ptr);
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -11497,9 +11512,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // llmodel.py:659 `bh_setinteriorfield_gc_r` → :495
         // `write_ref_at_mem`: the ref store carries an implied write barrier
         // on the destination array.
-        if array != 0 && pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
-        }
+        write_barrier_after_ref_store(array);
     }
 
     fn bh_setinteriorfield_gc_f(
