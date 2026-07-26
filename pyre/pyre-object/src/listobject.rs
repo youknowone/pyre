@@ -173,7 +173,15 @@ impl W_ListObject {
     /// Upstream list.append equivalent for the object strategy.
     /// (listobject.py:1695 `AbstractUnwrappedStrategy.append` for the
     /// Object case: no unwrap, just append.)
-    unsafe fn object_push(&mut self, value: PyObjectRef) {
+    /// `pub` because the blackhole calls it by address: the #171 fold descends
+    /// `w_list_append`, so a guard exit inside that body resumes in its jitcode
+    /// and re-executes this store as a `residual_call`, whose funcptr comes
+    /// from the `jit_fnaddr.rs` binding (pyre's stand-in for `call.py:181-183
+    /// getfunctionptr(graph)`).
+    ///
+    /// # Safety
+    /// `self` must be an Object-strategy list.
+    pub unsafe fn object_push(&mut self, value: PyObjectRef) {
         // At capacity, route the grow through the `dont_look_inside`
         // boundary: it roots `value` across the (collecting) resize and
         // returns it relocated. The in-place store below stays outside the
