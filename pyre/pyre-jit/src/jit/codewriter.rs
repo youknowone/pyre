@@ -5147,7 +5147,7 @@ impl CodeWriter {
         // pattern (`self.cpu`) still works.
         let cpu = super::cpu::Cpu::new();
         Self {
-            assembler: RefCell::new(Assembler::new()),
+            assembler: RefCell::new(Assembler::resuming_build_time_liveness()),
             callcontrol: UnsafeCell::new(super::call::CallControl::new(cpu, Vec::new())),
             call_descr_stub_cache: Mutex::new(HashMap::new()),
         }

@@ -2016,21 +2016,14 @@ pub fn blackhole_resume_via_rd_numb(
         if novable { None } else { Some(vinfo_dyn) };
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     let allocator = crate::eval::PyreBlackholeAllocator;
-    // pyjitpl.py:2264: metainterp_sd.liveness_info — single shared pool.
-    // Snapshot once per call so the slice outlives ResumeDataDirectReader.
-    let runtime_liveness = pyre_jit_trace::state::liveness_info_snapshot();
-    // A novable drain frame's `-live-` markers carry 2-byte offsets baked at
-    // extraction into the build-time `ALL_LIVENESS` byte stream, NOT the
-    // runtime-accumulated `metainterp_sd.liveness_info` that jd0 tracing grows
-    // via `intern_liveness`.  Decoding a baked offset against the runtime buffer
-    // reads an unrelated jd0 frame's liveness triple (mistyping the drain's 2
-    // refs as ints → `Const::getint on Ref`).  Decode against the same build-time
-    // table the drain jitcode was resolved from.
-    let all_liveness: &[u8] = if novable {
-        pyre_jit_trace::jitcode_runtime::all_liveness()
-    } else {
-        &runtime_liveness
-    };
+    // resume.py:1022 `self.metainterp_sd.liveness_info` — the one pool, for
+    // every driver. A novable drain frame's `-live-` markers carry offsets
+    // baked at extraction into the build-time byte stream; those bytes are the
+    // prefix of this buffer (`Assembler::resuming_build_time_liveness`), so a
+    // baked offset and a runtime-interned one address the same space and no
+    // per-driver pick is needed. Snapshot once per call so the slice outlives
+    // ResumeDataDirectReader.
+    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
     // Scope the &mut to chain construction; the run() loop below uses
     // release_bh_rd to drop and re-acquire the borrow.
     let bh = BH_BUILDER_RD.with(|cell| unsafe {
@@ -2041,7 +2034,7 @@ pub fn blackhole_resume_via_rd_numb(
             &resolve_jitcode,
             rd_numb,
             rd_consts,
-            all_liveness,
+            &all_liveness,
             deadframe,
             deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals

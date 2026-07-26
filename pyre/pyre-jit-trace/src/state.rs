@@ -1169,20 +1169,23 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 ///
 /// pyre has two jitcode numbering spaces. jd0 (`pyframe_driver`) numbers
 /// Python-bytecode jitcodes into `MetaInterpStaticData.jitcodes`, keyed by
-/// CodeObject, and interns their `-live-` triples into
-/// `metainterp_sd.liveness_info` (`pyjitpl.py:2264`) as tracing discovers them.
-/// A novable driver over an extracted interpreter body — jd1
+/// CodeObject. A novable driver over an extracted interpreter body — jd1
 /// `unpackiterable_driver`, whose jitcode is the
 /// `_unpackiterable_unknown_length` graph plus its inlined build-time callees —
-/// numbers against `jitcode_runtime::all_jitcodes()`, with `-live-` offsets
-/// baked at extraction into `jitcode_runtime::all_liveness()`.
+/// numbers against `jitcode_runtime::all_jitcodes()`.
 ///
-/// Decoding one space's coordinate against the other's tables does not fail
-/// loudly, which is why the store has to be picked per driver rather than tried
-/// and retried: the runtime store's low indices hold unrelated PyCode jitcodes
-/// that decode at the same pc and hand back a mistyped count (the drain's 2 refs
+/// Decoding one space's index against the other's table does not fail loudly,
+/// which is why the store has to be picked per driver rather than tried and
+/// retried: the runtime store's low indices hold unrelated PyCode jitcodes that
+/// decode at the same pc and hand back a mistyped count (the drain's 2 refs
 /// read as ints → `Const::getint on Ref`). Same split, and same reasoning, as
-/// the `novable` arms of `call_jit.rs`'s `blackhole_resume_via_rd_numb`.
+/// the `novable` arm of `resolve_jitcode` in `call_jit.rs`.
+///
+/// The `-live-` *offsets* are no longer split: the build-time byte stream is
+/// the prefix of `metainterp_sd.liveness_info`
+/// (`Assembler::resuming_build_time_liveness`), so this reads the one pool
+/// `resume.py:1022` reads, exactly like [`frame_value_count_at`]. Only the
+/// jitcode table below is still per-space.
 ///
 /// Installed on jd1's `JitDriverStaticData::frame_value_count_fn`, so only that
 /// driver's guard metadata decodes here.
@@ -1203,7 +1206,7 @@ pub fn build_time_frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         Some(jc) => jc,
         None => return 0,
     };
-    let all_liveness = crate::jitcode_runtime::all_liveness();
+    let all_liveness = liveness_info_snapshot();
     if pc >= 0 && jitcode.can_decode_live_vars(pc as usize, op_live) {
         let off = jitcode.get_live_vars_info(pc as usize, op_live);
         if off + 2 < all_liveness.len() {
