@@ -1859,8 +1859,15 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
                 return false;
             };
             let resume_py_pc = resume_py_pc as usize;
-            if cf_addr == 0 || resume_py_pc == 0 {
-                mfdbg!("cf_addr {cf_addr:#x} / resume_py_pc {resume_py_pc} is zero");
+            // Only the frame address is checked.  `resume_py_pc` is a
+            // `depth_at_py_pc` index written through to
+            // `frame.last_instr = resume_py_pc - 1`, so 0 is an ordinary
+            // coordinate — the single-frame arm hands it to
+            // `apply_blackhole_crn` unfiltered.  Rejecting it here would also
+            // decline *after* the chain has been driven, returning to a legacy
+            // replay that re-executes what the chain already committed.
+            if cf_addr == 0 {
+                mfdbg!("cf_addr {cf_addr:#x} is zero");
                 return false;
             }
             // The terminal frame's own `setfield_vable` operations committed
