@@ -1757,6 +1757,14 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     // one and shifts every `_getframe` result up a level.  Closing this needs
     // the `jit.virtual_ref` emit at the inline push, so decline to legacy
     // replay until then.
+    mfdbg!(
+        "chain cf_addr={cf_addr:#x} levels=[{}]",
+        per_frame
+            .iter()
+            .map(|&(p, b)| format!("{p:#x}/nl{b}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(cf_addr as i64) {
         mfdbg!(
             "chain rooted at {:#x}, not the walked frame {cf_addr:#x} (needs the \
