@@ -42,10 +42,26 @@ pub struct AssemblerState {
 
 impl AssemblerState {
     fn new() -> Self {
+        // `assembler.py:29-31` gives one `Assembler` one `all_liveness`
+        // buffer, and `codewriter.py:73-86 make_jitcodes` drains *every*
+        // pending graph through it, so upstream has exactly one offset space
+        // for the whole program. pyre splits the drain across two processes —
+        // `build.rs` assembles the extracted interpreter graphs, the runtime
+        // codewriter assembles Python-bytecode graphs — but the offsets baked
+        // into the build-time jitcodes are positions in that same buffer.
+        // Resuming from the build-time bytes is what makes it one buffer
+        // again: the baked offsets stay valid and the runtime's own
+        // `_encode_liveness` allocates strictly above them.
+        //
+        // `pyre_jit::Assembler::resuming_build_time_liveness` seeds the
+        // writer side the same way, so a `publish_state` wholesale replace
+        // never rewinds past this prefix.
+        let all_liveness = crate::jitcode_runtime::all_liveness().to_vec();
+        let all_liveness_length = all_liveness.len();
         Self {
             insns: IndexMap::new(),
-            all_liveness: Vec::new(),
-            all_liveness_length: 0,
+            all_liveness,
+            all_liveness_length,
             all_liveness_positions: IndexMap::new(),
             num_liveness_ops: 0,
         }
@@ -120,4 +136,39 @@ pub fn publish_state(
         asm.all_liveness_positions.clear();
     });
     crate::state::publish_liveness_info(all_liveness.to_vec());
+}
+
+#[cfg(test)]
+mod tests {
+    /// `assembler.py:29-31` — one `Assembler`, one `all_liveness` offset
+    /// space. The build-time drain's bytes are the prefix of that buffer, so
+    /// every offset baked into a build-time jitcode's `-live-` operand
+    /// addresses the same byte in `metainterp_sd.liveness_info` that
+    /// `resume.py:1022` reads. Losing the prefix would not fail loudly — a
+    /// baked offset would land inside an unrelated runtime triple and hand
+    /// back a mistyped value count — so pin it.
+    #[test]
+    fn assembler_state_resumes_the_build_time_liveness_prefix() {
+        let build_time = crate::jitcode_runtime::all_liveness();
+        assert!(
+            !build_time.is_empty(),
+            "the build-time drain produced no liveness bytes; \
+             `liveness.bin` is empty or failed to deserialize"
+        );
+        super::ASSEMBLER_STATE.with(|r| {
+            let asm = r.borrow();
+            assert_eq!(
+                asm.all_liveness_length,
+                asm.all_liveness.len(),
+                "`assembler.py:30 all_liveness_length` must track the buffer"
+            );
+            assert!(
+                asm.all_liveness.starts_with(build_time),
+                "AssemblerState::new must resume the build-time buffer \
+                 (len {} vs build-time len {})",
+                asm.all_liveness.len(),
+                build_time.len(),
+            );
+        });
+    }
 }
