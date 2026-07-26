@@ -1757,6 +1757,21 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
     // one and shifts every `_getframe` result up a level.  Closing this needs
     // the `jit.virtual_ref` emit at the inline push, so decline to legacy
     // replay until then.
+    //
+    // Measured by driving the chain with this check lifted, over the
+    // `getframe_inline_subwalk_multiframe` shape: the shift is exactly one
+    // level and it is silent.  A `sys._getframe(2)` meant for the walked frame
+    // lands on the module frame instead, so the same run returns a wrong
+    // integer rather than failing — `f_locals["base"]` raises `KeyError`,
+    // `f_locals.get("base", -1)` scores -1 for 7, `len(f_locals)` scores the
+    // module globals' 12 for the walked frame's 3, and
+    // `len(f_code.co_name)` scores `<module>`'s 8 for `main_loop`'s 9.  The
+    // check is therefore load-bearing for EVERY outcome arm, not only the
+    // `ContinueRunningNormally` one that consumes a `cf_addr` coordinate:
+    // `DoneWithThisFrame*` and `ExitFrameWithExceptionRef` hand back a value
+    // the chain computed off the wrong frame.  It also has to stay AHEAD of
+    // the drive — declining afterwards returns to a legacy replay that
+    // re-executes what the chain already committed.
     mfdbg!(
         "chain cf_addr={cf_addr:#x} levels=[{}]",
         per_frame

@@ -20,6 +20,15 @@
 # run this is an output guard; the coverage it adds is for `PYRE_FBW_MULTIFRAME=1`
 # (5 builds), which is how the gate's owner exercises the path.
 #
+# What the decline is holding back, measured by lifting it: the resumed chain
+# shifts every `sys._getframe(n)` up exactly one level, so the read below lands
+# on the module frame and raises `KeyError: 'base'`. Variants of this shape that
+# cannot raise return a wrong number instead, silently -- `f_locals.get("base",
+# -1)` scores -1 for 7, `len(f_locals)` scores the module globals' 12 for this
+# frame's 3, `len(f_code.co_name)` scores `<module>`'s 8 for a 9-character
+# caller name. So the adopt is wrong for every outcome arm, not only the one
+# that carries a resume coordinate.
+#
 # Deliberately carries no `# pyre-check: max-pypy-ratio=` header: this guards
 # an output, and the forcing read makes it a poor perf subject.
 import sys
