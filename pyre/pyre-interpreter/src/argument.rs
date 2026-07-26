@@ -1671,17 +1671,13 @@ impl ArgErr {
                 }
             }
             ArgErr::PosonlyAsKwds { posonly_kwds } => {
-                if posonly_kwds.len() == 1 {
-                    format!(
-                        "got a positional-only argument passed as keyword argument: '{}'",
-                        posonly_kwds[0],
-                    )
-                } else {
-                    format!(
-                        "got some positional-only arguments passed as keyword arguments: '{}'",
-                        posonly_kwds.join(", "),
-                    )
-                }
+                // argument.py:635-637 — always the plural wording, even for
+                // a single name; CPython (`positional_only_passed_as_keyword`
+                // in Python/ceval.c) matches this, there is no singular form.
+                format!(
+                    "got some positional-only arguments passed as keyword arguments: '{}'",
+                    posonly_kwds.join(", "),
+                )
             }
         }
     }
@@ -1809,16 +1805,18 @@ mod tests {
         assert_eq!(many.getmsg(), "got 3 unexpected keyword arguments");
     }
 
-    /// pypy/interpreter/argument.py:635-640 `ArgErrPosonlyAsKwds`
-    /// — single vs multi-name plural branches.
+    /// pypy/interpreter/argument.py:635-637 `ArgErrPosonlyAsKwds.getmsg` —
+    /// always the plural wording, regardless of `posonly_kwds` length.
+    /// CPython's `positional_only_passed_as_keyword` (Python/ceval.c) has
+    /// no singular form either.
     #[test]
-    fn arg_err_posonly_as_kwds_branches() {
+    fn arg_err_posonly_as_kwds_always_plural() {
         let one = ArgErr::PosonlyAsKwds {
             posonly_kwds: vec!["a".to_string()],
         };
         assert_eq!(
             one.getmsg(),
-            "got a positional-only argument passed as keyword argument: 'a'",
+            "got some positional-only arguments passed as keyword arguments: 'a'",
         );
         let many = ArgErr::PosonlyAsKwds {
             posonly_kwds: vec!["x".to_string(), "y".to_string()],
