@@ -589,3 +589,15 @@ mod host_abi {
         ((out_ptr as u64) << 32) | (out_len as u64)
     }
 }
+
+/// Diagnostic-only: read one slot of the pyre walker's per-walk census
+/// (slot layout in `pyre_jit_trace::trace::fbw_diag`). The guest cannot read
+/// `PYRE_FBW_CENSUS`, so this is the only walk-level observability the wasm
+/// target has. Exported (not an import) for the same function-index reason as
+/// `pyre_jit_bridge_diag`. The host runner prints these at
+/// `PYRE_WASM_JIT_STATS` time.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_fbw_diag(i: u32) -> u64 {
+    pyre_jit_trace::trace::fbw_diag::get(i as usize)
+}

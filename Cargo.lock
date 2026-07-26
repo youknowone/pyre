@@ -2330,6 +2330,7 @@ dependencies = [
  "majit-metainterp",
  "pyre-interpreter",
  "pyre-jit",
+ "pyre-jit-trace",
  "pyre-object",
  "wasm-bindgen",
 ]

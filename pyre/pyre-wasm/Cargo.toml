@@ -34,7 +34,7 @@ web = [
 # `__getrandom_v03_custom` shim in `src/lib.rs`), selected by building with
 # `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
 # imports a non-JS embedder could not satisfy.
-wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend", "dep:majit-backend-wasm", "dep:majit-metainterp"]
+wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend", "dep:majit-backend-wasm", "dep:majit-metainterp", "dep:pyre-jit-trace"]
 # Diagnostic only: install a counting global allocator so the host runner can
 # read net-live guest-heap bytes/count (`pyre_heap_live_bytes` /
 # `pyre_heap_live_count`) and split a true Rust-heap leak from fragmentation.
@@ -59,3 +59,7 @@ majit-backend = { workspace = true, optional = true }
 # import, which would shift the JIT's function-index space).
 majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2", optional = true, default-features = false }
 majit-metainterp = { path = "../../majit/majit-metainterp", version = "0.0.2", optional = true, default-features = false }
+# Diagnostic-only, same rationale: lets the `pyre_fbw_diag` export read the
+# walker's per-walk census, the wasm target's only walk-level observability
+# (the guest cannot read `PYRE_FBW_CENSUS`).
+pyre-jit-trace = { path = "../pyre-jit-trace", version = "0.0.2", optional = true, default-features = false }

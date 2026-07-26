@@ -42,6 +42,11 @@ thread_local! {
     /// returned `FrameBox` carries adoptable end state for the LIVE
     /// frame (no-replay) or still holds the entry state (legacy replay).
     static WALK_END_FLUSH_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Which flush leg set [`WALK_END_FLUSH_COMMITTED`], recorded so the
+    /// per-walk census can name it (the legs differ in what they resume at,
+    /// so "committed" alone does not say whether the region re-runs).
+    /// See `WalkEndCommitLeg`.
+    static WALK_END_COMMIT_LEG: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// A no-handler exception produced by a committed rebuilt callee.  The
     /// portal consumes it as `LoopResult::Done(Err(..))`; keeping it separate
     /// from `ContinueRunningNormally` mirrors `_exit_frame_with_exception`.
@@ -62,6 +67,37 @@ thread_local! {
 /// returned from [`trace_bytecode`].
 pub fn take_walk_end_flush_committed() -> bool {
     WALK_END_FLUSH_COMMITTED.with(|c| c.replace(false))
+}
+
+/// The flush legs that can commit a walk's end state, in the order they are
+/// tried in the epilogue.  Recorded per walk so the census can distinguish
+/// them: they resume the interpreter at different pcs, and the ones that
+/// resume at a CALL re-execute it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WalkEndCommitLeg {
+    /// Loop-header end flush for a `CloseLoop`/`Terminate` walk.
+    LoopHeader = 1,
+    /// Force-time escape flush wrote the resume state into the live frame.
+    VableEscape = 2,
+    /// gh#467 CALL-forward: resume the OUTER frame AT the CALL that entered
+    /// the aborting callee, re-executing the call from scratch.
+    EntryCarrierCall = 3,
+    /// gh#467 callee-rebuild: resume inside the rebuilt callee frame.
+    CalleeRebuild = 4,
+    /// Resume at the abort pc itself.
+    AbortPc = 5,
+    /// Nested-inline decline: resume the outer caller AT its CALL pc, taken
+    /// from the framestack root's parent.
+    NestedInlineOuterCall = 6,
+    /// Kept-stack branch guard flush at the abort pc.
+    BranchGuard = 7,
+}
+
+/// Set [`WALK_END_FLUSH_COMMITTED`] and record which leg did it.
+pub(crate) fn commit_walk_end(leg: WalkEndCommitLeg) {
+    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+    WALK_END_COMMIT_LEG.with(|c| c.set(leg as u8));
 }
 
 pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError> {
@@ -605,6 +641,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // A stale flag from a prior trace on this thread must not leak into
     // this trace's adoption decision.
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
+    WALK_END_COMMIT_LEG.with(|c| c.set(0));
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
@@ -1632,7 +1669,7 @@ fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool 
         let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
         crate::jitcode_dispatch::discard_escape_flush_undo();
         crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-        WALK_END_FLUSH_COMMITTED.with(|slot| slot.set(true));
+        commit_walk_end(WalkEndCommitLeg::VableEscape);
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-blackhole] adopted single-frame terminal at jitcode_index={} \
@@ -1834,7 +1871,7 @@ fn try_adopt_multi_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
         let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
         crate::jitcode_dispatch::discard_escape_flush_undo();
         crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-        WALK_END_FLUSH_COMMITTED.with(|slot| slot.set(true));
+        commit_walk_end(WalkEndCommitLeg::VableEscape);
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
         }
@@ -2531,7 +2568,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                             crate::jitcode_dispatch::fbw_store_journal_len(),
                         );
                     }
-                    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    commit_walk_end(WalkEndCommitLeg::LoopHeader);
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
@@ -2586,7 +2623,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             // the legacy deliver cannot re-apply one.
             crate::jitcode_dispatch::fbw_foriter_inflight_clear();
             WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
-            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+            commit_walk_end(WalkEndCommitLeg::VableEscape);
         }
         let call_forward_abort = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
@@ -2635,7 +2672,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                     call_stack.len()
                                 );
                             }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            commit_walk_end(WalkEndCommitLeg::EntryCarrierCall);
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 CALL-forward declined at \
@@ -2670,7 +2707,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                     words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
                                 );
                             }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            commit_walk_end(WalkEndCommitLeg::CalleeRebuild);
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 callee-rebuild declined at \
@@ -2706,7 +2743,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                          resume_py_pc={resume_py_pc}"
                                 );
                             }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            commit_walk_end(WalkEndCommitLeg::AbortPc);
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
@@ -2788,7 +2825,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                          resume_py_pc={resume_py_pc} (nested inline decline)"
                                 );
                             }
-                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            commit_walk_end(WalkEndCommitLeg::NestedInlineOuterCall);
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
@@ -2911,7 +2948,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     // in-flight items so the legacy deliver cannot re-apply
                     // one (exactly-once).
                     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-                    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    commit_walk_end(WalkEndCommitLeg::BranchGuard);
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
                             "[fbw-branch-flush] COMMIT abort_jit_pc={abort_jit_pc} \
@@ -3027,7 +3064,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // re-consumes the in-flight item exactly once (no drop).
         crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
     }
-    if authoritative && std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+    if authoritative {
         let mut end = match &walk_result {
             Ok((outcome, _)) => format!("{outcome:?}"),
             Err(error) => format!("{error:?}"),
@@ -3043,12 +3080,27 @@ fn run_perfn_walk<Sym: WalkSym>(
         // journal back but cannot undo these, so `committed=false effects>0`
         // marks a walk whose caller is about to replay an irreversible region.
         let effects = crate::jitcode_dispatch::fbw_executed_effect_count();
-        eprintln!(
-            "[fbw-census] end={end} committed={committed} bridge={} unj_val={unj_val} \
-             unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} exec_pl={exec_pl} \
-             effects={effects} journal={journal}",
+        // The same record, into a static the wasm host reads back through the
+        // `pyre_fbw_diag` export.  The guest cannot see `PYRE_FBW_CENSUS`, so
+        // without this the wasm target has no walk-level observability at all.
+        let leg = WALK_END_COMMIT_LEG.with(|c| c.get());
+        fbw_diag::record(
+            &end,
+            committed,
             ctx.is_bridge_trace,
+            effects,
+            journal,
+            exec_mf,
+            leg,
         );
+        if std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+            eprintln!(
+                "[fbw-census] end={end} committed={committed} leg={leg} bridge={} \
+                 unj_val={unj_val} unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} \
+                 exec_pl={exec_pl} effects={effects} journal={journal}",
+                ctx.is_bridge_trace,
+            );
+        }
     }
 
     Some((entry, code_len, walk_result))
@@ -4115,5 +4167,105 @@ mod tests {
         assert!(super::exception_delivery_stack_is_sourceable(0, 8, 7));
         assert!(!super::exception_delivery_stack_is_sourceable(1, 9, 7));
         assert!(!super::exception_delivery_stack_is_sourceable(0, 7, 7));
+    }
+}
+
+// ── Guest-visible walk-outcome tally ─────────────────────────────
+//
+// `wasm32-unknown-unknown` cannot read the environment, so `PYRE_FBW_CENSUS`
+// and `PYRE_FBW_DEBUG_ABORT` — the two channels that make a walk-replay RCA
+// tractable on the native backends — are inert inside the guest.  Mirror the
+// shape `majit_backend_wasm::BRIDGE_DIAG` and `majit_metainterp::MC_DIAG`
+// already use for this: a static tally the host reads through a wasm EXPORT
+// (`pyre_fbw_diag`).  An export cannot shift the module's function-index
+// space, unlike an import, which would break the JIT's baked indices.
+//
+// Slot layout is duplicated in the runner's decoder
+// (`pyre-wasm-runner/src/main.rs`).
+pub mod fbw_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Authoritative walks run so far.  Counts every walk, including those
+    /// past the end of the ring.
+    pub const WALKS: usize = 0;
+    /// Walks that rolled their store journal back while the gh#467 odometer
+    /// says they executed a residual that wrote the live heap or entered a
+    /// Python frame — their caller is about to replay an irreversible region.
+    pub const ROLLED_BACK_WITH_EFFECTS: usize = 1;
+
+    /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
+    /// slot, little-endian) followed by one slot of packed counters.  A `u64`
+    /// export cannot carry a string, and the outcome set is far too large to
+    /// spend a tally slot per variant.
+    pub const RING_BASE: usize = 2;
+    pub const RING_ENTRIES: usize = 24;
+    pub const RING_STRIDE: usize = 5;
+    pub const NAME_SLOTS: usize = 4;
+
+    /// Bit positions inside a ring entry's counter slot.
+    pub const FLAG_VALID: u64 = 1 << 0;
+    pub const FLAG_COMMITTED: u64 = 1 << 1;
+    pub const FLAG_BRIDGE: u64 = 1 << 2;
+    pub const SHIFT_EFFECTS: u32 = 8;
+    pub const SHIFT_JOURNAL: u32 = 24;
+    pub const SHIFT_EXEC_MF: u32 = 40;
+    /// `WalkEndCommitLeg` discriminant (0 when the walk did not commit).
+    pub const SHIFT_LEG: u32 = 56;
+    pub const FIELD_MASK: u64 = 0xffff;
+
+    const LEN: usize = RING_BASE + RING_ENTRIES * RING_STRIDE;
+
+    static FBW_DIAG: [AtomicU64; LEN] = {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        [Z; LEN]
+    };
+
+    /// Read one slot (out-of-range reads as 0).  Surfaced to the wasm host
+    /// through the `pyre_fbw_diag` export in the `pyre-wasm` crate.
+    pub fn get(i: usize) -> u64 {
+        FBW_DIAG
+            .get(i)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Append one walk's census record.  Walks past `RING_ENTRIES` bump the
+    /// totals but leave the ring alone, so the first walks — the ones that
+    /// shape the trace — are the ones kept.
+    pub(crate) fn record(
+        name: &str,
+        committed: bool,
+        bridge: bool,
+        effects: usize,
+        journal: usize,
+        exec_mf: u32,
+        leg: u8,
+    ) {
+        let index = FBW_DIAG[WALKS].fetch_add(1, Ordering::Relaxed) as usize;
+        if !committed && effects > 0 {
+            FBW_DIAG[ROLLED_BACK_WITH_EFFECTS].fetch_add(1, Ordering::Relaxed);
+        }
+        if index >= RING_ENTRIES {
+            return;
+        }
+        let entry = RING_BASE + index * RING_STRIDE;
+        let bytes = name.as_bytes();
+        for slot in 0..NAME_SLOTS {
+            let mut packed = 0u64;
+            for byte in 0..8 {
+                if let Some(&b) = bytes.get(slot * 8 + byte) {
+                    packed |= (b as u64) << (byte * 8);
+                }
+            }
+            FBW_DIAG[entry + slot].store(packed, Ordering::Relaxed);
+        }
+        let flags = FLAG_VALID
+            | if committed { FLAG_COMMITTED } else { 0 }
+            | ((effects as u64).min(FIELD_MASK) << SHIFT_EFFECTS)
+            | if bridge { FLAG_BRIDGE } else { 0 }
+            | ((journal as u64).min(FIELD_MASK) << SHIFT_JOURNAL)
+            | ((exec_mf as u64).min(FIELD_MASK) << SHIFT_EXEC_MF)
+            | ((leg as u64) << SHIFT_LEG);
+        FBW_DIAG[entry + NAME_SLOTS].store(flags, Ordering::Relaxed);
     }
 }
