@@ -9,6 +9,11 @@ use crate::header::{GcHeader, header_of};
 use crate::minimarkpage::ArenaCollection;
 
 const WORD: usize = std::mem::size_of::<usize>();
+const OBJECT_ALIGN: usize = if GcHeader::ALIGN > WORD {
+    GcHeader::ALIGN
+} else {
+    WORD
+};
 const DEFAULT_PAGE_SIZE: usize = 1024 * WORD;
 const DEFAULT_ARENA_SIZE: usize = 65536 * WORD;
 const SMALL_REQUEST_THRESHOLD: usize = 35 * WORD;
@@ -102,10 +107,11 @@ impl OldGen {
     ) -> Option<*mut u8> {
         let obj_size = try_round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE))?;
         let alloc_size = try_round_up(card_header_bytes.checked_add(obj_size)?)?;
+        debug_assert_eq!(card_header_bytes % OBJECT_ALIGN, 0);
         let header_ptr = if card_header_bytes == 0 && alloc_size <= SMALL_REQUEST_THRESHOLD {
             self.ac.malloc(alloc_size)
         } else {
-            let layout = Layout::from_size_align(alloc_size, WORD).ok()?;
+            let layout = Layout::from_size_align(alloc_size, OBJECT_ALIGN).ok()?;
             let raw = unsafe { alloc::alloc(layout) };
             if raw.is_null() {
                 return None;
@@ -259,7 +265,7 @@ fn round_up(size: usize) -> usize {
 }
 
 fn try_round_up(size: usize) -> Option<usize> {
-    Some(size.checked_add(WORD - 1)? & !(WORD - 1))
+    Some(size.checked_add(OBJECT_ALIGN - 1)? & !(OBJECT_ALIGN - 1))
 }
 
 impl Default for OldGen {
@@ -296,6 +302,19 @@ mod tests {
     fn fallible_allocation_reports_size_overflow() {
         let mut oldgen = OldGen::new();
         assert!(oldgen.try_alloc(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn allocations_preserve_gc_header_alignment() {
+        let mut oldgen = OldGen::new();
+        for payload_size in 1..=4 * OBJECT_ALIGN {
+            let ptr = oldgen.alloc(GcHeader::SIZE + payload_size);
+            assert_eq!(
+                ptr as usize % GcHeader::ALIGN,
+                0,
+                "payload size {payload_size} produced a misaligned GC header"
+            );
+        }
     }
 
     #[test]

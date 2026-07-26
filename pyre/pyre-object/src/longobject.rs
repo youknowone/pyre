@@ -230,7 +230,11 @@ pub extern "C" fn jit_bigint_from_u64(value: u64) -> JitBigIntResult {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_clone(value: i64) -> JitBigIntResult {
     let value = value as *const BigInt;
-    unsafe { encode_jit_bigint_result(alloc_bigint_nursery_collecting((*value).clone())) }
+    unsafe {
+        encode_jit_bigint_result(crate::rbigint::alloc_rbigint_clone_nursery_collecting(
+            (*value).clone(),
+        ))
+    }
 }
 
 macro_rules! bigint_comparison_residual {
@@ -730,11 +734,15 @@ mod tests {
         let a = jit_bigint_from_i64(-42);
         let b = jit_bigint_from_u64(42);
         let cloned = jit_bigint_clone(a as i64);
+        let prebuilt_zero = jit_bigint_from_i64(0);
+        let cloned_zero = jit_bigint_clone(prebuilt_zero as i64);
         unsafe {
             assert_eq!(&*a, &BigInt::from(-42));
             assert_eq!(&*b, &BigInt::from(42));
             assert_eq!(&*cloned, &*a);
             assert_ne!(cloned, a);
+            assert_eq!(&*cloned_zero, &*prebuilt_zero);
+            assert_ne!(cloned_zero, prebuilt_zero);
         }
         assert_eq!(jit_bigint_eq(a as i64, b as i64), 0);
         assert_eq!(jit_bigint_lt(a as i64, b as i64), 1);

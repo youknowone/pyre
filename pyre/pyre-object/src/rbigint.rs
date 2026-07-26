@@ -454,8 +454,8 @@ fn prebuilt_payload_pointer(value: &RBigInt) -> Option<*mut RBigInt> {
 }
 
 #[inline]
-pub fn alloc_rbigint_nursery(value: RBigInt) -> *mut RBigInt {
-    if let Some(prebuilt) = prebuilt_payload_pointer(&value) {
+fn alloc_rbigint_nursery_impl(value: RBigInt, canonicalize_prebuilt: bool) -> *mut RBigInt {
+    if canonicalize_prebuilt && let Some(prebuilt) = prebuilt_payload_pointer(&value) {
         return prebuilt;
     }
     let tid = rbigint_gc_type_id();
@@ -484,8 +484,16 @@ pub fn alloc_rbigint_nursery(value: RBigInt) -> *mut RBigInt {
 }
 
 #[inline]
-pub fn alloc_rbigint_nursery_collecting(mut value: RBigInt) -> *mut RBigInt {
-    if let Some(prebuilt) = prebuilt_payload_pointer(&value) {
+pub fn alloc_rbigint_nursery(value: RBigInt) -> *mut RBigInt {
+    alloc_rbigint_nursery_impl(value, true)
+}
+
+#[inline]
+fn alloc_rbigint_nursery_collecting_impl(
+    mut value: RBigInt,
+    canonicalize_prebuilt: bool,
+) -> *mut RBigInt {
+    if canonicalize_prebuilt && let Some(prebuilt) = prebuilt_payload_pointer(&value) {
         return prebuilt;
     }
     let tid = rbigint_gc_type_id();
@@ -520,7 +528,23 @@ pub fn alloc_rbigint_nursery_collecting(mut value: RBigInt) -> *mut RBigInt {
             return raw as *mut RBigInt;
         }
     }
-    alloc_rbigint_nursery(value)
+    alloc_rbigint_nursery_impl(value, canonicalize_prebuilt)
+}
+
+#[inline]
+pub fn alloc_rbigint_nursery_collecting(value: RBigInt) -> *mut RBigInt {
+    alloc_rbigint_nursery_collecting_impl(value, true)
+}
+
+/// Allocate the fresh translated GC handle required by `RBigInt::clone`.
+///
+/// RPython's `rbigint.neg`/`abs` shallow-copy the immutable digit list and
+/// then update the new rbigint object's sign. Rust represents that intermediate
+/// object as a by-value handle, so the clone residual must preserve the shared
+/// digit array while bypassing the ordinary prebuilt-payload canonicalization.
+#[inline]
+pub fn alloc_rbigint_clone_nursery_collecting(value: RBigInt) -> *mut RBigInt {
+    alloc_rbigint_nursery_collecting_impl(value, false)
 }
 
 #[inline]
@@ -5682,6 +5706,49 @@ mod tests {
         let raw_zero_c = alloc_rbigint_stable(RBigInt::fromint(0));
         assert_eq!(raw_zero_a, raw_zero_b);
         assert_eq!(raw_zero_a, raw_zero_c);
+    }
+
+    #[test]
+    fn test_clone_allocation_bypasses_prebuilt_payload_canonicalization() {
+        let prebuilts = [
+            RBigInt::zero(),
+            RBigInt::one(),
+            RBigInt::negative_one(),
+            RBigInt::five(),
+        ];
+
+        for value in prebuilts {
+            let prebuilt = prebuilt_payload_pointer(&value).expect("prebuilt payload");
+            let original_sign = unsafe { (*prebuilt).get_sign() };
+            let original_digits = unsafe { (*prebuilt)._digits };
+            let cloned = alloc_rbigint_clone_nursery_collecting(value.clone());
+
+            assert_ne!(
+                cloned, prebuilt,
+                "the clone residual must allocate a fresh rbigint handle"
+            );
+            assert_eq!(
+                unsafe { (*cloned)._digits },
+                original_digits,
+                "the fresh handle must retain rbigint's shallow digit sharing"
+            );
+
+            // Generated neg/abs code mutates the cloned handle's `_size`.
+            // Exercise the same write directly, including zero where changing
+            // the raw size makes aliasing observable despite `_set_sign(0)`.
+            unsafe {
+                if original_sign == 0 {
+                    (*cloned)._size = 1;
+                } else {
+                    (*cloned)._set_sign(-original_sign);
+                }
+                assert_eq!(
+                    (*prebuilt).get_sign(),
+                    original_sign,
+                    "mutating the fresh handle must not corrupt the immortal prebuilt"
+                );
+            }
+        }
     }
 
     #[test]

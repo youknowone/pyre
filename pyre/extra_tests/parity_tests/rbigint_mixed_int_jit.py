@@ -1,5 +1,7 @@
 """Mixed machine-int/rbigint paths used by PyPy's longobject descriptors."""
 
+import gc
+
 
 BIG = (1 << 4095) + (1 << 2001) + 0x123456789
 MASK = (1 << 127) - 1
@@ -54,6 +56,23 @@ def comparisons(rounds):
 
 
 assert comparisons(20_000) == 120_000
+
+
+def clone_prebuilt_zero(rounds):
+    checksum = 0
+    for i in range(rounds):
+        # The long-long subtraction stays on the rbigint path even though its
+        # numeric result is the translated prebuilt zero. Unary negation then
+        # exercises RBigInt::clone's fresh-handle residual. Collections make a
+        # stale alias or an unrooted shared digit edge fail deterministically.
+        zero = BIG - BIG
+        checksum += -zero
+        if i & 255 == 0:
+            gc.collect()
+    return checksum
+
+
+assert clone_prebuilt_zero(20_000) == 0
 
 
 def shift_guards(rounds):

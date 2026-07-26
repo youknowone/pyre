@@ -29,6 +29,11 @@ pub struct GcHeader {
 impl GcHeader {
     /// Size of the header in bytes.
     pub const SIZE: usize = std::mem::size_of::<GcHeader>();
+    /// Alignment required by the fixed-width header word.
+    ///
+    /// This is wider than a native pointer on wasm32. Old-generation size
+    /// classes must therefore use this alignment rather than pointer width.
+    pub const ALIGN: usize = std::mem::align_of::<GcHeader>();
 
     /// Minimum object size in the nursery: header + one pointer (for forwarding).
     pub const MIN_NURSERY_OBJ_SIZE: usize = Self::SIZE + std::mem::size_of::<usize>();
