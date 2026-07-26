@@ -10661,6 +10661,17 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         if struct_ptr == 0 {
             return;
         }
+        // `resume.py:1512` dispatches to `cpu.bh_setfield_gc_r`, whose
+        // `write_ref_at_mem` (llmodel.py:495) carries the framework GC
+        // transformer's write barrier around the ref store. This override
+        // shadows the backend's `bh_setfield_gc_r`, so it must reproduce the
+        // barrier itself: `allocate_with_vtable` materializes a virtual
+        // straight into the non-moving old generation, so a young `value`
+        // stored here is an `old -> young` edge. Without the barrier the store
+        // never reaches `old_objects_pointing_to_young`, the next minor
+        // collection reclaims the payload while the materialized struct still
+        // points at it, and the following major mark reads a dangling header.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
         unsafe {
             ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
         }
@@ -10732,6 +10743,12 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::DescrRef,
     ) {
+        // Same barrier obligation as `bh_setfield_gc_r` above: the `_i`
+        // helper is a bare store, and the blackhole has no inline
+        // `TRACK_YOUNG_PTRS` test in front of it.
+        if array != 0 {
+            majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
+        }
         self.bh_setinteriorfield_gc_i(array, index, value, descr);
         // llmodel.py:659 `bh_setinteriorfield_gc_r` → :495
         // `write_ref_at_mem`: the ref store carries an implied write barrier

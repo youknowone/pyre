@@ -16,7 +16,12 @@ semantics.
 
 Usage:
     python3 pyre/extra_tests/parity_tests/run.py
-        [--dynasm-only|--cranelift-only]
+        [--dynasm-only|--cranelift-only] [--gc-poison]
+
+`--gc-poison` fills reclaimed nursery bytes with a poison pattern for the
+pyre backends. A dangling reference into reclaimed nursery memory usually
+still decodes as a plausible object, so without poison that whole class of
+GC defect passes silently; with it the run aborts at the first stale read.
 
 Exit code is 0 iff every (script, backend) pair passed.
 """
@@ -45,7 +50,7 @@ def _scripts() -> list[Path]:
     return out
 
 
-def _run(cmd: list[str], script: Path) -> tuple[bool, str]:
+def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
             cmd + [str(script)],
@@ -54,6 +59,7 @@ def _run(cmd: list[str], script: Path) -> tuple[bool, str]:
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            env=None if env is None else {**os.environ, **env},
         )
     except subprocess.TimeoutExpired:
         return False, "timeout"
@@ -66,16 +72,19 @@ def _run(cmd: list[str], script: Path) -> tuple[bool, str]:
     return ok, detail
 
 
-def _runners(only_dynasm: bool, only_cranelift: bool) -> list[tuple[str, list[str]]]:
-    runners: list[tuple[str, list[str]]] = []
+def _runners(
+    only_dynasm: bool, only_cranelift: bool, gc_poison: bool
+) -> list[tuple[str, list[str], dict[str, str] | None]]:
+    runners: list[tuple[str, list[str], dict[str, str] | None]] = []
     cpython = os.environ.get("PYRE_CHECK_PYTHON3") or "python3"
-    runners.append(("cpython", [cpython]))
+    runners.append(("cpython", [cpython], None))
+    pyre_env = {"MAJIT_GC_NURSERY_POISON": "1"} if gc_poison else None
     dynasm = TARGET_RELEASE / f"pyre-dynasm{EXE}"
     cranelift = TARGET_RELEASE / f"pyre-cranelift{EXE}"
     if not only_cranelift and dynasm.exists():
-        runners.append(("dynasm", [str(dynasm)]))
+        runners.append(("dynasm", [str(dynasm)], pyre_env))
     if not only_dynasm and cranelift.exists():
-        runners.append(("cranelift", [str(cranelift)]))
+        runners.append(("cranelift", [str(cranelift)], pyre_env))
     return runners
 
 
@@ -83,15 +92,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dynasm-only", action="store_true")
     parser.add_argument("--cranelift-only", action="store_true")
+    parser.add_argument("--gc-poison", action="store_true")
     args = parser.parse_args()
 
-    runners = _runners(args.dynasm_only, args.cranelift_only)
+    runners = _runners(args.dynasm_only, args.cranelift_only, args.gc_poison)
     scripts = _scripts()
     if not scripts:
         print("no parity test scripts found", file=sys.stderr)
         return 1
 
-    print(f"runners: {[name for name, _ in runners]}")
+    print(f"runners: {[name for name, _, _ in runners]}")
     print(f"scripts: {len(scripts)}")
     print()
 
@@ -99,8 +109,8 @@ def main() -> int:
     for script in scripts:
         name = script.name
         row: list[str] = [f"  {name:<36s}"]
-        for backend, cmd in runners:
-            ok, detail = _run(cmd, script)
+        for backend, cmd, env in runners:
+            ok, detail = _run(cmd, script, env)
             mark = "OK" if ok else "FAIL"
             row.append(f"{backend}={mark}")
             if not ok:
