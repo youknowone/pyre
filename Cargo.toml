@@ -184,3 +184,13 @@ insta = "1"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# The `pyre-jit-trace` build script runs the whole RPython-style translation
+# pipeline (flowspace → annotator → rtyper → codewriter) over the interpreter.
+# Cargo's default build-override profile compiles it at `opt-level = 0`, so that
+# analysis — the single longest and most memory-hungry step of a cold build —
+# runs unoptimized.
+[profile.release.build-override]
+opt-level = 1
+[profile.dev.build-override]
+opt-level = 1
