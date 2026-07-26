@@ -5714,7 +5714,7 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
 }
 
 /// True when `code` holds more than one `FOR_ITER` and at least one of them
-/// sits inside an exception-table-covered range — the signature of a loop
+/// sits in the *exceptional copy* of a `finally` body — the signature of a loop
 /// DUPLICATED into a `finally` block's normal and exceptional copies (3.14
 /// emits the `finally` body twice). The JIT compiles only the normal copy; on
 /// loop exhaustion the side-exit resumes the live frame through the dense
@@ -5725,29 +5725,42 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
 /// emitted into the trace, so no inverse-map rule can recover it; the frame must
 /// run in the interpreter (#57).
 ///
-/// A single `FOR_ITER` inside a `try`/`except` (no duplication) keeps JITting
-/// because the count stays at one, and genuinely nested `FOR_ITER` frames are
-/// already declined by [`for_iter_bodies_all_jit_safe`].
+/// The exceptional copy is identified by the entry that protects it: 3.14 lays
+/// the copy at a handler landing and covers it with its own exception-table
+/// entry starting exactly there, so a duplicated loop is a `FOR_ITER` covered by
+/// an entry whose `start` is another entry's `target`. Merely being covered by
+/// *some* entry is far weaker and does not imply duplication — a PEP 709 inlined
+/// comprehension puts its `FOR_ITER` inside a range whose handler only restores
+/// the shadowed loop variable and reraises, and a `for` inside `try`/`except`
+/// puts it inside the protected body. Both keep their single copy, so declining
+/// on coverage alone took every function holding a comprehension plus any other
+/// loop out of the JIT entirely.
+///
+/// A single `FOR_ITER` keeps JITting because the count stays at one, and
+/// genuinely nested `FOR_ITER` frames are already declined by
+/// [`for_iter_bodies_all_jit_safe`].
 fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> bool {
+    let entries: Vec<_> =
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut for_iter_count = 0usize;
-    let mut any_in_handler = false;
+    let mut any_in_duplicated_copy = false;
     for (pc, unit) in code.instructions.iter().copied().enumerate() {
         if let pyre_interpreter::Instruction::ForIter { .. } = arg_state.get(unit).0 {
             for_iter_count += 1;
             // The exception table is keyed by byte offset; pyre's `pc` is the
             // instruction-unit index (two bytes per unit).
-            if pyre_interpreter::pycode::lookup_exceptiontable(
-                &code.exceptiontable,
-                (pc * 2) as u32,
-            )
-            .is_some()
-            {
-                any_in_handler = true;
+            let byte_offset = (pc * 2) as u32;
+            if entries.iter().any(|entry| {
+                entry.start <= byte_offset
+                    && byte_offset < entry.end
+                    && entries.iter().any(|outer| outer.target == entry.start)
+            }) {
+                any_in_duplicated_copy = true;
             }
         }
     }
-    for_iter_count > 1 && any_in_handler
+    for_iter_count > 1 && any_in_duplicated_copy
 }
 
 /// True when `code` holds an `except ... as name:` handler whose own body can
