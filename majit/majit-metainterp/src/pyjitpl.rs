@@ -1,4 +1,4 @@
-pub(crate) mod dispatch;
+pub mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
