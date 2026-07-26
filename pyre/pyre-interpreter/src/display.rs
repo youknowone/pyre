@@ -358,6 +358,13 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         if !is_leaf {
             return Ok(None);
         }
+        // An exact builtin is not a subclass instance: its `w_class` is the
+        // canonical type object, so the MRO walk below would resolve the
+        // builtin's own dunder and re-dispatch it through a full call rather
+        // than the native formatting this function exists to defer to.
+        if pyre_object::is_exact_builtin_instance(obj) {
+            return Ok(None);
+        }
         let w_class = (*obj).w_class;
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
