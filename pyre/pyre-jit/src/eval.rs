@@ -2058,8 +2058,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // GcLLDescr_framework.init_array_descr (gc.py:544-549).  These
     // two primitive GcArray lltypes have the same trace shape but are
     // distinct ARRAY identities, so register separate tids.
+    //
+    // The blocks carrying these two tids are `TypedItemsBlock`s
+    // (`rbigint._digits`, the Integer/Float list strategies), so the base size
+    // is that block's items offset, not `GcTypedArray`'s bare length word: the
+    // 8-byte items force 8-byte alignment, which pads a 4-byte length prefix on
+    // a 32-bit target. Sizing the instance from the length word would then
+    // compute four bytes too few and truncate the last item on every copy.
+    // `state.rs` builds the JIT array descrs for the same tids from the same
+    // offset.
     let gc_int_array_tid = gc.register_type(TypeInfo::varsize(
-        pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
+        pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
         std::mem::size_of::<i64>(),
         pyre_object::GC_TYPED_ARRAY_LEN_OFFSET,
         false,
@@ -2067,7 +2076,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     ));
     debug_assert_eq!(gc_int_array_tid, GC_INT_ARRAY_GC_TYPE_ID);
     let gc_float_array_tid = gc.register_type(TypeInfo::varsize(
-        pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET,
+        pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
         std::mem::size_of::<f64>(),
         pyre_object::GC_TYPED_ARRAY_LEN_OFFSET,
         false,
