@@ -584,6 +584,14 @@ impl FrameBox {
             std::mem::size_of::<PyFrame>(),
         );
         if !raw.is_null() {
+            // RPython allocation results stay live in the translated shadow
+            // stack while the caller initializes their fields.  Free-threaded
+            // pyre must expose the same root before entering the write-barrier
+            // GC operation: a contended barrier is an entry safepoint, so an
+            // unrooted fresh frame could otherwise be swept by another
+            // collector between this allocation and the barrier below.
+            let frame_root = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
@@ -597,6 +605,7 @@ impl FrameBox {
             // tracer, exactly as `generator.rs:72` does for a stable
             // generator wrapping young frame contents.
             pyre_object::gc_hook::try_gc_write_barrier(raw);
+            drop(frame_root);
             return FrameBox { ptr };
         }
         debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
@@ -684,11 +693,12 @@ impl FrameBox {
         let frame_ptr = self.into_raw();
         // `w_generator_new` allocates and may trigger a collection. Until the
         // generator owns `frame_ptr` (and its custom trace greys the frame
-        // block), the frame's locals/args live only in its
-        // `locals_cells_stack_w` — the caller has already dropped them from
-        // its own stack — so root that slot across the allocation. The frame
-        // block is non-moving (old-gen when GC-managed, `std::alloc`
-        // otherwise), so only the locals array needs protecting.
+        // block), the frame is an RPython allocation result still live in the
+        // translated caller.  Publish both the managed frame itself and the
+        // locals slot (the latter also covers the std::alloc fallback frame)
+        // across that allocation.
+        let _frame_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame_ptr);
         // generator.py:21 `self.pycode = frame.pycode`: preserve the exact
         // code object independently of the frame, which is cleared when the
@@ -2746,6 +2756,13 @@ impl PyFrame {
         w_inputvalue: Option<PyObjectRef>,
         operr: Option<crate::PyError>,
     ) -> crate::PyResult {
+        // pyframe.py:360 `execute_frame.insert_stack_check_here = True`.
+        // RPython's transform inserts the check at this graph entry, so
+        // builtin/object-space calls remain usable while an existing frame is
+        // handling RecursionError and every newly entered Python frame is
+        // still guarded.
+        crate::stack_check::drain_jit_pending_exception()?;
+        crate::stack_check::stack_check()?;
         crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
     }
 
@@ -2760,6 +2777,8 @@ impl PyFrame {
         operr: Option<crate::PyError>,
         throw_args: Option<([PyObjectRef; 3], usize)>,
     ) -> crate::PyResult {
+        crate::stack_check::drain_jit_pending_exception()?;
+        crate::stack_check::stack_check()?;
         crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, throw_args)
     }
 
@@ -4007,6 +4026,12 @@ pub fn createframe_obj(
     // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
     // a collection mid-init can't drop the cells already written there.
     {
+        // The owned Rust `FrameBox` is not itself visible to the collector.
+        // RPython keeps the freshly allocated frame as a livevar across these
+        // initialization allocations, so expose the frame object alongside
+        // the separately registered locals-array field.
+        let _frame_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
         frame.initialize_frame_scopes(outer_ref, code)?;
     }

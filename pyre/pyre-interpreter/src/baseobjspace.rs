@@ -308,6 +308,14 @@ impl Lock {
     /// is free and take it; otherwise take it only if it is free right now.
     /// Returns whether the lock is now held by the caller.
     pub fn acquire(&self, flag: bool) -> bool {
+        // `rthread.acquire_timed(..., intr_flag=1)` enters the external-call
+        // aroundstate before a potentially blocking native lock wait.  In
+        // free-threaded pyre that transition removes this mutator from the GC
+        // RUNNING census; otherwise an import-lock waiter can prevent an STW
+        // collector from completing while the lock owner is parked by that
+        // same STW.  The non-blocking form must remain a poll and needs no
+        // transition.
+        let _blocked = flag.then(crate::module::thread::before_external_block);
         let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
         if !flag {
             if *acquired {

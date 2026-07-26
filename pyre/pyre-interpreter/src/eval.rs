@@ -1024,6 +1024,11 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // interp_posix.ApplevelForkCallbacks is another object-space cache.
         #[cfg(not(target_arch = "wasm32"))]
         crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);
+        // `space.sys.modules` and its authoritative dictionary belong to the
+        // process/interpreter import state.  Keep them in the global
+        // non-stack-root walk so incminimark's end-of-marking rescan sees
+        // modules and bindings installed after the initial root snapshot.
+        crate::importing::walk_process_import_roots(&mut forward);
     }
     if is_minor {
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
@@ -1548,7 +1553,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
 /// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (call.rs:328 etc.)
 /// continues to reference it directly.
 pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
-    eval_frame_plain_with_resume(frame, None, None, None)
+    frame.execute_frame(None, None)
 }
 
 /// pyframe.py:270-299 execute_frame body — enter/call_trace/eval_loop/
@@ -1556,7 +1561,7 @@ pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
 /// throw() path routes it through handle_operation_error and sets
 /// last_instr = next_instr - 1 before resuming (pyframe.py:273-277).
 pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
-    eval_frame_plain_with_resume(frame, None, operr, None)
+    frame.execute_frame(None, operr)
 }
 
 enum FrameResume {

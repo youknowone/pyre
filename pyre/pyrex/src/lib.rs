@@ -496,14 +496,6 @@ fn real_main(binary_name: &str) {
     }
 
     if !is_interact {
-        // pypy/interpreter/app_main.py:824-825 parity for the standalone
-        // launcher: untranslated hosts need a higher startup recursion limit
-        // than translated PyPy's default 1000 because each host-language
-        // frame is larger. Pyre is likewise running on Rust frames here, so
-        // raise the startup budget before executing user code.
-        pyre_interpreter::stack_check::set_recursion_limit(5000)
-            .expect("startup recursion limit must be applicable");
-
         // Eagerly install pyre-jit's hooks into pyre-interpreter so that
         // sys.settrace / set_jit_param routing is live from the very first
         // user statement, not only after the first JIT-traced bytecode.

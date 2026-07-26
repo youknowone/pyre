@@ -414,18 +414,12 @@ where
     FBuiltin: FnOnce(PyObjectRef) -> Result<R, PyError>,
     FUser: FnOnce(PyObjectRef) -> Result<R, PyError>,
 {
-    // Drain any pending JIT-prologue overflow first so a backend
-    // probe that already detected an overflow surfaces here as the
-    // user-visible RecursionError. The pending-exception slot is
-    // populated by the backend slowpath wrapper when the JIT
-    // prologue probe trips — backend raises, glue propagates
-    // (rpython/rlib/rstack.py:68-73 stack_check_slowpath parity).
+    // Drain any pending JIT-prologue overflow first so a backend probe that
+    // already detected an overflow surfaces here as the user-visible
+    // RecursionError.  A fresh check is performed only when a Python frame is
+    // entered (`PyFrame.execute_frame.insert_stack_check_here` in PyPy);
+    // builtin dispatch itself is not a recursive frame entry.
     crate::stack_check::drain_jit_pending_exception()?;
-    // rpython/rlib/rstack.py:42 stack_check(): every interpreter call
-    // boundary also checks the native stack synchronously, so deep
-    // interpreter recursion (no JIT involved) raises RecursionError
-    // instead of letting the OS abort on a guard-page hit.
-    crate::stack_check::stack_check()?;
     unsafe {
         if crate::is_function_carrier(callable) {
             // All callables are Function objects. Check code type to distinguish

@@ -1554,6 +1554,20 @@ pub(crate) unsafe fn walk_import_roots_area(
     visitor: &mut dyn FnMut(&mut PyObjectRef),
 ) {
     let area = unsafe { &*(data as *const ImportRootArea) };
+    let argv_pending = unsafe { &*area.argv_pending };
+    let mut argv = argv_pending.get();
+    if !argv.is_null() {
+        visitor(&mut argv);
+        argv_pending.set(argv);
+    }
+}
+
+/// Walk the import state owned by PyPy's process/interpreter object space.
+///
+/// Unlike `SYS_ARGV_PENDING`, these slots are not thread-local.  Keeping this
+/// walk separate lets the collector's `collect_nonstack_roots` parity rescan
+/// them exactly once at the end of incremental marking.
+pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
     // mutator, so the process-global cache cannot be semantically mutated
     // while this walk holds its native lock.
@@ -1573,12 +1587,6 @@ pub(crate) unsafe fn walk_import_roots_area(
     if !dict.is_null() {
         visitor(&mut dict);
         SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
-    }
-    let argv_pending = unsafe { &*area.argv_pending };
-    let mut argv = argv_pending.get();
-    if !argv.is_null() {
-        visitor(&mut argv);
-        argv_pending.set(argv);
     }
 }
 

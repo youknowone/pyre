@@ -1650,7 +1650,11 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
 fn gc_write_barrier_via_active_runtime(obj: GcRef) {
-    with_cranelift_gc(|gc| gc.write_barrier(obj));
+    if CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+        with_cranelift_gc(|gc| gc.write_barrier(obj));
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj));
+    }
 }
 
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side

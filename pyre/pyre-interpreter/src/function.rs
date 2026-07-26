@@ -2527,15 +2527,11 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
-    // rpython/rlib/rstack.py:42 stack_check(): every interpreter call
-    // boundary checks the native stack synchronously, so deep recursion
-    // raises RecursionError instead of letting the OS abort on a
-    // guard-page hit. funccall_valuestack is the bytecode CALL fast
-    // path that bypasses dispatch_callable, so it carries its own
-    // probe. Also drain any JIT-prologue pending overflow.
-    if let Err(e) = crate::stack_check::drain_jit_pending_exception()
-        .and_then(|_| crate::stack_check::stack_check())
-    {
+    // A compiled callee prologue can publish an overflow before control
+    // returns to this dispatcher.  The fresh stack check belongs to the
+    // Python frame entry (`PyFrame.execute_frame.insert_stack_check_here`),
+    // not to every CALL: builtin calls do not create a recursive frame.
+    if let Err(e) = crate::stack_check::drain_jit_pending_exception() {
         crate::call::set_call_error(e);
         return pyre_object::PY_NULL;
     }

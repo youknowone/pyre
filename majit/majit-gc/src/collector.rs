@@ -2140,6 +2140,31 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py:2478-2481 `collect_nonstack_roots(); visit_all_objects()`.
+    ///
+    /// Non-stack roots may grow after the initial root snapshot while marking
+    /// is incremental.  Revisit the process/interpreter-owned root walkers and
+    /// pending-finalizer queues immediately before finalizer processing and
+    /// sweep, then drain every newly greyed object.  Thread frame/shadow-stack
+    /// roots are deliberately not repeated here: upstream repeats only
+    /// `collect_nonstack_roots`, not `collect_roots`.
+    fn rescan_major_nonstack_roots_and_drain(&mut self) {
+        crate::shadow_stack::walk_extra_roots(|gcref| {
+            self.seed_major_root(*gcref);
+        });
+        let pending: Vec<usize> = self
+            .finalizer_handlers
+            .iter()
+            .flat_map(|handler| handler.deque.iter().copied())
+            .collect();
+        for addr in pending {
+            self.seed_major_root(GcRef(addr));
+        }
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+            self.mark_object(obj_addr);
+        }
+    }
+
     /// Drive incremental major-collection progress after a minor collection.
     ///
     /// This follows incminimark's accounting rule: each major step grants
@@ -2386,6 +2411,10 @@ impl MiniMarkGC {
         // modified since the last minor) before the sweep, or a cycle finished
         // between minors frees reachable old->old targets.
         self.rescan_remembered_black_and_drain();
+        // incminimark.py:2478-2481: process-global/non-stack roots can grow
+        // after the cycle's initial snapshot.  Rescan and trace them before
+        // finalizers, weakrefs, and sweep inspect VISITED.
+        self.rescan_major_nonstack_roots_and_drain();
         // incminimark.py:2961-2965 (and :2495-2499) — clear weak
         // pointers to dying objects before the sweep frees them. The
         // VISITED bit on every old-gen object is still meaningful at

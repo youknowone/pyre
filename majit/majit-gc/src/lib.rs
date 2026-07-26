@@ -767,10 +767,10 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
     }
     fn write_barrier(&mut self, obj: GcRef) {
-        gc_sync::gc_op(|gc| gc.write_barrier(obj))
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj))
     }
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
-        gc_sync::gc_op(|gc| gc.jit_remember_young_pointer_from_array(obj))
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.jit_remember_young_pointer_from_array(obj))
     }
     fn remember_young_pointer_from_array2(
         &mut self,
@@ -778,7 +778,9 @@ impl GcAllocator for GcHandle {
         index: usize,
         card_page_shift: u32,
     ) {
-        gc_sync::gc_op(|gc| gc.remember_young_pointer_from_array2(obj, index, card_page_shift))
+        gc_sync::gc_op_with_root(obj, |gc, obj| {
+            gc.remember_young_pointer_from_array2(obj, index, card_page_shift)
+        })
     }
     fn collect_nursery(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_nursery())

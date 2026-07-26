@@ -2548,12 +2548,15 @@ pub fn call_function_impl_result(
         pyre_object::gc_roots::pin_root(arg);
     }
 
-    // rpython/rlib/rstack.py:42 stack_check(): every interpreter call
-    // boundary checks the native stack synchronously, so deep recursion
-    // raises RecursionError instead of letting the OS abort on a
-    // guard-page hit. Also drain any JIT-prologue pending overflow.
+    // A JIT prologue may have published an overflow before entering this
+    // residual dispatcher, so preserve that pending exception.  Do not run a
+    // fresh stack check here: RPython's insert_ll_stackcheck places checks on
+    // recursive graph entries (PyPy marks PyFrame.execute_frame), not in front
+    // of every ObjSpace call.  In particular, CheckSignalAction must still be
+    // able to invoke the non-recursive default_int_handler while the current
+    // Python frame is handling a RecursionError.  Python frame call paths carry
+    // their stack check in funccall_valuestack / the JIT callee prologue.
     crate::stack_check::drain_jit_pending_exception()?;
-    crate::stack_check::stack_check()?;
 
     let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
     let mut rooted_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());

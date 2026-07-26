@@ -557,7 +557,7 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
     {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.write_barrier(obj));
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier(obj));
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {

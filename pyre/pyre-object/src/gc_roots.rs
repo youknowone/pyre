@@ -129,13 +129,25 @@ pub fn push_roots() -> RootScope {
 /// it (`@dont_look_inside`, `rlib/jit.py:139`), the `shadow_stack_len` twin.
 #[majit_macros::dont_look_inside]
 pub fn pin_root(root: PyObjectRef) {
+    // Publish the raw value first.  `try_gc_current_object_address` is itself
+    // a GC operation and may wait behind another thread's collection; the
+    // fresh allocation must already be visible to that collector before we
+    // enter the query safepoint.  RPython's push_roots writes the livevar to
+    // the shadow stack before calling the allocation/GC slow path for the
+    // same reason.
+    let index = SHADOW_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let index = stack.len();
+        stack.push(root);
+        index
+    });
     // A foreign mutator may have completed a nursery collection after the
     // caller copied this GCREF but before it entered this explicit root
     // bracket.  RPython's `_trace_drag_out` always rewrites a root that names
     // an already-forwarded nursery object; normalize the host-side copy at
     // the same boundary so the shadow stack never gains a forwarding stub.
     let root = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    SHADOW_STACK.with(|s| s.borrow_mut().push(root));
+    SHADOW_STACK.with(|s| s.borrow_mut()[index] = root);
 }
 
 /// Current length of the thread-local shadow stack. Used by

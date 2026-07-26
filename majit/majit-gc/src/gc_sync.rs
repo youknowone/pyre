@@ -621,6 +621,31 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
     });
 }
 
+/// Run a GC operation whose object argument is a translated livevar.
+///
+/// A contended [`gc_op`] temporarily removes this mutator from the RUNNING
+/// census before it acquires `gc_mutex`. Publish the argument on the
+/// per-mutator shadow stack first so a collector which runs during that wait
+/// preserves (and, for a moving minor, forwards) it. Reload the possibly
+/// forwarded value only after the operation owns the GC.
+pub fn gc_op_with_root<R>(
+    root: crate::GcRef,
+    f: impl FnOnce(&mut dyn GcAllocator, crate::GcRef) -> R,
+) -> R {
+    struct RootGuard(usize);
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            crate::shadow_stack::try_pop_to(self.0);
+        }
+    }
+
+    let guard = RootGuard(crate::shadow_stack::push(root));
+    gc_op(|gc| {
+        let root = crate::shadow_stack::get(guard.0);
+        f(gc, root)
+    })
+}
+
 /// Park the current thread until the ongoing STW finishes.
 fn park_until_stw_done() {
     if !GC_THREAD.with(|t| t.registered.get()) || !GC_THREAD.with(|t| t.running.get()) {
