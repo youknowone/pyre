@@ -21,10 +21,15 @@ use crate::PyError;
 
 /// `listsort.py:93-97` — `lt` is the single comparison primitive and `le` is
 /// derived from it.  Implementors must not override `le`.
-pub(crate) trait SortLt {
-    fn lt(&mut self, a: usize, b: usize) -> Result<bool, PyError>;
+///
+/// `T` is what `make_timsort_class`'s `lt` receives: the list's element type.
+/// For an object list that is an index into a rooted area; for the unwrapped
+/// strategies (`listobject.py:1963` `IntegerListStrategy.sort`, `:2067`
+/// `FloatListStrategy.sort`) it is the scalar itself.
+pub(crate) trait SortLt<T> {
+    fn lt(&mut self, a: T, b: T) -> Result<bool, PyError>;
 
-    fn le(&mut self, a: usize, b: usize) -> Result<bool, PyError> {
+    fn le(&mut self, a: T, b: T) -> Result<bool, PyError> {
         Ok(!self.lt(b, a)?)
     }
 }
@@ -90,17 +95,17 @@ impl ListSlice {
 /// wins by the same run.
 const MIN_GALLOP: usize = 7;
 
-struct TimSort<'a, L: SortLt> {
-    list: &'a mut [usize],
+struct TimSort<'a, T: Copy, L: SortLt<T>> {
+    list: &'a mut [T],
     listlength: usize,
-    scratch_list: Vec<usize>,
+    scratch_list: Vec<T>,
     min_gallop: usize,
     pending: Vec<ListSlice>,
     cmp: &'a mut L,
 }
 
-impl<L: SortLt> TimSort<'_, L> {
-    fn slice_get(&self, slice: &ListSlice, index: usize) -> usize {
+impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
+    fn slice_get(&self, slice: &ListSlice, index: usize) -> T {
         if slice.scratch {
             self.scratch_list[index]
         } else {
@@ -110,7 +115,7 @@ impl<L: SortLt> TimSort<'_, L> {
 
     /// `listsort.py:198-201` — `gallop`'s `lower`: `le` searches for the
     /// largest `k` with `a[k] <= key`, `lt` for the largest with `a[k] < key`.
-    fn lower(&mut self, a: usize, b: usize, rightmost: bool) -> Result<bool, PyError> {
+    fn lower(&mut self, a: T, b: T, rightmost: bool) -> Result<bool, PyError> {
         if rightmost {
             self.cmp.le(a, b)
         } else {
@@ -134,7 +139,7 @@ impl<L: SortLt> TimSort<'_, L> {
     }
 
     /// `listsort.py:651` `ListSlice.popleft`.
-    fn popleft(&mut self, slice: &mut ListSlice) -> usize {
+    fn popleft(&mut self, slice: &mut ListSlice) -> T {
         let result = self.slice_get(slice, slice.base);
         slice.base += 1;
         slice.len -= 1;
@@ -142,7 +147,7 @@ impl<L: SortLt> TimSort<'_, L> {
     }
 
     /// `listsort.py:657` `ListSlice.popright`.
-    fn popright(&mut self, slice: &mut ListSlice) -> usize {
+    fn popright(&mut self, slice: &mut ListSlice) -> T {
         slice.len -= 1;
         self.slice_get(slice, slice.base + slice.len)
     }
@@ -253,7 +258,7 @@ impl<L: SortLt> TimSort<'_, L> {
     /// (`listsort.py:305` asserts `-1 <= lastofs`).
     fn gallop(
         &mut self,
-        key: usize,
+        key: T,
         a: &ListSlice,
         hint: usize,
         rightmost: bool,
@@ -680,7 +685,7 @@ impl<L: SortLt> TimSort<'_, L> {
 ///
 /// On a raising comparison the error propagates and `list` is left holding
 /// some permutation of its input (`listsort.py`'s merge `finally` blocks).
-pub(crate) fn sort_with<L: SortLt>(list: &mut [usize], cmp: &mut L) -> Result<(), PyError> {
+pub(crate) fn sort_with<T: Copy, L: SortLt<T>>(list: &mut [T], cmp: &mut L) -> Result<(), PyError> {
     let listlength = list.len();
     let mut sorter = TimSort {
         list,

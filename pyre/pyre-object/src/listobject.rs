@@ -658,6 +658,71 @@ pub fn w_list_new_empty() -> PyObjectRef {
     w_list_new_object(Vec::new())
 }
 
+/// Build the backing storage a `strategy`-strategy list holding `items` needs,
+/// without installing it anywhere: the typed blocks (empty unless the matching
+/// strategy) first, then the Object-strategy items block.
+///
+/// The caller must have pinned every element of `items` — the unboxing and the
+/// block allocation below can both collect.  The returned block is young; the
+/// caller must pin it across any further allocation before storing it.
+///
+/// Each typed block stays a bare Rust local until the caller installs it, so
+/// every one of them is pinned across the allocations that follow it: old-gen
+/// is mark-sweep, and an unrooted block with no heap edge yet is sweepable, not
+/// merely immobile (`IntArray::pin_block`).  The caller owns the `push_roots`
+/// scope those pins live in and closes the bracket with
+/// [`ListStorage::reload_typed_blocks`] after its last allocation.
+unsafe fn build_list_storage(items: &[PyObjectRef], strategy: ListStrategy) -> ListStorage {
+    let int_seed: Vec<i64> = if let ListStrategy::Integer = strategy {
+        items.iter().map(|&item| plain_int_w(item)).collect()
+    } else {
+        Vec::new()
+    };
+    let int_items = IntArray::from_vec(int_seed);
+    let int_block_root = int_items.pin_block();
+    let float_seed: Vec<f64> = if let ListStrategy::Float = strategy {
+        items.iter().map(|&item| w_float_get_value(item)).collect()
+    } else {
+        Vec::new()
+    };
+    let float_items = FloatArray::from_vec(float_seed);
+    let float_block_root = float_items.pin_block();
+    let (length, block) = if let ListStrategy::Object = strategy {
+        (items.len(), alloc_list_items_block_gc(items))
+    } else {
+        (0usize, std::ptr::null_mut())
+    };
+    ListStorage {
+        length,
+        block,
+        int_items,
+        float_items,
+        int_block_root,
+        float_block_root,
+    }
+}
+
+/// Backing storage built but not yet installed, plus the shadow-stack slots the
+/// typed blocks are pinned in.
+struct ListStorage {
+    length: usize,
+    block: *mut ItemsBlock,
+    int_items: IntArray,
+    float_items: FloatArray,
+    int_block_root: usize,
+    float_block_root: usize,
+}
+
+impl ListStorage {
+    /// The `pop_roots` half of [`IntArray::pin_block`]'s bracket: re-read both
+    /// typed blocks once the caller's last allocation is behind them, since
+    /// both take their heap edge from the store that follows.
+    fn reload_typed_blocks(&mut self) {
+        self.int_items.reload_block(self.int_block_root);
+        self.float_items.reload_block(self.float_block_root);
+    }
+}
+
 fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
@@ -672,37 +737,12 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         crate::gc_roots::pin_root(item);
     }
 
-    // Build the typed backing blocks (empty unless the matching strategy) first,
-    // then the Object-strategy items block. Each block stays a bare Rust local
-    // until the `W_ListObject` below is built, so every one of them is pinned
-    // across the allocations that follow it: old-gen is mark-sweep, and an
-    // unrooted block with no heap edge yet is sweepable, not merely immobile
-    // (`IntArray::pin_block`).
-    let int_seed: Vec<i64> = if let ListStrategy::Integer = strategy {
-        items
-            .iter()
-            .map(|&item| unsafe { plain_int_w(item) })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut int_items = IntArray::from_vec(int_seed);
-    let int_block_root = int_items.pin_block();
-    let float_seed: Vec<f64> = if let ListStrategy::Float = strategy {
-        items
-            .iter()
-            .map(|&item| unsafe { w_float_get_value(item) })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut float_items = FloatArray::from_vec(float_seed);
-    let float_block_root = float_items.pin_block();
-    let (length, mut items_block) = if let ListStrategy::Object = strategy {
-        (items.len(), unsafe { alloc_list_items_block_gc(&items) })
-    } else {
-        (0usize, std::ptr::null_mut())
-    };
+    // The nursery `items_block` is allocated last and pinned across the
+    // `try_gc_alloc_stable` header alloc — the only allocation that can
+    // relocate it, since the typed-block allocs precede it.  The typed blocks
+    // carry their own pins out of `build_list_storage`.
+    let mut storage = unsafe { build_list_storage(&items, strategy) };
+    let (length, mut items_block) = (storage.length, storage.block);
     // Phase L2: pin the (possibly young, GC-managed) items block across the
     // W_ListObject header allocation below — `try_gc_alloc_stable` may trigger a
     // collection that relocates the nursery block, so re-read its moved address
@@ -726,8 +766,12 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
     // `pop_roots` for the two typed blocks: this was the last allocation they
     // had to survive, and both take their heap edge from the struct built below.
-    int_items.reload_block(int_block_root);
-    float_items.reload_block(float_block_root);
+    storage.reload_typed_blocks();
+    let ListStorage {
+        int_items,
+        float_items,
+        ..
+    } = storage;
     if raw.is_null() {
         let boxed = Box::new(W_ListObject {
             ob_header: header,
@@ -1457,6 +1501,85 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
             }
             Some(list.object_pop())
         }
+    }
+}
+
+/// The unwrapped Integer-strategy storage `IntegerListStrategy.sort`
+/// (listobject.py:1963) orders in place, or `None` when the list holds a
+/// different strategy.  Handed out as a raw pointer + length because the
+/// caller (the `descr_sort` level) owns the sort; nothing in the sort boxes a
+/// value, so no collection can move the block while it is ordered.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`, and the returned pointer is
+/// only valid until the list's storage is next resized or re-strategised.
+pub unsafe fn w_list_int_items_raw(obj: PyObjectRef) -> Option<(*mut i64, usize)> {
+    let list = &mut *(obj as *mut W_ListObject);
+    if list.strategy != ListStrategy::Integer {
+        return None;
+    }
+    let items = list.int_items.as_mut_slice();
+    Some((items.as_mut_ptr(), items.len()))
+}
+
+/// The Float-strategy counterpart of [`w_list_int_items_raw`]
+/// (`FloatListStrategy.sort`, listobject.py:2067).
+///
+/// # Safety
+/// As [`w_list_int_items_raw`].
+pub unsafe fn w_list_float_items_raw(obj: PyObjectRef) -> Option<(*mut f64, usize)> {
+    let list = &mut *(obj as *mut W_ListObject);
+    if list.strategy != ListStrategy::Float {
+        return None;
+    }
+    let items = list.float_items.as_mut_slice();
+    Some((items.as_mut_ptr(), items.len()))
+}
+
+/// Whether the list still holds the EmptyListStrategy.
+///
+/// `descr_sort` (listobject.py:873) uses this to tell whether the user mucked
+/// with the receiver while it was emptied for the sort: any mutation switches
+/// the list off the Empty strategy and a list never switches back, so an
+/// append followed by a pop is caught even though the length is 0 again.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+pub unsafe fn w_list_is_empty_strategy(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_ListObject)).strategy == ListStrategy::Empty
+}
+
+/// listobject.py:52 `W_ListObject.__init__` applied to an existing list:
+/// re-pick the strategy for `items` and install fresh storage, dropping
+/// whatever the list held.  This is how `descr_sort` (listobject.py:879) puts
+/// the sorted items back — one bulk install, not an append loop, so the
+/// storage is sized once and the strategy is decided from the whole item set.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`; every element of `items` live.
+pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
+    // Build the replacement storage before touching the list: the allocations
+    // below can collect, and `items` is only reachable through the caller's
+    // roots until the install.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
+    let strategy = list_strategy_for(&items);
+    let mut storage = build_list_storage(&items, strategy);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    // `drop_object_items`' `try_gc_owns_object` query is a safepoint and the
+    // fresh blocks have no heap edge until the stores below, so close their pin
+    // bracket only once it is behind them (`IntArray::install`).
+    list.drop_object_items();
+    storage.reload_typed_blocks();
+    list.length = storage.length;
+    list.items = storage.block;
+    list.strategy = strategy;
+    list.int_items = storage.int_items;
+    list.float_items = storage.float_items;
+    if strategy == ListStrategy::Object {
+        list_write_barrier(obj);
     }
 }
 

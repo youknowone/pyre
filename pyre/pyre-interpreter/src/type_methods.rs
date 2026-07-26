@@ -625,53 +625,10 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         .transpose()?
         .unwrap_or(false);
 
-    unsafe {
-        // Hold the detached values in shadow-stack slots, not a bare Rust
-        // Vec, while key and comparison calls can collect.  The receiver is
-        // empty for the whole operation, so user code cannot alter this
-        // sorting slice through the visible list.
-        let saved = pyre_object::w_list_items_copy_as_vec(list);
-        let _roots = pyre_object::gc_roots::push_roots();
-        let item_base = pyre_object::gc_roots::shadow_stack_len();
-        for item in saved {
-            pyre_object::gc_roots::pin_root(item);
-        }
-        let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-        pyre_object::listobject::w_list_clear(list);
-
-        let sorted = crate::builtins::sort_rooted_items(item_base, saved_len, key_fn, reverse);
-        let modified = w_list_len(list) != 0;
-
-        // Discard any visible mutations and always restore the detached
-        // values.  On an error from the key function this restores the input
-        // order; after a successful sort it installs the sorted permutation.
-        pyre_object::listobject::w_list_clear(list);
-        match sorted {
-            Ok(order) => {
-                for index in order {
-                    w_list_append(
-                        list,
-                        pyre_object::gc_roots::shadow_stack_get(item_base + index),
-                    );
-                }
-                if modified {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::ValueError,
-                        "list modified during sort",
-                    ));
-                }
-            }
-            Err(err) => {
-                for index in 0..saved_len {
-                    w_list_append(
-                        list,
-                        pyre_object::gc_roots::shadow_stack_get(item_base + index),
-                    );
-                }
-                return Err(err);
-            }
-        }
-    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(list);
+    crate::builtins::sort_list_in_place(list_slot, key_fn, reverse)?;
     Ok(w_none())
 }
 

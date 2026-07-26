@@ -10637,30 +10637,136 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         .map(|v| crate::baseobjspace::is_true(v))
         .transpose()?
         .unwrap_or(false);
-    let items = collect_iterable(iterable)?;
+    // `app_functional.py:7` `sorted` is `list(iterable)` followed by
+    // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
+    // storage strategy first and the sort runs through the same body
+    // `list.sort` uses.
+    let w_list = w_list_new(collect_iterable(iterable)?);
     let _roots = pyre_object::gc_roots::push_roots();
-    let item_base = pyre_object::gc_roots::shadow_stack_len();
-    for item in items {
-        pyre_object::gc_roots::pin_root(item);
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_list);
+    sort_list_in_place(list_slot, key_fn, reverse)?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
+}
+
+/// `listobject.py:809 descr_sort` — the shared body of `list.sort` and
+/// `sorted`.  `list_slot` is a shadow-stack slot holding the list, because a
+/// key call or a comparison dunder can collect and move it.
+pub(crate) fn sort_list_in_place(
+    list_slot: usize,
+    key_fn: Option<PyObjectRef>,
+    reverse: bool,
+) -> Result<(), crate::PyError> {
+    // `descr_sort` sorts through the strategy's own `sort` whenever the list
+    // is not object-strategy and no key was given: the storage is already
+    // unwrapped, so there is no boxing, no comparison dunder, and no need to
+    // empty the receiver first — no user code can run to observe it.
+    if key_fn.is_none() {
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        unsafe {
+            if let Some((items, len)) = pyre_object::listobject::w_list_int_items_raw(list) {
+                sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+                return Ok(());
+            }
+            if let Some((items, len)) = pyre_object::listobject::w_list_float_items_raw(list) {
+                sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+                return Ok(());
+            }
+        }
     }
-    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-    let order = sort_rooted_items(item_base, item_len, key_fn, reverse)?;
-    let result = order
-        .into_iter()
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
-        .collect();
-    Ok(w_list_new(result))
+    unsafe {
+        // Hold the detached values in shadow-stack slots, not a bare Rust Vec,
+        // while key and comparison calls can collect.  The receiver is empty
+        // for the whole operation, so user code cannot alter this sorting
+        // slice through the visible list.
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        let saved = pyre_object::listobject::w_list_items_copy_as_vec(list);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let item_base = pyre_object::gc_roots::shadow_stack_len();
+        for item in saved {
+            pyre_object::gc_roots::pin_root(item);
+        }
+        let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        pyre_object::listobject::w_list_clear(list);
+
+        let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        // Whether the user mucked with the list during the sort: any mutation
+        // switches the emptied receiver away from the Empty strategy, and a
+        // list never switches back, so a net-zero append+pop is caught too.
+        let mucked = !pyre_object::listobject::w_list_is_empty_strategy(list);
+
+        // `descr_sort`'s `finally` puts the items back unconditionally,
+        // discarding whatever the user stored into the receiver meanwhile.
+        let restored = order
+            .into_iter()
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
+            .collect();
+        pyre_object::listobject::w_list_init_items(list, restored);
+        sorted?;
+        if mucked {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "list modified during sort",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `IntegerListStrategy.sort` (`listobject.py:1963`) / `FloatListStrategy.sort`
+/// (`:2067`) on the unwrapped storage.
+///
+/// `descr_sort`'s reverse handling — reverse, stable ascending sort, reverse
+/// again — is kept here rather than the strategies' single trailing
+/// `l.reverse()`: for `float` the difference is observable, since `-0.0` and
+/// `0.0` compare equal but are distinct values whose relative order a stable
+/// sort must preserve.
+fn sort_scalars<T: Copy>(items: &mut [T], reverse: bool) -> Result<(), crate::PyError>
+where
+    ScalarLt: crate::listsort::SortLt<T>,
+{
+    if reverse {
+        items.reverse();
+    }
+    crate::listsort::sort_with(items, &mut ScalarLt)?;
+    if reverse {
+        items.reverse();
+    }
+    Ok(())
+}
+
+/// `listobject.py:2429 IntSort.lt` / `:2434 FloatSort.lt` — a direct scalar
+/// comparison, never a dunder.
+struct ScalarLt;
+
+impl crate::listsort::SortLt<i64> for ScalarLt {
+    fn lt(&mut self, a: i64, b: i64) -> Result<bool, crate::PyError> {
+        Ok(a < b)
+    }
+}
+
+impl crate::listsort::SortLt<f64> for ScalarLt {
+    fn lt(&mut self, a: f64, b: f64) -> Result<bool, crate::PyError> {
+        Ok(a < b)
+    }
 }
 
 /// Sort rooted item slots and return the resulting permutation.  All object
 /// references that survive a Python call live in the shadow stack; the sort
 /// itself only moves integer indices.
+///
+/// The permutation comes back even when a key call or a comparison raises,
+/// because `descr_sort` puts `sorter.list` back from a `finally` — an
+/// interrupted sort leaves the list holding its elements in whatever order the
+/// merge had reached, not the order it started in.
 pub(crate) fn sort_rooted_items(
     item_base: usize,
     item_len: usize,
     key_fn: Option<PyObjectRef>,
     reverse: bool,
-) -> Result<Vec<usize>, crate::PyError> {
+) -> (Vec<usize>, Result<(), crate::PyError>) {
+    let mut order: Vec<usize> = (0..item_len).collect();
     let _key_roots = pyre_object::gc_roots::push_roots();
     let key_base = pyre_object::gc_roots::shadow_stack_len();
     let key_fn_slot = key_fn.map(|key| {
@@ -10670,19 +10776,22 @@ pub(crate) fn sort_rooted_items(
     let key_base = key_base + usize::from(key_fn_slot.is_some());
     if let Some(key_fn_slot) = key_fn_slot {
         for index in 0..item_len {
-            let key = crate::call::call_function_impl_result(
+            // `_compute_keys_for_sorting` (listobject.py:894) runs before the
+            // `reverse` flip, so a raising key leaves the input order.
+            match crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
                 &[pyre_object::gc_roots::shadow_stack_get(item_base + index)],
-            )?;
-            pyre_object::gc_roots::pin_root(key);
+            ) {
+                Ok(key) => pyre_object::gc_roots::pin_root(key),
+                Err(err) => return (order, Err(err)),
+            }
         }
     }
 
-    let mut order: Vec<usize> = (0..item_len).collect();
-    // `listobject.py descr_sort` reverses before and after a stable ascending
-    // sort for `reverse=True`, so equal elements keep their original relative
-    // order (a stable descending sort).  A single post-sort reverse would
-    // instead flip ties.
+    // `descr_sort` reverses before and after a stable ascending sort for
+    // `reverse=True`, so equal elements keep their original relative order (a
+    // stable descending sort).  A single post-sort reverse would instead flip
+    // ties.
     if reverse {
         order.reverse();
     }
@@ -10692,12 +10801,16 @@ pub(crate) fn sort_rooted_items(
         item_base
     };
     let mut compare = sort_compare_for(base, item_len, key_fn_slot.is_some());
-    crate::listsort::sort_with(&mut order, &mut compare)?;
-    // Second half of the `reverse=True` double-reverse (see above).
+    let result = crate::listsort::sort_with(&mut order, &mut compare);
+    // Second half of the double-reverse (see above), which runs on the raising
+    // path too — an interrupted `reverse=True` sort must not leave the list in
+    // the opposite orientation from the one it was handed.  `descr_sort` puts
+    // this reverse inside its `try` and so skips it; `list_sort_impl` does not,
+    // and that is the behaviour to match.
     if reverse {
         order.reverse();
     }
-    Ok(order)
+    (order, result)
 }
 
 /// The comparison primitive `listsort.py`'s TimSort drives, holding the
@@ -10716,7 +10829,7 @@ enum SortCompare {
     Generic(usize),
 }
 
-impl crate::listsort::SortLt for SortCompare {
+impl crate::listsort::SortLt<usize> for SortCompare {
     fn lt(&mut self, a: usize, b: usize) -> Result<bool, crate::PyError> {
         let (Self::Int(base) | Self::Float(base) | Self::Str(base) | Self::Generic(base)) = *self;
         let left = pyre_object::gc_roots::shadow_stack_get(base + a);
