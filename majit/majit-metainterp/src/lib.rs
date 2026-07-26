@@ -141,6 +141,11 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
 pub use majit_translate::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
+/// The walker's own `getfield_gc` / `setfield_gc` descr resolution
+/// (`blackhole.py:1432-1483` reads the descr straight out of the constant
+/// pool).  Exported so the descr-identity census can compare it against the
+/// pool-side resolution without re-deriving a second copy of the logic.
+pub use pyjitpl::dispatch::field_descr_ref_from_bh;
 pub use pyjitpl::{
     BackEdgeAction, BridgeRetraceResult, ClosureRuntime, ClosureRuntimeWithResolver,
     CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,

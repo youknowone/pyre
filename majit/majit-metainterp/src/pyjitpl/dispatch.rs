@@ -131,7 +131,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
 /// (`optimizeopt/virtualize.rs:689`) requires the parent to virtualize
 /// the store.  A parentless field (getfield round-trip / non-virtualized
 /// store) keeps the placeholder builder.
-fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
+pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
     match descr {
         crate::blackhole::BhDescr::Field {
             offset,
