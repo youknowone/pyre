@@ -882,6 +882,15 @@ pub unsafe fn module_dict_register_version_watcher(
 /// helpers reading the Vec directly still see an empty container;
 /// when EmptyDictStrategy is active the Vec is observationally
 /// empty (the trait readers return empty without touching the slot).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `alloc_dict_object` / `w_str_new` twin: the body builds the host
+/// `IndexMap` storage box (`gc_alloc_storage_box(IndexMap::new())`) before
+/// `alloc_dict_object` runs, so the foreign `IndexMap::new` construction sits
+/// outside `alloc_dict_object`'s own residual boundary.  Tracing into it
+/// carries the unported host container op into the caller; residualising the
+/// whole constructor models it by signature — a plain `PyObjectRef` GCREF.
+#[majit_macros::dont_look_inside]
 pub fn w_dict_new() -> PyObjectRef {
     let entries: *mut ObjectDictStorage = crate::gc_storage::gc_alloc_storage_box(
         indexmap::IndexMap::new(),

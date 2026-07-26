@@ -677,6 +677,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::alloc_dict_object",
         pyre_object::dictmultiobject::alloc_dict_object as *const (),
     );
+    // `w_dict_new` is `#[dont_look_inside]` (residualised over the host
+    // `IndexMap::new` storage box); bind its zero-arg `fn() -> PyObjectRef`
+    // so the residual call resolves, mirroring `w_list_new_empty`.
+    let w_dict_new: fn() -> pyre_object::PyObjectRef = pyre_object::dictmultiobject::w_dict_new;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_new",
+        "pyre_object::w_dict_new",
+        w_dict_new as *const (),
+    );
+    push_fnaddr(&mut entries, "w_dict_new", w_dict_new as *const ());
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_len",
