@@ -2367,19 +2367,28 @@ pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult 
     pyre_object::gc_roots::pin_root(callable);
     unsafe {
         let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
+        // A spent cursor keeps its list so `__setstate__` can revive it, but
+        // still pickles as `reversed([])`, so the exhausted form is selected
+        // by the cursor rather than by a cleared sequence.
+        let index = pyre_object::w_list_reverse_iter_index(receiver);
+        let seq = if index < 0 {
+            PY_NULL
+        } else {
+            pyre_object::w_list_reverse_iter_seq(receiver)
+        };
         iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
-            pyre_object::w_list_reverse_iter_seq(receiver),
-            pyre_object::w_list_reverse_iter_index(receiver),
+            seq,
+            index,
             2,
         )
     }
 }
 
-/// `list_reverseiterator.__setstate__(index)` — the descending cursor is
-/// clamped to the last valid index, and a negative cursor exhausts the
-/// iterator, which is the state `descr_next` leaves behind once it walks off
-/// the front.
+/// `list_reverseiterator.__setstate__(index)` — the cursor is clamped into
+/// `[-1, len - 1]`, where -1 is the exhausted state `descr_next` leaves behind
+/// once it walks off the front.  The list outlives exhaustion, so this restores
+/// a spent iterator to a live cursor as well.
 pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
@@ -2387,13 +2396,10 @@ pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResul
         if seq.is_null() {
             return Ok(w_none());
         }
-        if index < 0 {
-            pyre_object::w_list_reverse_iter_set_index(args[0], -1);
-            pyre_object::w_list_reverse_iter_set_seq(args[0], PY_NULL);
-            return Ok(w_none());
-        }
         let length = pyre_object::w_list_len(seq) as i64;
-        if index >= length {
+        if index < -1 {
+            index = -1;
+        } else if index >= length {
             index = length - 1;
         }
         pyre_object::w_list_reverse_iter_set_index(args[0], index);
@@ -12230,8 +12236,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(item);
                 }
             }
+            // The descending cursor alone marks exhaustion; the list stays
+            // referenced so `__setstate__` can put the cursor back on it.
             pyre_object::w_list_reverse_iter_set_index(obj, -1);
-            pyre_object::w_list_reverse_iter_set_seq(obj, PY_NULL);
             return Err(PyError::stop_iteration());
         }
         if pyre_object::is_tuple_iter(obj) {
