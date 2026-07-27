@@ -3720,6 +3720,7 @@ mod tests {
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
                 index: 10,
+                field_key: "Node.value".to_string(),
                 name: "Node.value".to_string(),
                 offset: 16,
                 field_size: 8,
@@ -5361,6 +5362,7 @@ mod tests {
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
                 index: 10,
+                field_key: "Node.value".to_string(),
                 name: "Node.value".to_string(),
                 offset: 0,
                 field_size: 8,

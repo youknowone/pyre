@@ -3062,6 +3062,7 @@ fn bh_field_spec_from_parts(
 ) -> crate::jitcode::BhFieldSpec {
     crate::jitcode::BhFieldSpec {
         index,
+        field_key: field_name.to_string(),
         name: bh_field_name(owner, field_name),
         offset,
         field_size,
@@ -3131,7 +3132,7 @@ fn bh_all_field_specs_for_struct(
     owner: &str,
 ) -> Vec<crate::jitcode::BhFieldSpec> {
     let mut specs = Vec::new();
-    bh_all_field_specs_for_struct_into(cc, owner, &mut specs);
+    bh_all_field_specs_for_struct_into(cc, owner, owner, "", 0, &mut specs);
     specs
 }
 
@@ -3147,7 +3148,10 @@ fn bh_all_field_specs_for_struct(
 /// to recover the inner owner string before recursing.
 fn bh_all_field_specs_for_struct_into(
     cc: &CallControl,
+    root_owner: &str,
     owner: &str,
+    field_prefix: &str,
+    base_offset: usize,
     specs: &mut Vec<crate::jitcode::BhFieldSpec>,
 ) {
     if let Some(layout) = cc.struct_layout_for(owner) {
@@ -3174,16 +3178,25 @@ fn bh_all_field_specs_for_struct_into(
                     .find(|(name, _)| name == &fl.name)
                     .map(|(_, ty)| ty.as_str())
                 {
-                    bh_all_field_specs_for_struct_into(cc, inner_owner, specs);
+                    let nested_prefix = format!("{field_prefix}{}.", fl.name);
+                    bh_all_field_specs_for_struct_into(
+                        cc,
+                        root_owner,
+                        inner_owner,
+                        &nested_prefix,
+                        base_offset + fl.offset,
+                        specs,
+                    );
                 }
                 continue;
             }
             let index_in_parent = specs.len();
+            let field_key = format!("{field_prefix}{}", fl.name);
             specs.push(bh_field_spec_from_parts(
                 index_in_parent as u32,
-                owner,
-                &fl.name,
-                fl.offset,
+                root_owner,
+                &field_key,
+                base_offset + fl.offset,
                 fl.size,
                 fl.field_type,
                 fl.flag,
@@ -3222,15 +3235,24 @@ fn bh_all_field_specs_for_struct_into(
                 // `heaptracker.py:68-69` recursive flatten for nested
                 // structs.  `field_type_str` is the inner owner name in
                 // this textual path.
-                bh_all_field_specs_for_struct_into(cc, field_type_str, specs);
+                let nested_prefix = format!("{field_prefix}{field_name}.");
+                bh_all_field_specs_for_struct_into(
+                    cc,
+                    root_owner,
+                    field_type_str,
+                    &nested_prefix,
+                    base_offset + offset,
+                    specs,
+                );
             } else {
                 let index_in_parent = specs.len();
                 let rank = cc.field_immutability(Some(owner), field_name);
+                let field_key = format!("{field_prefix}{field_name}");
                 specs.push(bh_field_spec_from_parts(
                     index_in_parent as u32,
-                    owner,
-                    field_name,
-                    offset,
+                    root_owner,
+                    &field_key,
+                    base_offset + offset,
                     field_size,
                     field_type,
                     field_flag,
@@ -3292,6 +3314,16 @@ fn fielddescrof(
     let mut is_quasi_immutable = false;
     let mut index_in_parent = 0usize;
     let mut parent = None;
+    let field_key = if let Some(owner) = field.owner_root.as_deref() {
+        let prefix = format!("{owner}.");
+        field
+            .name
+            .strip_prefix(&prefix)
+            .unwrap_or(&field.name)
+            .to_string()
+    } else {
+        field.name.clone()
+    };
 
     if let (Some(cc), Some(owner)) = (callcontrol, field.owner_root.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
@@ -3338,7 +3370,7 @@ fn fielddescrof(
             is_field_signed = computed_signed;
         }
 
-        if let Some(rank) = cc.field_immutability(Some(owner), &field.name) {
+        if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
             is_quasi_immutable = rank.is_quasi_immutable();
         }
@@ -3354,7 +3386,7 @@ fn fielddescrof(
         is_quasi_immutable,
         index_in_parent,
         parent,
-        name: field.name.clone(),
+        name: field_key,
         owner: field.owner_root.clone().unwrap_or_default(),
     }
 }
@@ -3422,6 +3454,7 @@ fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitc
     let field_flag = bh_field_flag_from_descr(fd);
     crate::jitcode::BhFieldSpec {
         index: fd.index(),
+        field_key: fd.field_key().to_string(),
         name: fd.field_name().to_string(),
         offset: fd.offset(),
         field_size: fd.field_size(),

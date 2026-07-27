@@ -70,6 +70,8 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 false,
                 false,
                 #flag_tok,
+                u32::MAX,
+                false,
                 #idx,
             );
         }

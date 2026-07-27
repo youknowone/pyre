@@ -1009,6 +1009,8 @@ impl Default for BhCallDescr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BhFieldSpec {
     pub index: u32,
+    #[serde(default)]
+    pub field_key: String,
     pub name: String,
     pub offset: usize,
     pub field_size: usize,
@@ -1021,6 +1023,14 @@ pub struct BhFieldSpec {
 }
 
 impl BhFieldSpec {
+    pub fn field_key(&self) -> &str {
+        if self.field_key.is_empty() {
+            &self.name
+        } else {
+            &self.field_key
+        }
+    }
+
     /// Mirror an `Arc<dyn FieldDescr>` into the serializable
     /// `BhFieldSpec` shape so producers outside the codewriter
     /// (e.g. blackhole-allocator dispatch in `pyre-jit`) can build
@@ -1040,6 +1050,7 @@ impl BhFieldSpec {
         };
         Self {
             index: fd.index(),
+            field_key: fd.field_key().to_string(),
             name: fd.field_name().to_string(),
             offset: fd.offset(),
             field_size: fd.field_size(),
@@ -1531,7 +1542,7 @@ impl BhDescr {
             // fields only; the parent SizeDescr backref is not surfaced
             // by the live `FieldDescr` trait.
             parent: None,
-            name: spec.name,
+            name: spec.field_key,
             owner: String::new(),
         }
     }

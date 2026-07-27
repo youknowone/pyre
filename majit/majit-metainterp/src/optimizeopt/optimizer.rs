@@ -5842,6 +5842,7 @@ mod tests {
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
                 index: 91,
+                field_key: "CallResult.field".to_string(),
                 name: "CallResult.field".to_string(),
                 offset: 0,
                 field_size: 8,
@@ -5933,6 +5934,7 @@ mod tests {
             &[
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: 101,
+                    field_key: "CallResult.type".to_string(),
                     name: "CallResult.type".to_string(),
                     offset: 0,
                     field_size: 8,
@@ -5945,6 +5947,7 @@ mod tests {
                 },
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: 102,
+                    field_key: "CallResult.value".to_string(),
                     name: "CallResult.value".to_string(),
                     offset: 8,
                     field_size: 8,

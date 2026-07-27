@@ -1754,6 +1754,7 @@ impl CallControl {
                         false,
                         majit_ir::descr::ArrayFlag::Signed,
                         "len".to_string(),
+                        "len".to_string(),
                     )) as majit_ir::descr::DescrRef
                 });
                 let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
@@ -2062,6 +2063,8 @@ impl CallControl {
                     is_immutable,
                     is_quasi_immutable,
                     flag,
+                    u32::MAX,
+                    false,
                     field_pos,
                 );
                 descr.set_index(idx);
@@ -2198,6 +2201,8 @@ impl CallControl {
                         is_immutable,
                         is_quasi_immutable,
                         flag,
+                        u32::MAX,
+                        false,
                         field_pos,
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
@@ -6720,6 +6725,8 @@ fn all_interiorfielddescrs(
                         *is_immutable,
                         *is_quasi_immutable,
                         *flag,
+                        u32::MAX,
+                        false,
                         index_in_parent,
                     )
                 }
@@ -6850,6 +6857,8 @@ fn all_interiorfielddescrs(
                     *is_immutable,
                     *is_quasi_immutable,
                     *flag,
+                    u32::MAX,
+                    false,
                     index_in_parent,
                 )
             }
