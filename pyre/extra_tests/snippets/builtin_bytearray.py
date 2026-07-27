@@ -420,6 +420,89 @@ assert bytearray(b"abcdabcda").rfind(b"a", 2, None) == 8
 assert bytearray(b"abcdabcda").index(b"a") == 0
 assert bytearray(b"abcdabcda").rindex(b"a") == 8
 
+search_buffer = FromHexExporter(b"bc")
+assert bytearray(b"abcd").find(search_buffer) == 1
+assert bytearray(b"abcbc").count(search_buffer) == 2
+assert search_buffer in bytearray(b"abcd")
+assert len(search_buffer.released) == 3
+
+split_buffer = FromHexExporter(b",")
+assert bytearray(b"a,b").split(split_buffer) == [bytearray(b"a"), bytearray(b"b")]
+assert bytearray(b"a,b").rsplit(split_buffer) == [bytearray(b"a"), bytearray(b"b")]
+assert len(split_buffer.released) == 2
+
+
+# CPython 3.14 gh-142560: search methods acquire the bytearray receiver
+# before converting a buffer/index argument.  Re-entrant conversion therefore
+# cannot resize the receiver out from under the borrowed search window.
+class SearchResize:
+    def __init__(self, receiver):
+        self.receiver = receiver
+
+    def __buffer__(self, flags):
+        self.receiver.clear()
+        return memoryview(self.receiver)
+
+    def __release_buffer__(self, view):
+        view.release()
+
+    def __index__(self):
+        self.receiver.clear()
+        return ord("A")
+
+
+for method_name in (
+    "find",
+    "count",
+    "index",
+    "rindex",
+    "rfind",
+    "startswith",
+    "endswith",
+):
+    receiver = bytearray(b"A")
+    assert_raises(BufferError, getattr(receiver, method_name), SearchResize(receiver))
+
+receiver = bytearray(b"A")
+argument = SearchResize(receiver)
+assert_raises(BufferError, lambda: argument in receiver)
+
+for method_name in ("split", "rsplit"):
+    receiver = bytearray(b"A")
+    assert_raises(BufferError, getattr(receiver, method_name), SearchResize(receiver))
+
+
+class SearchBound:
+    def __init__(self, receiver, value):
+        self.receiver = receiver
+        self.value = value
+
+    def __index__(self):
+        self.receiver.clear()
+        return self.value
+
+
+# Argument-clinic converts slice bounds/maxsplit before the implementation
+# acquires the receiver export, so these mutations remain legal.
+for method_name, expected in (("find", -1), ("count", 0), ("rfind", -1)):
+    receiver = bytearray(b"A")
+    assert getattr(receiver, method_name)(b"A", SearchBound(receiver, 0)) == expected
+
+for method_name in ("index", "rindex"):
+    receiver = bytearray(b"A")
+    assert_raises(
+        ValueError,
+        getattr(receiver, method_name),
+        b"A",
+        SearchBound(receiver, 0),
+    )
+
+for method_name in ("split", "rsplit"):
+    receiver = bytearray(b"A,A")
+    assert getattr(receiver, method_name)(
+        b",", SearchBound(receiver, 1)
+    ) == [bytearray()]
+
 
 # make trans
 # fmt: off

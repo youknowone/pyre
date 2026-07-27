@@ -16598,54 +16598,89 @@ fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// `stringmethods.py:_op_val(space, w_sub, allow_char=True)` — the
 /// `sub` argument of a bytes search/count method is either a bytes-like
 /// object or a single integer in `range(0, 256)` standing for one byte.
-fn bytes_sub_arg(w_sub: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    unsafe {
-        if let Some(src) = buffer_as_bytes_like(w_sub)? {
-            Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec())
-        } else if pyre_object::is_int(w_sub) {
-            let v = pyre_object::w_int_get_value(w_sub);
-            if !(0..=255).contains(&v) {
-                return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
-            }
-            Ok(vec![v as u8])
-        } else {
-            Err(crate::PyError::type_error(format!(
-                "argument should be integer or bytes-like object, not '{}'",
-                type_name_of(w_sub)
-            )))
+enum BytesSubArg {
+    Buffer(crate::baseobjspace::SimpleBufferBytes),
+    Char([u8; 1]),
+}
+
+impl BytesSubArg {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Buffer(buffer) => buffer.as_bytes(),
+            Self::Char(value) => value,
+        }
+    }
+
+    fn release(self) {
+        if let Self::Buffer(buffer) = self {
+            buffer.release();
         }
     }
 }
 
-/// `stringmethods.py:_convert_idx_params` — resolve the optional `start`
-/// / `end` search args (PyPy slice semantics) into a byte-offset window
-/// `[start, end)` into a bytes-like of length `len`.  Returns `None`
-/// when the window is empty because `start` is past the end or past
-/// `end` (the search-miss case shared by find / index / count).
-fn bytes_idx_window(
-    len: usize,
-    args: &[PyObjectRef],
-) -> Result<Option<(usize, usize)>, crate::PyError> {
+fn bytes_sub_arg(w_sub: PyObjectRef) -> Result<BytesSubArg, crate::PyError> {
+    unsafe {
+        // bytesobject.py / bytearrayobject.py `_op_val`: integer subclasses
+        // take the allow_char path before the general buffer protocol.
+        if crate::baseobjspace::isinstance_int_w(w_sub) {
+            let v = match crate::baseobjspace::int_w(w_sub) {
+                Ok(value) => value,
+                Err(error) if error.kind == crate::PyErrorKind::OverflowError => 256,
+                Err(error) => return Err(error),
+            };
+            if !(0..=255).contains(&v) {
+                return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
+            }
+            return Ok(BytesSubArg::Char([v as u8]));
+        }
+    }
+    match crate::baseobjspace::simple_buffer_bytes(w_sub)? {
+        Some(buffer) => Ok(BytesSubArg::Buffer(buffer)),
+        None => Err(crate::PyError::type_error(format!(
+            "argument should be integer or bytes-like object, not '{}'",
+            type_name_of(w_sub)
+        ))),
+    }
+}
+
+/// Argument-clinic `slice_index` conversion for bytes/bytearray search
+/// methods.  Conversion precedes the bytearray implementation's receiver
+/// export, so a re-entrant `__index__` may resize the receiver.
+fn bytes_idx_args(args: &[PyObjectRef]) -> Result<(Option<i64>, Option<i64>), crate::PyError> {
+    let convert = |index: usize| {
+        let Some(&value) = args.get(index) else {
+            return Ok(None);
+        };
+        if unsafe { pyre_object::is_none(value) } {
+            Ok(None)
+        } else {
+            crate::sliceobject::eval_slice_index(value).map(Some)
+        }
+    };
+    Ok((convert(2)?, convert(3)?))
+}
+
+/// Normalize already-converted `start` / `end` against the receiver length
+/// observed after argument conversion.
+fn bytes_idx_window(len: usize, bounds: (Option<i64>, Option<i64>)) -> Option<(usize, usize)> {
     let len_i = len as i64;
-    let w_start = if args.len() >= 3 {
-        args[2]
-    } else {
-        pyre_object::w_none()
+    let adapt = |value: i64| {
+        if value < 0 {
+            value.saturating_add(len_i).max(0)
+        } else {
+            value
+        }
     };
-    let w_end = if args.len() >= 4 {
-        args[3]
-    } else {
-        pyre_object::w_none()
-    };
-    let (start, end) = crate::sliceobject::unwrap_start_stop(len_i, w_start, w_end)?;
+    let start = bounds.0.map(adapt).unwrap_or(0);
+    let end = bounds.1.map(adapt).unwrap_or(len_i);
     if start > len_i {
-        return Ok(None);
+        return None;
     }
     let end = end.min(len_i);
     if start > end {
-        return Ok(None);
+        return None;
     }
-    Ok(Some((start as usize, end as usize)))
+    Some((start as usize, end as usize))
 }
 
 /// First index of `needle` within `hay`; empty needle matches at 0.
@@ -16693,18 +16728,36 @@ fn bytes_count_subslices(hay: &[u8], needle: &[u8]) -> usize {
 /// `stringmethods.py:descr_find` / `descr_rfind` — search a bytes-like
 /// over the codepoint-irrelevant byte window selected by start / end.
 fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let sub = bytes_sub_arg(args[1])?;
-    let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
-        return Ok(-1);
+    let bounds = bytes_idx_args(args)?;
+    // CPython 3.14 bytearray search methods acquire the receiver before
+    // converting `sub` (gh-142560), so re-entrant buffer conversion cannot
+    // resize the storage under a borrowed slice.  Argument-clinic converted
+    // start/end above, before the implementation acquires that export.
+    let receiver = crate::baseobjspace::simple_buffer_bytes(args[0])?
+        .expect("bytes/bytearray receiver always exports a buffer");
+    let sub = match bytes_sub_arg(args[1]) {
+        Ok(sub) => sub,
+        Err(error) => {
+            receiver.release();
+            return Err(error);
+        }
     };
-    let window = &data[start..end];
-    let pos = if forward {
-        bytes_find_subslice(window, &sub)
-    } else {
-        bytes_rfind_subslice(window, &sub)
-    };
-    Ok(pos.map(|p| (start + p) as i64).unwrap_or(-1))
+    let result = (|| {
+        let data = receiver.as_bytes();
+        let Some((start, end)) = bytes_idx_window(data.len(), bounds) else {
+            return Ok(-1);
+        };
+        let window = &data[start..end];
+        let pos = if forward {
+            bytes_find_subslice(window, sub.as_bytes())
+        } else {
+            bytes_rfind_subslice(window, sub.as_bytes())
+        };
+        Ok(pos.map(|p| (start + p) as i64).unwrap_or(-1))
+    })();
+    sub.release();
+    receiver.release();
+    result
 }
 
 fn bytes_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -16737,14 +16790,28 @@ fn bytes_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "count", 1)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let sub = bytes_sub_arg(args[1])?;
-    let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
-        return Ok(pyre_object::w_int_new(0));
+    let bounds = bytes_idx_args(args)?;
+    let receiver = crate::baseobjspace::simple_buffer_bytes(args[0])?
+        .expect("bytes/bytearray receiver always exports a buffer");
+    let sub = match bytes_sub_arg(args[1]) {
+        Ok(sub) => sub,
+        Err(error) => {
+            receiver.release();
+            return Err(error);
+        }
     };
-    Ok(pyre_object::w_int_new(
-        bytes_count_subslices(&data[start..end], &sub) as i64,
-    ))
+    let result = (|| {
+        let data = receiver.as_bytes();
+        let Some((start, end)) = bytes_idx_window(data.len(), bounds) else {
+            return Ok(pyre_object::w_int_new(0));
+        };
+        Ok(pyre_object::w_int_new(
+            bytes_count_subslices(&data[start..end], sub.as_bytes()) as i64,
+        ))
+    })();
+    sub.release();
+    receiver.release();
+    result
 }
 
 /// `stringmethods.py:descr_startswith` / `descr_endswith` — test the
@@ -16755,45 +16822,56 @@ fn bytes_prefix_match(
     method: &str,
     forward: bool,
 ) -> Result<bool, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    // `start > len(value)` collapses the window to None → no match.
-    let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
-        return Ok(false);
-    };
-    let window = &data[start..end];
-    let test = |p: &[u8]| {
-        if forward {
-            window.starts_with(p)
-        } else {
-            window.ends_with(p)
-        }
-    };
-    let needle = args[1];
-    unsafe {
-        if let Some(src) = buffer_as_bytes_like(needle)? {
-            return Ok(test(pyre_object::bytesobject::bytes_like_data(src)));
-        }
-        if pyre_object::is_tuple(needle) {
-            let n = pyre_object::w_tuple_len(needle) as i64;
-            for i in 0..n {
-                let item = pyre_object::w_tuple_getitem(needle, i).expect("index is in range");
-                let Some(src) = buffer_as_bytes_like(item)? else {
-                    return Err(crate::PyError::type_error(format!(
-                        "a bytes-like object is required, not '{}'",
-                        type_name_of(item)
-                    )));
-                };
-                if test(pyre_object::bytesobject::bytes_like_data(src)) {
-                    return Ok(true);
-                }
-            }
+    let bounds = bytes_idx_args(args)?;
+    let receiver = crate::baseobjspace::simple_buffer_bytes(args[0])?
+        .expect("bytes/bytearray receiver always exports a buffer");
+    let result = (|| {
+        let data = receiver.as_bytes();
+        // `start > len(value)` collapses the window to None → no match.
+        let Some((start, end)) = bytes_idx_window(data.len(), bounds) else {
             return Ok(false);
+        };
+        let window = &data[start..end];
+        let test = |prefix: &[u8]| {
+            if forward {
+                window.starts_with(prefix)
+            } else {
+                window.ends_with(prefix)
+            }
+        };
+        let needle = args[1];
+        unsafe {
+            if pyre_object::is_tuple(needle) {
+                let n = pyre_object::w_tuple_len(needle) as i64;
+                for i in 0..n {
+                    let item = pyre_object::w_tuple_getitem(needle, i).expect("index is in range");
+                    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(item)? else {
+                        return Err(crate::PyError::type_error(format!(
+                            "a bytes-like object is required, not '{}'",
+                            type_name_of(item)
+                        )));
+                    };
+                    let matches = test(buffer.as_bytes());
+                    buffer.release();
+                    if matches {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+            let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(needle)? else {
+                return Err(crate::PyError::type_error(format!(
+                    "{method} first arg must be bytes or a tuple of bytes, not {}",
+                    type_name_of(needle)
+                )));
+            };
+            let matches = test(buffer.as_bytes());
+            buffer.release();
+            Ok(matches)
         }
-        Err(crate::PyError::type_error(format!(
-            "{method} first arg must be bytes or a tuple of bytes, not {}",
-            type_name_of(needle)
-        )))
-    }
+    })();
+    receiver.release();
+    result
 }
 
 fn bytes_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -17154,7 +17232,8 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    // Argument clinic converts maxsplit before bytearray_split_impl acquires
+    // the receiver export; a re-entrant __index__ may therefore resize it.
     let maxsplit = match pos
         .get(2)
         .copied()
@@ -17163,44 +17242,56 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
         Some(m) if !m.is_null() => crate::builtins::space_index_w(m)?,
         _ => -1,
     };
-    let sep_arg = pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
-    let sep: Option<Vec<u8>> = match sep_arg {
-        Some(o) if !o.is_null() && unsafe { !pyre_object::is_none(o) } => {
-            if let Some(src) = buffer_as_bytes_like(o)? {
-                Some(unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec())
-            } else {
-                return Err(crate::PyError::type_error(format!(
-                    "a bytes-like object is required, not '{}'",
-                    type_name_of(o)
-                )));
-            }
+    // CPython 3.14 bytearray split keeps the receiver export across separator
+    // buffer acquisition (gh-142560).
+    let receiver = crate::baseobjspace::simple_buffer_bytes(pos[0])?
+        .expect("bytes/bytearray receiver always exports a buffer");
+    let mut sep_buffer = None;
+    let result = (|| {
+        let sep_arg = pos
+            .get(1)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
+        if let Some(o) = sep_arg.filter(|o| !o.is_null() && unsafe { !pyre_object::is_none(*o) }) {
+            sep_buffer = match crate::baseobjspace::simple_buffer_bytes(o)? {
+                Some(buffer) => Some(buffer),
+                None => {
+                    return Err(crate::PyError::type_error(format!(
+                        "a bytes-like object is required, not '{}'",
+                        type_name_of(o)
+                    )));
+                }
+            };
         }
-        _ => None,
-    };
-    let parts = match sep {
-        Some(s) => {
-            if s.is_empty() {
-                return Err(crate::PyError::value_error("empty separator"));
+        let data = receiver.as_bytes();
+        let parts = match sep_buffer.as_ref() {
+            Some(buffer) => {
+                let sep = buffer.as_bytes();
+                if sep.is_empty() {
+                    return Err(crate::PyError::value_error("empty separator"));
+                }
+                if forward {
+                    split_bytes_sep(data, sep, maxsplit)
+                } else {
+                    rsplit_bytes_sep(data, sep, maxsplit)
+                }
             }
-            if forward {
-                split_bytes_sep(data, &s, maxsplit)
-            } else {
-                rsplit_bytes_sep(data, &s, maxsplit)
+            None => {
+                if forward {
+                    split_bytes_ws(data, maxsplit)
+                } else {
+                    rsplit_bytes_ws(data, maxsplit)
+                }
             }
-        }
-        None => {
-            if forward {
-                split_bytes_ws(data, maxsplit)
-            } else {
-                rsplit_bytes_ws(data, maxsplit)
-            }
-        }
-    };
-    let items: Vec<PyObjectRef> = parts.iter().map(|p| cut_bytes_like(pos[0], p)).collect();
-    Ok(pyre_object::w_list_new(items))
+        };
+        let items: Vec<PyObjectRef> = parts.iter().map(|p| cut_bytes_like(pos[0], p)).collect();
+        Ok(pyre_object::w_list_new(items))
+    })();
+    if let Some(buffer) = sep_buffer {
+        buffer.release();
+    }
+    receiver.release();
+    result
 }
 
 fn bytes_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -18037,12 +18128,15 @@ fn bytes_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let out = parse_hex_string(&args[1..])?;
-    let w_bytearray = pyre_object::bytearrayobject::w_bytearray_from_bytes(&out);
     let base = crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
     if cls.is_null() || crate::baseobjspace::is_w(cls, base) {
-        Ok(w_bytearray)
+        // CPython 3.14 `_PyBytes_FromHex(string, type == &PyByteArray_Type)`.
+        Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&out))
     } else {
-        crate::call::call_function_impl_result(cls, &[w_bytearray])
+        // A subclass receives the base bytes result through `cls(result)`,
+        // not an already-materialised bytearray.
+        let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&out);
+        crate::call::call_function_impl_result(cls, &[w_bytes])
     }
 }
 

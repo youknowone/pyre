@@ -15328,8 +15328,9 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         // `_op_val` falls back to `buffer_w(BUF_SIMPLE)`, so any buffer-protocol
         // object (e.g. a memoryview) is also accepted as the needle.
         if pyre_object::bytesobject::is_bytes_like(haystack) {
-            let hay = pyre_object::bytesobject::bytes_like_data(haystack);
-            if is_int(needle) || is_long(needle) {
+            let receiver = simple_buffer_bytes(haystack)?
+                .expect("bytes/bytearray receiver always exports a buffer");
+            let result = if is_int(needle) || is_long(needle) {
                 // `_single_char`: `int_w` then `0 <= c < 256`; a bignum is
                 // necessarily out of range (its `int_w` overflows upstream).
                 let v = if is_int(needle) {
@@ -15338,21 +15339,35 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     -1
                 };
                 if !(0..=255).contains(&v) {
-                    return Err(PyError::value_error("byte must be in range(0, 256)"));
+                    Err(PyError::value_error("byte must be in range(0, 256)"))
+                } else {
+                    Ok(receiver.as_bytes().contains(&(v as u8)))
                 }
-                return Ok(hay.contains(&(v as u8)));
-            }
-            if let Some(src) = crate::typedef::buffer_as_bytes_like(needle)? {
-                let sub = pyre_object::bytesobject::bytes_like_data(src);
-                return Ok(sub.is_empty() || hay.windows(sub.len()).any(|w| w == sub));
-            }
-            let tname = match crate::typedef::r#type(needle) {
-                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                None => "object".to_string(),
+            } else {
+                match simple_buffer_bytes(needle) {
+                    Ok(Some(sub)) => {
+                        let value = sub.as_bytes().is_empty()
+                            || receiver
+                                .as_bytes()
+                                .windows(sub.as_bytes().len())
+                                .any(|window| window == sub.as_bytes());
+                        sub.release();
+                        Ok(value)
+                    }
+                    Ok(None) => {
+                        let tname = match crate::typedef::r#type(needle) {
+                            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+                            None => "object".to_string(),
+                        };
+                        Err(PyError::type_error(format!(
+                            "a bytes-like object is required, not '{tname}'"
+                        )))
+                    }
+                    Err(error) => Err(error),
+                }
             };
-            return Err(PyError::type_error(format!(
-                "a bytes-like object is required, not '{tname}'"
-            )));
+            receiver.release();
+            return result;
         }
         // dict: key containment (dictmultiobject.py __contains__)
         if is_dict(haystack) {
