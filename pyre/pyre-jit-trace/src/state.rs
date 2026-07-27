@@ -4763,6 +4763,51 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + below.len() + 1
 }
 
+/// Take a copy of `frame`'s locals so a caller that publishes over them can put
+/// the frame back exactly as it found it.  Returned as raw words: boxing a slot
+/// during the publish can collect, so the copy has to be registered as resume
+/// roots (`push_resume_ref_roots`) for the duration, like the register image
+/// `apply_blackhole_crn` holds.
+pub(crate) fn capture_frame_locals(frame: usize) -> Option<Vec<i64>> {
+    if frame == 0 {
+        return None;
+    }
+    let nlocals = concrete_nlocals(frame)?;
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return None;
+    }
+    let slots = unsafe { &*arr_ptr }.as_slice();
+    if slots.len() < nlocals {
+        return None;
+    }
+    Some(slots[..nlocals].iter().map(|&o| o as i64).collect())
+}
+
+/// Put back what [`capture_frame_locals`] took.
+pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
+    if frame == 0 {
+        return;
+    }
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return;
+    }
+    let len = unsafe { &*arr_ptr }.as_slice().len();
+    for (abs, &value) in saved.iter().enumerate().take(len) {
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = value as usize as PyObjectRef;
+        }
+    }
+    frame_array_write_barrier(frame as *mut u8, arr_ptr);
+}
+
 /// Materialize the outer frame's locals from the virtualizable shadow.
 /// Callers must run their complete preflight before executing a rebuilt
 /// callee; after that point a failure would make replay unsafe.

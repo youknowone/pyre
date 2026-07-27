@@ -1968,7 +1968,11 @@ fn apply_blackhole_crn(
     true
 }
 
-fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool {
+fn try_adopt_single_frame_blackhole(
+    ctx: &mut TraceCtx,
+    cf_addr: usize,
+    live_root_addr: usize,
+) -> bool {
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         return false;
     };
@@ -1986,6 +1990,60 @@ fn try_adopt_single_frame_blackhole(ctx: &mut TraceCtx, cf_addr: usize) -> bool 
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         return false;
     };
+    // The escape flush that ran ahead of the forcing residual is
+    // all-or-nothing, and its decline is what this latch is gated on
+    // (`committed_frame_escape_pc().is_none()`).  What it declines on is the
+    // operand-stack half — the shadow's stack region reads NULL away from a
+    // merge point — and the register image below carries that half anyway.
+    // The LOCALS half is not optional: every LOAD_FAST lowers to
+    // `getarrayitem_vable_r` on the frame the register image names, so without
+    // it the replay reads whatever that frame held before the walk began, and
+    // a local the walk assigned comes back null.  Publish that half here and
+    // withdraw it if it cannot complete, so a decline still leaves the legacy
+    // replay pristine pre-walk state.
+    // Which frame gets it is an identity question, and the walked frame has two
+    // representations: `cf_addr` is the `snapshot_for_tracing` copy the walk
+    // steps concretely, `live_root_addr` the frame the compiled loop runs on.
+    // The register is recovered the same way `try_adopt_multi_frame_blackhole`
+    // recovers `per_frame[0]`, and `seed_virtualizable_boxes` bakes that root
+    // vable identity against the live address whenever there is one, so the
+    // comparison uses the same address under the same fallback.  Code-object
+    // equality would not do: two invocations of one function share a code
+    // object, and the shadow belongs to exactly one of them.
+    let root_addr = if live_root_addr != 0 {
+        live_root_addr
+    } else {
+        cf_addr
+    };
+    let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
+    let vable_frame = latched
+        .miframe
+        .ref_values
+        .get(frame_reg as usize)
+        .copied()
+        .flatten()
+        .unwrap_or(0) as usize;
+    if vable_frame == 0 || vable_frame != root_addr {
+        return false;
+    }
+    let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
+        return false;
+    };
+    let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
+    }
+    let locals_published = crate::state::write_back_outer_locals(ctx, vable_frame);
+    if !locals_published {
+        crate::state::restore_frame_locals(vable_frame, &locals_undo);
+    }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+    if !locals_published {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-blackhole] single-frame locals publish declined — legacy replay kept");
+        }
+        return false;
+    }
     let mut terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
@@ -2390,7 +2448,7 @@ fn try_adopt_multi_frame_blackhole(
 
 fn try_adopt_force_blackhole(ctx: &mut TraceCtx, cf_addr: usize, live_root_addr: usize) -> bool {
     try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr)
-        || try_adopt_single_frame_blackhole(ctx, cf_addr)
+        || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr)
 }
 
 fn run_perfn_walk<Sym: WalkSym>(
