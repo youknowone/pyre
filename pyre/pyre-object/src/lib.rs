@@ -51,6 +51,7 @@ pub mod objectobject;
 pub mod operation;
 pub mod pyobject;
 pub mod rbigint;
+pub mod rutf8;
 pub mod setobject;
 pub mod sliceobject;
 pub mod special;
