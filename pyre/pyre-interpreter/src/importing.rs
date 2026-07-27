@@ -1444,6 +1444,23 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
 
+/// Return the interpreter-owned `sys` module, bypassing the Python-visible
+/// `sys.modules` mapping.
+///
+/// CPython's `_PySys_GetOptionalAttr*` reads `PyInterpreterState.sysdict`
+/// directly, and PyPy reads `space.sys`; neither follows a replacement
+/// `sys.modules["sys"]`.  `SYS_MODULES` is pyre's process/interpreter-owned
+/// module registry and is independently walked as a GC root, so its original
+/// `sys` entry is the corresponding owner.
+pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
+    SYS_MODULES
+        .lock()
+        .unwrap()
+        .get("sys")
+        .copied()
+        .map(|module| module as PyObjectRef)
+}
+
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
 /// installed. Used by callers that need to iterate every loaded module
 /// (e.g. pickle's `whichmodule` scan).

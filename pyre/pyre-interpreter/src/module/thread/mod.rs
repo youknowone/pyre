@@ -1721,6 +1721,17 @@ fn call_method_result(
     }
 }
 
+/// CPython `PyObject_GetOptionalAttr`: only `AttributeError` denotes a missing
+/// attribute.  In particular, a `NameError` raised by a descriptor propagates.
+fn optional_attr(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match crate::baseobjspace::getattr_str(obj, name) {
+        Ok(value) if value.is_null() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind == crate::PyErrorKind::AttributeError => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// `thread_excepthook_file`: write one string to the live file root.
 fn thread_excepthook_write(file_slot: usize, text: PyObjectRef) -> Result<(), crate::PyError> {
     let text_slot = pin_root_slot(text);
@@ -1752,7 +1763,7 @@ fn thread_excepthook_file(
     // to the native thread identifier, while a raising descriptor propagates.
     let thread = pyre_object::gc_roots::shadow_stack_get(thread_slot);
     let name = if !unsafe { is_none(thread) } {
-        crate::baseobjspace::findattr_result(thread, "name")?
+        optional_attr(thread, "name")?
     } else {
         None
     };
@@ -1839,12 +1850,15 @@ fn thread_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let exc_traceback_slot = pin_root_slot(exc_traceback);
     let thread_slot = pin_root_slot(thread);
 
-    // `_PySys_GetOptionalAttr("stderr")`; when it is absent/None, use the
-    // Thread object's saved `_stderr`, unless both the stream and thread are
-    // None.
-    let sys = crate::importing::get_sys_module("sys")
+    // `_PySys_GetOptionalAttr("stderr")` reads the interpreter-owned sys dict,
+    // not the replaceable `sys.modules["sys"]` entry.  When stderr is
+    // absent/None, use the Thread object's saved `_stderr`, unless both the
+    // stream and thread are None.
+    let sys = crate::importing::get_interpreter_sys_module()
         .ok_or_else(|| crate::PyError::runtime_error("sys module is unavailable"))?;
-    let mut file = crate::baseobjspace::findattr_result(sys, "stderr")?.unwrap_or(PY_NULL);
+    let sys_dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
+    let mut file =
+        unsafe { pyre_object::w_module_dict_getitem_str(sys_dict, "stderr") }.unwrap_or(PY_NULL);
     if file.is_null() || unsafe { is_none(file) } {
         let thread = pyre_object::gc_roots::shadow_stack_get(thread_slot);
         if unsafe { is_none(thread) } {

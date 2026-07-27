@@ -1468,18 +1468,24 @@ pub fn write_exception<W: Write>(
     }
 }
 
-/// CPython `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used by
-/// `_thread._excepthook`.
+/// CPython 3.14 `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used
+/// by `_thread._excepthook`.
 ///
-/// The exception hook receives the traceback as a separate structseq field;
-/// it must display that live value rather than reading (or mutating)
-/// `exc_value.__traceback__`.  PyPy's `OperationError.print_application_traceback`
-/// likewise carries its traceback independently from the wrapped value.
+/// `Python/pythonrun.c:_PyErr_Display` installs a supplied traceback only when
+/// the exception has none, then displays the traceback resident on the
+/// exception.  An existing traceback therefore wins and the one-time
+/// installation remains observable through `exc_value.__traceback__`.
 pub fn write_exception_from_parts<W: Write>(
     writer: &mut W,
     exc_value: PyObjectRef,
     exc_tb: PyObjectRef,
 ) -> std::io::Result<()> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exc_value);
+    let exc_tb_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exc_tb);
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
     if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
         if !exc_value.is_null() && unsafe { pyre_object::is_none(exc_value) } {
             return writeln!(writer, "NoneType: None");
@@ -1493,19 +1499,35 @@ pub fn write_exception_from_parts<W: Write>(
         );
     }
 
-    // `PyErr_DisplayException`: older explicit cause/context entries precede
-    // the current value, while the current traceback comes from the argument
-    // supplied by ExceptHookArgs.
-    write_chained_context(writer, exc_value)?;
+    let exc_tb = pyre_object::gc_roots::shadow_stack_get(exc_tb_slot);
     if !exc_tb.is_null()
         && !unsafe { pyre_object::is_none(exc_tb) }
         && unsafe { crate::pytraceback::is_pytraceback(exc_tb) }
+        && unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_value).is_null() }
     {
-        writeln!(writer, "Traceback (most recent call last):")?;
-        write_traceback_chain_from_tb(writer, exc_tb)?;
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_traceback(exc_value, exc_tb);
+        }
     }
+
+    // Older explicit cause/context entries precede the current value.  The
+    // current traceback is the exception-resident value after the conditional
+    // installation above, exactly as `print_exception_recursive` observes it.
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
+    write_chained_context(writer, exc_value)?;
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
+    let current_tb =
+        unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_value) };
+    if !current_tb.is_null() {
+        writeln!(writer, "Traceback (most recent call last):")?;
+        write_traceback_chain_from_tb(writer, current_tb)?;
+    }
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
     writeln!(writer, "{}", render_exc_object(exc_value))?;
-    write_exception_notes(writer, exc_value)
+    write_exception_notes(
+        writer,
+        pyre_object::gc_roots::shadow_stack_get(exc_value_slot),
+    )
 }
 
 /// Render an uncaught compile-time SyntaxError as the top-level banner
@@ -1655,35 +1677,25 @@ fn render_exc_object(exc: PyObjectRef) -> String {
         let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
         exc_kind_name(kind).to_string()
     });
-    // `str(e)` semantically — pyre stores args as a list; the
-    // first arg's str repr is the message.  Empty args produces
-    // bare `ExcName` per `traceback.format_exception_only`.
-    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(exc) };
+    // `Python/pythonrun.c:print_exception_message` calls
+    // `PyObject_Str(value)`, so specialized builtin formatting
+    // (KeyError/OSError/Unicode errors) and a user `__str__` override all win
+    // over reconstructing a message from `args`.  A raising `__str__` is
+    // cleared and rendered with CPython's diagnostic placeholder.
     let msg = unsafe {
-        if args.is_null() || !pyre_object::is_tuple(args) {
-            String::new()
-        } else {
-            let len = pyre_object::w_tuple_len(args);
-            if len == 0 {
-                String::new()
-            } else if len == 1 {
-                let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(pyre_object::PY_NULL);
-                if first.is_null() {
-                    String::new()
+        match crate::display::py_str_wtf8(exc) {
+            Ok(w) => {
+                if let Ok(s) = w.as_str() {
+                    s.to_owned()
                 } else {
-                    crate::display::py_str_display(first)
+                    let s_obj = pyre_object::w_str_from_wtf8(w);
+                    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_else(|| "<exception str() failed>".to_string())
                 }
-            } else {
-                // Multi-arg exceptions render as tuple repr — matches
-                // BaseException.__str__ (`interp_exceptions.py:142`).
-                let items: Vec<String> = (0..len as i64)
-                    .filter_map(|i| pyre_object::w_tuple_getitem(args, i))
-                    .map(|w| {
-                        crate::display::py_repr(w).unwrap_or_else(|_| "<unprintable>".to_string())
-                    })
-                    .collect();
-                format!("({})", items.join(", "))
             }
+            Err(_) => "<exception str() failed>".to_string(),
         }
     };
     if msg.is_empty() {
