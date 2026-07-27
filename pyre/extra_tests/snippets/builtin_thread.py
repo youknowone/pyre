@@ -169,6 +169,37 @@ assert 'File "thread_syntax.py", line 3\n' in syntax_output
 assert "SyntaxError: bad syntax\n" in syntax_output
 assert "(thread_syntax.py, line 3)" not in syntax_output
 
+group_output = hook_output(
+    ExceptionGroup(
+        "outer",
+        [
+            ValueError("first leaf"),
+            ExceptionGroup("inner", [TypeError("nested leaf")]),
+        ],
+    )
+)
+assert "ExceptionGroup: outer (2 sub-exceptions)\n" in group_output
+assert "ValueError: first leaf\n" in group_output
+assert "ExceptionGroup: inner (1 sub-exception)\n" in group_output
+assert "TypeError: nested leaf\n" in group_output
+assert "+---------------- 1 ----------------\n" in group_output
+assert "+------------------------------------\n" in group_output
+
+self_cause = ValueError("self cycle")
+self_cause.__cause__ = self_cause
+self_cause_output = hook_output(self_cause)
+assert self_cause_output.count("ValueError: self cycle\n") == 1
+assert "direct cause" not in self_cause_output
+
+cycle_first = ValueError("cycle first")
+cycle_second = TypeError("cycle second")
+cycle_first.__context__ = cycle_second
+cycle_second.__context__ = cycle_first
+context_cycle_output = hook_output(cycle_first)
+assert context_cycle_output.count("ValueError: cycle first\n") == 1
+assert context_cycle_output.count("TypeError: cycle second\n") == 1
+assert context_cycle_output.count("During handling") == 1
+
 
 class BrokenThreadName:
     @property

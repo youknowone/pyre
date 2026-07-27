@@ -3,6 +3,7 @@ use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
 use ruff_text_size::Ranged;
 use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::Wtf8Buf;
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -1511,32 +1512,13 @@ pub fn write_exception_from_parts<W: Write>(
         }
     }
 
-    // Older explicit cause/context entries precede the current value.  The
-    // current traceback is the exception-resident value after the conditional
-    // installation above, exactly as `print_exception_recursive` observes it.
+    // `lib-python/3/traceback.py:1047-1188 TracebackException.__init__`
+    // records every visited exception before following cause/context edges.
+    // Keep the same set for the complete structured render so cycles terminate
+    // and ExceptionGroup leaves share the chain census.
     let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
-    write_chained_context(writer, exc_value)?;
-    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
-    let current_tb =
-        unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_value) };
-    if !current_tb.is_null() {
-        writeln!(writer, "Traceback (most recent call last):")?;
-        write_traceback_chain_from_tb(writer, current_tb)?;
-    }
-    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
-    if unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_value) }
-        == ExcKind::SyntaxError
-    {
-        write_syntax_error_object(writer, exc_value)?;
-    } else {
-        let rendered = render_exc_object_wtf8(exc_value);
-        writer.write_all(rendered.as_bytes())?;
-        writer.write_all(b"\n")?;
-    }
-    write_exception_notes(
-        writer,
-        pyre_object::gc_roots::shadow_stack_get(exc_value_slot),
-    )
+    let mut context = ExceptionPrintContext::new(exc_value);
+    write_exception_object_recursive(writer, exc_value, &mut context)
 }
 
 /// Render an uncaught compile-time SyntaxError as the top-level banner
@@ -1603,11 +1585,234 @@ pub fn eprint_syntax_error(err: &PyError) {
     crate::host_seam::emit_stderr(&buf);
 }
 
+/// `lib-python/3/traceback.py:980-1000 _ExceptionPrintContext` and
+/// `:1468-1565 TracebackException.format` state.  CPython shares one visited
+/// set across the complete cause/context/ExceptionGroup tree.
+struct ExceptionPrintContext {
+    seen: HashSet<usize>,
+    exception_group_depth: usize,
+    need_close: bool,
+}
+
+impl ExceptionPrintContext {
+    fn new(exc: PyObjectRef) -> Self {
+        let mut seen = HashSet::new();
+        seen.insert(exc as usize);
+        Self {
+            seen,
+            exception_group_depth: 0,
+            need_close: false,
+        }
+    }
+}
+
+fn write_exception_object_recursive<W: Write>(
+    writer: &mut W,
+    exc: PyObjectRef,
+    context: &mut ExceptionPrintContext,
+) -> std::io::Result<()> {
+    let cause = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(exc) };
+    let chained = if !cause.is_null()
+        && !unsafe { pyre_object::is_none(cause) }
+        && context.seen.insert(cause as usize)
+    {
+        Some((
+            cause,
+            "\nThe above exception was the direct cause of the following exception:\n\n",
+        ))
+    } else {
+        let previous = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
+        let suppress =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(exc) };
+        if !suppress
+            && !previous.is_null()
+            && !unsafe { pyre_object::is_none(previous) }
+            && context.seen.insert(previous as usize)
+        {
+            Some((
+                previous,
+                "\nDuring handling of the above exception, another exception occurred:\n\n",
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some((older, banner)) = chained {
+        write_exception_object_recursive(writer, older, context)?;
+        emit_exception_text(writer, banner.as_bytes(), context, b'|')?;
+    }
+
+    if exception_group_items(exc).is_some() {
+        write_exception_group(writer, exc, context)
+    } else {
+        write_plain_exception_object(writer, exc, context)
+    }
+}
+
+fn write_plain_exception_object<W: Write>(
+    writer: &mut W,
+    exc: PyObjectRef,
+    context: &ExceptionPrintContext,
+) -> std::io::Result<()> {
+    let mut rendered = Vec::new();
+    let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    if !tb.is_null() {
+        writeln!(rendered, "Traceback (most recent call last):")?;
+        write_traceback_chain_from_tb(&mut rendered, tb)?;
+    }
+    if unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) } == ExcKind::SyntaxError
+    {
+        write_syntax_error_object(&mut rendered, exc)?;
+    } else {
+        let header = render_exc_object_wtf8(exc);
+        rendered.write_all(header.as_bytes())?;
+        rendered.write_all(b"\n")?;
+    }
+    write_exception_notes(&mut rendered, exc)?;
+    emit_exception_text(writer, &rendered, context, b'|')
+}
+
+fn exception_group_items(exc: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+    let base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup")?;
+    if !crate::baseobjspace::isinstance(exc, base_group).ok()? {
+        return None;
+    }
+    let exceptions = crate::baseobjspace::getattr_str(exc, "exceptions").ok()?;
+    if !unsafe { pyre_object::is_tuple(exceptions) } {
+        return None;
+    }
+    Some(unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) })
+}
+
+fn write_exception_group<W: Write>(
+    writer: &mut W,
+    exc: PyObjectRef,
+    context: &mut ExceptionPrintContext,
+) -> std::io::Result<()> {
+    const MAX_GROUP_WIDTH: usize = 15;
+    const MAX_GROUP_DEPTH: usize = 10;
+
+    if context.exception_group_depth > MAX_GROUP_DEPTH {
+        return emit_exception_text(writer, b"... (max_group_depth is 10)\n", context, b'|');
+    }
+    let exceptions = match exception_group_items(exc) {
+        Some(exceptions) => exceptions,
+        None => return write_plain_exception_object(writer, exc, context),
+    };
+    let is_toplevel = context.exception_group_depth == 0;
+    if is_toplevel {
+        context.exception_group_depth += 1;
+    }
+
+    let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    if !tb.is_null() {
+        emit_exception_text(
+            writer,
+            b"Exception Group Traceback (most recent call last):\n",
+            context,
+            if is_toplevel { b'+' } else { b'|' },
+        )?;
+        let mut traceback = Vec::new();
+        write_traceback_chain_from_tb(&mut traceback, tb)?;
+        emit_exception_text(writer, &traceback, context, b'|')?;
+    }
+
+    let mut header = Vec::new();
+    let group_header = render_exc_object_wtf8(exc);
+    header.write_all(group_header.as_bytes())?;
+    header.write_all(b"\n")?;
+    write_exception_notes(&mut header, exc)?;
+    emit_exception_text(writer, &header, context, b'|')?;
+
+    let shown = exceptions.len().min(MAX_GROUP_WIDTH);
+    let count = if exceptions.len() > MAX_GROUP_WIDTH {
+        shown + 1
+    } else {
+        shown
+    };
+    context.need_close = false;
+    for index in 0..count {
+        let last = index + 1 == count;
+        if last {
+            context.need_close = true;
+        }
+        let truncated = index >= MAX_GROUP_WIDTH;
+        let title = if truncated {
+            "...".to_string()
+        } else {
+            (index + 1).to_string()
+        };
+        write!(
+            writer,
+            "{}{}+---------------- {title} ----------------\n",
+            " ".repeat(2 * context.exception_group_depth),
+            if index == 0 { "+-" } else { "  " },
+        )?;
+        context.exception_group_depth += 1;
+        if truncated {
+            let remaining = exceptions.len() - MAX_GROUP_WIDTH;
+            let suffix = if remaining == 1 { "" } else { "s" };
+            emit_exception_text(
+                writer,
+                format!("and {remaining} more exception{suffix}\n").as_bytes(),
+                context,
+                b'|',
+            )?;
+        } else {
+            let child = exceptions[index];
+            context.seen.insert(child as usize);
+            write_exception_object_recursive(writer, child, context)?;
+        }
+        if last && context.need_close {
+            writeln!(
+                writer,
+                "{}+------------------------------------",
+                " ".repeat(2 * context.exception_group_depth)
+            )?;
+            context.need_close = false;
+        }
+        context.exception_group_depth -= 1;
+    }
+
+    if is_toplevel {
+        debug_assert_eq!(context.exception_group_depth, 1);
+        context.exception_group_depth = 0;
+    }
+    Ok(())
+}
+
+fn emit_exception_text<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    context: &ExceptionPrintContext,
+    margin: u8,
+) -> std::io::Result<()> {
+    let mut prefix = vec![b' '; 2 * context.exception_group_depth];
+    if context.exception_group_depth != 0 {
+        prefix.extend_from_slice(&[margin, b' ']);
+    }
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        writer.write_all(&prefix)?;
+        writer.write_all(line)?;
+    }
+    Ok(())
+}
+
 /// `Lib/traceback.py:171-200 TracebackException._format_*` parity —
 /// walk `__cause__` (or `__context__` when `__suppress_context__` is
 /// False) chains and emit each older exception with the appropriate
 /// bridging banner before the current one.
 fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
+    let mut seen = HashSet::new();
+    seen.insert(exc as usize);
+    write_chained_context_inner(writer, exc, &mut seen)
+}
+
+fn write_chained_context_inner<W: Write>(
+    writer: &mut W,
+    exc: PyObjectRef,
+    seen: &mut HashSet<usize>,
+) -> std::io::Result<()> {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());
     }
@@ -1618,12 +1823,19 @@ fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     // `traceback.py:184-191` — `__cause__` wins over `__context__`;
     // `__suppress_context__` (set by `raise X from None`) hides
     // `__context__` only when no explicit cause was attached.
-    let (older, banner) = if !cause.is_null() && !unsafe { pyre_object::is_none(cause) } {
+    let (older, banner) = if !cause.is_null()
+        && !unsafe { pyre_object::is_none(cause) }
+        && seen.insert(cause as usize)
+    {
         (
             cause,
             "\nThe above exception was the direct cause of the following exception:\n",
         )
-    } else if !suppress && !context.is_null() && !unsafe { pyre_object::is_none(context) } {
+    } else if !suppress
+        && !context.is_null()
+        && !unsafe { pyre_object::is_none(context) }
+        && seen.insert(context as usize)
+    {
         (
             context,
             "\nDuring handling of the above exception, another exception occurred:\n",
@@ -1632,7 +1844,7 @@ fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
         return Ok(());
     };
 
-    write_chained_context(writer, older)?;
+    write_chained_context_inner(writer, older, seen)?;
     write_single_exception(writer, older)?;
     writeln!(writer, "{}", banner)?;
     Ok(())
