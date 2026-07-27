@@ -51,6 +51,29 @@ pub fn w_complex_new(real: f64, imag: f64) -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// Allocate a `W_ComplexObject` for a `complex` subclass instance, on the
+/// managed heap so it can be reclaimed. See [`crate::intobject::w_int_subclass_new`]
+/// for why the shared constructor cannot be used.
+pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
+    let obj = W_ComplexObject {
+        ob_header: PyObject {
+            ob_type: &COMPLEX_TYPE as *const PyType,
+            w_class: get_instantiate(&COMPLEX_TYPE),
+        },
+        real,
+        imag,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_COMPLEX_GC_TYPE_ID, W_COMPLEX_OBJECT_SIZE);
+    if raw.is_null() {
+        crate::lltype::malloc_typed(obj) as PyObjectRef
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut W_ComplexObject, obj);
+            raw as PyObjectRef
+        }
+    }
+}
+
 /// Extract the real component from a known W_ComplexObject pointer.
 ///
 /// # Safety

@@ -2013,12 +2013,9 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::w_long_new(big)
     } else {
         let int_val = unsafe { pyre_object::w_int_get_value(value) };
-        pyre_object::w_int_new_unique(int_val)
+        pyre_object::intobject::w_int_subclass_new(int_val)
     };
-    unsafe {
-        (*obj).w_class = cls;
-    }
-    Ok(obj)
+    Ok(tag_subclass_instance(obj, cls))
 }
 
 /// `float.__new__(cls, *args)` — PyPy: floatobject.py descr__new__.
@@ -2052,11 +2049,8 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         None => return Ok(value),
     };
     let float_val = unsafe { pyre_object::w_float_get_value(value) };
-    let obj = pyre_object::w_float_new(float_val);
-    unsafe {
-        (*obj).w_class = sub;
-    }
-    Ok(obj)
+    let obj = pyre_object::floatobject::w_float_subclass_new(float_val);
+    Ok(tag_subclass_instance(obj, sub))
 }
 
 fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2076,11 +2070,8 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             pyre_object::w_complex_get_imag(value),
         )
     };
-    let obj = pyre_object::w_complex_new(re, im);
-    unsafe {
-        (*obj).w_class = cls;
-    }
-    Ok(obj)
+    let obj = pyre_object::complexobject::w_complex_subclass_new(re, im);
+    Ok(tag_subclass_instance(obj, cls))
 }
 
 /// Wrap a `__new__` builtin function in a staticmethod descriptor.
@@ -3001,6 +2992,25 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         w_obj,
     )?))
 }
+/// Tag a freshly allocated builtin-layout instance with the user subclass
+/// it is being constructed for, then enqueue it on the user-finalizer
+/// queue when that subclass defines `__del__`.
+///
+/// `objspace.py:485-487 allocate_instance` performs both steps together —
+/// `instance.user_setup(self, w_subtype)` followed by
+/// `if w_subtype.hasuserdel: self.finalizer_queue.register_finalizer(instance)`.
+/// Order is load-bearing: the hook reads the object's `w_class` to find
+/// `hasuserdel`, so tagging must precede registration. Registering an
+/// instance whose type has no `__del__` is a no-op, the hook gates on
+/// `hasuserdel` exactly as upstream does.
+fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        (*obj).w_class = sub;
+    }
+    pyre_object::gc_hook::maybe_register_finalizer(obj);
+    obj
+}
+
 /// When `cls` is a user subclass of the builtin `base` (not `base`
 /// itself, not null/non-type), return it so `__new__` can tag the fresh
 /// builtin instance's `w_class`; otherwise `None`.  Mirrors the
@@ -3145,9 +3155,7 @@ fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_enumerate(args.get(1..).unwrap_or(&[]))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ENUMERATE_TYPE)? {
-        unsafe {
-            (*value).w_class = sub;
-        }
+        tag_subclass_instance(value, sub);
     }
     Ok(value)
 }
@@ -3165,9 +3173,7 @@ fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE)? {
-        unsafe {
-            (*value).w_class = sub;
-        }
+        tag_subclass_instance(value, sub);
     }
     Ok(value)
 }
@@ -3229,9 +3235,7 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE)? {
-        unsafe {
-            (*value).w_class = sub;
-        }
+        tag_subclass_instance(value, sub);
     }
     Ok(value)
 }
@@ -3249,9 +3253,7 @@ fn zip_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ZIP_TYPE)? {
-        unsafe {
-            (*value).w_class = sub;
-        }
+        tag_subclass_instance(value, sub);
     }
     Ok(value)
 }

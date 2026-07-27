@@ -71,6 +71,34 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
     crate::lltype::malloc_typed(obj) as PyObjectRef
 }
 
+/// Allocate a `W_FloatObject` for a `float` subclass instance, on the
+/// managed heap so it can be reclaimed.
+///
+/// [`w_float_new`] gates its managed allocation on
+/// [`crate::gc_interp::enabled`], which is off unless `PYRE_GC_INTERP` is
+/// set, so it falls back to an unreclaimable `malloc_typed` box. A subclass
+/// instance cannot: `register_finalizer` drops anything outside the managed
+/// heap, so such an instance would never die and its `__del__` would never
+/// run. See [`crate::intobject::w_int_subclass_new`].
+pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
+    let obj = W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: value,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+    if raw.is_null() {
+        crate::lltype::malloc_typed(obj) as PyObjectRef
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut W_FloatObject, obj);
+            raw as PyObjectRef
+        }
+    }
+}
+
 /// Box a float constant into a heap Python float object.
 pub fn box_float_constant(value: f64) -> PyObjectRef {
     w_float_new(value)

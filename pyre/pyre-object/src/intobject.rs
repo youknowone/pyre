@@ -138,6 +138,36 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// Allocate a `W_IntObject` for an `int` subclass instance, on the managed
+/// heap so it can be reclaimed.
+///
+/// [`w_int_new_unique`] is shared with the JIT's tagged-int unboxing paths
+/// and keeps their `malloc_typed` allocation; a subclass instance cannot
+/// use it, because `register_finalizer` drops anything outside the managed
+/// heap, so a boxed instance would never die and its `__del__` would never
+/// run. Allocation is unconditional rather than gated on
+/// [`crate::gc_interp::enabled`], matching the other subclass allocators
+/// ([`crate::bytesobject::w_bytes_subclass_from_bytes`],
+/// `w_str_subclass_from_wtf8`).
+pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
+    let obj = W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: value,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+    if raw.is_null() {
+        crate::lltype::malloc_typed(obj) as PyObjectRef
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut W_IntObject, obj);
+            raw as PyObjectRef
+        }
+    }
+}
+
 /// Return the address of INT_TYPE for JIT type-id validation.
 #[inline]
 pub fn w_int_type_id() -> usize {

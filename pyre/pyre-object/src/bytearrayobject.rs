@@ -118,12 +118,17 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
     };
-    if raw.is_null() {
+    let obj = if raw.is_null() {
         crate::lltype::malloc_typed(payload) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytearrayObject, payload) };
         raw as PyObjectRef
-    }
+    };
+    // `allocate_instance` registers the fresh instance on the finalizer queue
+    // when its subtype has `__del__`; the `w_class` is already stamped above,
+    // so the hook resolves the subclass rather than the canonical bytearray type.
+    crate::gc_hook::maybe_register_finalizer(obj);
+    obj
 }
 
 #[inline]
