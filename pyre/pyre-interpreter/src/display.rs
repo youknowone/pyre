@@ -758,10 +758,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let name = function_get_name(obj);
             format!("<built-in function {name}>")
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
-            // CPython 3.14 func_repr, selected by `init_function_type`.
-            // Exact builtin values take this fast path instead of dispatching
-            // through that type-dict descriptor, so it must preserve the same
-            // address-bearing representation.
+            // function.py:283 Function.descr_function_repr —
+            // `self.getrepr(space, 'function %s' % self.qualname)`, and
+            // `baseobjspace.py:115 getrepr` appends ` at 0x<addr>`.  Exact
+            // builtin values take this fast path instead of dispatching
+            // through the `__repr__` the type registers in `typedef.rs`, so it
+            // must produce the same address-bearing text.
             let name = function_get_qualname(obj);
             format!("<function {name} at {obj:p}>")
         } else if unsafe { pyre_object::is_exception(obj) } {
