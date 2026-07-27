@@ -4668,7 +4668,9 @@ thread_local! {
     /// [`fbw_abort_nested_unjournaled_residual`] at the nested-inline decline,
     /// read back by the trace loop after the walk unwinds
     /// ([`fbw_abort_outer_resume_take`]) to drive the abort-point flush.
-    static FBW_ABORT_OUTER_RESUME: std::cell::Cell<Option<(u32, usize)>> =
+    /// The trailing `usize` is the executed-effect odometer at that CALL, the
+    /// `WalkEndResume::Rewind` snapshot the flush re-checks before committing.
+    static FBW_ABORT_OUTER_RESUME: std::cell::Cell<Option<(u32, usize, usize)>> =
         const { std::cell::Cell::new(None) };
     static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -4998,6 +5000,12 @@ pub(crate) enum InlineAbortCarrier {
         outer_jitcode_index: u32,
         call_jitcode_pc: usize,
         call_stack: Vec<pyre_object::PyObjectRef>,
+        /// [`FBW_EXECUTED_EFFECT_COUNT`] at the CALL this carrier resumes at,
+        /// sampled when the latch was set.  The flush that consumes this
+        /// carrier re-executes that CALL, so it is
+        /// [`crate::trace::WalkEndResume::Rewind`] and must prove the odometer
+        /// has not moved since.
+        entry_executed_effects: usize,
     },
     MidBody(MidBodyPayload),
 }

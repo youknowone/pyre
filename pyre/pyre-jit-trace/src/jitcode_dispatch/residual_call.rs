@@ -17,12 +17,27 @@
 
 use super::*;
 
+/// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
+/// pc.  They differ in exactly the way the walk-end commit contract cares
+/// about, so the epilogue cannot classify the leg without being told.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EscapeResumeKind {
+    /// The latched mid-expression operand stack resolved.  The resume pc still
+    /// re-runs the escaping opcode — both flushes take the same `py_pc` and the
+    /// same `last_instr = py_pc - 1` — but this path is gated:
+    /// [`escape_opcode_window_clean`] ran at the residual before the latch.
+    Exact,
+    /// The latch did not resolve and the flush fell back to the merge-point
+    /// state.  Same resume pc, but NO gate ran on this path at any point.
+    RerunsOpcode,
+}
+
 thread_local! {
     static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
     static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
         const { std::cell::RefCell::new(None) };
-    static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<usize>> =
+    static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<(usize, EscapeResumeKind)>> =
         const { std::cell::Cell::new(None) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
@@ -486,7 +501,12 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 }
             }
             if flushed {
-                COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some(py_pc)));
+                let kind = if latched {
+                    EscapeResumeKind::Exact
+                } else {
+                    EscapeResumeKind::RerunsOpcode
+                };
+                COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
             } else {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
@@ -628,11 +648,13 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
     })
 }
 
-pub fn take_committed_frame_escape_pc() -> Option<usize> {
+/// Take the committed escape resume pc and which flush produced it (the
+/// walk-end commit contract turns on the difference — see [`EscapeResumeKind`]).
+pub(crate) fn take_committed_frame_escape_pc() -> Option<(usize, EscapeResumeKind)> {
     COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.take())
 }
 
-fn committed_frame_escape_pc() -> Option<usize> {
+fn committed_frame_escape_pc() -> Option<(usize, EscapeResumeKind)> {
     COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.get())
 }
 
@@ -1672,9 +1694,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
     // accounting so an escaping residual later in the same body does not
     // refuse-drop the whole iteration.
-    // `vstack_cur_pypc` points one past the executing op (next-instr
-    // convention), while `body_pc` is the store's own py_pc, so the loop-var
-    // store satisfies `vstack_cur_pypc == body_pc + 1`.
+    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
+    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
+    // the PREVIOUS opcode), so at this residual it names the opcode being
+    // walked.  The loop-var store is recognised by the FOR_ITER body's own
+    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
+    // opcode past the recorded body pc — not by a next-instr convention.
     let is_loop_var_binding_store = matches!(
         helper,
         majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
