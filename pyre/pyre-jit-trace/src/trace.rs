@@ -1173,7 +1173,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
         // Churn guard (Task 8): making this class transient retried the same
-        // guard 500 times in depth2_inline_chain_typeflip.py and
+        // guard 500 times in inline_chain_depth_typeflip.py and
         // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
         // this measured P2 class permanently declined.
         fbw_bridge_decline(ctx);

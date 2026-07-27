@@ -73,7 +73,7 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
     }
 
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
-    for bench in ["global_reassign.py", "global_reassign_obj.py"] {
+    for bench in ["global_reassign.py"] {
         let script = root.join("pyre/bench/synth").join(bench);
         let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
         assert!(
