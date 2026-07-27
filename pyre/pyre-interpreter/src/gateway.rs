@@ -1019,15 +1019,20 @@ pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<()
     Err(crate::PyError::type_error(message))
 }
 
-/// Check the declared arity against positional arguments only. Keyword calls
-/// carry a trailing marker dict in the raw builtin slice; the callee still
-/// receives that raw slice after the arity guard.
+/// Check the declared arity as positional-only. Keyword calls carry a trailing
+/// marker dict in the raw builtin slice; the callee still receives that raw
+/// slice after the arity guard.
 pub fn check_declared_positional_arity(
     name: &str,
     arity: usize,
     args: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes no keyword arguments"
+        )));
+    }
     check_declared_arity(name, arity, positional.len())
 }
 
