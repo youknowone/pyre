@@ -64,23 +64,37 @@ impl GraphBodyProvider {
         }
     }
 
-    /// Locate the funcobj whose Charon `name_path()` is `name_path`.
+    /// Locate the funcobj whose Charon `name_path()` is `name_path`, if
+    /// exactly one carries it.
+    ///
+    /// `bookkeeper.py:361 getdesc(pyobj)` keys a descriptor by the function
+    /// object itself, so two distinct functions are never conflated even
+    /// when they render the same name.  A name path carries no such
+    /// identity, and nothing stops two extracted `FunDecl`s from sharing
+    /// one, so an ambiguous name resolves to nothing rather than to an
+    /// arbitrary one of the candidates: binding the wrong body is silent,
+    /// while a miss is not.  Identity on the demand path is
+    /// [`GraphBodySource`], recorded when the funcobj was registered.
     ///
     /// Linear over the corpus, so it is a registration-time helper (and
-    /// the test seam), not a per-demand lookup: the demand path carries
-    /// the [`GraphBodySource`] recorded when the funcobj was registered.
+    /// the test seam), not a per-demand lookup.
     pub(crate) fn source_for_name_path(&self, name_path: &str) -> Option<GraphBodySource> {
+        let mut found = None;
         for (i, llbc) in self.llbcs.iter().enumerate() {
             for fd in llbc.iter_local_fns() {
-                if fd.item_meta.name_path() == name_path {
-                    return Some(GraphBodySource {
-                        llbc_index: i as u32,
-                        def_id: fd.def_id,
-                    });
+                if fd.item_meta.name_path() != name_path {
+                    continue;
                 }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(GraphBodySource {
+                    llbc_index: i as u32,
+                    def_id: fd.def_id,
+                });
             }
         }
-        None
+        found
     }
 
     /// Lower the funcobj `src` names, reproducing what the whole-program
@@ -184,6 +198,10 @@ mod tests {
     /// A body built through the provider is the body the whole-program
     /// loop built: same graph shape, from the same `FunDecl`, for every
     /// funcobj in the corpus that lowers at all.
+    ///
+    /// Also asserts every lowerable funcobj's name path is unique in the
+    /// corpus: `source_for_name_path` resolves an ambiguous name to
+    /// `None`, so a duplicate surfaces here as a lookup miss.
     #[test]
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
@@ -208,7 +226,7 @@ mod tests {
         for (name_path, want) in &eager {
             let src = provider
                 .source_for_name_path(name_path)
-                .unwrap_or_else(|| panic!("no GraphBodySource for {name_path}"));
+                .unwrap_or_else(|| panic!("no unique GraphBodySource for {name_path}"));
             let got = provider
                 .build(src)
                 .unwrap_or_else(|e| panic!("provider failed to build {name_path}: {e}"));
