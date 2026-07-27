@@ -1528,6 +1528,10 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // `module` `w_class` excludes a module subclass with a custom
     // `__getattribute__`; a module-level PEP 562 `__getattr__` is irrelevant
     // because the name is present (the dict lookup wins before `__getattr__`).
+    // Module getattr resolves the namespace dict before the module type's
+    // data descriptors (`LOAD_ATTR_MODULE` precedence, mirrored in the
+    // interpreter), so folding the cell is faithful even for a name that also
+    // names a data descriptor on the module type (e.g. `__dict__`).
     if unsafe { pyre_object::is_module(concrete_obj) }
         && std::ptr::eq(
             unsafe { (*concrete_obj).w_class },
