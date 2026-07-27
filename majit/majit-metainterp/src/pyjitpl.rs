@@ -2964,8 +2964,21 @@ impl<M: Clone> MetaInterp<M> {
     /// `bridgeopt.py:155 descr = metainterp_sd.all_descrs[descr_index]` is one
     /// such reader (the bridge's `PendingBridgeRd` snapshot), and it indexes
     /// blind.
+    ///
+    /// The list is **monotone**: `descr.py:25-47 setup_descrs` numbers it once
+    /// and `descr.py:28 v.descr_index = len(all_descrs); all_descrs.append(v)`
+    /// only ever appends, so a shorter write-back cannot be a legitimate new
+    /// universe.  It comes from an optimizer that never received the seed —
+    /// `unroll.rs` hands `all_descrs` to each phase with `std::mem::take` and
+    /// restores it on the way out, so any early exit between the two leaves
+    /// the outer `UnrollOptimizer` holding an empty vector, which
+    /// `compile_loop` then publishes.  Ignore those instead of invalidating
+    /// every `descr_index` already serialized into a compiled bridge.
     pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
-        *self.staticdata.all_descrs().lock().unwrap() = all_descrs;
+        let mut slot = self.staticdata.all_descrs().lock().unwrap();
+        if all_descrs.len() >= slot.len() {
+            *slot = all_descrs;
+        }
     }
 
     /// Accessor for `pending_frontend_boxes` without consuming it.
