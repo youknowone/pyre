@@ -2289,6 +2289,42 @@ fn try_adopt_multi_frame_blackhole(
             }
         }
     }
+    // Frame 0 is the walked frame, and the escape flush that ran ahead of the
+    // forcing residual declined — that decline is what the latch is gated on.
+    // Its LOCALS half is not optional for frame 0's level either: every
+    // LOAD_FAST lowers to `getarrayitem_vable_r` on `per_frame[0]`, so without
+    // it the level reads what the live frame held before the walk began.  Same
+    // publish and same withdrawal as the single-frame arm.
+    //
+    // The INNER levels get no counterpart, and that is a second thing standing
+    // between this path and its flip.  The walk's virtualizable shadow covers
+    // the walked frame only, so an inlined callee's frame array keeps its
+    // pre-sub-walk contents while the values the sub-walk assigned sit in that
+    // level's register image; a local assigned inside the callee and read back
+    // after the escape therefore reads null.  Measured on
+    // `scratchpad/exc_virt/s21_sigsegv.py` with the gate on: an inlined callee
+    // that stores `e.__traceback__` and then reads an attribute off it faults
+    // in `object_getattr_miss`, where the same shape through the single-frame
+    // arm is correct.  Publishing them needs a per-level slot→value map — what
+    // `apply_blackhole_crn` builds from `pcdep_trivia_at` — run before the
+    // drive rather than after it.
+    let Some(mut locals_undo) = crate::state::capture_frame_locals(root_addr) else {
+        mfdbg!("frame 0: {root_addr:#x} locals not capturable");
+        return false;
+    };
+    let undo_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
+    }
+    let locals_published = crate::state::write_back_outer_locals(ctx, root_addr);
+    if !locals_published {
+        crate::state::restore_frame_locals(root_addr, &locals_undo);
+    }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
+    if !locals_published {
+        mfdbg!("frame 0: {root_addr:#x} locals publish declined");
+        return false;
+    }
     let ec = unsafe {
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
