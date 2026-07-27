@@ -2246,7 +2246,7 @@ pub fn blackhole_resume_via_rd_numb(
     // live (to-space) pointer rather than a dangling from-space one.  The
     // `to_vec` uses the host allocator, so it cannot itself trigger a GC.
     let mut deadframe_buf: Vec<i64> = deadframe.to_vec();
-    let _deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
+    let deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
     let deadframe: &[i64] = &deadframe_buf;
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
@@ -2331,6 +2331,19 @@ pub fn blackhole_resume_via_rd_numb(
         }
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
     }
+    // Last read of `deadframe`.  `blackhole_from_resumedata` has copied every
+    // live value into the blackhole register banks, which the collector reaches
+    // through their own root source (`walk_bh_regs`), so the off-heap copy is
+    // dead from here on.  Release its roots BEFORE the forward run: `bh.run()`
+    // executes the whole remainder of the resumed frame — for a module-level
+    // frame that is the rest of the program — and every `Ref` cell left
+    // registered pins the object it happened to hold at the guard, whether or
+    // not the resumed code still uses it.  A `for v in gen(): break` leaves the
+    // abandoned generator in such a cell, so it is never collected and its
+    // `finally` never runs.  `blackhole.py:1782-1796 resume_in_blackhole` ends
+    // `deadframe`'s live range at `_prepare_resume_from_failure`, before
+    // `_run_forever`, for the same reason.
+    drop(deadframe_roots);
     // resume.py:1332-1343 builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
     // stores the vinfo per-`BlackholeInterpreter` (RPython reads it from
