@@ -3807,30 +3807,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             ..
         } => {
             let field_key = bh_field_cache_key(owner, name);
-            if let Some(parent) = parent {
-                if parent.type_id != 0 {
-                    let key = majit_ir::descr::LLType::Struct(parent.type_id);
-                    if let Some(fd) = majit_ir::descr::gc_cache()
-                        .lock()
-                        .unwrap()
-                        ._cache_field
-                        .get(&key)
-                        .and_then(|inner| inner.get(&field_key))
-                    {
-                        return fd.clone() as DescrRef;
-                    }
-                    let group = simple_descr_group_from_bh_size(parent);
-                    if let Some((pos, _)) =
-                        parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
-                            spec.offset == *offset && spec.field_key() == field_key
-                        })
-                    {
-                        if let Some(descr) = group.field_descrs.get(pos) {
-                            return descr.clone() as DescrRef;
-                        }
-                    }
-                }
-            }
             // #171 codewriter descr-bridge: `_handle_list_call`
             // (codewriter/jtransform.rs) lowers Integer-strategy list
             // ops to fields on the dotted nested names
@@ -3843,6 +3819,20 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // list specializations already use so an assembled codewriter
             // list body addresses `IntArray.{len,block}` rather
             // than the header.
+            //
+            // This runs BEFORE the parent-group lookup below, not after: when
+            // the codewriter DOES model the parent struct, that lookup answers
+            // with the parent group's own entry for the same offset, and the
+            // field ends up carrying two descrs — the parent group's for a
+            // codewriter-lowered body, `W_LIST_DESCR_GROUP`'s for the
+            // walker-native specializations.  The heapcache and the optimizer's
+            // heap pass both key on descr identity, so the split silently
+            // breaks aliasing: the `w_list_append` sub-walk's
+            // `SetfieldGc(int_items.len)` does not invalidate the `len(xs)`
+            // read that follows it, which then folds to the pre-append length
+            // (one skipped `list.pop(0)` per compiled loop entry). One field is
+            // one descr — `metainterp_sd.all_descrs` has no second entry for a
+            // field just because a different interpreter reached it.
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
@@ -3869,6 +3859,30 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "length" => return list_length_descr(),
                     "items" => return list_items_descr(),
                     _ => {}
+                }
+            }
+            if let Some(parent) = parent {
+                if parent.type_id != 0 {
+                    let key = majit_ir::descr::LLType::Struct(parent.type_id);
+                    if let Some(fd) = majit_ir::descr::gc_cache()
+                        .lock()
+                        .unwrap()
+                        ._cache_field
+                        .get(&key)
+                        .and_then(|inner| inner.get(&field_key))
+                    {
+                        return fd.clone() as DescrRef;
+                    }
+                    let group = simple_descr_group_from_bh_size(parent);
+                    if let Some((pos, _)) =
+                        parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
+                            spec.offset == *offset && spec.field_key() == field_key
+                        })
+                    {
+                        if let Some(descr) = group.field_descrs.get(pos) {
+                            return descr.clone() as DescrRef;
+                        }
+                    }
                 }
             }
             // #171 object-strategy capacity read: `list.obj_capacity` lowers
