@@ -1473,6 +1473,32 @@ impl<S: JitState> JitDriver<S> {
         self.meta.mainjitcode_of(self.portal_jd_index?)
     }
 
+    /// Point the per-thread state-field store back at this driver, reusing what
+    /// [`Self::register_dispatch_jitcode`] already built.
+    ///
+    /// That store is a SINGLE slot per thread and is written only when a driver
+    /// registers its dispatch jitcode, so a consumer holding more than one
+    /// driver alive on a thread must call this for the driver it is about to
+    /// run. Leaving another driver's store in place is not a benign miss:
+    /// [`JitDriverStaticData::frame_value_count_fn`] records that the wrong
+    /// store frequently *succeeds*, decoding an unrelated jitcode at the same pc
+    /// and silently returning a mistyped frame count.
+    ///
+    /// A driver that has not registered a dispatch jitcode has nothing to
+    /// publish and is left alone.
+    ///
+    /// The upstream arrangement is one process-wide `metainterp_sd.jitcodes`
+    /// table rather than a registry per driver; until majit has that, the store
+    /// has to be aimed at the right driver by hand.
+    pub fn republish_state_field_fvc(&self) {
+        if self.dispatch_jitcode.is_none() {
+            return;
+        }
+        let all_liveness = self.meta_interp().staticdata.liveness_info.clone();
+        let op_live = self.meta_interp().staticdata.op_live as u8;
+        install_state_field_fvc(self.jitcode_registry.clone(), all_liveness, op_live);
+    }
+
     /// Register a BlackholeAllocator for virtual materialization during
     /// guard failure blackhole resume. Without this, virtual objects
     /// and raw buffers are allocated as null/zero.
