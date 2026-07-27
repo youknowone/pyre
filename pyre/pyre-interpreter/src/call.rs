@@ -773,7 +773,13 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     };
 
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code()) } {
-        if sig.has_vararg() || sig.has_kwarg() || sig.num_kwonlyargnames() > 0 {
+        // Every HOPELESS signature needs `_match_signature`, not only
+        // *args/**kwargs/kw-only shapes.  A plain optional positional
+        // parameter also has HOPELESS fast arity; bypassing the binder let
+        // excess positionals reach the typed wrapper, which consumes its
+        // declared prefix and silently ignores the rest.
+        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code()) } == crate::HOPELESS
+        {
             let fname = unsafe { crate::builtin_code_name(current_code()) };
             let args = current_args();
             let bound = bind_kwargs_to_signature(sig, fname, &args, &[])?;
