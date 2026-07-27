@@ -4635,72 +4635,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
     // Looks up `name` in cls's MRO starting AFTER super_type.
     unsafe {
-        if pyre_object::descriptor::is_super(obj)
-            && !pyre_object::descriptor::w_super_get_obj(obj).is_null()
-            && name != "__class__"
-        {
-            let super_type = pyre_object::descriptor::w_super_get_type(obj);
-            let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
-
-            // Walk obj's type MRO, skip until we pass super_type.
-            // Fall back to `crate::typedef::r#type(obj)` so non-INSTANCE
-            // built-in subclasses (W_BaseException, etc.) resolve their
-            // class through the same path that powers `type(obj)` —
-            // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
-            // descriptor.py:127-149 _super_check: `su_obj` is itself a
-            // subtype of `su_type` only in the classmethod / class-level
-            // case (return `su_obj`).  A class whose metaclass is
-            // `su_type` is an *instance* of `su_type`, not a subtype, so
-            // it must resolve through `type(su_obj)` — otherwise its MRO
-            // never reaches `su_type` and the lookup fails.
-            let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
-                bound_obj
-            } else if is_instance(bound_obj) {
-                w_instance_get_type(bound_obj)
-            } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
-                cls.as_ptr()
-            } else {
-                return Err(PyError::type_error("super: bad obj type"));
-            };
-            let mro_ptr = w_type_get_mro(w_obj_type);
-            if !mro_ptr.is_null() {
-                let mro = &*mro_ptr;
-                let mro_len = mro.len();
-                let mut past_super = false;
-                for i in 0..mro_len {
-                    let t = mro[i];
-                    if std::ptr::eq(t, super_type) {
-                        past_super = true;
-                        continue;
-                    }
-                    if !past_super {
-                        continue;
-                    }
-                    if is_type(t) {
-                        // Look in this class's own dict only (not its MRO),
-                        // since we are already iterating the full MRO ourselves.
-                        let found = crate::type_dict_lookup(t, name);
-                        if let Some(attr) = found {
-                            // W_Super.getattribute binds every descriptor,
-                            // rather than only the three builtin method
-                            // wrapper shapes.  This also covers property,
-                            // getset, member, and user-defined descriptors.
-                            // descriptor.py:76-82 — class-mode
-                            // `super(C, C)` calls `__get__(None, C)`.
-                            let descr_obj = if std::ptr::eq(bound_obj, w_obj_type) {
-                                // `get` represents class access with PY_NULL
-                                // and exposes `space.w_None` only when it
-                                // invokes a user `__get__`. Passing the None
-                                // singleton here would bind plain functions to
-                                // None instead of returning them unbound.
-                                PY_NULL
-                            } else {
-                                bound_obj
-                            };
-                            return Ok(get(attr, descr_obj, w_obj_type)?.unwrap_or(attr));
-                        }
-                    }
-                }
+        if name != "__class__" {
+            if let Some(value) = super_getattribute_wtf8(obj, Wtf8::new(name))? {
+                return Ok(value);
             }
             // `W_Super.getattribute` falls back to
             // `object.__getattribute__` when the post-starttype MRO has no
@@ -5275,6 +5212,77 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     Err(err)
 }
 
+/// super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
+///
+/// Looks `name` up in the bound object's MRO starting AFTER `su_type`, and
+/// returns `None` when `obj` is not a bound super or the walk finds nothing,
+/// so the caller falls through to ordinary attribute lookup.  Taken by WTF-8
+/// so a name carrying a lone surrogate reaches the same walk as any other.
+unsafe fn super_getattribute_wtf8(
+    obj: PyObjectRef,
+    name: &Wtf8,
+) -> Result<Option<PyObjectRef>, PyError> {
+    unsafe {
+        if !pyre_object::descriptor::is_super(obj)
+            || pyre_object::descriptor::w_super_get_obj(obj).is_null()
+        {
+            return Ok(None);
+        }
+        let super_type = pyre_object::descriptor::w_super_get_type(obj);
+        let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
+        // descriptor.py:127-149 _super_check: `su_obj` is itself a subtype of
+        // `su_type` only in the classmethod / class-level case.  A class whose
+        // metaclass is `su_type` is an *instance* of `su_type`, not a subtype,
+        // so it must resolve through `type(su_obj)` — otherwise its MRO never
+        // reaches `su_type` and the lookup fails.  The `type()` fallback also
+        // lets non-INSTANCE builtin subclasses (W_BaseException and friends)
+        // resolve their class through the path that powers `type(obj)`
+        // (`pypy/objspace/std/typeobject.py:1083 type_get_mro`).
+        let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
+            bound_obj
+        } else if is_instance(bound_obj) {
+            w_instance_get_type(bound_obj)
+        } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
+            cls.as_ptr()
+        } else {
+            return Err(PyError::type_error("super: bad obj type"));
+        };
+        let mro_ptr = w_type_get_mro(w_obj_type);
+        if mro_ptr.is_null() {
+            return Ok(None);
+        }
+        let mut past_super = false;
+        for &t in (*mro_ptr).as_slice() {
+            if std::ptr::eq(t, super_type) {
+                past_super = true;
+                continue;
+            }
+            if !past_super || !is_type(t) {
+                continue;
+            }
+            // This class's own dict only — the full MRO is already being
+            // walked here.
+            if let Some(attr) = crate::type_dict_lookup_wtf8(t, name) {
+                // W_Super.getattribute binds every descriptor rather than only
+                // the three builtin method-wrapper shapes, which also covers
+                // property, getset, member and user-defined descriptors.
+                // descriptor.py:76-82 — class-mode `super(C, C)` calls
+                // `__get__(None, C)`.  `get` spells class access as PY_NULL and
+                // exposes the None singleton only when it invokes a user
+                // `__get__`; passing None here would bind plain functions to
+                // None instead of returning them unbound.
+                let descr_obj = if std::ptr::eq(bound_obj, w_obj_type) {
+                    PY_NULL
+                } else {
+                    bound_obj
+                };
+                return Ok(Some(get(attr, descr_obj, w_obj_type)?.unwrap_or(attr)));
+            }
+        }
+        Ok(None)
+    }
+}
+
 // ─── `w_name`-taking attribute API ───
 //
 // `descroperation.py:225/247/255 getattr/setattr/delattr(space, w_obj,
@@ -5332,6 +5340,11 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 /// `getattr_str`'s builtin-type special-cases, all valid identifiers.)
 unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
     unsafe {
+        if name.as_str() != Ok("__class__") {
+            if let Some(value) = super_getattribute_wtf8(obj, name)? {
+                return Ok(value);
+            }
+        }
         match object_getattribute_surrogate(obj, w_name, name) {
             Ok(v) => Ok(v),
             Err(mut e) => {
@@ -8649,7 +8662,7 @@ pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<P
 pub unsafe fn super_lookup_binding(
     super_type: PyObjectRef,
     self_obj: PyObjectRef,
-    name: &str,
+    name: &Wtf8,
 ) -> PyObjectRef {
     use pyre_object::*;
     let w_obj_type = if is_instance(self_obj) {
@@ -8672,7 +8685,7 @@ pub unsafe fn super_lookup_binding(
                 continue;
             }
             if is_type(t) {
-                if let Some(raw) = lookup_in_type_where(t, name) {
+                if let Some(raw) = lookup_in_type_wtf8(t, name) {
                     if is_staticmethod(raw) {
                         return PY_NULL;
                     }
@@ -8681,7 +8694,7 @@ pub unsafe fn super_lookup_binding(
                     }
                     // `__new__` is implicitly static (type.__new__ is a
                     // builtin_function_or_method, not a Python function)
-                    if name == "__new__" {
+                    if name.as_str() == Ok("__new__") {
                         return PY_NULL;
                     }
                     return self_obj;
