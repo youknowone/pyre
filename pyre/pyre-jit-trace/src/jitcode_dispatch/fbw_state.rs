@@ -902,14 +902,26 @@ pub(crate) fn fbw_bump_executed_effect() {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(c.get() + 1));
 }
 
-/// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
+/// gh#467 latch the inline-abort forward-flush carrier (see
+/// [`FBW_ABORT_CALL_RESUME`]).
+///
+/// Declines when a `MidBody` carrier is already latched.  Rebuilding the callee
+/// at its own pc and resuming the caller past its call is what upstream does
+/// (`blackhole.py:1799-1821`, `:1653-1662`); rewinding the caller TO the call
+/// has no upstream counterpart, so it stands in only for a callee the rebuild
+/// could not describe.  Both sites are `is_top_inline` on an aborting sub-walk,
+/// which ends the walk, so at most one of each is latched per walk.
 pub(crate) fn fbw_set_abort_call_resume(
     outer_jitcode_index: u32,
     call_jitcode_pc: usize,
     stack: Vec<pyre_object::PyObjectRef>,
 ) {
     FBW_ABORT_CALL_RESUME.with(|c| {
-        *c.borrow_mut() = Some(InlineAbortCarrier::Entry {
+        let mut slot = c.borrow_mut();
+        if matches!(&*slot, Some(InlineAbortCarrier::MidBody(_))) {
+            return;
+        }
+        *slot = Some(InlineAbortCarrier::Entry {
             outer_jitcode_index,
             call_jitcode_pc,
             call_stack: stack,

@@ -174,8 +174,10 @@ pub(crate) enum WalkEndResume {
     /// The resume pc is AHEAD of what the walk applied — a rebuilt callee
     /// resumed at its own abort pc.  Nothing re-runs; committing is what
     /// *keeps* the applied effects, and rolling back would lose them (the
-    /// discarded trace was their only carrier).  Such a leg's own gate is the
-    /// mirror image of `Rewind`: it latches BECAUSE the odometer moved.
+    /// discarded trace was their only carrier).  Needs no effect gate at all,
+    /// which is why upstream's version of this leg is unconditional
+    /// (`run_blackhole_interp_to_cancel_tracing` ends `assert False`,
+    /// `pyjitpl.py:2956`).
     AfterApplied,
 }
 
@@ -2953,8 +2955,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // This leg resumes INSIDE the rebuilt callee at its
                             // abort pc — ahead of what the callee applied, not
                             // behind it.  Nothing re-runs; committing is what
-                            // keeps those effects, which is why the leg's own
-                            // gate latches BECAUSE the odometer moved.
+                            // keeps those effects.
                             let _ = commit_walk_end(
                                 WalkEndCommitLeg::CalleeRebuild,
                                 WalkEndResume::AfterApplied,
