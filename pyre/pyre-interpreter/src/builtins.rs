@@ -12450,8 +12450,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else {
         String::new()
     };
-    let s = crate::type_methods::format_value_dispatch(value, &spec)?;
-    Ok(pyre_object::w_str_from_wtf8(s))
+    crate::type_methods::format_value_dispatch_w(value, &spec)
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`

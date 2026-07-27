@@ -16831,6 +16831,31 @@ fn empty_bytes_like(recv: PyObjectRef) -> PyObjectRef {
     new_bytes_like(recv, b"")
 }
 
+/// [`new_bytes_like`] for a piece cut out of `recv`'s own storage.
+///
+/// The cut is `self._value[start:stop]`, and `ll_stringslice_startstop`
+/// (rstr.py:867-869) hands the source string back unchanged when it spans the
+/// whole (`start == 0 and stop >= len`); `is_w` (bytesobject.py:34-35) then
+/// reports the piece identical to its operand.  A piece cut from `recv` spans
+/// it whole exactly when their lengths agree.
+///
+/// Immutable exact `bytes` only: `_new` on a `bytearray` must produce a fresh
+/// mutable object, a subclass cuts to a fresh base `bytes`, and `is_w` rejects
+/// a `user_overridden_class` operand (bytesobject.py:30-31).
+///
+/// Restricted to cuts — a transform that preserves the length has no upstream
+/// identity shortcut, so routing one through here would create a divergence.
+fn cut_bytes_like(recv: PyObjectRef, piece: &[u8]) -> PyObjectRef {
+    if piece.len() == unsafe { pyre_object::bytesobject::bytes_like_data(recv) }.len()
+        && unsafe {
+            pyre_object::pyobject::is_exact_type(recv, &pyre_object::bytesobject::BYTES_TYPE)
+        }
+    {
+        return recv;
+    }
+    new_bytes_like(recv, piece)
+}
+
 fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "upper")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
@@ -16885,7 +16910,7 @@ fn bytes_strip(
             hi -= 1;
         }
     }
-    Ok(new_bytes_like(args[0], &data[lo..hi]))
+    Ok(cut_bytes_like(args[0], &data[lo..hi]))
 }
 
 fn bytes_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -16976,7 +17001,10 @@ fn type_name_of(obj: PyObjectRef) -> String {
 /// Non-overlapping left-to-right byte replacement, capped at `limit`.
 /// An empty `old` inserts `new` before every byte and at the end, per
 /// CPython `bytes.replace(b"", ...)`.
-fn replace_bytes(data: &[u8], old: &[u8], new: &[u8], limit: usize) -> Vec<u8> {
+///
+/// Returns the `(res, replacements)` pair `replace_count` (rstring.py:220-309)
+/// does: `descr_replace` keys its identity shortcut on the count.
+fn replace_bytes(data: &[u8], old: &[u8], new: &[u8], limit: usize) -> (Vec<u8>, usize) {
     let mut out = Vec::with_capacity(data.len());
     let mut count = 0;
     if old.is_empty() {
@@ -16989,8 +17017,9 @@ fn replace_bytes(data: &[u8], old: &[u8], new: &[u8], limit: usize) -> Vec<u8> {
         }
         if count < limit {
             out.extend_from_slice(new);
+            count += 1;
         }
-        return out;
+        return (out, count);
     }
     let mut i = 0;
     while i < data.len() {
@@ -17003,7 +17032,7 @@ fn replace_bytes(data: &[u8], old: &[u8], new: &[u8], limit: usize) -> Vec<u8> {
             i += 1;
         }
     }
-    out
+    (out, count)
 }
 
 const BYTES_WHITESPACE: [u8; 6] = [0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20];
@@ -17162,7 +17191,7 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
             }
         }
     };
-    let items: Vec<PyObjectRef> = parts.iter().map(|p| new_bytes_like(pos[0], p)).collect();
+    let items: Vec<PyObjectRef> = parts.iter().map(|p| cut_bytes_like(pos[0], p)).collect();
     Ok(pyre_object::w_list_new(items))
 }
 
@@ -17202,10 +17231,20 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         _ => usize::MAX,
     };
-    Ok(new_bytes_like(
-        pos[0],
-        &replace_bytes(data, old, new, limit),
-    ))
+    let (out, replacements) = replace_bytes(data, old, new, limit);
+    // `descr_replace` returns `self` when nothing was replaced
+    // (unicodeobject.py:1175-1176 for the str twin) — keyed on the count, so
+    // `b.replace(b'a', b'a')` still builds a new object.  Exact `bytes` only:
+    // a `bytearray` must stay a fresh mutable object, and `is_w` rejects a
+    // `user_overridden_class` operand (bytesobject.py:30-31).
+    if replacements == 0
+        && unsafe {
+            pyre_object::pyobject::is_exact_type(pos[0], &pyre_object::bytesobject::BYTES_TYPE)
+        }
+    {
+        return Ok(pos[0]);
+    }
+    Ok(new_bytes_like(pos[0], &out))
 }
 
 /// `stringmethods.py:descr_join` — concatenate the bytes-like elements
@@ -17297,9 +17336,10 @@ fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, c
             ]))
         }
         None => {
-            // A bytearray receiver must not alias into the result tuple
-            // (mutating it would mutate the tuple); hand back a fresh copy.
-            let whole = new_bytes_like(args[0], data);
+            // `cut_bytes_like` keeps a bytearray receiver out of the result
+            // tuple (mutating it would mutate the tuple) and hands an
+            // immutable exact `bytes` back unchanged.
+            let whole = cut_bytes_like(args[0], data);
             let empty = || empty_bytes_like(args[0]);
             if forward {
                 Ok(pyre_object::w_tuple_new(vec![whole, empty(), empty()]))
@@ -17599,7 +17639,7 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     } else {
         data
     };
-    Ok(new_bytes_like(args[0], out))
+    Ok(cut_bytes_like(args[0], out))
 }
 
 /// `bytes.removesuffix` — drop a trailing bytes-like suffix if present.
@@ -17620,7 +17660,7 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     } else {
         data
     };
-    Ok(new_bytes_like(args[0], out))
+    Ok(cut_bytes_like(args[0], out))
 }
 
 /// `bytesobject.py:descr_translate` — map each byte through a 256-entry
@@ -17719,7 +17759,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            parts.push(new_bytes_like(args[0], &data[start..end]));
+            parts.push(cut_bytes_like(args[0], &data[start..end]));
             start = term_end;
             i = term_end;
         } else {
@@ -17727,7 +17767,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         }
     }
     if start < data.len() {
-        parts.push(new_bytes_like(args[0], &data[start..]));
+        parts.push(cut_bytes_like(args[0], &data[start..]));
     }
     Ok(pyre_object::w_list_new(parts))
 }

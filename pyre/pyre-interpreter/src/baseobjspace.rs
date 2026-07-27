@@ -1643,6 +1643,21 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         )?;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len as i64);
+        // `_unicode_sliced` (unicodeobject.py:1043-1050) cuts the utf8
+        // storage, and `ll_stringslice_startstop` (rstr.py:867-869) hands the
+        // source string back unchanged for `start == 0 and stop >= len` — so a
+        // whole-string slice shares its operand's storage and `is_w`
+        // (unicodeobject.py:110-111) reports the two identical.  Only for an
+        // exact `str`: a subclass slices to a fresh base `str`, and `is_w`
+        // rejects a `user_overridden_class` operand anyway
+        // (unicodeobject.py:106).
+        if step == 1
+            && start == 0
+            && slicelength == len as i64
+            && pyre_object::pyobject::is_exact_type(obj, &pyre_object::pyobject::STR_TYPE)
+        {
+            return Ok(obj);
+        }
         let mut result = Wtf8Buf::new();
         let mut i = start;
         for n in 0..slicelength {
@@ -1705,6 +1720,21 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if is_slice(index) {
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, stop, step) = normalize_slice(index, len)?;
+        // `_new(self._value[start:stop])` (stringmethods.py descr_getslice)
+        // runs through `ll_stringslice_startstop` (rstr.py:867-869), which
+        // hands the source string back unchanged for `start == 0 and
+        // stop >= len`; `is_w` (bytesobject.py:34-35) then reports the whole
+        // slice identical to its operand.  Immutable exact `bytes` only — a
+        // `bytearray` gets a fresh object from `_new` because it is mutable,
+        // and a subclass keeps pointer identity through `is_w`.
+        if step == 1
+            && start == 0
+            && stop >= len
+            && is_bytes
+            && pyre_object::pyobject::is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
+        {
+            return Ok(obj);
+        }
         let mut result = Vec::new();
         let mut i = start;
         if step > 0 {

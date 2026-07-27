@@ -776,13 +776,16 @@ fn resolve_split_args(
     Ok((sep, maxsplit))
 }
 
-/// Box a code-point slice into a str object.
-fn cps_to_str(cps: &[CodePoint]) -> PyObjectRef {
+/// Box a run of `recv`'s own code points into a str object, so a run covering
+/// all of them yields `recv` itself — see [`pyre_object::w_str_cut`].  The runs
+/// a splitter emits are disjoint pieces of the receiver, so an equal WTF-8 byte
+/// count means this one spans the whole string.
+fn cps_to_str_cut(recv: PyObjectRef, cps: &[CodePoint]) -> PyObjectRef {
     let mut buf = Wtf8Buf::with_capacity(cps.len());
     for &cp in cps {
         buf.push(cp);
     }
-    w_str_from_wtf8_managed(buf)
+    unsafe { pyre_object::w_str_cut(recv, &buf) }
 }
 
 /// A lone surrogate is not whitespace.
@@ -796,7 +799,7 @@ fn cp_is_whitespace(cp: CodePoint) -> bool {
 /// `str.split()` with no separator: split on runs of whitespace,
 /// dropping leading/trailing runs.  When `maxsplit >= 0`, after that
 /// many splits the rest (leading whitespace stripped) is one tail token.
-fn wtf8_split_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
+fn wtf8_split_whitespace(recv: PyObjectRef, s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
     let cps: Vec<CodePoint> = s.code_points().collect();
     let mut out: Vec<PyObjectRef> = Vec::new();
     let mut i = 0usize;
@@ -814,20 +817,20 @@ fn wtf8_split_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
         while i < cps.len() && !cp_is_whitespace(cps[i]) {
             i += 1;
         }
-        out.push(cps_to_str(&cps[start..i]));
+        out.push(cps_to_str_cut(recv, &cps[start..i]));
     }
     while i < cps.len() && cp_is_whitespace(cps[i]) {
         i += 1;
     }
     if i < cps.len() {
-        out.push(cps_to_str(&cps[i..]));
+        out.push(cps_to_str_cut(recv, &cps[i..]));
     }
     out
 }
 
 /// `str.rsplit()` with no separator: like `wtf8_split_whitespace` but
 /// scanning from the right, so the tail token is the leading remainder.
-fn wtf8_rsplit_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
+fn wtf8_rsplit_whitespace(recv: PyObjectRef, s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
     let cps: Vec<CodePoint> = s.code_points().collect();
     let mut tokens: Vec<PyObjectRef> = Vec::new();
     let mut i = cps.len();
@@ -845,7 +848,7 @@ fn wtf8_rsplit_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
         while i > 0 && !cp_is_whitespace(cps[i - 1]) {
             i -= 1;
         }
-        tokens.push(cps_to_str(&cps[i..end]));
+        tokens.push(cps_to_str_cut(recv, &cps[i..end]));
     }
     tokens.reverse();
     let mut prefix_end = i;
@@ -853,7 +856,7 @@ fn wtf8_rsplit_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
         prefix_end -= 1;
     }
     if prefix_end > 0 {
-        let mut out = vec![cps_to_str(&cps[..prefix_end])];
+        let mut out = vec![cps_to_str_cut(recv, &cps[..prefix_end])];
         out.extend(tokens);
         out
     } else {
@@ -877,17 +880,20 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             if sep.as_bytes().is_empty() {
                 return Err(crate::PyError::value_error("empty separator"));
             }
+            // Each piece is a `value[start:end]` cut (rstring.py:52-140
+            // `split`), so a separator-free receiver yields itself back — see
+            // [`pyre_object::w_str_cut`].
             if maxsplit < 0 {
                 s.split(sep)
-                    .map(|p| w_str_from_wtf8_managed(p.to_wtf8_buf()))
+                    .map(|p| unsafe { pyre_object::w_str_cut(args[0], p) })
                     .collect()
             } else {
                 s.splitn((maxsplit as usize) + 1, sep)
-                    .map(|p| w_str_from_wtf8_managed(p.to_wtf8_buf()))
+                    .map(|p| unsafe { pyre_object::w_str_cut(args[0], p) })
                     .collect()
             }
         }
-        None => wtf8_split_whitespace(s, maxsplit),
+        None => wtf8_split_whitespace(args[0], s, maxsplit),
     };
     Ok(w_list_new(parts))
 }
@@ -953,10 +959,10 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             };
             out.reverse();
             out.into_iter()
-                .map(|p| w_str_from_wtf8_managed(p.to_wtf8_buf()))
+                .map(|p| unsafe { pyre_object::w_str_cut(args[0], p) })
                 .collect()
         }
-        None => wtf8_rsplit_whitespace(s, maxsplit),
+        None => wtf8_rsplit_whitespace(args[0], s, maxsplit),
     };
     Ok(w_list_new(parts))
 }
@@ -1010,7 +1016,13 @@ pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// the same Unicode whitespace predicate as `str.isspace()`.  When provided, removes
 /// any character contained in `chars` from each end (NOT a substring
 /// match — `'aabaa'.strip('a') == 'b'`).
-fn strip_chars(s: &Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> Wtf8Buf {
+///
+/// Returns the cut itself, not a copy: both `_strip` arms cut
+/// `value[lpos:rpos]` out of the utf8 storage (`_utf8_sliced`,
+/// unicodeobject.py:1456; `_strip_unboxed`, unicodeobject.py:1480), so a strip
+/// that removes nothing shares its operand's storage — see
+/// [`pyre_object::w_str_cut`].
+fn strip_chars<'a>(s: &'a Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> &'a Wtf8 {
     let chars_set: Option<Vec<CodePoint>> = chars.map(|c| c.code_points().collect());
     let mut current: &Wtf8 = s;
     if left {
@@ -1025,7 +1037,7 @@ fn strip_chars(s: &Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> Wtf8B
             None => current.trim_end_matches(cp_is_whitespace),
         };
     }
-    current.to_wtf8_buf()
+    current
 }
 
 /// `pypy/objspace/std/unicodeobject.py:1464-1473 W_UnicodeObject
@@ -1053,12 +1065,7 @@ pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         Some(&a) => extract_strip_chars(a, "strip")?,
         None => None,
     };
-    Ok(w_str_from_wtf8_managed(strip_chars(
-        s,
-        chars.as_deref(),
-        true,
-        true,
-    )))
+    Ok(unsafe { pyre_object::w_str_cut(args[0], strip_chars(s, chars.as_deref(), true, true)) })
 }
 
 pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1068,12 +1075,7 @@ pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         Some(&a) => extract_strip_chars(a, "lstrip")?,
         None => None,
     };
-    Ok(w_str_from_wtf8_managed(strip_chars(
-        s,
-        chars.as_deref(),
-        true,
-        false,
-    )))
+    Ok(unsafe { pyre_object::w_str_cut(args[0], strip_chars(s, chars.as_deref(), true, false)) })
 }
 
 pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1083,12 +1085,7 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         Some(&a) => extract_strip_chars(a, "rstrip")?,
         None => None,
     };
-    Ok(w_str_from_wtf8_managed(strip_chars(
-        s,
-        chars.as_deref(),
-        false,
-        true,
-    )))
+    Ok(unsafe { pyre_object::w_str_cut(args[0], strip_chars(s, chars.as_deref(), false, true)) })
 }
 
 /// `unicodeobject.py descr_startswith` — accepts either a single str
@@ -1280,7 +1277,16 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         Some(w_count) => crate::builtins::space_index_w(w_count)?,
         None => -1,
     };
-    Ok(w_str_from_wtf8_managed(wtf8_replace(s, old, new, maxcount)))
+    let (out, replacements) = wtf8_replace(s, old, new, maxcount);
+    // `descr_replace` (unicodeobject.py:1175-1176) returns `self` when nothing
+    // was replaced — keyed on the count, so `s.replace('a', 'a')` still builds
+    // a new string.  Exact `str` only: a subclass yields a fresh base `str`,
+    // and `is_w` rejects a `user_overridden_class` operand
+    // (unicodeobject.py:106).
+    if replacements == 0 && unsafe { pyre_object::is_exact_type(pos[0], &pyre_object::STR_TYPE) } {
+        return Ok(pos[0]);
+    }
+    Ok(w_str_from_wtf8_managed(out))
 }
 
 /// WTF-8 window for the optional `start` / `end` search args: resolve them
@@ -2347,6 +2353,29 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, cr
     }
 }
 
+/// `PyObject_Format` returning the formatted object rather than its bytes.
+///
+/// `format_string` (newformat.py:602-608) hands the receiver's own utf8
+/// storage to `self.wrap(...)` once `_parse_spec("s", "<")` reports the
+/// defaults — which only an empty spec does — so `format(s, "")` shares its
+/// operand's storage and `is_w` (unicodeobject.py:110-111) reports the result
+/// identical to `s`.  An exact `str` is the whole of that case: a subclass is
+/// converted by `space.str(w_string)` (newformat.py:604) to a fresh base
+/// `str` first, and `is_w` rejects a `user_overridden_class` operand anyway
+/// (unicodeobject.py:106).  Any other receiver, or any non-empty spec, builds
+/// a new string through [`format_value_dispatch`].
+pub fn format_value_dispatch_w(
+    val: PyObjectRef,
+    spec: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    if spec.is_empty() && unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
+        return Ok(val);
+    }
+    Ok(pyre_object::w_str_from_wtf8_managed(format_value_dispatch(
+        val, spec,
+    )?))
+}
+
 /// The type name of `obj` for a TypeError message — the `w_class` name
 /// for instances, else the storage type name.
 pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
@@ -2390,6 +2419,12 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         String::new()
     };
     if spec.is_empty() {
+        // `format_string` (newformat.py:602-608) wraps the receiver's own utf8
+        // storage when the spec parses to the defaults, so an exact `str`
+        // comes back identical (see [`format_value_dispatch_w`]).
+        if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) } {
+            return Ok(args[0]);
+        }
         // `str(self)` — a str self passes through as WTF-8. Dynamic result:
         // collectable.
         if unsafe { pyre_object::is_str(args[0]) } {
@@ -5025,15 +5060,20 @@ fn wtf8_slice_str(bytes: &[u8]) -> PyObjectRef {
 /// WTF-8 bytes (rstring.py:220-309 `replace_count` isutf8 path). A
 /// negative `maxcount` means no limit; an empty `sub` inserts `by` at
 /// every code-point boundary, including the ends.
-fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
+///
+/// Returns the `(res, replacements)` pair `replace_count` does — `descr_replace`
+/// (unicodeobject.py:1175-1176) keys its identity shortcut on the count, not on
+/// the resulting bytes.
+fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> (Wtf8Buf, usize) {
     if maxcount == 0 {
-        return input.to_wtf8_buf();
+        return (input.to_wtf8_buf(), 0);
     }
     let inp = input.as_bytes();
     let sub_b = sub.as_bytes();
     let mut out = Wtf8Buf::new();
     let mut start = 0usize;
     let mut maxcount = maxcount;
+    let mut replacements = 0usize;
     if sub_b.is_empty() {
         let mut indices = input.code_point_indices().map(|(i, _)| i);
         // Skip the leading boundary at 0; it is handled by the first
@@ -5042,6 +5082,7 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
         loop {
             out.push_wtf8(by);
             maxcount -= 1;
+            replacements += 1;
             if start == inp.len() || maxcount == 0 {
                 break;
             }
@@ -5057,13 +5098,14 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
                     out.push_wtf8(by);
                     start = next + sub_b.len();
                     maxcount -= 1;
+                    replacements += 1;
                 }
                 None => break,
             }
         }
     }
     out.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&inp[start..]) });
-    out
+    (out, replacements)
 }
 
 /// PyPy: unicodeobject.py descr_partition
@@ -5172,7 +5214,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            parts.push(cps_to_str(&cps[start..end]));
+            parts.push(cps_to_str_cut(pos[0], &cps[start..end]));
             start = term_end;
             i = term_end;
         } else {
@@ -5180,7 +5222,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         }
     }
     if start < cps.len() {
-        parts.push(cps_to_str(&cps[start..]));
+        parts.push(cps_to_str_cut(pos[0], &cps[start..]));
     }
     Ok(w_list_new(parts))
 }

@@ -629,6 +629,12 @@ pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
 /// `__str__` / `__repr__` may run Python → fallible.
 pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
     if conv == 0 || conv == 3 {
+        // `descr_str` (unicodeobject.py:333-337) returns `self` for an exact
+        // `str` and converts anything else — a subclass included — to a fresh
+        // base `str`.
+        if unsafe { pyre_object::is_exact_type(value, &pyre_object::STR_TYPE) } {
+            return Ok(value);
+        }
         let w = unsafe { crate::py_str_wtf8(value)? };
         return Ok(pyre_object::w_str_from_wtf8_managed(w));
     }
@@ -657,8 +663,7 @@ pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef
             String::new()
         }
     };
-    let s = crate::type_methods::format_value_dispatch(value, &spec_str)?;
-    Ok(pyre_object::w_str_from_wtf8_managed(s))
+    crate::type_methods::format_value_dispatch_w(value, &spec_str)
 }
 
 /// STORE_SLICE evaluation (`obj[start:stop] = value`): builds a `slice`
