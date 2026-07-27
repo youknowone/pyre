@@ -1670,6 +1670,201 @@ fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
+/// CPython 3.14 `ExceptHookArgs_desc`: the immutable, non-baseable
+/// `_thread._ExceptHookArgs` struct sequence passed to
+/// `threading.excepthook`.  The storage and descriptors come from pyre's
+/// line-by-line port of PyPy `lib_pypy/_structseq.py`.
+fn except_hook_args_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let ty = crate::_structseq::make_struct_seq(
+            "_thread._ExceptHookArgs",
+            &["exc_type", "exc_value", "exc_traceback", "thread"],
+        );
+        let ty_slot = pin_root_slot(ty);
+        unsafe {
+            let ty = pyre_object::gc_roots::shadow_stack_get(ty_slot);
+            pyre_object::w_type_set_acceptable_as_base_class(ty, false);
+            let doc =
+                w_str_new("ExceptHookArgs\n\nType used to pass arguments to threading.excepthook.");
+            let doc_slot = pin_root_slot(doc);
+            let ty = pyre_object::gc_roots::shadow_stack_get(ty_slot);
+            let ns = pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef;
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__doc__",
+                pyre_object::gc_roots::shadow_stack_get(doc_slot),
+            );
+        }
+        pyre_object::gc_roots::shadow_stack_get(ty_slot) as usize
+    }) as PyObjectRef
+}
+
+#[inline]
+fn pin_root_slot(value: PyObjectRef) -> usize {
+    pyre_object::gc_roots::pin_root(value);
+    pyre_object::gc_roots::shadow_stack_len() - 1
+}
+
+fn call_method_result(
+    obj: PyObjectRef,
+    name: &str,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let result = crate::baseobjspace::call_method(obj, name, args);
+    if result.is_null() {
+        Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error(format!("{name} failed"))))
+    } else {
+        Ok(result)
+    }
+}
+
+/// `thread_excepthook_file`: write one string to the live file root.
+fn thread_excepthook_write(file_slot: usize, text: PyObjectRef) -> Result<(), crate::PyError> {
+    let text_slot = pin_root_slot(text);
+    call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(file_slot),
+        "write",
+        &[pyre_object::gc_roots::shadow_stack_get(text_slot)],
+    )?;
+    Ok(())
+}
+
+/// CPython 3.14 `thread_excepthook_file`.
+fn thread_excepthook_file(
+    file: PyObjectRef,
+    exc_value: PyObjectRef,
+    exc_traceback: PyObjectRef,
+    thread: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let file_slot = pin_root_slot(file);
+    let exc_value_slot = pin_root_slot(exc_value);
+    let exc_traceback_slot = pin_root_slot(exc_traceback);
+    let thread_slot = pin_root_slot(thread);
+
+    // `PyFile_WriteString("Exception in thread ", file)`.
+    thread_excepthook_write(file_slot, w_str_new("Exception in thread "))?;
+
+    // `PyObject_GetOptionalAttr(thread, "name")`; a missing name falls back
+    // to the native thread identifier, while a raising descriptor propagates.
+    let thread = pyre_object::gc_roots::shadow_stack_get(thread_slot);
+    let name = if !unsafe { is_none(thread) } {
+        crate::baseobjspace::findattr_result(thread, "name")?
+    } else {
+        None
+    };
+    if let Some(name) = name {
+        let name_slot = pin_root_slot(name);
+        let rendered = unsafe {
+            crate::display::py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(name_slot))?
+        };
+        thread_excepthook_write(file_slot, w_str_from_wtf8(rendered))?;
+    } else {
+        thread_excepthook_write(file_slot, w_str_new(&current_ident().to_string()))?;
+    }
+    thread_excepthook_write(file_slot, w_str_new(":\n"))?;
+
+    // `_PyErr_Display(file, exc_type, exc_value, exc_traceback)`.  The
+    // renderer consumes the explicit traceback field and never rewrites the
+    // exception object's own `__traceback__`.
+    let mut rendered = Vec::new();
+    crate::error::write_exception_from_parts(
+        &mut rendered,
+        pyre_object::gc_roots::shadow_stack_get(exc_value_slot),
+        pyre_object::gc_roots::shadow_stack_get(exc_traceback_slot),
+    )
+    .map_err(|err| crate::PyError::runtime_error(format!("failed to display exception: {err}")))?;
+    let rendered = String::from_utf8(rendered).map_err(|err| {
+        crate::PyError::new(crate::PyErrorKind::UnicodeEncodeError, err.to_string())
+    })?;
+    thread_excepthook_write(file_slot, w_str_new(&rendered))?;
+
+    // `_PyFile_Flush(file)`.
+    call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(file_slot),
+        "flush",
+        &[],
+    )?;
+    Ok(())
+}
+
+/// CPython 3.14 `thread_excepthook`.
+fn thread_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let hook_args = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("_excepthook() missing argument"))?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let hook_args_slot = pin_root_slot(hook_args);
+    let hook_args = pyre_object::gc_roots::shadow_stack_get(hook_args_slot);
+    let actual_type = crate::typedef::r#type(hook_args)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or(PY_NULL);
+    if !std::ptr::eq(actual_type, except_hook_args_type()) {
+        return Err(crate::PyError::type_error(
+            "_thread.excepthook argument type must be ExceptHookArgs",
+        ));
+    }
+
+    let exc_type = unsafe {
+        w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hook_args_slot), 0)
+            .expect("ExceptHookArgs has four sequence fields")
+    };
+    let exc_type_slot = pin_root_slot(exc_type);
+    if crate::builtins::lookup_exc_class("SystemExit").is_some_and(|system_exit| {
+        crate::baseobjspace::is_w(
+            pyre_object::gc_roots::shadow_stack_get(exc_type_slot),
+            system_exit,
+        )
+    }) {
+        return Ok(w_none());
+    }
+
+    let exc_value = unsafe {
+        w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hook_args_slot), 1)
+            .expect("ExceptHookArgs has four sequence fields")
+    };
+    let exc_traceback = unsafe {
+        w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hook_args_slot), 2)
+            .expect("ExceptHookArgs has four sequence fields")
+    };
+    let thread = unsafe {
+        w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hook_args_slot), 3)
+            .expect("ExceptHookArgs has four sequence fields")
+    };
+    let exc_value_slot = pin_root_slot(exc_value);
+    let exc_traceback_slot = pin_root_slot(exc_traceback);
+    let thread_slot = pin_root_slot(thread);
+
+    // `_PySys_GetOptionalAttr("stderr")`; when it is absent/None, use the
+    // Thread object's saved `_stderr`, unless both the stream and thread are
+    // None.
+    let sys = crate::importing::get_sys_module("sys")
+        .ok_or_else(|| crate::PyError::runtime_error("sys module is unavailable"))?;
+    let mut file = crate::baseobjspace::findattr_result(sys, "stderr")?.unwrap_or(PY_NULL);
+    if file.is_null() || unsafe { is_none(file) } {
+        let thread = pyre_object::gc_roots::shadow_stack_get(thread_slot);
+        if unsafe { is_none(thread) } {
+            return Ok(w_none());
+        }
+        file = crate::baseobjspace::getattr_str(thread, "_stderr")?;
+        if unsafe { is_none(file) } {
+            return Ok(w_none());
+        }
+    }
+    let file_slot = pin_root_slot(file);
+    thread_excepthook_file(
+        pyre_object::gc_roots::shadow_stack_get(file_slot),
+        pyre_object::gc_roots::shadow_stack_get(exc_value_slot),
+        pyre_object::gc_roots::shadow_stack_get(exc_traceback_slot),
+        pyre_object::gc_roots::shadow_stack_get(thread_slot),
+    )?;
+    Ok(w_none())
+}
+
 crate::py_module! {
     "_thread",
     interpleveldefs: {
@@ -1681,6 +1876,7 @@ crate::py_module! {
         "RLock"         => rlock_class::type_object(),
         "_ThreadHandle" => handle_class::type_object(),
         "_local"        => local_type(),
+        "_ExceptHookArgs" => except_hook_args_type(),
         "TIMEOUT_MAX"   => w_float_new(TIMEOUT_MAX),
         "error"         => crate::builtins::lookup_exc_class("RuntimeError")
                                .unwrap_or_else(crate::typedef::w_object),
@@ -1699,7 +1895,7 @@ crate::py_module! {
         "stack_size"             / * = stack_size,
         "interrupt_main"         / * = interrupt_main,
         "set_name"               / 1 = |_| Ok(w_none()),
-        "_excepthook"            / 1 = |_| Ok(w_none()),
+        "_excepthook"            / 1 = thread_excepthook,
         "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(current_ident())),
         "start_joinable_thread"  / * = start_joinable_thread,
         "start_new_thread"       / * = start_new_thread,

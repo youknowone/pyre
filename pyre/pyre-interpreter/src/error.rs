@@ -1468,6 +1468,46 @@ pub fn write_exception<W: Write>(
     }
 }
 
+/// CPython `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used by
+/// `_thread._excepthook`.
+///
+/// The exception hook receives the traceback as a separate structseq field;
+/// it must display that live value rather than reading (or mutating)
+/// `exc_value.__traceback__`.  PyPy's `OperationError.print_application_traceback`
+/// likewise carries its traceback independently from the wrapped value.
+pub fn write_exception_from_parts<W: Write>(
+    writer: &mut W,
+    exc_value: PyObjectRef,
+    exc_tb: PyObjectRef,
+) -> std::io::Result<()> {
+    if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
+        if !exc_value.is_null() && unsafe { pyre_object::is_none(exc_value) } {
+            return writeln!(writer, "NoneType: None");
+        }
+        let value_type = crate::typedef::r#type(exc_value)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()).to_string() })
+            .unwrap_or_else(|| "NULL".to_string());
+        return writeln!(
+            writer,
+            "TypeError: print_exception(): Exception expected for value, {value_type} found"
+        );
+    }
+
+    // `PyErr_DisplayException`: older explicit cause/context entries precede
+    // the current value, while the current traceback comes from the argument
+    // supplied by ExceptHookArgs.
+    write_chained_context(writer, exc_value)?;
+    if !exc_tb.is_null()
+        && !unsafe { pyre_object::is_none(exc_tb) }
+        && unsafe { crate::pytraceback::is_pytraceback(exc_tb) }
+    {
+        writeln!(writer, "Traceback (most recent call last):")?;
+        write_traceback_chain_from_tb(writer, exc_tb)?;
+    }
+    writeln!(writer, "{}", render_exc_object(exc_value))?;
+    write_exception_notes(writer, exc_value)
+}
+
 /// Render an uncaught compile-time SyntaxError as the top-level banner
 /// (`print_error_text`): the `File "…", line N` header, the offending
 /// source line, a caret under the offending column span, and
@@ -1672,7 +1712,14 @@ fn write_traceback_chain_from_exc<W: Write>(
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());
     }
-    let mut tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    write_traceback_chain_from_tb(writer, tb)
+}
+
+fn write_traceback_chain_from_tb<W: Write>(
+    writer: &mut W,
+    mut tb: PyObjectRef,
+) -> std::io::Result<()> {
     while !tb.is_null() {
         if !unsafe { crate::pytraceback::is_pytraceback(tb) } {
             break;
