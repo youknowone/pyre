@@ -2415,7 +2415,7 @@ pub fn blackhole_resume_via_rd_numb(
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
                 //   e = cast_opaque_ptr(GCREF, e)
                 //   raise ExitFrameWithExceptionRef(e)
-                let mut err = if exc_value != 0 {
+                let err = if exc_value != 0 {
                     unsafe {
                         pyre_interpreter::PyError::from_exc_object(
                             exc_value as pyre_object::PyObjectRef,
@@ -2427,9 +2427,16 @@ pub fn blackhole_resume_via_rd_numb(
                         "blackhole exception (null exc_value)",
                     )
                 };
-                if bare_reraise {
-                    err.attach_tb = false;
-                }
+                // `attach_tb` deliberately stays true on the way out.  It
+                // suppresses the traceback record of the re-raising frame
+                // only, and this frame's decision was already applied above by
+                // skipping its own record; `handle_exception` clears the flag
+                // for that same reason once a frame is done with it.  Clearing
+                // it here hands the suppression one frame further instead: the
+                // compiled frame never runs `handle_exception` itself, so the
+                // interpreter caller is the first frame to read the flag and
+                // would drop its own node.
+                //
                 // A residual helper can publish a raise to both exception
                 // channels.  Blackhole propagation has consumed its own
                 // channel into `ExitFrameWithExceptionRef`; keep the backend
