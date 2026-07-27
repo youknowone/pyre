@@ -1371,6 +1371,12 @@ pub fn install_jit_call_bridge() {
             majit_ir::value::default_str_eq,
             majit_ir::value::default_unicode_hash,
         );
+        // Same frontend-owns-its-object-model split for the `w_class`
+        // header identity `OptVirtualize` folds `new_with_vtable` reads
+        // to: `SimpleSizeDescr` carries pyre's `ob_type` in its `vtable`
+        // slot but knows nothing about `PyType`, so pyre registers the
+        // `get_instantiate` decoder here.
+        majit_ir::descr::set_w_class_obj_resolver(pyre_jit_trace::descr::w_class_obj_for_vtable);
         register_jit_function_caller(jit_call_user_function_from_frame);
         register_jit_exc_raiser(jit_exc_raise_shim);
         // compile.py:1090 `memory_error = MemoryError()` parity — give
