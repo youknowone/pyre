@@ -99,6 +99,11 @@ class BrokenStrError(Exception):
         raise RuntimeError("str failed")
 
 
+class SurrogateStrError(Exception):
+    def __str__(self):
+        return "bad\ud800value"
+
+
 def capture_error(exc):
     try:
         raise exc
@@ -145,6 +150,24 @@ assert "[Errno 2] missing: 'file.txt'" in hook_output(
 assert hook_output(BrokenStrError("raw")).endswith(
     "BrokenStrError: <exception str() failed>\n"
 )
+assert hook_output(SurrogateStrError()).endswith(
+    "SurrogateStrError: bad\ud800value\n"
+)
+
+# CPython's invalid-value printer intentionally retains its historical
+# `NoneType: None` special case while other non-exceptions use the diagnostic.
+assert hook_output(None).endswith("NoneType: None\n")
+assert hook_output(42).endswith(
+    "TypeError: print_exception(): Exception expected for value, int found\n"
+)
+
+located_syntax_error = SyntaxError(
+    "bad syntax", ("thread_syntax.py", 3, 4, "abc\n", 3, 5)
+)
+syntax_output = hook_output(located_syntax_error)
+assert 'File "thread_syntax.py", line 3\n' in syntax_output
+assert "SyntaxError: bad syntax\n" in syntax_output
+assert "(thread_syntax.py, line 3)" not in syntax_output
 
 
 class BrokenThreadName:
@@ -195,6 +218,43 @@ finally:
     sys.modules["sys"] = original_sys_entry
 assert "ValueError: real stderr\n" in "".join(real_sink.parts)
 assert wrong_sink.parts == []
+
+
+class FakeThread:
+    def __init__(self, name, stderr):
+        self.name = name
+        self._stderr = stderr
+
+
+named_thread = FakeThread("worker-1", Sink())
+assert hook_output(ValueError("named"), thread=named_thread).startswith(
+    "Exception in thread worker-1:\n"
+)
+
+# Exercise the saved `_stderr` fallback.  CPython 3.14's stdlib traceback
+# fast path writes the exception body through `sys.__stderr__`, while its
+# C fallback (and pyre) writes it to the explicit file; the named banner and
+# flush prove that `_thread` selected the thread-owned stream in both cases.
+fallback_sink = Sink()
+backup_sink = Sink()
+fallback_thread = FakeThread("worker-fallback", fallback_sink)
+old_stderr = sys.stderr
+old_dunder_stderr = sys.__stderr__
+try:
+    sys.stderr = None
+    sys.__stderr__ = backup_sink
+    _thread._excepthook(
+        ExceptHookArgs(
+            [ValueError, ValueError("fallback"), None, fallback_thread]
+        )
+    )
+finally:
+    sys.stderr = old_stderr
+    sys.__stderr__ = old_dunder_stderr
+assert "".join(fallback_sink.parts).startswith(
+    "Exception in thread worker-fallback:\n"
+)
+assert fallback_sink.flushed
 
 import threading
 

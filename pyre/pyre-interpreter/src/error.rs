@@ -2,6 +2,7 @@ use pyre_object::PyObjectRef;
 use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
 use ruff_text_size::Ranged;
 use rustpython_compiler::{ast, parser};
+use rustpython_wtf8::Wtf8Buf;
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -1523,7 +1524,15 @@ pub fn write_exception_from_parts<W: Write>(
         write_traceback_chain_from_tb(writer, current_tb)?;
     }
     let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
-    writeln!(writer, "{}", render_exc_object(exc_value))?;
+    if unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_value) }
+        == ExcKind::SyntaxError
+    {
+        write_syntax_error_object(writer, exc_value)?;
+    } else {
+        let rendered = render_exc_object_wtf8(exc_value);
+        writer.write_all(rendered.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
     write_exception_notes(
         writer,
         pyre_object::gc_roots::shadow_stack_get(exc_value_slot),
@@ -1543,6 +1552,10 @@ pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::R
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return writeln!(writer, "{}", err.render_exception());
     }
+    write_syntax_error_object(writer, exc)
+}
+
+fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
     let attr = |name: &str| crate::baseobjspace::syntax_error_attr(exc, name);
     let str_of = |w: PyObjectRef| -> Option<String> {
         (!w.is_null() && unsafe { pyre_object::is_str(w) })
@@ -1575,8 +1588,7 @@ pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::R
             writeln!(writer, "{caret}")?;
         }
     }
-    let name =
-        exc_object_class_name(exc).unwrap_or_else(|| exc_kind_name(err.to_exc_kind()).to_string());
+    let name = exc_object_class_name(exc).unwrap_or_else(|| "SyntaxError".to_string());
     match str_of(attr("msg")) {
         Some(msg) if !msg.is_empty() => writeln!(writer, "{name}: {msg}"),
         _ => writeln!(writer, "{name}"),
@@ -1670,8 +1682,20 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
 /// Compose the `ExcName: msg` header for a W_BaseException —
 /// equivalent to `traceback.format_exception_only`'s last line.
 fn render_exc_object(exc: PyObjectRef) -> String {
+    let rendered = render_exc_object_wtf8(exc);
+    if let Ok(s) = rendered.as_str() {
+        return s.to_owned();
+    }
+    let s_obj = pyre_object::w_str_from_wtf8(rendered);
+    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "<exception str() failed>".to_string())
+}
+
+fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
-        return String::from("<no exception>");
+        return Wtf8Buf::from_string("<no exception>".to_string());
     }
     let name = exc_object_class_name(exc).unwrap_or_else(|| {
         let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
@@ -1683,26 +1707,15 @@ fn render_exc_object(exc: PyObjectRef) -> String {
     // over reconstructing a message from `args`.  A raising `__str__` is
     // cleared and rendered with CPython's diagnostic placeholder.
     let msg = unsafe {
-        match crate::display::py_str_wtf8(exc) {
-            Ok(w) => {
-                if let Ok(s) = w.as_str() {
-                    s.to_owned()
-                } else {
-                    let s_obj = pyre_object::w_str_from_wtf8(w);
-                    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
-                        .ok()
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .unwrap_or_else(|| "<exception str() failed>".to_string())
-                }
-            }
-            Err(_) => "<exception str() failed>".to_string(),
-        }
+        crate::display::py_str_wtf8(exc)
+            .unwrap_or_else(|_| Wtf8Buf::from_string("<exception str() failed>".to_string()))
     };
-    if msg.is_empty() {
-        name
-    } else {
-        format!("{name}: {msg}")
+    let mut rendered = Wtf8Buf::from_string(name);
+    if !msg.as_bytes().is_empty() {
+        rendered.push_str(": ");
+        rendered.push_wtf8(&msg);
     }
+    rendered
 }
 
 /// `pypy/interpreter/error.py:125-158 print_app_tb_only` parity —

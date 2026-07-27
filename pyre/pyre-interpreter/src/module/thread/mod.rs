@@ -1788,10 +1788,9 @@ fn thread_excepthook_file(
         pyre_object::gc_roots::shadow_stack_get(exc_traceback_slot),
     )
     .map_err(|err| crate::PyError::runtime_error(format!("failed to display exception: {err}")))?;
-    let rendered = String::from_utf8(rendered).map_err(|err| {
-        crate::PyError::new(crate::PyErrorKind::UnicodeEncodeError, err.to_string())
-    })?;
-    thread_excepthook_write(file_slot, w_str_new(&rendered))?;
+    let rendered = rustpython_wtf8::Wtf8Buf::from_bytes(rendered)
+        .map_err(|_| crate::PyError::runtime_error("invalid WTF-8 exception display"))?;
+    thread_excepthook_write(file_slot, pyre_object::w_str_from_wtf8(rendered))?;
 
     // `_PyFile_Flush(file)`.
     call_method_result(
