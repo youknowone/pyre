@@ -4324,7 +4324,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     if ctx.is_bridge_trace && std::env::var_os("PYRE_P2_DIAG").is_some() {
         ctx.dump_trace_ops_diag("carrier-root-walk-end");
     }
-    match walk_result {
+    let action = match walk_result {
         Some((_entry, _code_len, Ok((outcome, _end_pc)))) => match outcome {
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
@@ -4482,7 +4482,20 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 TraceAction::Abort
             }
         }
+    };
+    // A permanent abort is a property of the walked jitcode body, not of the
+    // guard's runtime values: the same `(jitcode, resume_pc)` reaches the same
+    // marker on every retrace.  The loop-header entry stops re-entering because
+    // `abort_trace(true)` flips its cell to `DONT_TRACE_HERE`, but a bridge
+    // entry is keyed on the guard descr, which that cell never gates — so
+    // without this the guard keeps re-firing `must_compile` every
+    // `trace_eagerness` failures and each retry walks the whole body, executing
+    // its residual calls concretely, before failing again.  Record the decline
+    // through the same channel the pre-walk structural declines use.
+    if matches!(action, TraceAction::AbortPermanent) {
+        fbw_bridge_decline(ctx);
     }
+    action
 }
 
 /// Walker-as-tracer diagnostic dump.
