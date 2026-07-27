@@ -195,7 +195,7 @@ impl W_Unpickler {
         // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
         // forward map before resolution; otherwise the name resolves literally.
         let (module, name) = if self.proto < 3 && self.fix_imports {
-            crate::module::_pickle::compat_map(&module, &name, false)
+            crate::module::_pickle::compat_map(&module, &name, false)?
         } else {
             (module, name)
         };

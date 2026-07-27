@@ -2027,7 +2027,7 @@ fn save_toplevel_by_name(
     name: &str,
 ) -> Result<(), PyError> {
     let (module_name, name) = if ctx.proto < 3 && ctx.fix_imports {
-        crate::module::_pickle::compat_map(module_name, name, true)
+        crate::module::_pickle::compat_map(module_name, name, true)?
     } else {
         (module_name.to_string(), name.to_string())
     };

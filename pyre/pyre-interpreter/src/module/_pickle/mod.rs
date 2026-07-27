@@ -230,7 +230,11 @@ pub(crate) fn lookup_builtin(name: &str) -> Option<PyObjectRef> {
 /// REVERSE_* tables); the forward direction (py2 → py3) is used when
 /// loading. Returns the mapped `(module, name)`, unchanged when no entry
 /// matches.
-pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, String) {
+pub(crate) fn compat_map(
+    module: &str,
+    name: &str,
+    reverse: bool,
+) -> Result<(String, String), crate::PyError> {
     let (name_map_attr, import_map_attr) = if reverse {
         ("REVERSE_NAME_MAPPING", "REVERSE_IMPORT_MAPPING")
     } else {
@@ -238,34 +242,37 @@ pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, St
     };
     let compat = match import_module("_compat_pickle") {
         Ok(m) => m,
-        Err(_) => return (module.to_string(), name.to_string()),
+        Err(_) => return Ok((module.to_string(), name.to_string())),
     };
-    // (module, name) entry takes precedence over a bare module remap.
+    // (module, name) entry takes precedence over a bare module remap.  Read the
+    // mapping attributes through the generic `space.finditem` so a replaced or
+    // non-dict `*_MAPPING` and a raising key comparison are handled like PyPy's
+    // `space.finditem` (interp_pickle.py) rather than a raw native-dict probe.
     if let Ok(w_name_map) = crate::baseobjspace::getattr_str(compat, name_map_attr) {
         let key = pyre_object::tupleobject::w_tuple_new(vec![
             pyre_object::w_str_new(module),
             pyre_object::w_str_new(name),
         ]);
-        if let Some(v) = unsafe { pyre_object::w_dict_lookup(w_name_map, key) } {
+        if let Some(v) = crate::baseobjspace::finditem(w_name_map, key)? {
             let m = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 0) };
             let n = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 1) };
             if let (Some(m), Some(n)) = (m, n) {
-                return (
+                return Ok((
                     unsafe { pyre_object::unicodeobject::w_str_get_value(m) }.to_string(),
                     unsafe { pyre_object::unicodeobject::w_str_get_value(n) }.to_string(),
-                );
+                ));
             }
         }
     }
     if let Ok(w_import_map) = crate::baseobjspace::getattr_str(compat, import_map_attr) {
-        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_import_map, module) } {
-            return (
+        if let Some(v) = crate::baseobjspace::finditem_str(w_import_map, module)? {
+            return Ok((
                 unsafe { pyre_object::unicodeobject::w_str_get_value(v) }.to_string(),
                 name.to_string(),
-            );
+            ));
         }
     }
-    (module.to_string(), name.to_string())
+    Ok((module.to_string(), name.to_string()))
 }
 
 /// `interp_pickle.py _getattribute` — walk a dotted `qualname` from `obj`,
