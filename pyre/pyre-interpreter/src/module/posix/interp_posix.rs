@@ -1737,7 +1737,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `__index__` conversion, so a non-integer is a TypeError
                 // instead of a raw field read that asks for an arbitrary
                 // number of bytes.
-                let n = crate::baseobjspace::int_w(args[0])?;
+                let n = crate::builtins::space_index_w(args[0])?;
                 if n < 0 {
                     return Err(crate::PyError::value_error("negative argument not allowed"));
                 }
