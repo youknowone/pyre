@@ -4944,18 +4944,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // Module attribute lookup resolves the namespace dict before the module
-    // type's data descriptors (`LOAD_ATTR_MODULE` precedence): a name present
-    // in the module dict wins even over a same-named data descriptor on the
-    // module type.  This deliberately departs from the generic
-    // descriptor-first protocol so a hot `m.attr` and its compiled fold agree
-    // — e.g. after `m.__dict__["__dict__"] = x`, reading `m.__dict__` yields
-    // `x`.  A retagged module's replacement `__getattribute__`
-    // (importlib.util._LazyModule) still runs first.  A dict miss resumes the
-    // descriptor protocol, so a `ModuleType` subclass shadowing the base
-    // `__dict__` member with a plain value (`class M(ModuleType): __dict__ =
-    // 8`) still exposes 8.  Only after the whole lookup misses does module.py
-    // consult PEP 562 `__getattr__` (the tail below).
+    // Module objects use `object_getattribute` first (`module.py:130-134`),
+    // so their class descriptors and namespace follow the normal descriptor
+    // precedence.  This matters for a ModuleType subclass that shadows the
+    // base `__dict__` member: `class M(ModuleType): __dict__ = 8` must expose
+    // 8, and `module.__dir__` then rejects it as a non-dict.  Only after the
+    // complete normal lookup misses does module.py consult PEP 562
+    // `__getattr__` (the tail below).
     unsafe {
         if is_module(obj) {
             let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
@@ -4982,14 +4977,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     }
                 }
             }
-            let w_dict = pyre_object::w_module_get_w_dict(obj);
-            if !w_dict.is_null() {
-                if let Some(value) = finditem_str(w_dict, name)? {
-                    if !value.is_null() {
-                        return Ok(value);
-                    }
-                }
-            }
             let w_descr = if w_type.is_null() {
                 None
             } else {
@@ -5001,6 +4988,16 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         return Ok(value);
                     }
                 }
+            }
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                if let Some(value) = finditem_str(w_dict, name)? {
+                    if !value.is_null() {
+                        return Ok(value);
+                    }
+                }
+            }
+            if let Some(descr) = w_descr {
                 return Ok(get(descr, obj, w_type)?.unwrap_or(descr));
             }
         }
@@ -7472,6 +7469,17 @@ pub unsafe fn lookup_special(
 /// PyPy equivalent: `space.lookup_in_type(w_type, name)`.
 pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type_where(w_type, name)
+}
+
+/// True if `name` resolves to a data descriptor on `w_type`'s MRO.  Generic
+/// getattr consults a data descriptor before the object's own dict, so a
+/// same-named dict entry is shadowed; a JIT fold that reads the dict directly
+/// must decline for such a name.
+pub unsafe fn type_lookup_is_data_descr(w_type: PyObjectRef, name: &str) -> bool {
+    match lookup_in_type(w_type, name) {
+        Some(descr) => is_data_descr(descr),
+        None => false,
+    }
 }
 
 /// `typeobject.py:353-371 W_TypeObject.compares_by_identity` — walk
