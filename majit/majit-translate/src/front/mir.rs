@@ -9940,10 +9940,12 @@ impl<'a> Lowering<'a> {
     /// the same smaller-than-word unsigned → Signed widening as a
     /// no-op; pyre spells it `usize::try_from(x).expect(..)`
     /// (`pyopcode.rs` `u32_as_usize` / `raise_kind_as_usize`), whose
-    /// `Err` arm is statically dead on the 64-bit-only targets pyre
-    /// supports.  Impls with word-sized-or-wider inputs — the
-    /// genuinely fallible directions of the same impl group — keep
-    /// the `Call` form.
+    /// `Err` arm is statically dead for the `U8`/`U16`/`U32` sources
+    /// filtered on below — narrower than `usize` on every target pyre
+    /// builds for, wasm32 included.  Impls with word-sized-or-wider
+    /// inputs — the genuinely fallible directions of the same impl
+    /// group — keep the `Call` form, so this filter must not be
+    /// widened to `U64` on the strength of the host being 64-bit.
     fn try_lower_usize_try_from(
         &mut self,
         mir_bb: usize,

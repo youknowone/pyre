@@ -1407,7 +1407,7 @@ impl MemoryRef {
             self.descr
                 .as_array_descr()
                 .map(|ad| ad.item_size() as i64)
-                .unwrap_or(8)
+                .unwrap_or(std::mem::size_of::<usize>() as i64)
         }
     }
 }

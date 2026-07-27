@@ -1064,7 +1064,7 @@ impl StructLayout {
             })
             .filter(|s| *s > 0)
             .max()
-            .unwrap_or(8);
+            .unwrap_or_else(crate::layout::target_word_size);
         let size = if offset > 0 {
             (offset + max_align - 1) & !(max_align - 1)
         } else {
@@ -1566,7 +1566,9 @@ impl CallControl {
         let (flag, item_size, item_type) = if is_struct {
             (
                 majit_ir::descr::ArrayFlag::Struct,
-                elem_ref.map(|n| compute_struct_size(self, n)).unwrap_or(8),
+                elem_ref
+                    .map(|n| compute_struct_size(self, n))
+                    .unwrap_or_else(crate::layout::target_word_size),
                 majit_ir::value::Type::Ref,
             )
         } else if let Some(elem) = elem_ref {
@@ -6741,7 +6743,7 @@ fn all_interiorfielddescrs(
         .map(|(_, ty)| get_type_flag(ty).2)
         .filter(|s| *s > 0)
         .max()
-        .unwrap_or(8);
+        .unwrap_or_else(crate::layout::target_word_size);
     let item_size = if offset > 0 {
         (offset + max_align - 1) & !(max_align - 1)
     } else {
@@ -6861,7 +6863,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
         })
         .filter(|s| *s > 0)
         .max()
-        .unwrap_or(8);
+        .unwrap_or_else(crate::layout::target_word_size);
     if offset > 0 {
         (offset + max_align - 1) & !(max_align - 1)
     } else {

@@ -863,8 +863,10 @@ impl RewriteState {
 
         // rewrite.py:760-766 — NULL-pointer writes still pending for
         // any zero-init fields not covered by a subsequent explicit
-        // SETFIELD_GC.  RPython uses `WORD` (architecture pointer
-        // size); pyre targets 64-bit exclusively so WORD == 8.
+        // SETFIELD_GC.  The store width is `WORD`, the target's pointer
+        // size (`symbolic.py:12 WORD = sizeof(lltype.Signed)`) — 4 on the
+        // wasm32 target, where an 8-byte zero would run past the field
+        // and null the neighbouring one.
         //
         // The constant path inside `emit_gc_store_or_indexed`
         // (rewrite.py:148-150) collapses (ConstInt(ofs), factor=1,
@@ -889,7 +891,7 @@ impl RewriteState {
             for ofs in entries.iter().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
-                let word_ref = self.const_int(8);
+                let word_ref = self.const_int(std::mem::size_of::<usize>() as i64);
                 let store = mk_op(
                     OpCode::GcStore,
                     &[ptr_box.clone(), ofs_ref, zero_ref, word_ref],

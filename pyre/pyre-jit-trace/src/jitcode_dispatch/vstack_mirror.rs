@@ -45,6 +45,18 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::UnaryNegative
         | Instruction::UnaryNot
         | Instruction::UnaryInvert
+        // TO_BOOL is net 0 (liveness `(d, d)`) and emits no JitCode
+        // (codewriter `Instruction::ToBool => {}`), so it stamps no
+        // `write_ref_reg` box of its own.  It still belongs here: the
+        // unchanged value is exactly `vstack_last_ref`, and where that is
+        // NONE — the tested value came from an unboxed bank —
+        // `loadconst_operand_ref` fail-closes to NONE, leaving the
+        // intentional hole the capture overlay omits and resume
+        // rematerializes.  What it must NOT be is `Unmodeled`: that latched
+        // `vstack_valid = false` whenever the after-residual guard-capture
+        // reconcile re-entered at the TO_BOOL pc (`prev_pypc == new_pypc`),
+        // dropping the kept accumulator below a residual-call condition
+        // (`s = s + (i if f(...) else 0)`).
         | Instruction::ToBool
         | Instruction::GetIter
         | Instruction::GetLen
@@ -152,20 +164,6 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::JumpBackward { .. }
         | Instruction::JumpBackwardNoInterrupt { .. }
         | Instruction::ReturnValue => VstackOpClass::PopOnlyOrSideStore,
-
-        // TO_BOOL: pops TOS and pushes its bool (net 0, liveness `(d, d)`) and
-        // emits no JitCode (codewriter `Instruction::ToBool => {}`), so it has
-        // no `write_ref_reg` box for the pushed bool.  Its result is always
-        // consumed by the immediately following branch (POP_JUMP_IF_*), never
-        // kept below a guard, so the untracked TOS box is inert; model it as a
-        // net-0 side effect that truncates to the (unchanged) depth and keeps
-        // every surviving box in place — crucially the operand-stack slots
-        // BELOW the tested value.  Classifying it as `Unmodeled` here (the
-        // former `_` fallthrough) latched `vstack_valid = false` whenever the
-        // after-residual guard-capture reconcile re-entered at the TO_BOOL pc
-        // (`prev_pypc == new_pypc`), dropping the kept accumulator below a
-        // residual-call condition (`s = s + (i if f(...) else 0)`).
-        Instruction::ToBool => VstackOpClass::PopOnlyOrSideStore,
 
         // LOAD_GLOBAL: the global value is the new TOS = the last Ref written.
         // When `namei & 1` the lowering also pushes a NULL sentinel BENEATH the

@@ -1813,7 +1813,11 @@ impl EncodedResumeData {
                         .collect();
                     let field_sizes: Vec<usize> = fielddescrs
                         .iter()
-                        .map(|fd| fd.as_field_descr().map(|f| f.field_size()).unwrap_or(8))
+                        .map(|fd| {
+                            fd.as_field_descr()
+                                .map(|f| f.field_size())
+                                .unwrap_or(std::mem::size_of::<usize>())
+                        })
                         .collect();
                     majit_ir::RdVirtualInfo::VArrayStructInfo {
                         arraydescr: arraydescr.clone(),
