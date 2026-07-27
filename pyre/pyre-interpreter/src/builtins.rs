@@ -6192,6 +6192,7 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let canonical = *registry.entry(name).or_insert(cls as usize) as PyObjectRef;
+    crate::typedef::stamp_exception_method_owners(canonical, name);
     if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(name) {
         let by_kind = pyre_object::interp_exceptions::register_exc_class_for_kind(kind, canonical);
         debug_assert_eq!(by_kind, canonical);

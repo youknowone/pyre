@@ -1489,6 +1489,14 @@ pub fn w_object() -> PyObjectRef {
 /// `object`'s predicate accepts everything, since every receiver really is an
 /// `object`; listing it still rejects a *missing* receiver, which its methods
 /// would otherwise index straight off an empty argument slice.
+///
+/// Every builtin type gets an owner, whether or not a layout test is written
+/// for it: `d_type` is what names the descriptor in `descriptor 'x' of 'T'
+/// object needs an argument` and in the qualified name its arity errors
+/// report, and it is set for every entry of every `tp_methods` table.  A type
+/// missing from the table below takes an owner with no layout test — the
+/// receiver must be present, but a foreign one still reaches the
+/// implementation.
 fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner> {
     macro_rules! owners {
         ($($name:literal => $pred:path),+ $(,)?) => {
@@ -1496,11 +1504,11 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
                 $($name => {
                     static OWNER: crate::gateway::MethodOwner = crate::gateway::MethodOwner {
                         type_name: $name,
-                        is_instance: |obj| unsafe { $pred(obj) },
+                        is_instance: Some(|obj| unsafe { $pred(obj) }),
                     };
-                    Some(&OWNER)
+                    return Some(&OWNER);
                 })+
-                _ => None,
+                _ => {}
             }
         };
     }
@@ -1522,12 +1530,81 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "tuple" => pyre_object::is_tuple,
         "set" => pyre_object::is_set,
         "frozenset" => pyre_object::is_frozenset,
+        "set_iterator" => pyre_object::is_set_iterator,
         "range" => pyre_object::functional::is_w_range,
         "slice" => pyre_object::is_slice,
         "memoryview" => pyre_object::memoryview::is_w_memoryview,
         "type" => pyre_object::is_type,
         "object" => is_any_object,
         "BaseException" => pyre_object::interp_exceptions::is_exception,
+        // The `iter()` / `reversed()` products and the functional wrappers.
+        // Each reads its receiver's payload at its own layout, so an unchecked
+        // receiver reaches those accessors as type confusion — reproducibly a
+        // SIGSEGV for `type(iter(())).__length_hint__(None)`.
+        "iterator" => pyre_object::is_seq_iter,
+        "list_iterator" => pyre_object::is_list_iter,
+        "list_reverseiterator" => pyre_object::is_list_reverse_iter,
+        "tuple_iterator" => pyre_object::is_tuple_iter,
+        "range_iterator" => pyre_object::functional::is_range_iter,
+        "longrange_iterator" => pyre_object::is_long_range_iter,
+        "callable_iterator" => pyre_object::operation::is_callable_iterator,
+        "enumerate" => pyre_object::functional::is_enumerate,
+        "reversed" => pyre_object::functional::is_reversed,
+        "map" => pyre_object::functional::is_map,
+        "filter" => pyre_object::functional::is_filter,
+        "zip" => pyre_object::functional::is_zip,
+        "property" => pyre_object::descriptor::is_property,
+        "super" => pyre_object::descriptor::is_super,
+    }
+    Some(untested_method_owner(type_name))
+}
+
+/// The `MethodOwner` for a builtin type with no entry in the table above.
+/// Built once per type while the type is, and leaked: a `MethodOwner` lives as
+/// long as the interpreter, like the `PyMethodDef` tables it stands in for.
+fn untested_method_owner(type_name: &str) -> &'static crate::gateway::MethodOwner {
+    leaked_method_owner(type_name, None)
+}
+
+fn leaked_method_owner(
+    type_name: &str,
+    is_instance: Option<fn(PyObjectRef) -> bool>,
+) -> &'static crate::gateway::MethodOwner {
+    // Keyed by the layout test as well as the name: a type reached first
+    // through the shared constructors takes an owner with no test, and a
+    // later caller that does know the test must not be handed that one back.
+    static LEAKED: std::sync::Mutex<
+        Option<std::collections::HashMap<(String, bool), &'static crate::gateway::MethodOwner>>,
+    > = std::sync::Mutex::new(None);
+    let mut guard = LEAKED.lock().unwrap_or_else(|err| err.into_inner());
+    let table = guard.get_or_insert_with(std::collections::HashMap::new);
+    let key = (type_name.to_owned(), is_instance.is_some());
+    if let Some(owner) = table.get(&key) {
+        return owner;
+    }
+    let owner: &'static crate::gateway::MethodOwner =
+        Box::leak(Box::new(crate::gateway::MethodOwner {
+            type_name: Box::leak(type_name.to_owned().into_boxed_str()),
+            is_instance,
+        }));
+    table.insert(key, owner);
+    owner
+}
+
+/// Bind a builtin exception class's own methods to it.  The exception classes
+/// are built by their own factories rather than through the shared type
+/// constructors, and every one of them shares `BaseException`'s instance
+/// layout, so each takes that layout test under its own name — without it
+/// `ImportError.__reduce__(None)` reaches an accessor that reads a `NoneType`
+/// at the exception layout.
+pub(crate) fn stamp_exception_method_owners(cls: PyObjectRef, name: &str) {
+    let owner = leaked_method_owner(
+        name,
+        Some(|obj| unsafe { pyre_object::interp_exceptions::is_exception(obj) }),
+    );
+    let ns = unsafe { pyre_object::w_type_get_dict_ptr(cls) } as PyObjectRef;
+    if !ns.is_null() {
+        unsafe { stamp_method_owners(ns, owner) };
     }
 }
 
@@ -1578,6 +1655,25 @@ unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::M
             continue;
         }
         crate::gateway::builtin_code_set_owner(code, owner);
+    }
+}
+
+/// Bind one freshly built method descriptor to the type that defines it, for
+/// the bound methods `getattr` assembles outside a type namespace.  Without
+/// it those carry no owner and report their errors under the bare method name,
+/// where the namespace entry for the same method reports `type.name`.
+///
+/// # Safety
+/// `func` must be a valid, live function object.
+pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
+    let Some(owner) = method_owner(type_name) else {
+        return;
+    };
+    unsafe {
+        let code = crate::function::getcode(func) as PyObjectRef;
+        if !code.is_null() && crate::gateway::is_builtin_code(code) {
+            crate::gateway::builtin_code_set_owner(code, owner);
+        }
     }
 }
 
@@ -1652,6 +1748,14 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     let ns = pyre_object::w_dict_new();
     pyre_object::gc_roots::pin_root(ns);
     init(ns);
+    // `object`'s own methods are descriptors of `object` just like every other
+    // builtin type's, so they are bound here too: their receiver test accepts
+    // any instance, but the binding is what supplies the qualified name their
+    // receiver and arity errors report.
+    if let Some(owner) = method_owner(name) {
+        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        unsafe { stamp_method_owners(ns, owner) };
+    }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let type_obj = w_type_new_builtin(
         name,

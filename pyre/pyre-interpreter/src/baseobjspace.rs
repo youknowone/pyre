@@ -4758,6 +4758,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             };
             if let Some((func, sname, arity)) = entry {
                 let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
+                unsafe { crate::typedef::stamp_builtin_owner(func_obj, "range") };
                 return Ok(pyre_object::w_method_new(
                     func_obj,
                     obj,

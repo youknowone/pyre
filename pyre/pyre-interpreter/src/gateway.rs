@@ -510,8 +510,11 @@ pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 pub struct MethodOwner {
     /// The owning type's name as it appears in the mismatch message.
     pub type_name: &'static str,
-    /// Layout membership, true for instances of subclasses as well.
-    pub is_instance: fn(PyObjectRef) -> bool,
+    /// Layout membership, true for instances of subclasses as well.  `None`
+    /// for a type with no layout test written yet: the receiver still has to
+    /// be *present*, and the owner still names the descriptor in every error
+    /// it raises, but a foreign object of the right shape is not rejected.
+    pub is_instance: Option<fn(PyObjectRef) -> bool>,
 }
 
 /// A built-in function object.
@@ -700,7 +703,8 @@ pub unsafe fn builtin_code_call(
     let owner = unsafe { (*code).owner };
     if !owner.is_null() {
         let owner = unsafe { &*owner };
-        let accepted = matches!(args.first(), Some(&receiver) if (owner.is_instance)(receiver));
+        let accepted = matches!(args.first(), Some(&receiver)
+            if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
         if !accepted {
             return Err(receiver_mismatch(owner, unsafe { (*code).name }, args));
         }
