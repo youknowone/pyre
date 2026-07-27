@@ -5,7 +5,14 @@
 # stack.  dynasm and PYRE_JIT=0 are clean, which matches the known
 # cranelift/wasm/Windows-only shape of that signature.
 #
-# Intermittent but high-rate - 9/10 runs - and needs no GC stress build.
+# Intermittent but high-rate - 8/10 to 9/10 runs - and needs no GC stress build.
+#
+# REFUTED lead, do not re-attempt: the unbarriered `(*frame).f_backref =
+# saved_topframeref` in ResidualFrameChainGuard::enter looks exactly like the
+# known producer of this signature - old-gen FrameBox taking a possibly-nursery
+# caller, while its sibling store in the walker carries a barrier and a comment
+# saying why.  Adding the same barrier there changes nothing: 18/20 aborts with
+# it versus 8/10 without.
 #
 # Ingredients, each of which removing made it stop aborting:
 #   * TWO exception classes raised into one hot try/except, so a bridge is
