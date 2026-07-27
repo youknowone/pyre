@@ -17,7 +17,9 @@
 # as a function-entry portal, a `for` loop inlines it into the loop trace - so
 # the two are surveyed separately and must agree.  A publish wired into only one
 # route shows up as a disagreement between the two lines without the oracle
-# having to say anything.
+# having to say anything.  The `loop_owner_*` group covers the third route: a
+# frame whose own `while` IS the compiled loop leaves through a guard failure,
+# and the replay that finishes it has to reach the same `return` coordinate.
 #
 # Surveying every iteration rather than sampling the last one is what catches a
 # frame that is only sometimes right: the pre-compile iterations are correct, so
@@ -94,6 +96,74 @@ def for_callee():
     return sorted(seen)
 
 
+def loop_owner_return(n):
+    """The frame that raises OWNS the compiled loop, so it never goes through
+    the function-entry portal: the loop guard fails and the rest of the frame
+    is replayed from the guard's resume image.  Each arm puts a different
+    amount of work between the last iteration and the `return`, so the reported
+    offset says which coordinate the frame is stuck on — the raise inside the
+    body, the loop exit, or the `return` it actually reached."""
+    tb = None
+    k = 0
+    while k < n:
+        try:
+            raise ValueError(k)
+        except ValueError as e:
+            tb = e.__traceback__
+        k += 1
+    return tb
+
+
+def loop_owner_stmt(n):
+    tb = None
+    k = 0
+    while k < n:
+        try:
+            raise ValueError(k)
+        except ValueError as e:
+            tb = e.__traceback__
+        k += 1
+    j = k
+    return tb
+
+
+def loop_owner_call(n):
+    tb = None
+    k = 0
+    while k < n:
+        try:
+            raise ValueError(k)
+        except ValueError as e:
+            tb = e.__traceback__
+        k += 1
+    catches_here(k)
+    return tb
+
+
+def loop_owner_second_loop(n):
+    tb = None
+    k = 0
+    while k < n:
+        try:
+            raise ValueError(k)
+        except ValueError as e:
+            tb = e.__traceback__
+        k += 1
+    m = 0
+    while m < 3:
+        m += 1
+    return tb
+
+
+def loop_owners():
+    return [chain(fn(N)) for fn in (
+        loop_owner_return,
+        loop_owner_stmt,
+        loop_owner_call,
+        loop_owner_second_loop,
+    )]
+
+
 def kept_alive():
     """Many tracebacks alive at once: a shared or recycled frame collapses."""
     kept = []
@@ -110,6 +180,8 @@ print("while/same  ", while_same())
 print("for/same    ", for_same())
 print("while/callee", while_callee())
 print("for/callee  ", for_callee())
+for shape in loop_owners():
+    print("loop_owner  ", shape)
 kept_shapes, kept_distinct = kept_alive()
 print("kept        ", kept_shapes)
 print("kept_distinct", kept_distinct)
