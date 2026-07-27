@@ -473,7 +473,7 @@ pub struct TraceCtx {
     /// the consumer mirrors only `pyjitpl.py:2491` `aborted_tracing(reason)`
     /// accounting.  `stb.raising_exception` is preserved on this struct
     /// but the `convert_and_run_from_pyjitpl` invocation
-    /// (`blackhole.rs:3011`, ported from `blackhole.py:1798`) is NOT yet
+    /// (in `blackhole.rs`, ported from `blackhole.py:1799`) is NOT yet
     /// wired through this path; the helper-side exception raised during
     /// the residual call is therefore silently dropped at the abort
     /// boundary rather than re-raised via blackhole as RPython does.

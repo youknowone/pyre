@@ -1384,6 +1384,94 @@ mod tests {
         }
     }
 
+    /// Coverage of the *production* builder, which is not the default one.
+    ///
+    /// `build_pyre_production_bh_builder` delegates to
+    /// `build_inline_call_only_bh_builder`, which registers only the shapes
+    /// with an explicit handler contract, so an emitted byte outside that
+    /// surface reaches `dispatch_step`'s unwired-opcode panic.  Upstream has
+    /// no analogue: `setup_insns` (blackhole.py:66) resolves every opname in
+    /// `asm.insns` eagerly, so its dispatch table covers the whole emitted
+    /// bytecode universe by construction.
+    ///
+    /// This publishes the gap so it is a reviewable number rather than a
+    /// runtime surprise: every opname the codewriter can emit that the
+    /// production blackhole cannot execute.
+    #[test]
+    fn production_bh_builder_coverage_gap_snapshot() {
+        let builder = build_pyre_production_bh_builder();
+        let mut gap: Vec<String> = insns_opname_to_byte()
+            .iter()
+            .filter(|(_key, byte)| {
+                builder
+                    ._insns
+                    .get(**byte as usize)
+                    .is_none_or(|name| name.is_empty())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        gap.sort();
+        let mut unwired: Vec<String> = builder
+            .unwired_opnames()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        unwired.sort();
+        assert_eq!(
+            unwired,
+            Vec::<String>::new(),
+            "production builder registered an opname without a handler",
+        );
+        // Every entry below has a `bhimpl_*` handler — `build_default_bh_builder`
+        // wires all 208 opnames and its unwired set is empty (see the snapshot
+        // test right after this one).  The gap is registration, not
+        // implementation: `build_inline_call_only_bh_builder` opts each family
+        // in by hand.  Note `rvmprof_code/ii`, one of the three well-known
+        // opcodes `setup_insns` resolves (blackhole.py:72-74), so the
+        // production builder's `op_rvmprof_code` stays `u8::MAX`.
+        let expected = [
+            "abort/>r",
+            "arraylen_gc/rd>i",
+            "assert_not_none/r",
+            "cast_float_to_int/f>i",
+            "cast_int_to_float/i>f",
+            "cast_int_to_ptr/i>r",
+            "cast_ptr_to_int/r>i",
+            "check_neg_index/rid>i",
+            "conditional_call_ir_v/iiIRd",
+            "conditional_call_value_ir_i/iiIRd>i",
+            "conditional_call_value_ir_r/riIRd>r",
+            "convert_float_bytes_to_longlong/f>i",
+            "convert_longlong_bytes_to_float/i>f",
+            "gc_load_indexed_f/riiii>f",
+            "gc_load_indexed_i/riiii>i",
+            "getinteriorfield_gc_f/rid>f",
+            "getinteriorfield_gc_i/rid>i",
+            "getinteriorfield_gc_r/rid>r",
+            "getlistitem_gc_f/ridd>f",
+            "getlistitem_gc_i/ridd>i",
+            "getlistitem_gc_r/ridd>r",
+            "int_between/iii>i",
+            "new/d>r",
+            "new_array/id>r",
+            "new_with_vtable/d>r",
+            "newlist/idddd>r",
+            "newlist_clear/idddd>r",
+            "newlist_hint/idddd>r",
+            "record_exact_class/ri",
+            "record_known_result_i_ir_v/iiIRd",
+            "record_known_result_r_ir_v/riIRd",
+            "record_quasiimmut_field/rdd",
+            "rvmprof_code/ii",
+            "vtable_method_ptr/rd>i",
+        ];
+        assert_eq!(
+            gap, expected,
+            "production blackhole coverage gap drifted; a jitcode emitting any \
+             opname in this set reaches `dispatch_step`'s unwired-opcode panic",
+        );
+    }
+
     #[test]
     fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
         // Lock-in: every generated opname must be wired by

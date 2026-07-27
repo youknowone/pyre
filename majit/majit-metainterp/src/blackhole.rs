@@ -2469,7 +2469,7 @@ pub fn run_forever_with_portal(
     }
 }
 
-/// blackhole.py:1798 convert_and_run_from_pyjitpl
+/// blackhole.py:1799 convert_and_run_from_pyjitpl
 ///
 /// Get a chain of blackhole interpreters and fill them by copying
 /// 'metainterp.framestack'.
@@ -3300,6 +3300,51 @@ mod tests {
             builder.setup_insns(&entries);
             wire_bhimpl_handlers(&mut builder);
             builder
+        }
+
+        /// `test_blackhole.py:115-143 test_convert_and_run_from_pyjitpl`.
+        ///
+        /// The fixture puts an illegal instruction at pc 0 and gives the
+        /// MIFrame `pc = 1`, so the chain must start at exactly `frame.pc`
+        /// and can never reach anything before it.  pyre's assembler emits
+        /// only real opcodes, so the illegal instruction is an `int_mul`
+        /// left out of the dispatch table: its slot holds
+        /// `unwired_handler_placeholder`, which panics the same way
+        /// `\xFF` does upstream.  It also writes `r0`, so a chain that
+        /// started at 0 would return 1602 rather than panicking silently.
+        #[test]
+        fn test_convert_and_run_from_pyjitpl_starts_at_frame_pc() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_translate::insns;
+
+            let mut b = JitCodeBuilder::default();
+            // pc 0 — never executed.
+            b.record_binop_i(0, OpCode::IntMul, 0, 0);
+            let second = b.current_pos();
+            b.record_binop_i(2, OpCode::IntAdd, 0, 1);
+            b.int_return(2);
+            let jitcode = std::sync::Arc::new(b.finish());
+
+            // test_blackhole.py:124-125 `pc = 1`, `registers_i = [40, 2, None]`.
+            let mut frame = MIFrame::new(jitcode, second);
+            frame.int_values[0] = Some(40);
+            frame.int_values[1] = Some(2);
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert("int_add/ii>i".to_string(), insns::BC_INT_ADD);
+            entries.insert("int_return/i".to_string(), insns::BC_INT_RETURN);
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+
+            // test_blackhole.py:141-143 `DoneWithThisFrameInt`, `result == 42`.
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(42)
+            );
         }
 
         #[test]

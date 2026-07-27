@@ -2977,8 +2977,8 @@ impl<S: JitState> JitDriver<S> {
                 // call's eventual exception is preserved
                 // (`pyjitpl.py:3391-3393` comment).  Pyre wires only
                 // the accounting half here; the `convert_and_run_from_pyjitpl`
-                // helper exists at `blackhole.rs:3011` (port of
-                // `blackhole.py:1798`) but is not yet invoked from
+                // helper exists in `blackhole.rs` (port of
+                // `blackhole.py:1799`) but is not yet invoked from
                 // this consumer, so `stb.raising_exception` is
                 // currently a no-op and the helper-side exception is
                 // dropped at the abort boundary.  Full cancel-tracing
