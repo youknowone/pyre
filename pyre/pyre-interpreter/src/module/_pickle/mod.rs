@@ -258,9 +258,7 @@ pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, St
         }
     }
     if let Ok(w_import_map) = crate::baseobjspace::getattr_str(compat, import_map_attr) {
-        if let Some(v) =
-            unsafe { pyre_object::w_dict_lookup(w_import_map, pyre_object::w_str_new(module)) }
-        {
+        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_import_map, module) } {
             return (
                 unsafe { pyre_object::unicodeobject::w_str_get_value(v) }.to_string(),
                 name.to_string(),

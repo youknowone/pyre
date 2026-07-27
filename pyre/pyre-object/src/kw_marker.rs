@@ -28,6 +28,18 @@ pub fn w_kw_marker_sentinel() -> PyObjectRef {
     &KW_MARKER_SENTINEL as *const KwMarkerSentinel as *mut PyObject
 }
 
+/// Cached immortal `"__pyre_kw__"` key `W_str`.  Builtin-kwargs packing stores
+/// the sentinel under this key on every keyworded call; minting a fresh
+/// `w_str_new("__pyre_kw__")` per call allocated one never-freed immortal string
+/// per call, so the constant key is allocated once and reused.  Immortal by
+/// design — it is shared across every (collectable) marker dict, which on
+/// collection drops only the borrowed pointer.
+pub fn w_kw_marker_key() -> PyObjectRef {
+    static KW_MARKER_KEY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KW_MARKER_KEY.get_or_init(|| crate::unicodeobject::w_str_new("__pyre_kw__") as usize)
+        as PyObjectRef
+}
+
 /// `true` when `value` is the marker sentinel (pointer identity).
 #[inline]
 pub fn is_kw_marker_sentinel(value: PyObjectRef) -> bool {

@@ -2869,7 +2869,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         && unsafe {
             let last = *args.last().unwrap();
             is_dict(last)
-                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
                     .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
         };
     let (positional, end, sep, file, flush) = if is_kwargs {
@@ -2888,19 +2888,19 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         }
-        let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("end")) };
-        let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("sep")) };
+        let end_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "end") };
+        let sep_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "sep") };
         // The type check is up front; the str() rendering happens at write
         // time so a raising `__str__` leaves the preceding output in place.
         let end_obj = print_sep_check(end_val, "end")?;
         let sep_obj = print_sep_check(sep_val, "sep")?;
         // `file=None` (or absent) uses the native stdout path; any other
         // object is written through its `write` / `flush` methods.
-        let file_obj = match unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("file")) } {
+        let file_obj = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "file") } {
             Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
             _ => None,
         };
-        let flush = match unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("flush")) } {
+        let flush = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "flush") } {
             Some(f) => crate::baseobjspace::is_true(f)?,
             None => false,
         };
@@ -3242,7 +3242,7 @@ pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
 /// or the requested key is absent.
 pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObjectRef> {
     let dict = kwargs?;
-    unsafe { pyre_object::w_dict_lookup(dict, w_str_new(name)) }
+    unsafe { pyre_object::w_dict_getitem_str(dict, name) }
 }
 
 /// Reject any keyword argument whose name is not in `allowed`.  Mirrors
@@ -3308,7 +3308,7 @@ pub(crate) fn bind_pos_or_kw(
 pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
     matches!(args.last(), Some(&last) if unsafe {
         is_dict(last)
-            && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+            && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
                 .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     })
 }

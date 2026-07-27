@@ -861,7 +861,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     let is_kwargs = unsafe {
         let last = *args.last().unwrap();
         pyre_object::is_dict(last)
-            && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__"))
+            && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
                 .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     };
     let (positional, start) = if is_kwargs {
@@ -998,7 +998,8 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
         && unsafe {
             let last = *args.last().unwrap();
             pyre_object::is_dict(last)
-                && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
         };
     let (pos, kwargs) = if is_kwargs {
         (&args[..args.len() - 1], Some(*args.last().unwrap()))
@@ -1010,8 +1011,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
             "nextafter() takes exactly 2 positional arguments",
         ));
     }
-    let steps = match kwargs
-        .and_then(|kw| unsafe { pyre_object::w_dict_lookup(kw, pyre_object::w_str_new("steps")) })
+    let steps = match kwargs.and_then(|kw| unsafe { pyre_object::w_dict_getitem_str(kw, "steps") })
     {
         Some(s) => {
             use num_traits::ToPrimitive;

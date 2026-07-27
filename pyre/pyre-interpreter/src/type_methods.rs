@@ -1420,7 +1420,7 @@ fn format_render(
             return crate::baseobjspace::getitem(m, w_key).map(Some);
         }
         if let Some(dict) = kwargs_dict {
-            let v = unsafe { pyre_object::w_dict_lookup(dict, pyre_object::w_str_new(name)) };
+            let v = unsafe { pyre_object::w_dict_getitem_str(dict, name) };
             return Ok(v);
         }
         Ok(None)
