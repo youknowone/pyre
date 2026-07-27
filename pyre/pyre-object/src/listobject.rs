@@ -1288,6 +1288,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
 /// listobject.py:1850-1862 IntegerListStrategy.pop
 /// Strategy-preserving: pops from typed storage, wraps result.
 pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py:1180 EmptyListStrategy.pop raises IndexError.
@@ -1332,6 +1333,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
 
 /// Remove and return last item. Returns `None` if empty.
 pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py:1180 EmptyListStrategy.pop raises IndexError.
