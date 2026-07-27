@@ -4523,10 +4523,22 @@ impl<'a> Lowering<'a> {
                 // shape (`flowspace_adapter.rs::is_str_const_define`).
                 result_ty: ValueType::Ref(None),
             },
+            // A function item's value is its address.  Upstream materialises
+            // it as `Constant(funcptr)` of lltype `Ptr(FuncType)`
+            // (`rtyper.getcallable`, and `sub_helper_funcptr_constant` for the
+            // sub-helper twins), whose `getkind` is `r` — the same reason the
+            // `Str` arm above declares a Ref.  The synthetic define reuses the
+            // callee's real path so a value threaded into a call site still
+            // resolves, which also puts it in front of `getcalldescr`'s
+            // `RESULT == FUNC.RESULT` check (`call.py`): an `Int` here read as
+            // a 0-arg call to that function and hard-failed against any callee
+            // whose graph carries a `FUNC.RESULT` token — `w_dict_new`
+            // (`dont_look_inside`) threaded through `Option::unwrap_or_else` is
+            // the shape that surfaces it.
             DecodedConst::FnPath(segments) => OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
                 args: vec![],
-                result_ty: ValueType::Int,
+                result_ty: ValueType::Ref(None),
             },
         };
         let var = self
