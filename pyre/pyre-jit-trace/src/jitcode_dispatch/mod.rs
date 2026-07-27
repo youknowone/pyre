@@ -5936,6 +5936,13 @@ pub(crate) unsafe fn resolve_inlinable_callee(
         if raw.is_null() {
             return None;
         }
+        // Calling a generator / coroutine / async-generator function does NOT
+        // run its body — it builds the iterator and returns.  Inlining the
+        // body at the call site walks code the call never reaches, so the
+        // attempt can only end in an abort that discards the whole trace.
+        if pyre_interpreter::pyframe::code_flags_make_generator((*raw).flags) {
+            return None;
+        }
         let closure = pyre_interpreter::function_get_closure(callable);
         Some((w_code, (*raw).arg_count as usize, !closure.is_null()))
     }

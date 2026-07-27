@@ -156,32 +156,34 @@ i.e. rows 1/4/5 — **is refuted by measurement**. Slice A dropped row 2 and mad
 leg 4 preferred; the conversion was **zero**. Census over `pyre/bench/synth`
 (315 files, `PYRE_FBW_DEBUG_ABORT=1`):
 
-| | count |
-|---|---|
-| leg 3 `EntryCarrierCall` commits | 169 |
-| leg 4 `CalleeRebuild` commits | 1 |
-| refusal: callee is a generator | 151 |
-| refusal: abort pc is not an exact segment anchor | 18 |
-| refusal: first callee argument is not a `Ref` | 1 |
+| | base | after slices A–C |
+|---|---|---|
+| leg 3 `EntryCarrierCall` commits | 169 | **9** |
+| leg 4 `CalleeRebuild` commits | 1 | **11** |
+| refusal: callee is a generator | 151 | 0 |
+| refusal: abort pc is not an exact segment anchor | 18 | 3 |
+| refusal: first callee argument is not a `Ref` | 1 | 1 |
 
 Row 1 never fired. Rows 4b and 6 never fired. Print the denominator: 149 of the
-151 generator refusals come from one loop in `calls_closures.py`, and the 18
-anchor refusals are spread over 5 files (`foriter_exempt_nested_foriter`,
+151 generator refusals came from one loop in `calls_closures.py`, and the 18
+anchor refusals were spread over 5 files (`foriter_exempt_nested_foriter`,
 `foriter_exempt_shared_generator`, `inline_subwalk_user_iterator`,
 `selfrec_tail_exception_unwind`, `bridge_recursion_overflow`).
 
-#### Row 4a is correct and must stay
+The orthodox leg is now the majority one.
+
+#### ✅Row 4a is correct and must stay — the defect was upstream of it
 
 Rebuilding a generator callee would run its body eagerly instead of producing a
-generator object, so leg 4 refusing it is right. What is *not* right is that the
+generator object, so leg 4 refusing it is right. What was *not* right is that the
 call was inlined at all: `resolve_inlinable_callee` (`jitcode_dispatch/mod.rs`)
-has no `code_flags_make_generator` guard, so the walker inlines `gen(6)` and
-starts walking the generator body, escaping only via an abort. Verified **not** a
+had no `code_flags_make_generator` guard, so the walker inlined `gen(6)` and
+started walking the generator body, escaping only via an abort. Verified **not** a
 miscompile (jit / `PYRE_NO_JIT=1` / CPython agree on a `yield`-per-`next` probe)
-— it is wasted tracing, and a separate defect from this plan.
+— it was wasted tracing that discarded the whole trace 149 times.
 
-⇒ the honest denominator for R5 is **19**, not 170, and row 7's anchor is the
-dominant real blocker.
+Adding the guard (slice C) took leg 3 from 169 to **9** commits on its own, and
+is what actually makes legs 3/6 rare rather than dominant.
 
 #### ✅Slice B landed: row 7 (the segment anchor)
 
@@ -232,9 +234,12 @@ the walk-end MidBody arm retries through the extracted
 
 #### Next slice
 
-The remaining refusals are 3 `getarrayitem_vable_r` anchors and 1 non-`Ref`
-first argument (row 5). Row 1 (depth-1) and rows 4b/6 still have no corpus
-witness — do not work them without one.
+Leg 3's remaining 9 commits are the ceiling to attack next; 5 of them are the
+rebuild's fallback (a rebuild that latched but declined at
+`try_commit_midbody_abort`), so that decline is where the leverage is, not the
+latch. The remaining latch refusals are 3 `getarrayitem_vable_r` anchors and 1
+non-`Ref` first argument (row 5). Row 1 (depth-1) and rows 4b/6 still have no
+corpus witness — do not work them without one.
 
 ⚠️Do **not** drop the other conjunct, `!fbw_has_unjournaled_effect()`. Upstream's
 `execute_and_record` executes *then* records (`pyjitpl.py:2647-2662`), so
