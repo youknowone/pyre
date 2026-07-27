@@ -604,26 +604,75 @@ fn try_commit_entry_carrier_call(
     Some(call_py_pc)
 }
 
+/// Wrapper that names which narrowing kept a rebuild off leg 4; the reason
+/// otherwise vanishes into the entry-carrier fallback.
 fn try_commit_midbody_abort(
     ctx: &TraceCtx,
     cf_addr: usize,
     payload: &crate::jitcode_dispatch::MidBodyPayload,
     words: MidBodyFlushWords,
 ) -> bool {
+    match try_commit_midbody_abort_inner(ctx, cf_addr, payload, words) {
+        Ok(()) => true,
+        Err(reason) => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-abort-flush] gh#467 callee-rebuild NOT COMMITTED at \
+                     callee_py_pc={} ({reason})",
+                    words.callee_py_pc,
+                );
+            }
+            false
+        }
+    }
+}
+
+fn try_commit_midbody_abort_inner(
+    ctx: &TraceCtx,
+    cf_addr: usize,
+    payload: &crate::jitcode_dispatch::MidBodyPayload,
+    words: MidBodyFlushWords,
+) -> Result<(), &'static str> {
+    // An expression-position call sits on top of operands the payload does not
+    // record — it counts only the call's own `[callable, null_or_self, args…]`.
+    // The entry fallback's `reconstructed_all_ref_call_stack` is the caller's
+    // WHOLE operand stack at that pc, slot-ordered from the stack base, so its
+    // prefix is exactly that residue.
+    let below = match crate::state::outer_call_operands_below(
+        cf_addr,
+        words.call_py_pc,
+        words.post_call_py_pc,
+        payload.call_stack_len,
+    ) {
+        Some(0) => &[][..],
+        Some(n) => {
+            let Some(full) = payload
+                .entry_fallback
+                .as_ref()
+                .map(|fallback| fallback.call_stack.as_slice())
+                .filter(|full| full.len() == n + payload.call_stack_len)
+            else {
+                return Err("expression-position call with no reconstructed stack below it");
+            };
+            &full[..n]
+        }
+        None => return Err("caller stack depth does not model this call shape"),
+    };
     if !crate::state::can_flush_walk_end_state_after_outer_call(
         ctx,
         cf_addr,
         words.call_py_pc,
         words.post_call_py_pc,
         payload.call_stack_len,
+        below,
     ) {
-        return false;
+        return Err("outer call boundary not flushable");
     }
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(payload.w_code) as *const pyre_interpreter::CodeObject
     };
     if raw.is_null() {
-        return false;
+        return Err("null callee code ptr");
     }
     let code = unsafe { &*raw };
     // Only portal trace sites currently carry `_exit_frame_with_exception`
@@ -634,15 +683,15 @@ fn try_commit_midbody_abort(
         && (!code.exceptiontable.is_empty()
             || !midbody_post_marker_is_effect_free(code, words.callee_py_pc))
     {
-        return false;
+        return Err("no propagate licence and callee body can raise");
     }
     if cf_addr == 0 {
-        return false;
+        return Err("no live caller frame");
     }
     let ec = unsafe { (*(cf_addr as *const pyre_interpreter::PyFrame)).execution_context }
         as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
-        return false;
+        return Err("null execution context");
     }
     let propagate_allowed = WALK_END_PROPAGATE_ALLOWED.with(|c| c.get());
     let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
@@ -662,14 +711,14 @@ fn try_commit_midbody_abort(
                 outer.locals_w().as_slice().len(),
                 outer_stack_base,
             ) {
-                return false;
+                return Err("caller handler keeps an operand below the call");
             }
         }
         // G7: materialize every outer local before the rebuilt callee can run.
         // `can_flush_walk_end_state_after_outer_call` already proved all
         // shadow entries sourceable, so no post-effect decline remains.
         if !crate::state::write_back_outer_locals(ctx, cf_addr) {
-            return false;
+            return Err("an outer local is not sourceable");
         }
     }
     let mut w_code = payload.w_code;
@@ -687,7 +736,7 @@ fn try_commit_midbody_abort(
         pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
     ) {
         Ok(frame) => frame,
-        Err(_) => return false,
+        Err(_) => return Err("callee frame allocation failed"),
     };
     let mut frame = pyre_interpreter::pyframe::FrameBox::new(frame);
     frame.fix_array_ptrs();
@@ -696,10 +745,10 @@ fn try_commit_midbody_abort(
     let Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(current)) =
         crate::jitcode_dispatch::fbw_abort_carrier_clone()
     else {
-        return false;
+        return Err("carrier is no longer a MidBody");
     };
     if current.live_locals.len() != code.varnames.len() {
-        return false;
+        return Err("live_locals length does not match varnames");
     }
     for slot in &mut frame.locals_w_mut().as_mut_slice()[..code.varnames.len()] {
         *slot = pyre_object::PY_NULL;
@@ -714,7 +763,7 @@ fn try_commit_midbody_abort(
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
     for (rel, value) in current.live_stack.iter().enumerate() {
         let crate::state::ConcreteValue::Ref(value) = value else {
-            return false;
+            return Err("live stack slot is not a Ref");
         };
         frame.locals_w_mut().as_mut_slice()[stack_base + rel] = *value;
     }
@@ -740,7 +789,7 @@ fn try_commit_midbody_abort(
                 pyre_object::floatobject::w_float_new(*value)
             }
             Some(crate::state::ConcreteValue::Null | crate::state::ConcreteValue::Bool(_)) => {
-                return false;
+                return Err("live local is Null/Bool");
             }
         };
     }
@@ -755,14 +804,38 @@ fn try_commit_midbody_abort(
         Ok(mut retval) => {
             crate::jitcode_dispatch::fbw_abort_carrier_set_return(retval);
             let _retval_root = ObjectSlotRoot::new(&mut retval);
-            crate::state::flush_walk_end_state_after_outer_call(
+            // `below` came from a clone taken BEFORE the callee ran; a minor
+            // collection inside it can have moved those objects.  Re-read them
+            // from the live carrier, which the abort-resume GC root area keeps
+            // forwarded.
+            let fresh = crate::jitcode_dispatch::fbw_abort_carrier_clone();
+            let below_now = match (below.len(), fresh.as_ref()) {
+                (0, _) => &[][..],
+                (
+                    n,
+                    Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(fresh)),
+                ) => match fresh.entry_fallback.as_ref() {
+                    Some(fallback) if fallback.call_stack.len() >= n => &fallback.call_stack[..n],
+                    _ => return Err("entry fallback vanished while the callee ran"),
+                },
+                _ => return Err("carrier is no longer a MidBody after the callee ran"),
+            };
+            // The callee has already RUN.  A false here is not a plain
+            // decline: it drops to the legacy replay with the callee's
+            // effects applied.
+            if crate::state::flush_walk_end_state_after_outer_call(
                 ctx,
                 cf_addr,
                 words.call_py_pc,
                 words.post_call_py_pc,
                 current.call_stack_len,
+                below_now,
                 retval,
-            )
+            ) {
+                Ok(())
+            } else {
+                Err("post-call caller flush declined AFTER the callee ran")
+            }
         }
         Err(mut operr) => {
             // `_resume_mainloop(current_exc)` returns the exception to the
@@ -771,7 +844,7 @@ fn try_commit_midbody_abort(
             // selected handler onward.
             unsafe { (*ec).sys_exc_value = sys_exc_value_pre };
             if !propagate_allowed {
-                return false;
+                return Err("callee raised and this site has no propagate licence");
             }
             let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
             outer.last_instr = words.call_py_pc as isize;
@@ -782,7 +855,7 @@ fn try_commit_midbody_abort(
             } else {
                 WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(operr));
             }
-            true
+            Ok(())
         }
     }
 }

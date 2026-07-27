@@ -4562,15 +4562,54 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     true
 }
 
-/// Allocation-free preflight for the depth-1 post-CALL delivery. Every gate
-/// is checked before the rebuilt callee runs, so a later decline cannot replay
-/// effects the plain interpreter already committed.
+/// How many operands the CALL at `call_py_pc` sits on top of: the caller's
+/// static stack height there minus the call's own `[callable, null_or_self,
+/// args...]`.  Zero for a statement-position call, positive for an
+/// expression-position one (`total += f(x)` keeps `total` below the call).
+/// `None` when the two disagree, i.e. the residual's operand list does not
+/// model this call shape.
+pub(crate) fn outer_call_operands_below(
+    frame: usize,
+    call_py_pc: usize,
+    post_call_py_pc: usize,
+    call_stack_len: usize,
+) -> Option<usize> {
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return None;
+    }
+    let depths = crate::liveness::liveness_for(raw_code).depth_at_py_pc();
+    let at_call = usize::from(depths.get(call_py_pc).copied()?);
+    let after_call = usize::from(depths.get(post_call_py_pc).copied()?);
+    let below = at_call.checked_sub(call_stack_len)?;
+    // The call leaves exactly one value where its operands were.
+    (after_call == below + 1).then_some(below)
+}
+
+/// Allocation-free preflight for the post-CALL delivery. Every gate is checked
+/// before the rebuilt callee runs, so a later decline cannot replay effects the
+/// plain interpreter already committed.
+///
+/// `below` is [`outer_call_operands_below`]'s slice of the caller's operand
+/// stack — empty for a statement-position call.  Leg 4's payload records only
+/// the call's own operand count, so an expression-position call sources the
+/// residue from the entry carrier's full-stack reconstruction.
 pub(crate) fn can_flush_walk_end_state_after_outer_call(
     ctx: &TraceCtx,
     frame: usize,
     call_py_pc: usize,
     post_call_py_pc: usize,
     call_stack_len: usize,
+    below: &[PyObjectRef],
 ) -> bool {
     if frame == 0 {
         return false;
@@ -4594,10 +4633,12 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     if raw_code.is_null() {
         return false;
     }
-    let depths = crate::liveness::liveness_for(raw_code).depth_at_py_pc();
-    if depths.get(call_py_pc).copied().map(usize::from) != Some(call_stack_len)
-        || depths.get(post_call_py_pc).copied() != Some(1)
-    {
+    let Some(want_below) =
+        outer_call_operands_below(frame, call_py_pc, post_call_py_pc, call_stack_len)
+    else {
+        return false;
+    };
+    if want_below != below.len() || below.iter().any(|slot| slot.is_null()) {
         return false;
     }
     let Some(lastblock_idx) = info
@@ -4616,14 +4657,17 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
         return false;
     }
     let base = info.num_static_extra_boxes;
-    if (0..nlocals).any(|abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
+    if let Some(abs) = (0..nlocals).find(|&abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[after-call] outer local {abs} has no shadow entry");
+        }
         return false;
     }
     let arr_ptr = unsafe {
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
-    !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + 1
+    !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + below.len() + 1
 }
 
 /// Materialize the outer frame's locals from the virtualizable shadow.
@@ -4673,6 +4717,7 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
     call_py_pc: usize,
     post_call_py_pc: usize,
     call_stack_len: usize,
+    below: &[PyObjectRef],
     retval: PyObjectRef,
 ) -> bool {
     if !can_flush_walk_end_state_after_outer_call(
@@ -4681,6 +4726,7 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
         call_py_pc,
         post_call_py_pc,
         call_stack_len,
+        below,
     ) {
         return false;
     }
@@ -4692,11 +4738,17 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
-    // Land the nursery-resident result, then arm the barrier before
+    // Restore the operands the CALL sat on top of, then land the
+    // nursery-resident result above them, arming the barrier before
     // `write_back_outer_locals` boxes locals (an allocation that can
-    // collect the just-stored result if the array is not remembered).
+    // collect the just-stored refs if the array is not remembered).
     unsafe {
-        (*arr_ptr).as_mut_slice()[nlocals] = retval;
+        let slots = (*arr_ptr).as_mut_slice();
+        if slots.len() < nlocals + below.len() + 1 {
+            return false;
+        }
+        slots[nlocals..nlocals + below.len()].copy_from_slice(below);
+        slots[nlocals + below.len()] = retval;
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
     if !write_back_outer_locals(ctx, frame) {
@@ -4704,7 +4756,7 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
     }
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
-        pf.valuestackdepth = nlocals + 1;
+        pf.valuestackdepth = nlocals + below.len() + 1;
         pf.last_instr = post_call_py_pc as isize - 1;
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);

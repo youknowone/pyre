@@ -156,13 +156,14 @@ i.e. rows 1/4/5 — **is refuted by measurement**. Slice A dropped row 2 and mad
 leg 4 preferred; the conversion was **zero**. Census over `pyre/bench/synth`
 (315 files, `PYRE_FBW_DEBUG_ABORT=1`):
 
-| | base | after slices A–C |
+| | base | after slices A–D |
 |---|---|---|
-| leg 3 `EntryCarrierCall` commits | 169 | **9** |
-| leg 4 `CalleeRebuild` commits | 1 | **11** |
+| leg 3 `EntryCarrierCall` commits | 169 | **4** |
+| leg 4 `CalleeRebuild` commits | 1 | **16** |
 | refusal: callee is a generator | 151 | 0 |
 | refusal: abort pc is not an exact segment anchor | 18 | 3 |
 | refusal: first callee argument is not a `Ref` | 1 | 1 |
+| rebuild latched but declined at the flush | 0 | 0 |
 
 Row 1 never fired. Rows 4b and 6 never fired. Print the denominator: 149 of the
 151 generator refusals came from one loop in `calls_closures.py`, and the 18
@@ -232,14 +233,33 @@ TL;DR §3, and precisely the double-apply the entry carrier was built to close.
 the walk-end MidBody arm retries through the extracted
 `try_commit_entry_carrier_call`. Commit totals are conserved: 169+1 → 159+11.
 
+#### ✅Slice D landed: expression-position calls
+
+All 5 rebuilds that latched and then declined failed one gate,
+`can_flush_walk_end_state_after_outer_call`, and all 5 for the same reason: the
+CALL was in **expression** position (static depth 7 at a 6-operand call, 2
+after), while the preflight demanded `depths[post_call_py_pc] == 1` — the
+statement-position specialization.
+
+`outer_call_operands_below` now computes the residue
+`depths[call_py_pc] - call_stack_len` and requires
+`depths[post_call_py_pc] == below + 1`; the flush restores those operands under
+the return value and sets `valuestackdepth` accordingly. `MidBodyPayload`
+records only the call's own operand count, so the residue is sourced from
+`entry_fallback.call_stack` — the entry carrier's
+`reconstructed_all_ref_call_stack` is the caller's WHOLE operand stack at that
+pc, slot-ordered from the stack base, so its prefix is exactly the residue.
+
+⚠️GC: those refs are written **after** `frame.execute_frame` has run arbitrary
+Python, so they are re-read from the live carrier (kept forwarded by the
+abort-resume root area), never from the pre-execute clone.
+
 #### Next slice
 
-Leg 3's remaining 9 commits are the ceiling to attack next; 5 of them are the
-rebuild's fallback (a rebuild that latched but declined at
-`try_commit_midbody_abort`), so that decline is where the leverage is, not the
-latch. The remaining latch refusals are 3 `getarrayitem_vable_r` anchors and 1
-non-`Ref` first argument (row 5). Row 1 (depth-1) and rows 4b/6 still have no
-corpus witness — do not work them without one.
+Leg 3 is down to 4 commits, each of them a rebuild that could not latch:
+3 `getarrayitem_vable_r` anchors and 1 non-`Ref` first argument (row 5).
+No rebuild declines at the flush any more. Row 1 (depth-1) and rows 4b/6 still
+have no corpus witness — do not work them without one.
 
 ⚠️Do **not** drop the other conjunct, `!fbw_has_unjournaled_effect()`. Upstream's
 `execute_and_record` executes *then* records (`pyjitpl.py:2647-2662`), so
