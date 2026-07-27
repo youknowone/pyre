@@ -2948,8 +2948,25 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::print_output(&s);
             return Ok(());
         };
-        let s_obj = pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(source)? });
+        let s_obj = pyre_object::w_str_from_wtf8_managed(unsafe { crate::py_str_wtf8(source)? });
         let r = crate::baseobjspace::call_method(fp, "write", &[s_obj]);
+        if r.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("print: file.write() failed")));
+        }
+        Ok(())
+    };
+    // A default separator / terminator is a fixed ASCII literal; on the native
+    // stdout path write it straight to the stream rather than building a
+    // throwaway str object per gap/line.  The `file=` path still hands a str
+    // to `file.write`.
+    let emit_literal = |lit: &str| -> Result<(), crate::PyError> {
+        let Some(fp) = file else {
+            crate::print_output(lit);
+            return Ok(());
+        };
+        let r =
+            crate::baseobjspace::call_method(fp, "write", &[pyre_object::w_str_new_managed(lit)]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| crate::PyError::runtime_error("print: file.write() failed")));
@@ -2958,11 +2975,17 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     for (i, &obj) in positional.iter().enumerate() {
         if i > 0 {
-            emit(sep.unwrap_or_else(|| w_str_new(" ")))?;
+            match sep {
+                Some(s) => emit(s)?,
+                None => emit_literal(" ")?,
+            }
         }
         emit(obj)?;
     }
-    emit(end.unwrap_or_else(|| w_str_new("\n")))?;
+    match end {
+        Some(e) => emit(e)?,
+        None => emit_literal("\n")?,
+    }
     if flush {
         match file {
             None => {
@@ -6361,7 +6384,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // before `is_str` / `ob_type` touch it as a pointer.
     // Mirrors `py_str_wtf8` / `py_repr_obj`. Gated on `CAN_BE_TAGGED`.
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-        return Ok(w_str_new(&format!(
+        return Ok(pyre_object::w_str_new_managed(&format!(
             "{}",
             pyre_object::tagged_int::untag_int(obj)
         )));
@@ -6382,7 +6405,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if is_exact_type(obj, &STR_TYPE) {
                 return Ok(obj);
             }
-            return Ok(pyre_object::w_str_from_wtf8(
+            return Ok(pyre_object::w_str_from_wtf8_managed(
                 pyre_object::w_str_get_wtf8(obj).to_owned(),
             ));
         }
@@ -6408,13 +6431,13 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
-    Ok(pyre_object::w_str_from_wtf8(w))
+    Ok(pyre_object::w_str_from_wtf8_managed(w))
 }
 
 unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-            return Ok(w_str_new(&format!(
+            return Ok(pyre_object::w_str_new_managed(&format!(
                 "{}",
                 pyre_object::tagged_int::untag_int(obj)
             )));
@@ -6433,9 +6456,9 @@ unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         }
-        Ok(pyre_object::w_str_from_wtf8(crate::display::py_repr_wtf8(
-            obj,
-        )?))
+        Ok(pyre_object::w_str_from_wtf8_managed(
+            crate::display::py_repr_wtf8(obj)?,
+        ))
     }
 }
 
