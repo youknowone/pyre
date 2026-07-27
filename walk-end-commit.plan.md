@@ -141,15 +141,56 @@ builder — in the order they refuse:
 | # | refusal | upstream counterpart |
 |---|---|---|
 | 1 | `is_top_inline` (depth-1 only) | none — upstream loops over the whole `framestack` (`blackhole.py:1799-1821`) |
-| 2 | `fbw_executed_effect_count() != executed_effects_before` | none — routing filter, drop it |
+| 2 | ~~`fbw_executed_effect_count() != executed_effects_before`~~ | dropped (slice A) |
 | 3 | `!fbw_has_unjournaled_effect()` | ⚠️KEEP — see below |
-| 4 | generator / `cellvars` / `freevars` / non-null closure | none — upstream rebuilds any frame |
+| 4a | callee is a generator / coroutine | ✅CORRECT, keep — see below |
+| 4b | `cellvars` / `freevars` / non-null closure | none — upstream rebuilds any frame |
 | 5 | `callee_arg_concretes.first()` must be a `Ref` (`x_arg`) | none — single-argument residue |
 | 6 | every live stack slot a non-null `Ref`; every live local resolvable and not `Null`/`Bool` | partial — upstream reads typed registers per frame |
-| 7 | `anchor_ok` / `abort_flush_call_jitcode_coord` / `depth`+`pcdep` resolvable | pyre's jitcode↔py_pc mapping, orthogonal |
+| 7 | `anchor_ok` / `abort_flush_call_jitcode_coord` / `depth`+`pcdep` resolvable | pyre's jitcode↔py_pc mapping, the F1 charter deviation |
 
-Rows 1, 4 and 5 are the ones the per-level `PyFrame` materialization blocks;
-rows 2 and 6 are independent of it and can move first.
+#### ⛔The assumed blocker is not the measured one
+
+The blocker recorded here before slice A — per-level `PyFrame` materialization,
+i.e. rows 1/4/5 — **is refuted by measurement**. Slice A dropped row 2 and made
+leg 4 preferred; the conversion was **zero**. Census over `pyre/bench/synth`
+(315 files, `PYRE_FBW_DEBUG_ABORT=1`):
+
+| | count |
+|---|---|
+| leg 3 `EntryCarrierCall` commits | 169 |
+| leg 4 `CalleeRebuild` commits | 1 |
+| refusal: callee is a generator | 151 |
+| refusal: abort pc is not an exact segment anchor | 18 |
+| refusal: first callee argument is not a `Ref` | 1 |
+
+Row 1 never fired. Rows 4b and 6 never fired. Print the denominator: 149 of the
+151 generator refusals come from one loop in `calls_closures.py`, and the 18
+anchor refusals are spread over 5 files (`foriter_exempt_nested_foriter`,
+`foriter_exempt_shared_generator`, `inline_subwalk_user_iterator`,
+`selfrec_tail_exception_unwind`, `bridge_recursion_overflow`).
+
+#### Row 4a is correct and must stay
+
+Rebuilding a generator callee would run its body eagerly instead of producing a
+generator object, so leg 4 refusing it is right. What is *not* right is that the
+call was inlined at all: `resolve_inlinable_callee` (`jitcode_dispatch/mod.rs`)
+has no `code_flags_make_generator` guard, so the walker inlines `gen(6)` and
+starts walking the generator body, escaping only via an abort. Verified **not** a
+miscompile (jit / `PYRE_NO_JIT=1` / CPython agree on a `yield`-per-`next` probe)
+— it is wasted tracing, and a separate defect from this plan.
+
+⇒ the honest denominator for R5 is **19**, not 170, and row 7's anchor is the
+dominant real blocker.
+
+#### Next slice: row 7 (the segment anchor)
+
+`exact_floor_segment_anchor` (`jitcode_dispatch/mod.rs`) demands the abort
+jitcode pc be the exact FIRST jitcode op of its Python pc's floor segment,
+because leg 4 rebuilds a **Python** frame at a **Python** pc. Upstream needs no
+such mapping: `_copy_data_from_miframe` (`blackhole.py:1711-1712`) resumes each
+blackhole at its **jitcode** position. This is the F1 charter deviation
+(py_pc ↔ jitcode), so the slice is scoped by it rather than by frame layout.
 
 ⚠️Do **not** drop the other conjunct, `!fbw_has_unjournaled_effect()`. Upstream's
 `execute_and_record` executes *then* records (`pyjitpl.py:2647-2662`), so
@@ -157,10 +198,12 @@ rows 2 and 6 are independent of it and can move first.
 can record without executing, so that state is real and the conjunct is
 load-bearing. It dies with the two-executor split, not with the odometer.
 
-Blocker: per-level `PyFrame` materialization (`fbw_strict_fold_frame_reg`,
-`vable_ops.rs`). Upstream avoids it only because `_nonstandard_virtualizable`
-already degraded callee frames to heap fields (`pyjitpl.py:1120-1146`).
-Tracked upstream of this as the inner-frame rebuild (gh#126/#215).
+Per-level `PyFrame` materialization (`fbw_strict_fold_frame_reg`,
+`vable_ops.rs`; the inner-frame rebuild, gh#126/#215) is still the blocker for
+row 1 *in principle* — upstream avoids it only because
+`_nonstandard_virtualizable` already degraded callee frames to heap fields
+(`pyjitpl.py:1120-1146`) — but no corpus case reaches it yet, so it is not what
+gates progress today.
 
 ### R6 — vable write-through parity
 
