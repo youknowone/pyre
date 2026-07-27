@@ -462,6 +462,17 @@ fn run_python_impl(source: &str) -> String {
     // JIT-compiled loop — can resolve its parent frame instead of tripping the
     // fail-fast topframe assert.
     pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+    // objspace.py `space.user_del_action`: the queue every registered
+    // finalizer's trigger fires into (`finalizer_queue_trigger` reads
+    // `ec.user_del_action`).  Without it the pointer stays null and the trigger
+    // returns silently, so NOTHING is ever finalized on this entry point — no
+    // `__del__`, no generator `finally`, not even under an explicit
+    // `gc.collect()`.  `pyrex::setup_exec_context` installs it at boot; this
+    // entry point is the other launcher and needs the same step.
+    unsafe {
+        let ec_ptr = std::rc::Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        (*ec_ptr).install_user_del_action();
+    }
     // Register the __build_class__ callback. Class construction resolves the
     // live frame from the execution-context slot seeded above.
     pyre_interpreter::call::register_build_class();
