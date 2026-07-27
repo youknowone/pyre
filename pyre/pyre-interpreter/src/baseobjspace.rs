@@ -7494,6 +7494,13 @@ pub fn text_wtf8_w(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
 /// `UnicodeEncodeError` with "surrogates not allowed" — instead of demanding a
 /// view the backing `Wtf8Buf` cannot give.
 pub fn str_utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    if !unsafe { pyre_object::is_str(obj) } {
+        return Err(PyError::type_error(format!(
+            "expected str, not {}",
+            crate::type_methods::arg_type_name(obj)
+        )));
+    }
+    // The raw buffer read below is only valid for a `str`.
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
     match wtf8.as_str() {
         Ok(s) => Ok(s),
