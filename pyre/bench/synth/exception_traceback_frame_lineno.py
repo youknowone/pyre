@@ -222,6 +222,26 @@ def mid_replay():
     ]
 
 
+def recursive_mid_replay(n, depth):
+    """Direct recursion, every level with its own hot loop, so every level is
+    replayed and every level shares ONE code object with its caller — the shape
+    where a per-level frame mix-up survives a code-object check.  A level
+    answering for another one shows up as a shifted offset."""
+    tb = None
+    k = 0
+    while k < n:
+        try:
+            raise ValueError(k)
+        except ValueError as e:
+            tb = e.__traceback__
+        k += 1
+    if depth > 0:
+        inner = recursive_mid_replay(n, depth - 1)
+    else:
+        inner = ()
+    return ((caller_offset(), caller_offset()),) + inner
+
+
 def kept_alive():
     """Many tracebacks alive at once: a shared or recycled frame collapses."""
     kept = []
@@ -242,6 +262,7 @@ for shape in loop_owners():
     print("loop_owner  ", shape)
 for shape in mid_replay():
     print("mid_replay  ", shape)
+print("recursive   ", recursive_mid_replay(N // 2, 3))
 kept_shapes, kept_distinct = kept_alive()
 print("kept        ", kept_shapes)
 print("kept_distinct", kept_distinct)
