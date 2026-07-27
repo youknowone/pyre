@@ -2106,17 +2106,32 @@ impl Optimization for OptVirtualize {
             // `drain_extra_operations_from` (called right after this method
             // returns) flushes it through the pipeline first.  The guard lands
             // in `new_operations` first, the FINISH second — the same final
-            // layout, with the guard's resume data finalized by the
-            // `store_final_boxes_in_guard` that `emit_guard_operation` runs for
-            // every guard it emits.
+            // op order.
             //
-            // RPython parity: optimize_FINISH does NOT call the generic
-            // escaping-op force path here. Forcing the FINISH args in the
-            // virtualize pass would happen before the stashed
-            // GUARD_NOT_FORCED_2 is reinserted, and store_final_boxes_in_guard
-            // would then see the already-forced return box in vable_array.
-            // The actual arg forcing belongs later in Optimizer._emit_operation,
-            // after the queued guard has been flushed ahead of FINISH.
+            // The RESUME DATA is where the two diverge.  Upstream finalizes the
+            // guard in `postprocess_FINISH`, i.e. after `emit(op)` forced the
+            // FINISH args, so `store_final_boxes_in_guard` sees a return box
+            // that was virtual as already materialized.  Here the guard is
+            // finalized on the way through the pipeline, before that forcing,
+            // and encodes the same box as still virtual.  Both are consistent
+            // images, but they are not the same image.
+            //
+            // BLOCKER for the faithful order.  `propagate_postprocess` (the
+            // port of optimizer.py's postprocess dispatch) is a method on a
+            // PASS, and the finalization a guard needs is
+            // `Optimizer::store_final_boxes_in_guard` with the knowledge
+            // `collect_optimizer_knowledge_for_resume(&self)` gathers — which
+            // needs the Optimizer, not a pass.  Running it from here with no
+            // knowledge would drop the bridgeopt sections that
+            // `serialize_optimizer_knowledge` puts in every other guard, buying
+            // one ordering divergence with a worse one.  Reaching upstream's
+            // shape needs an Optimizer-side FINISH postprocess that can insert
+            // at `new_operations.len() - 1` after its own emit.
+            //
+            // Nothing arms the token today — the portal-return
+            // `gen_store_back_in_vable` sets `forced_virtualizable`, so
+            // `store_token_in_vable` early-returns and no `GUARD_NOT_FORCED_2`
+            // reaches a FINISH — so neither image is currently observable.
             OpCode::Finish => {
                 self.finish_guard_op = self.last_guard_not_forced_2.take();
                 if let Some(guard_op) = self.finish_guard_op.clone() {

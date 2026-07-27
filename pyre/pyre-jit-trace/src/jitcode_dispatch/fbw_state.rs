@@ -1328,11 +1328,23 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 /// "If you have something equivalent of a Python generator, where the
 /// virtualizable survives for longer, you want to force it before returning.
 /// It's better to do it that way than by an external call some time later."
-/// A frame the function-entry portal compiled can survive its trace the same
-/// way — a traceback it hands out keeps it alive — and pyre cannot take the
-/// other route: the backend frees the jitframe chain before `execute_token`
-/// returns, so the force marker `store_token_in_vable` leaves behind would name
-/// freed memory rather than the retained deadframe upstream forces through.
+///
+/// Upstream applies it to ONE exit — `interp_jit.py` `PyFrame.dispatch` reads
+/// `except Yield: … jit.hint(self, force_virtualizable=True)` against a bare
+/// `except Return: return self.popvalue()`.  A generator frame is the only one
+/// that outlives its dispatch there; every other frame is answered lazily,
+/// through the marker `store_token_in_vable` leaves behind and the deadframe it
+/// names.  So this fires on an exit upstream leaves alone, and the ordinary
+/// return gives up the `FORCE_TOKEN`/`GUARD_NOT_FORCED_2` protocol for an
+/// unconditional store-back.
+///
+/// A frame the function-entry portal compiled can outlive its trace the same
+/// way a generator's does — a traceback it hands out keeps it alive — and the
+/// lazy route is not available to narrow this back down: the backend frees the
+/// jitframe chain before `execute_token` returns, so that marker would name
+/// freed memory rather than a retained deadframe.  Narrowing the force to the
+/// frames that actually escape needs that retention first; the escape is a
+/// runtime property, which is exactly what the token protocol exists to answer.
 ///
 /// Storing back here is what makes the token store unnecessary rather than
 /// merely redundant: `gen_store_back_in_vable` sets `forced_virtualizable`, and
