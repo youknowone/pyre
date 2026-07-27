@@ -2253,17 +2253,25 @@ pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `list_iterator.__setstate__(index)` — Python 3.14's specialized list
+/// iterator carries the exhausted state in the cursor itself, so a negative
+/// cursor exhausts the iterator instead of rewinding it to the front the way
+/// the generic sequence iterator does, and an index past the end is clamped to
+/// the length rather than stored verbatim.
 pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
-        if pyre_object::w_list_iter_seq(args[0]).is_null() {
+        let seq = pyre_object::w_list_iter_seq(args[0]);
+        if seq.is_null() {
             return Ok(w_none());
         }
-        // PyPy `W_AbstractSeqIterObject.descr_setstate` clamps a negative
-        // cursor to zero for every live sequence iterator, including the
-        // specialised list iterator.
         if index < 0 {
-            index = 0;
+            pyre_object::w_list_iter_set_seq(args[0], PY_NULL);
+            return Ok(w_none());
+        }
+        let length = pyre_object::w_list_len(seq) as i64;
+        if index > length {
+            index = length;
         }
         pyre_object::w_list_iter_set_index(args[0], index);
     }
@@ -2346,11 +2354,20 @@ pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult 
     }
 }
 
+/// `list_reverseiterator.__setstate__(index)` — the descending cursor is
+/// clamped to the last valid index, and a negative cursor exhausts the
+/// iterator, which is the state `descr_next` leaves behind once it walks off
+/// the front.
 pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
         let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
         if seq.is_null() {
+            return Ok(w_none());
+        }
+        if index < 0 {
+            pyre_object::w_list_reverse_iter_set_index(args[0], -1);
+            pyre_object::w_list_reverse_iter_set_seq(args[0], PY_NULL);
             return Ok(w_none());
         }
         let length = pyre_object::w_list_len(seq) as i64;
