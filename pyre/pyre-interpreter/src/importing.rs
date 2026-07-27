@@ -3094,6 +3094,11 @@ pub fn dunder_import_name_obj(
         w_locals
     });
     let fromlist_slot = shadow_stack_len();
+    let w_fromlist = if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    };
     pin_root(w_fromlist);
 
     let bootstrap = if let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") {
