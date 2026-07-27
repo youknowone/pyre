@@ -1052,6 +1052,13 @@ impl TraceCtx {
         self.virtualref_boxes.len()
     }
 
+    /// Snapshot the open virtual-ref scopes before a non-committal sub-walk.
+    /// If that walk is cut from the recorder, its stack mutations must be
+    /// rolled back with the operations.
+    pub fn snapshot_virtualref_boxes(&self) -> Vec<(OpRef, usize)> {
+        self.virtualref_boxes.clone()
+    }
+
     /// The innermost still-open scope's `virtualbox` — `virtualref_boxes[-2]`,
     /// the operand `opimpl_virtual_ref_finish` pops next.  A bridge resumes
     /// into scopes its parent guard opened, so the frame box that closes one is
@@ -1059,6 +1066,12 @@ impl TraceCtx {
     pub fn innermost_virtualref_virtual(&self) -> Option<(OpRef, usize)> {
         let len = self.virtualref_boxes.len();
         (len >= 2).then(|| self.virtualref_boxes[len - 2])
+    }
+
+    /// The innermost still-open scope's `vrefbox` —
+    /// `virtualref_boxes[-1]`.
+    pub fn innermost_virtualref_vref(&self) -> Option<(OpRef, usize)> {
+        self.virtualref_boxes.last().copied()
     }
 
     /// `pyjitpl.py:3433 rebuild_state_after_failure`'s

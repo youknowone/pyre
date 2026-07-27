@@ -49,6 +49,14 @@ pub(crate) fn carrier_ec_leave<Sym: WalkSym>(
         &[root_sym.frame()],
         crate::descr::pyframe_execution_context_descr(),
     );
+    // Every `GetfieldGcR` the enter/leave pair records carries its concrete
+    // value (`history.py:803 *FrontendOp(pos, value)`); without it
+    // `concrete_of_opref` reports this result symbolic on the residual-call
+    // and snapshot paths.  The value is the same EC the leave below acts on.
+    ctx.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_ec as usize)),
+    );
     super::inline_call::walker_ec_leave(
         ctx,
         callee_frame,

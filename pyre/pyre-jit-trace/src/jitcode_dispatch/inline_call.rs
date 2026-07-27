@@ -1783,7 +1783,10 @@ pub(crate) fn walker_ec_leave(
         // reachable; converge on the upstream spelling when the force lowering
         // lands.
         let live = ctx.virtualref_boxes_len();
-        if live >= 2 {
+        let vref_is_live = ctx
+            .innermost_virtualref_vref()
+            .is_some_and(|(vrefbox, _)| vrefbox.as_const_ptr().is_none_or(|vref| vref.0 != 0));
+        if live >= 2 && vref_is_live {
             ctx.stop_tracking_virtualref(live - 2);
         }
     }

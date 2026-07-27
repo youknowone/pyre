@@ -497,8 +497,13 @@ impl VirtualRefInfo {
             vref.virtual_token = TOKEN_NONE;
             // The vref is an old-gen allocation and `real_object` can be young,
             // so the `forced` store needs the generational barrier its creation
-            // counterpart in `alloc_virtual_ref` already carries.
-            majit_gc::gc_write_barrier(majit_ir::GcRef(vref_ptr as usize));
+            // counterpart in `alloc_virtual_ref` already carries.  That
+            // counterpart barriers only inside its GC-allocated arm, so skip
+            // an address the collector does not own (the `Box` arm taken
+            // before the vref type id is registered).
+            if majit_gc::gc_owns_object(vref_ptr as usize) {
+                majit_gc::gc_write_barrier(majit_ir::GcRef(vref_ptr as usize));
+            }
             vref.forced = real_object;
         }
     }

@@ -248,6 +248,41 @@ impl Drop for FrameLocalsRoot {
     }
 }
 
+/// Restores `ExecutionContext.topframeref` after compiled execution, including
+/// panic unwinds.  The saved pointer lives on the shadow stack so a moving
+/// collection can forward it in place, matching `CurrentFrameGuard`.
+struct TopFrameRefGuard {
+    ec: *mut PyExecutionContext,
+    saved_root: Option<usize>,
+}
+
+impl TopFrameRefGuard {
+    fn new(ec: *mut PyExecutionContext) -> Self {
+        let saved_root = if ec.is_null() {
+            None
+        } else {
+            let saved = unsafe { (*ec).topframeref };
+            Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
+                saved as usize,
+            )))
+        };
+        Self { ec, saved_root }
+    }
+}
+
+impl Drop for TopFrameRefGuard {
+    fn drop(&mut self) {
+        let Some(saved_root) = self.saved_root else {
+            return;
+        };
+        let saved = majit_gc::shadow_stack::get(saved_root);
+        majit_gc::shadow_stack::pop_to(saved_root);
+        unsafe {
+            (*self.ec).topframeref = saved.0 as *mut PyFrame;
+        }
+    }
+}
+
 /// Bridge pyre-object's `is_managed_heap_object` query to
 /// `majit_gc::gc_owns_object`. Used by host-side allocators
 /// (`pyre_object::dealloc_items_block`) to discriminate
@@ -7528,13 +7563,9 @@ fn execute_assembler(
     // `CurrentFrameGuard` bracket a frame: a balanced run restores the same
     // value it saved, an unbalanced exit restores the caller.
     let ec_for_topframeref = frame_root.frame().execution_context as *mut PyExecutionContext;
-    let saved_topframeref = if ec_for_topframeref.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*ec_for_topframeref).topframeref }
-    };
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
     let outcome = {
+        let _topframeref_guard = TopFrameRefGuard::new(ec_for_topframeref);
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -7544,9 +7575,6 @@ fn execute_assembler(
             || {},
         )
     };
-    if !ec_for_topframeref.is_null() {
-        unsafe { (*ec_for_topframeref).topframeref = saved_topframeref };
-    }
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // JIT-overflow flag the backend probe records when it trips. The

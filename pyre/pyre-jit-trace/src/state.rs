@@ -9403,11 +9403,19 @@ impl JitState for PyreJitState {
         };
         if !live_ec.is_null() && restored_top != 0 {
             let published = unsafe { (*live_ec).topframeref };
-            if published as usize != restored_top
-                && unsafe {
+            // A scope the guard still had open must be republished whatever the
+            // slot currently holds: `execute_assembler` restores `topframeref`
+            // to the frame it saved before the run, so after an inlined-callee
+            // guard the slot names the portal frame — not a vref — and leaving
+            // it there would expose the portal to a residual `sys._getframe()`
+            // and close the wrong concrete chain on leave.  With no scope open
+            // `restored_top` is the resumed frame itself, and only a stale vref
+            // in the slot is worth overwriting.
+            let stale_scope = !restored_virtualref_boxes.is_empty()
+                || unsafe {
                     majit_metainterp::virtualref::ptr_is_virtual_ref(published as *const u8)
-                }
-            {
+                };
+            if published as usize != restored_top && stale_scope {
                 unsafe {
                     (*live_ec).topframeref = restored_top as *mut pyre_interpreter::PyFrame;
                 }
