@@ -43,9 +43,7 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
 /// bytes-like source only, so a str of any kind is rejected by its type.
 fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     match unsafe { crate::typedef::buffer_as_bytes_like(obj) }? {
-        Some(src) if !unsafe { is_str(obj) } => {
-            Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec())
-        }
+        Some(src) => Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec()),
         _ => Err(crate::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
             crate::baseobjspace::object_functionstr_type_name(obj)
