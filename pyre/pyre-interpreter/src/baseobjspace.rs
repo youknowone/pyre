@@ -13872,6 +13872,12 @@ unsafe fn generator_invoke_execute_frame(
     if !ec.is_null() {
         (*ec).push_gen_or_coroutine(gen_obj);
     }
+    // generator.py:_invoke_execute_frame enters through the execution
+    // context of the thread that is resuming the generator.  A suspended
+    // frame must not retain the context of the thread that created or last
+    // ran it: that thread may have exited before close()/finalization resumes
+    // the frame elsewhere.
+    frame.execution_context = ec;
     let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
     let result = match result {
         Err(e) => {
@@ -13898,6 +13904,7 @@ unsafe fn generator_invoke_execute_frame(
     };
     // generator.py:142-145 `finally`.
     frame.f_backref = std::ptr::null_mut();
+    frame.execution_context = std::ptr::null();
     w_generator_set_running(gen_obj, false);
     if !ec.is_null() {
         (*ec).pop_gen_or_coroutine(gen_obj);
