@@ -40,6 +40,12 @@ pub struct TracePosition {
     pub snapshot_data_len: usize,
     /// opencoder.py:567 `len(self._snapshot_array_data)`.
     pub snapshot_array_data_len: usize,
+    /// pyre-only: `Trace::guard_count` at the cut point, so
+    /// [`Trace::cut`] restores it without rescanning `ops`.  RPython keeps
+    /// no guard counter, so this has no slot in opencoder.py's 5-tuple;
+    /// `None` marks a position minted by a producer that does not track
+    /// one (`TraceRecordBuffer::cut_point`) and makes `cut` recompute.
+    pub guard_count: Option<usize>,
 }
 
 /// opencoder.py Snapshot parity: per-guard snapshot of the interpreter
@@ -125,6 +131,14 @@ pub struct Trace {
     inputargs: Vec<InputArgRc>,
     /// Next OpRef index to assign.
     op_count: u32,
+    /// Running count of recorded guards, kept in sync by the two
+    /// `record_guard*` entry points (the only producers — `record_op` /
+    /// `record_op_with_descr` assert the opcode is not a guard) and
+    /// restored by [`Self::cut`] from `TracePosition::guard_count`.
+    /// `num_guards` is consulted once per traced vable op
+    /// (`walker_capture_inline_nonstandard_vable_guard`), so counting by
+    /// scanning `ops` made tracing quadratic in trace length.
+    guard_count: usize,
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
@@ -141,6 +155,7 @@ impl Trace {
             ops: Vec::with_capacity(256),
             inputargs: Vec::new(),
             op_count: 0,
+            guard_count: 0,
             box_count: 0,
         }
     }
@@ -313,6 +328,7 @@ impl Trace {
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
+        self.guard_count += 1;
         let op = match descr {
             Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
             None => Op::new(opcode, &self.box_args(args)),
@@ -338,6 +354,7 @@ impl Trace {
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
+        self.guard_count += 1;
         let op = match descr {
             Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
             None => Op::new(opcode, &self.box_args(args)),
@@ -489,6 +506,7 @@ impl Trace {
             _index: self.box_count,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
+            guard_count: Some(self.guard_count),
         }
     }
 
@@ -502,6 +520,12 @@ impl Trace {
         self.ops.truncate(pos._pos);
         self.op_count = pos._count;
         self.box_count = pos._index;
+        // `record_result_of_call_pure` cuts back after every speculative
+        // pure-call record, so this runs on a hot path — restore from the
+        // saved position instead of rescanning `ops`.
+        self.guard_count = pos
+            .guard_count
+            .unwrap_or_else(|| self.ops.iter().filter(|op| op.opcode.is_guard()).count());
     }
 
     /// history.py:725 `length`: number of non-inputarg ops recorded so far.
@@ -523,7 +547,7 @@ impl Trace {
 
     /// Number of guards recorded so far.
     pub fn num_guards(&self) -> usize {
-        self.ops.iter().filter(|op| op.opcode.is_guard()).count()
+        self.guard_count
     }
 
     /// Access the recorded operations.
@@ -537,6 +561,9 @@ impl Trace {
     /// without driving the full record path.
     #[cfg(test)]
     pub fn push_op_for_test(&mut self, op: Op) {
+        if op.opcode.is_guard() {
+            self.guard_count += 1;
+        }
         self.ops.push(OpRc::new(op));
     }
 

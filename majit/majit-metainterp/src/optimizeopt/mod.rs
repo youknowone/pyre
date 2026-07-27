@@ -2653,9 +2653,25 @@ impl OptContext {
         // `resop_refs` is keyed by the full type-tagged `OpRef`; a raw `u32`
         // can host more than one entry (typed vs untyped). Any host at this
         // raw carrying `Forwarded::Const` claims the position.
-        let resop_const = self.resop_refs.values().any(|op| {
-            op.pos.get().raw() == raw && matches!(*op.forwarded.borrow(), Forwarded::Const(_))
-        });
+        //
+        // Every key is the value's own `op.pos` (`install_canonical_producer`,
+        // `materialize_operand_at`), so the hosts at `raw` are exactly the
+        // OpRef variants that carry it. Probing those keys keeps this O(1):
+        // scanning `resop_refs` made `allocate_next_pos_raw` linear in the
+        // trace, and it runs once per `reserve_pos_typed`, so the whole
+        // optimizer emit path was quadratic in trace length.
+        let resop_const = [
+            OpRef::IntOp(raw),
+            OpRef::FloatOp(raw),
+            OpRef::RefOp(raw),
+            OpRef::VoidOp(raw),
+            OpRef::InputArgInt(raw),
+            OpRef::InputArgFloat(raw),
+            OpRef::InputArgRef(raw),
+        ]
+        .iter()
+        .filter_map(|key| self.resop_refs.get(key))
+        .any(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
         let inputarg_const = self
             .inputarg_refs
             .get(idx)

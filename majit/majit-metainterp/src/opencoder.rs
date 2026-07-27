@@ -1681,6 +1681,10 @@ impl Trace {
             _index: self._index,
             snapshot_data_len: self._snapshot_data.len(),
             snapshot_array_data_len: self._snapshot_array_data.len(),
+            // The byte-stream recorder keeps no guard counter; `None` makes
+            // `recorder::Trace::cut` recompute if such a position ever
+            // reaches it.
+            guard_count: None,
         }
     }
 
