@@ -1803,6 +1803,12 @@ fn write_exception_group<W: Write>(
     } else {
         shown
     };
+    for child_slot in exceptions.iter().take(shown) {
+        let child = pyre_object::gc_roots::shadow_stack_get(*child_slot);
+        context
+            .seen
+            .insert(pyre_object::gc_hook::gc_identity_hash(child as usize));
+    }
     context.need_close = false;
     for index in 0..count {
         let last = index + 1 == count;
@@ -1833,9 +1839,6 @@ fn write_exception_group<W: Write>(
             )?;
         } else {
             let child = pyre_object::gc_roots::shadow_stack_get(exceptions[index]);
-            context
-                .seen
-                .insert(pyre_object::gc_hook::gc_identity_hash(child as usize));
             write_exception_object_recursive(writer, child, context)?;
         }
         if last && context.need_close {
@@ -2014,10 +2017,11 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
         }
         for item_slot in item_slots {
             let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
-            let s = unsafe { crate::display::py_str(item) }
-                .unwrap_or_else(|_| "<unprintable note>".to_string());
-            for line in s.split('\n') {
-                writeln!(writer, "{}", line)?;
+            let s = unsafe { crate::display::py_str_wtf8(item) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable note>".to_string()));
+            for line in s.as_bytes().split(|byte| *byte == b'\n') {
+                writer.write_all(line)?;
+                writer.write_all(b"\n")?;
             }
         }
         return Ok(());
@@ -2308,6 +2312,13 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
     let wrong_name = unsafe { pyre_object::w_str_get_value(wrong) }.to_string();
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    let tb_slot = if tb.is_null() {
+        None
+    } else {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(tb);
+        Some(slot)
+    };
     let suggestion = match kind {
         ExcKind::AttributeError => {
             let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
@@ -2317,6 +2328,9 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             object_dir_strings(obj).and_then(|mut names| {
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let tb = tb_slot
+                    .map(pyre_object::gc_roots::shadow_stack_get)
+                    .unwrap_or(pyre_object::PY_NULL);
                 if !wrong_name.starts_with('_') && !traceback_self_is(tb, obj) {
                     names.retain(|name| !name.starts_with('_'));
                 }

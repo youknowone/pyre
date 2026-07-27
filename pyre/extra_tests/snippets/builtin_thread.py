@@ -198,6 +198,11 @@ range_notes.__notes__ = range(2)
 range_notes_output = hook_output(range_notes)
 assert range_notes_output.endswith("0\n1\n")
 
+surrogate_note = ValueError("surrogate note")
+surrogate_note.add_note("bad\ud800note")
+surrogate_note_output = hook_output(surrogate_note)
+assert surrogate_note_output.endswith("bad\ud800note\n")
+
 scalar_notes = ValueError("scalar notes")
 scalar_notes.__notes__ = "detail"
 scalar_notes_output = hook_output(scalar_notes)
@@ -242,6 +247,14 @@ assert hook_output(attribute_suggestion).endswith(
 
 class PrivateSuggestionTarget:
     _public = 1
+
+    def __dir__(self):
+        import gc
+
+        garbage = [[index] for index in range(4096)]
+        gc.collect()
+        assert len(garbage) == 4096
+        return ["_public"]
 
     def fail(self):
         return self.public
@@ -296,6 +309,15 @@ assert "ExceptionGroup: inner (1 sub-exception)\n" in group_output
 assert "TypeError: nested leaf\n" in group_output
 assert "+---------------- 1 ----------------\n" in group_output
 assert "+------------------------------------\n" in group_output
+
+later_group_child = TypeError("later child")
+first_group_child = ValueError("first child")
+first_group_child.__cause__ = later_group_child
+sibling_chain_group_output = hook_output(
+    ExceptionGroup("sibling chain", [first_group_child, later_group_child])
+)
+assert sibling_chain_group_output.count("TypeError: later child\n") == 1
+assert "direct cause" not in sibling_chain_group_output
 
 self_cause = ValueError("self cycle")
 self_cause.__cause__ = self_cause
