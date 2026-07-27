@@ -420,6 +420,39 @@ pub fn try_gc_jitframe_empty() -> bool {
     }
 }
 
+/// Signature of the host-side `(oldgen_total, nursery_used)` byte-stats
+/// callback. `oldgen_total` is `get_total_memory_used`
+/// (incminimark.py:1264-1268).
+pub type GcHeapStatsHookFn = fn() -> (usize, usize);
+
+majit_gc::global_hook!(static GC_HEAP_STATS_HOOK: GcHeapStatsHookFn);
+
+/// Install the heap-byte-stats callback.
+pub fn register_gc_heap_stats_hook(hook: GcHeapStatsHookFn) {
+    GC_HEAP_STATS_HOOK.set(Some(hook));
+}
+
+/// Remove the heap-byte-stats callback.
+pub fn clear_gc_heap_stats_hook() {
+    GC_HEAP_STATS_HOOK.set(None);
+}
+
+/// Report `(oldgen_total, nursery_used)` in bytes via the installed hook.
+/// `(0, 0)` when none is installed, which leaves the interpreter safepoint on
+/// its `min_heap_size` floor.
+///
+/// Reads the runtime-mutable `GC_HEAP_STATS_HOOK` fn-pointer cell, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the [`try_gc_jitframe_empty`] twin). It
+/// cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_heap_stats() -> (usize, usize) {
+    match GC_HEAP_STATS_HOOK.get() {
+        Some(f) => f(),
+        None => (0, 0),
+    }
+}
+
 /// Signature of the host-side root-register callbacks.
 /// `slot` is a pointer to a slot holding a `PyObjectRef`
 /// (equivalently `*mut u8`); the GC treats it as a live root until

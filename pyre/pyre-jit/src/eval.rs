@@ -141,6 +141,13 @@ fn pyre_object_gc_collect_oldgen_trampoline() {
     majit_gc::collect_oldgen_nonmoving();
 }
 
+/// Trampoline for the interpreter safepoint's `(oldgen_total, nursery_used)`
+/// read, used to re-derive its next-major threshold from what survived a
+/// collection (`set_major_threshold_from`, incminimark.py:575-594).
+fn pyre_object_gc_heap_stats_trampoline() -> (usize, usize) {
+    majit_gc::active_heap_stats()
+}
+
 fn pyre_object_gc_set_enabled_trampoline(enabled: bool) {
     majit_gc::gc_set_enabled(enabled);
 }
@@ -3463,6 +3470,7 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
+    pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
     pyre_object::gc_hook::register_gc_set_enabled_hook(pyre_object_gc_set_enabled_trampoline);
     pyre_object::gc_hook::register_gc_finalizer_hooks(
         pyre_object_gc_register_finalizer_trampoline,

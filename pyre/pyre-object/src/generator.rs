@@ -160,7 +160,7 @@ fn w_generator_or_coroutine_new(
     let raw =
         crate::gc_hook::try_gc_alloc_stable_raw(W_GENERATOR_GC_TYPE_ID, W_GENERATOR_OBJECT_SIZE);
     if !raw.is_null() {
-        crate::gc_interp::note_alloc();
+        crate::gc_interp::note_alloc(W_GENERATOR_OBJECT_SIZE);
         unsafe {
             std::ptr::write(raw as *mut GeneratorIterator, value);
         }

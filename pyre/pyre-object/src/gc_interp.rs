@@ -20,8 +20,10 @@
 //! path dict/set/list/instances already use), so they become GC-tracked without
 //! the move hazard, and trigger a full mark-sweep at a bytecode-dispatch
 //! safepoint (loop top, where the only live refs are in the frame and reachable
-//! through the registered `pyframe` root walker). The collection is throttled by
-//! an allocation counter so the old-gen high-water stays bounded.
+//! through the registered `pyframe` root walker). The collection is throttled
+//! the way `set_major_threshold_from` (incminimark.py:575-594) throttles a
+//! major: on bytes allocated since the last one, against a threshold re-derived
+//! from what survived it, so the cost is amortised against heap growth.
 //!
 //! Gated off by default on native; enabled with `PYRE_GC_INTERP=1`. On wasm it
 //! is on by default — the env read returns nothing there, and the interp-path
@@ -101,12 +103,37 @@ pub fn at_outermost_activation() -> bool {
 /// routing+collection while diagnosing root-completeness.
 static COLLECT_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Number of interpreter-routed object allocations since the last collection.
-static ALLOC_SINCE_GC: AtomicUsize = AtomicUsize::new(0);
+/// Bytes of interpreter-routed object allocation since the last collection.
+///
+/// The allocator accumulating a byte total is `nursery_free = result +
+/// totalsize` (minimark.py:556-557); a count of allocations has no upstream
+/// counterpart, and cannot bound anything because one allocation is not one
+/// size.
+static ALLOC_BYTES_SINCE_GC: AtomicUsize = AtomicUsize::new(0);
 
-/// Allocations between safepoint collections. At ~24-40 B per int/float this
-/// bounds the dead-object high-water to a couple of MB.
-const COLLECT_THRESHOLD: usize = 1 << 16;
+/// Bytes that must be allocated before the next safepoint collection.
+///
+/// `set_major_threshold_from` (incminimark.py:575-594) schedules the next major
+/// at `get_total_memory_used() * major_collection_threshold`, so the major cost
+/// is amortised against how much the heap grew rather than paid on a fixed
+/// cadence. `threshold_reached` (incminimark.py:1288-1290) is the comparison.
+///
+/// Held here as the equivalent *delta*: having allocated `b` bytes since the
+/// last major, the total is `live + b`, so `live + b >= live * threshold` is
+/// just `b >= live * (threshold - 1)`. That keeps the safepoint's per-dispatch
+/// test a plain atomic compare and confines the heap-stats read to the far
+/// rarer post-collection update.
+static NEXT_MAJOR_BYTES: AtomicUsize = AtomicUsize::new(MIN_HEAP_BYTES);
+
+/// `major_collection_threshold - 1` in hundredths (incminimark.py:198's 1.82
+/// default, as the growth delta 0.82). Integer maths keeps the safepoint free
+/// of floating point.
+const MAJOR_GROWTH_DELTA_PCT: usize = 82;
+
+/// Floor for [`NEXT_MAJOR_BYTES`], mirroring `min_heap_size`
+/// (incminimark.py:307). Without it a small live heap would schedule the next
+/// major almost immediately and the collection cost would dominate again.
+const MIN_HEAP_BYTES: usize = 8 << 20;
 
 /// Whether `PYRE_GC_INTERP` routes int/float allocations through the GC and
 /// arms the dispatch-loop safepoint. Reads the env once, then caches.
@@ -129,16 +156,22 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Account for one interpreter-routed allocation. Called from `w_int_new` /
-/// `w_float_new` after a successful `try_gc_alloc_stable`.
+/// Account for `size` bytes of interpreter-routed allocation. Called after a
+/// successful `try_gc_alloc_stable` with the payload size that succeeded.
 ///
-/// Touches the runtime-mutable `ALLOC_SINCE_GC` atomic; the value is not a
-/// build-time constant, so the JIT residualises the call instead of tracing
+/// Takes the size because the safepoint's budget is a byte budget: the
+/// allocator's own accumulation is `nursery_free = result + totalsize`
+/// (minimark.py:556-557). Counting allocations instead lets a workload that
+/// boxes many small objects trigger a whole-heap major far more often than the
+/// bytes it reclaims justify.
+///
+/// Touches the runtime-mutable `ALLOC_BYTES_SINCE_GC` atomic; the value is not
+/// a build-time constant, so the JIT residualises the call instead of tracing
 /// into it (`@dont_look_inside`, the [`enabled`] sibling). A `()` return has no
 /// discriminant to erase.
 #[majit_macros::dont_look_inside]
-pub fn note_alloc() {
-    ALLOC_SINCE_GC.fetch_add(1, Ordering::Relaxed);
+pub fn note_alloc(size: usize) {
+    ALLOC_BYTES_SINCE_GC.fetch_add(size, Ordering::Relaxed);
 }
 
 /// Dispatch-loop safepoint: when enough interpreter objects have accumulated,
@@ -175,11 +208,18 @@ pub fn safepoint() {
     }
     if collect_enabled()
         && at_outermost_activation()
-        && ALLOC_SINCE_GC.load(Ordering::Relaxed) >= COLLECT_THRESHOLD
+        && ALLOC_BYTES_SINCE_GC.load(Ordering::Relaxed) >= NEXT_MAJOR_BYTES.load(Ordering::Relaxed)
         && crate::gc_hook::try_gc_jitframe_empty()
     {
         crate::gc_hook::try_gc_collect_oldgen();
-        ALLOC_SINCE_GC.store(0, Ordering::Relaxed);
+        // `set_major_threshold_from` (incminimark.py:575-594) re-derives the
+        // next threshold from what survived, so a heap that keeps growing pays
+        // proportionally more between majors and a steady-state one stops
+        // collecting altogether.
+        let (oldgen_live, _nursery_used) = crate::gc_hook::try_gc_heap_stats();
+        let next = (oldgen_live / 100).saturating_mul(MAJOR_GROWTH_DELTA_PCT);
+        NEXT_MAJOR_BYTES.store(next.max(MIN_HEAP_BYTES), Ordering::Relaxed);
+        ALLOC_BYTES_SINCE_GC.store(0, Ordering::Relaxed);
     }
 }
 
