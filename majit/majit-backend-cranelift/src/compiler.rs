@@ -7904,6 +7904,22 @@ impl CraneliftBackend {
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "speed").unwrap();
+        // Cranelift's IR verifier defaults to on and re-checks every function we
+        // hand it, which is 25% of this backend's compile time (measured on the
+        // cel nested-loop shape: 3719 -> 2783 us, steady-state unchanged).
+        // compile.py:242-244 runs the equivalent trace consistency checks under
+        // `if not we_are_translated()`, i.e. only in the untranslated
+        // interpreter; `debug_assertions` is that same distinction here.
+        flag_builder
+            .set(
+                "enable_verifier",
+                if cfg!(debug_assertions) {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .unwrap();
         // cranelift 0.132 x86_64 `emit_return_call_common_sequence` panics
         // when `preserve_frame_pointers=false`:
         //   "frame pointers aren't fundamentally required for tail calls,
