@@ -1534,24 +1534,31 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
                     "memoryview: negative export count",
                 ));
             }
-            // `_release_underlying`: read the backing before `set_released`
-            // drops the view box.  A slice / copy (`owns_export == false`)
+            // `_release_underlying`.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
             if pyre_object::memoryview::w_memoryview_owns_export(mv) {
                 let backing = pyre_object::memoryview::w_memoryview_backing(mv);
-                // Clear the view before invoking the exporter hook so a
-                // re-entrant release is a no-op.
-                pyre_object::memoryview::w_memoryview_set_released(mv);
+                // Mark the view released before invoking the exporter hook so a
+                // re-entrant release is a no-op, but keep the view box until
+                // the hook returns: it is handed this memoryview and reads the
+                // backing back off it to identify the export it is undoing.
+                pyre_object::memoryview::w_memoryview_mark_released(mv);
                 // An `mmap` mapping keeps its count internally — it exposes no
                 // Python-callable release, so the drop cannot be forged from
                 // user code.  Every other exporter runs `__release_buffer__`.
-                if !release_external_backing(backing) {
-                    if let Some(release_fn) =
-                        crate::baseobjspace::lookup(backing, "__release_buffer__")
-                    {
-                        crate::call::call_function_impl_result(release_fn, &[backing, mv])?;
+                let released = if release_external_backing(backing) {
+                    Ok(())
+                } else {
+                    match crate::baseobjspace::lookup(backing, "__release_buffer__") {
+                        Some(release_fn) => {
+                            crate::call::call_function_impl_result(release_fn, &[backing, mv])
+                                .map(|_| ())
+                        }
+                        None => Ok(()),
                     }
-                }
+                };
+                pyre_object::memoryview::w_memoryview_drop_view(mv);
+                released?;
             } else {
                 pyre_object::memoryview::w_memoryview_set_released(mv);
             }

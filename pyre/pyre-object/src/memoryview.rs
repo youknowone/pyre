@@ -244,19 +244,34 @@ pub unsafe fn w_memoryview_owns_export(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).owns_export }
 }
 
-/// Release the view: drop the off-heap `BufferView` box (reclaiming any
-/// nested `Buffer::Sub` boxes through `Box`'s recursive drop glue) and null
-/// `view`, then flip `released`.  Mirrors `descr_release` clearing
-/// `self.view = None` (`memoryobject.py`) so the backing / view graph is
-/// dropped eagerly on release rather than lingering until the header is
-/// GC-collected.  Idempotent: a second call finds `view` already null.  The
-/// `released` flag is an inline scalar, so no write barrier is needed (a
-/// barrier guards `PyObjectRef` stores only).
+/// Flip `released` without touching the view box, so a re-entrant `release()`
+/// is already a no-op while the view is still readable.  The exporter's
+/// `__release_buffer__` runs in exactly that window: it is handed this
+/// memoryview and reads its backing to identify the export it is undoing.
+/// The flag is an inline scalar, so no write barrier is needed (a barrier
+/// guards `PyObjectRef` stores only).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_MemoryView`.
 #[inline]
-pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
+pub unsafe fn w_memoryview_mark_released(obj: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_MemoryView)).released = true;
+    }
+}
+
+/// Drop the off-heap `BufferView` box (reclaiming any nested `Buffer::Sub`
+/// boxes through `Box`'s recursive drop glue) and null `view`.  Mirrors
+/// `descr_release` clearing `self.view = None` (`memoryobject.py`) so the
+/// backing / view graph is dropped eagerly on release rather than lingering
+/// until the header is GC-collected.  Idempotent: a second call finds `view`
+/// already null.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`, and no borrow handed out by
+/// [`w_memoryview_view`] may outlive this call.
+#[inline]
+pub unsafe fn w_memoryview_drop_view(obj: PyObjectRef) {
     unsafe {
         let mv = obj as *mut W_MemoryView;
         let view_ptr = (*mv).view as *mut BufferView;
@@ -264,7 +279,19 @@ pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
             drop(Box::from_raw(view_ptr));
             (*mv).view = std::ptr::null();
         }
-        (*mv).released = true;
+    }
+}
+
+/// Release the view: flip `released` and drop the view box together, for the
+/// paths that run no exporter callback in between.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
+    unsafe {
+        w_memoryview_mark_released(obj);
+        w_memoryview_drop_view(obj);
     }
 }
 
