@@ -2241,14 +2241,22 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// (iterobject.py:16-24): `len(seq) - index` recomputed from the LIVE sequence
 /// — `space.len(w_seq)`, so a subclass `__len__` override or a mutation made
 /// mid-iteration is reflected — clamped to 0.  An exhausted (cleared) sequence
-/// reports 0.  A missing or raising `__len__` propagates as a real error;
-/// `operator.length_hint` then maps a TypeError to its default, exactly as a
-/// direct `space.len` would.
+/// reports 0.
+///
+/// A sequence whose type has no `__len__` reports `NotImplemented` rather than
+/// raising: `iter_len` (`iterobject.c`) guards the length read with
+/// `_PyObject_HasLen`, and a `__getitem__`-only sequence is exactly the case
+/// that guard exists for.  A `__len__` that raises still propagates.  This
+/// intentionally differs from PyPy's `getlength`, which lets `space.len` raise;
+/// the observable behaviour target is 3.14.
 pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
         if seq.is_null() {
             return Ok(w_int_new(0));
+        }
+        if is_instance(seq) && lookup(seq, "__len__").is_none() {
+            return Ok(pyre_object::special::w_not_implemented());
         }
         let length = len_w(seq)?;
         let remaining = length - pyre_object::w_seq_iter_index(args[0]);
