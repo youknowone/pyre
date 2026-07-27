@@ -120,7 +120,45 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // Invalidate any outstanding cache token.
     INVALIDATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // `app_abc.py:102-105` — an ABC that carries a structural-match marker
+    // hands it to the registered class and its descendants
+    // (`_internal_set_collection_flag_recursive`).  Registering with
+    // `Mapping` / `Sequence` is what makes `case {...}` / `case [...]` accept
+    // a class that inherits from neither, so the marker has to travel with
+    // the registration, not only with `__abc_tpflags__` at class creation.
+    let flag = unsafe { typeobject::w_type_get_flag_map_or_seq(cls) };
+    if flag != b'?' && unsafe { is_type(subclass) } {
+        set_collection_flag_recursive(subclass, flag);
+    }
     Ok(subclass)
+}
+
+// `interp_abc.py:15-20 set_collection_flag_recursive` — stamp the marker on
+// `w_type` and every class already deriving from it.
+fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
+    unsafe {
+        // A non-heap type's marker is fixed at registration
+        // (`objspace.py:104-108` marks exactly dict / dictproxy / list /
+        // tuple), and `Py_TPFLAGS_IMMUTABLETYPE` stops the recursion there.
+        // `_collections_abc` runs `Sequence.register(str)` and
+        // `ByteString.register(bytes)`, so without this stop `str` / `bytes` /
+        // `bytearray` would start matching `case [...]` — the one thing a
+        // sequence pattern must never accept.
+        //
+        // A class already carrying the marker passed it to its descendants at
+        // creation (`inherit_flag_map_or_seq`), so that subtree is done.
+        if !typeobject::w_type_is_heaptype(w_type)
+            || typeobject::w_type_get_flag_map_or_seq(w_type) == flag
+        {
+            return;
+        }
+        typeobject::w_type_set_flag_map_or_seq(w_type, flag);
+        // `only_real_subclasses` is False for every walk but
+        // `descr___subclasses__` (typeobject.py:677-680).
+        for child in typeobject::w_type_get_subclasses(w_type, false) {
+            set_collection_flag_recursive(child, flag);
+        }
+    }
 }
 
 // `_py_abc.ABCMeta.__subclasscheck__` (`_py_abc.py:108-147`): the subclass
