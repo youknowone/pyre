@@ -21185,13 +21185,36 @@ fn set_method_symmetric_difference_update(
 /// counts as present when it lands in the same bucket and compares equal; a
 /// bare `eq_w` scan over the elements would instead call two objects the same
 /// element on `__eq__` alone, and place them where their hashes never meet.
+///
+/// Walked one index at a time through `w_set_key_at` and probed with
+/// `w_set_contains_key_checked`, the same shape as `set_intersect_update`, so
+/// the merge loop stays traced and only the per-key table probe/insert cross a
+/// residual boundary. The two sets are old-gen allocations that keep their
+/// addresses across a collection, but their elements are young and move, so
+/// each key is re-read from the table the collector rewrites rather than
+/// carried across the `eq_w` a bucket probe can run.
 fn set_symmetric_difference_storage(
     w_set: pyre_object::PyObjectRef,
     w_other: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
-        pyre_object::setobject::w_set_symmetric_difference_storage(w_set, w_other)
-            .map_err(crate::baseobjspace::map_set_update_error)
+        let d_new = pyre_object::w_set_new();
+        for (walk, probe) in [(w_other, w_set), (w_set, w_other)] {
+            let mut i = 0;
+            while let Some(key) = pyre_object::w_set_key_at(walk, i) {
+                if !pyre_object::w_set_contains_key_checked(probe, key)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+                {
+                    let Some(key) = pyre_object::w_set_key_at(walk, i) else {
+                        break;
+                    };
+                    pyre_object::w_set_insert_key_checked(d_new, key)
+                        .map_err(crate::baseobjspace::map_set_update_error)?;
+                }
+                i += 1;
+            }
+        }
+        Ok(d_new)
     }
 }
 
