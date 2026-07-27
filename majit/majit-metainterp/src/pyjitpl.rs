@@ -4457,68 +4457,10 @@ impl<M: Clone> MetaInterp<M> {
             None => return,
         };
         let vable_ptr = self.vable_ptr;
-        if vable_ptr.is_null() {
-            return;
-        }
-        let (vable_box, array_lengths) = match self.tracing.as_ref() {
-            Some(ctx) => {
-                let Some(vable_box) = ctx.standard_virtualizable_box() else {
-                    return;
-                };
-                let array_lengths = ctx
-                    .virtualizable_array_lengths()
-                    .map(|lengths| lengths.to_vec())
-                    .unwrap_or_default();
-                (vable_box, array_lengths)
-            }
-            None => return,
-        };
-        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(vable_ptr, &array_lengths) };
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
-        let cap = static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>() + 1;
-        let mut boxes = Vec::with_capacity(cap);
-        let mut values = Vec::with_capacity(cap);
-        for (index, value) in static_boxes.into_iter().enumerate() {
-            let (opref, concrete) = match info.static_fields[index].field_type {
-                majit_ir::Type::Int => (ctx.const_int(value), Value::Int(value)),
-                majit_ir::Type::Ref => (
-                    ctx.const_ref(value),
-                    Value::Ref(majit_ir::GcRef(value as usize)),
-                ),
-                majit_ir::Type::Float => (
-                    ctx.const_float(value),
-                    Value::Float(f64::from_bits(value as u64)),
-                ),
-                majit_ir::Type::Void => continue,
-            };
-            boxes.push(opref);
-            values.push(concrete);
-        }
-        for (array_index, items) in array_boxes.into_iter().enumerate() {
-            let item_type = info.array_fields[array_index].item_type;
-            for value in items {
-                let (opref, concrete) = match item_type {
-                    majit_ir::Type::Int => (ctx.const_int(value), Value::Int(value)),
-                    majit_ir::Type::Ref => (
-                        ctx.const_ref(value),
-                        Value::Ref(majit_ir::GcRef(value as usize)),
-                    ),
-                    majit_ir::Type::Float => (
-                        ctx.const_float(value),
-                        Value::Float(f64::from_bits(value as u64)),
-                    ),
-                    majit_ir::Type::Void => continue,
-                };
-                boxes.push(opref);
-                values.push(concrete);
-            }
-        }
-        boxes.push(vable_box);
-        // The vable identity's concrete value is the heap pointer itself.
-        values.push(Value::Ref(majit_ir::GcRef(vable_ptr as usize)));
-        ctx.set_virtualizable_boxes_with_info(boxes, values, &info, &array_lengths);
+        ctx.load_fields_from_virtualizable(&info, vable_ptr);
     }
 
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.

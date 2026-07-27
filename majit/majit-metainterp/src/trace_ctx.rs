@@ -2444,6 +2444,84 @@ impl TraceCtx {
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
 
+    /// Reload the tracing-time `virtualizable_boxes` cache from the heap
+    /// object — the `TraceCtx`-level body of
+    /// `MetaInterp::load_fields_from_virtualizable` (pyjitpl.py:3452-3464).
+    ///
+    /// ```text
+    /// def load_fields_from_virtualizable(self):
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         self.virtualizable_boxes = vinfo.read_boxes(self.cpu, virtualizable, 0)
+    ///         self.virtualizable_boxes.append(virtualizable_box)
+    /// ```
+    ///
+    /// It lives here rather than only on `MetaInterp` because the second
+    /// upstream caller of this reload — the escape path of
+    /// `vable_after_residual_call` (pyjitpl.py:3377) — is reached from the
+    /// state-field dispatcher, which holds no `MetaInterp` reference.
+    pub fn load_fields_from_virtualizable(
+        &mut self,
+        info: &VirtualizableInfo,
+        vable_ptr: *const u8,
+    ) {
+        if vable_ptr.is_null() {
+            return;
+        }
+        let Some(vable_box) = self.standard_virtualizable_box() else {
+            return;
+        };
+        let array_lengths = self
+            .virtualizable_array_lengths()
+            .map(|lengths| lengths.to_vec())
+            .unwrap_or_default();
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(vable_ptr, &array_lengths) };
+        let cap = static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>() + 1;
+        let mut boxes = Vec::with_capacity(cap);
+        let mut values = Vec::with_capacity(cap);
+        for (index, value) in static_boxes.into_iter().enumerate() {
+            let (opref, concrete) = match info.static_fields[index].field_type {
+                majit_ir::Type::Int => (self.const_int(value), Value::Int(value)),
+                majit_ir::Type::Ref => (
+                    self.const_ref(value),
+                    Value::Ref(majit_ir::GcRef(value as usize)),
+                ),
+                majit_ir::Type::Float => (
+                    self.const_float(value),
+                    Value::Float(f64::from_bits(value as u64)),
+                ),
+                majit_ir::Type::Void => continue,
+            };
+            boxes.push(opref);
+            values.push(concrete);
+        }
+        for (array_index, items) in array_boxes.into_iter().enumerate() {
+            let item_type = info.array_fields[array_index].item_type;
+            for value in items {
+                let (opref, concrete) = match item_type {
+                    majit_ir::Type::Int => (self.const_int(value), Value::Int(value)),
+                    majit_ir::Type::Ref => (
+                        self.const_ref(value),
+                        Value::Ref(majit_ir::GcRef(value as usize)),
+                    ),
+                    majit_ir::Type::Float => (
+                        self.const_float(value),
+                        Value::Float(f64::from_bits(value as u64)),
+                    ),
+                    majit_ir::Type::Void => continue,
+                };
+                boxes.push(opref);
+                values.push(concrete);
+            }
+        }
+        boxes.push(vable_box);
+        // The vable identity's concrete value is the heap pointer itself.
+        values.push(Value::Ref(majit_ir::GcRef(vable_ptr as usize)));
+        self.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
+    }
+
     /// Canonical virtualizable metadata for the active standard virtualizable.
     pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
         self.virtualizable_info.as_ref()

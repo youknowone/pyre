@@ -1030,13 +1030,15 @@ where
         Some(active)
     }
 
-    fn finish_standard_virtualizable_after_residual_call(
+    /// The escaping half of `vable_after_residual_call` (pyjitpl.py:3372):
+    /// `Some` when `tracing_after_residual_call` reports the virtualizable
+    /// escaped during this CALL_MAY_FORCE.  Returns the still-rooted
+    /// [`ActiveStandardVirtualizable`] so the caller can read the heap object
+    /// before dropping the shadow-stack root.
+    fn escaped_standard_virtualizable(
         active: Option<ActiveStandardVirtualizable>,
-    ) -> bool {
-        let Some(active) = active else {
-            return false;
-        };
-        unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) }
+    ) -> Option<ActiveStandardVirtualizable> {
+        active.filter(|active| unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) })
     }
 
     fn finalize_standard_virtualizable_may_force(
@@ -1045,7 +1047,18 @@ where
         sym: &mut S,
         active: Option<ActiveStandardVirtualizable>,
     ) -> TraceAction {
-        if Self::finish_standard_virtualizable_after_residual_call(active) {
+        if let Some(active) = Self::escaped_standard_virtualizable(active) {
+            // pyjitpl.py:3377 `self.load_fields_from_virtualizable()` runs
+            // BEFORE the abort: the residual call forced the virtualizable and
+            // wrote its fields through the heap object, so the tracing-time
+            // box cache is stale.  Without this reload the blackhole rebuilds
+            // the resumed interpreter state from the pre-call boxes and the
+            // forced writes are lost.  The `MetaInterp` side already does this
+            // (`vable_after_residual_call`); this dispatcher holds no
+            // `MetaInterp`, so it calls the shared `TraceCtx` body directly.
+            // `active` stays alive across the read to keep the shadow-stack
+            // root for `obj_ptr` — its `Drop` pops that root.
+            ctx.load_fields_from_virtualizable(&active.info, active.obj_ptr());
             // pyjitpl.py:3373-3375 `raise SwitchToBlackhole(ABORT_ESCAPE,
             // raising_exception=True)` — stash the upstream-orthodox
             // abort reason + `raising_exception` flag on TraceCtx so
@@ -9760,6 +9773,74 @@ mod tests {
         assert_eq!(
             recorder.get_op_by_pos(OpRef::void_op(2)).unwrap().opcode,
             OpCode::CallMayForceN
+        );
+    }
+
+    #[repr(C)]
+    struct ForcingVable {
+        token: u64,
+        pc: i64,
+    }
+
+    /// Force the virtualizable (clear the token) and write a field through the
+    /// heap object, the way a real forced residual call does.
+    extern "C" fn residual_force_and_write(vable: i64) {
+        unsafe {
+            let vable = &mut *(vable as usize as *mut ForcingVable);
+            vable.pc = 99;
+            vable.token = 0;
+        }
+    }
+
+    /// pyjitpl.py:3377 `vable_after_residual_call` calls
+    /// `load_fields_from_virtualizable()` before raising
+    /// `SwitchToBlackhole(ABORT_ESCAPE)`, so the fields the forced callee wrote
+    /// through the heap become the resumed interpreter's state.  Without the
+    /// reload the box cache still holds the pre-call values.
+    #[test]
+    fn escaping_standard_virtualizable_reloads_fields_before_abort() {
+        let mut obj = ForcingVable { token: 0, pc: 1 };
+        let obj_ptr = (&mut obj as *mut ForcingVable) as usize as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        let fn_idx = builder.add_fn_ptr(residual_force_and_write as *const ());
+        builder.call_may_force_void_canonical_via_target(fn_idx, &[JitCallArg::reference(0)]);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        let vable_ref = ctx.const_ref(obj_ptr);
+        let stale_pc = ctx.const_int(1);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef(obj_ptr as usize)),
+            &[stale_pc],
+            &[Value::Int(1)],
+            &[],
+        );
+
+        let mut sym = DummySym::default();
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable_ref, obj_ptr)],
+        );
+        assert!(matches!(action, TraceAction::Abort));
+        assert_eq!(obj.pc, 99, "the forced residual call wrote the heap field");
+
+        let (_, reloaded) = ctx
+            .virtualizable_entry_at(0)
+            .expect("escape path must leave the virtualizable box cache populated");
+        assert_eq!(
+            reloaded,
+            Value::Int(99),
+            "load_fields_from_virtualizable must refresh the box cache from the heap",
         );
     }
 
