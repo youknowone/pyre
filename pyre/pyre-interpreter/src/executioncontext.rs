@@ -31,6 +31,25 @@ pub fn force_frame(frame: *mut PyFrame) {
     }
 }
 
+/// Force a frame whose fastlocals application code is about to read.
+///
+/// RPython needs no such call: storing the frame pointer anywhere the JIT
+/// cannot see forces the virtualizable by escape analysis, so
+/// `pyframe.py:539 fast2locals` always finds a materialized
+/// `locals_cells_stack_w`.  Pyre forces through explicit hooks instead, and
+/// [`PyExecutionContext::gettopframe_nohidden`] only covers the frames IT
+/// walks — a frame handed out some other way (a traceback's `tb_frame`)
+/// reaches `fast2locals` unforced, whose null slots render as an EMPTY
+/// mapping rather than a stale one.
+///
+/// # Safety
+/// `frame` must be a live `PyFrame` (or null).
+pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
+    if !frame.is_null() {
+        force_frame(frame);
+    }
+}
+
 /// `_jit_vref.py:48-52` `vref()` = `jit_force_virtual`.
 ///
 /// `topframeref` and every frame's `f_backref` hold a `jit.virtual_ref` — at
