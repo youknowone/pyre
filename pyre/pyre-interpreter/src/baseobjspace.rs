@@ -1624,25 +1624,45 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // Index code points through the surrogate-aware WTF-8 view so a
     // surrogateescape / surrogatepass-decoded string can be sliced and
     // indexed without going through `w_str_get_value`.
-    let cps: Vec<CodePoint> = w_str_get_wtf8(obj).code_points().collect();
+    //
+    // `_index_to_byte` (`unicodeobject.py:1251`) reads an ASCII payload's byte
+    // at the code point index, so only a wide or surrogate-bearing string has
+    // to walk.  Upstream keeps that walk O(1) with a per-string
+    // `rutf8.create_utf8_index_storage` table; without one, walking it once
+    // per call beats walking it once per code point.
+    let ascii = pyre_object::w_str_is_ascii(obj);
+    let cps: Vec<CodePoint> = if ascii {
+        Vec::new()
+    } else {
+        w_str_get_wtf8(obj).code_points().collect()
+    };
+    let len = w_str_len(obj);
+    let at = |i: usize| -> Option<CodePoint> {
+        if ascii {
+            pyre_object::w_str_codepoint_at(obj, i)
+        } else {
+            cps.get(i).copied()
+        }
+    };
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
         // Use the shared adjusted slice count so very large steps do not
         // overflow the index loop.
-        let len = cps.len() as i64;
         let (rs, rp, st) = crate::sliceobject::slice_unpack(
             w_slice_get_start(index),
             w_slice_get_stop(index),
             w_slice_get_step(index),
         )?;
         let (start, _stop, step, slicelength) =
-            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len as i64);
         let mut result = Wtf8Buf::new();
         let mut i = start;
         for n in 0..slicelength {
-            if i >= 0 && (i as usize) < cps.len() {
-                result.push(cps[i as usize]);
+            if i >= 0 {
+                if let Some(cp) = at(i as usize) {
+                    result.push(cp);
+                }
             }
             if n + 1 < slicelength {
                 i += step;
@@ -1678,11 +1698,13 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else {
         return Err(string_index_type_error(index));
     };
-    let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
-    if actual_idx < cps.len() {
-        let mut one = Wtf8Buf::new();
-        one.push(cps[actual_idx]);
-        return Ok(w_str_from_wtf8(one));
+    let actual_idx = if idx < 0 { len as i64 + idx } else { idx };
+    if actual_idx >= 0 {
+        if let Some(cp) = at(actual_idx as usize) {
+            let mut one = Wtf8Buf::new();
+            one.push(cp);
+            return Ok(w_str_from_wtf8(one));
+        }
     }
     Err(PyError::new(
         PyErrorKind::IndexError,
@@ -12246,19 +12268,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // Box the idx-th code point as a one-character str,
                 // reading the WTF-8 view so a lone surrogate is yielded
                 // instead of panicking.
-                let s = w_str_get_wtf8(seq);
-                let mut found: Option<PyObjectRef> = None;
-                let mut n = 0i64;
-                for cp in s.code_points() {
-                    if n == idx {
-                        let mut one = Wtf8Buf::new();
-                        one.push(cp);
-                        found = Some(w_str_from_wtf8(one));
-                        break;
-                    }
-                    n += 1;
-                }
-                found
+                pyre_object::w_str_codepoint_at(seq, idx as usize).map(|cp| {
+                    let mut one = Wtf8Buf::new();
+                    one.push(cp);
+                    w_str_from_wtf8(one)
+                })
             } else if pyre_object::interp_array::is_array(seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
                     Some(pyre_object::interp_array::w_array_unpack_item(

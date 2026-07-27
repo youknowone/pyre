@@ -15,7 +15,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use rustpython_wtf8::{Wtf8, Wtf8Buf};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::pyobject::*;
 
@@ -410,6 +410,44 @@ pub unsafe fn w_str_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_UnicodeObject)).len }
 }
 
+/// `unicodeobject.py:1245 W_UnicodeObject.is_ascii` — `self._length ==
+/// len(self._utf8)`.  One byte per code point means a code point index is
+/// already a byte offset.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[inline]
+pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
+    unsafe {
+        let str_obj = obj as *const W_UnicodeObject;
+        (*str_obj).len == (*str_obj).byte_len
+    }
+}
+
+/// The code point at `index`, or `None` past the end — the read behind
+/// `_getitem_result` (`unicodeobject.py:1205`), which resolves the position
+/// through `_index_to_byte` (:1251).
+///
+/// An ASCII payload takes the direct branch and is O(1).  Anything else walks,
+/// because pyre has no counterpart of the `rutf8.create_utf8_index_storage`
+/// table that turns the general case into an O(1) lookup upstream; a
+/// surrogate-bearing or wide string therefore still costs O(index) per read.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodePoint> {
+    unsafe {
+        let value = &*(*(obj as *const W_UnicodeObject)).value;
+        if w_str_is_ascii(obj) {
+            let end = index.checked_add(1)?;
+            return value
+                .get(index..end)
+                .and_then(|one| one.code_points().next());
+        }
+        value.code_points().nth(index)
+    }
+}
+
 /// Check if an object is a str.
 ///
 /// # Safety
@@ -534,6 +572,47 @@ mod tests {
             let str_obj = obj as *const W_UnicodeObject;
             assert_eq!((*str_obj).byte_len, 5); // UTF-8: c(1) a(1) f(1) é(2)
             assert_eq!((*str_obj).len, 4); // 4 codepoints
+        }
+    }
+
+    #[test]
+    fn test_str_codepoint_at_indexes_code_points_not_bytes() {
+        let ascii = w_str_new("hello");
+        let wide = w_str_new("café一");
+        let empty = w_str_new("");
+        unsafe {
+            assert!(w_str_is_ascii(ascii));
+            assert!(w_str_is_ascii(empty));
+            assert!(!w_str_is_ascii(wide));
+
+            let at = |obj, i| w_str_codepoint_at(obj, i).map(CodePoint::to_u32);
+            assert_eq!(at(ascii, 0), Some(u32::from(b'h')));
+            assert_eq!(at(ascii, 4), Some(u32::from(b'o')));
+            assert_eq!(at(ascii, 5), None);
+            assert_eq!(at(ascii, usize::MAX), None);
+            assert_eq!(at(empty, 0), None);
+
+            // 'é' is two bytes, so byte offset 3 would land mid-character.
+            assert_eq!(at(wide, 3), Some(u32::from('é')));
+            assert_eq!(at(wide, 4), Some(u32::from('一')));
+            assert_eq!(at(wide, 5), None);
+        }
+    }
+
+    #[test]
+    fn test_str_codepoint_at_yields_a_lone_surrogate() {
+        let mut buf = Wtf8Buf::new();
+        buf.push_str("a");
+        buf.push(CodePoint::from_u32(0xD800).unwrap());
+        buf.push_str("b");
+        let obj = w_str_from_wtf8(buf);
+        unsafe {
+            assert!(!w_str_is_ascii(obj));
+            let at = |i| w_str_codepoint_at(obj, i).map(CodePoint::to_u32);
+            assert_eq!(at(0), Some(u32::from(b'a')));
+            assert_eq!(at(1), Some(0xD800));
+            assert_eq!(at(2), Some(u32::from(b'b')));
+            assert_eq!(at(3), None);
         }
     }
 
