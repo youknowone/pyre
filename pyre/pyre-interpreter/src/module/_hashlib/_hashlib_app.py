@@ -24,8 +24,10 @@ _BLOCK_SIZE = {
 class HASH:
     def __init__(self, name, data=b""):
         import _hashlib
-        _hashlib._check_digest_name(name)
-        self._name = name
+        # The digest is named by the entry the name resolved to, so `name`,
+        # `digest_size`, `block_size` and the digest itself all read the same
+        # spelling however the caller spelled it.
+        self._name = _hashlib._resolve_digest_name(name)
         self._data = bytearray()
         if data:
             self.update(data)
