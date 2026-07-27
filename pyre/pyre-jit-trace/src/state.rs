@@ -4768,6 +4768,13 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
 /// during the publish can collect, so the copy has to be registered as resume
 /// roots (`push_resume_ref_roots`) for the duration, like the register image
 /// `apply_blackhole_crn` holds.
+///
+/// Upstream needs no counterpart. `resume.py`'s virtualizable write-back
+/// (`VirtualizableInfo.write_from_resume_data`) runs on a per-call `MIFrame`
+/// whose values RPython's GC sees through ordinary object references, so the
+/// question of publishing over a live frame and taking it back never arises;
+/// carrying the old slots as raw words, and rooting them by hand, is what
+/// replaces that ownership.
 pub(crate) fn capture_frame_locals(frame: usize) -> Option<Vec<i64>> {
     if frame == 0 {
         return None;
@@ -4830,6 +4837,13 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
         return false;
     }
     let base = info.num_static_extra_boxes;
+    // Every slot has to resolve before the first store, the way the merge-point
+    // flush validates ahead of its commit loop: bailing partway through leaves
+    // the frame carrying a mix of walk-current and pre-walk locals, which is
+    // neither of the two states a caller can recover from.
+    if (0..nlocals).any(|abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
+        return false;
+    }
     // Boxing an Int/Float slot allocates; the detached frame array is
     // forwarded only while it is in the remembered set, and each minor
     // consumes that entry, so re-arm the barrier after every store.
