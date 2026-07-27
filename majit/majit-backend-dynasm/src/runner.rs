@@ -191,6 +191,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
     majit_gc::set_active_collect_full(Some(dynasm_collect_full));
+    majit_gc::set_active_get_objects(Some(dynasm_get_objects));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
@@ -479,6 +480,17 @@ fn dynasm_collect_full() {
         return;
     }
     majit_gc::gc_sync::gc_op(|g| g.collect_full());
+}
+
+fn dynasm_get_objects(generation: i8) -> Vec<GcRef> {
+    if let Some(result) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut()
+            .as_deref_mut()
+            .map(|g| g.get_objects(generation))
+    }) {
+        return result;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.get_objects(generation))
 }
 
 /// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float

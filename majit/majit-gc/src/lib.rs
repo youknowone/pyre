@@ -319,6 +319,14 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// `rpython/rlib/rgc.py:1224 do_get_objects`: walk every object reachable
+    /// from the GC roots and return the `rclass.OBJECT` instances selected by
+    /// CPython 3.14's generation argument (`-1` all, `0` nursery, `1` empty,
+    /// `2` old generation). Collectors without an inspector return no objects.
+    fn get_objects(&mut self, _generation: i8) -> Vec<GcRef> {
+        Vec::new()
+    }
+
     /// Trigger a non-moving old-gen-only major collection (sweep dead old-gen
     /// objects without moving the nursery). The default no-ops so a backend
     /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
@@ -785,6 +793,9 @@ impl GcAllocator for GcHandle {
     }
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
+    }
+    fn get_objects(&mut self, generation: i8) -> Vec<GcRef> {
+        gc_sync::gc_op(|gc| gc.get_objects(generation))
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
@@ -1444,6 +1455,23 @@ pub fn collect_full() {
     if let Some(f) = ACTIVE_COLLECT_FULL.get() {
         f();
     }
+}
+
+/// Active-backend trampoline for `rpython/rlib/rgc.py:1224
+/// do_get_objects`. The generation values are CPython 3.14's public
+/// `gc.get_objects` convention.
+pub type GetObjectsFn = fn(i8) -> Vec<GcRef>;
+
+global_hook!(static ACTIVE_GET_OBJECTS: GetObjectsFn);
+
+pub fn set_active_get_objects(hook: Option<GetObjectsFn>) {
+    ACTIVE_GET_OBJECTS.set(hook);
+}
+
+pub fn get_objects(generation: i8) -> Vec<GcRef> {
+    ACTIVE_GET_OBJECTS
+        .get()
+        .map_or_else(Vec::new, |f| f(generation))
 }
 
 /// Process-global callback running a non-moving old-gen-only major collection

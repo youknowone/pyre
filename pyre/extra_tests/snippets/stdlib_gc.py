@@ -36,6 +36,13 @@ assert gc.get_objects(1) == []
 assert isinstance(gc.get_objects(2), list)
 assert isinstance(gc.get_objects(Index()), list)
 
+marker = []
+assert any(obj is marker for obj in gc.get_objects())
+assert any(
+    obj is marker
+    for obj in gc.get_objects(0) + gc.get_objects(2)
+)
+
 for generation in (-2, 3):
     with assert_raises(ValueError):
         gc.get_objects(generation)

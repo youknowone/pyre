@@ -98,9 +98,7 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             // CPython 3.14 `gc.get_objects(generation=None)`: -1/None means
             // every generation, generation 1 is empty after its removal, and
-            // 0/2 select the young/old generations.  Heap enumeration itself
-            // remains the same empty-list fallback until majit-gc exposes the
-            // RPython `rgc.do_get_objects` walk.
+            // 0/2 select the young/old generations.
             let generation = if unsafe { is_none(generation) } {
                 -1
             } else {
@@ -116,7 +114,16 @@ crate::py_module! {
                     "generation parameter must be less than the number of available generations (3)",
                 ));
             }
-            Ok(w_list_new(vec![]))
+            let _roots = pyre_object::gc_roots::push_roots();
+            let objects = majit_gc::get_objects(generation as i8);
+            for &object in &objects {
+                pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
+            }
+            let first = pyre_object::gc_roots::shadow_stack_len() - objects.len();
+            let objects = (0..objects.len())
+                .map(|index| pyre_object::gc_roots::shadow_stack_get(first + index))
+                .collect();
+            Ok(w_list_new_object(objects))
         }
     },
     functions: {
