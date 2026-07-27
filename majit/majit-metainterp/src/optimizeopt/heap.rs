@@ -1315,18 +1315,21 @@ impl OptHeap {
         // clear `_lazy_set`), so every later guard re-collects it into
         // pendingfields and a later call/flush boundary still emits it.
         // Only force_lazy_set — the non-virtual arm — clears it.
-        let mut ordered_entries: Vec<_> = self
+        // heap.py:611-612 `op = cf._lazy_set; if op is None: continue` — skip
+        // before touching the entry, so a guard costs one `Option` probe per
+        // cached field instead of a `DescrRef` clone per cached field. Filtering
+        // ahead of the sort is equivalent: the sort is stable and filtering
+        // preserves relative order.
+        let mut field_entries: Vec<(u32, DescrRef, Op)> = self
             .cached_fields
-            .iter_mut()
-            .map(|(field_idx, descr, cf)| (*field_idx, descr.clone(), cf))
-            .collect();
-        sort_descr_entries_untranslated(&mut ordered_entries);
-        let field_entries: Vec<(u32, DescrRef, Op)> = ordered_entries
-            .into_iter()
+            .iter()
             .filter_map(|(field_idx, descr, cf)| {
-                cf.lazy_set.clone().map(|op| (field_idx, descr, op))
+                cf.lazy_set
+                    .clone()
+                    .map(|op| (*field_idx, descr.clone(), op))
             })
             .collect();
+        sort_descr_entries_untranslated(&mut field_entries);
         for (field_idx, descr, mut op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let is_virtual = ctx.is_virtual(&op.arg(1).get_box_replacement(false));
@@ -1783,9 +1786,13 @@ impl OptHeap {
         }
         let escaped_owners: &[OpRef] = &flush_owners;
 
+        // Same `_lazy_set is None` skip as force_lazy_sets_for_guard: only the
+        // entries that carry a lazy set can reach the arm below, so nothing
+        // else needs its `DescrRef` cloned.
         let mut field_entries: Vec<_> = self
             .cached_fields
             .iter_mut()
+            .filter(|(_field_idx, _descr, cf)| cf.lazy_set.is_some())
             .map(|(field_idx, descr, cf)| (*field_idx, descr.clone(), cf))
             .collect();
         sort_descr_entries_untranslated(&mut field_entries);
